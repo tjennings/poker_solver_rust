@@ -979,9 +979,10 @@ fn generate_turn_training_data_exact(
         PIPELINE_CHANNEL_CAPACITY,
     );
 
-    // Channel: Stage 3 -> Stage 4.
+    // Channel: Stage 3 -> Stage 4. Keep small to limit memory.
+    const STORAGE_CHANNEL_CAPACITY: usize = 50;
     let (storage_tx, storage_rx) =
-        std::sync::mpsc::sync_channel::<StorageMsg>(PIPELINE_CHANNEL_CAPACITY);
+        std::sync::mpsc::sync_channel::<StorageMsg>(STORAGE_CHANNEL_CAPACITY);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
@@ -1019,48 +1020,63 @@ fn generate_turn_training_data_exact(
         }
     });
 
-    // --- Stage 4: Storage Writer ---
+    // --- Stage 4: Storage Writer (streaming, no buffering) ---
     let turn_output_path = output_path.to_path_buf();
     let river_out_for_stage4 = river_output_path.map(|p| p.to_path_buf());
     let turn_buf_depth_ref = Arc::clone(&turn_buf_depth);
     let river_buf_depth_ref = Arc::clone(&river_buf_depth);
     let stage4 = std::thread::spawn(move || -> Result<(), String> {
-        let mut turn_buffer: Vec<TrainingRecord> = Vec::new();
-        let mut river_buffer: Vec<TrainingRecord> = Vec::new();
+        // Open first files immediately. Rotate at per_file threshold.
         let mut turn_file_count = 0u32;
         let mut river_file_count = 0u32;
+        let mut turn_records_in_file = 0u64;
+        let mut river_records_in_file = 0u64;
+
+        let open_file = |base: &Path, count: &mut u32| -> Result<BufWriter<std::fs::File>, String> {
+            let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+            let parent = base.parent().unwrap_or(Path::new("."));
+            let path = parent.join(format!("{}_{:05}.bin", stem, count));
+            *count += 1;
+            let f = std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+            eprintln!("[storage] opened {}", path.display());
+            Ok(BufWriter::new(f))
+        };
+
+        let mut turn_writer = open_file(&turn_output_path, &mut turn_file_count)?;
+        let mut river_writer: Option<BufWriter<std::fs::File>> = match &river_out_for_stage4 {
+            Some(rp) => Some(open_file(rp, &mut river_file_count)?),
+            None => None,
+        };
 
         while let Ok(msg) = storage_rx.recv() {
             match msg {
                 StorageMsg::TurnRecord(rec) => {
-                    turn_buffer.push(rec);
-                    turn_buf_depth_ref.store(turn_buffer.len() as u64, Ordering::Relaxed);
-                    if turn_buffer.len() as u64 >= per_file {
-                        flush_buffer(&turn_output_path, &mut turn_buffer, &mut turn_file_count)?;
+                    write_record(&mut turn_writer, &rec).map_err(|e| format!("write turn: {e}"))?;
+                    turn_records_in_file += 1;
+                    turn_buf_depth_ref.store(turn_records_in_file, Ordering::Relaxed);
+                    if turn_records_in_file >= per_file {
+                        drop(turn_writer);
+                        turn_writer = open_file(&turn_output_path, &mut turn_file_count)?;
+                        turn_records_in_file = 0;
                         turn_buf_depth_ref.store(0, Ordering::Relaxed);
                     }
                 }
                 StorageMsg::RiverRecord(rec) => {
-                    if let Some(ref river_path) = river_out_for_stage4 {
-                        river_buffer.push(rec);
-                        river_buf_depth_ref.store(river_buffer.len() as u64, Ordering::Relaxed);
-                        if river_buffer.len() as u64 >= per_file {
-                            flush_buffer(river_path, &mut river_buffer, &mut river_file_count)?;
-                            river_buf_depth_ref.store(0, Ordering::Relaxed);
+                    if let Some(ref mut rw) = river_writer {
+                        write_record(rw, &rec).map_err(|e| format!("write river: {e}"))?;
+                        river_records_in_file += 1;
+                        river_buf_depth_ref.store(river_records_in_file, Ordering::Relaxed);
+                        if river_records_in_file >= per_file {
+                            if let Some(ref rp) = river_out_for_stage4 {
+                                drop(river_writer.take());
+                                river_writer = Some(open_file(rp, &mut river_file_count)?);
+                                river_records_in_file = 0;
+                                river_buf_depth_ref.store(0, Ordering::Relaxed);
+                            }
                         }
                     }
-                    // Drop river records if no river output path.
                 }
                 StorageMsg::Flush => break,
-            }
-        }
-
-        if !turn_buffer.is_empty() {
-            flush_buffer(&turn_output_path, &mut turn_buffer, &mut turn_file_count)?;
-        }
-        if !river_buffer.is_empty() {
-            if let Some(ref river_path) = river_out_for_stage4 {
-                flush_buffer(river_path, &mut river_buffer, &mut river_file_count)?;
             }
         }
 
