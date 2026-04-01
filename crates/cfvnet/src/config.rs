@@ -172,6 +172,10 @@ pub struct DatagenConfig {
     /// When set in exact mode, river records are written alongside turn records.
     #[serde(default)]
     pub river_output: Option<String>,
+    /// Max samples per output file. Splits into multiple files if total exceeds this.
+    /// Default: no splitting (all samples in one file).
+    #[serde(default)]
+    pub per_file: Option<u64>,
 }
 
 impl Default for DatagenConfig {
@@ -189,6 +193,7 @@ impl Default for DatagenConfig {
             leaf_eval_interval: 0,
             bet_size_fuzz: 0.0,
             river_output: None,
+            per_file: None,
         }
     }
 }

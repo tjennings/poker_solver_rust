@@ -330,7 +330,7 @@ fn cmd_generate(
     }
 
     let total = cfg.datagen.num_samples;
-    let chunk_size = per_file.unwrap_or(total);
+    let chunk_size = per_file.or(cfg.datagen.per_file).unwrap_or(total);
     let num_files = total.div_ceil(chunk_size);
 
     let street = cfg.datagen.street.as_str();
