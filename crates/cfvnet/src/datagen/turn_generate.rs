@@ -792,7 +792,9 @@ pub fn generate_turn_training_data(
     });
 
     // --- Stage 2: GPU Inference (1 thread) ---
-    // Loads ONE model, evaluates boundary CFVs, sends to Stage 3.
+    // Loads ONE model, batches boundary evaluations across multiple samples
+    // for larger GPU forward passes.
+    const GPU_BATCH_SIZE: usize = 32;
     let river_model_path_owned = river_model_path.to_string();
     let stage2_count_ref = Arc::clone(&stage2_count);
     let stage2 = std::thread::spawn(move || {
@@ -808,9 +810,46 @@ pub fn generate_turn_training_data(
         .expect("load river model on Stage 2 thread");
         let evaluator = RiverNetEvaluator::new(model, device);
 
-        while let Ok((sit, mut game)) = rx1.recv() {
+        let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(GPU_BATCH_SIZE);
+
+        loop {
+            // Block on first receive, then drain non-blocking up to batch size.
+            match rx1.recv() {
+                Ok(item) => batch.push(item),
+                Err(_) => break, // Channel closed.
+            }
+            while batch.len() < GPU_BATCH_SIZE {
+                match rx1.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break,
+                }
+            }
+
+            // Evaluate boundaries for entire batch.
+            for (sit, game) in batch.iter_mut() {
+                evaluate_game_boundaries(
+                    game,
+                    sit.board_cards(),
+                    f64::from(sit.pot),
+                    f64::from(sit.effective_stack),
+                    &sit.ranges,
+                    &evaluator,
+                );
+                stage2_count_ref.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Send all to Stage 3.
+            for item in batch.drain(..) {
+                if tx2.send(item).is_err() {
+                    return;
+                }
+            }
+        }
+
+        // Process remaining items.
+        for (sit, game) in batch.iter_mut() {
             evaluate_game_boundaries(
-                &mut game,
+                game,
                 sit.board_cards(),
                 f64::from(sit.pot),
                 f64::from(sit.effective_stack),
@@ -818,9 +857,9 @@ pub fn generate_turn_training_data(
                 &evaluator,
             );
             stage2_count_ref.fetch_add(1, Ordering::Relaxed);
-            if tx2.send((sit, game)).is_err() {
-                break; // Receiver dropped.
-            }
+        }
+        for item in batch.drain(..) {
+            let _ = tx2.send(item);
         }
         // tx2 drops here, closing the channel.
     });
