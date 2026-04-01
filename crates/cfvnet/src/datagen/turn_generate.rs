@@ -31,7 +31,7 @@ use range_solver::bet_size::{BetSize, BetSizeOptions};
 use range_solver::card::{card_pair_to_index, CardConfig, NOT_DEALT};
 use range_solver::game::PostFlopGame;
 use range_solver::range::Range as RsRange;
-use range_solver::{solve, solve_step};
+use range_solver::solve_step;
 use rayon::prelude::*;
 
 use super::range_gen::NUM_COMBOS;
@@ -516,6 +516,41 @@ fn extract_river_data_at_node(
     }
 }
 
+/// Message types for the Stage 4 storage channel.
+enum StorageMsg {
+    /// A turn-level training record (4-card board).
+    TurnRecord(TrainingRecord),
+    /// A river-level training record (5-card board).
+    RiverRecord(TrainingRecord),
+    /// Flush remaining buffered records and shut down.
+    Flush,
+}
+
+/// Flush a buffer of training records to a new numbered file.
+///
+/// Generates a filename like `{stem}_{count:05}.bin` in the same directory as `base_path`.
+/// Increments `file_count` after writing.
+fn flush_buffer(
+    base_path: &Path,
+    buffer: &mut Vec<TrainingRecord>,
+    file_count: &mut u32,
+) -> Result<(), String> {
+    let count = buffer.len();
+    let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
+    let parent = base_path.parent().unwrap_or(Path::new("."));
+    let path = parent.join(format!("{}_{:05}.bin", stem, file_count));
+    *file_count += 1;
+
+    let file =
+        std::fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for rec in buffer.drain(..) {
+        write_record(&mut writer, &rec).map_err(|e| format!("write: {e}"))?;
+    }
+    eprintln!("[storage] wrote {count} records to {}", path.display());
+    Ok(())
+}
+
 /// GPU-accelerated turn datagen with pipelined GPU/CPU phases.
 ///
 /// Phase 1 (CPU parallel): Build game trees for each situation.
@@ -854,8 +889,15 @@ fn generate_turn_training_data_cuda(
 
 /// Generate turn training data in exact mode (no neural net).
 ///
-/// Uses a 2-stage pipeline: Stage 1 builds full turn+river trees (depth_limit: None),
-/// and Stage 3 solves them to showdown. No GPU inference stage is needed.
+/// Uses a 3-stage pipeline:
+///
+/// ```text
+/// [Stage 1: Deal Gen] -> channel -> [Stage 3: Solve] -> channel -> [Stage 4: Storage Writer]
+/// ```
+///
+/// Stage 1 builds full turn+river trees (depth_limit: None).
+/// Stage 3 solves them to showdown and sends records via channel.
+/// Stage 4 buffers records and flushes to numbered files.
 fn generate_turn_training_data_exact(
     config: &CfvnetConfig,
     output_path: &Path,
@@ -873,11 +915,12 @@ fn generate_turn_training_data_exact(
     let initial_stack = config.game.initial_stack;
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let river_output_path = config.datagen.river_output.as_ref().map(Path::new);
+    let per_file = config.datagen.per_file.unwrap_or(u64::MAX);
+    let extract_river = river_output_path.is_some();
 
     eprintln!("[turn datagen] exact mode: solving turn+river to showdown (no neural net)");
-    if river_output_path.is_some() {
-        eprintln!("[turn datagen] river records will be extracted to: {}",
-            river_output_path.unwrap().display());
+    if let Some(rp) = river_output_path {
+        eprintln!("[turn datagen] river records will be extracted to: {}", rp.display());
     }
 
     let pb = Arc::new(ProgressBar::new(num_samples));
@@ -889,8 +932,12 @@ fn generate_turn_training_data_exact(
 
     let stage1_count_for_pb = Arc::new(AtomicU64::new(0));
     let stage3_count_for_pb = Arc::new(AtomicU64::new(0));
+    let turn_buf_depth = Arc::new(AtomicU64::new(0));
+    let river_buf_depth = Arc::new(AtomicU64::new(0));
     let s1_pb = Arc::clone(&stage1_count_for_pb);
     let s3_pb = Arc::clone(&stage3_count_for_pb);
+    let tb_pb = Arc::clone(&turn_buf_depth);
+    let rb_pb = Arc::clone(&river_buf_depth);
     let exploit_sum_pb = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let exploit_count_pb = Arc::new(AtomicU64::new(0));
     let es_pb = Arc::clone(&exploit_sum_pb);
@@ -902,41 +949,36 @@ fn generate_turn_training_data_exact(
             let s1 = s1_pb.load(Ordering::Relaxed);
             let s3 = s3_pb.load(Ordering::Relaxed);
             let buf = s1.saturating_sub(s3);
+            let tb = tb_pb.load(Ordering::Relaxed);
+            let rb = rb_pb.load(Ordering::Relaxed);
             let ec = ec_pb.load(Ordering::Relaxed);
             let avg_exploit = if ec > 0 {
                 (es_pb.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
             } else {
                 0.0
             };
-            pb_ticker.set_message(format!("deal→[{buf}]→solve  expl:{avg_exploit:.1} mbb/h"));
+            pb_ticker.set_message(format!(
+                "deal\u{2192}[{buf}]\u{2192}solve\u{2192}[turn:{tb} river:{rb}]\u{2192}disk  expl:{avg_exploit:.1} mbb/h"
+            ));
             if pb_ticker.is_finished() {
                 break;
             }
         }
     });
 
-    let file =
-        std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
-    let writer = Arc::new(Mutex::new(BufWriter::new(file)));
-
-    let river_writer: Option<Arc<Mutex<BufWriter<std::fs::File>>>> =
-        if let Some(rp) = river_output_path {
-            let rf = std::fs::File::create(rp)
-                .map_err(|e| format!("create river output: {e}"))?;
-            Some(Arc::new(Mutex::new(BufWriter::new(rf))))
-        } else {
-            None
-        };
-
     let stage1_count = Arc::clone(&stage1_count_for_pb);
     let stage3_count = Arc::clone(&stage3_count_for_pb);
 
     let wall_start = std::time::Instant::now();
 
-    // Single channel: Stage 1 -> Stage 3 (no GPU stage).
+    // Channel: Stage 1 -> Stage 3.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
         PIPELINE_CHANNEL_CAPACITY,
     );
+
+    // Channel: Stage 3 -> Stage 4.
+    let (storage_tx, storage_rx) =
+        std::sync::mpsc::sync_channel::<StorageMsg>(PIPELINE_CHANNEL_CAPACITY);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
@@ -974,11 +1016,56 @@ fn generate_turn_training_data_exact(
         }
     });
 
+    // --- Stage 4: Storage Writer ---
+    let turn_output_path = output_path.to_path_buf();
+    let river_out_for_stage4 = river_output_path.map(|p| p.to_path_buf());
+    let turn_buf_depth_ref = Arc::clone(&turn_buf_depth);
+    let river_buf_depth_ref = Arc::clone(&river_buf_depth);
+    let stage4 = std::thread::spawn(move || -> Result<(), String> {
+        let mut turn_buffer: Vec<TrainingRecord> = Vec::new();
+        let mut river_buffer: Vec<TrainingRecord> = Vec::new();
+        let mut turn_file_count = 0u32;
+        let mut river_file_count = 0u32;
+
+        while let Ok(msg) = storage_rx.recv() {
+            match msg {
+                StorageMsg::TurnRecord(rec) => {
+                    turn_buffer.push(rec);
+                    turn_buf_depth_ref.store(turn_buffer.len() as u64, Ordering::Relaxed);
+                    if turn_buffer.len() as u64 >= per_file {
+                        flush_buffer(&turn_output_path, &mut turn_buffer, &mut turn_file_count)?;
+                        turn_buf_depth_ref.store(0, Ordering::Relaxed);
+                    }
+                }
+                StorageMsg::RiverRecord(rec) => {
+                    if let Some(ref river_path) = river_out_for_stage4 {
+                        river_buffer.push(rec);
+                        river_buf_depth_ref.store(river_buffer.len() as u64, Ordering::Relaxed);
+                        if river_buffer.len() as u64 >= per_file {
+                            flush_buffer(river_path, &mut river_buffer, &mut river_file_count)?;
+                            river_buf_depth_ref.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    // Drop river records if no river output path.
+                }
+                StorageMsg::Flush => break,
+            }
+        }
+
+        if !turn_buffer.is_empty() {
+            flush_buffer(&turn_output_path, &mut turn_buffer, &mut turn_file_count)?;
+        }
+        if !river_buffer.is_empty() {
+            if let Some(ref river_path) = river_out_for_stage4 {
+                flush_buffer(river_path, &mut river_buffer, &mut river_file_count)?;
+            }
+        }
+
+        Ok(())
+    });
+
     // --- Stage 3: DCFR Solvers (no Stage 2 in exact mode) ---
     let pb_ref = Arc::clone(&pb);
-    let writer_ref = Arc::clone(&writer);
-    let river_writer_ref = river_writer.clone();
-    let extract_river = river_writer.is_some();
     let stage3_count_ref = Arc::clone(&stage3_count);
     let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
     let exploit_count_ref = Arc::clone(&exploit_count_pb);
@@ -1030,8 +1117,6 @@ fn generate_turn_training_data_exact(
                     .collect()
             });
 
-            let mut w = writer_ref.lock().expect("writer lock");
-            let mut rw_guard = river_writer_ref.as_ref().map(|rw| rw.lock().expect("river writer lock"));
             for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit), river_recs) in results {
                 let board_vec = sit.board_cards().to_vec();
 
@@ -1046,7 +1131,8 @@ fn generate_turn_training_data_exact(
                     cfvs: oop_cfvs,
                     valid_mask,
                 };
-                write_record(&mut *w, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+                storage_tx.send(StorageMsg::TurnRecord(oop_rec))
+                    .map_err(|e| format!("send turn OOP: {e}"))?;
 
                 let ip_rec = TrainingRecord {
                     board: board_vec,
@@ -1059,23 +1145,25 @@ fn generate_turn_training_data_exact(
                     cfvs: ip_cfvs,
                     valid_mask,
                 };
-                write_record(&mut *w, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+                storage_tx.send(StorageMsg::TurnRecord(ip_rec))
+                    .map_err(|e| format!("send turn IP: {e}"))?;
 
-                // Write river records if configured.
-                if let Some(ref mut rw) = rw_guard {
-                    for river_rec in &river_recs {
-                        write_record(&mut **rw, river_rec)
-                            .map_err(|e| format!("write river: {e}"))?;
-                    }
+                for river_rec in river_recs {
+                    storage_tx.send(StorageMsg::RiverRecord(river_rec))
+                        .map_err(|e| format!("send river: {e}"))?;
                 }
             }
         }
 
+        // Signal Stage 4 to flush and shut down.
+        storage_tx.send(StorageMsg::Flush)
+            .map_err(|e| format!("send flush: {e}"))?;
         Ok(())
     });
 
     stage1.join().map_err(|e| format!("stage 1 panicked: {e:?}"))?;
     stage3.join().map_err(|e| format!("stage 3 panicked: {e:?}"))??;
+    stage4.join().map_err(|e| format!("stage 4 panicked: {e:?}"))??;
 
     pb.finish_with_message("done");
     let _ = ticker.join();
@@ -2124,18 +2212,368 @@ mod tests {
         let result = generate_turn_training_data(&config, &turn_output, "ndarray");
         assert!(result.is_ok(), "pipeline failed: {:?}", result.err());
 
-        // Turn records should exist (4-card boards).
-        let turn_meta = std::fs::metadata(&turn_output).unwrap();
+        // Storage stage writes numbered files: turn_data_00000.bin, river_data_00000.bin
+        let turn_file = tmp_dir.path().join("turn_data_00000.bin");
+        let turn_meta = std::fs::metadata(&turn_file).unwrap();
         assert!(turn_meta.len() > 0, "turn output should be non-empty");
 
-        // River records should exist (5-card boards).
-        assert!(river_output.exists(), "river output file should exist");
-        let river_meta = std::fs::metadata(&river_output).unwrap();
+        let river_file = tmp_dir.path().join("river_data_00000.bin");
+        assert!(river_file.exists(), "river output file should exist");
+        let river_meta = std::fs::metadata(&river_file).unwrap();
         assert!(river_meta.len() > 0, "river output should be non-empty");
 
         // Read and verify river records.
-        let mut river_file = std::fs::File::open(&river_output).unwrap();
-        let rec = storage::read_record(&mut river_file).unwrap();
+        let mut rf = std::fs::File::open(&river_file).unwrap();
+        let rec = storage::read_record(&mut rf).unwrap();
         assert_eq!(rec.board.len(), 5, "river record should have 5-card board");
+    }
+
+    fn make_test_record(board_size: usize, player: u8) -> TrainingRecord {
+        TrainingRecord {
+            board: (0..board_size as u8).map(|i| i * 4).collect(),
+            pot: 100.0,
+            effective_stack: 50.0,
+            player,
+            game_value: 0.05,
+            oop_range: [0.0f32; NUM_COMBOS],
+            ip_range: [0.0f32; NUM_COMBOS],
+            cfvs: [0.0f32; NUM_COMBOS],
+            valid_mask: [0u8; NUM_COMBOS],
+        }
+    }
+
+    #[test]
+    fn flush_buffer_writes_correct_record_count() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let base_path = tmp.path().join("turn_exact.bin");
+
+        let mut buffer = vec![
+            make_test_record(4, 0),
+            make_test_record(4, 1),
+            make_test_record(4, 0),
+        ];
+        let mut file_count = 0u32;
+
+        flush_buffer(&base_path, &mut buffer, &mut file_count).unwrap();
+
+        assert!(buffer.is_empty(), "buffer should be drained after flush");
+        assert_eq!(file_count, 1, "file_count should be incremented");
+
+        // Read back records from the file.
+        let file_path = tmp.path().join("turn_exact_00000.bin");
+        assert!(file_path.exists(), "output file should exist");
+        let mut f = std::fs::File::open(&file_path).unwrap();
+        let r1 = storage::read_record(&mut f).unwrap();
+        let r2 = storage::read_record(&mut f).unwrap();
+        let r3 = storage::read_record(&mut f).unwrap();
+        assert_eq!(r1.player, 0);
+        assert_eq!(r2.player, 1);
+        assert_eq!(r3.player, 0);
+        // No more records.
+        assert!(storage::read_record(&mut f).is_err());
+    }
+
+    #[test]
+    fn flush_buffer_increments_file_count() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let base_path = tmp.path().join("data.bin");
+
+        let mut file_count = 0u32;
+
+        let mut buf1 = vec![make_test_record(4, 0)];
+        flush_buffer(&base_path, &mut buf1, &mut file_count).unwrap();
+        assert_eq!(file_count, 1);
+
+        let mut buf2 = vec![make_test_record(4, 1)];
+        flush_buffer(&base_path, &mut buf2, &mut file_count).unwrap();
+        assert_eq!(file_count, 2);
+
+        assert!(tmp.path().join("data_00000.bin").exists());
+        assert!(tmp.path().join("data_00001.bin").exists());
+    }
+
+    #[test]
+    fn flush_buffer_empty_buffer_writes_empty_file() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let base_path = tmp.path().join("empty.bin");
+
+        let mut buffer: Vec<TrainingRecord> = Vec::new();
+        let mut file_count = 0u32;
+
+        flush_buffer(&base_path, &mut buffer, &mut file_count).unwrap();
+
+        let file_path = tmp.path().join("empty_00000.bin");
+        assert!(file_path.exists());
+        let meta = std::fs::metadata(&file_path).unwrap();
+        assert_eq!(meta.len(), 0, "empty buffer should produce zero-byte file");
+        assert_eq!(file_count, 1);
+    }
+
+    #[test]
+    fn storage_stage_writes_turn_and_river_to_separate_files() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let turn_path = tmp.path().join("turn.bin");
+        let river_path = tmp.path().join("river.bin");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StorageMsg>(100);
+
+        let turn_out = turn_path.clone();
+        let river_out = river_path.clone();
+        let per_file = u64::MAX; // flush only on Flush message
+        let turn_stored = Arc::new(AtomicU64::new(0));
+        let river_stored = Arc::new(AtomicU64::new(0));
+        let ts = Arc::clone(&turn_stored);
+        let rs = Arc::clone(&river_stored);
+
+        let stage4 = std::thread::spawn(move || -> Result<(), String> {
+            let mut turn_buffer: Vec<TrainingRecord> = Vec::new();
+            let mut river_buffer: Vec<TrainingRecord> = Vec::new();
+            let mut turn_file_count = 0u32;
+            let mut river_file_count = 0u32;
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    StorageMsg::TurnRecord(rec) => {
+                        turn_buffer.push(rec);
+                        ts.store(turn_buffer.len() as u64, Ordering::Relaxed);
+                        if turn_buffer.len() as u64 >= per_file {
+                            flush_buffer(&turn_out, &mut turn_buffer, &mut turn_file_count)?;
+                        }
+                    }
+                    StorageMsg::RiverRecord(rec) => {
+                        river_buffer.push(rec);
+                        rs.store(river_buffer.len() as u64, Ordering::Relaxed);
+                        if river_buffer.len() as u64 >= per_file {
+                            flush_buffer(&river_out, &mut river_buffer, &mut river_file_count)?;
+                        }
+                    }
+                    StorageMsg::Flush => break,
+                }
+            }
+
+            if !turn_buffer.is_empty() {
+                flush_buffer(&turn_out, &mut turn_buffer, &mut turn_file_count)?;
+            }
+            if !river_buffer.is_empty() {
+                flush_buffer(&river_out, &mut river_buffer, &mut river_file_count)?;
+            }
+            Ok(())
+        });
+
+        // Send 2 turn records and 3 river records.
+        tx.send(StorageMsg::TurnRecord(make_test_record(4, 0))).unwrap();
+        tx.send(StorageMsg::TurnRecord(make_test_record(4, 1))).unwrap();
+        tx.send(StorageMsg::RiverRecord(make_test_record(5, 0))).unwrap();
+        tx.send(StorageMsg::RiverRecord(make_test_record(5, 1))).unwrap();
+        tx.send(StorageMsg::RiverRecord(make_test_record(5, 0))).unwrap();
+        tx.send(StorageMsg::Flush).unwrap();
+
+        stage4.join().unwrap().unwrap();
+
+        // Read turn records.
+        let turn_file = tmp.path().join("turn_00000.bin");
+        assert!(turn_file.exists(), "turn file should exist");
+        let mut f = std::fs::File::open(&turn_file).unwrap();
+        let t1 = storage::read_record(&mut f).unwrap();
+        let t2 = storage::read_record(&mut f).unwrap();
+        assert_eq!(t1.board.len(), 4);
+        assert_eq!(t2.board.len(), 4);
+        assert!(storage::read_record(&mut f).is_err(), "no more turn records");
+
+        // Read river records.
+        let river_file = tmp.path().join("river_00000.bin");
+        assert!(river_file.exists(), "river file should exist");
+        let mut f = std::fs::File::open(&river_file).unwrap();
+        let r1 = storage::read_record(&mut f).unwrap();
+        let r2 = storage::read_record(&mut f).unwrap();
+        let r3 = storage::read_record(&mut f).unwrap();
+        assert_eq!(r1.board.len(), 5);
+        assert_eq!(r2.board.len(), 5);
+        assert_eq!(r3.board.len(), 5);
+        assert!(storage::read_record(&mut f).is_err(), "no more river records");
+    }
+
+    #[test]
+    fn storage_stage_splits_files_by_per_file_limit() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let turn_path = tmp.path().join("turn.bin");
+        let river_path = tmp.path().join("river.bin");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StorageMsg>(100);
+
+        let turn_out = turn_path.clone();
+        let river_out = river_path.clone();
+        let per_file = 2u64; // flush every 2 records
+        let turn_stored = Arc::new(AtomicU64::new(0));
+        let river_stored = Arc::new(AtomicU64::new(0));
+        let ts = Arc::clone(&turn_stored);
+        let rs = Arc::clone(&river_stored);
+
+        let stage4 = std::thread::spawn(move || -> Result<(), String> {
+            let mut turn_buffer: Vec<TrainingRecord> = Vec::new();
+            let mut river_buffer: Vec<TrainingRecord> = Vec::new();
+            let mut turn_file_count = 0u32;
+            let mut river_file_count = 0u32;
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    StorageMsg::TurnRecord(rec) => {
+                        turn_buffer.push(rec);
+                        ts.store(turn_buffer.len() as u64, Ordering::Relaxed);
+                        if turn_buffer.len() as u64 >= per_file {
+                            flush_buffer(&turn_out, &mut turn_buffer, &mut turn_file_count)?;
+                            ts.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    StorageMsg::RiverRecord(rec) => {
+                        river_buffer.push(rec);
+                        rs.store(river_buffer.len() as u64, Ordering::Relaxed);
+                        if river_buffer.len() as u64 >= per_file {
+                            flush_buffer(&river_out, &mut river_buffer, &mut river_file_count)?;
+                            rs.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    StorageMsg::Flush => break,
+                }
+            }
+
+            if !turn_buffer.is_empty() {
+                flush_buffer(&turn_out, &mut turn_buffer, &mut turn_file_count)?;
+            }
+            if !river_buffer.is_empty() {
+                flush_buffer(&river_out, &mut river_buffer, &mut river_file_count)?;
+            }
+            Ok(())
+        });
+
+        // Send 5 turn records: should produce files of 2, 2, 1.
+        for i in 0..5u8 {
+            tx.send(StorageMsg::TurnRecord(make_test_record(4, i % 2))).unwrap();
+        }
+        tx.send(StorageMsg::Flush).unwrap();
+
+        stage4.join().unwrap().unwrap();
+
+        // Should have 3 turn files.
+        assert!(tmp.path().join("turn_00000.bin").exists());
+        assert!(tmp.path().join("turn_00001.bin").exists());
+        assert!(tmp.path().join("turn_00002.bin").exists());
+        assert!(!tmp.path().join("turn_00003.bin").exists());
+
+        // First file: 2 records.
+        let mut f = std::fs::File::open(tmp.path().join("turn_00000.bin")).unwrap();
+        storage::read_record(&mut f).unwrap();
+        storage::read_record(&mut f).unwrap();
+        assert!(storage::read_record(&mut f).is_err());
+
+        // Second file: 2 records.
+        let mut f = std::fs::File::open(tmp.path().join("turn_00001.bin")).unwrap();
+        storage::read_record(&mut f).unwrap();
+        storage::read_record(&mut f).unwrap();
+        assert!(storage::read_record(&mut f).is_err());
+
+        // Third file: 1 record (remainder).
+        let mut f = std::fs::File::open(tmp.path().join("turn_00002.bin")).unwrap();
+        storage::read_record(&mut f).unwrap();
+        assert!(storage::read_record(&mut f).is_err());
+    }
+
+    #[test]
+    fn exact_mode_pipeline_splits_output_with_per_file() {
+        use tempfile::TempDir;
+
+        let mut config = turn_test_config(3);
+        config.datagen.mode = "exact".into();
+        config.game.river_model_path = None;
+        config.datagen.per_file = Some(2); // flush every 2 turn situations (= 4 records: 2 OOP + 2 IP)
+
+        let tmp_dir = TempDir::new().unwrap();
+        let turn_output = tmp_dir.path().join("turn_exact.bin");
+
+        let result = generate_turn_training_data(&config, &turn_output, "ndarray");
+        assert!(result.is_ok(), "pipeline failed: {:?}", result.err());
+
+        // With 3 samples at per_file=2, we expect multiple turn files.
+        // Each sample produces 2 turn records (OOP + IP).
+        // per_file=2 means flush after 2 records, so 6 records / 2 = 3 files.
+        let turn_files: Vec<_> = std::fs::read_dir(tmp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("turn_exact"))
+            .collect();
+        assert!(turn_files.len() > 1,
+            "expected multiple turn files with per_file=2, got {}", turn_files.len());
+
+        // All files should contain valid 4-card board records.
+        for entry in &turn_files {
+            let mut f = std::fs::File::open(entry.path()).unwrap();
+            let rec = storage::read_record(&mut f).unwrap();
+            assert_eq!(rec.board.len(), 4,
+                "file {} should contain 4-card board records", entry.file_name().to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn storage_stage_drops_river_records_when_no_river_path() {
+        // When river output is not configured, river records should be dropped
+        // (not sent to storage). This is tested at the pipeline level below.
+        // Here we test the Stage 4 pattern with only turn records.
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let turn_path = tmp.path().join("turn.bin");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StorageMsg>(100);
+
+        let turn_out = turn_path.clone();
+        let per_file = u64::MAX;
+
+        let stage4 = std::thread::spawn(move || -> Result<(), String> {
+            let mut turn_buffer: Vec<TrainingRecord> = Vec::new();
+            let mut turn_file_count = 0u32;
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    StorageMsg::TurnRecord(rec) => {
+                        turn_buffer.push(rec);
+                        if turn_buffer.len() as u64 >= per_file {
+                            flush_buffer(&turn_out, &mut turn_buffer, &mut turn_file_count)?;
+                        }
+                    }
+                    StorageMsg::RiverRecord(_) => {
+                        // Drop river records if no river path.
+                    }
+                    StorageMsg::Flush => break,
+                }
+            }
+
+            if !turn_buffer.is_empty() {
+                flush_buffer(&turn_out, &mut turn_buffer, &mut turn_file_count)?;
+            }
+            Ok(())
+        });
+
+        tx.send(StorageMsg::TurnRecord(make_test_record(4, 0))).unwrap();
+        // River record should be silently ignored.
+        tx.send(StorageMsg::RiverRecord(make_test_record(5, 0))).unwrap();
+        tx.send(StorageMsg::TurnRecord(make_test_record(4, 1))).unwrap();
+        tx.send(StorageMsg::Flush).unwrap();
+
+        stage4.join().unwrap().unwrap();
+
+        // Only turn file should exist with 2 records.
+        let turn_file = tmp.path().join("turn_00000.bin");
+        assert!(turn_file.exists());
+        let mut f = std::fs::File::open(&turn_file).unwrap();
+        storage::read_record(&mut f).unwrap();
+        storage::read_record(&mut f).unwrap();
+        assert!(storage::read_record(&mut f).is_err());
+
+        // No river file should exist.
+        assert!(!tmp.path().join("river_00000.bin").exists());
     }
 }

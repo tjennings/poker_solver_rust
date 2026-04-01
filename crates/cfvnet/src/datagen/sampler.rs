@@ -179,6 +179,7 @@ mod tests {
             leaf_eval_interval: 0,
             bet_size_fuzz: 0.0,
             river_output: None,
+            per_file: None,
         }
     }
 
