@@ -272,6 +272,7 @@ fn solve_and_extract(
         solve_step(game, t);
     }
 
+    range_solver::finalize(game);
     let exploit = 0.0f32; // Caller computes exploitability selectively.
 
     game.back_to_root();
@@ -936,7 +937,6 @@ pub fn generate_turn_training_data(
                         );
                         let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
                         if count % 100 == 0 {
-                            range_solver::finalize(&mut game);
                             let exploit = range_solver::compute_exploitability(&game);
                             exploit_sum_ref.fetch_add((exploit * 10000.0) as u64, Ordering::Relaxed);
                             exploit_count_ref.fetch_add(1, Ordering::Relaxed);
