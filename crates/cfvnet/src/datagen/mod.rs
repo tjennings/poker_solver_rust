@@ -1,3 +1,4 @@
+pub mod blueprint_ranges;
 pub mod generate;
 pub mod range_gen;
 pub mod sampler;

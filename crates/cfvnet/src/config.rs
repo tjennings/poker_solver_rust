@@ -176,6 +176,10 @@ pub struct DatagenConfig {
     /// Default: no splitting (all samples in one file).
     #[serde(default)]
     pub per_file: Option<u64>,
+    /// Path to blueprint bundle for realistic range generation.
+    /// When set, datagen uses blueprint-propagated ranges instead of random RSP.
+    #[serde(default)]
+    pub blueprint_path: Option<String>,
 }
 
 impl Default for DatagenConfig {
@@ -194,6 +198,7 @@ impl Default for DatagenConfig {
             bet_size_fuzz: 0.0,
             river_output: None,
             per_file: None,
+            blueprint_path: None,
         }
     }
 }
@@ -597,5 +602,38 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.datagen.river_output.is_none());
+    }
+
+    #[test]
+    fn blueprint_path_defaults_to_none() {
+        let config = DatagenConfig::default();
+        assert!(config.blueprint_path.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_blueprint_path() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  blueprint_path: "/path/to/blueprint_bundle"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.blueprint_path.as_deref(), Some("/path/to/blueprint_bundle"));
+    }
+
+    #[test]
+    fn parse_config_without_blueprint_path_is_none() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.datagen.blueprint_path.is_none());
     }
 }
