@@ -415,14 +415,15 @@ fn collect_river_nodes(
         return;
     }
 
-    // Decision node on the turn. Recurse into each action.
+    // Decision node on the turn. Only follow the first action (check/first bet)
+    // to find ONE chance node. Extracting from every turn action path would
+    // produce thousands of river records per sample (one per action sequence × 46 cards).
+    // One representative path per sample is sufficient for training diversity.
     let num_actions = game.available_actions().len();
-    for action_idx in 0..num_actions {
-        path.push(action_idx);
+    if num_actions > 0 {
+        path.push(0); // Follow first action only.
         game.apply_history(path);
-
         collect_river_nodes(game, path, sit, starting_pot, records);
-
         path.pop();
         game.apply_history(path);
     }
