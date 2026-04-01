@@ -34,7 +34,7 @@ type B = NdArray;
 
 /// Number of situations to generate, solve, and write per chunk.
 /// Keeps peak memory bounded regardless of total `num_samples`.
-const CHUNK_SIZE: u64 = 10_000;
+const CHUNK_SIZE: u64 = 64;
 
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
