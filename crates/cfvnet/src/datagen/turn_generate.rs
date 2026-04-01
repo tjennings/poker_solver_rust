@@ -7,7 +7,7 @@
 use std::io::BufWriter;
 use std::path::Path;
 
-use burn::backend::NdArray;
+use burn::backend::wgpu::Wgpu;
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -30,32 +30,12 @@ use crate::config::CfvnetConfig;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
 use crate::model::network::{CfvNet, INPUT_SIZE};
 
-type B = NdArray;
+type B = Wgpu;
 
 /// Number of situations to generate, solve, and write per chunk.
 /// Keeps peak memory bounded regardless of total `num_samples`.
 const CHUNK_SIZE: u64 = 128;
 
-/// Thin wrapper that marks `CfvNet<NdArray>` as `Sync` so it can be shared
-/// across rayon threads for cloning.
-///
-/// # Safety
-///
-/// `CfvNet<NdArray>` is backed by CPU `ndarray` tensors whose storage is
-/// reference-counted (`Arc`). The only operation performed through the shared
-/// reference is `Clone::clone`, which atomically increments the refcount and
-/// is inherently thread-safe. The `OnceCell` inside burn's `Param` that
-/// prevents the auto-`Sync` impl is never written to after model loading.
-struct SyncModel(CfvNet<B>);
-
-// SAFETY: see doc comment above — only `.clone()` is called through `&self`.
-unsafe impl Sync for SyncModel {}
-
-impl SyncModel {
-    fn clone_inner(&self) -> CfvNet<B> {
-        self.0.clone()
-    }
-}
 
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
@@ -119,7 +99,7 @@ fn solve_turn_situation(
     bet_sizes: &[Vec<f64>],
     solver_iterations: u32,
     target_exploitability: f32,
-    evaluator: Box<dyn LeafEvaluator>,
+    evaluator: &dyn LeafEvaluator,
 ) -> (
     [f32; NUM_COMBOS],
     [f32; NUM_COMBOS],
@@ -745,8 +725,8 @@ pub fn generate_turn_training_data(
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
 
-    // Wrap in SyncModel so rayon closures can share &model across threads.
-    let model = SyncModel(model);
+    // Drop the initial model — each rayon thread will load its own via map_init.
+    drop(model);
 
     let pb = ProgressBar::new(num_samples);
     pb.set_style(
@@ -785,37 +765,70 @@ pub fn generate_turn_training_data(
             .map(|_| sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng))
             .collect();
 
-        // Solve chunk in parallel (or sequentially if threads == 1).
-        let solve_one =
-            |sit: &super::sampler::Situation|
-             -> Option<([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32)> {
-                if sit.effective_stack <= 0 {
-                    pb.inc(1);
-                    return None;
-                }
-
-                let eval_model = model.clone_inner();
-                let evaluator: Box<dyn LeafEvaluator> =
-                    Box::new(RiverNetEvaluator::new(eval_model, device));
-
-                let result = solve_turn_situation(
-                    sit.board_cards(),
-                    f64::from(sit.pot),
-                    f64::from(sit.effective_stack),
-                    &sit.ranges,
-                    &bet_sizes_vec,
-                    solver_iterations,
-                    target_exploitability,
-                    evaluator,
-                );
-
-                pb.inc(1);
-                Some(result)
-            };
+        // Solve chunk in parallel. Each rayon thread loads its own model
+        // on first use via map_init — no cloning, no sharing.
+        let river_model_path = river_model_path.to_string();
+        let hidden_layers = config.training.hidden_layers;
+        let hidden_size = config.training.hidden_size;
 
         let results: Vec<_> = match &pool {
-            Some(pool) => pool.install(|| situations.par_iter().map(solve_one).collect()),
-            None => situations.iter().map(solve_one).collect(),
+            Some(pool) => pool.install(|| {
+                situations.par_iter().map_init(
+                    || {
+                        let device = <B as burn::tensor::backend::Backend>::Device::default();
+                        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+                        let m = CfvNet::<B>::new(&device, hidden_layers, hidden_size, INPUT_SIZE)
+                            .load_file(&river_model_path, &recorder, &device)
+                            .expect("load river model in worker thread");
+                        RiverNetEvaluator::new(m, device)
+                    },
+                    |evaluator, sit| {
+                        if sit.effective_stack <= 0 {
+                            pb.inc(1);
+                            return None;
+                        }
+                        let result = solve_turn_situation(
+                            sit.board_cards(),
+                            f64::from(sit.pot),
+                            f64::from(sit.effective_stack),
+                            &sit.ranges,
+                            &bet_sizes_vec,
+                            solver_iterations,
+                            target_exploitability,
+                            evaluator,
+                        );
+                        pb.inc(1);
+                        Some(result)
+                    },
+                ).collect()
+            }),
+            None => {
+                // Sequential fallback — single evaluator, no cloning.
+                let device = <B as burn::tensor::backend::Backend>::Device::default();
+                let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+                let m = CfvNet::<B>::new(&device, hidden_layers, hidden_size, INPUT_SIZE)
+                    .load_file(&river_model_path, &recorder, &device)
+                    .expect("load river model");
+                let evaluator = RiverNetEvaluator::new(m, device);
+                situations.iter().map(|sit| {
+                    if sit.effective_stack <= 0 {
+                        pb.inc(1);
+                        return None;
+                    }
+                    let result = solve_turn_situation(
+                        sit.board_cards(),
+                        f64::from(sit.pot),
+                        f64::from(sit.effective_stack),
+                        &sit.ranges,
+                        &bet_sizes_vec,
+                        solver_iterations,
+                        target_exploitability,
+                        &evaluator,
+                    );
+                    pb.inc(1);
+                    Some(result)
+                }).collect()
+            },
         };
 
         // Write results sequentially.
@@ -922,8 +935,7 @@ mod tests {
         // Use a tiny untrained model as the river evaluator.
         let device = <B as burn::tensor::backend::Backend>::Device::default();
         let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
-        let evaluator: Box<dyn LeafEvaluator> =
-            Box::new(RiverNetEvaluator::new(model, device));
+        let evaluator = RiverNetEvaluator::new(model, device);
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let datagen_config = DatagenConfig {
@@ -951,7 +963,7 @@ mod tests {
             &[bet_sizes_f64],
             20,
             0.0,
-            evaluator,
+            &evaluator,
         );
 
         // Verify shapes.
@@ -988,8 +1000,7 @@ mod tests {
         // Directly test the record writing path without needing a model file.
         let device = <B as burn::tensor::backend::Backend>::Device::default();
         let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
-        let evaluator: Box<dyn LeafEvaluator> =
-            Box::new(RiverNetEvaluator::new(model, device));
+        let evaluator = RiverNetEvaluator::new(model, device);
 
         let mut rng = ChaCha8Rng::seed_from_u64(123);
         let datagen_config = DatagenConfig {
@@ -1015,7 +1026,7 @@ mod tests {
             &[bet_sizes_f64],
             10,
             0.0,
-            evaluator,
+            &evaluator,
         );
 
         // Write records and verify they round-trip correctly.
