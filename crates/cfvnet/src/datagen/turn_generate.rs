@@ -272,9 +272,7 @@ fn solve_and_extract(
         solve_step(game, t);
     }
 
-    // Finalize before computing exploitability (marks game as solved).
-    range_solver::finalize(game);
-    let exploit = range_solver::compute_exploitability(game);
+    let exploit = 0.0f32; // Caller computes exploitability selectively.
 
     game.back_to_root();
     game.cache_normalized_weights();
@@ -923,7 +921,7 @@ pub fn generate_turn_training_data(
                 }
             }
 
-            // Solve batch in parallel.
+            // Solve batch in parallel. Compute exploitability every 100th sample.
             let results: Vec<_> = pool.install(|| {
                 batch
                     .par_drain(..)
@@ -936,12 +934,14 @@ pub fn generate_turn_training_data(
                             solver_iterations,
                             target_exploitability,
                         );
-                        let (_, _, _, _, _, exploit) = &result;
-                        // Store exploit * 10000 as integer for atomic accumulation.
-                        exploit_sum_ref.fetch_add((*exploit * 10000.0) as u64, Ordering::Relaxed);
-                        exploit_count_ref.fetch_add(1, Ordering::Relaxed);
+                        let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
+                        if count % 100 == 0 {
+                            range_solver::finalize(&mut game);
+                            let exploit = range_solver::compute_exploitability(&game);
+                            exploit_sum_ref.fetch_add((exploit * 10000.0) as u64, Ordering::Relaxed);
+                            exploit_count_ref.fetch_add(1, Ordering::Relaxed);
+                        }
                         pb_ref.inc(1);
-                        stage3_count_ref.fetch_add(1, Ordering::Relaxed);
                         (sit, result)
                     })
                     .collect()
