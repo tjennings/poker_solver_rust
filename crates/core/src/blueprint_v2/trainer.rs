@@ -79,7 +79,7 @@ pub fn bucket_files_exist(dir: &Path) -> bool {
 /// `river.buckets`. Missing files are silently skipped (returning `None`
 /// for that street). Load errors are logged to stderr but do not cause
 /// a hard failure.
-fn load_bucket_files(dir: &Path) -> [Option<BucketFile>; 4] {
+pub fn load_bucket_files(dir: &Path) -> [Option<BucketFile>; 4] {
     const NAMES: [&str; 4] = [
         "preflop.buckets",
         "flop.buckets",
