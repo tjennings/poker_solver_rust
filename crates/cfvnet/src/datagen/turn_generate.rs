@@ -45,7 +45,7 @@ use crate::model::network::{CfvNet, INPUT_SIZE};
 type B = Wgpu;
 
 /// Bounded channel capacity for the pipeline stages (tunable).
-const PIPELINE_CHANNEL_CAPACITY: usize = 64;
+const PIPELINE_CHANNEL_CAPACITY: usize = 16;
 
 /// Batch size for Stage 3 rayon solve dispatch.
 const SOLVE_BATCH_SIZE: usize = 128;
@@ -267,6 +267,12 @@ fn build_turn_game_inner(
     let action_tree = ActionTree::new(tree_config).expect("valid action tree");
     let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
     game.allocate_memory(false);
+    use std::sync::atomic::{AtomicBool, Ordering as AO};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, AO::Relaxed) {
+        let (mem, _) = game.memory_usage();
+        eprintln!("[tree] memory per game: {:.1} MB", mem as f64 / 1_048_576.0);
+    }
     Some(game)
 }
 
