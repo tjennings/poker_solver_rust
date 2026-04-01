@@ -36,27 +36,6 @@ type B = NdArray;
 /// Keeps peak memory bounded regardless of total `num_samples`.
 const CHUNK_SIZE: u64 = 10_000;
 
-/// Thin wrapper that marks `CfvNet<NdArray>` as `Sync` so it can be shared
-/// across rayon threads for cloning.
-///
-/// # Safety
-///
-/// `CfvNet<NdArray>` is backed by CPU `ndarray` tensors whose storage is
-/// reference-counted (`Arc`). The only operation performed through the shared
-/// reference is `Clone::clone`, which atomically increments the refcount and
-/// is inherently thread-safe. The `OnceCell` inside burn's `Param` that
-/// prevents the auto-`Sync` impl is never written to after model loading.
-struct SyncModel(CfvNet<B>);
-
-// SAFETY: see doc comment above — only `.clone()` is called through `&self`.
-unsafe impl Sync for SyncModel {}
-
-impl SyncModel {
-    fn clone_inner(&self) -> CfvNet<B> {
-        self.0.clone()
-    }
-}
-
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
     let rank = id / 4;
@@ -105,11 +84,12 @@ fn parse_bet_sizes(sizes: &[String]) -> Vec<f64> {
 
 /// Solve a single turn situation and return per-player root CFVs mapped to 1326 indices.
 ///
-/// Uses the range-solver with `depth_limit: Some(1)` so that river transitions
-/// become depth boundary terminals. The leaf evaluator (river net) is called once
-/// per boundary to fill in the boundary CFVs before solving.
+/// Convenience wrapper that calls [`build_turn_game`], [`evaluate_game_boundaries`],
+/// and [`solve_and_extract`] in sequence. Used by tests; the production pipeline
+/// uses the two-phase approach directly.
 ///
 /// Returns `(oop_cfvs_1326, ip_cfvs_1326, valid_mask, game_value_oop, game_value_ip)`.
+#[cfg(test)]
 #[allow(clippy::type_complexity)]
 fn solve_turn_situation(
     board_u8: &[u8],
@@ -127,138 +107,17 @@ fn solve_turn_situation(
     f32,
     f32,
 ) {
-    // Build range-solver Range objects from 1326-indexed f32 arrays.
-    let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
-    let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
-
-    // Build bet size options from pot fractions.
-    let sizes: Vec<BetSize> = bet_sizes
-        .iter()
-        .flat_map(|v| v.iter().map(|&f| BetSize::PotRelative(f)))
-        .collect();
-    let bet_size_opts = BetSizeOptions {
-        bet: sizes.clone(),
-        raise: Vec::new(),
-    };
-
-    let card_config = CardConfig {
-        range: [oop_range, ip_range],
-        flop: [board_u8[0], board_u8[1], board_u8[2]],
-        turn: board_u8[3],
-        river: NOT_DEALT,
-    };
-
-    let tree_config = TreeConfig {
-        initial_state: BoardState::Turn,
-        starting_pot: pot as i32,
-        effective_stack: effective_stack as i32,
-        turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
-        river_bet_sizes: [BetSizeOptions::default(), BetSizeOptions::default()],
-        depth_limit: Some(0),
-        add_allin_threshold: 1.5,
-        force_allin_threshold: 0.15,
-        merging_threshold: 0.1,
-        ..Default::default()
-    };
-
-    let action_tree = ActionTree::new(tree_config).expect("valid action tree");
-    let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
-    game.allocate_memory(false);
-
-    // Convert board from u8 to poker_solver_core::Card for the evaluator.
-    let board_cards: Vec<Card> = board_u8.iter().map(|&c| u8_to_rs_card(c)).collect();
-
-    // Evaluate all boundary nodes using batched evaluation (one forward pass).
-    let num_boundaries = game.num_boundary_nodes();
-    if num_boundaries > 0 {
-        // Both players share the same hands on a 4-card board.
-        let hands = game.private_cards(0);
-
-        // Convert to [[Card; 2]] for the evaluator.
-        let combos: Vec<[Card; 2]> = hands
-            .iter()
-            .map(|&(c0, c1)| [u8_to_rs_card(c0), u8_to_rs_card(c1)])
-            .collect();
-
-        // Build per-combo range arrays from the 1326-indexed input ranges.
-        let oop_reach: Vec<f64> = hands
-            .iter()
-            .map(|&(c0, c1)| f64::from(ranges[0][card_pair_to_index(c0, c1)]))
-            .collect();
-        let ip_reach: Vec<f64> = hands
-            .iter()
-            .map(|&(c0, c1)| f64::from(ranges[1][card_pair_to_index(c0, c1)]))
-            .collect();
-
-        // Collect all (pot, eff_stack, player) requests.
-        let mut requests: Vec<(f64, f64, u8)> = Vec::with_capacity(num_boundaries * 2);
-        for ordinal in 0..num_boundaries {
-            let bpot = game.boundary_pot(ordinal) as f64;
-            let eff_stack_at_boundary = effective_stack - (bpot - pot) / 2.0;
-            for player in 0..2u8 {
-                requests.push((bpot, eff_stack_at_boundary, player));
-            }
-        }
-
-        // One batched call — GPU implementations do one forward pass.
-        let all_cfvs = evaluator.evaluate_boundaries(
-            &combos,
-            &board_cards,
-            &oop_reach,
-            &ip_reach,
-            &requests,
-        );
-
-        // Scatter results back to game.
-        for ordinal in 0..num_boundaries {
-            for player in 0..2usize {
-                let req_idx = ordinal * 2 + player;
-                let cfvs_f32: Vec<f32> =
-                    all_cfvs[req_idx].iter().map(|&v| v as f32).collect();
-                game.set_boundary_cfvs(ordinal, player, cfvs_f32);
-            }
-        }
-    }
-    // Solve the depth-limited turn game.
-    // target_exploitability is pot-relative; scale to absolute chips.
-    let abs_target = target_exploitability * pot as f32;
-    solve(&mut game, solver_iterations, abs_target, false);
-
-    // Extract root EVs.
-    game.back_to_root();
-    game.cache_normalized_weights();
-    let raw_oop = game.expected_values(0);
-    let raw_ip = game.expected_values(1);
-
-    let oop_hands = game.private_cards(0);
-    let ip_hands = game.private_cards(1);
-
-    // Map solver EVs (absolute chips) to 1326-indexed pot-relative arrays.
-    // expected_values() returns total payoff (includes player's contribution).
-    // Net gain = ev - pot/2. Normalize to half-pot-relative: (ev - pot/2) / (pot/2).
-    let half_pot = pot / 2.0;
-    let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
-
-    let mut oop_cfvs = [0.0_f32; NUM_COMBOS];
-    let mut ip_cfvs = [0.0_f32; NUM_COMBOS];
-    let mut valid_mask = [0_u8; NUM_COMBOS];
-
-    for (i, &(c0, c1)) in oop_hands.iter().enumerate() {
-        let idx = card_pair_to_index(c0, c1);
-        oop_cfvs[idx] = ((f64::from(raw_oop[i]) - half_pot) / norm) as f32;
-        valid_mask[idx] = 1;
-    }
-    for (i, &(c0, c1)) in ip_hands.iter().enumerate() {
-        let idx = card_pair_to_index(c0, c1);
-        ip_cfvs[idx] = ((f64::from(raw_ip[i]) - half_pot) / norm) as f32;
-        valid_mask[idx] = 1;
-    }
-
-    // Compute weighted game values.
-    let oop_gv = weighted_sum(&ranges[0], &oop_cfvs);
-    let ip_gv = weighted_sum(&ranges[1], &ip_cfvs);
-
-    (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)
+    let mut game = build_turn_game(board_u8, pot, effective_stack, ranges, bet_sizes)
+        .expect("valid game for non-degenerate situation");
+    evaluate_game_boundaries(
+        &mut game,
+        board_u8,
+        pot,
+        effective_stack,
+        ranges,
+        evaluator.as_ref(),
+    );
+    solve_and_extract(&mut game, pot, ranges, solver_iterations, target_exploitability)
 }
 
 /// Compute `sum(range[i] * cfvs[i])` for all combos.
@@ -269,7 +128,6 @@ fn weighted_sum(range: &[f32; NUM_COMBOS], cfvs: &[f32; NUM_COMBOS]) -> f32 {
 /// Build a depth-limited turn game tree for a situation.
 ///
 /// Returns `None` for degenerate situations (effective_stack <= 0).
-#[allow(dead_code)]
 fn build_turn_game(
     board_u8: &[u8],
     pot: f64,
@@ -315,8 +173,69 @@ fn build_turn_game(
     Some(game)
 }
 
+/// Evaluate all boundary nodes on a pre-built game using the given leaf evaluator.
+///
+/// Sets the boundary CFVs on the game so it is ready for solving.
+/// Does nothing if the game has no boundary nodes.
+fn evaluate_game_boundaries(
+    game: &mut PostFlopGame,
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    evaluator: &dyn LeafEvaluator,
+) {
+    let num_boundaries = game.num_boundary_nodes();
+    if num_boundaries == 0 {
+        return;
+    }
+
+    let board_cards: Vec<Card> = board_u8.iter().map(|&c| u8_to_rs_card(c)).collect();
+    let hands = game.private_cards(0);
+
+    let combos: Vec<[Card; 2]> = hands
+        .iter()
+        .map(|&(c0, c1)| [u8_to_rs_card(c0), u8_to_rs_card(c1)])
+        .collect();
+
+    let oop_reach: Vec<f64> = hands
+        .iter()
+        .map(|&(c0, c1)| f64::from(ranges[0][card_pair_to_index(c0, c1)]))
+        .collect();
+    let ip_reach: Vec<f64> = hands
+        .iter()
+        .map(|&(c0, c1)| f64::from(ranges[1][card_pair_to_index(c0, c1)]))
+        .collect();
+
+    let mut requests: Vec<(f64, f64, u8)> = Vec::with_capacity(num_boundaries * 2);
+    for ordinal in 0..num_boundaries {
+        let bpot = game.boundary_pot(ordinal) as f64;
+        let eff_stack_at_boundary = effective_stack - (bpot - pot) / 2.0;
+        for player in 0..2u8 {
+            requests.push((bpot, eff_stack_at_boundary, player));
+        }
+    }
+
+    let all_cfvs = evaluator.evaluate_boundaries(
+        &combos,
+        &board_cards,
+        &oop_reach,
+        &ip_reach,
+        &requests,
+    );
+
+    for ordinal in 0..num_boundaries {
+        for player in 0..2usize {
+            let req_idx = ordinal * 2 + player;
+            let cfvs_f32: Vec<f32> =
+                all_cfvs[req_idx].iter().map(|&v| v as f32).collect();
+            game.set_boundary_cfvs(ordinal, player, cfvs_f32);
+        }
+    }
+}
+
 /// Solve a game with boundaries already set. Returns 1326-indexed CFVs.
-#[allow(dead_code, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 fn solve_and_extract(
     game: &mut PostFlopGame,
     pot: f64,
@@ -698,7 +617,11 @@ fn generate_turn_training_data_cuda(
 /// Generate turn training data by sampling situations, solving with
 /// `PostFlopGame` + `RiverNetEvaluator`, and writing paired records.
 ///
-/// The river model is loaded once and cloned for each situation's evaluator.
+/// Uses a two-phase pipeline per chunk:
+/// - Phase 1 (sequential): Build games and evaluate boundaries with a single model.
+/// - Phase 2 (parallel): Solve games (pure CPU, no model needed).
+///
+/// This avoids cloning the neural network model per sample.
 ///
 /// # Errors
 ///
@@ -733,7 +656,7 @@ pub fn generate_turn_training_data(
     }
     let bet_sizes_vec = vec![bet_sizes_f64];
 
-    // Load river model.
+    // Load river model once.
     let device = <B as burn::tensor::backend::Backend>::Device::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model = CfvNet::<B>::new(
@@ -745,8 +668,9 @@ pub fn generate_turn_training_data(
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
 
-    // Wrap in SyncModel so rayon closures can share &model across threads.
-    let model = SyncModel(model);
+    // Single evaluator for all boundary evaluations — no per-sample cloning.
+    let single_evaluator: Box<dyn LeafEvaluator> =
+        Box::new(RiverNetEvaluator::new(model, device));
 
     let pb = ProgressBar::new(num_samples);
     pb.set_style(
@@ -785,37 +709,78 @@ pub fn generate_turn_training_data(
             .map(|_| sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng))
             .collect();
 
-        // Solve chunk in parallel (or sequentially if threads == 1).
-        let solve_one =
-            |sit: &super::sampler::Situation|
-             -> Option<([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32)> {
+        // Phase 1 (sequential): Build games and evaluate boundaries with one model.
+        let games: Vec<Option<PostFlopGame>> = situations
+            .iter()
+            .map(|sit| {
                 if sit.effective_stack <= 0 {
-                    pb.inc(1);
                     return None;
                 }
-
-                let eval_model = model.clone_inner();
-                let evaluator: Box<dyn LeafEvaluator> =
-                    Box::new(RiverNetEvaluator::new(eval_model, device));
-
-                let result = solve_turn_situation(
+                let mut game = build_turn_game(
                     sit.board_cards(),
                     f64::from(sit.pot),
                     f64::from(sit.effective_stack),
                     &sit.ranges,
                     &bet_sizes_vec,
-                    solver_iterations,
-                    target_exploitability,
-                    evaluator,
+                )?;
+                evaluate_game_boundaries(
+                    &mut game,
+                    sit.board_cards(),
+                    f64::from(sit.pot),
+                    f64::from(sit.effective_stack),
+                    &sit.ranges,
+                    single_evaluator.as_ref(),
                 );
+                Some(game)
+            })
+            .collect();
 
-                pb.inc(1);
-                Some(result)
-            };
-
+        // Phase 2 (parallel): Solve games — pure CPU, no model needed.
         let results: Vec<_> = match &pool {
-            Some(pool) => pool.install(|| situations.par_iter().map(solve_one).collect()),
-            None => situations.iter().map(solve_one).collect(),
+            Some(pool) => pool.install(|| {
+                situations
+                    .par_iter()
+                    .zip(games.into_par_iter())
+                    .map(|(sit, game_opt)| match game_opt {
+                        None => {
+                            pb.inc(1);
+                            None
+                        }
+                        Some(mut game) => {
+                            let result = solve_and_extract(
+                                &mut game,
+                                f64::from(sit.pot),
+                                &sit.ranges,
+                                solver_iterations,
+                                target_exploitability,
+                            );
+                            pb.inc(1);
+                            Some(result)
+                        }
+                    })
+                    .collect()
+            }),
+            None => situations
+                .iter()
+                .zip(games)
+                .map(|(sit, game_opt)| match game_opt {
+                    None => {
+                        pb.inc(1);
+                        None
+                    }
+                    Some(mut game) => {
+                        let result = solve_and_extract(
+                            &mut game,
+                            f64::from(sit.pot),
+                            &sit.ranges,
+                            solver_iterations,
+                            target_exploitability,
+                        );
+                        pb.inc(1);
+                        Some(result)
+                    }
+                })
+                .collect(),
         };
 
         // Write results sequentially.
@@ -981,6 +946,141 @@ mod tests {
         let result = generate_turn_training_data(&config, output.path(), "ndarray");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("river_model_path"));
+    }
+
+    /// Test that evaluate_game_boundaries sets boundary CFVs on a game.
+    #[test]
+    fn evaluate_game_boundaries_sets_cfvs() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let evaluator: Box<dyn LeafEvaluator> =
+            Box::new(RiverNetEvaluator::new(model, device));
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: 0.05,
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+
+        let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
+        let mut game = build_turn_game(
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            &[bet_sizes_f64],
+        )
+        .expect("valid game");
+
+        let num_boundaries = game.num_boundary_nodes();
+        assert!(num_boundaries > 0, "expected boundary nodes for a turn game");
+
+        // Evaluate boundaries on the game.
+        evaluate_game_boundaries(
+            &mut game,
+            sit.board_cards(),
+            f64::from(sit.pot),
+            f64::from(sit.effective_stack),
+            &sit.ranges,
+            evaluator.as_ref(),
+        );
+
+        // Verify: after evaluation, boundary_cfvs should be non-empty.
+        // We can verify by solving — if boundaries were not set, solve would
+        // produce all-zero results.
+        let (oop_cfvs, _, valid_mask, _, _) = solve_and_extract(
+            &mut game,
+            f64::from(sit.pot),
+            &sit.ranges,
+            20,
+            0.0,
+        );
+        let num_valid: usize = valid_mask.iter().map(|&v| v as usize).sum();
+        assert!(num_valid > 0, "expected valid combos after boundary evaluation + solve");
+        // At least some CFVs should be non-zero (untrained model produces non-zero outputs).
+        let has_nonzero = oop_cfvs.iter().any(|&v| v != 0.0);
+        assert!(has_nonzero, "expected non-zero CFVs after boundary evaluation");
+    }
+
+    /// Test that the two-phase approach (build + evaluate_boundaries + solve_and_extract)
+    /// produces identical results to the monolithic solve_turn_situation.
+    #[test]
+    fn two_phase_matches_monolithic() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: 0.05,
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+
+        let bet_sizes_f64 = parse_bet_sizes(&["50%".into(), "a".into()]);
+        let pot = f64::from(sit.pot);
+        let eff = f64::from(sit.effective_stack);
+
+        // Monolithic path.
+        let evaluator_mono: Box<dyn LeafEvaluator> =
+            Box::new(RiverNetEvaluator::new(model.clone(), device));
+        let (mono_oop, mono_ip, mono_mask, mono_gv_oop, mono_gv_ip) = solve_turn_situation(
+            sit.board_cards(), pot, eff, &sit.ranges,
+            &[bet_sizes_f64.clone()], 20, 0.0, evaluator_mono,
+        );
+
+        // Two-phase path.
+        let evaluator_two: Box<dyn LeafEvaluator> =
+            Box::new(RiverNetEvaluator::new(model.clone(), device));
+        let mut game = build_turn_game(
+            sit.board_cards(), pot, eff, &sit.ranges, &[bet_sizes_f64],
+        )
+        .expect("valid game");
+        evaluate_game_boundaries(
+            &mut game, sit.board_cards(), pot, eff, &sit.ranges, evaluator_two.as_ref(),
+        );
+        let (two_oop, two_ip, two_mask, two_gv_oop, two_gv_ip) = solve_and_extract(
+            &mut game, pot, &sit.ranges, 20, 0.0,
+        );
+
+        // Results must be identical (same model, same seed, deterministic solver).
+        assert_eq!(mono_mask, two_mask, "valid masks differ");
+        for i in 0..NUM_COMBOS {
+            assert!(
+                (mono_oop[i] - two_oop[i]).abs() < 1e-6,
+                "OOP CFV mismatch at combo {i}: mono={} two={}",
+                mono_oop[i], two_oop[i],
+            );
+            assert!(
+                (mono_ip[i] - two_ip[i]).abs() < 1e-6,
+                "IP CFV mismatch at combo {i}: mono={} two={}",
+                mono_ip[i], two_ip[i],
+            );
+        }
+        assert!(
+            (mono_gv_oop - two_gv_oop).abs() < 1e-6,
+            "OOP game value mismatch: mono={mono_gv_oop} two={two_gv_oop}",
+        );
+        assert!(
+            (mono_gv_ip - two_gv_ip).abs() < 1e-6,
+            "IP game value mismatch: mono={mono_gv_ip} two={two_gv_ip}",
+        );
     }
 
     #[test]
