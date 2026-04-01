@@ -163,7 +163,9 @@ fn run_server_loop<B: AutodiffBackend>(
 {
     let timeout = Duration::from_micros(config.batch_timeout_us);
     let mut last_train_at = 0usize;
-    let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
+    let mut optim = AdamConfig::new()
+        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(5.0)))
+        .init::<B, CfvNet<B>>();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Collect a batch of requests.
@@ -274,9 +276,15 @@ fn maybe_train<B: AutodiffBackend>(
     // Build contiguous input/target arrays.
     let mut flat_input = Vec::with_capacity(n * INPUT_SIZE);
     let mut flat_target = Vec::with_capacity(n * OUTPUT_SIZE);
+    let mut flat_mask = Vec::with_capacity(n * OUTPUT_SIZE);
+    let mut flat_range = Vec::with_capacity(n * OUTPUT_SIZE);
+    let mut flat_gv = Vec::with_capacity(n);
     for s in &samples {
         flat_input.extend_from_slice(&s.input);
         flat_target.extend_from_slice(&s.target);
+        flat_mask.extend_from_slice(&s.mask);
+        flat_range.extend_from_slice(&s.range);
+        flat_gv.push(s.game_value);
     }
 
     // Create tensors on the inner (non-autodiff) backend, then lift to autodiff.
@@ -288,15 +296,33 @@ fn maybe_train<B: AutodiffBackend>(
         TensorData::new(flat_target, [n, OUTPUT_SIZE]),
         device,
     );
+    let mask_inner = Tensor::<B::InnerBackend, 2>::from_data(
+        TensorData::new(flat_mask, [n, OUTPUT_SIZE]),
+        device,
+    );
+    let range_inner = Tensor::<B::InnerBackend, 2>::from_data(
+        TensorData::new(flat_range, [n, OUTPUT_SIZE]),
+        device,
+    );
+    let gv_inner = Tensor::<B::InnerBackend, 1>::from_data(
+        TensorData::new(flat_gv, [n]),
+        device,
+    );
     let input = Tensor::<B, 2>::from_inner(input_inner);
     let target = Tensor::<B, 2>::from_inner(target_inner);
+    let mask = Tensor::<B, 2>::from_inner(mask_inner);
+    let range = Tensor::<B, 2>::from_inner(range_inner);
+    let game_value = Tensor::<B, 1>::from_inner(gv_inner);
 
     // Forward pass through autograd model.
     let predicted = model.forward(input);
 
-    // MSE loss: mean((predicted - target)^2)
-    let diff = predicted - target;
-    let loss = diff.powf_scalar(2.0).mean();
+    // Masked Huber loss + auxiliary game-value consistency loss.
+    let loss = cfvnet::model::loss::cfvnet_loss(
+        predicted, target, mask, range, game_value,
+        1.0,  // huber_delta
+        1.0,  // aux_weight
+    );
 
     // Read loss value for logging.
     let loss_val: f32 = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
@@ -473,10 +499,10 @@ mod tests {
         let replay_buffer = ReplayBuffer::new(100);
         // Fill replay buffer with enough entries.
         for i in 0..10 {
-            replay_buffer.push(crate::replay_buffer::ReplayEntry {
-                input: vec![i as f32; INPUT_SIZE],
-                target: vec![0.0; OUTPUT_SIZE],
-            });
+            replay_buffer.push(crate::replay_buffer::ReplayEntry::simple(
+                vec![i as f32; INPUT_SIZE],
+                vec![0.0; OUTPUT_SIZE],
+            ));
         }
 
         let solve_counter = AtomicUsize::new(5);
@@ -513,10 +539,10 @@ mod tests {
         };
         let replay_buffer = ReplayBuffer::new(100);
         for i in 0..10 {
-            replay_buffer.push(crate::replay_buffer::ReplayEntry {
-                input: vec![i as f32; INPUT_SIZE],
-                target: vec![0.0; OUTPUT_SIZE],
-            });
+            replay_buffer.push(crate::replay_buffer::ReplayEntry::simple(
+                vec![i as f32; INPUT_SIZE],
+                vec![0.0; OUTPUT_SIZE],
+            ));
         }
 
         let solve_counter = AtomicUsize::new(3);
@@ -554,10 +580,10 @@ mod tests {
         let replay_buffer = ReplayBuffer::new(1000);
         // Only 5 entries, but train_batch_size requires 100.
         for i in 0..5 {
-            replay_buffer.push(crate::replay_buffer::ReplayEntry {
-                input: vec![i as f32; INPUT_SIZE],
-                target: vec![0.0; OUTPUT_SIZE],
-            });
+            replay_buffer.push(crate::replay_buffer::ReplayEntry::simple(
+                vec![i as f32; INPUT_SIZE],
+                vec![0.0; OUTPUT_SIZE],
+            ));
         }
 
         let solve_counter = AtomicUsize::new(10);
@@ -665,10 +691,10 @@ mod tests {
             for j in 0..10 {
                 input[j] = (i as f32 + j as f32) * 0.01;
             }
-            replay_buffer.push(crate::replay_buffer::ReplayEntry {
+            replay_buffer.push(crate::replay_buffer::ReplayEntry::simple(
                 input,
-                target: vec![0.0; OUTPUT_SIZE],
-            });
+                vec![0.0; OUTPUT_SIZE],
+            ));
         }
 
         let (handle, server_thread) = spawn_inference_server(

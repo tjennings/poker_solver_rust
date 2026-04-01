@@ -514,7 +514,30 @@ pub fn self_play_training_loop(
             for player in 0..2u8 {
                 let input = build_training_input(&example.pbs, player);
                 let target = example.cfvs[player as usize].to_vec();
-                replay_buffer.push(ReplayEntry { input, target });
+
+                // Build mask: 1.0 for non-blocked combos
+                let mask: Vec<f32> = example.pbs.reach_probs[0]
+                    .iter()
+                    .zip(example.pbs.reach_probs[1].iter())
+                    .map(|(&r0, &r1)| if r0 > 0.0 || r1 > 0.0 { 1.0 } else { 0.0 })
+                    .collect();
+
+                // Acting player's normalized range
+                let reach = &example.pbs.reach_probs[player as usize];
+                let reach_sum: f32 = reach.iter().sum();
+                let range: Vec<f32> = if reach_sum > 0.0 {
+                    reach.iter().map(|&r| r / reach_sum).collect()
+                } else {
+                    reach.to_vec()
+                };
+
+                // Game value: weighted sum of range * cfvs
+                let game_value: f32 = range.iter()
+                    .zip(target.iter())
+                    .map(|(&r, &c)| r * c)
+                    .sum();
+
+                replay_buffer.push(ReplayEntry { input, target, mask, range, game_value });
             }
         }
         handle.notify_solve_complete();

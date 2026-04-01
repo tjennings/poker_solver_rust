@@ -6,8 +6,25 @@ use rand::Rng;
 /// A single training example: encoded PBS input and target CFVs.
 #[derive(Clone)]
 pub struct ReplayEntry {
-    pub input: Vec<f32>,  // 2720 elements
-    pub target: Vec<f32>, // 1326 elements
+    pub input: Vec<f32>,   // 2720 elements
+    pub target: Vec<f32>,  // 1326 elements
+    pub mask: Vec<f32>,    // 1326 elements (1.0 = valid, 0.0 = board-blocked)
+    pub range: Vec<f32>,   // 1326 elements (acting player's normalized range)
+    pub game_value: f32,   // weighted sum of range * cfvs
+}
+
+impl ReplayEntry {
+    /// Create an entry with dummy mask/range/game_value (for tests and simple use cases).
+    pub fn simple(input: Vec<f32>, target: Vec<f32>) -> Self {
+        let n = target.len();
+        Self {
+            input,
+            target,
+            mask: vec![1.0; n],
+            range: vec![1.0 / n as f32; n],
+            game_value: 0.0,
+        }
+    }
 }
 
 /// Thread-safe circular replay buffer.
@@ -68,10 +85,7 @@ mod tests {
     fn test_replay_buffer_push_and_len() {
         let buf = ReplayBuffer::new(100);
         assert_eq!(buf.len(), 0);
-        buf.push(ReplayEntry {
-            input: vec![0.0; 2720],
-            target: vec![0.0; 1326],
-        });
+        buf.push(ReplayEntry::simple(vec![0.0; 2720], vec![0.0; 1326]));
         assert_eq!(buf.len(), 1);
     }
 
@@ -79,10 +93,7 @@ mod tests {
     fn test_replay_buffer_sample() {
         let buf = ReplayBuffer::new(100);
         for i in 0..50 {
-            buf.push(ReplayEntry {
-                input: vec![i as f32; 2720],
-                target: vec![0.0; 1326],
-            });
+            buf.push(ReplayEntry::simple(vec![i as f32; 2720], vec![0.0; 1326]));
         }
         let samples = buf.sample(10);
         assert_eq!(samples.len(), 10);
@@ -96,10 +107,7 @@ mod tests {
     fn test_replay_buffer_evicts_oldest() {
         let buf = ReplayBuffer::new(5);
         for i in 0..10 {
-            buf.push(ReplayEntry {
-                input: vec![i as f32; 2720],
-                target: vec![0.0; 1326],
-            });
+            buf.push(ReplayEntry::simple(vec![i as f32; 2720], vec![0.0; 1326]));
         }
         assert_eq!(buf.len(), 5);
         // Oldest entries (0-4) should be evicted, only 5-9 remain
@@ -116,10 +124,7 @@ mod tests {
         let buf2 = Arc::clone(&buf);
         let handle = std::thread::spawn(move || {
             for i in 0..100 {
-                buf2.push(ReplayEntry {
-                    input: vec![i as f32; 2720],
-                    target: vec![0.0; 1326],
-                });
+                buf2.push(ReplayEntry::simple(vec![i as f32; 2720], vec![0.0; 1326]));
             }
         });
         handle.join().unwrap();
