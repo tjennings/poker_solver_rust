@@ -23,6 +23,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             big_blind: 2.0,
             rake_rate: 0.0,
             rake_cap: 0.0,
+            allow_preflop_limp: true,
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
@@ -286,6 +287,7 @@ fn brcfr_plus_converges_small_game() {
             big_blind: 2.0,
             rake_rate: 0.0,
             rake_cap: 0.0,
+            allow_preflop_limp: true,
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
