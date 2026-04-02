@@ -1463,11 +1463,7 @@ pub fn generate_turn_training_data(
         .num_threads(stage1_pool_size)
         .build()
         .map_err(|e| format!("stage 1 thread pool: {e}"))?;
-    let solve_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(stage3_pool_size)
-        .build()
-        .map_err(|e| format!("stage 3 thread pool: {e}"))?;
-    eprintln!("[pipeline] Stage 1 pool: {stage1_pool_size} threads, Stage 3 pool: {stage3_pool_size} threads");
+    eprintln!("[pipeline] Stage 1 pool: {stage1_pool_size} threads, Stage 3: {stage3_pool_size} solver threads");
 
     // --- Stage 1: Deal Generator (1 thread, parallel tree building) ---
     // Samples situations sequentially (needs single RNG), then
@@ -1662,72 +1658,58 @@ pub fn generate_turn_training_data(
         Ok(())
     });
 
-    // --- Stage 3: DCFR Solvers (rayon thread pool, N threads) ---
-    // Receives games with boundaries set, solves in parallel, sends results to Stage 4.
-    let pb_ref = Arc::clone(&pb);
-    let stage3_count_ref = Arc::clone(&stage3_count);
-    let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
-    let exploit_count_ref = Arc::clone(&exploit_count_pb);
-    let stage3 = std::thread::spawn(move || -> Result<(), String> {
-        let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(SOLVE_BATCH_SIZE);
-
-        loop {
-            // Block on first receive; drain up to SOLVE_BATCH_SIZE non-blocking.
-            match rx2.recv() {
-                Ok(item) => batch.push(item),
-                Err(_) => break, // Channel closed.
-            }
-            while batch.len() < SOLVE_BATCH_SIZE {
-                match rx2.try_recv() {
-                    Ok(item) => batch.push(item),
-                    Err(_) => break,
+    // --- Stage 3: DCFR Solvers (N_SOLVE_THREADS plain threads) ---
+    // Each thread independently: recv game → solve (sequential) → send result.
+    // No rayon, no batching — one solve per thread, no nested parallelism.
+    let rx2 = Arc::new(Mutex::new(rx2));
+    let mut stage3_handles = Vec::with_capacity(stage3_pool_size);
+    for _ in 0..stage3_pool_size {
+        let rx2_ref = Arc::clone(&rx2);
+        let storage_tx_ref = storage_tx.clone();
+        let stage3_count_ref = Arc::clone(&stage3_count);
+        let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
+        let exploit_count_ref = Arc::clone(&exploit_count_pb);
+        let pb_ref = Arc::clone(&pb);
+        stage3_handles.push(std::thread::spawn(move || {
+            // Disable solver's internal par_iter — we already have outer parallelism.
+            range_solver::set_force_sequential(true);
+            while let Ok((sit, mut game)) = {
+                let rx = rx2_ref.lock().expect("rx2 lock");
+                rx.recv()
+            } {
+                let pot = f64::from(sit.pot);
+                let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit_chips) =
+                    solve_and_extract(
+                        &mut game,
+                        pot,
+                        &sit.ranges,
+                        solver_iterations,
+                        target_exploitability,
+                    );
+                let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
+                if count % 10 == 0 && exploit_chips >= 0.0 {
+                    let bb = initial_stack as f32 / 100.0;
+                    let exploit_mbb = if bb > 0.0 { exploit_chips / bb * 1000.0 } else { 0.0 };
+                    exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
+                    exploit_count_ref.fetch_add(1, Ordering::Relaxed);
+                }
+                pb_ref.inc(1);
+                if storage_tx_ref.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)).is_err() {
+                    return;
                 }
             }
-
-            // Solve batch in parallel — workers only solve, no serialization.
-            let results: Vec<SolveResult> = solve_pool.install(|| {
-                batch
-                    .par_drain(..)
-                    .map(|(sit, mut game)| {
-                        let pot = f64::from(sit.pot);
-                        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit_chips) =
-                            solve_and_extract(
-                                &mut game,
-                                pot,
-                                &sit.ranges,
-                                solver_iterations,
-                                target_exploitability,
-                            );
-                        let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
-                        if count % 10 == 0 && exploit_chips >= 0.0 {
-                            let bb = initial_stack as f32 / 100.0;
-                            let exploit_mbb = if bb > 0.0 { exploit_chips / bb * 1000.0 } else { 0.0 };
-                            exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
-                            exploit_count_ref.fetch_add(1, Ordering::Relaxed);
-                        }
-                        pb_ref.inc(1);
-                        (sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)
-                    })
-                    .collect()
-            });
-
-            // Send results to Stage 4 for serialization + write.
-            for result in results {
-                if storage_tx.send(result).is_err() {
-                    return Ok(());
-                }
-            }
-        }
-
-        Ok(())
-    });
+        }));
+    }
+    drop(storage_tx); // Drop original so Stage 4 closes when all solvers finish.
 
     // Wait for all stages to complete.
     stage1.join().map_err(|e| format!("stage 1 panicked: {e:?}"))?;
     for (i, handle) in stage2_handles.into_iter().enumerate() {
         handle.join().map_err(|e| format!("stage 2 thread {i} panicked: {e:?}"))?;
     }
-    stage3.join().map_err(|e| format!("stage 3 panicked: {e:?}"))??;
+    for (i, handle) in stage3_handles.into_iter().enumerate() {
+        handle.join().map_err(|e| format!("stage 3 thread {i} panicked: {e:?}"))?;
+    }
     stage4.join().map_err(|e| format!("stage 4 panicked: {e:?}"))??;
 
     pb.finish_with_message("done");

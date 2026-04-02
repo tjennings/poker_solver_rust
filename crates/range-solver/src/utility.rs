@@ -8,6 +8,23 @@ use std::ptr;
 use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
+// Thread-local parallelization override
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// When `true`, `for_each_child` always runs sequentially regardless of
+    /// the node's `enable_parallelization()` hint. Set this in threads that
+    /// already have outer parallelism (e.g. datagen solving many games at once).
+    static FORCE_SEQUENTIAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Disable internal solver parallelization on the current thread.
+/// Returns the previous value so callers can restore it.
+pub fn set_force_sequential(force: bool) -> bool {
+    FORCE_SEQUENTIAL.with(|cell| cell.replace(force))
+}
+
+// ---------------------------------------------------------------------------
 // UtilityScratch — reusable allocations for exploitability checks
 // ---------------------------------------------------------------------------
 
@@ -84,9 +101,13 @@ fn put_cfv_scratch(scratch: CfvScratch) {
 }
 
 /// Executes `op` for each child, potentially in parallel via rayon.
+///
+/// Respects the thread-local `FORCE_SEQUENTIAL` flag: when set, always
+/// runs sequentially even if the node allows parallelization.
 #[inline]
 pub(crate) fn for_each_child<T: GameNode, OP: Fn(usize) + Sync + Send>(node: &T, op: OP) {
-    if node.enable_parallelization() {
+    let dominated = FORCE_SEQUENTIAL.with(|cell| cell.get());
+    if !dominated && node.enable_parallelization() {
         node.action_indices().into_par_iter().for_each(op);
     } else {
         node.action_indices().for_each(op);

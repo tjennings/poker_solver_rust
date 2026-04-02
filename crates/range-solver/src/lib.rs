@@ -10,6 +10,7 @@ pub mod solver;
 pub(crate) mod isomorphism;
 pub(crate) mod sliceop;
 pub(crate) mod utility;
+pub use utility::set_force_sequential;
 
 mod hand_table;
 pub(crate) mod hand;
