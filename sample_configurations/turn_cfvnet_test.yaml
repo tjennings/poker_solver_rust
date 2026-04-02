@@ -35,8 +35,8 @@ datagen:
   bet_size_fuzz: 0
   pot_intervals: [[4, 50], [50, 150], [150, 400]]
   spr_intervals: [[0.0, 1.0], [1.0, 4.0], [4.0, 50.0]]
-  solver_iterations: 8000
-  target_exploitability: 0.05
+  solver_iterations: 1000
+  #target_exploitability: 0.05
   threads: 18
 
 training:

@@ -728,7 +728,7 @@ mod tests {
                 num_samples: 1,
                 street: "turn".into(),
                 solver_iterations: 20,
-                target_exploitability: 0.05,
+                target_exploitability: Some(0.05),
                 threads: 1,
                 seed: Some(42),
                 ..Default::default()

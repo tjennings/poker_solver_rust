@@ -219,7 +219,7 @@ mod tests {
             pot_intervals: vec![[4, 20], [20, 80], [80, 200], [200, 400]],
             spr_intervals: None,
             solver_iterations: 100,
-            target_exploitability: 0.01,
+            target_exploitability: Some(0.01),
             threads: 1,
             seed: Some(42),
             leaf_eval_interval: 0,

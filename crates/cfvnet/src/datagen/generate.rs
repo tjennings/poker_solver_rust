@@ -199,7 +199,7 @@ mod tests {
             datagen: DatagenConfig {
                 num_samples,
                 solver_iterations: 100,
-                target_exploitability: 0.05,
+                target_exploitability: Some(0.05),
                 threads: 1,
                 seed: Some(seed),
                 ..Default::default()

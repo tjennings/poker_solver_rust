@@ -154,8 +154,9 @@ pub struct DatagenConfig {
     pub spr_intervals: Option<Vec<[f64; 2]>>,
     #[serde(default = "default_solver_iterations")]
     pub solver_iterations: u32,
-    #[serde(default = "default_target_exploitability")]
-    pub target_exploitability: f32,
+    /// Early-exit exploitability target (chips per pot). Omit or set null to disable.
+    #[serde(default)]
+    pub target_exploitability: Option<f32>,
     #[serde(default = "default_threads")]
     pub threads: usize,
     #[serde(default)]
@@ -194,7 +195,7 @@ impl Default for DatagenConfig {
             pot_intervals: default_pot_intervals(),
             spr_intervals: None,
             solver_iterations: 1000,
-            target_exploitability: 0.005,
+            target_exploitability: None,
             threads: 8,
             seed: Some(42),
             leaf_eval_interval: 0,
@@ -219,9 +220,6 @@ fn default_pot_intervals() -> Vec<[i32; 2]> {
 }
 fn default_solver_iterations() -> u32 {
     1000
-}
-fn default_target_exploitability() -> f32 {
-    0.005
 }
 fn default_threads() -> usize {
     std::thread::available_parallelism()
@@ -371,7 +369,7 @@ datagen:
   num_samples: 1000000
   pot_intervals: [[4,20], [20,80], [80,200], [200,400]]
   solver_iterations: 1000
-  target_exploitability: 0.005
+  target_exploitability: 0.005  # optional; omit for fixed iterations
   threads: 8
   seed: 42
 training:

@@ -14,8 +14,8 @@ pub struct SolveConfig {
     pub bet_sizes: BetSizeOptions,
     /// Maximum number of solver iterations.
     pub solver_iterations: u32,
-    /// Target exploitability (pot-relative); solver stops early if reached.
-    pub target_exploitability: f32,
+    /// Target exploitability (pot-relative); solver stops early if reached. None = fixed iterations.
+    pub target_exploitability: Option<f32>,
     /// Add all-in if max bet / pot <= this threshold.
     pub add_allin_threshold: f64,
     /// Force all-in if SPR after call <= this threshold.
@@ -75,7 +75,7 @@ pub fn solve_situation(situation: &Situation, config: &SolveConfig) -> Result<So
     let mut game = PostFlopGame::with_config(card_config, action_tree)?;
     game.allocate_memory(false);
 
-    let exploitability = solve(&mut game, config.solver_iterations, config.target_exploitability, false);
+    let exploitability = solve(&mut game, config.solver_iterations, config.target_exploitability.unwrap_or(-1.0), false);
 
     game.cache_normalized_weights();
 
@@ -178,7 +178,7 @@ mod tests {
         SolveConfig {
             bet_sizes,
             solver_iterations: 200,
-            target_exploitability: 0.01,
+            target_exploitability: Some(0.01),
             add_allin_threshold: 1.5,
             force_allin_threshold: 0.15,
         }
@@ -213,7 +213,7 @@ mod tests {
         let sit = known_river_situation();
         let mut config = test_solve_config();
         config.solver_iterations = 500;
-        config.target_exploitability = 0.01;
+        config.target_exploitability = Some(0.01);
         let result = solve_situation(&sit, &config).unwrap();
         assert!(
             result.exploitability < 0.02,
@@ -242,7 +242,7 @@ mod tests {
         let sit = known_river_situation();
         let mut config = test_solve_config();
         config.solver_iterations = 500;
-        config.target_exploitability = 0.005;
+        config.target_exploitability = Some(0.005);
         let result = solve_situation(&sit, &config).unwrap();
         assert!(result.oop_game_value.is_finite(), "OOP game value not finite");
         assert!(result.ip_game_value.is_finite(), "IP game value not finite");

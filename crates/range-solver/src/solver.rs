@@ -151,7 +151,7 @@ pub fn solve<T: Game>(
             );
         }
 
-        if (t + 1) % 10 == 0 || t + 1 == max_num_iterations {
+        if (t + 1) % 5 == 0 || t + 1 == max_num_iterations {
             exploitability = compute_exploitability(game);
         }
 

@@ -581,7 +581,7 @@ fn generate_turn_training_data_cuda(
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
-    let target_exploitability = config.datagen.target_exploitability as f32;
+    let target_exploitability = config.datagen.target_exploitability.unwrap_or(-1.0);
     let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -909,7 +909,7 @@ fn generate_turn_training_data_exact(
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
-    let target_exploitability = config.datagen.target_exploitability as f32;
+    let target_exploitability = config.datagen.target_exploitability.unwrap_or(-1.0);
     let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -1273,7 +1273,7 @@ pub fn generate_turn_training_data(
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
     let solver_iterations = config.datagen.solver_iterations;
-    let target_exploitability = config.datagen.target_exploitability as f32;
+    let target_exploitability = config.datagen.target_exploitability.unwrap_or(-1.0);
     let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -1534,12 +1534,11 @@ pub fn generate_turn_training_data(
                             target_exploitability,
                         );
                         let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
-                        if count % 100 == 0 {
-                            let exploit = range_solver::compute_exploitability(&game);
-                            // Convert to mbb/hand: exploit_chips / big_blind * 1000.
-                            // BB = initial_stack / 100 (e.g. 200 chips = 100bb, so BB = 2 chips).
+                        // Use the exploitability returned by solve() (6th tuple element).
+                        let (_, _, _, _, _, exploit_chips) = &result;
+                        if count % 10 == 0 && *exploit_chips >= 0.0 {
                             let bb = initial_stack as f32 / 100.0;
-                            let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                            let exploit_mbb = if bb > 0.0 { exploit_chips / bb * 1000.0 } else { 0.0 };
                             exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
                             exploit_count_ref.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1630,7 +1629,7 @@ mod tests {
                 num_samples,
                 street: "turn".into(),
                 solver_iterations: 50,
-                target_exploitability: 0.05,
+                target_exploitability: Some(0.05),
                 threads: 1,
                 seed: Some(42),
                 ..Default::default()
