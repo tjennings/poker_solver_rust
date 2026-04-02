@@ -1455,12 +1455,19 @@ pub fn generate_turn_training_data(
         PIPELINE_CHANNEL_CAPACITY_TURN,
     );
 
-    // Single shared rayon pool for Stage 1 (tree building) and Stage 3 (solving).
-    // Avoids duplicate idle workers from separate pools.
-    let pool = Arc::new(rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max(1))
+    // Dedicated thread allocation: deal=1, gpu=N_GPU_THREADS, write=1, rest→solve.
+    // Stage 1 sampling is sequential; its rayon pool handles tree building only.
+    let stage1_pool_size = 1;
+    let stage3_pool_size = threads.max(1);
+    let stage1_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(stage1_pool_size)
         .build()
-        .map_err(|e| format!("thread pool: {e}"))?);
+        .map_err(|e| format!("stage 1 thread pool: {e}"))?;
+    let solve_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(stage3_pool_size)
+        .build()
+        .map_err(|e| format!("stage 3 thread pool: {e}"))?;
+    eprintln!("[pipeline] Stage 1 pool: {stage1_pool_size} threads, Stage 3 pool: {stage3_pool_size} threads");
 
     // --- Stage 1: Deal Generator (1 thread, parallel tree building) ---
     // Samples situations sequentially (needs single RNG), then
@@ -1471,7 +1478,7 @@ pub fn generate_turn_training_data(
     let bet_sizes_for_stage1 = bet_sizes_vec.clone();
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let stage1_count_ref = Arc::clone(&stage1_count);
-    let pool_for_stage1 = Arc::clone(&pool);
+    let pool_for_stage1 = stage1_pool;
     let stage1 = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut remaining = num_samples;
@@ -1678,7 +1685,7 @@ pub fn generate_turn_training_data(
             }
 
             // Solve batch in parallel — workers only solve, no serialization.
-            let results: Vec<SolveResult> = pool.install(|| {
+            let results: Vec<SolveResult> = solve_pool.install(|| {
                 batch
                     .par_drain(..)
                     .map(|(sit, mut game)| {
