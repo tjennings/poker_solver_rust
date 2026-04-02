@@ -1,0 +1,47 @@
+# River CFVnet — datagen + training config
+#
+# Uses the same game structure as the turn config but generates river
+# training data (5-card boards, solve to showdown, no GPU model needed).
+#
+# Generate training data:
+#   cargo run -p cfvnet --release -- generate \
+#     -c sample_configurations/river_cfvnet_v2.yaml
+#
+# Train river model (Mac/wgpu):
+#   cargo run -p cfvnet --release -- train \
+#     -c sample_configurations/river_cfvnet_v2.yaml \
+#     -d local_data/cfvnet/river/v2 \
+#     -o local_data/models/river_v2 \
+#     --backend wgpu
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["33%", "75%", "a"]     # first bet: 3 sizes
+    - ["75%", "a"]             # raises: 2 sizes
+  board_size: 5
+
+datagen:
+  street: "river"
+  num_samples: 2000000
+  river_output: "local_data/cfvnet/river/v2"
+  per_file: 10000
+  bet_size_fuzz: 0
+  pot_intervals: [[4, 50], [50, 150], [150, 400]]
+  spr_intervals: [[0.0, 1.0], [1.0, 4.0], [4.0, 50.0]]
+  solver_iterations: 1000
+  threads: 18
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 2048
+  epochs: 20
+  learning_rate: 0.002
+  lr_min: 0.0001
+  huber_delta: 1.0
+  aux_loss_weight: 1.0
+  validation_split: 0.1
+  checkpoint_every_n_epochs: 5
+  shuffle_buffer_size: 8192
+  prefetch_depth: 2
