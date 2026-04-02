@@ -1,42 +1,51 @@
-# River CFVnet training configuration
-# Based on Supremus (Zarick et al. 2020)
+# River CFVnet — datagen + training config
 #
-# Datagen:
+# Step 1: Precompute blueprint ranges (one-time):
+#   cargo run -p cfvnet --release -- precompute-ranges \
+#     -b local_data/blueprints/1k_100bb_brdcfr_v2 \
+#     -o local_data/cfvnet/preflop_ranges.bin
+#
+# Step 2: Generate river training data:
 #   cargo run -p cfvnet --release -- generate \
-#     -c sample_configurations/river_cfvnet.yaml \
-#     -o data/river/river.bin \
-#     --per-file 1000000
+#     -c sample_configurations/river_cfvnet.yaml
 #
-# Training (CUDA):
-#   cargo run -p cfvnet --release --features cuda -- train \
+# Step 3: Train river model (Mac/wgpu):
+#   cargo run -p cfvnet --release -- train \
 #     -c sample_configurations/river_cfvnet.yaml \
-#     -d data/river/ -o models/river_v1 --backend cuda
+#     -d local_data/cfvnet/river/v1 \
+#     -o local_data/models/river_v7 \
+#     --backend wgpu
 
 game:
-  initial_stack: 200 # 100bb in SB units
-  bet_sizes: ["25%", "50%", "100%", "a"]
-  add_allin_threshold: 1.5
-  force_allin_threshold: 0.15
+  initial_stack: 200
+  bet_sizes:
+    - ["33%", "75%", "a"]     # first bet: 3 sizes
+    - ["75%", "a"]             # raises: 2 sizes
+  board_size: 5
 
 datagen:
-  num_samples: 10000000
-  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
-  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
-  solver_iterations: 5000
-  target_exploitability: 0.005
-  threads: 8
-  seed: 42
+  street: "river"
+  mode: "exact"
+  blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
+  river_output: "local_data/cfvnet/river/v1"
+  num_samples: 2000000
+  per_file: 10000
+  bet_size_fuzz: 0
+  pot_intervals: [[4, 50], [50, 150], [150, 400]]
+  spr_intervals: [[0.0, 1.0], [1.0, 4.0], [4.0, 50.0]]
+  solver_iterations: 250
+  threads: 18
 
 training:
   hidden_layers: 7
   hidden_size: 768
-  batch_size: 8192
-  epochs: 35
+  batch_size: 2048
+  epochs: 20
   learning_rate: 0.002
-  lr_min: 0.00002
+  lr_min: 0.0001
   huber_delta: 1.0
   aux_loss_weight: 1.0
-  validation_split: 0.05
-  checkpoint_every_n_epochs: 10
-  shuffle_buffer_size: 262144
-  prefetch_depth: 4
+  validation_split: 0.1
+  checkpoint_every_n_epochs: 5
+  shuffle_buffer_size: 8192
+  prefetch_depth: 2

@@ -44,8 +44,10 @@ use crate::model::network::{CfvNet, INPUT_SIZE};
 
 type B = Wgpu;
 
-/// Bounded channel capacity for the pipeline stages (tunable).
-const PIPELINE_CHANNEL_CAPACITY: usize = 16;
+/// Bounded channel capacity for the pipeline stages.
+/// River trees are tiny (~1MB) so we can buffer many more; turn trees are large (~200MB).
+const PIPELINE_CHANNEL_CAPACITY_TURN: usize = 16;
+const PIPELINE_CHANNEL_CAPACITY_RIVER: usize = 512;
 
 /// Batch size for Stage 3 rayon solve dispatch.
 const SOLVE_BATCH_SIZE: usize = 128;
@@ -238,21 +240,25 @@ fn build_turn_game_inner(
     };
     let bet_size_opts = BetSizeOptions { bet, raise };
 
+    let is_river = board_u8.len() >= 5;
+
     let card_config = CardConfig {
         range: [oop_range, ip_range],
         flop: [board_u8[0], board_u8[1], board_u8[2]],
         turn: board_u8[3],
-        river: NOT_DEALT,
+        river: if is_river { board_u8[4] } else { NOT_DEALT },
     };
 
-    let (river_bet_sizes, depth_limit) = if exact {
+    let (river_bet_sizes, depth_limit) = if exact || is_river {
         ([bet_size_opts.clone(), bet_size_opts.clone()], None)
     } else {
         ([BetSizeOptions::default(), BetSizeOptions::default()], Some(0))
     };
 
+    let initial_state = if is_river { BoardState::River } else { BoardState::Turn };
+
     let tree_config = TreeConfig {
-        initial_state: BoardState::Turn,
+        initial_state,
         starting_pot: pot as i32,
         effective_stack: effective_stack as i32,
         turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
@@ -800,7 +806,7 @@ fn generate_turn_training_data_cuda(
 
         // Sample + build trees for current chunk.
         let situations: Vec<_> = (0..chunk_len)
-            .map(|_| sample_situation(&config.datagen, config.game.initial_stack, 4, &mut rng))
+            .map(|_| sample_situation(&config.datagen, config.game.initial_stack, config.game.board_size, &mut rng))
             .collect();
 
         let build_one = |sit: &super::sampler::Situation| -> Option<PostFlopGame> {
@@ -916,6 +922,8 @@ fn generate_turn_training_data_exact(
     }
     let bet_sizes_vec = bet_sizes_f64;
     let initial_stack = config.game.initial_stack;
+    let board_size = config.game.board_size;
+    let channel_capacity = if board_size >= 5 { PIPELINE_CHANNEL_CAPACITY_RIVER } else { PIPELINE_CHANNEL_CAPACITY_TURN };
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let river_output_path = config.datagen.river_output.as_ref().map(Path::new);
     let per_file = config.datagen.per_file.unwrap_or(u64::MAX);
@@ -948,12 +956,13 @@ fn generate_turn_training_data_exact(
         None
     };
 
-    eprintln!("[turn datagen] exact mode: solving turn+river to showdown (no neural net)");
+    let street_label = if board_size >= 5 { "river" } else { "turn" };
+    eprintln!("[{street_label} datagen] exact mode: solving to showdown (no neural net)");
     if precomputed_ranges.is_some() {
-        eprintln!("[turn datagen] using blueprint ranges instead of RSP");
+        eprintln!("[{street_label} datagen] using blueprint ranges instead of RSP");
     }
     if let Some(rp) = river_output_path {
-        eprintln!("[turn datagen] river records will be extracted to: {}", rp.display());
+        eprintln!("[{street_label} datagen] river records will be extracted to: {}", rp.display());
     }
 
     let pb = Arc::new(ProgressBar::new(num_samples));
@@ -990,8 +999,13 @@ fn generate_turn_training_data_exact(
             } else {
                 0.0
             };
+            let disk_status = if rb > 0 {
+                format!("[turn:{tb} river:{rb}]")
+            } else {
+                format!("[{tb}]")
+            };
             pb_ticker.set_message(format!(
-                "deal\u{2192}[{buf}]\u{2192}solve\u{2192}[turn:{tb} river:{rb}]\u{2192}disk  expl:{avg_exploit:.1} mbb/h"
+                "deal\u{2192}[{buf}]\u{2192}solve\u{2192}{disk_status}\u{2192}disk  expl:{avg_exploit:.1} mbb/h"
             ));
             if pb_ticker.is_finished() {
                 break;
@@ -1006,7 +1020,7 @@ fn generate_turn_training_data_exact(
 
     // Channel: Stage 1 -> Stage 3.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
-        PIPELINE_CHANNEL_CAPACITY,
+        channel_capacity,
     );
 
     // Channel: Stage 3 -> Stage 4. Keep small to limit memory.
@@ -1028,10 +1042,10 @@ fn generate_turn_training_data_exact(
         for _ in 0..num_samples {
             let sit = if let Some(ref precomp) = precomputed_ranges {
                 super::sampler::sample_situation_with_blueprint(
-                    &datagen_config, initial_stack, 4, precomp, &mut rng,
+                    &datagen_config, initial_stack, board_size, precomp, &mut rng,
                 )
             } else {
-                sample_situation(&datagen_config, initial_stack, 4, &mut rng)
+                sample_situation(&datagen_config, initial_stack, board_size, &mut rng)
             };
             if sit.effective_stack <= 0 {
                 stage1_count_ref.fetch_add(1, Ordering::Relaxed);
@@ -1153,10 +1167,10 @@ fn generate_turn_training_data_exact(
                             target_exploitability,
                         );
                         let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
-                        if count % 100 == 0 {
-                            let exploit = range_solver::compute_exploitability(&game);
+                        let (_, _, _, _, _, exploit_chips) = &result;
+                        if count % 10 == 0 && *exploit_chips >= 0.0 {
                             let bb = initial_stack as f32 / 100.0;
-                            let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                            let exploit_mbb = if bb > 0.0 { exploit_chips / bb * 1000.0 } else { 0.0 };
                             exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
                             exploit_count_ref.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1370,10 +1384,10 @@ pub fn generate_turn_training_data(
     //    1 thread                      1 thread                     N rayon threads
 
     let (tx1, rx1) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
-        PIPELINE_CHANNEL_CAPACITY,
+        PIPELINE_CHANNEL_CAPACITY_TURN,
     );
     let (tx2, rx2) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
-        PIPELINE_CHANNEL_CAPACITY,
+        PIPELINE_CHANNEL_CAPACITY_TURN,
     );
 
     // Build rayon thread pool for Stage 3.
@@ -1386,13 +1400,14 @@ pub fn generate_turn_training_data(
     // Samples situations, builds PostFlopGame, sends to Stage 2.
     let datagen_config = config.datagen.clone();
     let initial_stack = config.game.initial_stack;
+    let board_size = config.game.board_size;
     let bet_sizes_for_stage1 = bet_sizes_vec.clone();
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let stage1_count_ref = Arc::clone(&stage1_count);
     let stage1 = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         for _ in 0..num_samples {
-            let sit = sample_situation(&datagen_config, initial_stack, 4, &mut rng);
+            let sit = sample_situation(&datagen_config, initial_stack, board_size, &mut rng);
             if sit.effective_stack <= 0 {
                 stage1_count_ref.fetch_add(1, Ordering::Relaxed);
                 continue; // Skip degenerate situations.

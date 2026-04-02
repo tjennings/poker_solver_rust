@@ -360,11 +360,21 @@ fn cmd_generate(
         cfg.datagen.river_output = Some(rp.to_string_lossy().into_owned());
     }
 
-    // Resolve output path: CLI -o overrides config datagen.turn_output.
+    // Resolve output path: CLI -o > config turn_output/river_output (by street).
     let output = output
-        .or_else(|| cfg.datagen.turn_output.as_ref().map(PathBuf::from))
+        .or_else(|| {
+            let path = match cfg.datagen.street.as_str() {
+                "river" => cfg.datagen.river_output.as_ref(),
+                _ => cfg.datagen.turn_output.as_ref(),
+            };
+            path.map(PathBuf::from)
+        })
         .unwrap_or_else(|| {
-            eprintln!("No output path specified. Use -o or set datagen.turn_output in config.");
+            let field = match cfg.datagen.street.as_str() {
+                "river" => "datagen.river_output",
+                _ => "datagen.turn_output",
+            };
+            eprintln!("No output path specified. Use -o or set {field} in config.");
             std::process::exit(1);
         });
     ensure_parent_dir(&output);
@@ -409,7 +419,7 @@ fn cmd_generate(
         }
 
         let result = match street {
-            "turn" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &file_output, backend),
+            "turn" | "river" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &file_output, backend),
             _ => cfvnet::datagen::generate::generate_training_data(&cfg, &file_output),
         };
 
