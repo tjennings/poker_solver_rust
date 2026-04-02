@@ -70,6 +70,78 @@ struct BoundaryRequest {
 /// ranges (2 × OUTPUT_SIZE) + board_onehot (52) + rank_presence (13).
 const PREFIX_LEN: usize = OUTPUT_SIZE * 2 + 52 + 13;
 
+/// Build batched GPU input rows for all boundary nodes of a single game.
+///
+/// For each boundary node × player × river card, appends one `INPUT_SIZE`-element
+/// row to `all_inputs`. Also pushes one `BoundaryRequest` per (boundary, player)
+/// pair into `requests`, and the corresponding river count into `rows_per`.
+fn build_game_inputs(
+    gi: usize,
+    game: &PostFlopGame,
+    sit: &super::sampler::Situation,
+    all_inputs: &mut Vec<f32>,
+    requests: &mut Vec<BoundaryRequest>,
+    rows_per: &mut Vec<usize>,
+) {
+    let num_boundaries = game.num_boundary_nodes();
+    if num_boundaries == 0 {
+        return;
+    }
+    let hands = game.private_cards(0);
+    let combos_u8: Vec<[u8; 2]> = hands.iter().map(|&(c0, c1)| [c0, c1]).collect();
+    let combo_indices: Vec<usize> = combos_u8.iter().map(|c| card_pair_to_index(c[0], c[1])).collect();
+    let board_u8 = sit.board_cards();
+    let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !board_u8.contains(r)).collect();
+    let num_rivers = valid_rivers.len();
+    let river_valid_masks: Vec<Vec<bool>> = valid_rivers.iter()
+        .map(|&r| combos_u8.iter().map(|c| c[0] != r && c[1] != r).collect())
+        .collect();
+    let oop_rc: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[0][card_pair_to_index(c0, c1)]).collect();
+    let ip_rc: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[1][card_pair_to_index(c0, c1)]).collect();
+    let pot = f64::from(sit.pot);
+    let eff = f64::from(sit.effective_stack);
+
+    let mut prefixes = vec![[0.0_f32; PREFIX_LEN]; num_rivers];
+    for (ri, &river_u8) in valid_rivers.iter().enumerate() {
+        let p = &mut prefixes[ri];
+        for (i, &idx) in combo_indices.iter().enumerate() {
+            if river_valid_masks[ri][i] {
+                p[idx] = oop_rc[i];
+                p[OUTPUT_SIZE + idx] = ip_rc[i];
+            }
+        }
+        let bs = OUTPUT_SIZE * 2;
+        for &card in board_u8 { p[bs + card as usize] = 1.0; }
+        p[bs + river_u8 as usize] = 1.0;
+        let rs = bs + 52;
+        for &card in board_u8 { p[rs + (card / 4) as usize] = 1.0; }
+        p[rs + (river_u8 / 4) as usize] = 1.0;
+    }
+
+    for ordinal in 0..num_boundaries {
+        let bpot = game.boundary_pot(ordinal) as f64;
+        let es = eff - (bpot - pot) / 2.0;
+        let pn = bpot as f32 / 400.0;
+        let sn = es as f32 / 400.0;
+        for player in 0..2usize {
+            let pi = if player == 0 { 0.0_f32 } else { 1.0 };
+            for prefix in &prefixes {
+                all_inputs.extend_from_slice(prefix);
+                all_inputs.push(pn);
+                all_inputs.push(sn);
+                all_inputs.push(pi);
+            }
+            requests.push(BoundaryRequest {
+                game_idx: gi, ordinal, player,
+                combo_indices: combo_indices.clone(),
+                river_valid_masks: river_valid_masks.clone(),
+                num_combos: hands.len(),
+            });
+            rows_per.push(num_rivers);
+        }
+    }
+}
+
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
     let rank = id / 4;
@@ -668,73 +740,6 @@ fn generate_turn_training_data_cuda(
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut remaining = num_samples;
     let cuda_chunk_size = 128u64;
-
-    fn build_game_inputs(
-        gi: usize,
-        game: &PostFlopGame,
-        sit: &super::sampler::Situation,
-        all_inputs: &mut Vec<f32>,
-        requests: &mut Vec<BoundaryRequest>,
-        rows_per: &mut Vec<usize>,
-    ) {
-        let num_boundaries = game.num_boundary_nodes();
-        if num_boundaries == 0 {
-            return;
-        }
-        let hands = game.private_cards(0);
-        let combos_u8: Vec<[u8; 2]> = hands.iter().map(|&(c0, c1)| [c0, c1]).collect();
-        let combo_indices: Vec<usize> = combos_u8.iter().map(|c| card_pair_to_index(c[0], c[1])).collect();
-        let board_u8 = sit.board_cards();
-        let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !board_u8.contains(r)).collect();
-        let num_rivers = valid_rivers.len();
-        let river_valid_masks: Vec<Vec<bool>> = valid_rivers.iter()
-            .map(|&r| combos_u8.iter().map(|c| c[0] != r && c[1] != r).collect())
-            .collect();
-        let oop_rc: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[0][card_pair_to_index(c0, c1)]).collect();
-        let ip_rc: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[1][card_pair_to_index(c0, c1)]).collect();
-        let pot = f64::from(sit.pot);
-        let eff = f64::from(sit.effective_stack);
-
-        let mut prefixes = vec![[0.0_f32; PREFIX_LEN]; num_rivers];
-        for (ri, &river_u8) in valid_rivers.iter().enumerate() {
-            let p = &mut prefixes[ri];
-            for (i, &idx) in combo_indices.iter().enumerate() {
-                if river_valid_masks[ri][i] {
-                    p[idx] = oop_rc[i];
-                    p[OUTPUT_SIZE + idx] = ip_rc[i];
-                }
-            }
-            let bs = OUTPUT_SIZE * 2;
-            for &card in board_u8 { p[bs + card as usize] = 1.0; }
-            p[bs + river_u8 as usize] = 1.0;
-            let rs = bs + 52;
-            for &card in board_u8 { p[rs + (card / 4) as usize] = 1.0; }
-            p[rs + (river_u8 / 4) as usize] = 1.0;
-        }
-
-        for ordinal in 0..num_boundaries {
-            let bpot = game.boundary_pot(ordinal) as f64;
-            let es = eff - (bpot - pot) / 2.0;
-            let pn = bpot as f32 / 400.0;
-            let sn = es as f32 / 400.0;
-            for player in 0..2usize {
-                let pi = if player == 0 { 0.0_f32 } else { 1.0 };
-                for prefix in &prefixes {
-                    all_inputs.extend_from_slice(prefix);
-                    all_inputs.push(pn);
-                    all_inputs.push(sn);
-                    all_inputs.push(pi);
-                }
-                requests.push(BoundaryRequest {
-                    game_idx: gi, ordinal, player,
-                    combo_indices: combo_indices.clone(),
-                    river_valid_masks: river_valid_masks.clone(),
-                    num_combos: hands.len(),
-                });
-                rows_per.push(num_rivers);
-            }
-        }
-    }
 
     fn scatter_gpu_results(
         out_vec: &[f32],
