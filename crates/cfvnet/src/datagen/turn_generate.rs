@@ -142,6 +142,40 @@ fn build_game_inputs(
     }
 }
 
+/// Decode batched GPU output into per-request CFVs by averaging over river cards.
+///
+/// Returns one `(game_idx, ordinal, player, cfvs)` tuple per request.
+/// Each `cfvs` is a `Vec<f32>` of length `num_combos`.
+fn decode_boundary_cfvs(
+    out_vec: &[f32],
+    requests: &[BoundaryRequest],
+    rows_per: &[usize],
+) -> Vec<(usize, usize, usize, Vec<f32>)> {
+    let mut results = Vec::with_capacity(requests.len());
+    let mut row_offset = 0;
+    for (req, &nr) in requests.iter().zip(rows_per.iter()) {
+        let mut cfv_sum = vec![0.0_f64; req.num_combos];
+        let mut cfv_count = vec![0_u32; req.num_combos];
+        for (ri, mask) in req.river_valid_masks.iter().enumerate() {
+            let rs = (row_offset + ri) * OUTPUT_SIZE;
+            for (i, &idx) in req.combo_indices.iter().enumerate() {
+                if mask[i] {
+                    cfv_sum[i] += f64::from(out_vec[rs + idx]);
+                    cfv_count[i] += 1;
+                }
+            }
+        }
+        row_offset += nr;
+        let cfvs: Vec<f32> = cfv_sum
+            .iter()
+            .zip(cfv_count.iter())
+            .map(|(&s, &c)| if c > 0 { (s / f64::from(c)) as f32 } else { 0.0 })
+            .collect();
+        results.push((req.game_idx, req.ordinal, req.player, cfvs));
+    }
+    results
+}
+
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
     let rank = id / 4;
@@ -747,25 +781,9 @@ fn generate_turn_training_data_cuda(
         rows_per: &[usize],
         games: &mut [Option<PostFlopGame>],
     ) {
-        let mut row_offset = 0;
-        for (req, &nr) in requests.iter().zip(rows_per.iter()) {
-            let mut cfv_sum = vec![0.0_f64; req.num_combos];
-            let mut cfv_count = vec![0_u32; req.num_combos];
-            for (ri, mask) in req.river_valid_masks.iter().enumerate() {
-                let rs = (row_offset + ri) * OUTPUT_SIZE;
-                for (i, &idx) in req.combo_indices.iter().enumerate() {
-                    if mask[i] {
-                        cfv_sum[i] += f64::from(out_vec[rs + idx]);
-                        cfv_count[i] += 1;
-                    }
-                }
-            }
-            row_offset += nr;
-            let cfvs: Vec<f32> = cfv_sum.iter().zip(cfv_count.iter())
-                .map(|(&s, &c)| if c > 0 { (s / f64::from(c)) as f32 } else { 0.0 })
-                .collect();
-            if let Some(game) = &mut games[req.game_idx] {
-                game.set_boundary_cfvs(req.ordinal, req.player, cfvs);
+        for (gi, ordinal, player, cfvs) in decode_boundary_cfvs(out_vec, requests, rows_per) {
+            if let Some(game) = &mut games[gi] {
+                game.set_boundary_cfvs(ordinal, player, cfvs);
             }
         }
     }
@@ -1703,7 +1721,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 20,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()
@@ -1760,7 +1778,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 20,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()
@@ -1826,7 +1844,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 20,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()
@@ -1929,7 +1947,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 10,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(123),
             ..Default::default()
