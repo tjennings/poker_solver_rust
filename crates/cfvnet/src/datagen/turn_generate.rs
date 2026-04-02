@@ -1547,7 +1547,7 @@ pub fn generate_turn_training_data(
 
     // --- Stage 2: GPU Inference (N_GPU_THREADS threads) ---
     // Each thread loads its own model, pulls from shared rx1, sends to tx2.
-    const N_GPU_THREADS: usize = 2;
+    const N_GPU_THREADS: usize = 1;
     const GPU_BATCH_SIZE: usize = 32;
     let rx1 = Arc::new(Mutex::new(rx1));
     let mut stage2_handles = Vec::with_capacity(N_GPU_THREADS);
