@@ -40,7 +40,7 @@ use super::sampler::{sample_situation, Situation};
 use super::storage::{write_record, TrainingRecord};
 use crate::config::CfvnetConfig;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
-use crate::model::network::{CfvNet, INPUT_SIZE};
+use crate::model::network::{CfvNet, INPUT_SIZE, OUTPUT_SIZE};
 
 type B = Wgpu;
 
@@ -52,6 +52,23 @@ const PIPELINE_CHANNEL_CAPACITY_RIVER: usize = 512;
 /// Batch size for Stage 3 rayon solve dispatch.
 const SOLVE_BATCH_SIZE: usize = 128;
 
+/// Tracks a single boundary evaluation request within a batched GPU forward pass.
+///
+/// Each request corresponds to one (game, boundary_ordinal, player) triple.
+/// The GPU output rows for this request span `rows_per` contiguous rows
+/// starting at the cumulative offset.
+struct BoundaryRequest {
+    game_idx: usize,
+    ordinal: usize,
+    player: usize,
+    combo_indices: Vec<usize>,
+    river_valid_masks: Vec<Vec<bool>>,
+    num_combos: usize,
+}
+
+/// Prefix length for batched GPU input rows:
+/// ranges (2 × OUTPUT_SIZE) + board_onehot (52) + rank_presence (13).
+const PREFIX_LEN: usize = OUTPUT_SIZE * 2 + 52 + 13;
 
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
@@ -573,7 +590,6 @@ fn generate_turn_training_data_cuda(
     use burn::backend::cuda_jit::CudaDevice;
     use burn::backend::CudaJit;
     use burn::tensor::{Tensor, TensorData};
-    use crate::model::network::OUTPUT_SIZE;
 
     type CudaB = CudaJit<f32>;
 
@@ -652,19 +668,6 @@ fn generate_turn_training_data_cuda(
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut remaining = num_samples;
     let cuda_chunk_size = 128u64;
-
-    // Reusable types for boundary evaluation.
-    struct BoundaryRequest {
-        game_idx: usize,
-        ordinal: usize,
-        player: usize,
-        combo_indices: Vec<usize>,
-        river_valid_masks: Vec<Vec<bool>>,
-        num_combos: usize,
-    }
-
-    /// Prefix length: ranges (2×1326) + board_onehot (52) + rank_presence (13).
-    const PREFIX_LEN: usize = OUTPUT_SIZE * 2 + 52 + 13;
 
     fn build_game_inputs(
         gi: usize,
