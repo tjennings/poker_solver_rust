@@ -23,9 +23,9 @@ enum Commands {
         /// Path to YAML config file
         #[arg(short, long)]
         config: PathBuf,
-        /// Output path for binary training data
+        /// Output path for binary training data. Overrides config datagen.turn_output.
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Override num_samples from config
         #[arg(long)]
         num_samples: Option<u64>,
@@ -196,7 +196,9 @@ fn main() {
             backend,
             river_output,
         } => {
-            ensure_parent_dir(&output);
+            if let Some(ref o) = output {
+                ensure_parent_dir(o);
+            }
             cmd_generate(config, output, num_samples, threads, per_file, &backend, river_output);
         }
         Commands::Train {
@@ -326,7 +328,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
 
 fn cmd_generate(
     config_path: PathBuf,
-    output: PathBuf,
+    output: Option<PathBuf>,
     num_samples: Option<u64>,
     threads: Option<usize>,
     per_file: Option<u64>,
@@ -357,6 +359,15 @@ fn cmd_generate(
     if let Some(rp) = river_output {
         cfg.datagen.river_output = Some(rp.to_string_lossy().into_owned());
     }
+
+    // Resolve output path: CLI -o overrides config datagen.turn_output.
+    let output = output
+        .or_else(|| cfg.datagen.turn_output.as_ref().map(PathBuf::from))
+        .unwrap_or_else(|| {
+            eprintln!("No output path specified. Use -o or set datagen.turn_output in config.");
+            std::process::exit(1);
+        });
+    ensure_parent_dir(&output);
 
     let total = cfg.datagen.num_samples;
     let chunk_size = per_file.or(cfg.datagen.per_file).unwrap_or(total);

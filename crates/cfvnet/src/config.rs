@@ -168,6 +168,9 @@ pub struct DatagenConfig {
     /// `1.0 + uniform(-fuzz, +fuzz)`. Default 0.0 (no fuzzing).
     #[serde(default)]
     pub bet_size_fuzz: f64,
+    /// Output path for turn training data. CLI `-o` overrides this.
+    #[serde(default)]
+    pub turn_output: Option<String>,
     /// Output path for river training data (extracted from exact turn+river solves).
     /// When set in exact mode, river records are written alongside turn records.
     #[serde(default)]
@@ -196,6 +199,7 @@ impl Default for DatagenConfig {
             seed: Some(42),
             leaf_eval_interval: 0,
             bet_size_fuzz: 0.0,
+            turn_output: None,
             river_output: None,
             per_file: None,
             blueprint_path: None,
