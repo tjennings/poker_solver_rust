@@ -12,13 +12,13 @@ fn full_pipeline_smoke_test() {
     let config = cfvnet::config::CfvnetConfig {
         game: cfvnet::config::GameConfig {
             initial_stack: 200,
-            bet_sizes: vec!["50%".into(), "a".into()],
+            bet_sizes: cfvnet::config::BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
             ..Default::default()
         },
         datagen: cfvnet::config::DatagenConfig {
             num_samples: 4,
             solver_iterations: 100,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()

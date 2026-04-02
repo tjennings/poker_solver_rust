@@ -227,6 +227,7 @@ mod tests {
             river_output: None,
             per_file: None,
             blueprint_path: None,
+            turn_output: None,
         }
     }
 
