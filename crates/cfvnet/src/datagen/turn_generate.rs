@@ -1340,12 +1340,6 @@ pub fn generate_turn_training_data(
         "cuda" => return Err("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release".into()),
         _ => {} // fall through to NdArray path
     }
-    let river_model_path = config
-        .game
-        .river_model_path
-        .as_deref()
-        .ok_or("river_model_path is required for turn datagen")?;
-
     let num_samples = config.datagen.num_samples;
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
@@ -1356,38 +1350,43 @@ pub fn generate_turn_training_data(
         return Err("no valid percentage bet sizes found in config".into());
     }
     let bet_sizes_vec = bet_sizes_f64;
+    let board_size = config.game.board_size;
+    let needs_gpu = board_size < 5; // River solves go to showdown, no GPU needed.
 
-    // Load river model's config to get its architecture (may differ from turn config).
-    let river_model_dir = std::path::Path::new(river_model_path)
-        .parent()
-        .ok_or("river_model_path has no parent directory")?;
-    let river_config_path = river_model_dir.join("config.yaml");
-    let (river_hidden_layers, river_hidden_size) = if river_config_path.exists() {
-        let river_yaml = std::fs::read_to_string(&river_config_path)
-            .map_err(|e| format!("read river config: {e}"))?;
-        let river_cfg: CfvnetConfig = serde_yaml::from_str(&river_yaml)
-            .map_err(|e| format!("parse river config: {e}"))?;
-        eprintln!("[turn datagen] river model architecture: {}×{} (from {})",
-            river_cfg.training.hidden_layers, river_cfg.training.hidden_size,
-            river_config_path.display());
-        (river_cfg.training.hidden_layers, river_cfg.training.hidden_size)
+    // Load river model config + verify load (only for turn, which needs GPU boundaries).
+    let river_model_path = config.game.river_model_path.as_deref();
+    let (river_hidden_layers, river_hidden_size) = if needs_gpu {
+        let rmp = river_model_path
+            .ok_or("river_model_path is required for turn datagen")?;
+        let river_model_dir = std::path::Path::new(rmp)
+            .parent()
+            .ok_or("river_model_path has no parent directory")?;
+        let river_config_path = river_model_dir.join("config.yaml");
+        let (hl, hs) = if river_config_path.exists() {
+            let river_yaml = std::fs::read_to_string(&river_config_path)
+                .map_err(|e| format!("read river config: {e}"))?;
+            let river_cfg: CfvnetConfig = serde_yaml::from_str(&river_yaml)
+                .map_err(|e| format!("parse river config: {e}"))?;
+            eprintln!("[datagen] river model architecture: {}×{} (from {})",
+                river_cfg.training.hidden_layers, river_cfg.training.hidden_size,
+                river_config_path.display());
+            (river_cfg.training.hidden_layers, river_cfg.training.hidden_size)
+        } else {
+            eprintln!("[datagen] warning: no river config.yaml found, using config architecture");
+            (config.training.hidden_layers, config.training.hidden_size)
+        };
+        // Verify initial load works (fail fast before spawning threads).
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+        let model = CfvNet::<B>::new(&device, hl, hs, INPUT_SIZE)
+            .load_file(rmp, &recorder, &device)
+            .map_err(|e| format!("failed to load river model: {e}"))?;
+        drop(model);
+        (hl, hs)
     } else {
-        eprintln!("[turn datagen] warning: no river config.yaml found, using turn config architecture");
-        (config.training.hidden_layers, config.training.hidden_size)
+        eprintln!("[datagen] river mode: no GPU inference needed (solving to showdown)");
+        (0, 0) // unused
     };
-
-    // Verify initial load works (fail fast before spawning threads).
-    let device = <B as burn::tensor::backend::Backend>::Device::default();
-    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-    let model = CfvNet::<B>::new(
-        &device,
-        river_hidden_layers,
-        river_hidden_size,
-        INPUT_SIZE,
-    )
-    .load_file(river_model_path, &recorder, &device)
-    .map_err(|e| format!("failed to load river model: {e}"))?;
-    drop(model);
 
     let pb = Arc::new(ProgressBar::new(num_samples));
     pb.set_style(
@@ -1410,6 +1409,7 @@ pub fn generate_turn_training_data(
     let es_pb = Arc::clone(&exploit_sum_pb);
     let ec_pb = Arc::clone(&exploit_count_pb);
     let pb_ticker = Arc::clone(&pb);
+    let needs_gpu_for_pb = needs_gpu;
     let ticker = std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1426,7 +1426,13 @@ pub fn generate_turn_training_data(
             } else {
                 0.0
             };
-            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve→[{buf3}]→write  expl:{avg_exploit:.1} mbb/h"));
+            if needs_gpu_for_pb {
+                pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve→[{buf3}]→write  expl:{avg_exploit:.1} mbb/h"));
+            } else {
+                // River mode: no GPU stage, s2 tracks same as s1.
+                let buf_solve = s1.saturating_sub(s3);
+                pb_ticker.set_message(format!("deal→[{buf_solve}]→solve→[{buf3}]→write  expl:{avg_exploit:.1} mbb/h"));
+            }
             if pb_ticker.is_finished() {
                 break;
             }
@@ -1448,9 +1454,16 @@ pub fn generate_turn_training_data(
     // [Deal Generator] -> ch1(16) -> [GPU Inference] -> ch2(16) -> [DCFR Solvers] -> output
     //    1 thread + rayon             N GPU threads                  N rayon threads
 
-    let (tx1, rx1) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
-        PIPELINE_CHANNEL_CAPACITY_TURN,
-    );
+    // When GPU is needed: deal→ch1→GPU→ch2→solve.
+    // When no GPU (river): deal→ch2→solve directly.
+    let (tx1, rx1) = if needs_gpu {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
+            PIPELINE_CHANNEL_CAPACITY_TURN,
+        );
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (tx2, rx2) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
         PIPELINE_CHANNEL_CAPACITY_TURN,
     );
@@ -1475,6 +1488,9 @@ pub fn generate_turn_training_data(
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let stage1_count_ref = Arc::clone(&stage1_count);
     let pool_for_stage1 = stage1_pool;
+    // Stage 1 sends to tx1 (→ GPU) if GPU is needed, else directly to tx2 (→ solve).
+    let stage1_tx = if needs_gpu { tx1.unwrap() } else { tx2.clone() };
+    let stage2_count_for_passthrough = if !needs_gpu { Some(Arc::clone(&stage2_count)) } else { None };
     let stage1 = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut remaining = num_samples;
@@ -1526,7 +1542,11 @@ pub fn generate_turn_training_data(
             for item in games {
                 if let Some(pair) = item {
                     stage1_count_ref.fetch_add(1, Ordering::Relaxed);
-                    if tx1.send(pair).is_err() {
+                    // In river mode, also bump stage2 counter (no GPU stage).
+                    if let Some(ref s2) = stage2_count_for_passthrough {
+                        s2.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if stage1_tx.send(pair).is_err() {
                         channel_broken = true;
                         break;
                     }
@@ -1541,69 +1561,67 @@ pub fn generate_turn_training_data(
         // tx1 drops here, closing the channel.
     });
 
-    // --- Stage 2: GPU Inference (N_GPU_THREADS threads) ---
-    // Each thread loads its own model, pulls from shared rx1, sends to tx2.
+    // --- Stage 2: GPU Inference (only when needs_gpu) ---
     const N_GPU_THREADS: usize = 1;
     const GPU_BATCH_SIZE: usize = 32;
-    let rx1 = Arc::new(Mutex::new(rx1));
-    let mut stage2_handles = Vec::with_capacity(N_GPU_THREADS);
-    for gpu_id in 0..N_GPU_THREADS {
-        let rx1_ref = Arc::clone(&rx1);
-        let tx2_ref = tx2.clone();
-        let stage2_count_ref = Arc::clone(&stage2_count);
-        let river_model_path_owned = river_model_path.to_string();
-        stage2_handles.push(std::thread::spawn(move || {
-            let device = <B as burn::tensor::backend::Backend>::Device::default();
-            let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
-            let model = CfvNet::<B>::new(
-                &device,
-                river_hidden_layers,
-                river_hidden_size,
-                INPUT_SIZE,
-            )
-            .load_file(&river_model_path_owned, &recorder, &device)
-            .unwrap_or_else(|e| panic!("GPU thread {gpu_id}: load river model: {e}"));
+    let mut stage2_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    if needs_gpu {
+        let rx1 = Arc::new(Mutex::new(rx1.unwrap()));
+        for gpu_id in 0..N_GPU_THREADS {
+            let rx1_ref = Arc::clone(&rx1);
+            let tx2_ref = tx2.clone();
+            let stage2_count_ref = Arc::clone(&stage2_count);
+            let river_model_path_owned = river_model_path.unwrap().to_string();
+            stage2_handles.push(std::thread::spawn(move || {
+                let device = <B as burn::tensor::backend::Backend>::Device::default();
+                let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+                let model = CfvNet::<B>::new(
+                    &device,
+                    river_hidden_layers,
+                    river_hidden_size,
+                    INPUT_SIZE,
+                )
+                .load_file(&river_model_path_owned, &recorder, &device)
+                .unwrap_or_else(|e| panic!("GPU thread {gpu_id}: load river model: {e}"));
 
-            let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(GPU_BATCH_SIZE);
+                let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(GPU_BATCH_SIZE);
 
-            loop {
-                // Lock rx1, block on first recv, drain non-blocking up to batch size.
-                {
-                    let rx = rx1_ref.lock().expect("rx1 lock");
-                    match rx.recv() {
-                        Ok(item) => batch.push(item),
-                        Err(_) => break,
-                    }
-                    while batch.len() < GPU_BATCH_SIZE {
-                        match rx.try_recv() {
+                loop {
+                    {
+                        let rx = rx1_ref.lock().expect("rx1 lock");
+                        match rx.recv() {
                             Ok(item) => batch.push(item),
                             Err(_) => break,
                         }
+                        while batch.len() < GPU_BATCH_SIZE {
+                            match rx.try_recv() {
+                                Ok(item) => batch.push(item),
+                                Err(_) => break,
+                            }
+                        }
                     }
-                } // Drop lock before GPU work.
 
-                // Batched evaluation: one forward pass for all games in batch.
-                evaluate_batch(&model, &device, &mut batch);
-                stage2_count_ref.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    evaluate_batch(&model, &device, &mut batch);
+                    stage2_count_ref.fetch_add(batch.len() as u64, Ordering::Relaxed);
 
-                for item in batch.drain(..) {
-                    if tx2_ref.send(item).is_err() {
-                        return;
+                    for item in batch.drain(..) {
+                        if tx2_ref.send(item).is_err() {
+                            return;
+                        }
                     }
                 }
-            }
 
-            // Process remaining.
-            if !batch.is_empty() {
-                evaluate_batch(&model, &device, &mut batch);
-                stage2_count_ref.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                for item in batch.drain(..) {
-                    let _ = tx2_ref.send(item);
+                if !batch.is_empty() {
+                    evaluate_batch(&model, &device, &mut batch);
+                    stage2_count_ref.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    for item in batch.drain(..) {
+                        let _ = tx2_ref.send(item);
+                    }
                 }
-            }
-        }));
+            }));
+        }
     }
-    drop(tx2); // Drop the original tx2 so channel closes when all GPU threads finish.
+    drop(tx2); // Drop the original tx2 so channel closes when Stage 1 (river) or Stage 2 (turn) finishes.
 
     // --- Stage 3→4 channel: solved results to storage writer ---
     // Sends raw solve results; Stage 4 handles serialization + disk I/O.
