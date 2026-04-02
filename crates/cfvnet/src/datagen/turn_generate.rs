@@ -176,6 +176,42 @@ fn decode_boundary_cfvs(
     results
 }
 
+/// Evaluate all boundary nodes across a batch of games in a single GPU forward pass.
+///
+/// Builds one combined input tensor for all games, runs `model.forward()`,
+/// then scatters the averaged CFVs back to each game's boundary nodes.
+fn evaluate_batch<B2: burn::tensor::backend::Backend>(
+    model: &CfvNet<B2>,
+    device: &B2::Device,
+    batch: &mut [(Situation, PostFlopGame)],
+) where
+    B2::Device: Clone,
+{
+    use burn::tensor::{Tensor, TensorData};
+
+    let mut all_inputs: Vec<f32> = Vec::new();
+    let mut requests: Vec<BoundaryRequest> = Vec::new();
+    let mut rows_per: Vec<usize> = Vec::new();
+
+    for (gi, (sit, game)) in batch.iter().enumerate() {
+        build_game_inputs(gi, game, sit, &mut all_inputs, &mut requests, &mut rows_per);
+    }
+
+    if all_inputs.is_empty() {
+        return;
+    }
+
+    let total_rows = all_inputs.len() / INPUT_SIZE;
+    let data = TensorData::new(all_inputs, [total_rows, INPUT_SIZE]);
+    let input_tensor = Tensor::<B2, 2>::from_data(data, device);
+    let output = model.forward(input_tensor);
+    let out_vec: Vec<f32> = output.into_data().to_vec().expect("output tensor conversion");
+
+    for (gi, ordinal, player, cfvs) in decode_boundary_cfvs(&out_vec, &requests, &rows_per) {
+        batch[gi].1.set_boundary_cfvs(ordinal, player, cfvs);
+    }
+}
+
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
 fn u8_to_rs_card(id: u8) -> Card {
     let rank = id / 4;
@@ -1480,7 +1516,6 @@ pub fn generate_turn_training_data(
             )
             .load_file(&river_model_path_owned, &recorder, &device)
             .unwrap_or_else(|e| panic!("GPU thread {gpu_id}: load river model: {e}"));
-            let evaluator = RiverNetEvaluator::new(model, device);
 
             let mut batch: Vec<(Situation, PostFlopGame)> = Vec::with_capacity(GPU_BATCH_SIZE);
 
@@ -1500,17 +1535,9 @@ pub fn generate_turn_training_data(
                     }
                 } // Drop lock before GPU work.
 
-                for (sit, game) in batch.iter_mut() {
-                    evaluate_game_boundaries(
-                        game,
-                        sit.board_cards(),
-                        f64::from(sit.pot),
-                        f64::from(sit.effective_stack),
-                        &sit.ranges,
-                        &evaluator,
-                    );
-                    stage2_count_ref.fetch_add(1, Ordering::Relaxed);
-                }
+                // Batched evaluation: one forward pass for all games in batch.
+                evaluate_batch(&model, &device, &mut batch);
+                stage2_count_ref.fetch_add(batch.len() as u64, Ordering::Relaxed);
 
                 for item in batch.drain(..) {
                     if tx2_ref.send(item).is_err() {
@@ -1520,19 +1547,12 @@ pub fn generate_turn_training_data(
             }
 
             // Process remaining.
-            for (sit, game) in batch.iter_mut() {
-                evaluate_game_boundaries(
-                    game,
-                    sit.board_cards(),
-                    f64::from(sit.pot),
-                    f64::from(sit.effective_stack),
-                    &sit.ranges,
-                    &evaluator,
-                );
-                stage2_count_ref.fetch_add(1, Ordering::Relaxed);
-            }
-            for item in batch.drain(..) {
-                let _ = tx2_ref.send(item);
+            if !batch.is_empty() {
+                evaluate_batch(&model, &device, &mut batch);
+                stage2_count_ref.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                for item in batch.drain(..) {
+                    let _ = tx2_ref.send(item);
+                }
             }
         }));
     }
@@ -2072,6 +2092,111 @@ mod tests {
                     per_ip[j],
                 );
             }
+        }
+    }
+
+    /// Test that evaluate_batch sets boundary CFVs identically to per-game evaluation.
+    #[test]
+    fn evaluate_batch_matches_per_game() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let evaluator = RiverNetEvaluator::new(model.clone(), device.clone());
+
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: Some(0.05),
+            threads: 1,
+            seed: Some(99),
+            ..Default::default()
+        };
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let mut situations: Vec<Situation> = Vec::new();
+        for _ in 0..10 {
+            let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            if let Some(game) = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            ) {
+                if game.num_boundary_nodes() > 0 {
+                    situations.push(sit);
+                }
+            }
+            if situations.len() >= 2 {
+                break;
+            }
+        }
+        assert!(!situations.is_empty(), "need at least 1 valid game");
+
+        let make_game = |sit: &Situation| -> PostFlopGame {
+            build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            )
+            .expect("game should build")
+        };
+
+        // Path A: per-game evaluation.
+        let mut per_game_results: Vec<(f32, f32)> = Vec::new();
+        for sit in &situations {
+            let mut game = make_game(sit);
+            evaluate_game_boundaries(
+                &mut game,
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &evaluator,
+            );
+            let (_oop, _ip, _mask, oop_gv, ip_gv, _exploit) = solve_and_extract(
+                &mut game,
+                f64::from(sit.pot),
+                &sit.ranges,
+                20,
+                0.0,
+            );
+            per_game_results.push((oop_gv, ip_gv));
+        }
+
+        // Path B: evaluate_batch.
+        let mut batch: Vec<(Situation, PostFlopGame)> = situations
+            .iter()
+            .map(|sit| (sit.clone(), make_game(sit)))
+            .collect();
+        evaluate_batch(&model, &device, &mut batch);
+
+        for (i, ((sit, mut game), (per_oop_gv, per_ip_gv))) in batch
+            .into_iter()
+            .zip(per_game_results.iter())
+            .enumerate()
+        {
+            let (_oop, _ip, _mask, bat_oop_gv, bat_ip_gv, _exploit) = solve_and_extract(
+                &mut game,
+                f64::from(sit.pot),
+                &sit.ranges,
+                20,
+                0.0,
+            );
+            assert!(
+                (bat_oop_gv - per_oop_gv).abs() < 1e-4,
+                "game {i} OOP game value mismatch: batched={bat_oop_gv} per_game={per_oop_gv}"
+            );
+            assert!(
+                (bat_ip_gv - per_ip_gv).abs() < 1e-4,
+                "game {i} IP game value mismatch: batched={bat_ip_gv} per_game={per_ip_gv}"
+            );
         }
     }
 
