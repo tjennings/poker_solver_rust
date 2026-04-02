@@ -1,38 +1,42 @@
-# Turn CFVnet — small test config for end-to-end pipeline verification
+# Turn CFVnet — exact mode datagen + training config
 #
-# Datagen:
+# Step 1: Precompute blueprint ranges (one-time):
+#   cargo run -p cfvnet --release -- precompute-ranges \
+#     -b local_data/blueprints/1k_100bb_brdcfr_v2 \
+#     -o local_data/cfvnet/preflop_ranges.bin
+#
+# Step 2: Generate training data (turn + river):
 #   cargo run -p cfvnet --release -- generate \
-#     -c sample_configurations/turn_cfvnet_test.yaml \
-#     -o local_data/cfvnet/turn_test.bin \
-#     --num-samples 10000
+#     -c sample_configurations/turn_cfvnet_test.yaml
 #
-# Training (Mac/wgpu):
+# Step 3: Train turn model (Mac/wgpu):
 #   cargo run -p cfvnet --release -- train \
 #     -c sample_configurations/turn_cfvnet_test.yaml \
-#     -d local_data/cfvnet/turn_test.bin \
-#     -o local_data/models/turn_test \
+#     -d local_data/cfvnet/turn/exact_v1 \
+#     -o local_data/models/turn_v1 \
 #     --backend wgpu
 
 game:
   initial_stack: 200
   bet_sizes:
-    - ["33%", "75%", "100%"]    # first bet
-    - ["100%", "200%"]   
-    - ["a"]        # raises
+    - ["33%", "75%", "a"]     # first bet: 3 sizes
+    - ["75%", "a"]             # raises: 2 sizes
   board_size: 4
-  add_allin_threshold: 1.5
-  force_allin_threshold: 0.15
   river_model_path: "local_data/models/river_v6/model"
 
 datagen:
   street: "turn"
-  num_samples: 100000
-  per_file: 5000
+  mode: "exact"
+  blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
+  river_output: "local_data/cfvnet/river/exact_v1"
+  turn_output: "local_data/cfvnet/turn/exact_v1"
+  num_samples: 2000000
+  per_file: 10000
+  bet_size_fuzz: 0
   pot_intervals: [[4, 50], [50, 150], [150, 400]]
   spr_intervals: [[0.0, 1.0], [1.0, 4.0], [4.0, 50.0]]
-  solver_iterations: 2000
-  target_exploitability: 0.1
-  leaf_eval_interval: 50
+  solver_iterations: 8000
+  target_exploitability: 0.05
   threads: 18
 
 training:
