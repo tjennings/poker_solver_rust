@@ -3,11 +3,12 @@
 //! Uses a 3-stage producer-consumer architecture:
 //!
 //! ```text
-//! [Deal Generator] -> channel(5K) -> [GPU Inference] -> channel(5K) -> [DCFR Solvers] -> output
-//!    1 thread                          1 thread                         N rayon threads
+//! [Deal Generator] -> channel(16) -> [GPU Inference] -> channel(16) -> [DCFR Solvers] -> output
+//!    1 thread + rayon               N GPU threads                      N rayon threads
 //! ```
 //!
-//! Stage 1 samples random turn situations and builds `PostFlopGame` trees.
+//! Stage 1 samples random turn situations sequentially, then builds
+//! `PostFlopGame` trees in parallel using a dedicated rayon pool.
 //! Stage 2 loads a single river model and evaluates depth-boundary CFVs.
 //! Stage 3 solves the games with DCFR in parallel and writes [`TrainingRecord`]s.
 
@@ -46,7 +47,7 @@ type B = Wgpu;
 
 /// Bounded channel capacity for the pipeline stages.
 /// River trees are tiny (~1MB) so we can buffer many more; turn trees are large (~200MB).
-const PIPELINE_CHANNEL_CAPACITY_TURN: usize = 16;
+const PIPELINE_CHANNEL_CAPACITY_TURN: usize = 256;
 const PIPELINE_CHANNEL_CAPACITY_RIVER: usize = 512;
 
 /// Batch size for Stage 3 rayon solve dispatch.
@@ -1399,9 +1400,11 @@ pub fn generate_turn_training_data(
     let stage1_count_for_pb = Arc::new(AtomicU64::new(0));
     let stage2_count_for_pb = Arc::new(AtomicU64::new(0));
     let stage3_count_for_pb = Arc::new(AtomicU64::new(0));
+    let stage4_count_for_pb = Arc::new(AtomicU64::new(0));
     let s1_pb = Arc::clone(&stage1_count_for_pb);
     let s2_pb = Arc::clone(&stage2_count_for_pb);
     let s3_pb = Arc::clone(&stage3_count_for_pb);
+    let s4_pb = Arc::clone(&stage4_count_for_pb);
     let exploit_sum_pb = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let exploit_count_pb = Arc::new(AtomicU64::new(0));
     let es_pb = Arc::clone(&exploit_sum_pb);
@@ -1413,25 +1416,25 @@ pub fn generate_turn_training_data(
             let s1 = s1_pb.load(Ordering::Relaxed);
             let s2 = s2_pb.load(Ordering::Relaxed);
             let s3 = s3_pb.load(Ordering::Relaxed);
+            let s4 = s4_pb.load(Ordering::Relaxed);
             let buf1 = s1.saturating_sub(s2);
             let buf2 = s2.saturating_sub(s3);
+            let buf3 = s3.saturating_sub(s4);
             let ec = ec_pb.load(Ordering::Relaxed);
             let avg_exploit = if ec > 0 {
                 (es_pb.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
             } else {
                 0.0
             };
-            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve  expl:{avg_exploit:.1} mbb/h"));
+            pb_ticker.set_message(format!("deal→[{buf1}]→gpu→[{buf2}]→solve→[{buf3}]→write  expl:{avg_exploit:.1} mbb/h"));
             if pb_ticker.is_finished() {
                 break;
             }
         }
     });
 
-    // Open output file with mutex for thread-safe writing from Stage 3.
-    let file =
-        std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
-    let writer = Arc::new(Mutex::new(BufWriter::new(file)));
+    // Output path for Stage 4 storage writer.
+    let output_path_owned = output_path.to_path_buf();
 
     // Per-stage throughput counters (shared with progress bar ticker).
     let stage1_count = Arc::clone(&stage1_count_for_pb);
@@ -1442,8 +1445,8 @@ pub fn generate_turn_training_data(
 
     // --- 3-stage pipeline connected by bounded channels ---
     //
-    // [Deal Generator] -> ch1(5K) -> [GPU Inference] -> ch2(5K) -> [DCFR Solvers] -> output
-    //    1 thread                      1 thread                     N rayon threads
+    // [Deal Generator] -> ch1(16) -> [GPU Inference] -> ch2(16) -> [DCFR Solvers] -> output
+    //    1 thread + rayon             N GPU threads                  N rayon threads
 
     let (tx1, rx1) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
         PIPELINE_CHANNEL_CAPACITY_TURN,
@@ -1452,43 +1455,84 @@ pub fn generate_turn_training_data(
         PIPELINE_CHANNEL_CAPACITY_TURN,
     );
 
-    // Build rayon thread pool for Stage 3.
-    let pool = rayon::ThreadPoolBuilder::new()
+    // Single shared rayon pool for Stage 1 (tree building) and Stage 3 (solving).
+    // Avoids duplicate idle workers from separate pools.
+    let pool = Arc::new(rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
         .build()
-        .map_err(|e| format!("thread pool: {e}"))?;
+        .map_err(|e| format!("thread pool: {e}"))?);
 
-    // --- Stage 1: Deal Generator (1 thread) ---
-    // Samples situations, builds PostFlopGame, sends to Stage 2.
+    // --- Stage 1: Deal Generator (1 thread, parallel tree building) ---
+    // Samples situations sequentially (needs single RNG), then
+    // builds PostFlopGame trees in parallel via shared rayon pool.
     let datagen_config = config.datagen.clone();
     let initial_stack = config.game.initial_stack;
     let board_size = config.game.board_size;
     let bet_sizes_for_stage1 = bet_sizes_vec.clone();
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
     let stage1_count_ref = Arc::clone(&stage1_count);
+    let pool_for_stage1 = Arc::clone(&pool);
     let stage1 = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        for _ in 0..num_samples {
-            let sit = sample_situation(&datagen_config, initial_stack, board_size, &mut rng);
-            if sit.effective_stack <= 0 {
-                stage1_count_ref.fetch_add(1, Ordering::Relaxed);
-                continue; // Skip degenerate situations.
-            }
-            let sizes = fuzz_bet_sizes(&bet_sizes_for_stage1, bet_size_fuzz, &mut rng);
-            let game = build_turn_game(
-                sit.board_cards(),
-                f64::from(sit.pot),
-                f64::from(sit.effective_stack),
-                &sit.ranges,
-                &sizes,
-            );
-            if let Some(game) = game {
-                stage1_count_ref.fetch_add(1, Ordering::Relaxed);
-                if tx1.send((sit, game)).is_err() {
-                    break; // Receiver dropped.
+        let mut remaining = num_samples;
+        let batch_size = 64usize;
+
+        while remaining > 0 {
+            let chunk = (remaining as usize).min(batch_size);
+            remaining -= chunk as u64;
+
+            // 1. Sample situations + fuzz bet sizes sequentially (cheap, needs RNG).
+            let mut degenerate_count = 0u64;
+            let sampled: Vec<(Situation, Vec<Vec<f64>>)> = (0..chunk)
+                .filter_map(|_| {
+                    let sit = sample_situation(
+                        &datagen_config, initial_stack, board_size, &mut rng,
+                    );
+                    if sit.effective_stack <= 0 {
+                        degenerate_count += 1;
+                        return None;
+                    }
+                    let sizes = fuzz_bet_sizes(
+                        &bet_sizes_for_stage1, bet_size_fuzz, &mut rng,
+                    );
+                    Some((sit, sizes))
+                })
+                .collect();
+
+            // Count degenerate situations in progress.
+            stage1_count_ref.fetch_add(degenerate_count, Ordering::Relaxed);
+
+            // 2. Build trees in parallel via shared pool.
+            let games: Vec<Option<(Situation, PostFlopGame)>> = pool_for_stage1.install(|| {
+                sampled.into_par_iter()
+                    .map(|(sit, sizes)| {
+                        let game = build_turn_game(
+                            sit.board_cards(),
+                            f64::from(sit.pot),
+                            f64::from(sit.effective_stack),
+                            &sit.ranges,
+                            &sizes,
+                        );
+                        game.map(|g| (sit, g))
+                    })
+                    .collect()
+            });
+
+            // 3. Send to channel sequentially; count successes and build failures.
+            let mut channel_broken = false;
+            for item in games {
+                if let Some(pair) = item {
+                    stage1_count_ref.fetch_add(1, Ordering::Relaxed);
+                    if tx1.send(pair).is_err() {
+                        channel_broken = true;
+                        break;
+                    }
+                } else {
+                    stage1_count_ref.fetch_add(1, Ordering::Relaxed);
                 }
-            } else {
-                stage1_count_ref.fetch_add(1, Ordering::Relaxed);
+            }
+            if channel_broken {
+                return;
             }
         }
         // tx1 drops here, closing the channel.
@@ -1558,10 +1602,62 @@ pub fn generate_turn_training_data(
     }
     drop(tx2); // Drop the original tx2 so channel closes when all GPU threads finish.
 
+    // --- Stage 3→4 channel: solved results to storage writer ---
+    // Sends raw solve results; Stage 4 handles serialization + disk I/O.
+    type SolveResult = (
+        Situation,
+        [f32; NUM_COMBOS], // oop_cfvs
+        [f32; NUM_COMBOS], // ip_cfvs
+        [u8; NUM_COMBOS],  // valid_mask
+        f32,               // oop_gv
+        f32,               // ip_gv
+    );
+    const STORAGE_CHANNEL_CAP: usize = 512;
+    let (storage_tx, storage_rx) =
+        std::sync::mpsc::sync_channel::<SolveResult>(STORAGE_CHANNEL_CAP);
+
+    // --- Stage 4: Storage Writer (1 thread) ---
+    // Receives raw solve results, serializes and writes to disk.
+    let stage4_count_ref = Arc::clone(&stage4_count_for_pb);
+    let stage4 = std::thread::spawn(move || -> Result<(), String> {
+        let file = std::fs::File::create(&output_path_owned)
+            .map_err(|e| format!("create output: {e}"))?;
+        let mut writer = BufWriter::with_capacity(1 << 20, file); // 1MB buffer
+        while let Ok((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) = storage_rx.recv() {
+            let board_vec = sit.board_cards().to_vec();
+            let oop_rec = TrainingRecord {
+                board: board_vec.clone(),
+                pot: sit.pot as f32,
+                effective_stack: sit.effective_stack as f32,
+                player: 0,
+                game_value: oop_gv,
+                oop_range: sit.ranges[0],
+                ip_range: sit.ranges[1],
+                cfvs: oop_cfvs,
+                valid_mask,
+            };
+            write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+            let ip_rec = TrainingRecord {
+                board: board_vec,
+                pot: sit.pot as f32,
+                effective_stack: sit.effective_stack as f32,
+                player: 1,
+                game_value: ip_gv,
+                oop_range: sit.ranges[0],
+                ip_range: sit.ranges[1],
+                cfvs: ip_cfvs,
+                valid_mask,
+            };
+            write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+            stage4_count_ref.fetch_add(1, Ordering::Relaxed);
+        }
+        std::io::Write::flush(&mut writer).map_err(|e| format!("flush: {e}"))?;
+        Ok(())
+    });
+
     // --- Stage 3: DCFR Solvers (rayon thread pool, N threads) ---
-    // Receives games with boundaries set, solves in parallel batches, writes output.
+    // Receives games with boundaries set, solves in parallel, sends results to Stage 4.
     let pb_ref = Arc::clone(&pb);
-    let writer_ref = Arc::clone(&writer);
     let stage3_count_ref = Arc::clone(&stage3_count);
     let exploit_sum_ref = Arc::clone(&exploit_sum_pb);
     let exploit_count_ref = Arc::clone(&exploit_count_pb);
@@ -1577,68 +1673,42 @@ pub fn generate_turn_training_data(
             while batch.len() < SOLVE_BATCH_SIZE {
                 match rx2.try_recv() {
                     Ok(item) => batch.push(item),
-                    Err(_) => break, // Empty or closed; process what we have.
+                    Err(_) => break,
                 }
             }
 
-            // Solve batch in parallel. Compute exploitability every 100th sample.
-            let results: Vec<_> = pool.install(|| {
+            // Solve batch in parallel — workers only solve, no serialization.
+            let results: Vec<SolveResult> = pool.install(|| {
                 batch
                     .par_drain(..)
                     .map(|(sit, mut game)| {
                         let pot = f64::from(sit.pot);
-                        let result = solve_and_extract(
-                            &mut game,
-                            pot,
-                            &sit.ranges,
-                            solver_iterations,
-                            target_exploitability,
-                        );
+                        let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit_chips) =
+                            solve_and_extract(
+                                &mut game,
+                                pot,
+                                &sit.ranges,
+                                solver_iterations,
+                                target_exploitability,
+                            );
                         let count = stage3_count_ref.fetch_add(1, Ordering::Relaxed);
-                        // Use the exploitability returned by solve() (6th tuple element).
-                        let (_, _, _, _, _, exploit_chips) = &result;
-                        if count % 10 == 0 && *exploit_chips >= 0.0 {
+                        if count % 10 == 0 && exploit_chips >= 0.0 {
                             let bb = initial_stack as f32 / 100.0;
                             let exploit_mbb = if bb > 0.0 { exploit_chips / bb * 1000.0 } else { 0.0 };
                             exploit_sum_ref.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
                             exploit_count_ref.fetch_add(1, Ordering::Relaxed);
                         }
                         pb_ref.inc(1);
-                        (sit, result)
+                        (sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)
                     })
                     .collect()
             });
 
-            // Write results sequentially under lock.
-            let mut w = writer_ref.lock().expect("writer lock");
-            for (sit, (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit)) in results {
-                let board_vec = sit.board_cards().to_vec();
-
-                let oop_rec = TrainingRecord {
-                    board: board_vec.clone(),
-                    pot: sit.pot as f32,
-                    effective_stack: sit.effective_stack as f32,
-                    player: 0,
-                    game_value: oop_gv,
-                    oop_range: sit.ranges[0],
-                    ip_range: sit.ranges[1],
-                    cfvs: oop_cfvs,
-                    valid_mask,
-                };
-                write_record(&mut *w, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
-
-                let ip_rec = TrainingRecord {
-                    board: board_vec,
-                    pot: sit.pot as f32,
-                    effective_stack: sit.effective_stack as f32,
-                    player: 1,
-                    game_value: ip_gv,
-                    oop_range: sit.ranges[0],
-                    ip_range: sit.ranges[1],
-                    cfvs: ip_cfvs,
-                    valid_mask,
-                };
-                write_record(&mut *w, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+            // Send results to Stage 4 for serialization + write.
+            for result in results {
+                if storage_tx.send(result).is_err() {
+                    return Ok(());
+                }
             }
         }
 
@@ -1651,6 +1721,7 @@ pub fn generate_turn_training_data(
         handle.join().map_err(|e| format!("stage 2 thread {i} panicked: {e:?}"))?;
     }
     stage3.join().map_err(|e| format!("stage 3 panicked: {e:?}"))??;
+    stage4.join().map_err(|e| format!("stage 4 panicked: {e:?}"))??;
 
     pb.finish_with_message("done");
     let _ = ticker.join();
@@ -2944,5 +3015,121 @@ mod tests {
 
         // No river file should exist.
         assert!(!tmp.path().join("river_00000.bin").exists());
+    }
+
+    /// Test that parallel tree building via rayon produces the same games as
+    /// sequential building. This validates the Stage 1 parallelization approach:
+    /// sample situations sequentially, then build trees in parallel.
+    #[test]
+    fn parallel_tree_building_matches_sequential() {
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: Some(0.05),
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let bet_sizes = vec![vec![0.5, 1.0], vec![0.75]];
+        let bet_size_fuzz = 0.0; // No fuzz for deterministic comparison.
+        let initial_stack = 200;
+        let board_size = 4;
+        let num_samples = 20u64;
+
+        // --- Sequential path (current Stage 1 approach) ---
+        let mut rng_seq = ChaCha8Rng::seed_from_u64(42);
+        let mut seq_results: Vec<usize> = Vec::new(); // boundary node counts
+        let mut seq_skipped = 0u64;
+        let mut seq_build_failed = 0u64;
+        for _ in 0..num_samples {
+            let sit = sample_situation(&datagen_config, initial_stack, board_size, &mut rng_seq);
+            if sit.effective_stack <= 0 {
+                seq_skipped += 1;
+                continue;
+            }
+            let sizes = fuzz_bet_sizes(&bet_sizes, bet_size_fuzz, &mut rng_seq);
+            let game = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &sizes,
+            );
+            if let Some(g) = game {
+                seq_results.push(g.num_boundary_nodes());
+            } else {
+                seq_build_failed += 1;
+            }
+        }
+
+        // --- Parallel path (new Stage 1 approach: batch + rayon) ---
+        let mut rng_par = ChaCha8Rng::seed_from_u64(42);
+        let mut par_results: Vec<usize> = Vec::new();
+        let mut par_skipped = 0u64;
+        let mut par_build_failed = 0u64;
+        let batch_size = 8usize;
+        let mut remaining = num_samples;
+
+        let build_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("test thread pool");
+
+        while remaining > 0 {
+            let chunk = (remaining as usize).min(batch_size);
+            remaining -= chunk as u64;
+
+            // Sample sequentially (same RNG).
+            let sampled: Vec<(Situation, Vec<Vec<f64>>)> = (0..chunk)
+                .filter_map(|_| {
+                    let sit = sample_situation(
+                        &datagen_config, initial_stack, board_size, &mut rng_par,
+                    );
+                    if sit.effective_stack <= 0 {
+                        par_skipped += 1;
+                        return None;
+                    }
+                    let sizes = fuzz_bet_sizes(&bet_sizes, bet_size_fuzz, &mut rng_par);
+                    Some((sit, sizes))
+                })
+                .collect();
+
+            // Build trees in parallel.
+            let games: Vec<Option<(Situation, PostFlopGame)>> = build_pool.install(|| {
+                sampled.into_par_iter()
+                    .map(|(sit, sizes)| {
+                        let game = build_turn_game(
+                            sit.board_cards(),
+                            f64::from(sit.pot),
+                            f64::from(sit.effective_stack),
+                            &sit.ranges,
+                            &sizes,
+                        );
+                        game.map(|g| (sit, g))
+                    })
+                    .collect()
+            });
+
+            for item in games {
+                if let Some((_sit, game)) = item {
+                    par_results.push(game.num_boundary_nodes());
+                } else {
+                    par_build_failed += 1;
+                }
+            }
+        }
+
+        // Verify identical results.
+        assert_eq!(seq_skipped, par_skipped, "skipped counts must match");
+        assert_eq!(seq_build_failed, par_build_failed, "build failure counts must match");
+        assert_eq!(seq_results.len(), par_results.len(), "successful game counts must match");
+        assert_eq!(seq_results, par_results, "boundary node counts must match in order");
+
+        // Verify total accounting: all num_samples are accounted for.
+        let total_seq = seq_results.len() as u64 + seq_skipped + seq_build_failed;
+        let total_par = par_results.len() as u64 + par_skipped + par_build_failed;
+        assert_eq!(total_seq, num_samples, "sequential must account for all samples");
+        assert_eq!(total_par, num_samples, "parallel must account for all samples");
     }
 }
