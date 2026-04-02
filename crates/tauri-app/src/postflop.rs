@@ -1982,13 +1982,13 @@ mod tests {
     #[test]
     fn test_matrix_cell_label_offsuit() {
         let (label, suited, pair) = matrix_cell_label(1, 0);
-        assert_eq!(label, "KAo");
+        assert_eq!(label, "AKo");
         assert!(!suited);
         assert!(!pair);
 
         // More conventional: row=larger rank index, col=smaller.
         let (label, suited, pair) = matrix_cell_label(2, 0);
-        assert_eq!(label, "QAo");
+        assert_eq!(label, "AQo");
         assert!(!suited);
         assert!(!pair);
     }

@@ -1101,29 +1101,29 @@ fn generate_turn_training_data_exact(
         while let Ok(msg) = storage_rx.recv() {
             match msg {
                 StorageMsg::TurnRecord(rec) => {
-                    write_record(&mut turn_writer, &rec).map_err(|e| format!("write turn: {e}"))?;
-                    turn_records_in_file += 1;
-                    turn_buf_depth_ref.store(turn_records_in_file, Ordering::Relaxed);
                     if turn_records_in_file >= per_file {
                         drop(turn_writer);
                         turn_writer = open_file(&turn_output_path, &mut turn_file_count)?;
                         turn_records_in_file = 0;
                         turn_buf_depth_ref.store(0, Ordering::Relaxed);
                     }
+                    write_record(&mut turn_writer, &rec).map_err(|e| format!("write turn: {e}"))?;
+                    turn_records_in_file += 1;
+                    turn_buf_depth_ref.store(turn_records_in_file, Ordering::Relaxed);
                 }
                 StorageMsg::RiverRecord(rec) => {
+                    if river_writer.is_some() && river_records_in_file >= per_file {
+                        if let Some(ref rp) = river_out_for_stage4 {
+                            drop(river_writer.take());
+                            river_writer = Some(open_file(rp, &mut river_file_count)?);
+                            river_records_in_file = 0;
+                            river_buf_depth_ref.store(0, Ordering::Relaxed);
+                        }
+                    }
                     if let Some(ref mut rw) = river_writer {
                         write_record(rw, &rec).map_err(|e| format!("write river: {e}"))?;
                         river_records_in_file += 1;
                         river_buf_depth_ref.store(river_records_in_file, Ordering::Relaxed);
-                        if river_records_in_file >= per_file {
-                            if let Some(ref rp) = river_out_for_stage4 {
-                                drop(river_writer.take());
-                                river_writer = Some(open_file(rp, &mut river_file_count)?);
-                                river_records_in_file = 0;
-                                river_buf_depth_ref.store(0, Ordering::Relaxed);
-                            }
-                        }
                     }
                 }
                 StorageMsg::Flush => break,
@@ -1695,7 +1695,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 20,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()
@@ -1752,7 +1752,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 20,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()
@@ -1818,7 +1818,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 20,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(42),
             ..Default::default()
@@ -1921,7 +1921,7 @@ mod tests {
             num_samples: 1,
             street: "turn".into(),
             solver_iterations: 10,
-            target_exploitability: 0.05,
+            target_exploitability: Some(0.05),
             threads: 1,
             seed: Some(123),
             ..Default::default()
