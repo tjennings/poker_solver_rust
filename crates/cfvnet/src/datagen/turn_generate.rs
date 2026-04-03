@@ -245,7 +245,59 @@ fn evaluate_pool_boundaries<B2: burn::tensor::backend::Backend>(
     let output = model.forward(input_tensor);
     let out_vec: Vec<f32> = output.into_data().to_vec().expect("output tensor conversion");
 
-    for (gi, ordinal, player, cfvs) in decode_boundary_cfvs(&out_vec, &requests, &rows_per) {
+    let decoded = decode_boundary_cfvs(&out_vec, &requests, &rows_per);
+
+    // Diagnostic: log GPU inputs/outputs for game 0, OOP player.
+    if !active_games.is_empty() {
+        let (ref sit, ref game, iter) = active_games[0];
+        let board_u8 = sit.board_cards();
+        let board_str: Vec<String> = board_u8.iter().map(|&c| {
+            let rank = ["2","3","4","5","6","7","8","9","T","J","Q","K","A"][c as usize / 4];
+            let suit = ["c","d","h","s"][c as usize % 4];
+            format!("{rank}{suit}")
+        }).collect();
+        let nb = game.num_boundary_nodes();
+        let hands = game.private_cards(0);
+
+        for (gi, ordinal, player, cfvs) in &decoded {
+            if *gi == 0 && *player == 0 {
+                let oop_reach = game.boundary_reach(*ordinal, 0);
+                let ip_reach = game.boundary_reach(*ordinal, 1);
+                let oop_sum: f32 = oop_reach.iter().sum();
+                let ip_sum: f32 = ip_reach.iter().sum();
+
+                let mut hand_reaches: Vec<(String, f32)> = hands.iter().enumerate()
+                    .filter_map(|(i, &(c0, c1))| {
+                        let r = if i < oop_reach.len() { oop_reach[i] } else { 0.0 };
+                        if r > 0.0 {
+                            let h0 = format!("{}{}", ["2","3","4","5","6","7","8","9","T","J","Q","K","A"][c0 as usize / 4], ["c","d","h","s"][c0 as usize % 4]);
+                            let h1 = format!("{}{}", ["2","3","4","5","6","7","8","9","T","J","Q","K","A"][c1 as usize / 4], ["c","d","h","s"][c1 as usize % 4]);
+                            Some((format!("{h0}{h1}"), r))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                hand_reaches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let top_hands: Vec<String> = hand_reaches.iter().take(5)
+                    .map(|(h, r)| format!("{h}:{r:.4}"))
+                    .collect();
+
+                let cfv_sum: f32 = cfvs.iter().sum();
+                let cfv_abs: f32 = cfvs.iter().map(|v| v.abs()).sum();
+                let bpot = game.boundary_pot(*ordinal);
+
+                // Log the ordinal and pot which identifies the action line.
+
+                eprintln!(
+                    "[GPU] iter={iter} board=[{}] ord={ordinal}/{nb} pot={bpot} | reach: oop={oop_sum:.4} ip={ip_sum:.4} | top_oop=[{}] | cfv: sum={cfv_sum:.4} abs={cfv_abs:.4}",
+                    board_str.join(" "), top_hands.join(", ")
+                );
+            }
+        }
+    }
+
+    for (gi, ordinal, player, cfvs) in decoded {
         active_games[gi].1.set_boundary_cfvs(ordinal, player, cfvs);
     }
 }
@@ -1710,7 +1762,7 @@ fn generate_turn_training_data_iterative(
         
         // Flush boundary caches for next GPU eval.
         for (_sit, game, _iter) in &active {
-            game.flush_boundary_caches();
+            game.clear_boundary_cfvs();
         }
     }
 
@@ -3708,7 +3760,7 @@ mod tests {
 
             // 3. Flush boundary caches.
             for (_sit, game, _iter) in &pool {
-                game.flush_boundary_caches();
+                game.clear_boundary_cfvs();
             }
 
             // 4. Graduate finished games.
@@ -4012,7 +4064,7 @@ mod tests {
                     *iter += 1;
                 }
                 for (_sit, game, _iter) in pool.iter() {
-                    game.flush_boundary_caches();
+                    game.clear_boundary_cfvs();
                 }
                 let mut i = 0;
                 while i < pool.len() {
@@ -4046,7 +4098,7 @@ mod tests {
                     }
                 }
                 for (_sit, game, _iter) in pool.iter() {
-                    game.flush_boundary_caches();
+                    game.clear_boundary_cfvs();
                 }
                 let mut i = 0;
                 while i < pool.len() {
@@ -4153,7 +4205,7 @@ mod tests {
                 }
             }
             for (_sit, game, _iter) in pool.iter() {
-                game.flush_boundary_caches();
+                game.clear_boundary_cfvs();
             }
             let mut i = 0;
             while i < pool.len() {
