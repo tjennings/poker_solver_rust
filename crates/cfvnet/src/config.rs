@@ -227,7 +227,7 @@ fn default_solver_iterations() -> u32 {
     1000
 }
 fn default_active_pool_size() -> usize {
-    64
+    256
 }
 fn default_threads() -> usize {
     std::thread::available_parallelism()
