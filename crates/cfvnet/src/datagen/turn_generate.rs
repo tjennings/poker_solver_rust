@@ -1372,37 +1372,15 @@ fn generate_turn_training_data_exact(
     Ok(())
 }
 
-/// Turn datagen with per-iteration boundary re-evaluation (lockstep ring buffer).
+/// Load the river CFV model from the path specified in the config.
 ///
-/// K games cycle through a lockstep loop:
-/// 1. GPU batch eval all boundaries (one forward pass)
-/// 2. solve_step all K games in parallel (thread::scope, force_sequential)
-/// 3. Flush boundary caches so next GPU eval sees fresh reaches
-/// 4. Graduate finished games to writer, inject new ones from deal buffer
-fn generate_turn_training_data_iterative(
+/// Resolves model architecture (hidden layers/size) from the co-located `config.yaml`
+/// next to the model file, falling back to the main config if not found.
+/// `label` is used for log messages (e.g., `"[iterative]"`, `"[wgpu]"`).
+fn load_river_model(
     config: &CfvnetConfig,
-    output_path: &Path,
-) -> Result<(), String> {
-    let num_samples = config.datagen.num_samples;
-    let seed = crate::config::resolve_seed(config.datagen.seed);
-    let threads = config.datagen.threads.max(1);
-    let solver_iterations = config.datagen.solver_iterations;
-    let pool_size = config.datagen.active_pool_size;
-    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
-    if bet_sizes_f64.is_empty() {
-        return Err("no valid percentage bet sizes found in config".into());
-    }
-    let bet_sizes_vec = bet_sizes_f64;
-    let initial_stack = config.game.initial_stack;
-    let board_size = config.game.board_size;
-    let bet_size_fuzz = config.datagen.bet_size_fuzz;
-    let eval_interval = if config.datagen.leaf_eval_interval == 0 {
-        1 // 0 means every iteration
-    } else {
-        config.datagen.leaf_eval_interval
-    };
-
-    // Load river model.
+    label: &str,
+) -> Result<(CfvNet<B>, <B as burn::tensor::backend::Backend>::Device), String> {
     let river_model_path = config.game.river_model_path.as_deref()
         .ok_or("river_model_path is required for turn datagen")?;
     let river_model_dir = std::path::Path::new(river_model_path)
@@ -1414,12 +1392,12 @@ fn generate_turn_training_data_iterative(
             .map_err(|e| format!("read river config: {e}"))?;
         let river_cfg: CfvnetConfig = serde_yaml::from_str(&river_yaml)
             .map_err(|e| format!("parse river config: {e}"))?;
-        eprintln!("[iterative] river model architecture: {}x{} (from {})",
+        eprintln!("{label} river model architecture: {}x{} (from {})",
             river_cfg.training.hidden_layers, river_cfg.training.hidden_size,
             river_config_path.display());
         (river_cfg.training.hidden_layers, river_cfg.training.hidden_size)
     } else {
-        eprintln!("[iterative] warning: no river config.yaml found, using config architecture");
+        eprintln!("{label} warning: no river config.yaml found, using config architecture");
         (config.training.hidden_layers, config.training.hidden_size)
     };
 
@@ -1430,25 +1408,40 @@ fn generate_turn_training_data_iterative(
     )
     .load_file(river_model_path, &recorder, &device)
     .map_err(|e| format!("failed to load river model: {e}"))?;
-    eprintln!("[iterative] river model loaded on wgpu");
+    eprintln!("{label} river model loaded on wgpu");
 
-    let wall_start = std::time::Instant::now();
+    Ok((model, device))
+}
 
-    // --- Deal gen thread (reuses existing Stage 1 pattern) ---
+/// Spawn a background thread that generates deal situations and game trees.
+///
+/// Returns the thread handle, a receiver for `(Situation, PostFlopGame)` pairs,
+/// and an atomic counter tracking the total number of deals processed (including
+/// degenerate ones that were filtered out).
+fn spawn_deal_gen_thread(
+    config: &CfvnetConfig,
+    seed: u64,
+    num_samples: u64,
+) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<(Situation, PostFlopGame)>, Arc<AtomicU64>) {
+    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
+    let initial_stack = config.game.initial_stack;
+    let board_size = config.game.board_size;
+    let bet_size_fuzz = config.datagen.bet_size_fuzz;
+    let datagen_config = config.datagen.clone();
+
     let (deal_tx, deal_rx) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
         PIPELINE_CHANNEL_CAPACITY_TURN,
     );
 
     let deal_count = Arc::new(AtomicU64::new(0));
     let deal_count_ref = Arc::clone(&deal_count);
-    let datagen_config = config.datagen.clone();
-    let bet_sizes_for_deal = bet_sizes_vec;
+
     let build_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
-        .map_err(|e| format!("build pool: {e}"))?;
+        .expect("failed to create deal gen rayon pool");
 
-    let deal_thread = std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut remaining = num_samples;
         let batch_size = 64usize;
@@ -1468,7 +1461,7 @@ fn generate_turn_training_data_iterative(
                         return None;
                     }
                     let sizes = fuzz_bet_sizes(
-                        &bet_sizes_for_deal, bet_size_fuzz, &mut rng,
+                        &bet_sizes_f64, bet_size_fuzz, &mut rng,
                     );
                     Some((sit, sizes))
                 })
@@ -1509,14 +1502,25 @@ fn generate_turn_training_data_iterative(
         }
     });
 
-    // --- Writer thread (reuses existing Stage 4 pattern) ---
+    (handle, deal_rx, deal_count)
+}
+
+/// Spawn a background writer thread that consumes `SolveResult` tuples and writes
+/// training records to the output file.
+///
+/// Returns the thread handle, a sync sender for submitting results, and an atomic
+/// counter tracking the number of records written.
+fn spawn_writer_thread(
+    output_path: &Path,
+) -> (std::thread::JoinHandle<Result<(), String>>, std::sync::mpsc::SyncSender<SolveResult>, Arc<AtomicU64>) {
     let (storage_tx, storage_rx) =
         std::sync::mpsc::sync_channel::<SolveResult>(512);
 
     let output_path_owned = output_path.to_path_buf();
     let write_count = Arc::new(AtomicU64::new(0));
     let write_count_ref = Arc::clone(&write_count);
-    let writer_thread = std::thread::spawn(move || -> Result<(), String> {
+
+    let handle = std::thread::spawn(move || -> Result<(), String> {
         let file = std::fs::File::create(&output_path_owned)
             .map_err(|e| format!("create output: {e}"))?;
         let mut writer = BufWriter::with_capacity(1 << 20, file);
@@ -1551,6 +1555,43 @@ fn generate_turn_training_data_iterative(
         std::io::Write::flush(&mut writer).map_err(|e| format!("flush: {e}"))?;
         Ok(())
     });
+
+    (handle, storage_tx, write_count)
+}
+
+/// Turn datagen with per-iteration boundary re-evaluation (lockstep ring buffer).
+///
+/// K games cycle through a lockstep loop:
+/// 1. GPU batch eval all boundaries (one forward pass)
+/// 2. solve_step all K games in parallel (thread::scope, force_sequential)
+/// 3. Flush boundary caches so next GPU eval sees fresh reaches
+/// 4. Graduate finished games to writer, inject new ones from deal buffer
+fn generate_turn_training_data_iterative(
+    config: &CfvnetConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    let num_samples = config.datagen.num_samples;
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let threads = config.datagen.threads.max(1);
+    let solver_iterations = config.datagen.solver_iterations;
+    let pool_size = config.datagen.active_pool_size;
+    let initial_stack = config.game.initial_stack;
+    let eval_interval = if config.datagen.leaf_eval_interval == 0 {
+        1 // 0 means every iteration
+    } else {
+        config.datagen.leaf_eval_interval
+    };
+
+    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
+    if bet_sizes_f64.is_empty() {
+        return Err("no valid percentage bet sizes found in config".into());
+    }
+
+    let (model, device) = load_river_model(config, "[iterative]")?;
+    let wall_start = std::time::Instant::now();
+
+    let (deal_thread, deal_rx, deal_count) = spawn_deal_gen_thread(config, seed, num_samples);
+    let (writer_thread, storage_tx, write_count) = spawn_writer_thread(output_path);
 
     // --- Progress bar ---
     let pb = ProgressBar::new(num_samples);
@@ -4128,5 +4169,127 @@ mod tests {
             assert!(oop_gv.is_finite(), "game {i}: OOP game value not finite");
             assert!(ip_gv.is_finite(), "game {i}: IP game value not finite");
         }
+    }
+
+    // --- Tests for extracted helper functions ---
+
+    #[test]
+    fn spawn_deal_gen_thread_produces_deals() {
+        let config = turn_test_config(10);
+        let seed = 42u64;
+        let (handle, rx, deal_count) = spawn_deal_gen_thread(&config, seed, 10);
+
+        let mut received = Vec::new();
+        while let Ok(pair) = rx.recv() {
+            received.push(pair);
+        }
+        handle.join().expect("deal thread should not panic");
+
+        // Should produce some deals (not all 10 may succeed due to degenerate filtering).
+        assert!(!received.is_empty(), "should produce at least one deal");
+        // deal_count tracks both successful and degenerate deals.
+        assert!(deal_count.load(Ordering::Relaxed) > 0, "deal counter should be incremented");
+    }
+
+    #[test]
+    fn spawn_deal_gen_thread_respects_num_samples() {
+        let config = turn_test_config(5);
+        let seed = 123u64;
+        let (handle, rx, deal_count) = spawn_deal_gen_thread(&config, seed, 5);
+
+        let mut count = 0u64;
+        while rx.recv().is_ok() {
+            count += 1;
+        }
+        handle.join().expect("deal thread should not panic");
+
+        // Total deal_count (successful + degenerate) should equal num_samples.
+        assert_eq!(deal_count.load(Ordering::Relaxed), 5,
+            "deal counter should match num_samples");
+        // Received deals should be at most num_samples.
+        assert!(count <= 5, "should not produce more deals than requested");
+    }
+
+    #[test]
+    fn spawn_deal_gen_thread_handles_zero_samples() {
+        let config = turn_test_config(0);
+        let seed = 1u64;
+        let (handle, rx, deal_count) = spawn_deal_gen_thread(&config, seed, 0);
+
+        // Channel should close immediately with no items.
+        assert!(rx.recv().is_err(), "should produce no deals for zero samples");
+        handle.join().expect("deal thread should not panic");
+        assert_eq!(deal_count.load(Ordering::Relaxed), 0);
+    }
+
+    fn test_situation(pot: i32) -> Situation {
+        Situation {
+            board: [0, 4, 8, 12, 0], // As Kh Qd Jc + unused
+            board_size: 4,
+            pot,
+            effective_stack: 200,
+            ranges: [[0.5f32; NUM_COMBOS]; 2],
+        }
+    }
+
+    #[test]
+    fn spawn_writer_thread_writes_records() {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        let (handle, tx, write_count) = spawn_writer_thread(&path);
+
+        let sit = test_situation(100);
+        let oop_cfvs = [0.1f32; NUM_COMBOS];
+        let ip_cfvs = [0.2f32; NUM_COMBOS];
+        let valid_mask = [1u8; NUM_COMBOS];
+        let oop_gv = 0.5f32;
+        let ip_gv = -0.5f32;
+
+        tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv))
+            .expect("send should succeed");
+        drop(tx); // Close channel to signal writer to stop.
+
+        handle.join().expect("writer thread should not panic")
+            .expect("writer should succeed");
+
+        assert_eq!(write_count.load(Ordering::Relaxed), 1, "should have written one record");
+        // Verify file is non-empty.
+        let metadata = std::fs::metadata(&path).expect("file should exist");
+        assert!(metadata.len() > 0, "output file should be non-empty");
+    }
+
+    #[test]
+    fn spawn_writer_thread_handles_empty_channel() {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        let (handle, tx, write_count) = spawn_writer_thread(&path);
+        drop(tx); // Close immediately.
+
+        handle.join().expect("writer thread should not panic")
+            .expect("writer should succeed with no records");
+
+        assert_eq!(write_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn spawn_writer_thread_counts_multiple_records() {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        let (handle, tx, write_count) = spawn_writer_thread(&path);
+
+        for i in 0..3 {
+            let sit = test_situation(100 + i);
+            tx.send((sit, [0.0f32; NUM_COMBOS], [0.0f32; NUM_COMBOS], [1u8; NUM_COMBOS], 0.0, 0.0))
+                .expect("send should succeed");
+        }
+        drop(tx);
+
+        handle.join().expect("writer thread should not panic")
+            .expect("writer should succeed");
+
+        assert_eq!(write_count.load(Ordering::Relaxed), 3, "should count all three records");
     }
 }
