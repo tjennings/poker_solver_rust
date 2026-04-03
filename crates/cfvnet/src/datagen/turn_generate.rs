@@ -1703,8 +1703,19 @@ pub fn generate_turn_training_data(
         "cuda" => return generate_turn_training_data_cuda(config, output_path),
         #[cfg(not(feature = "cuda"))]
         "cuda" => return Err("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release".into()),
-        _ => {} // fall through to NdArray path
+        _ => {} // fall through to wgpu path
     }
+    generate_turn_training_data_wgpu(config, output_path)
+}
+
+/// wgpu pipeline: deal → GPU Stage 2 → solver threads → Stage 4 writer.
+///
+/// Used for model-mode turn datagen (pre-compute boundary CFVs once) and
+/// river datagen (skips GPU stage, solves to showdown).
+fn generate_turn_training_data_wgpu(
+    config: &CfvnetConfig,
+    output_path: &Path,
+) -> Result<(), String> {
     let num_samples = config.datagen.num_samples;
     let seed = crate::config::resolve_seed(config.datagen.seed);
     let threads = config.datagen.threads;
