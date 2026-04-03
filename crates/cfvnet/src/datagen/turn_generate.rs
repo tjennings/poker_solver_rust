@@ -532,7 +532,7 @@ fn build_turn_game_inner(
 }
 
 /// Build a depth-limited turn game tree (model mode, with boundary nodes at river).
-fn build_turn_game(
+pub(crate) fn build_turn_game(
     board_u8: &[u8],
     pot: f64,
     effective_stack: f64,
