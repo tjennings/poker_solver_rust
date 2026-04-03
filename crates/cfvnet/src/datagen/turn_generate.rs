@@ -1739,8 +1739,8 @@ fn generate_turn_training_data_iterative(
                     let _ = storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv));
                     active_count.fetch_sub(1, Ordering::Relaxed);
                 } else {
-                    // Needs GPU eval: flush and send to eval queue.
-                    game.flush_boundary_caches();
+                    // Needs GPU eval: clear stale CFVs but keep reaches for GPU input.
+                    game.clear_boundary_cfvs();
                     if eval_tx.send((sit, game, iter)).is_err() {
                         return;
                     }

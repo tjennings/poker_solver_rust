@@ -374,6 +374,17 @@ impl PostFlopGame {
         }
     }
 
+    /// Clear only boundary CFVs, keeping reach probabilities intact.
+    ///
+    /// Use this when sending games to GPU re-evaluation: the GPU needs
+    /// the current reaches to compute new CFVs, but old CFVs must be
+    /// cleared so `solve_step` doesn't reuse stale values.
+    pub fn clear_boundary_cfvs(&self) {
+        for m in &self.boundary_cfvs {
+            m.lock().unwrap().clear();
+        }
+    }
+
     /// Returns the opponent reach probabilities at a boundary node for a given player.
     /// Lazily cached during solve_step. Returns empty vec if not yet visited.
     pub fn boundary_reach(&self, ordinal: usize, player: usize) -> Vec<f32> {
