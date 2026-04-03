@@ -1396,6 +1396,11 @@ fn generate_turn_training_data_iterative(
     let initial_stack = config.game.initial_stack;
     let board_size = config.game.board_size;
     let bet_size_fuzz = config.datagen.bet_size_fuzz;
+    let eval_interval = if config.datagen.leaf_eval_interval == 0 {
+        1 // 0 means every iteration
+    } else {
+        config.datagen.leaf_eval_interval
+    };
 
     // Load river model.
     let river_model_path = config.game.river_model_path.as_deref()
@@ -1567,29 +1572,33 @@ fn generate_turn_training_data_iterative(
         }
     }
 
-    eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}",
-        active.len(), solver_iterations, threads);
+    eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}, leaf_eval_interval={}",
+        active.len(), solver_iterations, threads, eval_interval);
 
     // --- Lockstep loop ---
     while !active.is_empty() {
         // 1. GPU: evaluate boundaries for all active games.
         evaluate_pool_boundaries(&model, &device, &mut active);
 
-        // 2. Solve: one iteration per game, parallel via std::thread::scope.
+        // 2. Solve: run eval_interval iterations per game, parallel via std::thread::scope.
+        let iters_this_round = eval_interval;
         let chunk_size = (active.len() + threads - 1) / threads;
         std::thread::scope(|s| {
             for chunk in active.chunks_mut(chunk_size.max(1)) {
                 s.spawn(|| {
                     range_solver::set_force_sequential(true);
                     for (_sit, game, iter) in chunk.iter_mut() {
-                        solve_step(game, *iter);
-                        *iter += 1;
+                        let target = (*iter + iters_this_round).min(solver_iterations);
+                        while *iter < target {
+                            solve_step(game, *iter);
+                            *iter += 1;
+                        }
                     }
                 });
             }
         });
 
-        // 3. Flush boundary caches so next GPU eval sees fresh reaches.
+        // 3. Flush boundary caches for next GPU eval.
         for (_sit, game, _iter) in &active {
             game.flush_boundary_caches();
         }
@@ -3856,6 +3865,257 @@ mod tests {
                 (ip_gv - exp_ip_gv).abs() < 1e-4,
                 "game {i} IP game value mismatch: pool={ip_gv} batch={exp_ip_gv}"
             );
+        }
+    }
+
+    /// Test multi-iteration lockstep: running eval_interval iterations between
+    /// GPU evals produces valid, finite results identical to single-iteration lockstep.
+    #[test]
+    fn multi_iteration_lockstep_matches_single_iteration() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 10,
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let solver_iterations = 10u32;
+        let eval_interval: u32 = 5; // GPU eval every 5 iterations
+
+        // Build 2 games.
+        let mut games_for_single: Vec<(Situation, PostFlopGame, u32)> = Vec::new();
+        for _ in 0..20 {
+            let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            if let Some(game) = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            ) {
+                if game.num_boundary_nodes() > 0 {
+                    games_for_single.push((sit, game, 0));
+                }
+            }
+            if games_for_single.len() >= 2 {
+                break;
+            }
+        }
+        assert!(games_for_single.len() >= 2, "need at least 2 games");
+
+        // Clone games for multi-iteration path (rebuild from same situations).
+        let mut games_for_multi: Vec<(Situation, PostFlopGame, u32)> = games_for_single
+            .iter()
+            .map(|(sit, _game, _)| {
+                let game = build_turn_game(
+                    sit.board_cards(),
+                    f64::from(sit.pot),
+                    f64::from(sit.effective_stack),
+                    &sit.ranges,
+                    &bet_sizes,
+                )
+                .expect("rebuild should succeed");
+                (sit.clone(), game, 0u32)
+            })
+            .collect();
+
+        // Path A: single-iteration lockstep (eval_interval=1, existing pattern).
+        let mut results_single: Vec<SolveResult> = Vec::new();
+        {
+            let pool = &mut games_for_single;
+            while !pool.is_empty() {
+                evaluate_pool_boundaries(&model, &device, pool);
+                range_solver::set_force_sequential(true);
+                for (_sit, game, iter) in pool.iter_mut() {
+                    solve_step(game, *iter);
+                    *iter += 1;
+                }
+                for (_sit, game, _iter) in pool.iter() {
+                    game.flush_boundary_caches();
+                }
+                let mut i = 0;
+                while i < pool.len() {
+                    if pool[i].2 >= solver_iterations {
+                        let (sit, mut game, _) = pool.swap_remove(i);
+                        range_solver::finalize(&mut game);
+                        let exploit = range_solver::compute_exploitability(&game);
+                        let pot = f64::from(sit.pot);
+                        let r = extract_results(&mut game, pot, &sit.ranges, exploit);
+                        results_single.push((sit, r.0, r.1, r.2, r.3, r.4));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        // Path B: multi-iteration lockstep (eval_interval=5).
+        let mut results_multi: Vec<SolveResult> = Vec::new();
+        {
+            let pool = &mut games_for_multi;
+            while !pool.is_empty() {
+                evaluate_pool_boundaries(&model, &device, pool);
+                range_solver::set_force_sequential(true);
+                let iters_this_round = eval_interval;
+                for (_sit, game, iter) in pool.iter_mut() {
+                    let target = (*iter + iters_this_round).min(solver_iterations);
+                    while *iter < target {
+                        solve_step(game, *iter);
+                        *iter += 1;
+                    }
+                }
+                for (_sit, game, _iter) in pool.iter() {
+                    game.flush_boundary_caches();
+                }
+                let mut i = 0;
+                while i < pool.len() {
+                    if pool[i].2 >= solver_iterations {
+                        let (sit, mut game, _) = pool.swap_remove(i);
+                        range_solver::finalize(&mut game);
+                        let exploit = range_solver::compute_exploitability(&game);
+                        let pot = f64::from(sit.pot);
+                        let r = extract_results(&mut game, pot, &sit.ranges, exploit);
+                        results_multi.push((sit, r.0, r.1, r.2, r.3, r.4));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        // Both paths should graduate all games.
+        assert_eq!(results_single.len(), results_multi.len(),
+            "both paths should graduate the same number of games");
+        assert!(results_multi.len() >= 2, "expected at least 2 graduated results");
+
+        // Results won't be identical (different GPU eval frequency changes
+        // intermediate CFVs), but multi-iteration results must be valid.
+        for (i, (_, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) in results_multi.iter().enumerate() {
+            let num_valid: usize = valid_mask.iter().map(|&v| v as usize).sum();
+            assert!(num_valid > 0, "game {i}: no valid combos");
+            for (j, &cfv) in oop_cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "game {i} OOP combo {j}: non-finite CFV {cfv}");
+            }
+            for (j, &cfv) in ip_cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "game {i} IP combo {j}: non-finite CFV {cfv}");
+            }
+            assert!(oop_gv.is_finite(), "game {i}: OOP game value not finite");
+            assert!(ip_gv.is_finite(), "game {i}: IP game value not finite");
+        }
+    }
+
+    /// Test that eval_interval of 0 is treated as 1 (every iteration).
+    #[test]
+    fn eval_interval_zero_treated_as_one() {
+        let raw = 0u32;
+        let eval_interval = if raw == 0 { 1 } else { raw };
+        assert_eq!(eval_interval, 1);
+    }
+
+    /// Test that eval_interval equal to solver_iterations means only one GPU
+    /// eval at iter 0, with all iterations running in a single scope.
+    #[test]
+    fn eval_interval_equals_solver_iterations() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 10,
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let solver_iterations = 10u32;
+        let eval_interval = 10u32; // Only one GPU eval at start
+
+        let mut pool: Vec<(Situation, PostFlopGame, u32)> = Vec::new();
+        for _ in 0..20 {
+            let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            if let Some(game) = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            ) {
+                if game.num_boundary_nodes() > 0 {
+                    pool.push((sit, game, 0));
+                }
+            }
+            if pool.len() >= 2 {
+                break;
+            }
+        }
+        assert!(pool.len() >= 2, "need at least 2 games");
+
+        let mut gpu_eval_count = 0u32;
+        let mut results: Vec<SolveResult> = Vec::new();
+        while !pool.is_empty() {
+            evaluate_pool_boundaries(&model, &device, &mut pool);
+            gpu_eval_count += 1;
+
+            range_solver::set_force_sequential(true);
+            let iters_this_round = eval_interval;
+            for (_sit, game, iter) in pool.iter_mut() {
+                let target = (*iter + iters_this_round).min(solver_iterations);
+                while *iter < target {
+                    solve_step(game, *iter);
+                    *iter += 1;
+                }
+            }
+            for (_sit, game, _iter) in pool.iter() {
+                game.flush_boundary_caches();
+            }
+            let mut i = 0;
+            while i < pool.len() {
+                if pool[i].2 >= solver_iterations {
+                    let (sit, mut game, _) = pool.swap_remove(i);
+                    range_solver::finalize(&mut game);
+                    let exploit = range_solver::compute_exploitability(&game);
+                    let pot = f64::from(sit.pot);
+                    let r = extract_results(&mut game, pot, &sit.ranges, exploit);
+                    results.push((sit, r.0, r.1, r.2, r.3, r.4));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // With eval_interval == solver_iterations, there should be exactly 1
+        // GPU eval round (all iterations run in one scope).
+        assert_eq!(gpu_eval_count, 1,
+            "expected exactly 1 GPU eval when eval_interval == solver_iterations");
+        assert_eq!(results.len(), 2, "expected 2 graduated results");
+
+        for (i, (_sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) in results.iter().enumerate() {
+            let num_valid: usize = valid_mask.iter().map(|&v| v as usize).sum();
+            assert!(num_valid > 0, "game {i}: no valid combos");
+            for (j, &cfv) in oop_cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "game {i} OOP combo {j}: non-finite CFV {cfv}");
+            }
+            for (j, &cfv) in ip_cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "game {i} IP combo {j}: non-finite CFV {cfv}");
+            }
+            assert!(oop_gv.is_finite(), "game {i}: OOP game value not finite");
+            assert!(ip_gv.is_finite(), "game {i}: IP game value not finite");
         }
     }
 }
