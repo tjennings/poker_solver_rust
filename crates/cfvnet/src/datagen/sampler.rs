@@ -223,7 +223,7 @@ mod tests {
             threads: 1,
             seed: Some(42),
             leaf_eval_interval: 0,
-            active_pool_size: 64, gpu_batch_size: 10,
+            active_pool_size: 64,
             bet_size_fuzz: 0.0,
             river_output: None,
             per_file: None,
