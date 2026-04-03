@@ -1659,126 +1659,153 @@ fn generate_turn_training_data_iterative(
 
     eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}",
         active.len(), solver_iterations, threads);
-
     eprintln!("[iterative] leaf_eval_interval={eval_interval} (GPU eval every {eval_interval} iterations)");
 
-    // --- Double-buffered loop: GPU and CPU overlap ---
+    // --- Async queue-based pipeline: persistent threads, no barriers ---
     //
-    // Two groups of games: `solving` (CPU work) and `evaluating` (GPU work).
-    // While CPU threads solve one group, the GPU evaluates boundaries for the other.
-    // After both finish, swap groups.
+    // Ready Queue → [N Solver Threads] → Eval Queue → [GPU (main thread)] → Ready Queue
+    //                                  ↘ Write Queue (if done)
     //
-    // Flow per round:
-    //   GPU thread: evaluate_pool_boundaries(eval_group)
-    //   CPU threads: solve_step each game in solve_group (N iterations until next eval)
-    //   → swap groups
-    //   → graduate finished games, inject new ones
+    // Solver threads loop: pop ready → solve_step × eval_interval → push to eval or write.
+    // GPU (main thread): drain eval queue → batch forward pass → push to ready.
+    // Inject new deals when games graduate.
 
-    type ActiveGame = (Situation, PostFlopGame, u32);
+    type ActiveGame = (Situation, PostFlopGame, u32); // (sit, game, iteration)
 
-    // Helper: run eval_interval iterations of solve_step on a group.
-    let run_solve_iterations = |group: &mut [ActiveGame], n_iters: u32| {
-        let chunk_size = (group.len() + threads - 1) / threads;
-        for _ in 0..n_iters {
-            std::thread::scope(|s| {
-                for chunk in group.chunks_mut(chunk_size.max(1)) {
-                    s.spawn(|| {
-                        range_solver::set_force_sequential(true);
-                        for (_sit, game, iter) in chunk.iter_mut() {
-                            solve_step(game, *iter);
-                            *iter += 1;
-                        }
-                    });
-                }
-            });
-        }
-    };
+    // Channels: GPU pushes to ready, solvers pop from ready.
+    //           Solvers push to eval, GPU pops from eval.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<ActiveGame>(pool_size * 2);
+    let (eval_tx, eval_rx) = std::sync::mpsc::sync_channel::<ActiveGame>(pool_size * 2);
+    let ready_rx = Arc::new(Mutex::new(ready_rx));
 
-    // Helper: graduate finished games, inject new ones.
-    let graduate_and_inject = |group: &mut Vec<ActiveGame>,
-                                deal_rx: &std::sync::mpsc::Receiver<(Situation, PostFlopGame)>,
-                                storage_tx: &std::sync::mpsc::SyncSender<SolveResult>,
-                                pb: &ProgressBar,
-                                exploit_sum: &AtomicU64,
-                                exploit_count: &AtomicU64,
-                                initial_stack: i32| {
-        let mut i = 0;
-        while i < group.len() {
-            if group[i].2 >= solver_iterations {
-                let (sit, mut game, _) = group.swap_remove(i);
-                range_solver::finalize(&mut game);
-                let exploit = range_solver::compute_exploitability(&game);
-                let pot = f64::from(sit.pot);
-                let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
-                    extract_results(&mut game, pot, &sit.ranges, exploit);
+    // Seed eval queue — all games need initial GPU boundary eval.
+    for game in active {
+        eval_tx.send(game).expect("eval queue seed");
+    }
 
-                if exploit >= 0.0 {
-                    let bb = initial_stack as f32 / 100.0;
-                    let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
-                    exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
-                    exploit_count.fetch_add(1, Ordering::Relaxed);
-                }
+    // Track active game count for termination.
+    let active_count = Arc::new(AtomicU64::new(pool_size as u64));
+    let solve_iter_count = Arc::new(AtomicU64::new(0));
 
-                pb.inc(1);
-                let _ = storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv));
+    // --- Solver threads (persistent) ---
+    let mut solver_handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let ready_rx = Arc::clone(&ready_rx);
+        let eval_tx = eval_tx.clone();
+        let storage_tx = storage_tx.clone();
+        let pb = pb.clone();
+        let exploit_sum = Arc::clone(&exploit_sum);
+        let exploit_count = Arc::clone(&exploit_count);
+        let active_count = Arc::clone(&active_count);
+        let solve_iter_count = Arc::clone(&solve_iter_count);
 
-                if let Ok((new_sit, new_game)) = deal_rx.try_recv() {
-                    group.push((new_sit, new_game, 0));
-                }
-            } else {
-                i += 1;
-            }
-        }
-    };
+        solver_handles.push(std::thread::spawn(move || {
+            range_solver::set_force_sequential(true);
+            loop {
+                let (sit, mut game, mut iter) = match {
+                    let rx = ready_rx.lock().expect("ready_rx lock");
+                    rx.recv()
+                } {
+                    Ok(item) => item,
+                    Err(_) => return, // Channel closed.
+                };
 
-    // Split active pool into two groups.
-    let half = active.len() / 2;
-    let mut group_b: Vec<ActiveGame> = active.split_off(half);
-    let mut group_a: Vec<ActiveGame> = active;
-
-    // Bootstrap: GPU eval group_a so it's ready to solve.
-    evaluate_pool_boundaries(&model, &device, &mut group_a);
-
-    while !group_a.is_empty() || !group_b.is_empty() {
-        // group_a has fresh boundaries → solve on CPU threads.
-        // group_b needs boundaries → eval on GPU (this thread).
-        // Both run concurrently.
-
-        // Spawn CPU solve in background via thread::scope.
-        // GPU eval runs on this thread (model/device aren't Sync).
-        std::thread::scope(|s| {
-            if !group_a.is_empty() {
-                s.spawn(|| {
-                    run_solve_iterations(&mut group_a, eval_interval);
-                    for (_sit, game, _iter) in &group_a {
-                        game.flush_boundary_caches();
+                // Run eval_interval iterations.
+                for _ in 0..eval_interval {
+                    solve_step(&game, iter);
+                    iter += 1;
+                    solve_iter_count.fetch_add(1, Ordering::Relaxed);
+                    if iter >= solver_iterations {
+                        break;
                     }
-                });
+                }
+
+                if iter >= solver_iterations {
+                    // Graduate: finalize, extract, send to writer.
+                    range_solver::finalize(&mut game);
+                    let exploit = range_solver::compute_exploitability(&game);
+                    let pot = f64::from(sit.pot);
+                    let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
+                        extract_results(&mut game, pot, &sit.ranges, exploit);
+
+                    if exploit >= 0.0 {
+                        let bb = initial_stack as f32 / 100.0;
+                        let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                        exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
+                        exploit_count.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    pb.inc(1);
+                    let _ = storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv));
+                    active_count.fetch_sub(1, Ordering::Relaxed);
+                } else {
+                    // Needs GPU eval: flush and send to eval queue.
+                    game.flush_boundary_caches();
+                    if eval_tx.send((sit, game, iter)).is_err() {
+                        return;
+                    }
+                }
             }
+        }));
+    }
+    drop(eval_tx); // Solver clones are the only remaining senders.
+    drop(storage_tx); // Solver clones are the only remaining senders.
 
-            // GPU eval on the main thread (this scope participant).
-            if !group_b.is_empty() {
-                evaluate_pool_boundaries(&model, &device, &mut group_b);
+    // --- GPU loop (runs on main thread, owns model/device) ---
+    // Drains eval queue into batch, one forward pass, pushes to ready queue.
+    // Also injects new deals when games graduate.
+    let gpu_batch_size = pool_size; // max batch
+    loop {
+        // Drain eval queue into a batch (block on first, drain rest non-blocking).
+        let mut batch: Vec<ActiveGame> = Vec::with_capacity(gpu_batch_size);
+        match eval_rx.recv() {
+            Ok(item) => batch.push(item),
+            Err(_) => break, // All eval senders dropped → solvers done.
+        }
+        while batch.len() < gpu_batch_size {
+            match eval_rx.try_recv() {
+                Ok(item) => batch.push(item),
+                Err(_) => break,
             }
-        });
+        }
 
-        // Graduate + inject for both groups.
-        graduate_and_inject(&mut group_a, &deal_rx, &storage_tx, &pb,
-            &exploit_sum, &exploit_count, initial_stack);
-        graduate_and_inject(&mut group_b, &deal_rx, &storage_tx, &pb,
-            &exploit_sum, &exploit_count, initial_stack);
+        // GPU forward pass for the batch.
+        evaluate_pool_boundaries(&model, &device, &mut batch);
 
-        // Swap: group_a (just solved, needs GPU) becomes group_b.
-        //        group_b (just evaluated, ready to solve) becomes group_a.
-        std::mem::swap(&mut group_a, &mut group_b);
+        // Push evaluated games to ready queue.
+        for game in batch {
+            if ready_tx.send(game).is_err() {
+                break;
+            }
+        }
+
+        // Inject new deals to replace graduated games.
+        while active_count.load(Ordering::Relaxed) < pool_size as u64 {
+            match deal_rx.try_recv() {
+                Ok((sit, game)) => {
+                    // New game at iteration 0 — needs GPU eval, send to eval queue.
+                    // But we're the GPU thread, so eval it directly in the next batch.
+                    // For now, push to ready with iter=0; it will get eval'd next round
+                    // when the solver sends it back to eval queue after 0 iterations.
+                    // Actually: just eval it now and push to ready.
+                    let mut single = vec![(sit, game, 0u32)];
+                    evaluate_pool_boundaries(&model, &device, &mut single);
+                    let item = single.into_iter().next().unwrap();
+                    active_count.fetch_add(1, Ordering::Relaxed);
+                    if ready_tx.send(item).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break, // Deal buffer empty.
+            }
+        }
 
         // Update progress bar.
-        let total_active = group_a.len() + group_b.len();
-        let all_iters: f64 = group_a.iter().chain(group_b.iter())
-            .map(|(_, _, it)| *it as f64).sum::<f64>();
-        let avg_iter = all_iters / total_active.max(1) as f64;
+        let ac = active_count.load(Ordering::Relaxed);
         let wc = write_count.load(Ordering::Relaxed);
         let dc = deal_count.load(Ordering::Relaxed);
+        let si = solve_iter_count.load(Ordering::Relaxed);
+        let avg_iter = if ac + wc > 0 { si as f64 / (ac + wc) as f64 } else { 0.0 };
         let ec = exploit_count.load(Ordering::Relaxed);
         let avg_exploit = if ec > 0 {
             (exploit_sum.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
@@ -1786,19 +1813,22 @@ fn generate_turn_training_data_iterative(
             0.0
         };
         pb.set_message(format!(
-            "pool:[{}/{}] iter:[{:.0}/{}] deal\u{2192}[{}]\u{2192}solve\u{2192}[{}]\u{2192}write  expl:{:.1} mbb/h",
-            total_active, pool_size, avg_iter, solver_iterations,
-            dc, wc, avg_exploit,
+            "pool:[{ac}/{pool_size}] iter:[{avg_iter:.0}/{solver_iterations}] deal\u{2192}[{dc}]\u{2192}solve\u{2192}[{wc}]\u{2192}write  expl:{avg_exploit:.1} mbb/h",
         ));
 
-        // If both groups empty, we're done.
-        if group_a.is_empty() && group_b.is_empty() {
+        // If no active games and deal buffer empty, we're done.
+        if ac == 0 {
             break;
         }
     }
 
-    // Shut down writer.
-    drop(storage_tx);
+    // Shut down: close ready queue so solver threads exit.
+    drop(ready_tx);
+
+    // Wait for solver threads to drain, then shut down writer.
+    for (i, h) in solver_handles.into_iter().enumerate() {
+        h.join().map_err(|e| format!("solver thread {i} panicked: {e:?}"))?;
+    }
     deal_thread.join().map_err(|e| format!("deal thread panicked: {e:?}"))?;
     writer_thread.join().map_err(|e| format!("writer thread panicked: {e:?}"))??;
 
