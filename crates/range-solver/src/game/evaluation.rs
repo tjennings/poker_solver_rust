@@ -117,7 +117,11 @@ impl PostFlopGame {
                             let cfvs = evaluator.compute_cfvs(player, pot, remaining, &opp_reach_ref, num_hands, 0);
                             *self.boundary_cfvs[bcfv_index].lock().unwrap() = cfvs;
                         } else {
-                            return; // No evaluator — treat as zero.
+                            panic!(
+                                "boundary_cfvs empty at ordinal {ordinal}, player {player} \
+                                 with no boundary_evaluator set — cannot compute CFVs. \
+                                 Ensure set_boundary_cfvs() is called before solve/exploitability."
+                            );
                         }
                     }
                 }
