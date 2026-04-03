@@ -143,91 +143,6 @@ fn build_game_inputs(
     }
 }
 
-/// Build batched GPU input rows using per-boundary reach probabilities from the solver.
-///
-/// Like [`build_game_inputs`], but for each boundary the range prefix uses
-/// `game.boundary_reach(ordinal, player)` instead of `sit.ranges`. This allows
-/// the neural net to see updated reach probabilities during iterative solving.
-///
-/// If `boundary_reach` is empty for a given boundary (iteration 0, not yet visited),
-/// falls back to `sit.ranges`.
-fn build_iterative_game_inputs(
-    gi: usize,
-    game: &PostFlopGame,
-    sit: &super::sampler::Situation,
-    all_inputs: &mut Vec<f32>,
-    requests: &mut Vec<BoundaryRequest>,
-    rows_per: &mut Vec<usize>,
-) {
-    let num_boundaries = game.num_boundary_nodes();
-    if num_boundaries == 0 {
-        return;
-    }
-    let hands = game.private_cards(0);
-    let combos_u8: Vec<[u8; 2]> = hands.iter().map(|&(c0, c1)| [c0, c1]).collect();
-    let combo_indices: Vec<usize> = combos_u8.iter().map(|c| card_pair_to_index(c[0], c[1])).collect();
-    let board_u8 = sit.board_cards();
-    let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !board_u8.contains(r)).collect();
-    let num_rivers = valid_rivers.len();
-    let river_valid_masks: Vec<Vec<bool>> = valid_rivers.iter()
-        .map(|&r| combos_u8.iter().map(|c| c[0] != r && c[1] != r).collect())
-        .collect();
-    let pot = f64::from(sit.pot);
-    let eff = f64::from(sit.effective_stack);
-
-    // Fallback ranges from sit.ranges (used when boundary_reach is empty).
-    let fallback_oop: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[0][card_pair_to_index(c0, c1)]).collect();
-    let fallback_ip: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[1][card_pair_to_index(c0, c1)]).collect();
-
-    for ordinal in 0..num_boundaries {
-        let bpot = game.boundary_pot(ordinal) as f64;
-        let es = eff - (bpot - pot) / 2.0;
-        let pn = bpot as f32 / 400.0;
-        let sn = es as f32 / 400.0;
-
-        // Get per-boundary reaches, falling back to initial ranges.
-        let oop_reach_raw = game.boundary_reach(ordinal, 0);
-        let ip_reach_raw = game.boundary_reach(ordinal, 1);
-        let oop_rc: &[f32] = if oop_reach_raw.is_empty() { &fallback_oop } else { &oop_reach_raw };
-        let ip_rc: &[f32] = if ip_reach_raw.is_empty() { &fallback_ip } else { &ip_reach_raw };
-
-        // Build per-boundary prefixes (ranges differ per boundary).
-        let mut prefixes = vec![[0.0_f32; PREFIX_LEN]; num_rivers];
-        for (ri, &river_u8) in valid_rivers.iter().enumerate() {
-            let p = &mut prefixes[ri];
-            for (i, &idx) in combo_indices.iter().enumerate() {
-                if river_valid_masks[ri][i] {
-                    p[idx] = oop_rc[i];
-                    p[OUTPUT_SIZE + idx] = ip_rc[i];
-                }
-            }
-            let bs = OUTPUT_SIZE * 2;
-            for &card in board_u8 { p[bs + card as usize] = 1.0; }
-            p[bs + river_u8 as usize] = 1.0;
-            let rs = bs + 52;
-            for &card in board_u8 { p[rs + (card / 4) as usize] = 1.0; }
-            p[rs + (river_u8 / 4) as usize] = 1.0;
-        }
-
-        for player in 0..2usize {
-            let pi = if player == 0 { 0.0_f32 } else { 1.0 };
-            for prefix in &prefixes {
-                all_inputs.extend_from_slice(prefix);
-                all_inputs.push(pn);
-                all_inputs.push(sn);
-                all_inputs.push(pi);
-            }
-            requests.push(BoundaryRequest {
-                game_idx: gi, ordinal, player,
-                combo_indices: combo_indices.clone(),
-                river_valid_masks: river_valid_masks.clone(),
-                num_combos: hands.len(),
-            });
-            rows_per.push(num_rivers);
-        }
-    }
-}
-
 /// Decode batched GPU output into per-request CFVs by averaging over river cards.
 ///
 /// Returns one `(game_idx, ordinal, player, cfvs)` tuple per request.
@@ -300,9 +215,9 @@ fn evaluate_batch<B2: burn::tensor::backend::Backend>(
 
 /// Evaluate boundaries for all active games in a single GPU forward pass.
 ///
-/// Uses per-boundary reach probabilities from the solver (via
-/// [`build_iterative_game_inputs`]) so the neural net sees updated reaches
-/// each iteration. Falls back to `sit.ranges` at iteration 0.
+/// For each game, reads reach probabilities from `sit.ranges` (the subgame
+/// root context). Builds one combined tensor, runs `model.forward()`, scatters
+/// results back via `set_boundary_cfvs`.
 fn evaluate_pool_boundaries<B2: burn::tensor::backend::Backend>(
     model: &CfvNet<B2>,
     device: &B2::Device,
@@ -317,7 +232,7 @@ fn evaluate_pool_boundaries<B2: burn::tensor::backend::Backend>(
     let mut rows_per: Vec<usize> = Vec::new();
 
     for (gi, (sit, game, _iter)) in active_games.iter().enumerate() {
-        build_iterative_game_inputs(gi, game, sit, &mut all_inputs, &mut requests, &mut rows_per);
+        build_game_inputs(gi, game, sit, &mut all_inputs, &mut requests, &mut rows_per);
     }
 
     if all_inputs.is_empty() {
@@ -1473,11 +1388,6 @@ fn generate_turn_training_data_iterative(
     let threads = config.datagen.threads.max(1);
     let solver_iterations = config.datagen.solver_iterations;
     let pool_size = config.datagen.active_pool_size;
-    let eval_interval = if config.datagen.leaf_eval_interval == 0 {
-        1 // 0 means every iteration
-    } else {
-        config.datagen.leaf_eval_interval
-    };
     let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -1659,153 +1569,36 @@ fn generate_turn_training_data_iterative(
 
     eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}",
         active.len(), solver_iterations, threads);
-    eprintln!("[iterative] leaf_eval_interval={eval_interval} (GPU eval every {eval_interval} iterations)");
 
-    // --- Async queue-based pipeline: persistent threads, no barriers ---
-    //
-    // Ready Queue → [N Solver Threads] → Eval Queue → [GPU (main thread)] → Ready Queue
-    //                                  ↘ Write Queue (if done)
-    //
-    // Solver threads loop: pop ready → solve_step × eval_interval → push to eval or write.
-    // GPU (main thread): drain eval queue → batch forward pass → push to ready.
-    // Inject new deals when games graduate.
+    // --- Lockstep loop ---
+    while !active.is_empty() {
+        // 1. GPU: evaluate boundaries for all active games.
+        evaluate_pool_boundaries(&model, &device, &mut active);
 
-    type ActiveGame = (Situation, PostFlopGame, u32); // (sit, game, iteration)
-
-    // Channels: GPU pushes to ready, solvers pop from ready.
-    //           Solvers push to eval, GPU pops from eval.
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<ActiveGame>(pool_size * 2);
-    let (eval_tx, eval_rx) = std::sync::mpsc::sync_channel::<ActiveGame>(pool_size * 2);
-    let ready_rx = Arc::new(Mutex::new(ready_rx));
-
-    // Seed eval queue — all games need initial GPU boundary eval.
-    for game in active {
-        eval_tx.send(game).expect("eval queue seed");
-    }
-
-    // Track active game count for termination.
-    let active_count = Arc::new(AtomicU64::new(pool_size as u64));
-    let solve_iter_count = Arc::new(AtomicU64::new(0));
-
-    // --- Solver threads (persistent) ---
-    let mut solver_handles = Vec::with_capacity(threads);
-    for _ in 0..threads {
-        let ready_rx = Arc::clone(&ready_rx);
-        let eval_tx = eval_tx.clone();
-        let storage_tx = storage_tx.clone();
-        let pb = pb.clone();
-        let exploit_sum = Arc::clone(&exploit_sum);
-        let exploit_count = Arc::clone(&exploit_count);
-        let active_count = Arc::clone(&active_count);
-        let solve_iter_count = Arc::clone(&solve_iter_count);
-
-        solver_handles.push(std::thread::spawn(move || {
-            range_solver::set_force_sequential(true);
-            loop {
-                let (sit, mut game, mut iter) = match {
-                    let rx = ready_rx.lock().expect("ready_rx lock");
-                    rx.recv()
-                } {
-                    Ok(item) => item,
-                    Err(_) => return, // Channel closed.
-                };
-
-                // Run eval_interval iterations.
-                for _ in 0..eval_interval {
-                    solve_step(&game, iter);
-                    iter += 1;
-                    solve_iter_count.fetch_add(1, Ordering::Relaxed);
-                    if iter >= solver_iterations {
-                        break;
+        // 2. Solve: one iteration per game, parallel via std::thread::scope.
+        let chunk_size = (active.len() + threads - 1) / threads;
+        std::thread::scope(|s| {
+            for chunk in active.chunks_mut(chunk_size.max(1)) {
+                s.spawn(|| {
+                    range_solver::set_force_sequential(true);
+                    for (_sit, game, iter) in chunk.iter_mut() {
+                        solve_step(game, *iter);
+                        *iter += 1;
                     }
-                }
-
-                if iter >= solver_iterations {
-                    // Graduate: finalize, extract, send to writer.
-                    range_solver::finalize(&mut game);
-                    let exploit = range_solver::compute_exploitability(&game);
-                    let pot = f64::from(sit.pot);
-                    let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
-                        extract_results(&mut game, pot, &sit.ranges, exploit);
-
-                    if exploit >= 0.0 {
-                        let bb = initial_stack as f32 / 100.0;
-                        let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
-                        exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
-                        exploit_count.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    pb.inc(1);
-                    let _ = storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv));
-                    active_count.fetch_sub(1, Ordering::Relaxed);
-                } else {
-                    // Needs GPU eval: clear stale CFVs but keep reaches for GPU input.
-                    game.clear_boundary_cfvs();
-                    if eval_tx.send((sit, game, iter)).is_err() {
-                        return;
-                    }
-                }
+                });
             }
-        }));
-    }
-    drop(eval_tx); // Solver clones are the only remaining senders.
-    drop(storage_tx); // Solver clones are the only remaining senders.
+        });
 
-    // --- GPU loop (runs on main thread, owns model/device) ---
-    // Drains eval queue into batch, one forward pass, pushes to ready queue.
-    // Also injects new deals when games graduate.
-    let gpu_batch_size = pool_size; // max batch
-    loop {
-        // Drain eval queue into a batch (block on first, drain rest non-blocking).
-        let mut batch: Vec<ActiveGame> = Vec::with_capacity(gpu_batch_size);
-        match eval_rx.recv() {
-            Ok(item) => batch.push(item),
-            Err(_) => break, // All eval senders dropped → solvers done.
-        }
-        while batch.len() < gpu_batch_size {
-            match eval_rx.try_recv() {
-                Ok(item) => batch.push(item),
-                Err(_) => break,
-            }
+        // 3. Flush boundary caches so next GPU eval sees fresh reaches.
+        for (_sit, game, _iter) in &active {
+            game.flush_boundary_caches();
         }
 
-        // GPU forward pass for the batch.
-        evaluate_pool_boundaries(&model, &device, &mut batch);
-
-        // Push evaluated games to ready queue.
-        for game in batch {
-            if ready_tx.send(game).is_err() {
-                break;
-            }
-        }
-
-        // Inject new deals to replace graduated games.
-        while active_count.load(Ordering::Relaxed) < pool_size as u64 {
-            match deal_rx.try_recv() {
-                Ok((sit, game)) => {
-                    // New game at iteration 0 — needs GPU eval, send to eval queue.
-                    // But we're the GPU thread, so eval it directly in the next batch.
-                    // For now, push to ready with iter=0; it will get eval'd next round
-                    // when the solver sends it back to eval queue after 0 iterations.
-                    // Actually: just eval it now and push to ready.
-                    let mut single = vec![(sit, game, 0u32)];
-                    evaluate_pool_boundaries(&model, &device, &mut single);
-                    let item = single.into_iter().next().unwrap();
-                    active_count.fetch_add(1, Ordering::Relaxed);
-                    if ready_tx.send(item).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break, // Deal buffer empty.
-            }
-        }
-
-        // Update progress bar.
-        let ac = active_count.load(Ordering::Relaxed);
+        // Update progress bar with average iteration.
+        let avg_iter: f64 = active.iter().map(|(_, _, it)| *it as f64).sum::<f64>()
+            / active.len().max(1) as f64;
         let wc = write_count.load(Ordering::Relaxed);
         let dc = deal_count.load(Ordering::Relaxed);
-        let si = solve_iter_count.load(Ordering::Relaxed);
-        let avg_iter = if ac + wc > 0 { si as f64 / (ac + wc) as f64 } else { 0.0 };
         let ec = exploit_count.load(Ordering::Relaxed);
         let avg_exploit = if ec > 0 {
             (exploit_sum.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
@@ -1813,22 +1606,47 @@ fn generate_turn_training_data_iterative(
             0.0
         };
         pb.set_message(format!(
-            "pool:[{ac}/{pool_size}] iter:[{avg_iter:.0}/{solver_iterations}] deal\u{2192}[{dc}]\u{2192}solve\u{2192}[{wc}]\u{2192}write  expl:{avg_exploit:.1} mbb/h",
+            "pool:[{}/{}] iter:[{:.0}/{}] deal\u{2192}[{}]\u{2192}solve\u{2192}[{}]\u{2192}write  expl:{:.1} mbb/h",
+            active.len(), pool_size, avg_iter, solver_iterations,
+            dc, wc, avg_exploit,
         ));
 
-        // If no active games and deal buffer empty, we're done.
-        if ac == 0 {
-            break;
+        // 4. Graduate finished games, inject new ones.
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].2 >= solver_iterations {
+                let (sit, mut game, _) = active.swap_remove(i);
+                range_solver::finalize(&mut game);
+                let exploit = range_solver::compute_exploitability(&game);
+                let pot = f64::from(sit.pot);
+                let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
+                    extract_results(&mut game, pot, &sit.ranges, exploit);
+
+                // Track exploitability.
+                if exploit >= 0.0 {
+                    let bb = initial_stack as f32 / 100.0;
+                    let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                    exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
+                    exploit_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                pb.inc(1);
+                if storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)).is_err() {
+                    break;
+                }
+
+                // Inject replacement from deal buffer.
+                if let Ok((new_sit, new_game)) = deal_rx.try_recv() {
+                    active.push((new_sit, new_game, 0));
+                }
+            } else {
+                i += 1;
+            }
         }
     }
 
-    // Shut down: close ready queue so solver threads exit.
-    drop(ready_tx);
-
-    // Wait for solver threads to drain, then shut down writer.
-    for (i, h) in solver_handles.into_iter().enumerate() {
-        h.join().map_err(|e| format!("solver thread {i} panicked: {e:?}"))?;
-    }
+    // Shut down writer.
+    drop(storage_tx);
     deal_thread.join().map_err(|e| format!("deal thread panicked: {e:?}"))?;
     writer_thread.join().map_err(|e| format!("writer thread panicked: {e:?}"))??;
 
