@@ -89,15 +89,11 @@ impl PostFlopGame {
             let ordinal = self.node_to_boundary[node_index] as usize;
             let k = self.num_continuations.max(1);
 
-            // Lazily cache opponent reach at this boundary.
+            // Update opponent reach at this boundary every visit.
             let opp = player ^ 1;
             let reach_index = ordinal * 2 + opp;
             if reach_index < self.boundary_reach.len() {
-                let guard = self.boundary_reach[reach_index].lock().unwrap();
-                if guard.is_empty() {
-                    drop(guard);
-                    *self.boundary_reach[reach_index].lock().unwrap() = cfreach.to_vec();
-                }
+                *self.boundary_reach[reach_index].lock().unwrap() = cfreach.to_vec();
             }
 
             // -- Legacy single-continuation path (K <= 1) --
@@ -935,6 +931,54 @@ mod tests {
         for &v in &values {
             assert_eq!(v, 0.0, "zero reach should produce zero result");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // boundary_reach overwrites on every visit
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn boundary_reach_updates_every_visit() {
+        let game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "need boundary nodes for this test");
+
+        // Pre-set boundary CFVs so evaluate_internal doesn't bail out.
+        for ordinal in 0..n_boundary {
+            game.set_boundary_cfvs(ordinal, 0, vec![1.0; game.num_private_hands(0)]);
+            game.set_boundary_cfvs(ordinal, 1, vec![1.0; game.num_private_hands(1)]);
+        }
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let node = game.node_arena[bd_idx].lock();
+        let ordinal = game.node_to_boundary[bd_idx] as usize;
+
+        let num_oop = game.num_private_hands(0);
+        let num_ip = game.num_private_hands(1);
+
+        // First visit: evaluate from OOP's perspective with uniform IP reach.
+        let cfreach_first = vec![1.0f32; num_ip];
+        let mut result = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_first);
+
+        // boundary_reach stores the opponent's (IP's) reach for player=0 traversal.
+        let opp = 0 ^ 1; // = 1
+        let stored_first = game.boundary_reach(ordinal, opp);
+        assert!(!stored_first.is_empty(), "first visit should populate boundary_reach");
+        assert!(stored_first.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "first visit should store the uniform reach");
+
+        // Second visit: evaluate with a DIFFERENT reach (all 0.5).
+        let cfreach_second = vec![0.5f32; num_ip];
+        let mut result2 = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result2, &node, 0, &cfreach_second);
+
+        let stored_second = game.boundary_reach(ordinal, opp);
+        // The reach should now reflect the SECOND visit's values (0.5),
+        // not be stuck on the first visit's values (1.0).
+        assert!(stored_second.iter().all(|&v| (v - 0.5).abs() < 1e-6),
+            "second visit should overwrite boundary_reach with new values, \
+             got {:?}", &stored_second[..stored_second.len().min(5)]);
     }
 
     // -----------------------------------------------------------------

@@ -165,6 +165,10 @@ pub struct DatagenConfig {
     /// E.g. 1000 means evaluate at iteration 1, 1000, 2000, ... and the final iteration.
     #[serde(default)]
     pub leaf_eval_interval: u32,
+    /// Number of games in the active pool for per-iteration boundary re-eval.
+    /// Only used in model mode. Default 64.
+    #[serde(default = "default_active_pool_size")]
+    pub active_pool_size: usize,
     /// Per-deal bet size perturbation. Each bet size is multiplied by
     /// `1.0 + uniform(-fuzz, +fuzz)`. Default 0.0 (no fuzzing).
     #[serde(default)]
@@ -199,6 +203,7 @@ impl Default for DatagenConfig {
             threads: 8,
             seed: Some(42),
             leaf_eval_interval: 0,
+            active_pool_size: default_active_pool_size(),
             bet_size_fuzz: 0.0,
             turn_output: None,
             river_output: None,
@@ -220,6 +225,9 @@ fn default_pot_intervals() -> Vec<[i32; 2]> {
 }
 fn default_solver_iterations() -> u32 {
     1000
+}
+fn default_active_pool_size() -> usize {
+    64
 }
 fn default_threads() -> usize {
     std::thread::available_parallelism()
@@ -637,5 +645,38 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.datagen.blueprint_path.is_none());
+    }
+
+    #[test]
+    fn active_pool_size_defaults_to_64() {
+        let config = DatagenConfig::default();
+        assert_eq!(config.active_pool_size, 64);
+    }
+
+    #[test]
+    fn parse_config_with_active_pool_size() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  active_pool_size: 128
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.active_pool_size, 128);
+    }
+
+    #[test]
+    fn parse_config_without_active_pool_size_uses_default() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.active_pool_size, 64);
     }
 }

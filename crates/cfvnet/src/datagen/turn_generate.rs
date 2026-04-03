@@ -143,6 +143,91 @@ fn build_game_inputs(
     }
 }
 
+/// Build batched GPU input rows using per-boundary reach probabilities from the solver.
+///
+/// Like [`build_game_inputs`], but for each boundary the range prefix uses
+/// `game.boundary_reach(ordinal, player)` instead of `sit.ranges`. This allows
+/// the neural net to see updated reach probabilities during iterative solving.
+///
+/// If `boundary_reach` is empty for a given boundary (iteration 0, not yet visited),
+/// falls back to `sit.ranges`.
+fn build_iterative_game_inputs(
+    gi: usize,
+    game: &PostFlopGame,
+    sit: &super::sampler::Situation,
+    all_inputs: &mut Vec<f32>,
+    requests: &mut Vec<BoundaryRequest>,
+    rows_per: &mut Vec<usize>,
+) {
+    let num_boundaries = game.num_boundary_nodes();
+    if num_boundaries == 0 {
+        return;
+    }
+    let hands = game.private_cards(0);
+    let combos_u8: Vec<[u8; 2]> = hands.iter().map(|&(c0, c1)| [c0, c1]).collect();
+    let combo_indices: Vec<usize> = combos_u8.iter().map(|c| card_pair_to_index(c[0], c[1])).collect();
+    let board_u8 = sit.board_cards();
+    let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !board_u8.contains(r)).collect();
+    let num_rivers = valid_rivers.len();
+    let river_valid_masks: Vec<Vec<bool>> = valid_rivers.iter()
+        .map(|&r| combos_u8.iter().map(|c| c[0] != r && c[1] != r).collect())
+        .collect();
+    let pot = f64::from(sit.pot);
+    let eff = f64::from(sit.effective_stack);
+
+    // Fallback ranges from sit.ranges (used when boundary_reach is empty).
+    let fallback_oop: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[0][card_pair_to_index(c0, c1)]).collect();
+    let fallback_ip: Vec<f32> = hands.iter().map(|&(c0, c1)| sit.ranges[1][card_pair_to_index(c0, c1)]).collect();
+
+    for ordinal in 0..num_boundaries {
+        let bpot = game.boundary_pot(ordinal) as f64;
+        let es = eff - (bpot - pot) / 2.0;
+        let pn = bpot as f32 / 400.0;
+        let sn = es as f32 / 400.0;
+
+        // Get per-boundary reaches, falling back to initial ranges.
+        let oop_reach_raw = game.boundary_reach(ordinal, 0);
+        let ip_reach_raw = game.boundary_reach(ordinal, 1);
+        let oop_rc: &[f32] = if oop_reach_raw.is_empty() { &fallback_oop } else { &oop_reach_raw };
+        let ip_rc: &[f32] = if ip_reach_raw.is_empty() { &fallback_ip } else { &ip_reach_raw };
+
+        // Build per-boundary prefixes (ranges differ per boundary).
+        let mut prefixes = vec![[0.0_f32; PREFIX_LEN]; num_rivers];
+        for (ri, &river_u8) in valid_rivers.iter().enumerate() {
+            let p = &mut prefixes[ri];
+            for (i, &idx) in combo_indices.iter().enumerate() {
+                if river_valid_masks[ri][i] {
+                    p[idx] = oop_rc[i];
+                    p[OUTPUT_SIZE + idx] = ip_rc[i];
+                }
+            }
+            let bs = OUTPUT_SIZE * 2;
+            for &card in board_u8 { p[bs + card as usize] = 1.0; }
+            p[bs + river_u8 as usize] = 1.0;
+            let rs = bs + 52;
+            for &card in board_u8 { p[rs + (card / 4) as usize] = 1.0; }
+            p[rs + (river_u8 / 4) as usize] = 1.0;
+        }
+
+        for player in 0..2usize {
+            let pi = if player == 0 { 0.0_f32 } else { 1.0 };
+            for prefix in &prefixes {
+                all_inputs.extend_from_slice(prefix);
+                all_inputs.push(pn);
+                all_inputs.push(sn);
+                all_inputs.push(pi);
+            }
+            requests.push(BoundaryRequest {
+                game_idx: gi, ordinal, player,
+                combo_indices: combo_indices.clone(),
+                river_valid_masks: river_valid_masks.clone(),
+                num_combos: hands.len(),
+            });
+            rows_per.push(num_rivers);
+        }
+    }
+}
+
 /// Decode batched GPU output into per-request CFVs by averaging over river cards.
 ///
 /// Returns one `(game_idx, ordinal, player, cfvs)` tuple per request.
@@ -210,6 +295,43 @@ fn evaluate_batch<B2: burn::tensor::backend::Backend>(
 
     for (gi, ordinal, player, cfvs) in decode_boundary_cfvs(&out_vec, &requests, &rows_per) {
         batch[gi].1.set_boundary_cfvs(ordinal, player, cfvs);
+    }
+}
+
+/// Evaluate boundaries for all active games in a single GPU forward pass.
+///
+/// Uses per-boundary reach probabilities from the solver (via
+/// [`build_iterative_game_inputs`]) so the neural net sees updated reaches
+/// each iteration. Falls back to `sit.ranges` at iteration 0.
+fn evaluate_pool_boundaries<B2: burn::tensor::backend::Backend>(
+    model: &CfvNet<B2>,
+    device: &B2::Device,
+    active_games: &mut [(Situation, PostFlopGame, u32)],
+) where
+    B2::Device: Clone,
+{
+    use burn::tensor::{Tensor, TensorData};
+
+    let mut all_inputs: Vec<f32> = Vec::new();
+    let mut requests: Vec<BoundaryRequest> = Vec::new();
+    let mut rows_per: Vec<usize> = Vec::new();
+
+    for (gi, (sit, game, _iter)) in active_games.iter().enumerate() {
+        build_iterative_game_inputs(gi, game, sit, &mut all_inputs, &mut requests, &mut rows_per);
+    }
+
+    if all_inputs.is_empty() {
+        return;
+    }
+
+    let total_rows = all_inputs.len() / INPUT_SIZE;
+    let data = TensorData::new(all_inputs, [total_rows, INPUT_SIZE]);
+    let input_tensor = Tensor::<B2, 2>::from_data(data, device);
+    let output = model.forward(input_tensor);
+    let out_vec: Vec<f32> = output.into_data().to_vec().expect("output tensor conversion");
+
+    for (gi, ordinal, player, cfvs) in decode_boundary_cfvs(&out_vec, &requests, &rows_per) {
+        active_games[gi].1.set_boundary_cfvs(ordinal, player, cfvs);
     }
 }
 
@@ -480,20 +602,28 @@ fn fuzz_bet_sizes(bet_sizes: &[Vec<f64>], fuzz: f64, rng: &mut impl Rng) -> Vec<
     }).collect()
 }
 
-/// Solve a game with boundaries already set. Returns 1326-indexed CFVs + exploitability.
+/// Result tuple for a solved game: (situation, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv).
+type SolveResult = (
+    Situation,
+    [f32; NUM_COMBOS], // oop_cfvs
+    [f32; NUM_COMBOS], // ip_cfvs
+    [u8; NUM_COMBOS],  // valid_mask
+    f32,               // oop_gv
+    f32,               // ip_gv
+);
+
+/// Extract 1326-indexed CFVs from an already-finalized game.
+///
+/// The game must have been solved via `solve_step` + `finalize` (or `solve`).
+/// Calls `back_to_root()` and `cache_normalized_weights()` before reading EVs.
+/// Returns (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit).
 #[allow(clippy::type_complexity)]
-fn solve_and_extract(
+fn extract_results(
     game: &mut PostFlopGame,
     pot: f64,
     ranges: &[[f32; NUM_COMBOS]; 2],
-    solver_iterations: u32,
-    target_exploitability: f32,
+    exploit: f32,
 ) -> ([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32, f32) {
-    // Use solve() with early exit at target exploitability.
-    // This checks exploitability every 10 iterations and exits early when converged.
-    let abs_target = target_exploitability * pot as f32;
-    let exploit = solve(game, solver_iterations, abs_target, false);
-
     game.back_to_root();
     game.cache_normalized_weights();
     let raw_oop = game.expected_values(0);
@@ -524,6 +654,23 @@ fn solve_and_extract(
     let ip_gv = weighted_sum(&ranges[1], &ip_cfvs);
 
     (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, exploit)
+}
+
+/// Solve a game with boundaries already set. Returns 1326-indexed CFVs + exploitability.
+///
+/// Calls `solve()` (which internally finalizes the game) then delegates to
+/// `extract_results` for the CFV extraction.
+#[allow(clippy::type_complexity)]
+fn solve_and_extract(
+    game: &mut PostFlopGame,
+    pot: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    solver_iterations: u32,
+    target_exploitability: f32,
+) -> ([f32; NUM_COMBOS], [f32; NUM_COMBOS], [u8; NUM_COMBOS], f32, f32, f32) {
+    let abs_target = target_exploitability * pot as f32;
+    let exploit = solve(game, solver_iterations, abs_target, false);
+    extract_results(game, pot, ranges, exploit)
 }
 
 /// Extract river-level training records from a solved turn+river game.
@@ -1310,6 +1457,295 @@ fn generate_turn_training_data_exact(
     Ok(())
 }
 
+/// Turn datagen with per-iteration boundary re-evaluation (lockstep ring buffer).
+///
+/// K games cycle through a lockstep loop:
+/// 1. GPU batch eval all boundaries (one forward pass)
+/// 2. solve_step all K games in parallel (thread::scope, force_sequential)
+/// 3. Flush boundary caches so next GPU eval sees fresh reaches
+/// 4. Graduate finished games to writer, inject new ones from deal buffer
+fn generate_turn_training_data_iterative(
+    config: &CfvnetConfig,
+    output_path: &Path,
+) -> Result<(), String> {
+    let num_samples = config.datagen.num_samples;
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let threads = config.datagen.threads.max(1);
+    let solver_iterations = config.datagen.solver_iterations;
+    let pool_size = config.datagen.active_pool_size;
+    let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
+    if bet_sizes_f64.is_empty() {
+        return Err("no valid percentage bet sizes found in config".into());
+    }
+    let bet_sizes_vec = bet_sizes_f64;
+    let initial_stack = config.game.initial_stack;
+    let board_size = config.game.board_size;
+    let bet_size_fuzz = config.datagen.bet_size_fuzz;
+
+    // Load river model.
+    let river_model_path = config.game.river_model_path.as_deref()
+        .ok_or("river_model_path is required for turn datagen")?;
+    let river_model_dir = std::path::Path::new(river_model_path)
+        .parent()
+        .ok_or("river_model_path has no parent directory")?;
+    let river_config_path = river_model_dir.join("config.yaml");
+    let (river_hidden_layers, river_hidden_size) = if river_config_path.exists() {
+        let river_yaml = std::fs::read_to_string(&river_config_path)
+            .map_err(|e| format!("read river config: {e}"))?;
+        let river_cfg: CfvnetConfig = serde_yaml::from_str(&river_yaml)
+            .map_err(|e| format!("parse river config: {e}"))?;
+        eprintln!("[iterative] river model architecture: {}x{} (from {})",
+            river_cfg.training.hidden_layers, river_cfg.training.hidden_size,
+            river_config_path.display());
+        (river_cfg.training.hidden_layers, river_cfg.training.hidden_size)
+    } else {
+        eprintln!("[iterative] warning: no river config.yaml found, using config architecture");
+        (config.training.hidden_layers, config.training.hidden_size)
+    };
+
+    let device = <B as burn::tensor::backend::Backend>::Device::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model = CfvNet::<B>::new(
+        &device, river_hidden_layers, river_hidden_size, INPUT_SIZE,
+    )
+    .load_file(river_model_path, &recorder, &device)
+    .map_err(|e| format!("failed to load river model: {e}"))?;
+    eprintln!("[iterative] river model loaded on wgpu");
+
+    let wall_start = std::time::Instant::now();
+
+    // --- Deal gen thread (reuses existing Stage 1 pattern) ---
+    let (deal_tx, deal_rx) = std::sync::mpsc::sync_channel::<(Situation, PostFlopGame)>(
+        PIPELINE_CHANNEL_CAPACITY_TURN,
+    );
+
+    let deal_count = Arc::new(AtomicU64::new(0));
+    let deal_count_ref = Arc::clone(&deal_count);
+    let datagen_config = config.datagen.clone();
+    let bet_sizes_for_deal = bet_sizes_vec;
+    let build_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .map_err(|e| format!("build pool: {e}"))?;
+
+    let deal_thread = std::thread::spawn(move || {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut remaining = num_samples;
+        let batch_size = 64usize;
+
+        while remaining > 0 {
+            let chunk = (remaining as usize).min(batch_size);
+            remaining -= chunk as u64;
+
+            let mut degenerate_count = 0u64;
+            let sampled: Vec<(Situation, Vec<Vec<f64>>)> = (0..chunk)
+                .filter_map(|_| {
+                    let sit = sample_situation(
+                        &datagen_config, initial_stack, board_size, &mut rng,
+                    );
+                    if sit.effective_stack <= 0 {
+                        degenerate_count += 1;
+                        return None;
+                    }
+                    let sizes = fuzz_bet_sizes(
+                        &bet_sizes_for_deal, bet_size_fuzz, &mut rng,
+                    );
+                    Some((sit, sizes))
+                })
+                .collect();
+
+            deal_count_ref.fetch_add(degenerate_count, Ordering::Relaxed);
+
+            let games: Vec<Option<(Situation, PostFlopGame)>> = build_pool.install(|| {
+                sampled.into_par_iter()
+                    .map(|(sit, sizes)| {
+                        let game = build_turn_game(
+                            sit.board_cards(),
+                            f64::from(sit.pot),
+                            f64::from(sit.effective_stack),
+                            &sit.ranges,
+                            &sizes,
+                        );
+                        game.map(|g| (sit, g))
+                    })
+                    .collect()
+            });
+
+            let mut channel_broken = false;
+            for item in games {
+                if let Some(pair) = item {
+                    deal_count_ref.fetch_add(1, Ordering::Relaxed);
+                    if deal_tx.send(pair).is_err() {
+                        channel_broken = true;
+                        break;
+                    }
+                } else {
+                    deal_count_ref.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if channel_broken {
+                return;
+            }
+        }
+    });
+
+    // --- Writer thread (reuses existing Stage 4 pattern) ---
+    let (storage_tx, storage_rx) =
+        std::sync::mpsc::sync_channel::<SolveResult>(512);
+
+    let output_path_owned = output_path.to_path_buf();
+    let write_count = Arc::new(AtomicU64::new(0));
+    let write_count_ref = Arc::clone(&write_count);
+    let writer_thread = std::thread::spawn(move || -> Result<(), String> {
+        let file = std::fs::File::create(&output_path_owned)
+            .map_err(|e| format!("create output: {e}"))?;
+        let mut writer = BufWriter::with_capacity(1 << 20, file);
+        while let Ok((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) = storage_rx.recv() {
+            let board_vec = sit.board_cards().to_vec();
+            let oop_rec = TrainingRecord {
+                board: board_vec.clone(),
+                pot: sit.pot as f32,
+                effective_stack: sit.effective_stack as f32,
+                player: 0,
+                game_value: oop_gv,
+                oop_range: sit.ranges[0],
+                ip_range: sit.ranges[1],
+                cfvs: oop_cfvs,
+                valid_mask,
+            };
+            write_record(&mut writer, &oop_rec).map_err(|e| format!("write OOP: {e}"))?;
+            let ip_rec = TrainingRecord {
+                board: board_vec,
+                pot: sit.pot as f32,
+                effective_stack: sit.effective_stack as f32,
+                player: 1,
+                game_value: ip_gv,
+                oop_range: sit.ranges[0],
+                ip_range: sit.ranges[1],
+                cfvs: ip_cfvs,
+                valid_mask,
+            };
+            write_record(&mut writer, &ip_rec).map_err(|e| format!("write IP: {e}"))?;
+            write_count_ref.fetch_add(1, Ordering::Relaxed);
+        }
+        std::io::Write::flush(&mut writer).map_err(|e| format!("flush: {e}"))?;
+        Ok(())
+    });
+
+    // --- Progress bar ---
+    let pb = ProgressBar::new(num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
+            .expect("valid progress bar template"),
+    );
+
+    let exploit_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let exploit_count = Arc::new(AtomicU64::new(0));
+
+    // --- Fill initial active pool ---
+    let mut active: Vec<(Situation, PostFlopGame, u32)> = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        match deal_rx.recv() {
+            Ok((sit, game)) => active.push((sit, game, 0)),
+            Err(_) => break,
+        }
+    }
+
+    eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}",
+        active.len(), solver_iterations, threads);
+
+    // --- Lockstep loop ---
+    while !active.is_empty() {
+        // 1. GPU: evaluate boundaries for all active games.
+        evaluate_pool_boundaries(&model, &device, &mut active);
+
+        // 2. Solve: one iteration per game, parallel via std::thread::scope.
+        let chunk_size = (active.len() + threads - 1) / threads;
+        std::thread::scope(|s| {
+            for chunk in active.chunks_mut(chunk_size.max(1)) {
+                s.spawn(|| {
+                    range_solver::set_force_sequential(true);
+                    for (_sit, game, iter) in chunk.iter_mut() {
+                        solve_step(game, *iter);
+                        *iter += 1;
+                    }
+                });
+            }
+        });
+
+        // 3. Flush boundary caches so next GPU eval sees fresh reaches.
+        for (_sit, game, _iter) in &active {
+            game.flush_boundary_caches();
+        }
+
+        // Update progress bar with average iteration.
+        let avg_iter: f64 = active.iter().map(|(_, _, it)| *it as f64).sum::<f64>()
+            / active.len().max(1) as f64;
+        let wc = write_count.load(Ordering::Relaxed);
+        let dc = deal_count.load(Ordering::Relaxed);
+        let ec = exploit_count.load(Ordering::Relaxed);
+        let avg_exploit = if ec > 0 {
+            (exploit_sum.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
+        } else {
+            0.0
+        };
+        pb.set_message(format!(
+            "pool:[{}/{}] iter:[{:.0}/{}] deal\u{2192}[{}]\u{2192}solve\u{2192}[{}]\u{2192}write  expl:{:.1} mbb/h",
+            active.len(), pool_size, avg_iter, solver_iterations,
+            dc, wc, avg_exploit,
+        ));
+
+        // 4. Graduate finished games, inject new ones.
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].2 >= solver_iterations {
+                let (sit, mut game, _) = active.swap_remove(i);
+                range_solver::finalize(&mut game);
+                let exploit = range_solver::compute_exploitability(&game);
+                let pot = f64::from(sit.pot);
+                let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
+                    extract_results(&mut game, pot, &sit.ranges, exploit);
+
+                // Track exploitability.
+                if exploit >= 0.0 {
+                    let bb = initial_stack as f32 / 100.0;
+                    let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                    exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
+                    exploit_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                pb.inc(1);
+                if storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)).is_err() {
+                    break;
+                }
+
+                // Inject replacement from deal buffer.
+                if let Ok((new_sit, new_game)) = deal_rx.try_recv() {
+                    active.push((new_sit, new_game, 0));
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // Shut down writer.
+    drop(storage_tx);
+    deal_thread.join().map_err(|e| format!("deal thread panicked: {e:?}"))?;
+    writer_thread.join().map_err(|e| format!("writer thread panicked: {e:?}"))??;
+
+    pb.finish_with_message("done");
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let wc = write_count.load(Ordering::Relaxed);
+    let dc = deal_count.load(Ordering::Relaxed);
+    eprintln!("[iterative] deal gen: {dc} items, solved+wrote: {wc} items");
+    eprintln!("[iterative] wall time: {wall_secs:.1}s ({:.1} samples/sec)", num_samples as f64 / wall_secs);
+
+    Ok(())
+}
+
 /// Generate turn training data using a 3-stage producer-consumer pipeline.
 ///
 /// Stage 1 (deal generator): samples situations and builds game trees.
@@ -1328,9 +1764,14 @@ pub fn generate_turn_training_data(
     backend: &str,
 ) -> Result<(), String> {
     let exact_mode = config.datagen.mode == "exact";
+    let iterative_mode = config.datagen.mode == "iterative";
 
     if exact_mode {
         return generate_turn_training_data_exact(config, output_path);
+    }
+
+    if iterative_mode {
+        return generate_turn_training_data_iterative(config, output_path);
     }
 
     match backend {
@@ -1625,14 +2066,6 @@ pub fn generate_turn_training_data(
 
     // --- Stage 3→4 channel: solved results to storage writer ---
     // Sends raw solve results; Stage 4 handles serialization + disk I/O.
-    type SolveResult = (
-        Situation,
-        [f32; NUM_COMBOS], // oop_cfvs
-        [f32; NUM_COMBOS], // ip_cfvs
-        [u8; NUM_COMBOS],  // valid_mask
-        f32,               // oop_gv
-        f32,               // ip_gv
-    );
     const STORAGE_CHANNEL_CAP: usize = 512;
     let (storage_tx, storage_rx) =
         std::sync::mpsc::sync_channel::<SolveResult>(STORAGE_CHANNEL_CAP);
@@ -3138,5 +3571,376 @@ mod tests {
         let total_par = par_results.len() as u64 + par_skipped + par_build_failed;
         assert_eq!(total_seq, num_samples, "sequential must account for all samples");
         assert_eq!(total_par, num_samples, "parallel must account for all samples");
+    }
+
+    /// Test that `extract_results` produces the same output as `solve_and_extract`
+    /// when given a game that was solved with `solve` + `finalize`.
+    #[test]
+    fn extract_results_matches_solve_and_extract() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+        let evaluator = RiverNetEvaluator::new(model, device);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: Some(0.05),
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let pot = f64::from(sit.pot);
+
+        // Path A: solve_and_extract (calls solve() internally).
+        let mut game_a = build_turn_game(
+            sit.board_cards(), pot, f64::from(sit.effective_stack),
+            &sit.ranges, &bet_sizes,
+        ).expect("game should build");
+        evaluate_game_boundaries(
+            &mut game_a, sit.board_cards(), pot,
+            f64::from(sit.effective_stack), &sit.ranges, &evaluator,
+        );
+        let (a_oop, a_ip, a_mask, a_oop_gv, a_ip_gv, _) = solve_and_extract(
+            &mut game_a, pot, &sit.ranges, 20, 0.0,
+        );
+
+        // Path B: manual solve_step loop + finalize + extract_results.
+        let mut game_b = build_turn_game(
+            sit.board_cards(), pot, f64::from(sit.effective_stack),
+            &sit.ranges, &bet_sizes,
+        ).expect("game should build");
+        evaluate_game_boundaries(
+            &mut game_b, sit.board_cards(), pot,
+            f64::from(sit.effective_stack), &sit.ranges, &evaluator,
+        );
+        for iter in 0..20 {
+            solve_step(&game_b, iter);
+        }
+        range_solver::finalize(&mut game_b);
+        let exploit = range_solver::compute_exploitability(&game_b);
+        let (b_oop, b_ip, b_mask, b_oop_gv, b_ip_gv, _b_exploit) =
+            extract_results(&mut game_b, pot, &sit.ranges, exploit);
+
+        assert_eq!(a_mask, b_mask, "valid masks should match");
+        for i in 0..NUM_COMBOS {
+            assert!(
+                (a_oop[i] - b_oop[i]).abs() < 1e-5,
+                "OOP combo {i}: solve_and_extract={} extract_results={}",
+                a_oop[i], b_oop[i],
+            );
+            assert!(
+                (a_ip[i] - b_ip[i]).abs() < 1e-5,
+                "IP combo {i}: solve_and_extract={} extract_results={}",
+                a_ip[i], b_ip[i],
+            );
+        }
+        assert!(
+            (a_oop_gv - b_oop_gv).abs() < 1e-5,
+            "OOP game value: solve_and_extract={a_oop_gv} extract_results={b_oop_gv}"
+        );
+        assert!(
+            (a_ip_gv - b_ip_gv).abs() < 1e-5,
+            "IP game value: solve_and_extract={a_ip_gv} extract_results={b_ip_gv}"
+        );
+    }
+
+    /// Test the iterative lockstep pipeline end-to-end: build games, run the
+    /// lockstep loop with a tiny model, verify output records are valid.
+    #[test]
+    fn iterative_lockstep_produces_valid_records() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 10,
+            threads: 1,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let solver_iterations = 10u32;
+        let threads = 1usize;
+
+        // Build 2 games for the active pool.
+        let mut pool: Vec<(Situation, PostFlopGame, u32)> = Vec::new();
+        for _ in 0..20 {
+            let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            if let Some(game) = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            ) {
+                if game.num_boundary_nodes() > 0 {
+                    pool.push((sit, game, 0));
+                }
+            }
+            if pool.len() >= 2 {
+                break;
+            }
+        }
+        assert!(pool.len() >= 2, "need at least 2 games");
+
+        // Run the lockstep loop.
+        let mut results: Vec<SolveResult> = Vec::new();
+
+        while !pool.is_empty() {
+            // 1. GPU: evaluate boundaries.
+            evaluate_pool_boundaries(&model, &device, &mut pool);
+
+            // 2. Solve: one iteration per game.
+            range_solver::set_force_sequential(true);
+            for (_sit, game, iter) in pool.iter_mut() {
+                solve_step(game, *iter);
+                *iter += 1;
+            }
+
+            // 3. Flush boundary caches.
+            for (_sit, game, _iter) in &pool {
+                game.flush_boundary_caches();
+            }
+
+            // 4. Graduate finished games.
+            let mut i = 0;
+            while i < pool.len() {
+                if pool[i].2 >= solver_iterations {
+                    let (sit, mut game, _) = pool.swap_remove(i);
+                    range_solver::finalize(&mut game);
+                    let exploit = range_solver::compute_exploitability(&game);
+                    let pot = f64::from(sit.pot);
+                    let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _exploit) =
+                        extract_results(&mut game, pot, &sit.ranges, exploit);
+                    results.push((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // Verify we got results for both games.
+        assert_eq!(results.len(), 2, "expected 2 graduated results");
+        for (i, (sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)) in results.iter().enumerate() {
+            let num_valid: usize = valid_mask.iter().map(|&v| v as usize).sum();
+            assert!(num_valid > 0, "game {i}: no valid combos");
+            for (j, &cfv) in oop_cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "game {i} OOP combo {j}: non-finite CFV {cfv}");
+            }
+            for (j, &cfv) in ip_cfvs.iter().enumerate() {
+                assert!(cfv.is_finite(), "game {i} IP combo {j}: non-finite CFV {cfv}");
+            }
+            assert!(oop_gv.is_finite(), "game {i}: OOP game value not finite");
+            assert!(ip_gv.is_finite(), "game {i}: IP game value not finite");
+        }
+    }
+
+    /// Test that mode="iterative" dispatches to generate_turn_training_data_iterative.
+    /// We verify by providing a valid model and checking it produces output records.
+    #[test]
+    fn iterative_mode_dispatch_requires_river_model() {
+        let config = CfvnetConfig {
+            game: GameConfig {
+                initial_stack: 200,
+                bet_sizes: BetSizeConfig(vec![vec!["50%".into(), "a".into()]]),
+                board_size: 4,
+                river_model_path: None, // no model
+                ..Default::default()
+            },
+            datagen: DatagenConfig {
+                num_samples: 3,
+                street: "turn".into(),
+                mode: "iterative".into(),
+                solver_iterations: 10,
+                threads: 1,
+                seed: Some(42),
+                active_pool_size: 2,
+                ..Default::default()
+            },
+            training: TrainingConfig {
+                hidden_layers: 1,
+                hidden_size: 8,
+                ..Default::default()
+            },
+            evaluation: EvaluationConfig::default(),
+        };
+        let output = NamedTempFile::new().unwrap();
+        let result = generate_turn_training_data(&config, output.path(), "ndarray");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("river_model_path"));
+    }
+
+    /// Test that `evaluate_pool_boundaries` sets boundary CFVs on all games
+    /// in the active pool, producing finite values identical to `evaluate_batch`.
+    #[test]
+    fn evaluate_pool_boundaries_sets_cfvs_on_all_games() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: Some(0.05),
+            threads: 1,
+            seed: Some(99),
+            ..Default::default()
+        };
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let mut pool: Vec<(Situation, PostFlopGame, u32)> = Vec::new();
+        for _ in 0..20 {
+            let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            if let Some(game) = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            ) {
+                if game.num_boundary_nodes() > 0 {
+                    pool.push((sit, game, 0));
+                }
+            }
+            if pool.len() >= 3 {
+                break;
+            }
+        }
+        assert!(pool.len() >= 2, "need at least 2 valid games for pool test");
+
+        evaluate_pool_boundaries(&model, &device, &mut pool);
+
+        // Verify that boundary CFVs were set (non-empty) on all games.
+        for (i, (_sit, game, _iter)) in pool.iter().enumerate() {
+            let nb = game.num_boundary_nodes();
+            for ordinal in 0..nb {
+                for player in 0..2 {
+                    assert!(
+                        !game.boundary_cfvs_empty(ordinal, player),
+                        "game {i} boundary {ordinal} player {player}: CFVs not set"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test that `evaluate_pool_boundaries` produces identical solve results
+    /// to the existing `evaluate_batch` function.
+    #[test]
+    fn evaluate_pool_boundaries_matches_evaluate_batch() {
+        let device = <B as burn::tensor::backend::Backend>::Device::default();
+        let model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let datagen_config = DatagenConfig {
+            num_samples: 1,
+            street: "turn".into(),
+            solver_iterations: 20,
+            target_exploitability: Some(0.05),
+            threads: 1,
+            seed: Some(99),
+            ..Default::default()
+        };
+
+        let bet_sizes = vec![parse_bet_sizes_depth(&["50%".into(), "a".into()])];
+        let mut situations: Vec<Situation> = Vec::new();
+        for _ in 0..20 {
+            let sit = sample_situation(&datagen_config, 200, 4, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            if let Some(game) = build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            ) {
+                if game.num_boundary_nodes() > 0 {
+                    situations.push(sit);
+                }
+            }
+            if situations.len() >= 2 {
+                break;
+            }
+        }
+        assert!(situations.len() >= 2, "need at least 2 situations");
+
+        let make_game = |sit: &Situation| -> PostFlopGame {
+            build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &bet_sizes,
+            )
+            .expect("game should build")
+        };
+
+        // Path A: evaluate_batch (existing).
+        let mut batch: Vec<(Situation, PostFlopGame)> = situations
+            .iter()
+            .map(|sit| (sit.clone(), make_game(sit)))
+            .collect();
+        evaluate_batch(&model, &device, &mut batch);
+
+        let mut batch_results: Vec<(f32, f32)> = Vec::new();
+        for (sit, mut game) in batch {
+            let (_oop, _ip, _mask, oop_gv, ip_gv, _exploit) = solve_and_extract(
+                &mut game,
+                f64::from(sit.pot),
+                &sit.ranges,
+                20,
+                0.0,
+            );
+            batch_results.push((oop_gv, ip_gv));
+        }
+
+        // Path B: evaluate_pool_boundaries (new).
+        let mut pool: Vec<(Situation, PostFlopGame, u32)> = situations
+            .iter()
+            .map(|sit| (sit.clone(), make_game(sit), 0u32))
+            .collect();
+        evaluate_pool_boundaries(&model, &device, &mut pool);
+
+        for (i, ((sit, mut game, _), (exp_oop_gv, exp_ip_gv))) in pool
+            .into_iter()
+            .zip(batch_results.iter())
+            .enumerate()
+        {
+            let (_oop, _ip, _mask, oop_gv, ip_gv, _exploit) = solve_and_extract(
+                &mut game,
+                f64::from(sit.pot),
+                &sit.ranges,
+                20,
+                0.0,
+            );
+            assert!(
+                (oop_gv - exp_oop_gv).abs() < 1e-4,
+                "game {i} OOP game value mismatch: pool={oop_gv} batch={exp_oop_gv}"
+            );
+            assert!(
+                (ip_gv - exp_ip_gv).abs() < 1e-4,
+                "game {i} IP game value mismatch: pool={ip_gv} batch={exp_ip_gv}"
+            );
+        }
     }
 }
