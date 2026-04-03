@@ -1473,6 +1473,11 @@ fn generate_turn_training_data_iterative(
     let threads = config.datagen.threads.max(1);
     let solver_iterations = config.datagen.solver_iterations;
     let pool_size = config.datagen.active_pool_size;
+    let eval_interval = if config.datagen.leaf_eval_interval == 0 {
+        1 // 0 means every iteration
+    } else {
+        config.datagen.leaf_eval_interval
+    };
     let bet_sizes_f64 = parse_bet_sizes_all(&config.game.bet_sizes);
     if bet_sizes_f64.is_empty() {
         return Err("no valid percentage bet sizes found in config".into());
@@ -1655,10 +1660,21 @@ fn generate_turn_training_data_iterative(
     eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}",
         active.len(), solver_iterations, threads);
 
+    eprintln!("[iterative] leaf_eval_interval={eval_interval} (GPU eval every {eval_interval} iterations)");
+
     // --- Lockstep loop ---
     while !active.is_empty() {
-        // 1. GPU: evaluate boundaries for all active games.
-        evaluate_pool_boundaries(&model, &device, &mut active);
+        // 1. GPU: evaluate boundaries — only at eval_interval boundaries.
+        //    Games may be at different iterations after graduation/injection,
+        //    so check each game individually.
+        let needs_eval: Vec<bool> = active.iter()
+            .map(|(_, _, iter)| *iter % eval_interval == 0)
+            .collect();
+        let any_needs_eval = needs_eval.iter().any(|&b| b);
+
+        if any_needs_eval {
+            evaluate_pool_boundaries(&model, &device, &mut active);
+        }
 
         // 2. Solve: one iteration per game, parallel via std::thread::scope.
         let chunk_size = (active.len() + threads - 1) / threads;
@@ -1674,10 +1690,13 @@ fn generate_turn_training_data_iterative(
             }
         });
 
-        // 3. Flush boundary caches so next GPU eval sees fresh reaches.
-        for (_sit, game, _iter) in &active {
-            game.flush_boundary_caches();
+        // 3. Flush boundary caches only when next iteration will need GPU eval.
+        for (i, (_sit, game, iter)) in active.iter().enumerate() {
+            if *iter % eval_interval == 0 {
+                game.flush_boundary_caches();
+            }
         }
+        let _ = needs_eval; // suppress unused warning
 
         // Update progress bar with average iteration.
         let avg_iter: f64 = active.iter().map(|(_, _, it)| *it as f64).sum::<f64>()

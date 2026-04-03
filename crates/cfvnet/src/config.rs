@@ -648,9 +648,9 @@ datagen:
     }
 
     #[test]
-    fn active_pool_size_defaults_to_64() {
+    fn active_pool_size_defaults_to_256() {
         let config = DatagenConfig::default();
-        assert_eq!(config.active_pool_size, 64);
+        assert_eq!(config.active_pool_size, 256);
     }
 
     #[test]
@@ -677,6 +677,6 @@ datagen:
   num_samples: 100
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.datagen.active_pool_size, 64);
+        assert_eq!(config.datagen.active_pool_size, 256);
     }
 }
