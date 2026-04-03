@@ -1604,49 +1604,108 @@ fn generate_turn_training_data_iterative(
     let exploit_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let exploit_count = Arc::new(AtomicU64::new(0));
 
-    // --- Fill initial active pool ---
-    let mut active: Vec<(Situation, PostFlopGame, u32)> = Vec::with_capacity(pool_size);
+    // --- Two-queue pipeline ---
+    //
+    // solve_queue: games with fresh boundary CFVs, ready to solve
+    // gpu_queue: games that need GPU boundary eval
+    //
+    // Flow: deal → gpu_queue → [GPU eval] → solve_queue → [solve] → gpu_queue or serialize
+    // Flush happens when GPU picks up a game (before building inputs).
+
+    type ActiveGame = (Situation, PostFlopGame, u32);
+
+    // Init: fill gpu_queue with initial deals (they need GPU eval first).
+    let mut gpu_queue: Vec<ActiveGame> = Vec::with_capacity(pool_size);
+    let mut solve_queue: Vec<ActiveGame> = Vec::with_capacity(pool_size);
+
     for _ in 0..pool_size {
         match deal_rx.recv() {
-            Ok((sit, game)) => active.push((sit, game, 0)),
+            Ok((sit, game)) => gpu_queue.push((sit, game, 0)),
             Err(_) => break,
         }
     }
 
-    eprintln!("[iterative] pool filled with {} games, solver_iterations={}, threads={}, leaf_eval_interval={}",
-        active.len(), solver_iterations, threads, eval_interval);
+    eprintln!("[iterative] pool={}, solver_iterations={}, threads={}, eval_interval={}",
+        gpu_queue.len(), solver_iterations, threads, eval_interval);
 
-    // --- Lockstep loop ---
-    while !active.is_empty() {
-        // 1. GPU: evaluate boundaries for all active games.
-        evaluate_pool_boundaries(&model, &device, &mut active);
-
-        // 2. Solve: run eval_interval iterations per game, parallel via std::thread::scope.
-        let iters_this_round = eval_interval;
-        let chunk_size = (active.len() + threads - 1) / threads;
-        std::thread::scope(|s| {
-            for chunk in active.chunks_mut(chunk_size.max(1)) {
-                s.spawn(|| {
-                    range_solver::set_force_sequential(true);
-                    for (_sit, game, iter) in chunk.iter_mut() {
-                        let target = (*iter + iters_this_round).min(solver_iterations);
-                        while *iter < target {
-                            solve_step(game, *iter);
-                            *iter += 1;
-                        }
-                    }
-                });
+    loop {
+        // --- GPU phase: process gpu_queue → solve_queue ---
+        if !gpu_queue.is_empty() {
+            // Flush boundary caches on pickup (before reading/building inputs).
+            for (_sit, game, _iter) in &gpu_queue {
+                game.flush_boundary_caches();
             }
-        });
 
-        // 3. Flush boundary caches for next GPU eval.
-        for (_sit, game, _iter) in &active {
-            game.flush_boundary_caches();
+            // GPU eval all games in gpu_queue.
+            evaluate_pool_boundaries(&model, &device, &mut gpu_queue);
+
+            // Move to solve_queue (they now have fresh CFVs).
+            solve_queue.append(&mut gpu_queue);
         }
 
-        // Update progress bar with average iteration.
-        let avg_iter: f64 = active.iter().map(|(_, _, it)| *it as f64).sum::<f64>()
-            / active.len().max(1) as f64;
+        // --- Solve phase: process solve_queue ---
+        if !solve_queue.is_empty() {
+            let chunk_size = (solve_queue.len() + threads - 1) / threads;
+            std::thread::scope(|s| {
+                for chunk in solve_queue.chunks_mut(chunk_size.max(1)) {
+                    s.spawn(|| {
+                        range_solver::set_force_sequential(true);
+                        for (_sit, game, iter) in chunk.iter_mut() {
+                            let target = (*iter + eval_interval).min(solver_iterations);
+                            while *iter < target {
+                                solve_step(game, *iter);
+                                *iter += 1;
+                            }
+                        }
+                    });
+                }
+            });
+
+            // Route solved games: done → serialize, needs more → gpu_queue.
+            let mut i = 0;
+            while i < solve_queue.len() {
+                if solve_queue[i].2 >= solver_iterations {
+                    // Graduate.
+                    let (sit, mut game, _) = solve_queue.swap_remove(i);
+                    range_solver::finalize(&mut game);
+                    let exploit = range_solver::compute_exploitability(&game);
+                    let pot = f64::from(sit.pot);
+                    let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
+                        extract_results(&mut game, pot, &sit.ranges, exploit);
+
+                    if exploit >= 0.0 {
+                        let bb = initial_stack as f32 / 100.0;
+                        let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
+                        exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
+                        exploit_count.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    pb.inc(1);
+                    let _ = storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv));
+
+                    // Inject replacement into gpu_queue (needs GPU eval first).
+                    if let Ok((new_sit, new_game)) = deal_rx.try_recv() {
+                        gpu_queue.push((new_sit, new_game, 0));
+                    }
+                } else {
+                    // Needs more iterations → back to gpu_queue for fresh boundaries.
+                    let game = solve_queue.swap_remove(i);
+                    gpu_queue.push(game);
+                }
+                // Note: swap_remove puts last element at i, so don't increment i.
+            }
+        }
+
+        // Done?
+        if solve_queue.is_empty() && gpu_queue.is_empty() {
+            break;
+        }
+
+        // Progress bar.
+        let total = solve_queue.len() + gpu_queue.len();
+        let all_iters: f64 = solve_queue.iter().chain(gpu_queue.iter())
+            .map(|(_, _, it)| *it as f64).sum::<f64>();
+        let avg_iter = all_iters / total.max(1) as f64;
         let wc = write_count.load(Ordering::Relaxed);
         let dc = deal_count.load(Ordering::Relaxed);
         let ec = exploit_count.load(Ordering::Relaxed);
@@ -1656,43 +1715,10 @@ fn generate_turn_training_data_iterative(
             0.0
         };
         pb.set_message(format!(
-            "pool:[{}/{}] iter:[{:.0}/{}] deal\u{2192}[{}]\u{2192}solve\u{2192}[{}]\u{2192}write  expl:{:.1} mbb/h",
-            active.len(), pool_size, avg_iter, solver_iterations,
+            "pool:[{}/{}] gpu:[{}] iter:[{:.0}/{}] deal\u{2192}[{}]\u{2192}solve\u{2192}[{}]\u{2192}write  expl:{:.1} mbb/h",
+            total, pool_size, gpu_queue.len(), avg_iter, solver_iterations,
             dc, wc, avg_exploit,
         ));
-
-        // 4. Graduate finished games, inject new ones.
-        let mut i = 0;
-        while i < active.len() {
-            if active[i].2 >= solver_iterations {
-                let (sit, mut game, _) = active.swap_remove(i);
-                range_solver::finalize(&mut game);
-                let exploit = range_solver::compute_exploitability(&game);
-                let pot = f64::from(sit.pot);
-                let (oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv, _) =
-                    extract_results(&mut game, pot, &sit.ranges, exploit);
-
-                // Track exploitability.
-                if exploit >= 0.0 {
-                    let bb = initial_stack as f32 / 100.0;
-                    let exploit_mbb = if bb > 0.0 { exploit / bb * 1000.0 } else { 0.0 };
-                    exploit_sum.fetch_add((exploit_mbb * 100.0) as u64, Ordering::Relaxed);
-                    exploit_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                pb.inc(1);
-                if storage_tx.send((sit, oop_cfvs, ip_cfvs, valid_mask, oop_gv, ip_gv)).is_err() {
-                    break;
-                }
-
-                // Inject replacement from deal buffer.
-                if let Ok((new_sit, new_game)) = deal_rx.try_recv() {
-                    active.push((new_sit, new_game, 0));
-                }
-            } else {
-                i += 1;
-            }
-        }
     }
 
     // Shut down writer.
