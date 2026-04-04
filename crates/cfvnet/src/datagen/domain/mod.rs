@@ -2,11 +2,13 @@ pub mod evaluator;
 pub mod game;
 pub mod situation;
 pub mod solver;
+pub mod writer;
 
 pub use evaluator::{BoundaryCfvs, BoundaryEvaluator};
 pub use game::{Game, GameBuilder};
 pub use situation::SituationGenerator;
 pub use solver::{SolvedGame, Solver, SolverConfig};
+pub use writer::RecordWriter;
 
 #[cfg(test)]
 mod tests {
