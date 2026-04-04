@@ -332,7 +332,7 @@ fn cmd_generate(
     num_samples: Option<u64>,
     threads: Option<usize>,
     per_file: Option<u64>,
-    backend: &str,
+    _backend: &str,
     river_output: Option<PathBuf>,
 ) {
     let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {

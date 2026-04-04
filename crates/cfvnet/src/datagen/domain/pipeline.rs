@@ -253,15 +253,17 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_produces_records_for_turn() {
-        // Turn mode requires a river model which we can't load in unit tests.
-        // Verify it returns the expected error.
+    fn pipeline_produces_records_for_turn_exact() {
+        // Turn without a river model falls back to exact mode (full solve through river).
         range_solver::set_force_sequential(true);
         let tmp = NamedTempFile::new().unwrap();
         let config = test_config(3, 4);
-        let result = DomainPipeline::run(&config, tmp.path());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("river_model_path"));
+        DomainPipeline::run(&config, tmp.path()).unwrap();
+
+        let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+        let r0 = read_record(&mut reader).unwrap();
+        assert_eq!(r0.board.len(), 4);
+        assert!(r0.pot > 0.0);
     }
 
     #[test]

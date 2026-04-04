@@ -4,7 +4,6 @@
 //! - **compare-net**: solver uses `NetBoundaryEvaluator` (river net) at depth boundaries
 //! - **compare-exact**: solver uses `PostFlopGame` with `depth_limit: None` (full solve through river)
 
-use crate::config::BetSizeConfig;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -713,7 +712,7 @@ pub fn run_turn_comparison_exact_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig};
+    use crate::config::{BetSizeConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig};
 
     fn test_config() -> CfvnetConfig {
         CfvnetConfig {
