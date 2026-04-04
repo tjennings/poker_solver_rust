@@ -1,5 +1,6 @@
 pub mod evaluator;
 pub mod game;
+pub mod neural_net_evaluator;
 pub mod situation;
 pub mod solver;
 pub mod writer;

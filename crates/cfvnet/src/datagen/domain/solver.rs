@@ -8,6 +8,7 @@ use crate::datagen::range_gen::NUM_COMBOS;
 use crate::datagen::storage::TrainingRecord;
 
 /// Configuration for the DCFR solver.
+#[derive(Clone)]
 pub struct SolverConfig {
     pub max_iterations: u32,
     pub target_exploitability: Option<f32>,

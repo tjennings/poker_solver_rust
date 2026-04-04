@@ -303,7 +303,7 @@ fn evaluate_pool_boundaries<B2: burn::tensor::backend::Backend>(
 }
 
 /// Convert a range-solver `u8` card to an `rs_poker::core::Card`.
-fn u8_to_rs_card(id: u8) -> Card {
+pub(crate) fn u8_to_rs_card(id: u8) -> Card {
     let rank = id / 4;
     let suit_id = id % 4;
     let value = Value::from(rank);
@@ -349,7 +349,7 @@ fn parse_bet_sizes_depth(sizes: &[String]) -> Vec<f64> {
 }
 
 /// Parse all depths from a BetSizeConfig into `Vec<Vec<f64>>`.
-fn parse_bet_sizes_all(config: &crate::config::BetSizeConfig) -> Vec<Vec<f64>> {
+pub(crate) fn parse_bet_sizes_all(config: &crate::config::BetSizeConfig) -> Vec<Vec<f64>> {
     config.depths().iter().map(|d| parse_bet_sizes_depth(d)).collect()
 }
 
