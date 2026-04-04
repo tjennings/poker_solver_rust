@@ -34,16 +34,15 @@ pub struct SolvedGame {
 impl SolvedGame {
     /// Extract training records (OOP + IP) from the solved game.
     pub fn extract_records(&self) -> Vec<TrainingRecord> {
-        let tree = &self.game.tree;
-        let sit = &self.game.situation;
+        let sit = self.game.situation();
         let pot = f64::from(sit.pot);
         let half_pot = pot / 2.0;
         let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
 
-        let raw_oop = tree.expected_values(0);
-        let raw_ip = tree.expected_values(1);
-        let oop_hands = tree.private_cards(0);
-        let ip_hands = tree.private_cards(1);
+        let raw_oop = self.game.expected_values(0);
+        let raw_ip = self.game.expected_values(1);
+        let oop_hands = self.game.private_cards(0);
+        let ip_hands = self.game.private_cards(1);
 
         let mut oop_cfvs = [0.0_f32; NUM_COMBOS];
         let mut ip_cfvs = [0.0_f32; NUM_COMBOS];
@@ -109,10 +108,10 @@ pub struct Solver {
 }
 
 impl Solver {
-    pub fn new(game: Game, config: SolverConfig, evaluator: Arc<dyn BoundaryEvaluator>) -> Self {
+    pub fn new(game: Game, config: &SolverConfig, evaluator: Arc<dyn BoundaryEvaluator>) -> Self {
         Self {
             game: Some(game),
-            config,
+            config: config.clone(),
             evaluator,
             iteration: 0,
             boundaries_set: false,
@@ -135,26 +134,10 @@ impl Solver {
                 game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
             }
             self.boundaries_set = true;
-
-            // Verify all boundaries are populated.
-            let nb = game.num_boundaries();
-            let mut empty_count = 0;
-            for ord in 0..nb {
-                for pl in 0..2 {
-                    if game.boundary_cfvs_empty(ord, pl) {
-                        empty_count += 1;
-                    }
-                }
-            }
-            if empty_count > 0 {
-                eprintln!("[SOLVER] WARNING: {empty_count}/{} boundary slots empty after eval at iter {}", nb * 2, self.iteration);
-            } else {
-                eprintln!("[SOLVER] iter={}: all {nb} boundaries populated", self.iteration);
-            }
         }
 
         // Run one DCFR iteration.
-        range_solver::solve_step(&game.tree, self.iteration);
+        game.solve_step(self.iteration);
         self.iteration += 1;
 
         // Check if done by max iterations.
@@ -170,8 +153,8 @@ impl Solver {
                 for bc in &cfvs {
                     game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs.clone());
                 }
-                let exploit = range_solver::compute_exploitability(&game.tree);
-                let abs_target = target * game.situation.pot as f32;
+                let exploit = game.compute_exploitability();
+                let abs_target = target * game.situation().pot as f32;
                 if exploit <= abs_target {
                     return Some(self.finish());
                 }
@@ -190,23 +173,11 @@ impl Solver {
             game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
         }
 
-        // Verify boundaries before exploitability computation.
-        let nb = game.num_boundaries();
-        let mut empty_count = 0;
-        for ord in 0..nb {
-            for pl in 0..2 {
-                if game.boundary_cfvs_empty(ord, pl) {
-                    empty_count += 1;
-                }
-            }
-        }
-        eprintln!("[SOLVER] finish: {nb} boundaries, {empty_count} empty (iter={})", self.iteration);
+        game.finalize();
+        game.back_to_root();
+        game.cache_normalized_weights();
 
-        range_solver::finalize(&mut game.tree);
-        game.tree.back_to_root();
-        game.tree.cache_normalized_weights();
-
-        let exploit = range_solver::compute_exploitability(&game.tree);
+        let exploit = game.compute_exploitability();
 
         SolvedGame {
             game,
@@ -224,7 +195,6 @@ mod tests {
     use crate::datagen::sampler::sample_situation;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
-    use range_solver::interface::Game as RsGame;
     use std::sync::Arc;
 
     struct ZeroEvaluator;
@@ -235,7 +205,7 @@ mod tests {
                     (0..2).map(move |player| BoundaryCfvs {
                         ordinal: ord,
                         player,
-                        cfvs: vec![0.0; game.tree.num_private_hands(player)],
+                        cfvs: vec![0.0; game.num_private_hands(player)],
                     })
                 })
                 .collect()
@@ -274,7 +244,7 @@ mod tests {
             max_iterations: 50,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, eval);
 
         let solved = loop {
             match solver.step() {
@@ -304,7 +274,7 @@ mod tests {
             max_iterations: 10,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, eval);
 
         // First 9 steps should return None
         for _ in 0..9 {
@@ -323,7 +293,7 @@ mod tests {
             max_iterations: 20,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, eval);
 
         let solved = loop {
             match solver.step() {
@@ -341,14 +311,14 @@ mod tests {
     fn solved_game_records_have_matching_pot_and_stack() {
         range_solver::set_force_sequential(true);
         let game = build_test_game();
-        let expected_pot = game.situation.pot as f32;
-        let expected_stack = game.situation.effective_stack as f32;
+        let expected_pot = game.situation().pot as f32;
+        let expected_stack = game.situation().effective_stack as f32;
         let eval: Arc<dyn BoundaryEvaluator> = Arc::new(ZeroEvaluator);
         let solver_config = SolverConfig {
             max_iterations: 20,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, eval);
 
         let solved = loop {
             match solver.step() {

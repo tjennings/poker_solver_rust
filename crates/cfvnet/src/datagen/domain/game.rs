@@ -1,16 +1,35 @@
 use crate::datagen::sampler::Situation;
 use range_solver::game::PostFlopGame;
-
-use crate::datagen::range_gen::NUM_COMBOS;
+use range_solver::interface::Game as RsGame;
 
 /// A turn game tree built from a situation.
 /// Thin wrapper over PostFlopGame with domain-level boundary access.
 pub struct Game {
-    pub situation: Situation,
-    pub tree: PostFlopGame,
+    situation: Situation,
+    tree: PostFlopGame,
 }
 
 impl Game {
+    pub fn new(situation: Situation, tree: PostFlopGame) -> Self {
+        Self { situation, tree }
+    }
+
+    // Accessors
+
+    pub fn situation(&self) -> &Situation {
+        &self.situation
+    }
+
+    pub fn num_private_hands(&self, player: usize) -> usize {
+        self.tree.num_private_hands(player)
+    }
+
+    pub fn private_cards(&self, player: usize) -> &[(u8, u8)] {
+        self.tree.private_cards(player)
+    }
+
+    // Boundary methods
+
     pub fn num_boundaries(&self) -> usize {
         self.tree.num_boundary_nodes()
     }
@@ -29,6 +48,32 @@ impl Game {
 
     pub fn boundary_reach(&self, ordinal: usize, player: usize) -> Vec<f32> {
         self.tree.boundary_reach(ordinal, player)
+    }
+
+    // Solver operations
+
+    pub fn solve_step(&self, iteration: u32) {
+        range_solver::solve_step(&self.tree, iteration);
+    }
+
+    pub fn finalize(&mut self) {
+        range_solver::finalize(&mut self.tree);
+    }
+
+    pub fn compute_exploitability(&self) -> f32 {
+        range_solver::compute_exploitability(&self.tree)
+    }
+
+    pub fn expected_values(&self, player: usize) -> Vec<f32> {
+        self.tree.expected_values(player)
+    }
+
+    pub fn back_to_root(&mut self) {
+        self.tree.back_to_root();
+    }
+
+    pub fn cache_normalized_weights(&mut self) {
+        self.tree.cache_normalized_weights();
     }
 }
 
@@ -55,10 +100,7 @@ impl GameBuilder {
             &sit.ranges,
             &self.bet_sizes,
         )?;
-        Some(Game {
-            situation: sit.clone(),
-            tree,
-        })
+        Some(Game::new(sit.clone(), tree))
     }
 }
 
@@ -111,8 +153,8 @@ mod tests {
         }
         let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
         let game = builder.build(&sit).expect("should build");
-        assert_eq!(game.situation.pot, sit.pot);
-        assert_eq!(game.situation.effective_stack, sit.effective_stack);
+        assert_eq!(game.situation().pot, sit.pot);
+        assert_eq!(game.situation().effective_stack, sit.effective_stack);
     }
 
     #[test]

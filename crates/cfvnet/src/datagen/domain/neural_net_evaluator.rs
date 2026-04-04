@@ -76,15 +76,16 @@ impl BoundaryEvaluator for NeuralNetEvaluator {
             return Vec::new();
         }
 
-        let board_u8 = game.situation.board_cards();
-        let pot = f64::from(game.situation.pot);
-        let effective_stack = f64::from(game.situation.effective_stack);
+        let sit = game.situation();
+        let board_u8 = sit.board_cards();
+        let pot = f64::from(sit.pot);
+        let effective_stack = f64::from(sit.effective_stack);
 
         // Convert board from u8 to Card.
         let board_cards: Vec<Card> = board_u8.iter().map(|&c| u8_to_rs_card(c)).collect();
 
         // Both players share the same hands on a 4-card board.
-        let hands = game.tree.private_cards(0);
+        let hands = game.private_cards(0);
 
         // Convert to [[Card; 2]] for the evaluator.
         let combos: Vec<[Card; 2]> = hands
@@ -95,11 +96,11 @@ impl BoundaryEvaluator for NeuralNetEvaluator {
         // Build per-combo range arrays from the 1326-indexed input ranges.
         let oop_reach: Vec<f64> = hands
             .iter()
-            .map(|&(c0, c1)| f64::from(game.situation.ranges[0][card_pair_to_index(c0, c1)]))
+            .map(|&(c0, c1)| f64::from(sit.ranges[0][card_pair_to_index(c0, c1)]))
             .collect();
         let ip_reach: Vec<f64> = hands
             .iter()
-            .map(|&(c0, c1)| f64::from(game.situation.ranges[1][card_pair_to_index(c0, c1)]))
+            .map(|&(c0, c1)| f64::from(sit.ranges[1][card_pair_to_index(c0, c1)]))
             .collect();
 
         // Collect all (pot, eff_stack, player) requests.
@@ -120,31 +121,10 @@ impl BoundaryEvaluator for NeuralNetEvaluator {
         // Convert Vec<Vec<f64>> results to Vec<BoundaryCfvs>.
         let mut result = Vec::with_capacity(num_boundaries * 2);
 
-        // Format board for logging.
-        let board_str: Vec<&str> = board_u8.iter().map(|&c| {
-            let ranks = ["2","3","4","5","6","7","8","9","T","J","Q","K","A"];
-            let suits = ["c","d","h","s"];
-            // Leak a small string for the duration — fine for diagnostics.
-            Box::leak(format!("{}{}", ranks[c as usize / 4], suits[c as usize % 4]).into_boxed_str()) as &str
-        }).collect();
-
         for ordinal in 0..num_boundaries {
             for player in 0..2usize {
                 let req_idx = ordinal * 2 + player;
                 let cfvs_f32: Vec<f32> = all_cfvs[req_idx].iter().map(|&v| v as f32).collect();
-
-                // Diagnostic: log CFVs for player 0 only (OOP).
-                if player == 0 {
-                    let cfv_sum: f32 = cfvs_f32.iter().sum();
-                    let cfv_abs: f32 = cfvs_f32.iter().map(|v| v.abs()).sum();
-                    let cfv_nonzero = cfvs_f32.iter().filter(|&&v| v.abs() > 1e-8).count();
-                    let bpot = game.boundary_pot(ordinal);
-                    eprintln!(
-                        "[EVAL] board=[{}] ord={}/{} pot={} | cfv: sum={:.2} abs={:.2} nonzero={}/{}",
-                        board_str.join(" "), ordinal, num_boundaries, bpot,
-                        cfv_sum, cfv_abs, cfv_nonzero, cfvs_f32.len()
-                    );
-                }
 
                 result.push(BoundaryCfvs {
                     ordinal,
@@ -205,7 +185,7 @@ mod tests {
     #[test]
     fn bridge_converts_board_to_cards() {
         let game = build_test_game();
-        let board_u8 = game.situation.board_cards();
+        let board_u8 = game.situation().board_cards();
         assert_eq!(board_u8.len(), 4);
 
         let board_cards: Vec<Card> = board_u8.iter().map(|&c| u8_to_rs_card(c)).collect();
@@ -215,7 +195,7 @@ mod tests {
     #[test]
     fn bridge_converts_combos_to_card_pairs() {
         let game = build_test_game();
-        let hands = game.tree.private_cards(0);
+        let hands = game.private_cards(0);
         assert!(!hands.is_empty());
 
         let combos: Vec<[Card; 2]> = hands
@@ -228,8 +208,8 @@ mod tests {
     #[test]
     fn bridge_builds_range_arrays_from_situation() {
         let game = build_test_game();
-        let hands = game.tree.private_cards(0);
-        let ranges = &game.situation.ranges;
+        let hands = game.private_cards(0);
+        let ranges = &game.situation().ranges;
 
         let oop_reach: Vec<f64> = hands
             .iter()
@@ -244,8 +224,8 @@ mod tests {
     #[test]
     fn bridge_computes_eff_stack_at_boundary() {
         let game = build_test_game();
-        let root_pot = f64::from(game.situation.pot);
-        let root_eff_stack = f64::from(game.situation.effective_stack);
+        let root_pot = f64::from(game.situation().pot);
+        let root_eff_stack = f64::from(game.situation().effective_stack);
 
         for ord in 0..game.num_boundaries() {
             let bpot = game.boundary_pot(ord) as f64;

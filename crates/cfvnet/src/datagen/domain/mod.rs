@@ -16,7 +16,6 @@ pub use writer::RecordWriter;
 mod tests {
     use super::*;
     use crate::config::DatagenConfig;
-    use range_solver::interface::Game as RsGame;
     use std::sync::Arc;
 
     /// Zero-valued boundary evaluator for testing pipeline mechanics.
@@ -28,7 +27,7 @@ mod tests {
                     (0..2).map(move |player| BoundaryCfvs {
                         ordinal: ord,
                         player,
-                        cfvs: vec![0.0; game.tree.num_private_hands(player)],
+                        cfvs: vec![0.0; game.num_private_hands(player)],
                     })
                 })
                 .collect()
@@ -50,12 +49,13 @@ mod tests {
                 Some(g) => g,
                 None => continue,
             };
+            let solver_config = SolverConfig {
+                max_iterations: 20,
+                ..Default::default()
+            };
             let mut solver = Solver::new(
                 game,
-                SolverConfig {
-                    max_iterations: 20,
-                    ..Default::default()
-                },
+                &solver_config,
                 Arc::clone(&eval),
             );
             let solved = loop {
@@ -96,12 +96,13 @@ mod tests {
                 Some(g) => g,
                 None => continue,
             };
+            let solver_config = SolverConfig {
+                max_iterations: 10,
+                ..Default::default()
+            };
             let mut solver = Solver::new(
                 game,
-                SolverConfig {
-                    max_iterations: 10,
-                    ..Default::default()
-                },
+                &solver_config,
                 Arc::clone(&eval),
             );
             let solved = loop {

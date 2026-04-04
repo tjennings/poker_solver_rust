@@ -77,7 +77,7 @@ impl DomainPipeline {
                 }
             };
 
-            let mut solver = Solver::new(game, solver_config.clone(), Arc::clone(&evaluator));
+            let mut solver = Solver::new(game, &solver_config, Arc::clone(&evaluator));
             let solved = loop {
                 match solver.step() {
                     None => continue,

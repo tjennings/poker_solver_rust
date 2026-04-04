@@ -23,8 +23,6 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
-    use range_solver::interface::Game as RsGame;
-
     struct MockEvaluator;
     impl BoundaryEvaluator for MockEvaluator {
         fn evaluate(&self, game: &Game) -> Vec<BoundaryCfvs> {
@@ -33,7 +31,7 @@ mod tests {
                     (0..2).map(move |player| BoundaryCfvs {
                         ordinal: ord,
                         player,
-                        cfvs: vec![0.0; game.tree.num_private_hands(player)],
+                        cfvs: vec![0.0; game.num_private_hands(player)],
                     })
                 })
                 .collect()
@@ -68,7 +66,7 @@ mod tests {
         let eval = MockEvaluator;
         let results = eval.evaluate(&game);
         for bc in &results {
-            let expected_size = RsGame::num_private_hands(&game.tree, bc.player);
+            let expected_size = game.num_private_hands(bc.player);
             assert_eq!(bc.cfvs.len(), expected_size);
         }
     }
