@@ -1,6 +1,10 @@
+use rand::Rng;
+
 use crate::datagen::sampler::Situation;
 use range_solver::game::PostFlopGame;
 use range_solver::interface::Game as RsGame;
+
+use super::evaluator::SolveStrategy;
 
 /// A turn game tree built from a situation.
 /// Thin wrapper over PostFlopGame with domain-level boundary access.
@@ -78,28 +82,50 @@ impl Game {
 }
 
 /// Builds a Game from a Situation by delegating to the existing
-/// `build_turn_game` function.
+/// `build_turn_game` / `build_turn_game_exact` functions.
 pub struct GameBuilder {
-    pub bet_sizes: Vec<Vec<f64>>,
-    pub depth_limit: Option<usize>,
+    bet_sizes: Vec<Vec<f64>>,
+    pub(crate) exact: bool,
+    pub(crate) fuzz: f64,
 }
 
 impl GameBuilder {
-    pub fn new(bet_sizes: Vec<Vec<f64>>) -> Self {
+    pub fn new(bet_sizes: Vec<Vec<f64>>, strategy: &SolveStrategy) -> Self {
         Self {
             bet_sizes,
-            depth_limit: Some(0),
+            exact: matches!(strategy, SolveStrategy::Exact),
+            fuzz: 0.0,
         }
     }
 
-    pub fn build(&self, sit: &Situation) -> Option<Game> {
-        let tree = crate::datagen::turn_generate::build_turn_game(
-            sit.board_cards(),
-            f64::from(sit.pot),
-            f64::from(sit.effective_stack),
-            &sit.ranges,
-            &self.bet_sizes,
-        )?;
+    pub fn with_fuzz(mut self, fuzz: f64) -> Self {
+        self.fuzz = fuzz;
+        self
+    }
+
+    pub fn build(&self, sit: &Situation, rng: &mut impl Rng) -> Option<Game> {
+        let sizes = if self.fuzz > 0.0 {
+            crate::datagen::turn_generate::fuzz_bet_sizes(&self.bet_sizes, self.fuzz, rng)
+        } else {
+            self.bet_sizes.clone()
+        };
+        let tree = if self.exact {
+            crate::datagen::turn_generate::build_turn_game_exact(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &sizes,
+            )?
+        } else {
+            crate::datagen::turn_generate::build_turn_game(
+                sit.board_cards(),
+                f64::from(sit.pot),
+                f64::from(sit.effective_stack),
+                &sit.ranges,
+                &sizes,
+            )?
+        };
         Some(Game::new(sit.clone(), tree))
     }
 }
@@ -108,20 +134,44 @@ impl GameBuilder {
 mod tests {
     use super::*;
     use crate::config::DatagenConfig;
+    use crate::datagen::domain::evaluator::{BoundaryEvaluator, BoundaryCfvs, SolveStrategy};
     use crate::datagen::sampler::sample_situation;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use std::sync::Arc;
+
+    struct MockEvaluator;
+    impl BoundaryEvaluator for MockEvaluator {
+        fn evaluate(&self, game: &Game) -> Vec<BoundaryCfvs> {
+            (0..game.num_boundaries())
+                .flat_map(|ord| {
+                    (0..2).map(move |player| BoundaryCfvs {
+                        ordinal: ord,
+                        player,
+                        cfvs: vec![0.0; game.num_private_hands(player)],
+                    })
+                })
+                .collect()
+        }
+    }
+
+    fn depth_limited_strategy() -> SolveStrategy {
+        SolveStrategy::DepthLimited {
+            evaluator: Arc::new(MockEvaluator),
+        }
+    }
 
     #[test]
     fn game_builder_produces_game_with_boundaries() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = DatagenConfig::default();
         let sit = sample_situation(&config, 200, 4, &mut rng);
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
+        let strategy = depth_limited_strategy();
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
         if sit.effective_stack <= 0 {
             return;
         }
-        let game = builder.build(&sit).expect("should build");
+        let game = builder.build(&sit, &mut rng).expect("should build");
         assert!(game.num_boundaries() > 0, "turn game should have boundaries");
     }
 
@@ -130,11 +180,12 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = DatagenConfig::default();
         let sit = sample_situation(&config, 200, 4, &mut rng);
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
+        let strategy = depth_limited_strategy();
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
         if sit.effective_stack <= 0 {
             return;
         }
-        let game = builder.build(&sit).expect("should build");
+        let game = builder.build(&sit, &mut rng).expect("should build");
         let pot = game.boundary_pot(0);
         assert!(pot > 0, "boundary pot should be positive");
         assert!(
@@ -151,15 +202,66 @@ mod tests {
         if sit.effective_stack <= 0 {
             return;
         }
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
-        let game = builder.build(&sit).expect("should build");
+        let strategy = depth_limited_strategy();
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let game = builder.build(&sit, &mut rng).expect("should build");
         assert_eq!(game.situation().pot, sit.pot);
         assert_eq!(game.situation().effective_stack, sit.effective_stack);
     }
 
     #[test]
-    fn game_builder_with_default_depth_limit() {
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
-        assert_eq!(builder.depth_limit, Some(0));
+    fn game_builder_stores_exact_flag() {
+        let exact_builder = GameBuilder::new(vec![vec![0.5, 1.0]], &SolveStrategy::Exact);
+        assert!(exact_builder.exact);
+        let dl_builder = GameBuilder::new(vec![vec![0.5, 1.0]], &depth_limited_strategy());
+        assert!(!dl_builder.exact);
+    }
+
+    #[test]
+    fn game_builder_with_fuzz_sets_fuzz() {
+        let strategy = depth_limited_strategy();
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy).with_fuzz(0.1);
+        assert!((builder.fuzz - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn game_builder_default_fuzz_is_zero() {
+        let strategy = depth_limited_strategy();
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        assert!((builder.fuzz - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn game_builder_with_fuzz_builds_game() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let config = DatagenConfig::default();
+        let sit = sample_situation(&config, 200, 4, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let strategy = depth_limited_strategy();
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy).with_fuzz(0.1);
+        let game = builder.build(&sit, &mut rng);
+        assert!(game.is_some(), "fuzzed build should produce a game");
+    }
+
+    #[test]
+    fn game_builder_exact_mode_builds_game_for_river() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let config = DatagenConfig::default();
+        // River board (5 cards) with exact mode.
+        let sit = sample_situation(&config, 200, 5, &mut rng);
+        if sit.effective_stack <= 0 {
+            return;
+        }
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &SolveStrategy::Exact);
+        let game = builder.build(&sit, &mut rng);
+        assert!(game.is_some(), "exact mode should build a river game");
+        let game = game.unwrap();
+        assert_eq!(
+            game.num_boundaries(),
+            0,
+            "exact mode river game should have no boundaries"
+        );
     }
 }

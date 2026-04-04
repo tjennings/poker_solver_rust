@@ -141,21 +141,41 @@ impl BoundaryEvaluator for NeuralNetEvaluator {
 mod tests {
     use super::*;
     use crate::config::DatagenConfig;
+    use crate::datagen::domain::evaluator::SolveStrategy;
     use crate::datagen::domain::game::GameBuilder;
     use crate::datagen::sampler::sample_situation;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use std::sync::Arc;
+
+    struct ZeroEvaluator;
+    impl BoundaryEvaluator for ZeroEvaluator {
+        fn evaluate(&self, game: &Game) -> Vec<BoundaryCfvs> {
+            (0..game.num_boundaries())
+                .flat_map(|ord| {
+                    (0..2).map(move |player| BoundaryCfvs {
+                        ordinal: ord,
+                        player,
+                        cfvs: vec![0.0; game.num_private_hands(player)],
+                    })
+                })
+                .collect()
+        }
+    }
 
     fn build_test_game() -> Game {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = DatagenConfig::default();
+        let strategy = SolveStrategy::DepthLimited {
+            evaluator: Arc::new(ZeroEvaluator),
+        };
         loop {
             let sit = sample_situation(&config, 200, 4, &mut rng);
             if sit.effective_stack <= 0 {
                 continue;
             }
-            let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
-            if let Some(game) = builder.build(&sit) {
+            let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+            if let Some(game) = builder.build(&sit, &mut rng) {
                 return game;
             }
         }

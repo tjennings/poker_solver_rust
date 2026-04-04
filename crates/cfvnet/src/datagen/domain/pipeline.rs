@@ -2,11 +2,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 use crate::config::CfvnetConfig;
 
-use super::evaluator::{BoundaryCfvs, BoundaryEvaluator};
-use super::game::{Game, GameBuilder};
+use super::evaluator::SolveStrategy;
+use super::game::GameBuilder;
 use super::neural_net_evaluator::NeuralNetEvaluator;
 use super::situation::SituationGenerator;
 use super::solver::{Solver, SolverConfig};
@@ -29,25 +31,28 @@ impl DomainPipeline {
             return Err("no valid bet sizes".into());
         }
 
-        // Load boundary evaluator (neural net for turn, zero for river).
-        let evaluator: Arc<dyn BoundaryEvaluator> = if board_size < 5 {
-            Arc::new(NeuralNetEvaluator::load(
-                config
-                    .game
-                    .river_model_path
-                    .as_deref()
-                    .ok_or("river_model_path required for turn datagen")?,
-                config,
-            )?)
+        // Construct solve strategy: depth-limited with neural net for turn, exact for river.
+        let strategy = if board_size < 5 {
+            SolveStrategy::DepthLimited {
+                evaluator: Arc::new(NeuralNetEvaluator::load(
+                    config
+                        .game
+                        .river_model_path
+                        .as_deref()
+                        .ok_or("river_model_path required for turn datagen")?,
+                    config,
+                )?),
+            }
         } else {
-            Arc::new(ZeroBoundaryEvaluator)
+            SolveStrategy::Exact
         };
 
         // Construct domain objects.
         let range_source = super::RangeSource::from_config(&config.datagen)?;
         let sit_gen = SituationGenerator::new(&config.datagen, initial_stack, board_size, seed, num_samples)
             .with_range_source(range_source);
-        let builder = GameBuilder::new(bet_sizes);
+        let builder = GameBuilder::new(bet_sizes, &strategy)
+            .with_fuzz(config.datagen.bet_size_fuzz);
         let solver_config = SolverConfig {
             max_iterations: config.datagen.solver_iterations,
             target_exploitability: config.datagen.target_exploitability,
@@ -65,11 +70,12 @@ impl DomainPipeline {
         );
 
         // Generate loop.
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut exploit_sum = 0.0f64;
         let mut exploit_count = 0u64;
 
         for sit in sit_gen {
-            let game = match builder.build(&sit) {
+            let game = match builder.build(&sit, &mut rng) {
                 Some(g) => g,
                 None => {
                     pb.inc(1);
@@ -77,7 +83,7 @@ impl DomainPipeline {
                 }
             };
 
-            let mut solver = Solver::new(game, &solver_config, Arc::clone(&evaluator));
+            let mut solver = Solver::new(game, &solver_config, strategy.clone());
             let solved = loop {
                 match solver.step() {
                     None => continue,
@@ -122,14 +128,6 @@ impl DomainPipeline {
             output_path.display()
         );
         Ok(())
-    }
-}
-
-/// Zero evaluator for river games (no boundary nodes).
-struct ZeroBoundaryEvaluator;
-impl BoundaryEvaluator for ZeroBoundaryEvaluator {
-    fn evaluate(&self, _game: &Game) -> Vec<BoundaryCfvs> {
-        Vec::new()
     }
 }
 

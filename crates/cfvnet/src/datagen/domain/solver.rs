@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use range_solver::card::card_pair_to_index;
 
-use super::evaluator::BoundaryEvaluator;
+use super::evaluator::SolveStrategy;
 use super::game::Game;
 use crate::datagen::range_gen::NUM_COMBOS;
 use crate::datagen::storage::TrainingRecord;
@@ -102,17 +100,17 @@ impl SolvedGame {
 pub struct Solver {
     game: Option<Game>,
     config: SolverConfig,
-    evaluator: Arc<dyn BoundaryEvaluator>,
+    strategy: SolveStrategy,
     iteration: u32,
     boundaries_set: bool,
 }
 
 impl Solver {
-    pub fn new(game: Game, config: &SolverConfig, evaluator: Arc<dyn BoundaryEvaluator>) -> Self {
+    pub fn new(game: Game, config: &SolverConfig, strategy: SolveStrategy) -> Self {
         Self {
             game: Some(game),
             config: config.clone(),
-            evaluator,
+            strategy,
             iteration: 0,
             boundaries_set: false,
         }
@@ -122,18 +120,24 @@ impl Solver {
     pub fn step(&mut self) -> Option<SolvedGame> {
         let game = self.game.as_ref().expect("step called after finish");
 
-        // Evaluate boundaries if needed.
-        let needs_eval = !self.boundaries_set
-            || (self.config.leaf_eval_interval > 0
-                && self.iteration > 0
-                && self.iteration % self.config.leaf_eval_interval == 0);
-
-        if needs_eval {
-            let cfvs = self.evaluator.evaluate(game);
-            for bc in cfvs {
-                game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
+        // Evaluate boundaries if needed (only for depth-limited strategy).
+        match &self.strategy {
+            SolveStrategy::Exact => {
+                // No boundary eval needed -- full tree, no boundaries.
             }
-            self.boundaries_set = true;
+            SolveStrategy::DepthLimited { evaluator } => {
+                let needs_eval = !self.boundaries_set
+                    || (self.config.leaf_eval_interval > 0
+                        && self.iteration > 0
+                        && self.iteration % self.config.leaf_eval_interval == 0);
+                if needs_eval {
+                    let cfvs = evaluator.evaluate(game);
+                    for bc in cfvs {
+                        game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
+                    }
+                    self.boundaries_set = true;
+                }
+            }
         }
 
         // Run one DCFR iteration.
@@ -149,9 +153,11 @@ impl Solver {
         if let Some(target) = self.config.target_exploitability {
             if self.iteration % 10 == 0 {
                 let game = self.game.as_ref().expect("game present");
-                let cfvs = self.evaluator.evaluate(game);
-                for bc in &cfvs {
-                    game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs.clone());
+                if let SolveStrategy::DepthLimited { evaluator } = &self.strategy {
+                    let cfvs = evaluator.evaluate(game);
+                    for bc in &cfvs {
+                        game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs.clone());
+                    }
                 }
                 let exploit = game.compute_exploitability();
                 let abs_target = target * game.situation().pot as f32;
@@ -168,9 +174,11 @@ impl Solver {
         let mut game = self.game.take().expect("finish called twice");
 
         // Ensure boundaries are set for final exploitability computation.
-        let cfvs = self.evaluator.evaluate(&game);
-        for bc in cfvs {
-            game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
+        if let SolveStrategy::DepthLimited { evaluator } = &self.strategy {
+            let cfvs = evaluator.evaluate(&game);
+            for bc in cfvs {
+                game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
+            }
         }
 
         game.finalize();
@@ -190,7 +198,7 @@ impl Solver {
 mod tests {
     use super::*;
     use crate::config::DatagenConfig;
-    use crate::datagen::domain::evaluator::{BoundaryCfvs, BoundaryEvaluator};
+    use crate::datagen::domain::evaluator::{BoundaryCfvs, BoundaryEvaluator, SolveStrategy};
     use crate::datagen::domain::game::{Game, GameBuilder};
     use crate::datagen::sampler::sample_situation;
     use rand::SeedableRng;
@@ -212,16 +220,23 @@ mod tests {
         }
     }
 
+    fn depth_limited_strategy() -> SolveStrategy {
+        SolveStrategy::DepthLimited {
+            evaluator: Arc::new(ZeroEvaluator),
+        }
+    }
+
     fn build_test_game() -> Game {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let config = DatagenConfig::default();
+        let strategy = depth_limited_strategy();
         loop {
             let sit = sample_situation(&config, 200, 4, &mut rng);
             if sit.effective_stack <= 0 {
                 continue;
             }
-            let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
-            if let Some(game) = builder.build(&sit) {
+            let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+            if let Some(game) = builder.build(&sit, &mut rng) {
                 return game;
             }
         }
@@ -239,12 +254,12 @@ mod tests {
     fn solver_produces_solved_game_with_finite_records() {
         range_solver::set_force_sequential(true);
         let game = build_test_game();
-        let eval: Arc<dyn BoundaryEvaluator> = Arc::new(ZeroEvaluator);
+        let strategy = depth_limited_strategy();
         let solver_config = SolverConfig {
             max_iterations: 50,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, &solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, strategy);
 
         let solved = loop {
             match solver.step() {
@@ -269,12 +284,12 @@ mod tests {
     fn solver_step_returns_none_before_max_iterations() {
         range_solver::set_force_sequential(true);
         let game = build_test_game();
-        let eval: Arc<dyn BoundaryEvaluator> = Arc::new(ZeroEvaluator);
+        let strategy = depth_limited_strategy();
         let solver_config = SolverConfig {
             max_iterations: 10,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, &solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, strategy);
 
         // First 9 steps should return None
         for _ in 0..9 {
@@ -288,12 +303,12 @@ mod tests {
     fn solved_game_records_have_correct_player_ids() {
         range_solver::set_force_sequential(true);
         let game = build_test_game();
-        let eval: Arc<dyn BoundaryEvaluator> = Arc::new(ZeroEvaluator);
+        let strategy = depth_limited_strategy();
         let solver_config = SolverConfig {
             max_iterations: 20,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, &solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, strategy);
 
         let solved = loop {
             match solver.step() {
@@ -313,12 +328,12 @@ mod tests {
         let game = build_test_game();
         let expected_pot = game.situation().pot as f32;
         let expected_stack = game.situation().effective_stack as f32;
-        let eval: Arc<dyn BoundaryEvaluator> = Arc::new(ZeroEvaluator);
+        let strategy = depth_limited_strategy();
         let solver_config = SolverConfig {
             max_iterations: 20,
             ..Default::default()
         };
-        let mut solver = Solver::new(game, &solver_config, eval);
+        let mut solver = Solver::new(game, &solver_config, strategy);
 
         let solved = loop {
             match solver.step() {
@@ -331,6 +346,41 @@ mod tests {
         for rec in &records {
             assert_eq!(rec.pot, expected_pot);
             assert_eq!(rec.effective_stack, expected_stack);
+        }
+    }
+
+    #[test]
+    fn solver_with_exact_strategy_solves_river_game() {
+        range_solver::set_force_sequential(true);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let config = DatagenConfig::default();
+        let strategy = SolveStrategy::Exact;
+        loop {
+            let sit = sample_situation(&config, 200, 5, &mut rng);
+            if sit.effective_stack <= 0 {
+                continue;
+            }
+            let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+            let game = match builder.build(&sit, &mut rng) {
+                Some(g) => g,
+                None => continue,
+            };
+            assert_eq!(game.num_boundaries(), 0);
+            let solver_config = SolverConfig {
+                max_iterations: 20,
+                ..Default::default()
+            };
+            let mut solver = Solver::new(game, &solver_config, strategy.clone());
+            let solved = loop {
+                match solver.step() {
+                    None => continue,
+                    Some(sg) => break sg,
+                }
+            };
+            assert!(solved.exploitability.is_finite());
+            let records = solved.extract_records();
+            assert_eq!(records.len(), 2);
+            return;
         }
     }
 }

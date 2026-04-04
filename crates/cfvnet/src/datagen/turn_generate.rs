@@ -543,7 +543,7 @@ pub(crate) fn build_turn_game(
 }
 
 /// Build a full turn+river game tree (exact mode, no boundaries).
-fn build_turn_game_exact(
+pub(crate) fn build_turn_game_exact(
     board_u8: &[u8],
     pot: f64,
     effective_stack: f64,
@@ -557,7 +557,7 @@ fn build_turn_game_exact(
 ///
 /// Returns the original sizes unchanged if `fuzz <= 0.0`.
 /// Each fuzzed value is clamped to a minimum of 0.01 to avoid non-positive sizes.
-fn fuzz_bet_sizes(bet_sizes: &[Vec<f64>], fuzz: f64, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+pub(crate) fn fuzz_bet_sizes(bet_sizes: &[Vec<f64>], fuzz: f64, rng: &mut impl Rng) -> Vec<Vec<f64>> {
     if fuzz <= 0.0 {
         return bet_sizes.to_vec();
     }

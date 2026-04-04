@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::game::Game;
 
 /// Counterfactual values for a single boundary node.
@@ -14,6 +16,17 @@ pub trait BoundaryEvaluator: Send + Sync {
     fn evaluate(&self, game: &Game) -> Vec<BoundaryCfvs>;
 }
 
+/// Strategy for solving a game tree.
+#[derive(Clone)]
+pub enum SolveStrategy {
+    /// Solve to showdown -- no boundaries, no evaluator.
+    Exact,
+    /// Depth-limited with boundary evaluation.
+    DepthLimited {
+        evaluator: Arc<dyn BoundaryEvaluator>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -22,6 +35,7 @@ mod tests {
     use crate::datagen::sampler::sample_situation;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use std::sync::Arc;
 
     struct MockEvaluator;
     impl BoundaryEvaluator for MockEvaluator {
@@ -46,8 +60,11 @@ mod tests {
         if sit.effective_stack <= 0 {
             return;
         }
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
-        let game = builder.build(&sit).expect("build");
+        let strategy = SolveStrategy::DepthLimited {
+            evaluator: Arc::new(MockEvaluator),
+        };
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let game = builder.build(&sit, &mut rng).expect("build");
         let eval = MockEvaluator;
         let results = eval.evaluate(&game);
         assert_eq!(results.len(), game.num_boundaries() * 2);
@@ -61,8 +78,11 @@ mod tests {
         if sit.effective_stack <= 0 {
             return;
         }
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]]);
-        let game = builder.build(&sit).expect("build");
+        let strategy = SolveStrategy::DepthLimited {
+            evaluator: Arc::new(MockEvaluator),
+        };
+        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let game = builder.build(&sit, &mut rng).expect("build");
         let eval = MockEvaluator;
         let results = eval.evaluate(&game);
         for bc in &results {
@@ -76,5 +96,28 @@ mod tests {
         // Verify the trait can be used as a trait object (dyn BoundaryEvaluator).
         let eval: Box<dyn BoundaryEvaluator> = Box::new(MockEvaluator);
         let _ = eval; // just need to compile
+    }
+
+    #[test]
+    fn solve_strategy_exact_variant_exists() {
+        let _strategy = SolveStrategy::Exact;
+    }
+
+    #[test]
+    fn solve_strategy_depth_limited_variant_exists() {
+        let eval: Arc<dyn BoundaryEvaluator> = Arc::new(MockEvaluator);
+        let _strategy = SolveStrategy::DepthLimited { evaluator: eval };
+    }
+
+    #[test]
+    fn solve_strategy_is_clone() {
+        let eval: Arc<dyn BoundaryEvaluator> = Arc::new(MockEvaluator);
+        let strategy = SolveStrategy::DepthLimited {
+            evaluator: eval,
+        };
+        let cloned = strategy.clone();
+        // Both should exist without issue.
+        let _a = strategy;
+        let _b = cloned;
     }
 }
