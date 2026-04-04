@@ -59,7 +59,7 @@ impl DomainPipeline {
             leaf_eval_interval: config.datagen.leaf_eval_interval,
         };
 
-        let mut writer = RecordWriter::create(output_path)?;
+        let mut writer = RecordWriter::create(output_path, config.datagen.per_file)?;
 
         // Progress bar.
         let pb = ProgressBar::new(num_samples);
