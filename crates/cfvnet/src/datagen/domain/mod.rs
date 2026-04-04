@@ -1,5 +1,6 @@
 pub mod evaluator;
 pub mod game;
+pub mod game_tree;
 pub mod neural_net_evaluator;
 pub mod pipeline;
 pub mod situation;

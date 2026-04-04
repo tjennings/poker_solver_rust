@@ -8,7 +8,7 @@ use poker_solver_core::poker::Card;
 use range_solver::card::card_pair_to_index;
 
 use crate::config::CfvnetConfig;
-use crate::datagen::turn_generate::u8_to_rs_card;
+use super::game_tree::u8_to_rs_card;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
 use crate::model::network::{CfvNet, INPUT_SIZE};
 

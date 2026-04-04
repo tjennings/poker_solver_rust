@@ -105,12 +105,12 @@ impl GameBuilder {
 
     pub fn build(&self, sit: &Situation, rng: &mut impl Rng) -> Option<Game> {
         let sizes = if self.fuzz > 0.0 {
-            crate::datagen::turn_generate::fuzz_bet_sizes(&self.bet_sizes, self.fuzz, rng)
+            super::game_tree::fuzz_bet_sizes(&self.bet_sizes, self.fuzz, rng)
         } else {
             self.bet_sizes.clone()
         };
         let tree = if self.exact {
-            crate::datagen::turn_generate::build_turn_game_exact(
+            super::game_tree::build_turn_game_exact(
                 sit.board_cards(),
                 f64::from(sit.pot),
                 f64::from(sit.effective_stack),
@@ -118,7 +118,7 @@ impl GameBuilder {
                 &sizes,
             )?
         } else {
-            crate::datagen::turn_generate::build_turn_game(
+            super::game_tree::build_turn_game(
                 sit.board_cards(),
                 f64::from(sit.pot),
                 f64::from(sit.effective_stack),

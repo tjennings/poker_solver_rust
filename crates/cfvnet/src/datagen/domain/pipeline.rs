@@ -31,7 +31,7 @@ impl DomainPipeline {
 
         // Parse bet sizes from config.
         let bet_sizes =
-            crate::datagen::turn_generate::parse_bet_sizes_all(&config.game.bet_sizes);
+            super::game_tree::parse_bet_sizes_all(&config.game.bet_sizes);
         if bet_sizes.is_empty() {
             return Err("no valid bet sizes".into());
         }
