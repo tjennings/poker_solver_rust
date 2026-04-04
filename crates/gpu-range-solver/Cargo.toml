@@ -1,0 +1,11 @@
+[package]
+name = "gpu-range-solver"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+range-solver = { path = "../range-solver" }
+cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-12010"] }
+
+[dev-dependencies]
+rand = "0.8"

@@ -10,6 +10,7 @@ description = "CLI tool for training poker blueprint strategies"
 poker-solver-core = { path = "../core" }
 poker-solver-tauri = { path = "../tauri-app" }
 range-solver = { path = "../range-solver" }
+gpu-range-solver = { path = "../gpu-range-solver" }
 rebel = { path = "../rebel" }
 cfvnet = { path = "../cfvnet" }
 burn = { version = "0.16", features = ["wgpu"] }

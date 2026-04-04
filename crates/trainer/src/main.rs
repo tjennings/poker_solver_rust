@@ -134,6 +134,48 @@ enum Commands {
         #[arg(long)]
         compressed: bool,
     },
+    /// Solve a postflop spot using GPU-accelerated DCFR
+    GpuRangeSolve {
+        /// OOP player's range (PioSOLVER format, e.g. "QQ+,AKs,AKo")
+        #[arg(long)]
+        oop_range: String,
+        /// IP player's range
+        #[arg(long)]
+        ip_range: String,
+        /// Flop cards (e.g. "Qs Jh 2c")
+        #[arg(long)]
+        flop: String,
+        /// Turn card (optional, e.g. "8d")
+        #[arg(long)]
+        turn: Option<String>,
+        /// River card (optional, e.g. "3s")
+        #[arg(long)]
+        river: Option<String>,
+        /// Starting pot size
+        #[arg(long, default_value = "100")]
+        pot: i32,
+        /// Effective stack size
+        #[arg(long, default_value = "100")]
+        effective_stack: i32,
+        /// Maximum iterations
+        #[arg(long, default_value = "1000")]
+        iterations: u32,
+        /// Target exploitability (stops early if reached)
+        #[arg(long, default_value = "0.5")]
+        target_exploitability: f32,
+        /// OOP bet sizes (comma-separated, e.g. "50%,100%,a")
+        #[arg(long, default_value = "50%,100%")]
+        oop_bet_sizes: String,
+        /// OOP raise sizes
+        #[arg(long, default_value = "60%,100%")]
+        oop_raise_sizes: String,
+        /// IP bet sizes
+        #[arg(long, default_value = "50%,100%")]
+        ip_bet_sizes: String,
+        /// IP raise sizes
+        #[arg(long, default_value = "60%,100%")]
+        ip_raise_sizes: String,
+    },
     /// Validate a blueprint strategy against exact range-solver solutions
     ValidateBlueprint {
         /// Path to blueprint bundle directory
@@ -945,6 +987,37 @@ fn main() -> Result<(), Box<dyn Error>> {
                 compressed,
             )?;
         }
+        Commands::GpuRangeSolve {
+            oop_range,
+            ip_range,
+            flop,
+            turn,
+            river,
+            pot,
+            effective_stack,
+            iterations,
+            target_exploitability,
+            oop_bet_sizes,
+            oop_raise_sizes,
+            ip_bet_sizes,
+            ip_raise_sizes,
+        } => {
+            run_gpu_range_solve(
+                &oop_range,
+                &ip_range,
+                &flop,
+                turn.as_deref(),
+                river.as_deref(),
+                pot,
+                effective_stack,
+                iterations,
+                target_exploitability,
+                &oop_bet_sizes,
+                &oop_raise_sizes,
+                &ip_bet_sizes,
+                &ip_raise_sizes,
+            )?;
+        }
         Commands::ValidateBlueprint {
             blueprint,
             spots,
@@ -1754,6 +1827,162 @@ fn run_range_solve(
     Ok(())
 }
 
+fn run_gpu_range_solve(
+    oop_range_str: &str,
+    ip_range_str: &str,
+    flop_str: &str,
+    turn_str: Option<&str>,
+    river_str: Option<&str>,
+    pot: i32,
+    effective_stack: i32,
+    iterations: u32,
+    target_exploitability: f32,
+    oop_bet_str: &str,
+    oop_raise_str: &str,
+    ip_bet_str: &str,
+    ip_raise_str: &str,
+) -> Result<(), Box<dyn Error>> {
+    use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
+    use range_solver::bet_size::BetSizeOptions;
+    use range_solver::card::{card_from_str, flop_from_str, hole_to_string, CardConfig, NOT_DEALT};
+    use range_solver::range::Range;
+
+    // --- Parse inputs ---
+    let oop_range: Range = oop_range_str
+        .parse()
+        .map_err(|e: String| format!("Invalid OOP range: {e}"))?;
+    let ip_range: Range = ip_range_str
+        .parse()
+        .map_err(|e: String| format!("Invalid IP range: {e}"))?;
+
+    let flop = flop_from_str(flop_str).map_err(|e| format!("Invalid flop: {e}"))?;
+
+    let turn = match turn_str {
+        Some(s) => card_from_str(s).map_err(|e| format!("Invalid turn card: {e}"))?,
+        None => NOT_DEALT,
+    };
+
+    let river = match river_str {
+        Some(s) => card_from_str(s).map_err(|e| format!("Invalid river card: {e}"))?,
+        None => NOT_DEALT,
+    };
+
+    // Determine initial board state
+    let initial_state = if river != NOT_DEALT {
+        BoardState::River
+    } else if turn != NOT_DEALT {
+        BoardState::Turn
+    } else {
+        BoardState::Flop
+    };
+
+    // Parse bet sizes
+    let oop_sizes = BetSizeOptions::try_from((oop_bet_str, oop_raise_str))
+        .map_err(|e| format!("Invalid OOP bet sizes: {e}"))?;
+    let ip_sizes = BetSizeOptions::try_from((ip_bet_str, ip_raise_str))
+        .map_err(|e| format!("Invalid IP bet sizes: {e}"))?;
+
+    // --- Build game ---
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop,
+        turn,
+        river,
+    };
+
+    let tree_config = TreeConfig {
+        initial_state,
+        starting_pot: pot,
+        effective_stack,
+        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
+        river_bet_sizes: [oop_sizes, ip_sizes],
+        add_allin_threshold: 1.5,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.1,
+        ..Default::default()
+    };
+
+    let action_tree =
+        ActionTree::new(tree_config).map_err(|e| format!("Failed to build action tree: {e}"))?;
+
+    let mut game = range_solver::PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+
+    // --- Print game info ---
+    eprintln!("GPU Range Solver (Discounted CFR)");
+    eprintln!("  Board: {flop_str}{}", format_board_suffix(turn_str, river_str));
+    eprintln!("  Initial state: {initial_state}");
+    eprintln!("  Pot: {pot}, Effective stack: {effective_stack}");
+    eprintln!(
+        "  OOP hands: {}, IP hands: {}",
+        game.private_cards(0).len(),
+        game.private_cards(1).len(),
+    );
+    eprintln!();
+
+    // --- Allocate memory and solve on GPU ---
+    game.allocate_memory(false);
+
+    let config = gpu_range_solver::GpuSolverConfig {
+        max_iterations: iterations,
+        target_exploitability,
+        print_progress: true,
+    };
+
+    let start = Instant::now();
+    let result = gpu_range_solver::gpu_solve_hand_parallel(&game, &config);
+    let elapsed = start.elapsed();
+
+    eprintln!();
+    eprintln!(
+        "Solved in {:.2}s ({} iterations)",
+        elapsed.as_secs_f64(),
+        result.iterations_run,
+    );
+    eprintln!("Final exploitability: {:.4}", result.exploitability);
+    eprintln!();
+
+    // --- Print root actions and strategy summary ---
+    game.back_to_root();
+    let actions = game.available_actions();
+    let player = game.current_player();
+    let hands = game.private_cards(player);
+    let num_hands = hands.len();
+    let num_actions = actions.len();
+
+    println!(
+        "Root node: {} to act ({num_actions} actions, {num_hands} hands)",
+        if player == 0 { "OOP" } else { "IP" }
+    );
+    println!();
+
+    // Print header
+    print!("{:<10}", "Hand");
+    for action in &actions {
+        print!("  {:>10}", action.to_string());
+    }
+    println!();
+
+    // Print per-hand strategy (limit to first 30 hands for readability)
+    let display_count = num_hands.min(30);
+    for h in 0..display_count {
+        let hand_str = hole_to_string(hands[h]).unwrap_or_else(|_| "??".to_string());
+        print!("{:<10}", hand_str);
+        for a in 0..num_actions {
+            let prob = result.root_strategy[a * num_hands + h];
+            print!("  {:>10.1}%", prob * 100.0);
+        }
+        println!();
+    }
+
+    if num_hands > display_count {
+        println!("... and {} more hands", num_hands - display_count);
+    }
+
+    Ok(())
+}
+
 fn format_board_suffix(turn: Option<&str>, river: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(t) = turn {
@@ -1813,6 +2042,46 @@ mod tests {
         assert_eq!(per_flop_config.turn_buckets, 200);
         assert_eq!(per_flop_config.river_buckets, 200);
         assert_eq!(per_flop_config.seed, 42);
+    }
+
+    /// The gpu-range-solve subcommand should be parseable by clap.
+    #[test]
+    fn gpu_range_solve_cli_parses() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "gpu-range-solve",
+            "--oop-range", "AA",
+            "--ip-range", "KK",
+            "--flop", "Qs Jh 2c",
+            "--turn", "8d",
+            "--river", "3s",
+            "--pot", "100",
+            "--effective-stack", "100",
+            "--iterations", "100",
+        ]);
+        assert!(cli.is_ok(), "gpu-range-solve CLI must parse: {:?}", cli.err());
+    }
+
+    /// run_gpu_range_solve constructs a game and solves it without error.
+    #[test]
+    fn run_gpu_range_solve_returns_ok() {
+        let result = super::run_gpu_range_solve(
+            "AA",
+            "KK",
+            "Qs Jh 2c",
+            Some("8d"),
+            Some("3s"),
+            100,
+            100,
+            10,  // low iterations for speed
+            10.0, // high target so it stops fast
+            "100%",
+            "",
+            "100%",
+            "",
+        );
+        assert!(result.is_ok(), "run_gpu_range_solve must succeed: {:?}", result.err());
     }
 
     /// A config without per_flop should have per_flop as None.

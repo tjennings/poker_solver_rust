@@ -8,13 +8,13 @@ use crate::mutex_like::*;
 // Player constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const PLAYER_OOP: u8 = 0;
-pub(crate) const PLAYER_IP: u8 = 1;
-pub(crate) const PLAYER_CHANCE: u8 = 2; // only used with `PLAYER_CHANCE_FLAG`
-pub(crate) const PLAYER_MASK: u8 = 3;
-pub(crate) const PLAYER_CHANCE_FLAG: u8 = 4; // chance_player = PLAYER_CHANCE_FLAG | prev_player
-pub(crate) const PLAYER_TERMINAL_FLAG: u8 = 8;
-pub(crate) const PLAYER_FOLD_FLAG: u8 = 24; // TERMINAL_FLAG(8) | 16
+pub const PLAYER_OOP: u8 = 0;
+pub const PLAYER_IP: u8 = 1;
+pub const PLAYER_CHANCE: u8 = 2; // only used with `PLAYER_CHANCE_FLAG`
+pub const PLAYER_MASK: u8 = 3;
+pub const PLAYER_CHANCE_FLAG: u8 = 4; // chance_player = PLAYER_CHANCE_FLAG | prev_player
+pub const PLAYER_TERMINAL_FLAG: u8 = 8;
+pub const PLAYER_FOLD_FLAG: u8 = 24; // TERMINAL_FLAG(8) | 16
 pub const PLAYER_DEPTH_BOUNDARY_FLAG: u8 = 40; // TERMINAL_FLAG(8) | 32
 
 // ---------------------------------------------------------------------------

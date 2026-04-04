@@ -50,9 +50,9 @@ pub trait BoundaryEvaluator: Send + Sync {
 ///
 /// Used in sorted order (ascending strength) to evaluate showdown equity.
 #[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct StrengthItem {
-    pub(crate) strength: u16,
-    pub(crate) index: u16,
+pub struct StrengthItem {
+    pub strength: u16,
+    pub index: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +233,48 @@ pub struct PostFlopGame {
     pub(crate) cfvalues_cache: [Vec<f32>; 2],
 }
 
+impl PostFlopGame {
+    /// Returns the number of nodes in the tree arena.
+    pub fn num_nodes(&self) -> usize {
+        self.node_arena.len()
+    }
+
+    /// Locks and returns a reference to the node at arena `index`.
+    pub fn node_at(&self, index: usize) -> crate::mutex_like::MutexGuardLike<'_, PostFlopNode> {
+        self.node_arena[index].lock()
+    }
+
+    /// Returns the same-hand index mapping for `player`.
+    pub fn same_hand_index(&self, player: usize) -> &[u16] {
+        &self.same_hand_index[player]
+    }
+
+    /// Returns the hand strength ordering for all boards.
+    pub fn hand_strength(&self) -> &Vec<[Vec<StrengthItem>; 2]> {
+        &self.hand_strength
+    }
+
+    /// Returns valid hand indices for the flop board.
+    pub fn valid_indices_flop(&self) -> &[Vec<u16>; 2] {
+        &self.valid_indices_flop
+    }
+
+    /// Returns valid hand indices indexed by turn card.
+    pub fn valid_indices_turn(&self) -> &Vec<[Vec<u16>; 2]> {
+        &self.valid_indices_turn
+    }
+
+    /// Returns valid hand indices indexed by card_pair_to_index(turn, river).
+    pub fn valid_indices_river(&self) -> &Vec<[Vec<u16>; 2]> {
+        &self.valid_indices_river
+    }
+
+    /// Returns the number of valid card combinations.
+    pub fn num_combinations_f64(&self) -> f64 {
+        self.num_combinations
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +338,91 @@ mod tests {
         assert!(s2.is_empty());
         assert!(s_ip.is_empty());
         assert!(s_ch.is_empty());
+    }
+
+    fn make_river_game() -> PostFlopGame {
+        use crate::bet_size::BetSizeOptions;
+        use crate::card::{card_from_str, flop_from_str};
+
+        let oop_range: crate::range::Range = "AA,KK".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 100,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        PostFlopGame::with_config(card_config, tree).unwrap()
+    }
+
+    #[test]
+    fn game_accessor_num_nodes() {
+        let game = make_river_game();
+        assert!(game.num_nodes() > 0);
+    }
+
+    #[test]
+    fn game_accessor_node_at_and_index() {
+        let game = make_river_game();
+        let root = game.node_at(0);
+        assert_eq!(game.node_index(&root), 0);
+    }
+
+    #[test]
+    fn game_accessor_same_hand_index() {
+        let game = make_river_game();
+        let shi = game.same_hand_index(0);
+        assert!(!shi.is_empty());
+        let shi_ip = game.same_hand_index(1);
+        assert!(!shi_ip.is_empty());
+    }
+
+    #[test]
+    fn game_accessor_hand_strength() {
+        let game = make_river_game();
+        let hs = game.hand_strength();
+        assert!(!hs.is_empty());
+    }
+
+    #[test]
+    fn game_accessor_valid_indices_river() {
+        let game = make_river_game();
+        // River game has river indices populated
+        let river = game.valid_indices_river();
+        assert!(!river.is_empty());
+    }
+
+    #[test]
+    fn game_accessor_valid_indices_return_types() {
+        let game = make_river_game();
+        // Just verify accessors return without panic
+        let _flop = game.valid_indices_flop();
+        let _turn = game.valid_indices_turn();
+        let _river = game.valid_indices_river();
+    }
+
+    #[test]
+    fn game_accessor_num_combinations_f64() {
+        let game = make_river_game();
+        assert!(game.num_combinations_f64() > 0.0);
+    }
+
+    #[test]
+    fn strength_item_public_fields() {
+        let item = StrengthItem {
+            strength: 42,
+            index: 7,
+        };
+        assert_eq!(item.strength, 42);
+        assert_eq!(item.index, 7);
     }
 }

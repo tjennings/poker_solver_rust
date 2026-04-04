@@ -250,7 +250,7 @@ impl PostFlopGame {
 
     /// Returns the index of the given node within `node_arena`.
     #[inline]
-    pub(crate) fn node_index(&self, node: &PostFlopNode) -> usize {
+    pub fn node_index(&self, node: &PostFlopNode) -> usize {
         let node_ptr = node as *const _ as *const MutexLike<PostFlopNode>;
         // SAFETY: `node` is always a reference into `self.node_arena`, which is
         // a contiguous `Vec`. `MutexLike<T>` is `#[repr(transparent)]`.

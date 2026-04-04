@@ -19,4 +19,5 @@ pub(crate) mod hand;
 pub use game::PostFlopGame;
 pub use solver::{solve, solve_step, compute_exploitability, compute_average, compute_current_ev, finalize};
 pub use card::CardConfig;
-pub use action_tree::{Action, ActionTree, TreeConfig, BoardState, PLAYER_DEPTH_BOUNDARY_FLAG};
+pub use action_tree::{Action, ActionTree, TreeConfig, BoardState, PLAYER_DEPTH_BOUNDARY_FLAG, PLAYER_OOP, PLAYER_IP, PLAYER_CHANCE, PLAYER_MASK, PLAYER_CHANCE_FLAG, PLAYER_TERMINAL_FLAG, PLAYER_FOLD_FLAG};
+pub use game::StrengthItem;

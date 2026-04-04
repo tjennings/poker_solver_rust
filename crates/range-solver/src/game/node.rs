@@ -1,5 +1,5 @@
 use crate::action_tree::*;
-use crate::card::NOT_DEALT;
+use crate::card::{Card, NOT_DEALT};
 use crate::interface::GameNode;
 use crate::mutex_like::{MutexGuardLike, MutexLike};
 use std::ptr;
@@ -40,6 +40,54 @@ impl PostFlopNode {
     #[inline]
     pub fn is_depth_boundary(&self) -> bool {
         self.player & PLAYER_DEPTH_BOUNDARY_FLAG == PLAYER_DEPTH_BOUNDARY_FLAG
+    }
+
+    /// Returns true if this is a fold terminal.
+    #[inline]
+    pub fn is_fold(&self) -> bool {
+        self.player & PLAYER_FOLD_FLAG == PLAYER_FOLD_FLAG
+    }
+
+    /// Returns true if this is a showdown terminal (terminal, not fold, not depth boundary).
+    #[inline]
+    pub fn is_showdown(&self) -> bool {
+        self.is_terminal() && !self.is_fold() && !self.is_depth_boundary()
+    }
+
+    /// Returns the acting player (0=OOP, 1=IP) extracted from the player flags.
+    #[inline]
+    pub fn acting_player(&self) -> usize {
+        (self.player & PLAYER_MASK) as usize
+    }
+
+    /// Returns the previous action that led to this node.
+    #[inline]
+    pub fn prev_action(&self) -> Action {
+        self.prev_action
+    }
+
+    /// Returns the total bet amount at this node.
+    #[inline]
+    pub fn bet_amount(&self) -> i32 {
+        self.amount
+    }
+
+    /// Returns the turn card at this node (or `NOT_DEALT`).
+    #[inline]
+    pub fn turn_card(&self) -> Card {
+        self.turn
+    }
+
+    /// Returns the river card at this node (or `NOT_DEALT`).
+    #[inline]
+    pub fn river_card(&self) -> Card {
+        self.river
+    }
+
+    /// Returns the raw player byte (for flag inspection).
+    #[inline]
+    pub fn player_flags(&self) -> u8 {
+        self.player
     }
 
     /// Returns the child nodes as a slice.
@@ -435,5 +483,65 @@ mod tests {
         assert!(node.is_terminal());
         // But not chance flag
         assert!(!node.is_chance());
+    }
+
+    #[test]
+    fn node_public_accessors() {
+        let mut node = PostFlopNode::default();
+        node.player = PLAYER_FOLD_FLAG | PLAYER_OOP;
+        node.amount = 50;
+        node.turn = 10;
+        node.river = 20;
+        node.prev_action = Action::Fold;
+
+        assert!(node.is_fold());
+        assert!(!node.is_showdown());
+        assert_eq!(node.bet_amount(), 50);
+        assert_eq!(node.turn_card(), 10);
+        assert_eq!(node.river_card(), 20);
+        assert_eq!(node.prev_action(), Action::Fold);
+        assert_eq!(node.acting_player(), 0);
+
+        // Showdown node
+        let mut sd_node = PostFlopNode::default();
+        sd_node.player = PLAYER_TERMINAL_FLAG;
+        sd_node.river = 20;
+        assert!(!sd_node.is_fold());
+        assert!(sd_node.is_showdown());
+    }
+
+    #[test]
+    fn node_is_fold_requires_fold_flag() {
+        let mut node = PostFlopNode::default();
+        node.player = PLAYER_TERMINAL_FLAG;
+        assert!(!node.is_fold());
+
+        node.player = PLAYER_FOLD_FLAG;
+        assert!(node.is_fold());
+
+        node.player = PLAYER_OOP;
+        assert!(!node.is_fold());
+    }
+
+    #[test]
+    fn node_showdown_excludes_depth_boundary() {
+        let mut node = PostFlopNode::default();
+        node.player = PLAYER_DEPTH_BOUNDARY_FLAG;
+        node.river = 20;
+        assert!(!node.is_showdown());
+    }
+
+    #[test]
+    fn node_acting_player_ip() {
+        let mut node = PostFlopNode::default();
+        node.player = PLAYER_IP;
+        assert_eq!(node.acting_player(), 1);
+    }
+
+    #[test]
+    fn node_player_flags_raw() {
+        let mut node = PostFlopNode::default();
+        node.player = PLAYER_FOLD_FLAG | PLAYER_IP;
+        assert_eq!(node.player_flags(), PLAYER_FOLD_FLAG | PLAYER_IP);
     }
 }
