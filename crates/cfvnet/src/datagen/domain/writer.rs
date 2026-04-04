@@ -42,7 +42,7 @@ impl RecordWriter {
 mod tests {
     use super::*;
     use crate::datagen::storage::read_record;
-    use std::io::{BufReader, Seek, SeekFrom};
+    use std::io::BufReader;
     use tempfile::NamedTempFile;
 
     fn sample_record(player: u8, pot: f32) -> TrainingRecord {
