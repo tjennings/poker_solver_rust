@@ -1799,6 +1799,10 @@ pub fn generate_turn_training_data(
     output_path: &Path,
     backend: &str,
 ) -> Result<(), String> {
+    if config.datagen.mode == "domain" {
+        return crate::datagen::domain::pipeline::DomainPipeline::run(config, output_path);
+    }
+
     let exact_mode = config.datagen.mode == "exact";
     let iterative_mode = config.datagen.mode == "iterative";
 
@@ -4362,5 +4366,35 @@ mod tests {
             .expect("writer should succeed");
 
         assert_eq!(write_count.load(Ordering::Relaxed), 3, "should count all three records");
+    }
+
+    #[test]
+    fn domain_mode_dispatches_to_domain_pipeline() {
+        range_solver::set_force_sequential(true);
+        let tmp = NamedTempFile::new().unwrap();
+        // River config (board_size=5) so no GPU model needed.
+        let config = CfvnetConfig {
+            game: GameConfig {
+                initial_stack: 200,
+                board_size: 5,
+                ..Default::default()
+            },
+            datagen: DatagenConfig {
+                num_samples: 3,
+                mode: "domain".into(),
+                solver_iterations: 20,
+                seed: Some(42),
+                ..Default::default()
+            },
+            training: TrainingConfig::default(),
+            evaluation: EvaluationConfig::default(),
+        };
+        generate_turn_training_data(&config, tmp.path(), "wgpu").unwrap();
+
+        // Verify records were written.
+        let mut reader = std::io::BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+        let rec = storage::read_record(&mut reader).unwrap();
+        assert_eq!(rec.board.len(), 5);
+        assert!(rec.pot > 0.0);
     }
 }
