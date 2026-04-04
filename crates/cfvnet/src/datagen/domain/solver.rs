@@ -135,6 +135,22 @@ impl Solver {
                 game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
             }
             self.boundaries_set = true;
+
+            // Verify all boundaries are populated.
+            let nb = game.num_boundaries();
+            let mut empty_count = 0;
+            for ord in 0..nb {
+                for pl in 0..2 {
+                    if game.boundary_cfvs_empty(ord, pl) {
+                        empty_count += 1;
+                    }
+                }
+            }
+            if empty_count > 0 {
+                eprintln!("[SOLVER] WARNING: {empty_count}/{} boundary slots empty after eval at iter {}", nb * 2, self.iteration);
+            } else {
+                eprintln!("[SOLVER] iter={}: all {nb} boundaries populated", self.iteration);
+            }
         }
 
         // Run one DCFR iteration.
@@ -173,6 +189,18 @@ impl Solver {
         for bc in cfvs {
             game.set_boundary_cfvs(bc.ordinal, bc.player, bc.cfvs);
         }
+
+        // Verify boundaries before exploitability computation.
+        let nb = game.num_boundaries();
+        let mut empty_count = 0;
+        for ord in 0..nb {
+            for pl in 0..2 {
+                if game.boundary_cfvs_empty(ord, pl) {
+                    empty_count += 1;
+                }
+            }
+        }
+        eprintln!("[SOLVER] finish: {nb} boundaries, {empty_count} empty (iter={})", self.iteration);
 
         range_solver::finalize(&mut game.tree);
         game.tree.back_to_root();

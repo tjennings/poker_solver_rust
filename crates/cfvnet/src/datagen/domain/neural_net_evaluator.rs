@@ -119,10 +119,33 @@ impl BoundaryEvaluator for NeuralNetEvaluator {
 
         // Convert Vec<Vec<f64>> results to Vec<BoundaryCfvs>.
         let mut result = Vec::with_capacity(num_boundaries * 2);
+
+        // Format board for logging.
+        let board_str: Vec<&str> = board_u8.iter().map(|&c| {
+            let ranks = ["2","3","4","5","6","7","8","9","T","J","Q","K","A"];
+            let suits = ["c","d","h","s"];
+            // Leak a small string for the duration — fine for diagnostics.
+            Box::leak(format!("{}{}", ranks[c as usize / 4], suits[c as usize % 4]).into_boxed_str()) as &str
+        }).collect();
+
         for ordinal in 0..num_boundaries {
             for player in 0..2usize {
                 let req_idx = ordinal * 2 + player;
                 let cfvs_f32: Vec<f32> = all_cfvs[req_idx].iter().map(|&v| v as f32).collect();
+
+                // Diagnostic: log CFVs for player 0 only (OOP).
+                if player == 0 {
+                    let cfv_sum: f32 = cfvs_f32.iter().sum();
+                    let cfv_abs: f32 = cfvs_f32.iter().map(|v| v.abs()).sum();
+                    let cfv_nonzero = cfvs_f32.iter().filter(|&&v| v.abs() > 1e-8).count();
+                    let bpot = game.boundary_pot(ordinal);
+                    eprintln!(
+                        "[EVAL] board=[{}] ord={}/{} pot={} | cfv: sum={:.2} abs={:.2} nonzero={}/{}",
+                        board_str.join(" "), ordinal, num_boundaries, bpot,
+                        cfv_sum, cfv_abs, cfv_nonzero, cfvs_f32.len()
+                    );
+                }
+
                 result.push(BoundaryCfvs {
                     ordinal,
                     player,

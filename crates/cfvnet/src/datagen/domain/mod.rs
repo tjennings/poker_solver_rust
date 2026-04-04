@@ -8,7 +8,7 @@ pub mod writer;
 
 pub use evaluator::{BoundaryCfvs, BoundaryEvaluator};
 pub use game::{Game, GameBuilder};
-pub use situation::SituationGenerator;
+pub use situation::{RangeSource, SituationGenerator};
 pub use solver::{SolvedGame, Solver, SolverConfig};
 pub use writer::RecordWriter;
 

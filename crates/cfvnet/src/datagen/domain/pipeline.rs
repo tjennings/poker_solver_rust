@@ -44,7 +44,9 @@ impl DomainPipeline {
         };
 
         // Construct domain objects.
-        let sit_gen = SituationGenerator::new(&config.datagen, initial_stack, board_size, seed, num_samples);
+        let range_source = super::RangeSource::from_config(&config.datagen)?;
+        let sit_gen = SituationGenerator::new(&config.datagen, initial_stack, board_size, seed, num_samples)
+            .with_range_source(range_source);
         let builder = GameBuilder::new(bet_sizes);
         let solver_config = SolverConfig {
             max_iterations: config.datagen.solver_iterations,

@@ -1,14 +1,42 @@
 use crate::config::DatagenConfig;
-use crate::datagen::sampler::{sample_situation, Situation};
+use crate::datagen::precompute_ranges::PrecomputedRanges;
+use crate::datagen::sampler::{sample_situation, sample_situation_with_blueprint, Situation};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::path::Path;
+
+/// Source of initial ranges for situation generation.
+pub enum RangeSource {
+    /// Random RSP (random starting probabilities) — uniform-ish ranges.
+    Rsp,
+    /// Blueprint-derived ranges from precomputed preflop paths.
+    Blueprint(PrecomputedRanges),
+}
+
+impl RangeSource {
+    /// Load from config: if `blueprint_path` is set, load precomputed ranges.
+    /// Otherwise use RSP.
+    pub fn from_config(config: &DatagenConfig) -> Result<Self, String> {
+        if let Some(ref bp_path) = config.blueprint_path {
+            let path = Path::new(bp_path);
+            let ranges = PrecomputedRanges::load(path)
+                .map_err(|e| format!("load blueprint ranges: {e}"))?;
+            eprintln!("[SituationGenerator] loaded {} blueprint paths from {bp_path}", ranges.paths.len());
+            Ok(RangeSource::Blueprint(ranges))
+        } else {
+            Ok(RangeSource::Rsp)
+        }
+    }
+}
 
 /// Produces random Situations from config. Implements Iterator.
 /// Skips degenerate situations (effective_stack <= 0) internally.
+/// Uses blueprint ranges when available, otherwise RSP.
 pub struct SituationGenerator {
     config: DatagenConfig,
     initial_stack: i32,
     board_size: usize,
+    range_source: RangeSource,
     rng: ChaCha8Rng,
     remaining: u64,
 }
@@ -25,9 +53,15 @@ impl SituationGenerator {
             config: config.clone(),
             initial_stack,
             board_size,
+            range_source: RangeSource::Rsp,
             rng: ChaCha8Rng::seed_from_u64(seed),
             remaining: count,
         }
+    }
+
+    pub fn with_range_source(mut self, source: RangeSource) -> Self {
+        self.range_source = source;
+        self
     }
 }
 
@@ -37,8 +71,17 @@ impl Iterator for SituationGenerator {
     fn next(&mut self) -> Option<Situation> {
         while self.remaining > 0 {
             self.remaining -= 1;
-            let sit =
-                sample_situation(&self.config, self.initial_stack, self.board_size, &mut self.rng);
+            let sit = match &self.range_source {
+                RangeSource::Rsp => {
+                    sample_situation(&self.config, self.initial_stack, self.board_size, &mut self.rng)
+                }
+                RangeSource::Blueprint(precomputed) => {
+                    sample_situation_with_blueprint(
+                        &self.config, self.initial_stack, self.board_size,
+                        precomputed, &mut self.rng,
+                    )
+                }
+            };
             if sit.effective_stack > 0 {
                 return Some(sit);
             }
