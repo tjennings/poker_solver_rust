@@ -36,8 +36,15 @@ impl DomainPipeline {
             return Err("no valid bet sizes".into());
         }
 
-        // Construct solve strategy: depth-limited with neural net for turn, exact for river.
-        let strategy = if board_size < 5 {
+        // Construct solve strategy:
+        // - Exact if board_size >= 5 (river, no boundaries)
+        // - Exact if no river_model_path (turn exact mode)
+        // - DepthLimited with neural net otherwise
+        let has_model = config.game.river_model_path.is_some();
+        let strategy = if !has_model || board_size >= 5 {
+            eprintln!("[domain] exact mode: solving to showdown (no neural net)");
+            SolveStrategy::Exact
+        } else {
             SolveStrategy::DepthLimited {
                 evaluator: Arc::new(NeuralNetEvaluator::load(
                     config
@@ -48,8 +55,6 @@ impl DomainPipeline {
                     config,
                 )?),
             }
-        } else {
-            SolveStrategy::Exact
         };
 
         // Construct domain objects.
