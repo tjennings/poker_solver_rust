@@ -419,7 +419,7 @@ fn cmd_generate(
         }
 
         let result = match street {
-            "turn" | "river" => cfvnet::datagen::turn_generate::generate_turn_training_data(&cfg, &file_output, backend),
+            "turn" | "river" => cfvnet::datagen::domain::pipeline::DomainPipeline::run(&cfg, &file_output),
             _ => cfvnet::datagen::generate::generate_training_data(&cfg, &file_output),
         };
 
