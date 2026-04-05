@@ -1,8 +1,11 @@
+pub mod batch;
 pub mod extract;
 pub mod gpu;
 pub mod kernels;
 pub mod solver;
 pub mod terminal;
+
+pub use batch::{compute_evs_from_strategy_sum, GpuBatchSolver, SubgameResult, SubgameSpec};
 
 /// Configuration for the GPU range solver.
 pub struct GpuSolverConfig {

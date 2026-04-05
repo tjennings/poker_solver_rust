@@ -24,6 +24,11 @@ impl Game {
         &self.situation
     }
 
+    /// Access the underlying PostFlopGame for GPU topology extraction.
+    pub fn inner(&self) -> &PostFlopGame {
+        &self.tree
+    }
+
     pub fn num_private_hands(&self, player: usize) -> usize {
         self.tree.num_private_hands(player)
     }

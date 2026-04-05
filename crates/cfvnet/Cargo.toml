@@ -18,11 +18,13 @@ indicatif = "0.17"
 thiserror = { workspace = true }
 burn = { version = "0.16", features = ["train", "wgpu", "ndarray"] }
 burn-cuda = { version = "0.16", optional = true }
+gpu-range-solver = { path = "../gpu-range-solver", optional = true }
 half = "2"
 
 [features]
 default = []
 cuda = ["burn/cuda-jit"]
+gpu-datagen = ["gpu-range-solver"]
 
 [dev-dependencies]
 tempfile = "3"

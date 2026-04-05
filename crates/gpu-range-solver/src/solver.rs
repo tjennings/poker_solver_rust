@@ -652,7 +652,7 @@ pub fn gpu_solve_cudarc(
 // ============================================================
 
 /// Sort edges by parent depth and return flat arrays for topology upload.
-fn build_sorted_topology(
+pub fn build_sorted_topology(
     topo: &TreeTopology,
 ) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<i32>) {
     let mut edges_by_depth: Vec<Vec<usize>> = vec![Vec::new(); topo.max_depth + 1];
@@ -696,25 +696,25 @@ fn build_sorted_topology(
 
 /// Build flat terminal data arrays for the mega-kernel.
 /// Returns all the arrays the kernel needs for fold and showdown evaluation.
-struct MegaTerminalData {
-    fold_node_ids: Vec<i32>,
-    fold_payoffs_p0: Vec<f32>,
-    fold_payoffs_p1: Vec<f32>,
-    fold_depths: Vec<i32>,
-    showdown_node_ids: Vec<i32>,
-    showdown_outcomes_p0: Vec<f32>,
-    showdown_outcomes_p1: Vec<f32>,
-    showdown_num_player: Vec<i32>,
-    showdown_depths: Vec<i32>,
-    player_card1: Vec<i32>,
-    player_card2: Vec<i32>,
-    opp_card1: Vec<i32>,
-    opp_card2: Vec<i32>,
-    same_hand_idx: Vec<i32>,
-    initial_weights_flat: Vec<f32>,
+pub struct MegaTerminalData {
+    pub fold_node_ids: Vec<i32>,
+    pub fold_payoffs_p0: Vec<f32>,
+    pub fold_payoffs_p1: Vec<f32>,
+    pub fold_depths: Vec<i32>,
+    pub showdown_node_ids: Vec<i32>,
+    pub showdown_outcomes_p0: Vec<f32>,
+    pub showdown_outcomes_p1: Vec<f32>,
+    pub showdown_num_player: Vec<i32>,
+    pub showdown_depths: Vec<i32>,
+    pub player_card1: Vec<i32>,
+    pub player_card2: Vec<i32>,
+    pub opp_card1: Vec<i32>,
+    pub opp_card2: Vec<i32>,
+    pub same_hand_idx: Vec<i32>,
+    pub initial_weights_flat: Vec<f32>,
 }
 
-fn build_mega_terminal_data(
+pub fn build_mega_terminal_data(
     topo: &TreeTopology,
     term: &TerminalData,
     initial_weights: &[Vec<f32>; 2],
@@ -858,7 +858,7 @@ fn build_mega_terminal_data(
 }
 
 /// Upload a non-empty slice to GPU, or a dummy single-element slice if empty.
-fn upload_or_dummy_i32(
+pub fn upload_or_dummy_i32(
     stream: &Arc<CudaStream>,
     data: &[i32],
 ) -> Result<cudarc::driver::CudaSlice<i32>, Box<dyn std::error::Error>> {
@@ -869,7 +869,7 @@ fn upload_or_dummy_i32(
     }
 }
 
-fn upload_or_dummy_f32(
+pub fn upload_or_dummy_f32(
     stream: &Arc<CudaStream>,
     data: &[f32],
 ) -> Result<cudarc::driver::CudaSlice<f32>, Box<dyn std::error::Error>> {

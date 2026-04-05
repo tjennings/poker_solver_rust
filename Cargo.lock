@@ -1055,6 +1055,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "criterion",
+ "gpu-range-solver",
  "half",
  "indicatif",
  "poker-solver-core",

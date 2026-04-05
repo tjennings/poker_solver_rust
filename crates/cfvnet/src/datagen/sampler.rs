@@ -229,6 +229,8 @@ mod tests {
             per_file: None,
             blueprint_path: None,
             turn_output: None,
+            backend: "cpu".into(),
+            gpu_batch_size: None,
         }
     }
 

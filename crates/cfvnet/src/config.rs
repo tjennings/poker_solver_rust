@@ -188,6 +188,13 @@ pub struct DatagenConfig {
     /// When set, datagen uses blueprint-propagated ranges instead of random RSP.
     #[serde(default)]
     pub blueprint_path: Option<String>,
+    /// Solver backend: "cpu" (default) or "gpu".
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// GPU batch size: number of subgames solved per GPU kernel launch.
+    /// Only used when backend is "gpu". Defaults to None (auto-select).
+    #[serde(default)]
+    pub gpu_batch_size: Option<usize>,
 }
 
 impl Default for DatagenConfig {
@@ -209,12 +216,17 @@ impl Default for DatagenConfig {
             river_output: None,
             per_file: None,
             blueprint_path: None,
+            backend: default_backend(),
+            gpu_batch_size: None,
         }
     }
 }
 
 fn default_datagen_mode() -> String {
     "model".into()
+}
+fn default_backend() -> String {
+    "cpu".into()
 }
 
 fn default_street() -> String {
@@ -678,5 +690,47 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.datagen.active_pool_size, 256);
+    }
+
+    #[test]
+    fn backend_defaults_to_cpu() {
+        let config = DatagenConfig::default();
+        assert_eq!(config.backend, "cpu");
+    }
+
+    #[test]
+    fn gpu_batch_size_defaults_to_none() {
+        let config = DatagenConfig::default();
+        assert!(config.gpu_batch_size.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_gpu_backend() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  backend: "gpu"
+  gpu_batch_size: 142
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.backend, "gpu");
+        assert_eq!(config.datagen.gpu_batch_size, Some(142));
+    }
+
+    #[test]
+    fn parse_config_without_backend_defaults_to_cpu() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.backend, "cpu");
+        assert!(config.datagen.gpu_batch_size.is_none());
     }
 }
