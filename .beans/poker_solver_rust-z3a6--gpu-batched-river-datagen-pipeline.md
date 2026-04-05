@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-z3a6
 title: GPU-batched river datagen pipeline
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-04-05T00:38:54Z
-updated_at: 2026-04-05T00:38:54Z
+updated_at: 2026-04-05T01:10:49Z
 ---
 
 Integrate GPU batch solver into cfvnet datagen for 142 simultaneous river subgames.
@@ -17,3 +17,8 @@ Integrate GPU batch solver into cfvnet datagen for 142 simultaneous river subgam
 - [ ] Task 4: End-to-end test + benchmark
 
 Plan: docs/plans/2026-04-04-gpu-batched-datagen-impl.md
+
+
+
+## Summary
+GpuBatchSolver integrated into cfvnet domain pipeline. 84 GPU solver tests + 4 GPU pipeline tests passing. Feature-gated behind gpu-datagen flag. True batching requires matching hand counts (blueprint ranges).
