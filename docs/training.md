@@ -88,6 +88,29 @@ Options:
 
 ---
 
+### gpu-range-solve
+
+GPU-accelerated version of `range-solve` using custom CUDA kernels via the `gpu-range-solver` crate. Same inputs and output format as `range-solve`. Requires an NVIDIA GPU with CUDA 12.1+.
+
+```bash
+cargo run -p poker-solver-trainer --release -- gpu-range-solve \
+  --oop-range "QQ+,AKs" --ip-range "JJ-99,AQs" \
+  --flop "Qs Jh 2c" --turn "8d" --river "3s" \
+  --pot 100 --effective-stack 100 --iterations 500
+```
+
+Options are identical to `range-solve` except `--compressed` is not supported.
+
+**Architecture:** Hand-parallel CUDA kernel — one thread block per subgame, up to 1024 threads handling 1024 hands in parallel. Tree traversal is sequential within the block; `__syncthreads` is used only for fold terminal evaluation (card-blocking reduction). No cooperative groups required.
+
+**Performance characteristics:**
+- CUDA context initialization: ~280ms one-time cost per invocation
+- Per-iteration: ~0.6-1.2ms (vs ~0.02-0.08ms CPU) for single river subgames
+- GPU advantage is in **throughput**: 142 independent subgames solved simultaneously when batched (one per SM on RTX 6000 Ada)
+- Best for: batched datagen (many subgames), not single-spot analysis (use `range-solve` for that)
+
+---
+
 ### cluster
 
 Run the potential-aware clustering pipeline to build bucket assignments for all four streets. Uses Pluribus-style bottom-up abstraction: river (equity k-means) → turn (EMD over river buckets) → flop (EMD over turn buckets) → preflop (EMD over flop buckets).
@@ -303,6 +326,8 @@ The `cfvnet` crate trains Deep Counterfactual Value Networks following the Supre
 
 #### Generate River Training Data
 
+**CPU backend (default):**
+
 ```bash
 cargo run -p cfvnet --release -- generate \
   --config sample_configurations/river_cfvnet.yaml \
@@ -310,6 +335,32 @@ cargo run -p cfvnet --release -- generate \
   --num-samples 1000000 \
   --threads 8
 ```
+
+**GPU backend (NVIDIA GPU required):**
+
+```bash
+cargo run -p cfvnet --release --features gpu-datagen -- generate \
+  --config sample_configurations/river_cfvnet.yaml \
+  --output data/river_training.bin \
+  --num-samples 1000000
+```
+
+Set `datagen.backend: "gpu"` in the YAML config to use GPU solving. The GPU backend solves batches of river subgames simultaneously using the hand-parallel CUDA kernel. Each batch launches up to `gpu_batch_size` (default: 142) subgames in a single kernel launch.
+
+```yaml
+datagen:
+  street: "river"
+  backend: "gpu"          # "cpu" (default) or "gpu"
+  gpu_batch_size: 142     # subgames per GPU launch (default: 142)
+  num_samples: 1000000
+  solver_iterations: 500
+```
+
+**GPU requirements:**
+- NVIDIA GPU with CUDA 12.1+ and compute capability ≥ 6.0
+- Build with `--features gpu-datagen` to enable the GPU dependency
+- Ranges must produce ≤ 1024 hands per player (games exceeding this fall back to CPU)
+- True batching (142 games per launch) requires matching hand counts across games — use blueprint-derived ranges (`blueprint_path`) for best GPU utilization; random RSP ranges may have varying counts
 
 #### Train the River Network
 
@@ -441,6 +492,8 @@ See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
 | Parameter | Default | Description |
 |-|-|-|
 | `datagen.street` | `"river"` | Street to generate data for (`"river"` or `"turn"`) |
+| `datagen.backend` | `"cpu"` | Solver backend: `"cpu"` or `"gpu"` (GPU requires `--features gpu-datagen`) |
+| `datagen.gpu_batch_size` | 142 | Subgames per GPU kernel launch (only with `backend: "gpu"`) |
 | `datagen.num_samples` | 1,000,000 | Training situations to generate |
 | `datagen.solver_iterations` | 1000 | DCFR iterations per situation |
 | `game.river_model_path` | none | Path to trained river model (required for turn) |
