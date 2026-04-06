@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { invoke } from './invoke';
 import { useGlobalConfig } from './useGlobalConfig';
 import type {
@@ -11,6 +11,8 @@ import {
   SUIT_SYMBOLS,
   getActionColor,
 } from './matrix-utils';
+import { buildSolveParams, isPostflopStreet } from './strategy-tabs';
+import type { StrategySource, SolveMode } from './strategy-tabs';
 
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
 
@@ -140,7 +142,10 @@ export default function GameExplorer() {
   const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number; latest_snapshot: string | null }[]>([]);
   const [bundleName, setBundleName] = useState<string | null>(null);
   const [snapshotName, setSnapshotName] = useState<string | null>(null);
-  const [solving, setSolving] = useState(false);
+  const [activeSource, setActiveSource] = useState<StrategySource>('blueprint');
+  const [subgameSolving, setSubgameSolving] = useState(false);
+  const [exactSolving, setExactSolving] = useState(false);
+  const activeSourceRef = useRef<StrategySource>('blueprint');
   const [copied, setCopied] = useState(false);
   const [showLoadModal, setShowLoadModal] = useState(false);
   const [loadSpotInput, setLoadSpotInput] = useState('');
@@ -174,6 +179,10 @@ export default function GameExplorer() {
       setLoading(true);
       setError(null);
       setState(null);
+      setActiveSource('blueprint');
+      activeSourceRef.current = 'blueprint';
+      setSubgameSolving(false);
+      setExactSolving(false);
       const info = await invoke<{ snapshot_name: string | null }>('load_blueprint_v2', { path });
       await invoke('game_new', {});
       const s = await invoke<GameState>('game_get_state', {});
@@ -194,6 +203,7 @@ export default function GameExplorer() {
       setLoading(true);
       const s = await invoke<GameState>('game_play_action', {
         actionId,
+        source: activeSourceRef.current,
       });
       setState(s);
       setSelectedCell(null);
@@ -209,6 +219,8 @@ export default function GameExplorer() {
   const dealCard = useCallback(async (card: string) => {
     try {
       setLoading(true);
+      setActiveSource('blueprint');
+      activeSourceRef.current = 'blueprint';
       const s = await invoke<GameState>('game_deal_card', { card });
       setState(s);
     } catch (e) {
@@ -222,6 +234,8 @@ export default function GameExplorer() {
     async (cards: string[]) => {
       try {
         setLoading(true);
+        setActiveSource('blueprint');
+        activeSourceRef.current = 'blueprint';
         let s: GameState | null = null;
         for (const card of cards) {
           s = await invoke<GameState>('game_deal_card', { card });
@@ -241,7 +255,9 @@ export default function GameExplorer() {
   const goBack = useCallback(async () => {
     try {
       setLoading(true);
-      const s = await invoke<GameState>('game_back', {});
+      const s = await invoke<GameState>('game_back', {
+        source: activeSourceRef.current,
+      });
       setState(s);
       setSelectedCell(null);
     } catch (e) {
@@ -256,6 +272,10 @@ export default function GameExplorer() {
   const newHand = useCallback(async () => {
     try {
       setLoading(true);
+      setActiveSource('blueprint');
+      activeSourceRef.current = 'blueprint';
+      setSubgameSolving(false);
+      setExactSolving(false);
       await invoke('game_new', {});
       const s = await invoke<GameState>('game_get_state', {});
       setState(s);
@@ -282,7 +302,9 @@ export default function GameExplorer() {
         // even across street boundaries.
         let s: GameState | null = null;
         for (let i = 0; i < stepsBack; i++) {
-          s = await invoke<GameState>('game_back', {});
+          s = await invoke<GameState>('game_back', {
+            source: activeSourceRef.current,
+          });
         }
         if (s) setState(s);
         setSelectedCell(null);
@@ -314,6 +336,10 @@ export default function GameExplorer() {
   const loadSpot = useCallback(async () => {
     try {
       setLoadSpotError(null);
+      setActiveSource('blueprint');
+      activeSourceRef.current = 'blueprint';
+      setSubgameSolving(false);
+      setExactSolving(false);
       const s = await invoke<GameState>('game_load_spot', { spot: loadSpotInput });
       setState(s);
       setShowLoadModal(false);
@@ -323,6 +349,65 @@ export default function GameExplorer() {
       setLoadSpotError(String(e));
     }
   }, [loadSpotInput]);
+
+  // ── Tab switching ─────────────────────────────────────────────────
+
+  const handleTabSwitch = useCallback(async (source: StrategySource) => {
+    setActiveSource(source);
+    activeSourceRef.current = source;
+    try {
+      const s = await invoke<GameState>('game_get_state', { source });
+      setState(s);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  // ── Solve handler ─────────────────────────────────────────────────
+
+  const handleSolve = useCallback(async (mode: SolveMode) => {
+    const isSolving = mode === 'subgame' ? subgameSolving : exactSolving;
+    const setSolving = mode === 'subgame' ? setSubgameSolving : setExactSolving;
+
+    if (isSolving) {
+      // Cancel
+      try {
+        setSolving(false);
+        await invoke('game_cancel_solve', { mode });
+        const s = await invoke<GameState>('game_get_state', { source: mode });
+        setState(s);
+      } catch (e) {
+        setError(String(e));
+      }
+    } else {
+      // Start solve
+      try {
+        setSolving(true);
+        setActiveSource(mode);
+        activeSourceRef.current = mode;
+        const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
+        const params = buildSolveParams(mode, globalConfig);
+        await invoke('game_solve', { ...params });
+        // Poll for progress
+        const pollId = setInterval(async () => {
+          try {
+            const s = await invoke<GameState>('game_get_state', { source: mode });
+            setState(s);
+            if (s.solve?.is_complete) {
+              clearInterval(pollId);
+              setSolving(false);
+            }
+          } catch {
+            clearInterval(pollId);
+            setSolving(false);
+          }
+        }, 500);
+      } catch (e) {
+        setError(String(e));
+        setSolving(false);
+      }
+    }
+  }, [subgameSolving, exactSolving]);
 
   // ── Derived state ────────────────────────────────────────────────
 
@@ -511,7 +596,7 @@ export default function GameExplorer() {
                   padding: 0,
                   textAlign: 'left',
                 }}
-                onClick={() => { setState(null); setBundleName(null); }}
+                onClick={() => { setState(null); setBundleName(null); setActiveSource('blueprint'); activeSourceRef.current = 'blueprint'; setSubgameSolving(false); setExactSolving(false); }}
               >
                 Change
               </button>
@@ -545,75 +630,6 @@ export default function GameExplorer() {
               </div>
             );
 
-            const solveBtn = (key: string) => (
-              <button
-                key={key}
-                onClick={async () => {
-                  if (solving) {
-                    // Cancel
-                    try {
-                      setSolving(false);
-                      await invoke('game_cancel_solve', {});
-                      const s = await invoke<GameState>('game_get_state', {});
-                      setState(s);
-                    } catch (e) {
-                      setError(String(e));
-                    }
-                  } else {
-                    // Start solve
-                    try {
-                      setSolving(true);
-                      const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
-                      await invoke('game_solve', {
-                        maxIterations: globalConfig.solve_iterations ?? 200,
-                        targetExploitability: globalConfig.target_exploitability ?? 3.0,
-                        leafEvalInterval: globalConfig.leaf_eval_interval ?? 10,
-                        rolloutBiasFactor: globalConfig.rollout_bias_factor ?? 10.0,
-                        rolloutNumSamples: globalConfig.rollout_num_samples ?? 3,
-                        rolloutOpponentSamples: globalConfig.rollout_opponent_samples ?? 8,
-                        rangeClampThreshold: globalConfig.range_clamp_threshold ?? 0.05,
-                      });
-                      // Poll for progress
-                      const pollId = setInterval(async () => {
-                        try {
-                          const s = await invoke<GameState>('game_get_state', {});
-                          setState(s);
-                          if (s.solve?.is_complete) {
-                            clearInterval(pollId);
-                            setSolving(false);
-                          }
-                        } catch {
-                          clearInterval(pollId);
-                          setSolving(false);
-                        }
-                      }, 500);
-                    } catch (e) {
-                      setError(String(e));
-                      setSolving(false);
-                    }
-                  }
-                }}
-                style={{
-                  padding: '0.3rem 0.4rem',
-                  background: solving ? '#dc262622' : '#f59e0b22',
-                  border: `2px solid ${solving ? '#dc2626' : '#f59e0b'}`,
-                  borderRadius: '4px',
-                  color: solving ? '#dc2626' : '#f59e0b',
-                  cursor: 'pointer',
-                  fontSize: '0.7rem',
-                  fontWeight: 700,
-                  writingMode: 'vertical-rl',
-                  textOrientation: 'mixed',
-                  letterSpacing: '0.15em',
-                  alignSelf: 'stretch',
-                  flexShrink: 0,
-                  minHeight: '60px',
-                }}
-              >
-                {solving ? 'CANCEL' : 'SOLVE'}
-              </button>
-            );
-
             state.action_history.forEach((rec, idx) => {
               // Insert street block at transitions
               if (rec.street !== prevStreet && prevStreet !== '') {
@@ -624,8 +640,6 @@ export default function GameExplorer() {
                 if (cards.length > 0) {
                   const nextStreet = rec.street;
                   elems.push(streetBlock(nextStreet, cards));
-                  // Solve button after each street transition
-                  elems.push(solveBtn(`solve-${prevStreet}`));
                 }
               }
               prevStreet = rec.street;
@@ -654,7 +668,6 @@ export default function GameExplorer() {
                 : [];
               if (cards.length > 0) {
                 elems.push(streetBlock(state.street, cards));
-                elems.push(solveBtn(`solve-${prevStreet}-end`));
               }
             }
 
@@ -688,6 +701,46 @@ export default function GameExplorer() {
               isCurrent={true}
             />
           )}
+        </div>
+      )}
+
+      {/* Strategy source tabs (postflop only) */}
+      {state && isPostflopStreet(state.street) && (
+        <div className="strategy-tabs">
+          <span
+            className={`strategy-tab ${activeSource === 'blueprint' ? 'active' : ''}`}
+            onClick={() => handleTabSwitch('blueprint')}
+          >
+            Blueprint
+          </span>
+          <span className="strategy-tab-group">
+            <span
+              className={`strategy-tab ${activeSource === 'subgame' ? 'active' : ''}`}
+              onClick={() => handleTabSwitch('subgame')}
+            >
+              Subgame
+            </span>
+            <span
+              className="strategy-tab-action"
+              onClick={() => handleSolve('subgame')}
+            >
+              [{subgameSolving ? 'cancel' : 'solve'}]
+            </span>
+          </span>
+          <span className="strategy-tab-group">
+            <span
+              className={`strategy-tab ${activeSource === 'exact' ? 'active' : ''}`}
+              onClick={() => handleTabSwitch('exact')}
+            >
+              Exact
+            </span>
+            <span
+              className="strategy-tab-action"
+              onClick={() => handleSolve('exact')}
+            >
+              [{exactSolving ? 'cancel' : 'solve'}]
+            </span>
+          </span>
         </div>
       )}
 

@@ -574,55 +574,6 @@ button:disabled {
   border-radius: 4px;
 }
 
-.action-block.solve-block {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  border-color: #d4a017;
-  border-width: 2px;
-  min-width: 0;
-  width: 40px;
-  min-height: 80px;
-  padding: 0.5rem 0;
-  transition: border-color 0.2s, background 0.2s;
-}
-.action-block.solve-block:hover {
-  background: linear-gradient(135deg, #1a1a30 0%, #252545 100%);
-  border-color: #f0c030;
-}
-.action-block.solve-block.solving {
-  border-color: #dc2626;
-}
-.action-block.solve-block.solving:hover {
-  border-color: #ef4444;
-  background: linear-gradient(135deg, #1a1215 0%, #2a1520 100%);
-}
-.solve-label {
-  font-weight: 700;
-  font-size: 0.7rem;
-  letter-spacing: 0.1em;
-  writing-mode: vertical-rl;
-  text-orientation: mixed;
-  color: #d4a017;
-}
-.action-block.solve-block.solving .solve-label {
-  color: #dc2626;
-}
-.action-block.solve-block.solved {
-  background: #16a34a;
-  color: white;
-  cursor: default;
-  border-color: #16a34a;
-}
-.action-block.solve-block.solved:hover {
-  background: #16a34a;
-  border-color: #16a34a;
-}
-.action-block.solve-block.solved .solve-label {
-  color: white;
-}
-
 .action-block-header {
   display: flex;
   justify-content: space-between;
@@ -1481,4 +1432,43 @@ button:disabled {
 .re-solve-btn:hover {
   border-color: rgba(148, 163, 184, 0.6);
   color: #e2e8f0;
+}
+
+/* Strategy source tabs */
+.strategy-tabs {
+  display: flex;
+  gap: 1rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.8rem;
+  border-bottom: 1px solid #1a1a2e;
+}
+
+.strategy-tab {
+  color: #666;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.strategy-tab:hover {
+  color: #aaa;
+}
+
+.strategy-tab.active {
+  color: #00d9ff;
+}
+
+.strategy-tab-group {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.strategy-tab-action {
+  color: #f59e0b;
+  cursor: pointer;
+  font-size: 0.7rem;
+}
+
+.strategy-tab-action:hover {
+  color: #fbbf24;
 }
