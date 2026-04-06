@@ -464,6 +464,48 @@ cargo run -p cfvnet --release -- compare-exact \
   --num-spots 20
 ```
 
+### BoundaryNet (Normalized EV Model)
+
+BoundaryNet is a sibling model to CfvNet that outputs **normalized EVs** (`chip_ev / (pot + effective_stack)`) instead of pot-relative CFVs. It uses the same training data but with different input encoding (pot/stack as fractions of total stake) and normalized targets.
+
+BoundaryNet is designed as a depth-boundary evaluator for the range-solver, enabling turn solving with neural network leaf values at river boundaries.
+
+#### Train a BoundaryNet
+
+Uses the same training data as CfvNet (generated with `generate`):
+
+```bash
+cargo run -p cfvnet --release -- train-boundary \
+  --config sample_configurations/river_cfvnet.yaml \
+  --data data/river_training.bin \
+  --output models/boundary_v1
+```
+
+#### Evaluate BoundaryNet
+
+Reports normalized MAE with per-SPR bucket breakdown (<1, 1-3, 3-10, 10+):
+
+```bash
+cargo run -p cfvnet --release -- eval-boundary \
+  --model models/boundary_v1 \
+  --data data/river_validation.bin
+```
+
+#### Compare BoundaryNet Against Ground Truth
+
+Compares model predictions against datagen ground truth, reporting per-SPR MAE and worst-case error:
+
+```bash
+cargo run -p cfvnet --release -- compare-boundary \
+  --model models/boundary_v1 \
+  --data data/river_validation.bin \
+  --num-positions 100
+```
+
+#### Using BoundaryNet in the Explorer
+
+To enable neural boundary evaluation for turn solving in the explorer, configure the model path in the Tauri app's postflop settings. When set, turn subgame solving uses BoundaryNet at river boundaries instead of full-depth or rollout evaluation.
+
 ### Inspect Training Data Distribution
 
 Print frequency histograms (stack size and pot size, 20 equal-width buckets) for generated training data:

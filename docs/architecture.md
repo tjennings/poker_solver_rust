@@ -176,7 +176,7 @@ generate -> train -> evaluate -> compare
 
 1. **Generate** (`datagen`): Sample random river situations (board, pot, stack, ranges via DeepStack R(S,p)), solve each with range-solver DCFR, extract pot-relative CFVs for both players. Output: binary file of training records.
 
-2. **Train** (`model`): Train a 7-layer MLP (2660->500->...->1326) using Huber loss + auxiliary game-value consistency loss. Framework: burn (wgpu/ndarray backends).
+2. **Train** (`model`): Train a 7-layer MLP (2720->500->...->1326) using Huber loss + auxiliary game-value consistency loss. Framework: burn (wgpu/ndarray backends).
 
 3. **Evaluate** (`eval`): Compute MAE, max error, and mbb/hand metrics on held-out data.
 
@@ -184,18 +184,30 @@ generate -> train -> evaluate -> compare
 
 ### Network Architecture
 
-```
-Input(2660) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
-```
+Two model variants share the same MLP architecture (`HiddenBlock`: Linear -> BatchNorm -> PReLU):
 
-- Input: OOP range (1326) + IP range (1326) + board (5) + pot (1) + stack (1) + player (1)
+**CfvNet** (pot-relative output):
+```
+Input(2720) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
+```
+- Input: OOP range (1326) + IP range (1326) + board one-hot (52) + rank presence (13) + pot/400 + stack/400 + player
 - Output: 1326 pot-relative counterfactual values
-- Loss: Huber (masked for board-blocked combos) + lambda x auxiliary game-value constraint
-- ~3.5M parameters
+
+**BoundaryNet** (normalized EV output):
+```
+Input(2720) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
+```
+- Input: same layout as CfvNet, but pot and stack encoded as `pot/(pot+stack)` and `stack/(pot+stack)`
+- Output: 1326 normalized EVs (`chip_ev / (pot + effective_stack)`)
+- At inference: `chip_ev[h] = normalized_ev[h] * (pot + effective_stack)`
+
+Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game-value constraint. ~2.9M parameters (default 7x500).
 
 ### Integration Point
 
-The CFVnet replaces exact river solving at the leaves of turn subgames during depth-limited re-solving. Given a turn decision point, the solver builds a turn subtree and queries the CFVnet at each river leaf instead of running full DCFR.
+**CfvNet** provides standalone river value predictions for evaluation and comparison.
+
+**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. When solving turn subgames, the solver queries BoundaryNet at river boundary nodes instead of full-depth DCFR, enabling fast turn solving. The Tauri explorer supports loading a trained BoundaryNet model via `boundary_model_path` config.
 
 ### Key Files
 
@@ -203,13 +215,16 @@ The CFVnet replaces exact river solving at the leaves of turn subgames during de
 - Range generator: `crates/cfvnet/src/datagen/range_gen.rs`
 - Situation sampler: `crates/cfvnet/src/datagen/sampler.rs`
 - Solve wrapper: `crates/cfvnet/src/datagen/solver.rs`
-- Network model: `crates/cfvnet/src/model/network.rs`
+- CfvNet model: `crates/cfvnet/src/model/network.rs`
+- BoundaryNet model: `crates/cfvnet/src/model/boundary_net.rs`
+- BoundaryNet dataset encoding: `crates/cfvnet/src/model/boundary_dataset.rs`
+- BoundaryNet training: `crates/cfvnet/src/model/boundary_training.rs`
 - Loss functions: `crates/cfvnet/src/model/loss.rs`
 - Training loop: `crates/cfvnet/src/model/training.rs`
+- Boundary evaluator (range-solver integration): `crates/cfvnet/src/eval/boundary_evaluator.rs`
 - CLI: `crates/cfvnet/src/main.rs`
 - Sample config: `sample_configurations/river_cfvnet.yaml`
 
 ## Known Limitations
 
 - **No real-time subgame solving yet:** The blueprint is a static strategy. Pluribus-style real-time search is planned but not implemented.
-- **CFVnet not yet integrated:** The network is trainable but not yet wired into depth-limited solving at runtime.
