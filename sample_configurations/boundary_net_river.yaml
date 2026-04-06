@@ -1,0 +1,42 @@
+# BoundaryNet River — training config
+#
+# Uses existing river datagen data (same binary format as CfvNet).
+# BoundaryNet normalizes pot/stack inputs and outputs normalized EVs.
+#
+# Train:
+#   cargo run -p cfvnet --release -- train-boundary \
+#     -c sample_configurations/boundary_net_river.yaml \
+#     -d local_data/data/bucketed_river_10m \
+#     -o local_data/models/boundary_v1
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - "25%"
+    - "50%"
+    - "100%"
+    - "a"
+  board_size: 5
+
+datagen:
+  street: "river"
+  num_samples: 10000000
+  solver_iterations: 5000
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 16000
+  epochs: 500
+  learning_rate: 0.004
+  lr_min: 0.00004
+  huber_delta: 1.0
+  aux_loss_weight: 0.1
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 10
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  encoder_threads: 14
+  gpu_prefetch: 3

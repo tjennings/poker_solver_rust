@@ -5249,6 +5249,8 @@ dependencies = [
 name = "poker-solver-tauri"
 version = "0.1.0"
 dependencies = [
+ "burn",
+ "cfvnet",
  "lru",
  "parking_lot",
  "poker-solver-core",
