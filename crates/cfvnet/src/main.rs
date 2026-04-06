@@ -329,6 +329,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         shuffle_buffer_size: cfg.training.shuffle_buffer_size,
         prefetch_depth: cfg.training.prefetch_depth,
         encoder_threads: cfg.training.encoder_threads,
+        gpu_prefetch: cfg.training.gpu_prefetch,
     };
 
     match backend {
@@ -412,6 +413,7 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
         shuffle_buffer_size: cfg.training.shuffle_buffer_size,
         prefetch_depth: cfg.training.prefetch_depth,
         encoder_threads: cfg.training.encoder_threads,
+        gpu_prefetch: cfg.training.gpu_prefetch,
     };
 
     match backend {

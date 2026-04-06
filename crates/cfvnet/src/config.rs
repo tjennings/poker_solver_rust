@@ -279,6 +279,8 @@ pub struct TrainingConfig {
     pub prefetch_depth: usize,
     #[serde(default = "default_encoder_threads")]
     pub encoder_threads: usize,
+    #[serde(default = "default_gpu_prefetch")]
+    pub gpu_prefetch: usize,
 }
 
 impl Default for TrainingConfig {
@@ -297,6 +299,7 @@ impl Default for TrainingConfig {
             shuffle_buffer_size: 262_144,
             prefetch_depth: 4,
             encoder_threads: default_encoder_threads(),
+            gpu_prefetch: default_gpu_prefetch(),
         }
     }
 }
@@ -343,6 +346,9 @@ fn default_encoder_threads() -> usize {
         .unwrap_or(4)
         .saturating_sub(2) // reserve 1 for reader, 1 for training loop
         .max(1)
+}
+fn default_gpu_prefetch() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -732,5 +738,39 @@ datagen:
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.datagen.backend, "cpu");
         assert!(config.datagen.gpu_batch_size.is_none());
+    }
+
+    #[test]
+    fn gpu_prefetch_defaults_to_3() {
+        let config = TrainingConfig::default();
+        assert_eq!(config.gpu_prefetch, 3);
+    }
+
+    #[test]
+    fn parse_config_with_gpu_prefetch() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+training:
+  gpu_prefetch: 5
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.training.gpu_prefetch, 5);
+    }
+
+    #[test]
+    fn parse_config_without_gpu_prefetch_uses_default() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.training.gpu_prefetch, 3);
     }
 }

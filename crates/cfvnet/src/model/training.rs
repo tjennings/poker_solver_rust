@@ -31,6 +31,7 @@ pub struct TrainConfig {
     pub shuffle_buffer_size: usize,
     pub prefetch_depth: usize,
     pub encoder_threads: usize,
+    pub gpu_prefetch: usize,
 }
 
 /// Result returned after training completes.
@@ -588,6 +589,19 @@ pub fn train<B: AutodiffBackend>(
         val_count,
     );
 
+    // Spawn GPU upload thread to overlap CPU->GPU transfer with compute.
+    let gpu_prefetch = config.gpu_prefetch.max(1);
+    let (gpu_tx, gpu_rx) = mpsc::sync_channel::<DeviceTensors<B::InnerBackend>>(gpu_prefetch);
+    let upload_device = device.clone();
+    let upload_handle = std::thread::spawn(move || {
+        while let Ok(encoded) = data_rx.recv() {
+            let tensors = encoded.into_device_tensors::<B::InnerBackend>(&upload_device);
+            if gpu_tx.send(tensors).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut final_loss = f32::MAX;
     let mut global_step: usize = start_epoch * steps_per_epoch;
 
@@ -602,14 +616,11 @@ pub fn train<B: AutodiffBackend>(
         let mut epoch_loss = 0.0_f64;
 
         for step_in_epoch in 0..steps_per_epoch {
-            // Receive next pre-encoded batch from the dataloader (blocking).
-            let encoded = match data_rx.recv() {
-                Ok(e) => e,
+            // Receive next GPU-resident batch from the upload thread (blocking).
+            let batch = match gpu_rx.recv() {
+                Ok(b) => b,
                 Err(_) => break, // Channel closed unexpectedly.
             };
-
-            // Create tensors on the inner (non-autodiff) backend, then lift.
-            let batch = encoded.into_device_tensors::<B::InnerBackend>(device);
             let input = Tensor::<B, 2>::from_inner(batch.input);
             let target = Tensor::<B, 2>::from_inner(batch.target);
             let mask = Tensor::<B, 2>::from_inner(batch.mask);
@@ -670,8 +681,11 @@ pub fn train<B: AutodiffBackend>(
         }
     }
 
-    // Drop data channel to signal threads to exit (cascading close), then join.
-    drop(data_rx);
+    // Drop gpu channel to signal upload thread to exit, then join all threads.
+    drop(gpu_rx);
+    if let Err(e) = upload_handle.join() {
+        eprintln!("ERROR: GPU upload thread panicked: {e:?}");
+    }
     for handle in loader_threads {
         if let Err(e) = handle.join() {
             eprintln!("ERROR: dataloader thread panicked: {e:?}");
@@ -712,6 +726,7 @@ mod tests {
             shuffle_buffer_size: 100,
             prefetch_depth: 2,
             encoder_threads: 2,
+            gpu_prefetch: 1,
         }
     }
 
