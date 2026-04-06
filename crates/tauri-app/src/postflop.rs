@@ -2401,6 +2401,7 @@ mod tests {
             RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
             RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
             RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Heart),
         ];
         let bet_sizes = vec![vec![1.0f32]];
         let oop_w = weights_from_range("AA,KK,QQ");
@@ -2464,6 +2465,7 @@ mod tests {
             RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Heart),
             RsPokerCard::new(RsPokerValue::Six, RsPokerSuit::Club),
             RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Heart),
         ];
         let bet_sizes = vec![vec![0.5f32]];
         let oop_w = weights_from_range("AA,KK");
