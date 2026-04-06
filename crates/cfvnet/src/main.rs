@@ -136,6 +136,18 @@ enum Commands {
         #[arg(short, long)]
         data: PathBuf,
     },
+    /// Compare BoundaryNet boundary CFVs against ground truth on reference positions
+    CompareBoundary {
+        /// Path to trained boundary model directory
+        #[arg(short, long)]
+        model: PathBuf,
+        /// Path to binary test data (same format as training data)
+        #[arg(short, long)]
+        data: PathBuf,
+        /// Max positions to compare
+        #[arg(short, long, default_value = "100")]
+        num_positions: usize,
+    },
     /// Precompute average turn entry ranges from a blueprint strategy, bucketed by SPR.
     #[command(name = "precompute-ranges")]
     PrecomputeRanges {
@@ -253,6 +265,9 @@ fn main() {
             cmd_train_boundary(config, data, output, &backend);
         }
         Commands::EvalBoundary { model, data } => cmd_eval_boundary(model, data),
+        Commands::CompareBoundary { model, data, num_positions } => {
+            cmd_compare_boundary(&model, &data, num_positions);
+        }
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
@@ -838,6 +853,118 @@ fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
             );
         } else {
             println!("  SPR {:<5}: N/A     (0 records)", label);
+        }
+    }
+}
+
+fn cmd_compare_boundary(model_dir: &std::path::Path, data_path: &std::path::Path, num_positions: usize) {
+    use burn::backend::NdArray;
+    use burn::module::Module;
+    use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
+    use burn::tensor::{Tensor, TensorData};
+    use cfvnet::datagen::storage::read_record;
+    use cfvnet::eval::metrics::compute_normalized_mae;
+    use cfvnet::model::boundary_dataset::encode_boundary_record;
+    use cfvnet::model::boundary_net::BoundaryNet;
+    use cfvnet::model::network::INPUT_SIZE;
+
+    let cfg = load_model_config(model_dir);
+
+    type B = NdArray;
+    let device = Default::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model_path = resolve_model_path(model_dir);
+
+    let model = BoundaryNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size)
+        .load_file(&model_path, &recorder, &device)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    let file = std::fs::File::open(data_path).unwrap_or_else(|e| {
+        eprintln!("failed to open data file {}: {e}", data_path.display());
+        std::process::exit(1);
+    });
+    let mut reader = std::io::BufReader::new(file);
+
+    let mut total_mae = 0.0_f64;
+    let mut worst_mae = 0.0_f64;
+    let mut count = 0_u64;
+
+    // SPR buckets: <1, 1-3, 3-10, 10+
+    let mut spr_mae = [0.0_f64; 4];
+    let mut spr_count = [0_u64; 4];
+    let mut spr_worst = [0.0_f64; 4];
+
+    while count < num_positions as u64 {
+        let rec = match read_record(&mut reader) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        let item = encode_boundary_record(&rec);
+        let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
+
+        let input = Tensor::<B, 2>::from_data(
+            TensorData::new(item.input.clone(), [1, INPUT_SIZE]),
+            &device,
+        );
+        let pred = model.forward(input);
+        let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
+
+        let mae = compute_normalized_mae(&pred_vec, &item.target, &mask);
+        total_mae += mae;
+        if mae > worst_mae {
+            worst_mae = mae;
+        }
+        count += 1;
+
+        // SPR bucket
+        let spr = if rec.pot > 0.0 {
+            rec.effective_stack as f64 / rec.pot as f64
+        } else {
+            0.0
+        };
+        let bucket = if spr < 1.0 {
+            0
+        } else if spr < 3.0 {
+            1
+        } else if spr < 10.0 {
+            2
+        } else {
+            3
+        };
+        spr_mae[bucket] += mae;
+        spr_count[bucket] += 1;
+        if mae > spr_worst[bucket] {
+            spr_worst[bucket] = mae;
+        }
+    }
+
+    if count == 0 {
+        println!("No records to compare.");
+        return;
+    }
+
+    let n = count as f64;
+    println!("Comparison results ({count} positions):");
+    println!("  Normalized MAE: {:.6}", total_mae / n);
+    println!("  Worst-case MAE: {:.6}", worst_mae);
+
+    let bucket_labels = ["<1", "1-3", "3-10", "10+"];
+    println!("\nMAE by SPR bucket:");
+    for (i, label) in bucket_labels.iter().enumerate() {
+        if spr_count[i] > 0 {
+            println!(
+                "  SPR {:<5}: MAE={:.6}  worst={:.6}  ({} positions)",
+                label,
+                spr_mae[i] / spr_count[i] as f64,
+                spr_worst[i],
+                spr_count[i]
+            );
+        } else {
+            println!("  SPR {:<5}: N/A  (0 positions)", label);
         }
     }
 }
