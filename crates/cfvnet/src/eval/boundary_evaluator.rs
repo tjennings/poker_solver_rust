@@ -1,10 +1,13 @@
 //! Boundary evaluator that adapts BoundaryNet for range-solver leaf evaluation.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::model::boundary_net::BoundaryNet;
 use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_COMBOS, NUM_RANKS};
 use burn::backend::NdArray;
+use burn::module::Module;
+use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 use burn::tensor::{Tensor, TensorData};
 use range_solver::card::card_pair_to_index;
 
@@ -140,6 +143,41 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         }
         cfvs
     }
+}
+
+/// Load a trained `BoundaryNet` from a model directory and wrap it as a
+/// `NeuralBoundaryEvaluator` ready for range-solver integration.
+///
+/// The model directory must contain `config.yaml` (with `training.hidden_layers`
+/// and `training.hidden_size`) and the model checkpoint file.
+pub fn load_neural_boundary_evaluator(
+    model_dir: &Path,
+    board: Vec<u8>,
+    private_cards: [Vec<(u8, u8)>; 2],
+) -> Result<NeuralBoundaryEvaluator, String> {
+    let config_path = model_dir.join("config.yaml");
+    let yaml = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+    let cfg: crate::config::CfvnetConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| format!("parse {}: {e}", config_path.display()))?;
+
+    let device = Default::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model_path = if model_dir.is_dir() {
+        model_dir.join("model")
+    } else {
+        model_dir.to_path_buf()
+    };
+
+    let model = BoundaryNet::<NdArray>::new(
+        &device,
+        cfg.training.hidden_layers,
+        cfg.training.hidden_size,
+    )
+    .load_file(&model_path, &recorder, &device)
+    .map_err(|e| format!("load model from {}: {e}", model_path.display()))?;
+
+    Ok(NeuralBoundaryEvaluator::new(model, board, private_cards))
 }
 
 #[cfg(test)]
