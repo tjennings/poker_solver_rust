@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-06T00:52:01Z
-updated_at: 2026-04-06T01:30:27Z
+updated_at: 2026-04-06T02:11:33Z
 ---
 
 Add BoundaryNet model to cfvnet crate for depth-bounded range solving.
@@ -20,7 +20,7 @@ Impl plan: docs/plans/2026-04-05-boundary-net-impl.md
 - [x] Task 4: Validation metrics (normalized MAE)
 - [x] Task 5: CLI commands (train-boundary, eval-boundary)
 - [x] Task 6: Boundary evaluator for range-solver
-- [ ] Task 7: BoundaryEvaluator struct with batch inference
-- [ ] Task 8: Tauri integration for turn solving
-- [ ] Task 9: Exploitability comparison command
+- [x] Task 7: BoundaryEvaluator struct with batch inference
+- [x] Task 8: Tauri integration for turn solving
+- [x] Task 9: Exploitability comparison command
 - [ ] Task 10: Full workspace build/test verification + docs
