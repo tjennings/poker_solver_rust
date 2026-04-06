@@ -1,3 +1,4 @@
+pub mod boundary_evaluator;
 pub mod compare;
 pub mod compare_turn;
 pub mod metrics;
