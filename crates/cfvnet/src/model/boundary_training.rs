@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use crate::datagen::storage::{read_record, TrainingRecord};
 use crate::model::boundary_dataset::encode_boundary_record;
-use crate::model::loss::weighted_cfvnet_loss;
+use crate::model::loss::{weighted_cfvnet_loss, weighted_cfvnet_loss_components};
 use crate::model::boundary_net::BoundaryNet;
 use crate::model::network::{INPUT_SIZE, OUTPUT_SIZE};
 
@@ -139,17 +139,26 @@ fn cosine_lr(lr_max: f64, lr_min: f64, step: usize, total_steps: usize) -> f64 {
     lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f64::consts::PI * t / total).cos())
 }
 
+/// Validation loss result with component breakdown.
+struct ValLossResult {
+    combined: f64,
+    huber: f64,
+    aux: f64,
+}
+
 /// Compute average validation loss using pre-uploaded GPU tensors.
+/// Returns combined loss and individual huber/aux components.
 fn compute_val_loss<B: AutodiffBackend>(
     model: &BoundaryNet<B>,
     val_tensors: &DeviceTensors<B::InnerBackend>,
     n: usize,
     config: &BoundaryTrainConfig,
-) -> f64 {
+) -> ValLossResult {
     let valid_model = model.valid();
     let batch_size = config.batch_size;
 
-    let mut total_loss = 0.0_f64;
+    let mut total_huber = 0.0_f64;
+    let mut total_aux = 0.0_f64;
     let mut batch_count = 0_u64;
 
     for batch_start in (0..n).step_by(batch_size) {
@@ -164,26 +173,26 @@ fn compute_val_loss<B: AutodiffBackend>(
         let b_sw = val_tensors.sample_weight.clone().narrow(0, batch_start, len);
 
         let pred = valid_model.forward(b_input);
-        let loss = weighted_cfvnet_loss(
-            pred,
-            b_target,
-            b_mask,
-            b_range,
-            b_gv,
-            b_sw,
-            config.huber_delta,
-            config.aux_loss_weight,
+        let (h, a) = weighted_cfvnet_loss_components(
+            pred, b_target, b_mask, b_range, b_gv, b_sw, config.huber_delta,
         );
 
-        let val: f32 = loss.into_data().to_vec::<f32>().unwrap()[0];
-        total_loss += val as f64;
+        total_huber += h;
+        total_aux += a;
         batch_count += 1;
     }
 
     if batch_count == 0 {
-        0.0
+        ValLossResult { combined: 0.0, huber: 0.0, aux: 0.0 }
     } else {
-        total_loss / batch_count as f64
+        let n = batch_count as f64;
+        let huber = total_huber / n;
+        let aux = total_aux / n;
+        ValLossResult {
+            combined: huber + aux * config.aux_loss_weight,
+            huber,
+            aux,
+        }
     }
 }
 
@@ -680,8 +689,11 @@ pub fn train_boundary<B: AutodiffBackend>(
         );
 
         if let Some((ref val_tensors, val_n)) = val_on_device {
-            let val_loss = compute_val_loss(&model, val_tensors, val_n, config);
-            summary.push_str(&format!(" val={val_loss:.6}"));
+            let vl = compute_val_loss(&model, val_tensors, val_n, config);
+            summary.push_str(&format!(
+                " val={:.6} (huber={:.4} aux={:.4})",
+                vl.combined, vl.huber, vl.aux
+            ));
         }
 
         pb.finish_with_message(summary);

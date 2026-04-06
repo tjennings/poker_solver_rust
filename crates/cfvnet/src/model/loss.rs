@@ -90,6 +90,18 @@ fn weighted_masked_huber_loss<B: Backend>(
     weighted.sum() / sample_weight.sum().clamp_min(1.0)
 }
 
+/// Weighted aux loss: per-sample squared residual with sample weights.
+fn weighted_aux_loss<B: Backend>(
+    pred: Tensor<B, 2>,
+    range: Tensor<B, 2>,
+    game_value: Tensor<B, 1>,
+    sample_weight: Tensor<B, 1>,
+) -> Tensor<B, 1> {
+    let weighted_sum: Tensor<B, 1> = (pred * range).sum_dim(1).squeeze(1);
+    let residual = (weighted_sum - game_value).powf_scalar(2.0);
+    (residual * sample_weight.clone()).sum() / sample_weight.sum().clamp_min(1.0)
+}
+
 /// Combined loss with per-sample weighting: `L = weighted_huber + lambda * weighted_aux`.
 pub fn weighted_cfvnet_loss<B: Backend>(
     pred: Tensor<B, 2>,
@@ -102,11 +114,26 @@ pub fn weighted_cfvnet_loss<B: Backend>(
     aux_weight: f64,
 ) -> Tensor<B, 1> {
     let huber = weighted_masked_huber_loss(pred.clone(), target, mask, sample_weight.clone(), huber_delta);
-    // Weighted aux: per-sample squared residual, weighted average.
-    let weighted_sum: Tensor<B, 1> = (pred * range).sum_dim(1).squeeze(1);
-    let residual = (weighted_sum - game_value).powf_scalar(2.0);
-    let aux = (residual * sample_weight.clone()).sum() / sample_weight.sum().clamp_min(1.0);
+    let aux = weighted_aux_loss(pred, range, game_value, sample_weight);
     huber + aux.mul_scalar(aux_weight)
+}
+
+/// Compute separate huber and aux loss components for logging.
+/// Returns (huber, aux) as f64 values. Does NOT build an autodiff graph.
+pub fn weighted_cfvnet_loss_components<B: Backend>(
+    pred: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+    range: Tensor<B, 2>,
+    game_value: Tensor<B, 1>,
+    sample_weight: Tensor<B, 1>,
+    huber_delta: f64,
+) -> (f64, f64) {
+    let huber = weighted_masked_huber_loss(pred.clone(), target, mask, sample_weight.clone(), huber_delta);
+    let aux = weighted_aux_loss(pred, range, game_value, sample_weight);
+    let h: f32 = huber.into_data().to_vec::<f32>().unwrap()[0];
+    let a: f32 = aux.into_data().to_vec::<f32>().unwrap()[0];
+    (h as f64, a as f64)
 }
 
 #[cfg(test)]
