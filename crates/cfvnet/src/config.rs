@@ -281,6 +281,8 @@ pub struct TrainingConfig {
     pub encoder_threads: usize,
     #[serde(default = "default_gpu_prefetch")]
     pub gpu_prefetch: usize,
+    #[serde(default = "default_grad_clip_norm")]
+    pub grad_clip_norm: f64,
 }
 
 impl Default for TrainingConfig {
@@ -300,6 +302,7 @@ impl Default for TrainingConfig {
             prefetch_depth: 4,
             encoder_threads: default_encoder_threads(),
             gpu_prefetch: default_gpu_prefetch(),
+            grad_clip_norm: default_grad_clip_norm(),
         }
     }
 }
@@ -349,6 +352,9 @@ fn default_encoder_threads() -> usize {
 }
 fn default_gpu_prefetch() -> usize {
     3
+}
+fn default_grad_clip_norm() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

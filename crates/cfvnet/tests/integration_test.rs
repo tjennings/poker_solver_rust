@@ -57,6 +57,7 @@ fn full_pipeline_smoke_test() {
         prefetch_depth: 2,
         encoder_threads: 2,
         gpu_prefetch: 1,
+        grad_clip_norm: 1.0,
     };
 
     let result = cfvnet::model::training::train::<B>(

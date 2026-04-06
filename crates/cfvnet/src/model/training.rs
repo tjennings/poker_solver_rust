@@ -32,6 +32,7 @@ pub struct TrainConfig {
     pub prefetch_depth: usize,
     pub encoder_threads: usize,
     pub gpu_prefetch: usize,
+    pub grad_clip_norm: f64,
 }
 
 /// Result returned after training completes.
@@ -542,7 +543,9 @@ pub fn train<B: AutodiffBackend>(
     let model = CfvNet::<B>::new(device, config.hidden_layers, config.hidden_size, INPUT_SIZE);
     let (mut model, start_epoch) = load_or_create_model(model, output_dir, device);
 
-    let mut optim = AdamConfig::new().init::<B, CfvNet<B>>();
+    let mut optim = AdamConfig::new()
+        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(config.grad_clip_norm as f32)))
+        .init::<B, CfvNet<B>>();
 
     let files = collect_data_files(data_path).unwrap_or_else(|e| {
         eprintln!("failed to collect data files: {e}");
@@ -730,6 +733,7 @@ mod tests {
             prefetch_depth: 2,
             encoder_threads: 2,
             gpu_prefetch: 1,
+            grad_clip_norm: 1.0,
         }
     }
 
