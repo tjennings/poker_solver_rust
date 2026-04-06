@@ -137,6 +137,22 @@ struct PostflopCacheParams {
 #[serde(rename_all = "camelCase")]
 struct GamePlayActionParams {
     action_id: String,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GameGetStateParams {
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GameCancelSolveParams {
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GameBackParams {
+    source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -595,8 +611,9 @@ async fn handle_game_new(
 
 async fn handle_game_get_state(
     Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GameGetStateParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_get_state_core(&session_state, None))
+    result_to_response(poker_solver_tauri::game_get_state_core(&session_state, params.source))
 }
 
 async fn handle_game_play_action(
@@ -606,7 +623,7 @@ async fn handle_game_play_action(
     result_to_response(poker_solver_tauri::game_play_action_core(
         &session_state,
         &params.action_id,
-        None,
+        params.source,
     ))
 }
 
@@ -622,8 +639,9 @@ async fn handle_game_deal_card(
 
 async fn handle_game_back(
     Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GameBackParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_back_core(&session_state, None))
+    result_to_response(poker_solver_tauri::game_back_core(&session_state, params.source))
 }
 
 async fn handle_game_solve(
@@ -645,8 +663,9 @@ async fn handle_game_solve(
 
 async fn handle_game_cancel_solve(
     Extension(session_state): Extension<Arc<GameSessionState>>,
+    Json(params): Json<GameCancelSolveParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state, None))
+    result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state, params.mode))
 }
 
 async fn handle_game_encode_spot(
@@ -796,4 +815,83 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_get_state_params_deserializes_with_source() {
+        let json = r#"{"source": "subgame"}"#;
+        let params: GameGetStateParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.source.as_deref(), Some("subgame"));
+    }
+
+    #[test]
+    fn game_get_state_params_deserializes_empty_body() {
+        let json = r#"{}"#;
+        let params: GameGetStateParams = serde_json::from_str(json).unwrap();
+        assert!(params.source.is_none());
+    }
+
+    #[test]
+    fn game_cancel_solve_params_deserializes_with_mode() {
+        let json = r#"{"mode": "exact"}"#;
+        let params: GameCancelSolveParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.mode.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn game_cancel_solve_params_deserializes_empty_body() {
+        let json = r#"{}"#;
+        let params: GameCancelSolveParams = serde_json::from_str(json).unwrap();
+        assert!(params.mode.is_none());
+    }
+
+    #[test]
+    fn game_play_action_params_deserializes_with_source() {
+        let json = r#"{"actionId": "raise_100", "source": "exact"}"#;
+        let params: GamePlayActionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.action_id, "raise_100");
+        assert_eq!(params.source.as_deref(), Some("exact"));
+    }
+
+    #[test]
+    fn game_play_action_params_deserializes_without_source() {
+        let json = r#"{"actionId": "fold"}"#;
+        let params: GamePlayActionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.action_id, "fold");
+        assert!(params.source.is_none());
+    }
+
+    #[test]
+    fn game_back_params_deserializes_with_source() {
+        let json = r#"{"source": "blueprint"}"#;
+        let params: GameBackParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.source.as_deref(), Some("blueprint"));
+    }
+
+    #[test]
+    fn game_back_params_deserializes_empty_body() {
+        let json = r#"{}"#;
+        let params: GameBackParams = serde_json::from_str(json).unwrap();
+        assert!(params.source.is_none());
+    }
+
+    #[test]
+    fn game_solve_params_includes_mode() {
+        let json = r#"{"mode": "exact"}"#;
+        let params: GameSolveParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.mode.as_deref(), Some("exact"));
+        assert!(params.max_iterations.is_none());
+    }
+
+    #[test]
+    fn game_play_action_params_camel_case() {
+        let json = r#"{"actionId": "call", "source": "subgame"}"#;
+        let params: GamePlayActionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.action_id, "call");
+        assert_eq!(params.source.as_deref(), Some("subgame"));
+    }
 }
