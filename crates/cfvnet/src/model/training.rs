@@ -131,16 +131,12 @@ fn cosine_lr(lr_max: f64, lr_min: f64, step: usize, total_steps: usize) -> f64 {
 /// Compute average validation loss from a small set of records.
 fn compute_val_loss<B: AutodiffBackend>(
     model: &CfvNet<B>,
-    encoded: &PreEncoded,
+    val_tensors: &DeviceTensors<B::InnerBackend>,
+    n: usize,
     config: &TrainConfig,
-    device: &B::Device,
 ) -> f64 {
     let valid_model = model.valid();
-    let n = encoded.len;
     let batch_size = config.batch_size;
-
-    // Create full validation tensors on the inner (non-autodiff) backend.
-    let tensors = encoded.to_device_tensors::<B::InnerBackend>(device);
 
     let mut total_loss = 0.0_f64;
     let mut batch_count = 0_u64;
@@ -149,11 +145,11 @@ fn compute_val_loss<B: AutodiffBackend>(
         let batch_end = (batch_start + batch_size).min(n);
         let len = batch_end - batch_start;
 
-        let b_input = tensors.input.clone().narrow(0, batch_start, len);
-        let b_target = tensors.target.clone().narrow(0, batch_start, len);
-        let b_mask = tensors.mask.clone().narrow(0, batch_start, len);
-        let b_range = tensors.range.clone().narrow(0, batch_start, len);
-        let b_gv = tensors.game_value.clone().narrow(0, batch_start, len);
+        let b_input = val_tensors.input.clone().narrow(0, batch_start, len);
+        let b_target = val_tensors.target.clone().narrow(0, batch_start, len);
+        let b_mask = val_tensors.mask.clone().narrow(0, batch_start, len);
+        let b_range = val_tensors.range.clone().narrow(0, batch_start, len);
+        let b_gv = val_tensors.game_value.clone().narrow(0, batch_start, len);
 
         let pred = valid_model.forward(b_input);
         let loss = cfvnet_loss(pred, b_target, b_mask, b_range, b_gv, config.huber_delta, config.aux_loss_weight);
@@ -566,6 +562,13 @@ pub fn train<B: AutodiffBackend>(
         .min(total_records);
     let val_encoded = load_validation_set(&files, val_count);
 
+    // Pre-upload validation tensors to GPU once (avoids per-epoch re-upload leak).
+    let val_on_device = val_encoded.as_ref().map(|enc| {
+        let tensors = enc.to_device_tensors::<B::InnerBackend>(device);
+        let n = enc.len;
+        (tensors, n)
+    });
+
     // Compute training schedule.
     let train_records = total_records - val_count;
     let batch_size = config.batch_size;
@@ -665,8 +668,8 @@ pub fn train<B: AutodiffBackend>(
         );
 
         // Validation loss at epoch boundary.
-        if let Some(ref val_enc) = val_encoded {
-            let val_loss = compute_val_loss(&model, val_enc, config, device);
+        if let Some((ref val_tensors, val_n)) = val_on_device {
+            let val_loss = compute_val_loss(&model, val_tensors, val_n, config);
             summary.push_str(&format!(" val={val_loss:.6}"));
         }
 
