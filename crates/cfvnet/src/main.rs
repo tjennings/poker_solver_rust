@@ -1090,6 +1090,15 @@ fn cmd_datagen_eval(data: PathBuf) {
 
     let mut pots = Vec::new();
     let mut stacks = Vec::new();
+    let mut game_values = Vec::new();
+    let mut cfv_mins = Vec::new();
+    let mut cfv_maxs = Vec::new();
+    let mut cfv_abs_maxs = Vec::new();
+    let mut total_stakes = Vec::new();
+    let mut norm_target_abs_maxs = Vec::new();
+    let mut card_max: u8 = 0;
+    let mut num_extreme_records = 0u64;
+    let mut extreme_examples: Vec<String> = Vec::new();
 
     for path in &paths {
         let file = std::fs::File::open(path).unwrap_or_else(|e| {
@@ -1097,11 +1106,64 @@ fn cmd_datagen_eval(data: PathBuf) {
             std::process::exit(1);
         });
         let mut reader = BufReader::new(file);
+        let mut rec_idx = 0u64;
         loop {
             match read_record(&mut reader) {
                 Ok(rec) => {
                     pots.push(rec.pot as f64);
                     stacks.push(rec.effective_stack as f64);
+                    game_values.push(rec.game_value as f64);
+
+                    // Track board card IDs
+                    for &c in &rec.board {
+                        if c > card_max { card_max = c; }
+                    }
+
+                    // CFV statistics (over valid entries only)
+                    let mut cfv_min = f64::INFINITY;
+                    let mut cfv_max = f64::NEG_INFINITY;
+                    for (i, &cfv) in rec.cfvs.iter().enumerate() {
+                        if rec.valid_mask[i] != 0 {
+                            let v = cfv as f64;
+                            if v < cfv_min { cfv_min = v; }
+                            if v > cfv_max { cfv_max = v; }
+                        }
+                    }
+                    if cfv_min.is_finite() {
+                        cfv_mins.push(cfv_min);
+                        cfv_maxs.push(cfv_max);
+                        cfv_abs_maxs.push(cfv_min.abs().max(cfv_max.abs()));
+                    }
+
+                    // Normalized target statistics (BoundaryNet encoding)
+                    let total_stake = rec.pot as f64 + rec.effective_stack as f64;
+                    total_stakes.push(total_stake);
+                    if total_stake > 0.0 {
+                        let pot_over_norm = rec.pot as f64 / total_stake;
+                        let mut norm_abs_max = 0.0_f64;
+                        for (i, &cfv) in rec.cfvs.iter().enumerate() {
+                            if rec.valid_mask[i] != 0 {
+                                let norm = (cfv as f64) * pot_over_norm;
+                                if norm.abs() > norm_abs_max { norm_abs_max = norm.abs(); }
+                            }
+                        }
+                        norm_target_abs_maxs.push(norm_abs_max);
+
+                        // Flag extreme records
+                        let norm_gv = (rec.game_value as f64 * pot_over_norm).abs();
+                        if norm_abs_max > 5.0 || norm_gv > 5.0 || total_stake < 1.0 {
+                            num_extreme_records += 1;
+                            if extreme_examples.len() < 10 {
+                                extreme_examples.push(format!(
+                                    "  file={} rec={}: pot={:.1} stack={:.1} total={:.1} gv={:.4} norm_gv={:.4} max_norm_cfv={:.4} board={:?}",
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                    rec_idx, rec.pot, rec.effective_stack, total_stake,
+                                    rec.game_value, norm_gv, norm_abs_max, rec.board
+                                ));
+                            }
+                        }
+                    }
+                    rec_idx += 1;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => {
@@ -1120,14 +1182,64 @@ fn cmd_datagen_eval(data: PathBuf) {
         return;
     }
 
+    // Summary statistics
+    println!("\nValue Statistics:");
+    print_stats("  pot", &pots);
+    print_stats("  effective_stack", &stacks);
+    print_stats("  total_stake (pot+stack)", &total_stakes);
+    print_stats("  game_value (pot-relative)", &game_values);
+    print_stats("  cfv_min (pot-relative)", &cfv_mins);
+    print_stats("  cfv_max (pot-relative)", &cfv_maxs);
+    print_stats("  |cfv|_max (pot-relative)", &cfv_abs_maxs);
+    print_stats("  |norm_target|_max (boundary)", &norm_target_abs_maxs);
+    println!("  max board card ID: {card_max} (expected < 52)");
+
+    // Extreme records
+    if num_extreme_records > 0 {
+        println!("\nExtreme Records ({num_extreme_records} total, |norm_cfv|>5 or |norm_gv|>5 or total_stake<1):");
+        for ex in &extreme_examples {
+            println!("{ex}");
+        }
+        if num_extreme_records > 10 {
+            println!("  ... and {} more", num_extreme_records - 10);
+        }
+    } else {
+        println!("\nNo extreme records found.");
+    }
+
     print_raw_frequency_histogram("Frequency by Stack Size", &stacks);
     print_raw_frequency_histogram("Frequency by Pot Size", &pots);
+    print_raw_frequency_histogram("Frequency by Game Value", &game_values);
+    print_raw_frequency_histogram("Frequency by |CFV|_max", &cfv_abs_maxs);
+    print_raw_frequency_histogram("Frequency by |Normalized Target|_max", &norm_target_abs_maxs);
 
     let sprs: Vec<f64> = pots.iter().zip(&stacks)
         .filter(|(p, _)| **p > 0.0)
         .map(|(p, s)| *s / *p)
         .collect();
     print_spr_frequency_histogram("Frequency by SPR", &sprs);
+}
+
+fn print_stats(label: &str, values: &[f64]) {
+    if values.is_empty() {
+        println!("{label}: no data");
+        return;
+    }
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let sum: f64 = values.iter().sum();
+    let mean = sum / values.len() as f64;
+
+    // Percentiles via sorted copy (only if reasonable size, else sample)
+    let (p1, p50, p99) = if values.len() <= 20_000_000 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p = |frac: f64| sorted[(frac * (sorted.len() - 1) as f64) as usize];
+        (p(0.01), p(0.5), p(0.99))
+    } else {
+        (f64::NAN, f64::NAN, f64::NAN)
+    };
+    println!("{label}: min={min:.4} p1={p1:.4} median={p50:.4} mean={mean:.4} p99={p99:.4} max={max:.4} (n={})", values.len());
 }
 
 fn print_raw_frequency_histogram(title: &str, values: &[f64]) {

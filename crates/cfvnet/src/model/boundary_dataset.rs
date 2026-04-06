@@ -57,7 +57,9 @@ pub fn encode_boundary_record(rec: &TrainingRecord) -> BoundaryItem {
         rec.ip_range.to_vec()
     };
 
-    let game_value = rec.game_value * pot_over_norm;
+    // game_value = sum(range[i] * target[i]) — recompute from normalized targets
+    // rather than scaling raw game_value (which is a weighted sum, not a single value).
+    let game_value: f32 = range.iter().zip(target.iter()).map(|(&r, &t)| r * t).sum();
 
     BoundaryItem {
         input,
@@ -138,10 +140,12 @@ mod tests {
     fn encode_normalizes_game_value() {
         let rec = sample_record();
         let item = encode_boundary_record(&rec);
-        // game_value=0.05 (pot-relative), chip_gv = 0.05 * 100 = 5
-        // normalized = 5 / 250 = 0.02
+        // game_value = sum(range[i] * target[i])
+        // range = oop_range = [0.5, 0.5, 0, ...]
+        // target[0] = 0.3 * 100/250 = 0.12, target[1] = 0 * 100/250 = 0
+        // game_value = 0.5 * 0.12 + 0.5 * 0.0 = 0.06
         assert!(
-            (item.game_value - 0.02).abs() < 1e-6,
+            (item.game_value - 0.06).abs() < 1e-6,
             "game_value: {}",
             item.game_value
         );
