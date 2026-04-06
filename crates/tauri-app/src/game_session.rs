@@ -1092,6 +1092,9 @@ fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
 }
 
 /// Build a `PostFlopGame` from session state, ready for solving.
+///
+/// When `exact` is true, `depth_limit` is set to `None` so the game tree
+/// extends through all remaining streets to showdown (no boundary nodes).
 #[allow(clippy::too_many_arguments)]
 fn build_solve_game(
     board: &[String],
@@ -1100,6 +1103,7 @@ fn build_solve_game(
     pot: i32,
     effective_stack: i32,
     bet_sizes: &[Vec<f64>],
+    exact: bool,
 ) -> Result<PostFlopGame, String> {
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::CardConfig;
@@ -1139,9 +1143,10 @@ fn build_solve_game(
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
-        // Solve current street only. Boundaries at next street transition.
-        // River: no boundaries needed (solve to showdown).
-        depth_limit: if initial_state == range_solver::BoardState::River { None } else { Some(0) },
+        // Exact mode: solve through all streets to showdown (no boundaries).
+        // Subgame mode: solve current street only, with boundaries at next street transition.
+        // River: no boundaries needed in either mode (already at showdown).
+        depth_limit: if exact || initial_state == range_solver::BoardState::River { None } else { Some(0) },
     };
 
     let action_tree =
@@ -1675,6 +1680,7 @@ pub fn game_solve_core(
     rollout_opponent_samples: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
+    let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
 
     // Guard: reject if this mode is already solving
@@ -1794,7 +1800,7 @@ pub fn game_solve_core(
     let board_clone = board.clone();
     std::thread::spawn(move || {
         // Build game
-        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes) {
+        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes, is_exact) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("[solve] failed to build game: {e}");
@@ -1815,9 +1821,10 @@ pub fn game_solve_core(
             *ss_clone.solve_actions.write() = actions;
         }
 
-        // Set up lazy boundary evaluator if boundaries exist
+        // Set up lazy boundary evaluator if boundaries exist.
+        // Exact mode has no boundaries (depth_limit=None), so this block is skipped.
         let n_boundaries = game.num_boundary_nodes();
-        if n_boundaries > 0 {
+        if n_boundaries > 0 && !is_exact {
             let board_cards: Vec<rs_poker::core::Card> = board_clone
                 .iter()
                 .filter_map(|s| parse_rs_poker_card(s).ok())
@@ -2914,6 +2921,32 @@ mod tests {
         // Should have allin at minimum
         assert!(bet_str.contains('a'));
         assert!(raise_str.contains('a'));
+    }
+
+    // -------------------------------------------------------------------
+    // build_solve_game exact mode tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_solve_game_default_has_boundary_nodes_for_flop() {
+        // Default (subgame) mode: flop solve has depth_limit=Some(0), producing boundary nodes
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false).unwrap();
+        // Flop solve with depth_limit=Some(0) should have boundary nodes
+        assert!(game.num_boundary_nodes() > 0);
+    }
+
+    #[test]
+    fn build_solve_game_exact_has_no_boundary_nodes_for_flop() {
+        // Exact mode: flop solve has depth_limit=None, no boundary nodes
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true).unwrap();
+        // Exact solve with depth_limit=None should have no boundary nodes
+        assert_eq!(game.num_boundary_nodes(), 0);
     }
 
     // -------------------------------------------------------------------
