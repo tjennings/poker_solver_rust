@@ -389,16 +389,47 @@ fn load_or_create_model<B: AutodiffBackend>(
     (model, 0)
 }
 
-/// Load validation records and return them pre-encoded.
+/// Load validation records sampled uniformly across all files.
+///
+/// Takes the first `per_file` records from each file (round-robin) until
+/// `val_count` records are collected. This ensures the val set spans the
+/// full pot/SPR distribution rather than being biased toward the first files.
 fn load_validation_set(files: &[PathBuf], val_count: usize) -> Option<PreEncoded> {
-    if val_count == 0 {
+    if val_count == 0 || files.is_empty() {
         return None;
     }
-    eprintln!("Loading {val_count} validation records...");
-    let mut val_reader = StreamingReader::new(files.to_vec());
-    let val_records = val_reader.read_chunk(val_count);
+    eprintln!("Loading {val_count} validation records (sampled across {} files)...", files.len());
+
+    let per_file = (val_count / files.len()).max(1);
+    let mut val_records = Vec::with_capacity(val_count);
+
+    for path in files {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Warning: skipping val file {}: {e}", path.display());
+                continue;
+            }
+        };
+        let mut reader = BufReader::new(file);
+        for _ in 0..per_file {
+            match read_record(&mut reader) {
+                Ok(rec) => {
+                    val_records.push(rec);
+                    if val_records.len() >= val_count {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if val_records.len() >= val_count {
+            break;
+        }
+    }
+
     let actual_val = val_records.len();
-    eprintln!("Loaded {actual_val} validation records");
+    eprintln!("Loaded {actual_val} validation records from {} files ({per_file} per file)", actual_val.min(files.len()));
     Some(PreEncoded::from_records(&val_records))
 }
 
@@ -426,11 +457,9 @@ fn spawn_dataloader_thread(
         let mut files = reader_files;
         let mut epoch = 0u64;
 
-        // Initial fill: read past validation records and fill the shuffle buffer once.
+        // Initial fill: fill the shuffle buffer. Val records are now sampled
+        // across all files (a few from each), so no need to skip a contiguous block.
         let mut reader = StreamingReader::new(files.clone());
-        if val_count > 0 {
-            let _ = reader.read_chunk(val_count);
-        }
 
         let mut buffer = reader.read_chunk(shuffle_buffer_size);
         if buffer.is_empty() {
@@ -466,9 +495,6 @@ fn spawn_dataloader_thread(
             rng = ChaCha8Rng::seed_from_u64(42 + epoch);
             files.shuffle(&mut rng);
             reader = StreamingReader::new(files.clone());
-            if val_count > 0 {
-                let _ = reader.read_chunk(val_count);
-            }
         }
     });
 
