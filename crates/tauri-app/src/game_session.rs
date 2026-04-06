@@ -1646,6 +1646,7 @@ pub fn game_back_core(session_state: &GameSessionState) -> Result<GameState, Str
 #[allow(clippy::too_many_arguments)]
 pub fn game_solve_core(
     session_state: &GameSessionState,
+    mode: Option<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
     leaf_eval_interval: Option<u32>,
@@ -1654,8 +1655,10 @@ pub fn game_solve_core(
     rollout_opponent_samples: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
-    // Guard: reject if already solving
-    if session_state.subgame_solve.solving.load(Ordering::Relaxed) {
+    let ss_ref = session_state.solve_for(&mode);
+
+    // Guard: reject if this mode is already solving
+    if ss_ref.solving.load(Ordering::Relaxed) {
         return Err("A solve is already in progress".to_string());
     }
 
@@ -1755,7 +1758,7 @@ pub fn game_solve_core(
     let _target_exp = target_exploitability.unwrap_or(3.0);
 
     // Reset solve state atomics
-    let ss = &session_state.subgame_solve;
+    let ss = ss_ref;
     ss.iteration.store(0, Ordering::Relaxed);
     ss.max_iterations.store(max_iters, Ordering::Relaxed);
     ss.exploitability_bits
@@ -1767,7 +1770,7 @@ pub fn game_solve_core(
     *ss.solve_position.write() = position_label;
 
     // Spawn background thread
-    let ss_clone = Arc::clone(&session_state.subgame_solve);
+    let ss_clone = Arc::clone(ss_ref);
     let board_clone = board.clone();
     std::thread::spawn(move || {
         // Build game
@@ -2096,6 +2099,7 @@ pub fn game_back(
 #[tauri::command]
 pub fn game_solve(
     session_state: tauri::State<'_, GameSessionState>,
+    mode: Option<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
     leaf_eval_interval: Option<u32>,
@@ -2106,6 +2110,7 @@ pub fn game_solve(
 ) -> Result<(), String> {
     game_solve_core(
         &session_state,
+        mode,
         max_iterations,
         target_exploitability,
         leaf_eval_interval,
@@ -2116,9 +2121,9 @@ pub fn game_solve(
     )
 }
 
-pub fn game_cancel_solve_core(session_state: &GameSessionState) -> Result<(), String> {
+pub fn game_cancel_solve_core(session_state: &GameSessionState, mode: Option<String>) -> Result<(), String> {
     session_state
-        .subgame_solve
+        .solve_for(&mode)
         .cancel
         .store(true, Ordering::Relaxed);
     Ok(())
@@ -2127,8 +2132,9 @@ pub fn game_cancel_solve_core(session_state: &GameSessionState) -> Result<(), St
 #[tauri::command]
 pub fn game_cancel_solve(
     session_state: tauri::State<'_, GameSessionState>,
+    mode: Option<String>,
 ) -> Result<(), String> {
-    game_cancel_solve_core(&session_state)
+    game_cancel_solve_core(&session_state, mode)
 }
 
 /// Encode the current game state as a human-readable spot string.
@@ -2701,21 +2707,51 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
 
     #[test]
-    fn game_solve_core_rejects_double_solve() {
+    fn game_solve_core_rejects_double_solve_same_mode() {
         let gss = GameSessionState::default();
         let session = make_decision_session();
         *gss.session.write() = Some(session);
         gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None);
+        // Default mode (subgame) should reject when subgame is already solving
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
+    }
+
+    #[test]
+    fn game_solve_core_rejects_double_solve_exact_mode() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+        gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Exact mode should reject when exact is already solving
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already in progress"));
+    }
+
+    #[test]
+    fn game_solve_core_allows_different_mode_concurrent() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+        // Subgame is already solving
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Exact mode should NOT be rejected (different mode)
+        // It will still fail because it's a preflop node, but the error
+        // should NOT be "already in progress"
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None);
+        assert!(result.is_err());
+        assert!(!result.unwrap_err().contains("already in progress"));
     }
 
     // -------------------------------------------------------------------
@@ -2723,11 +2759,23 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn cancel_solve_sets_cancel_flag() {
+    fn cancel_solve_sets_cancel_flag_subgame() {
         let gss = GameSessionState::default();
         assert!(!gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
-        game_cancel_solve_core(&gss).unwrap();
+        game_cancel_solve_core(&gss, None).unwrap();
         assert!(gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        // exact_solve should be unaffected
+        assert!(!gss.exact_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancel_solve_sets_cancel_flag_exact() {
+        let gss = GameSessionState::default();
+        assert!(!gss.exact_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        game_cancel_solve_core(&gss, Some("exact".to_string())).unwrap();
+        assert!(gss.exact_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        // subgame_solve should be unaffected
+        assert!(!gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // -------------------------------------------------------------------

@@ -147,6 +147,7 @@ struct GameDealCardParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GameSolveParams {
+    mode: Option<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
     leaf_eval_interval: Option<u32>,
@@ -630,6 +631,7 @@ async fn handle_game_solve(
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     result_to_response(poker_solver_tauri::game_solve_core(
         &session_state,
+        params.mode,
         params.max_iterations,
         params.target_exploitability,
         params.leaf_eval_interval,
@@ -643,7 +645,7 @@ async fn handle_game_solve(
 async fn handle_game_cancel_solve(
     Extension(session_state): Extension<Arc<GameSessionState>>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state))
+    result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state, None))
 }
 
 async fn handle_game_encode_spot(
