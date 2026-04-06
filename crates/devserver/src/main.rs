@@ -596,7 +596,7 @@ async fn handle_game_new(
 async fn handle_game_get_state(
     Extension(session_state): Extension<Arc<GameSessionState>>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_get_state_core(&session_state))
+    result_to_response(poker_solver_tauri::game_get_state_core(&session_state, None))
 }
 
 async fn handle_game_play_action(
@@ -606,6 +606,7 @@ async fn handle_game_play_action(
     result_to_response(poker_solver_tauri::game_play_action_core(
         &session_state,
         &params.action_id,
+        None,
     ))
 }
 
@@ -622,7 +623,7 @@ async fn handle_game_deal_card(
 async fn handle_game_back(
     Extension(session_state): Extension<Arc<GameSessionState>>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_back_core(&session_state))
+    result_to_response(poker_solver_tauri::game_back_core(&session_state, None))
 }
 
 async fn handle_game_solve(

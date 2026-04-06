@@ -1481,13 +1481,22 @@ pub fn game_new_core(
 }
 
 /// Get the current game state, including solve progress if active.
-pub fn game_get_state_core(session_state: &GameSessionState) -> Result<GameState, String> {
+///
+/// `source` controls which strategy data is returned:
+/// - `None` or `"blueprint"`: return blueprint data only, skip solve overlay.
+/// - `"subgame"`: overlay from `subgame_solve`.
+/// - `"exact"`: overlay from `exact_solve`.
+pub fn game_get_state_core(session_state: &GameSessionState, source: Option<String>) -> Result<GameState, String> {
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
     let mut state = session.get_state();
 
-    // Override with solve state if active or just completed
-    let ss = &session_state.subgame_solve;
+    // Blueprint source: return raw blueprint data, no solve overlay
+    let ss = match source.as_deref() {
+        Some("subgame") => &session_state.subgame_solve,
+        Some("exact") => &session_state.exact_solve,
+        _ => return Ok(state),
+    };
     let is_solving = ss.solving.load(Ordering::Relaxed);
     let iteration = ss.iteration.load(Ordering::Relaxed);
 
@@ -1539,11 +1548,17 @@ pub fn game_get_state_core(session_state: &GameSessionState) -> Result<GameState
 ///
 /// If navigating within a solved subgame tree, serves the cached matrix
 /// instead of resetting the solve state.
+///
+/// `source` selects which solve cache to navigate within.
 pub fn game_play_action_core(
     session_state: &GameSessionState,
     action_id: &str,
+    source: Option<String>,
 ) -> Result<GameState, String> {
-    let ss = &session_state.subgame_solve;
+    let ss = match source.as_deref() {
+        Some("exact") => &session_state.exact_solve,
+        _ => &session_state.subgame_solve,
+    };
     let cache = ss.solve_cache.read();
 
     if !cache.is_empty() {
@@ -1606,14 +1621,19 @@ pub fn game_deal_card_core(
 /// If within a solved subgame tree, pops the last action from the solve path
 /// and serves the parent's cached matrix. If at the solve root, resets the
 /// solve state entirely.
-pub fn game_back_core(session_state: &GameSessionState) -> Result<GameState, String> {
+///
+/// `source` selects which solve cache to navigate within.
+pub fn game_back_core(session_state: &GameSessionState, source: Option<String>) -> Result<GameState, String> {
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.back()?;
     let mut state = session.get_state();
     drop(guard);
 
-    let ss = &session_state.subgame_solve;
+    let ss = match source.as_deref() {
+        Some("exact") => &session_state.exact_solve,
+        _ => &session_state.subgame_solve,
+    };
     let cache = ss.solve_cache.read();
 
     if !cache.is_empty() {
@@ -2065,16 +2085,18 @@ pub fn game_new(
 #[tauri::command]
 pub fn game_get_state(
     session_state: tauri::State<'_, GameSessionState>,
+    source: Option<String>,
 ) -> Result<GameState, String> {
-    game_get_state_core(&session_state)
+    game_get_state_core(&session_state, source)
 }
 
 #[tauri::command]
 pub fn game_play_action(
     session_state: tauri::State<'_, GameSessionState>,
     action_id: String,
+    source: Option<String>,
 ) -> Result<GameState, String> {
-    game_play_action_core(&session_state, &action_id)
+    game_play_action_core(&session_state, &action_id, source)
 }
 
 #[tauri::command]
@@ -2091,8 +2113,9 @@ pub fn game_deal_card(
 #[tauri::command]
 pub fn game_back(
     session_state: tauri::State<'_, GameSessionState>,
+    source: Option<String>,
 ) -> Result<GameState, String> {
-    game_back_core(&session_state)
+    game_back_core(&session_state, source)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2611,13 +2634,33 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // get_state reads solve progress
+    // get_state reads solve progress (source-aware)
     // -------------------------------------------------------------------
 
     #[test]
-    fn get_state_core_returns_solve_status_when_solving() {
+    fn get_state_core_blueprint_source_skips_solve_overlay() {
         let gss = GameSessionState::default();
-        // Set up a session
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        // Simulate active solve on subgame
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(50, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
+
+        // source=None means blueprint, should skip solve overlay
+        let state = game_get_state_core(&gss, None).unwrap();
+        assert!(state.solve.is_none());
+
+        // source="blueprint" also skips solve overlay
+        let state = game_get_state_core(&gss, Some("blueprint".to_string())).unwrap();
+        assert!(state.solve.is_none());
+    }
+
+    #[test]
+    fn get_state_core_subgame_source_returns_solve_status() {
+        let gss = GameSessionState::default();
         let session = make_decision_session();
         *gss.session.write() = Some(session);
 
@@ -2628,13 +2671,32 @@ mod tests {
         gss.subgame_solve.exploitability_bits.store(5.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
-        let state = game_get_state_core(&gss).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
         let solve = state.solve.expect("solve should be Some");
         assert_eq!(solve.iteration, 50);
         assert_eq!(solve.max_iterations, 200);
         assert!((solve.exploitability - 5.0).abs() < 0.01);
         assert!(!solve.is_complete);
         assert_eq!(solve.solver_name, "range");
+    }
+
+    #[test]
+    fn get_state_core_exact_source_returns_exact_solve_status() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        // Simulate active solve on exact
+        gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve.iteration.store(75, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve.max_iterations.store(300, std::sync::atomic::Ordering::Relaxed);
+        *gss.exact_solve.solve_start.write() = Some(std::time::Instant::now());
+
+        // source="exact" should read from exact_solve
+        let state = game_get_state_core(&gss, Some("exact".to_string())).unwrap();
+        let solve = state.solve.expect("solve should be Some");
+        assert_eq!(solve.iteration, 75);
+        assert_eq!(solve.max_iterations, 300);
     }
 
     #[test]
@@ -2650,7 +2712,7 @@ mod tests {
         gss.subgame_solve.exploitability_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
-        let state = game_get_state_core(&gss).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
         let solve = state.solve.expect("solve should be Some after completion");
         assert!(solve.is_complete);
         assert_eq!(solve.iteration, 200);
@@ -2684,7 +2746,7 @@ mod tests {
         };
         *gss.subgame_solve.matrix_snapshot.write() = Some(dummy_matrix);
 
-        let state = game_get_state_core(&gss).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
         let matrix = state.matrix.expect("matrix should be overridden by solve snapshot");
         assert_eq!(matrix.cells[0][0].hand, "TEST");
     }
@@ -2696,7 +2758,7 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // No solve has been run - iteration is 0, not solving
-        let state = game_get_state_core(&gss).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
         assert!(state.solve.is_none());
     }
 
@@ -3651,7 +3713,8 @@ mod tests {
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action "1" (Call) which maps to cache path [1]
-        let state = game_play_action_core(&gss, "1").unwrap();
+        let source = Some("subgame".to_string());
+        let state = game_play_action_core(&gss, "1", source).unwrap();
         let matrix = state.matrix.expect("should have cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "CHILD");
         assert_eq!(state.position, "SB");
@@ -3671,7 +3734,8 @@ mod tests {
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action "1" (Call) -- path [1] not in cache, should reset
-        let _state = game_play_action_core(&gss, "1").unwrap();
+        let source = Some("subgame".to_string());
+        let _state = game_play_action_core(&gss, "1", source).unwrap();
         // Cache should be cleared
         assert!(gss.subgame_solve.solve_cache.read().is_empty());
         assert!(gss.subgame_solve.solve_path.read().is_empty());
@@ -3693,11 +3757,12 @@ mod tests {
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action to get to child (within solved tree)
-        let _ = game_play_action_core(&gss, "1").unwrap();
+        let source = Some("subgame".to_string());
+        let _ = game_play_action_core(&gss, "1", source).unwrap();
         assert_eq!(*gss.subgame_solve.solve_path.read(), vec![1]);
 
         // Now go back -- should serve root cached matrix
-        let state = game_back_core(&gss).unwrap();
+        let state = game_back_core(&gss, Some("subgame".to_string())).unwrap();
         let matrix = state.matrix.expect("should have root cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "ROOT");
         assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
@@ -3727,7 +3792,7 @@ mod tests {
         // Path is empty (at solve root)
 
         // Go back -- should clear cache (navigating before solve root)
-        let _state = game_back_core(&gss).unwrap();
+        let _state = game_back_core(&gss, Some("subgame".to_string())).unwrap();
         // Cache should be cleared since we went before the solve root
         assert!(gss.subgame_solve.solve_cache.read().is_empty());
     }
@@ -3750,13 +3815,13 @@ mod tests {
         gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
 
         // At solve root (empty path), should serve root cache
-        let state = game_get_state_core(&gss).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
         let matrix = state.matrix.expect("should have cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "CACHE_ROOT");
 
         // Navigate to child path
         *gss.subgame_solve.solve_path.write() = vec![1];
-        let state = game_get_state_core(&gss).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
         let matrix = state.matrix.expect("should have child cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "CACHE_CHILD");
     }
