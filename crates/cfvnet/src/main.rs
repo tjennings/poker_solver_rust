@@ -795,12 +795,9 @@ fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
     });
     let mut reader = std::io::BufReader::new(file);
 
-    let mut total_mae = 0.0_f64;
-    let mut count = 0_u64;
-
-    // SPR buckets: <1, 1-3, 3-10, 10+
-    let mut spr_mae = [0.0_f64; 4];
-    let mut spr_count = [0_u64; 4];
+    // Collect per-record MAE and per-SPR-bucket MAE values.
+    let mut all_maes = Vec::new();
+    let mut spr_maes: [Vec<f64>; 4] = [vec![], vec![], vec![], vec![]];
 
     while let Ok(rec) = read_record(&mut reader) {
         let item = encode_boundary_record(&rec);
@@ -814,10 +811,8 @@ fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
         let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
 
         let mae = compute_normalized_mae(&pred_vec, &item.target, &mask);
-        total_mae += mae;
-        count += 1;
+        all_maes.push(mae);
 
-        // SPR bucket
         let spr = if rec.pot > 0.0 {
             rec.effective_stack as f64 / rec.pot as f64
         } else {
@@ -832,33 +827,42 @@ fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
         } else {
             3
         };
-        spr_mae[bucket] += mae;
-        spr_count[bucket] += 1;
+        spr_maes[bucket].push(mae);
     }
 
-    if count == 0 {
+    if all_maes.is_empty() {
         println!("No records to evaluate.");
         return;
     }
 
-    let n = count as f64;
-    println!("Results ({count} records):");
-    println!("  Normalized MAE: {:.6}", total_mae / n);
+    println!("Results ({} records):", all_maes.len());
+    print_error_stats("  Overall", &mut all_maes);
 
     let bucket_labels = ["<1", "1-3", "3-10", "10+"];
     println!("\nMAE by SPR bucket:");
     for (i, label) in bucket_labels.iter().enumerate() {
-        if spr_count[i] > 0 {
-            println!(
-                "  SPR {:<5}: {:.6}  ({} records)",
-                label,
-                spr_mae[i] / spr_count[i] as f64,
-                spr_count[i]
-            );
-        } else {
+        if spr_maes[i].is_empty() {
             println!("  SPR {:<5}: N/A     (0 records)", label);
+        } else {
+            print_error_stats(&format!("  SPR {:<5}", label), &mut spr_maes[i]);
         }
     }
+}
+
+fn print_error_stats(label: &str, values: &mut [f64]) {
+    let n = values.len();
+    let mean: f64 = values.iter().sum::<f64>() / n as f64;
+    let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let std_dev = variance.sqrt();
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p = |frac: f64| values[(frac * (n - 1) as f64) as usize];
+
+    println!(
+        "{}: mean={:.6} std={:.4} p50={:.4} p90={:.4} p95={:.4} p99={:.4} max={:.4}  ({n} records)",
+        label, mean, std_dev, p(0.5), p(0.9), p(0.95), p(0.99),
+        values.last().unwrap_or(&0.0)
+    );
 }
 
 fn cmd_compare_boundary(model_dir: &std::path::Path, data_path: &std::path::Path, num_positions: usize) {
