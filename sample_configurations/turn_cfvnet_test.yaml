@@ -21,12 +21,12 @@ game:
   bet_sizes:
     - ["33%", "75%", "a"]     # first bet: 3 sizes
     - ["75%", "a"]             # raises: 2 sizes
-  board_size: 4
-  river_model_path: "local_data/models/river_v6/model"
+  board_size: 5
+  #river_model_path: "local_data/models/river_v6/model"
 
 datagen:
   street: "turn"
-  mode: "exact"
+  mode: "domain"
   blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
   river_output: "local_data/cfvnet/river/exact_v1"
   turn_output: "local_data/cfvnet/turn/exact_v1"
