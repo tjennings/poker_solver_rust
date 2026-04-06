@@ -571,6 +571,7 @@ pub fn build_subgame_solver(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    neural_boundary_evaluator: Option<Arc<dyn range_solver::game::BoundaryEvaluator>>,
 ) -> Result<(PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64), String> {
     use range_solver::card::CardConfig;
     use range_solver::{ActionTree, TreeConfig, BoardState};
@@ -663,10 +664,14 @@ pub fn build_subgame_solver(
         .map(|(i, a)| range_solver_action_to_action_info(a, i))
         .collect();
 
-    // Set up BoundaryEvaluator if boundaries exist and CBV context is available.
+    // Set up BoundaryEvaluator if boundaries exist.
+    // Neural evaluator is preferred when available (much faster than rollout).
     let n_boundaries = game.num_boundary_nodes();
     if n_boundaries > 0 {
-        if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
+        if let Some(neural_eval) = neural_boundary_evaluator {
+            eprintln!("[subgame] using NeuralBoundaryEvaluator ({n_boundaries} boundary nodes)");
+            game.boundary_evaluator = Some(neural_eval);
+        } else if let (Some(ctx), Some(abs_node)) = (cbv_context, abstract_node_idx) {
             let bias_factor = rollout_bias_factor.unwrap_or(10.0);
             let num_rollouts = rollout_num_samples.unwrap_or(3);
             let opp_samples = rollout_opponent_samples.unwrap_or(8);
@@ -901,6 +906,9 @@ pub struct PostflopState {
     /// Loaded from the blueprint bundle. If present, subgame solver
     /// uses CBVs at depth boundaries instead of raw equity.
     pub cbv_context: RwLock<Option<Arc<CbvContext>>>,
+    /// Path to a trained BoundaryNet model directory. When set, the solver
+    /// uses a neural boundary evaluator instead of rollout-based evaluation.
+    pub boundary_model_path: RwLock<Option<PathBuf>>,
 }
 
 impl Default for PostflopState {
@@ -921,6 +929,7 @@ impl Default for PostflopState {
             subgame_result: RwLock::new(None),
             subgame_node: AtomicU32::new(0),
             cbv_context: RwLock::new(None),
+            boundary_model_path: RwLock::new(None),
         }
     }
 }
@@ -1341,6 +1350,7 @@ fn solve_depth_limited(
 
     let shared = Arc::clone(state);
     let board_strings = board;
+    let boundary_model = state.boundary_model_path.read().clone();
     std::thread::spawn(move || {
         match build_subgame_solver(
             &board_cards,
@@ -1355,8 +1365,32 @@ fn solve_depth_limited(
             rollout_bias_factor,
             rollout_num_samples,
             rollout_opponent_samples,
+            None, // neural boundary evaluator (constructed below if model path set)
         ) {
             Ok((mut game, hands, action_infos, initial_pot, starting_stack)) => {
+                // If a boundary model path is configured, load it and override
+                // any rollout-based boundary evaluator with the neural evaluator.
+                if let Some(ref model_path) = boundary_model {
+                    let board_ids: Vec<u8> = board_cards.iter().map(|c|
+                        poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id(*c)
+                    ).collect();
+                    match cfvnet::eval::boundary_evaluator::load_neural_boundary_evaluator(
+                        model_path,
+                        board_ids,
+                        [
+                            game.private_cards(0).to_vec(),
+                            game.private_cards(1).to_vec(),
+                        ],
+                    ) {
+                        Ok(evaluator) => {
+                            eprintln!("[subgame] loaded NeuralBoundaryEvaluator from {}", model_path.display());
+                            game.boundary_evaluator = Some(Arc::new(evaluator));
+                        }
+                        Err(e) => {
+                            eprintln!("[subgame] failed to load boundary model: {e} — falling back to rollout");
+                        }
+                    }
+                }
                 // Seed solver with blueprint strategy if available.
                 eprintln!("[seed] cbv_context={}, abstract_node_idx={:?}", cbv_context.is_some(), abstract_node_idx);
                 if let (Some(ctx), Some(abs_node)) = (&cbv_context, abstract_node_idx) {
@@ -2417,7 +2451,7 @@ mod tests {
             0,
             None,
             None,
-            None, None, None,
+            None, None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
 
@@ -2481,7 +2515,7 @@ mod tests {
             0,
             None,
             None,
-            None, None, None,
+            None, None, None, None,
         );
         assert!(result.is_ok());
 
@@ -2591,6 +2625,7 @@ mod tests {
             Some(5.0),  // rollout_bias_factor
             Some(5),     // rollout_num_samples
             Some(12),    // rollout_opponent_samples
+            None,
         );
         assert!(result.is_ok(), "build_subgame_solver with rollout params failed: {:?}", result.err());
 
@@ -2627,6 +2662,7 @@ mod tests {
             None, // rollout_bias_factor
             None, // rollout_num_samples
             None, // rollout_opponent_samples
+            None,
         );
         assert!(result.is_ok(), "build_subgame_solver with None rollout params failed: {:?}", result.err());
         // Verify the tuple shape: (PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64)
@@ -2691,7 +2727,7 @@ mod tests {
 
         let (mut game, _hands, _actions, _pot, _stack) = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None,
         ).unwrap();
 
         // 2. Capture the initial (uniform) strategy at root.
@@ -2808,7 +2844,7 @@ mod tests {
 
         let (game, _, _, _, _) = build_subgame_solver(
             &board_cards, &bet_sizes, 80, [150, 150],
-            &oop_w, &ip_w, 0, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None,
         ).unwrap();
 
         // Build a trivial empty tree with just a terminal.
@@ -2825,5 +2861,84 @@ mod tests {
             &empty_tree, &board_cards,
             Street::River, empty_tree.root,
         );
+    }
+
+    #[test]
+    fn test_build_subgame_solver_with_neural_boundary_evaluator() {
+        use burn::backend::NdArray;
+        use cfvnet::model::boundary_net::BoundaryNet;
+        use cfvnet::eval::boundary_evaluator::NeuralBoundaryEvaluator;
+        use range_solver::interface::Game;
+
+        // Turn board (4 cards) -> creates depth boundaries for river.
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![vec![1.0f32]];
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        // Build the game first to get private_cards for the evaluator.
+        let (game_for_cards, _, _, _, _) = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None, None,
+        ).unwrap();
+
+        // Construct a fresh (untrained) BoundaryNet as a stand-in.
+        let device = Default::default();
+        let model = BoundaryNet::<NdArray>::new(&device, 2, 64);
+
+        let board_ids: Vec<u8> = board_cards.iter().map(|c|
+            poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id(*c)
+        ).collect();
+
+        let neural_eval: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(
+            NeuralBoundaryEvaluator::new(
+                model,
+                board_ids,
+                [
+                    game_for_cards.private_cards(0).to_vec(),
+                    game_for_cards.private_cards(1).to_vec(),
+                ],
+            ),
+        );
+
+        // Build again, this time passing the neural evaluator.
+        let result = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None,
+            Some(neural_eval),
+        );
+        assert!(result.is_ok(), "build_subgame_solver with neural evaluator failed: {:?}", result.err());
+
+        let (game, _, _, _, _) = result.unwrap();
+        // Turn board with depth_limit=0 should have boundary nodes.
+        assert!(game.num_boundary_nodes() > 0, "turn board should have boundary nodes");
+        // The boundary evaluator should be set (neural).
+        assert!(game.boundary_evaluator.is_some(), "boundary evaluator should be set");
+    }
+
+    #[test]
+    fn test_build_subgame_solver_none_neural_evaluator_unchanged() {
+        // Verify that passing None for neural evaluator doesn't change behavior.
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Heart),
+        ];
+        let bet_sizes = vec![vec![1.0f32]];
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        let result = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None, None,
+        );
+        assert!(result.is_ok(), "build_subgame_solver with None neural eval failed: {:?}", result.err());
     }
 }
