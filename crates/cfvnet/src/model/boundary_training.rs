@@ -411,9 +411,13 @@ fn spawn_dataloader_thread(
     let batch_size = config.batch_size;
     let shuffle_buffer_size = config.shuffle_buffer_size;
     let prefetch_depth = config.prefetch_depth;
+    let num_encoders = config.encoder_threads;
 
     let (record_tx, record_rx) = mpsc::sync_channel::<Vec<TrainingRecord>>(prefetch_depth * 2);
-    let (batch_tx, batch_rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
+    // Use a larger capacity for encoded batches to prevent encoder threads from
+    // blocking on send while holding the record_rx mutex idle. The GPU prefetch
+    // channel (gpu_tx) provides the real backpressure.
+    let (batch_tx, batch_rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth + num_encoders);
 
     let reader_files = files.to_vec();
     let reader_thread = std::thread::spawn(move || {
@@ -422,19 +426,21 @@ fn spawn_dataloader_thread(
         let mut files = reader_files;
         let mut epoch = 0u64;
 
+        // Initial fill: read past validation records and fill the shuffle buffer once.
+        let mut reader = StreamingReader::new(files.clone());
+        if val_count > 0 {
+            let _ = reader.read_chunk(val_count);
+        }
+
+        let mut buffer = reader.read_chunk(shuffle_buffer_size);
+        if buffer.is_empty() {
+            eprintln!("Warning: no training records found, stopping dataloader");
+            return;
+        }
+        buffer.shuffle(&mut rng);
+
         loop {
-            let mut reader = StreamingReader::new(files.clone());
-            if val_count > 0 {
-                let _ = reader.read_chunk(val_count);
-            }
-
-            let mut buffer = reader.read_chunk(shuffle_buffer_size);
-            if buffer.is_empty() {
-                eprintln!("Warning: no training records found, stopping dataloader");
-                return;
-            }
-            buffer.shuffle(&mut rng);
-
+            // Stream records through the shuffle buffer via eviction.
             let mut batch_buf = Vec::with_capacity(batch_size);
             while let Some(record) = reader.read_one() {
                 let idx = rng.gen_range(0..buffer.len());
@@ -449,16 +455,9 @@ fn spawn_dataloader_thread(
                 }
             }
 
-            buffer.shuffle(&mut rng);
-            for record in buffer.drain(..) {
-                batch_buf.push(record);
-                if batch_buf.len() == batch_size {
-                    if record_tx.send(batch_buf).is_err() {
-                        return;
-                    }
-                    batch_buf = Vec::with_capacity(batch_size);
-                }
-            }
+            // Epoch boundary: flush remaining partial batch, then start
+            // a new reader pass. The shuffle buffer carries over — no
+            // refill stall.
             if !batch_buf.is_empty() && record_tx.send(batch_buf).is_err() {
                 return;
             }
@@ -466,11 +465,14 @@ fn spawn_dataloader_thread(
             epoch += 1;
             rng = ChaCha8Rng::seed_from_u64(42 + epoch);
             files.shuffle(&mut rng);
+            reader = StreamingReader::new(files.clone());
+            if val_count > 0 {
+                let _ = reader.read_chunk(val_count);
+            }
         }
     });
 
     let record_rx = std::sync::Arc::new(std::sync::Mutex::new(record_rx));
-    let num_encoders = config.encoder_threads;
     let mut handles = vec![reader_thread];
     for _ in 0..num_encoders {
         let rx = record_rx.clone();

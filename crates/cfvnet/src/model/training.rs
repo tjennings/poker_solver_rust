@@ -432,11 +432,13 @@ fn spawn_dataloader_thread(
     let batch_size = config.batch_size;
     let shuffle_buffer_size = config.shuffle_buffer_size;
     let prefetch_depth = config.prefetch_depth;
+    let num_encoders = config.encoder_threads;
 
     // Stage 1 → Stage 2: un-encoded record batches.
     let (record_tx, record_rx) = mpsc::sync_channel::<Vec<TrainingRecord>>(prefetch_depth * 2);
-    // Stage 2 → Training loop: encoded batches.
-    let (batch_tx, batch_rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth);
+    // Stage 2 → Training loop: encoded batches. Capacity includes encoder thread
+    // count to prevent send-blocking while record_rx mutex sits idle.
+    let (batch_tx, batch_rx) = mpsc::sync_channel::<PreEncoded>(prefetch_depth + num_encoders);
 
     // Stage 1: Reader thread — streaming shuffle buffer with eviction.
     let reader_files = files.to_vec();
@@ -502,7 +504,6 @@ fn spawn_dataloader_thread(
     // channel, encode via rayon, and push to the batch channel. This keeps CPU
     // cores busy continuously instead of idling between sequential encode calls.
     let record_rx = std::sync::Arc::new(std::sync::Mutex::new(record_rx));
-    let num_encoders = config.encoder_threads;
     let mut handles = vec![reader_thread];
     for _ in 0..num_encoders {
         let rx = record_rx.clone();
