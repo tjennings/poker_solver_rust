@@ -81,6 +81,21 @@ pub fn compute_prediction_metrics(
     }
 }
 
+/// Compute mean absolute error on normalized (stake-relative) values.
+///
+/// Only counts entries where mask is true. Returns 0.0 if no valid entries.
+pub fn compute_normalized_mae(pred: &[f32], target: &[f32], mask: &[bool]) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut count = 0u64;
+    for i in 0..pred.len().min(target.len()) {
+        if mask.get(i).copied().unwrap_or(false) {
+            sum += (pred[i] as f64 - target[i] as f64).abs();
+            count += 1;
+        }
+    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +158,14 @@ mod tests {
         assert!(metrics.mae.abs() < 1e-10);
         assert!(metrics.max_error.abs() < 1e-10);
         assert!(metrics.mbb_error.abs() < 1e-10);
+    }
+
+    #[test]
+    fn normalized_mae_basic() {
+        let pred = vec![0.1, 0.2, 0.0];
+        let target = vec![0.12, 0.18, 0.0];
+        let mask = vec![true, true, false];
+        let mae = compute_normalized_mae(&pred, &target, &mask);
+        assert!((mae - 0.02).abs() < 1e-6);
     }
 }
