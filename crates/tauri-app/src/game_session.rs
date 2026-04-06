@@ -194,14 +194,27 @@ impl SolveState {
 /// Shared session state, accessible by Tauri commands.
 pub struct GameSessionState {
     pub session: RwLock<Option<GameSession>>,
-    pub solve_state: Arc<SolveState>,
+    pub subgame_solve: Arc<SolveState>,
+    pub exact_solve: Arc<SolveState>,
+}
+
+impl GameSessionState {
+    /// Return the `SolveState` for the given mode string.
+    /// `"exact"` -> `exact_solve`, anything else (including `None`) -> `subgame_solve`.
+    pub fn solve_for(&self, mode: &Option<String>) -> &Arc<SolveState> {
+        match mode.as_deref() {
+            Some("exact") => &self.exact_solve,
+            _ => &self.subgame_solve,
+        }
+    }
 }
 
 impl Default for GameSessionState {
     fn default() -> Self {
         Self {
             session: RwLock::new(None),
-            solve_state: Arc::new(SolveState::default()),
+            subgame_solve: Arc::new(SolveState::default()),
+            exact_solve: Arc::new(SolveState::default()),
         }
     }
 }
@@ -1462,7 +1475,8 @@ pub fn game_new_core(
     let cbv_ctx = postflop.cbv_context.read().clone();
     let session = GameSession::from_exploration_state(exploration, cbv_ctx)?;
     *session_state.session.write() = Some(session);
-    session_state.solve_state.reset();
+    session_state.subgame_solve.reset();
+    session_state.exact_solve.reset();
     Ok(())
 }
 
@@ -1473,7 +1487,7 @@ pub fn game_get_state_core(session_state: &GameSessionState) -> Result<GameState
     let mut state = session.get_state();
 
     // Override with solve state if active or just completed
-    let ss = &session_state.solve_state;
+    let ss = &session_state.subgame_solve;
     let is_solving = ss.solving.load(Ordering::Relaxed);
     let iteration = ss.iteration.load(Ordering::Relaxed);
 
@@ -1529,7 +1543,7 @@ pub fn game_play_action_core(
     session_state: &GameSessionState,
     action_id: &str,
 ) -> Result<GameState, String> {
-    let ss = &session_state.solve_state;
+    let ss = &session_state.subgame_solve;
     let cache = ss.solve_cache.read();
 
     if !cache.is_empty() {
@@ -1571,7 +1585,8 @@ pub fn game_play_action_core(
     session.play_action(action_id)?;
     let state = session.get_state();
     drop(guard);
-    session_state.solve_state.reset();
+    session_state.subgame_solve.reset();
+    session_state.exact_solve.reset();
     Ok(state)
 }
 
@@ -1598,7 +1613,7 @@ pub fn game_back_core(session_state: &GameSessionState) -> Result<GameState, Str
     let mut state = session.get_state();
     drop(guard);
 
-    let ss = &session_state.solve_state;
+    let ss = &session_state.subgame_solve;
     let cache = ss.solve_cache.read();
 
     if !cache.is_empty() {
@@ -1616,7 +1631,8 @@ pub fn game_back_core(session_state: &GameSessionState) -> Result<GameState, Str
         // At solve root and going back -- navigating before solve root, reset
         drop(path);
         drop(cache);
-        session_state.solve_state.reset();
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
     }
 
     Ok(state)
@@ -1639,7 +1655,7 @@ pub fn game_solve_core(
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     // Guard: reject if already solving
-    if session_state.solve_state.solving.load(Ordering::Relaxed) {
+    if session_state.subgame_solve.solving.load(Ordering::Relaxed) {
         return Err("A solve is already in progress".to_string());
     }
 
@@ -1739,7 +1755,7 @@ pub fn game_solve_core(
     let _target_exp = target_exploitability.unwrap_or(3.0);
 
     // Reset solve state atomics
-    let ss = &session_state.solve_state;
+    let ss = &session_state.subgame_solve;
     ss.iteration.store(0, Ordering::Relaxed);
     ss.max_iterations.store(max_iters, Ordering::Relaxed);
     ss.exploitability_bits
@@ -1751,7 +1767,7 @@ pub fn game_solve_core(
     *ss.solve_position.write() = position_label;
 
     // Spawn background thread
-    let ss_clone = Arc::clone(&session_state.solve_state);
+    let ss_clone = Arc::clone(&session_state.subgame_solve);
     let board_clone = board.clone();
     std::thread::spawn(move || {
         // Build game
@@ -2038,7 +2054,8 @@ pub fn game_new(
     let cbv_ctx = postflop_state.cbv_context.read().clone();
     let session = GameSession::from_exploration_state(&exploration, cbv_ctx)?;
     *session_state.session.write() = Some(session);
-    session_state.solve_state.reset();
+    session_state.subgame_solve.reset();
+    session_state.exact_solve.reset();
     Ok(())
 }
 
@@ -2101,7 +2118,7 @@ pub fn game_solve(
 
 pub fn game_cancel_solve_core(session_state: &GameSessionState) -> Result<(), String> {
     session_state
-        .solve_state
+        .subgame_solve
         .cancel
         .store(true, Ordering::Relaxed);
     Ok(())
@@ -2556,10 +2573,35 @@ mod tests {
     }
 
     #[test]
-    fn game_session_state_has_solve_state() {
+    fn game_session_state_has_dual_solve_states() {
         let gss = GameSessionState::default();
-        // solve_state should be an Arc<SolveState>
-        assert!(!gss.solve_state.solving.load(std::sync::atomic::Ordering::Relaxed));
+        // Both subgame_solve and exact_solve should exist and default to not solving
+        assert!(!gss.subgame_solve.solving.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss.exact_solve.solving.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn solve_for_returns_subgame_by_default() {
+        let gss = GameSessionState::default();
+        gss.subgame_solve.iteration.store(42, std::sync::atomic::Ordering::Relaxed);
+        let ss = gss.solve_for(&None);
+        assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn solve_for_returns_subgame_for_subgame_mode() {
+        let gss = GameSessionState::default();
+        gss.subgame_solve.iteration.store(77, std::sync::atomic::Ordering::Relaxed);
+        let ss = gss.solve_for(&Some("subgame".to_string()));
+        assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 77);
+    }
+
+    #[test]
+    fn solve_for_returns_exact_for_exact_mode() {
+        let gss = GameSessionState::default();
+        gss.exact_solve.iteration.store(99, std::sync::atomic::Ordering::Relaxed);
+        let ss = gss.solve_for(&Some("exact".to_string()));
+        assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 99);
     }
 
     // -------------------------------------------------------------------
@@ -2574,11 +2616,11 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate active solve
-        gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.iteration.store(50, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.exploitability_bits.store(5.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(50, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.exploitability_bits.store(5.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         let state = game_get_state_core(&gss).unwrap();
         let solve = state.solve.expect("solve should be Some");
@@ -2596,11 +2638,11 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate completed solve
-        gss.solve_state.solving.store(false, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.iteration.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.exploitability_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+        gss.subgame_solve.solving.store(false, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.exploitability_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         let state = game_get_state_core(&gss).unwrap();
         let solve = state.solve.expect("solve should be Some after completion");
@@ -2615,10 +2657,10 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate solve with matrix snapshot
-        gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.iteration.store(10, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
-        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(10, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         // Create a dummy matrix snapshot
         let dummy_matrix = GameMatrix {
@@ -2634,7 +2676,7 @@ mod tests {
             }]],
             actions: vec![GameAction { id: "0".to_string(), label: "Check".to_string(), action_type: "check".to_string() }],
         };
-        *gss.solve_state.matrix_snapshot.write() = Some(dummy_matrix);
+        *gss.subgame_solve.matrix_snapshot.write() = Some(dummy_matrix);
 
         let state = game_get_state_core(&gss).unwrap();
         let matrix = state.matrix.expect("matrix should be overridden by solve snapshot");
@@ -2669,7 +2711,7 @@ mod tests {
         let gss = GameSessionState::default();
         let session = make_decision_session();
         *gss.session.write() = Some(session);
-        gss.solve_state.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         let result = game_solve_core(&gss, None, None, None, None, None, None, None);
         assert!(result.is_err());
@@ -2683,9 +2725,9 @@ mod tests {
     #[test]
     fn cancel_solve_sets_cancel_flag() {
         let gss = GameSessionState::default();
-        assert!(!gss.solve_state.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
         game_cancel_solve_core(&gss).unwrap();
-        assert!(gss.solve_state.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // -------------------------------------------------------------------
@@ -2772,17 +2814,17 @@ mod tests {
     fn game_new_resets_solve_state() {
         let gss = GameSessionState::default();
         // Simulate prior solve
-        gss.solve_state.iteration.store(100, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.solve_state.solving.store(false, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(100, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.solving.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // game_new_core needs ExplorationState and PostflopState, but
         // we can test the reset by calling reset_solve_state directly
-        gss.solve_state.reset();
+        gss.subgame_solve.reset();
 
-        assert_eq!(gss.solve_state.iteration.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(gss.solve_state.max_iterations.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert!(gss.solve_state.matrix_snapshot.read().is_none());
+        assert_eq!(gss.subgame_solve.iteration.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(gss.subgame_solve.max_iterations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(gss.subgame_solve.matrix_snapshot.read().is_none());
     }
 
     // -------------------------------------------------------------------
@@ -3555,10 +3597,10 @@ mod tests {
         // Populate solve cache: root and one child
         let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
         let child_node = make_cached_node("CHILD", &["Check", "Fold"], "SB");
-        gss.solve_state.solve_cache.write().insert(vec![], root_node);
-        gss.solve_state.solve_cache.write().insert(vec![1], child_node);
+        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
         // Mark solve as completed so iteration > 0
-        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action "1" (Call) which maps to cache path [1]
         let state = game_play_action_core(&gss, "1").unwrap();
@@ -3566,7 +3608,7 @@ mod tests {
         assert_eq!(matrix.cells[0][0].hand, "CHILD");
         assert_eq!(state.position, "SB");
         // Path should now be [1]
-        assert_eq!(*gss.solve_state.solve_path.read(), vec![1]);
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![1]);
     }
 
     #[test]
@@ -3577,14 +3619,14 @@ mod tests {
 
         // Populate solve cache with only root (no children cached)
         let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
-        gss.solve_state.solve_cache.write().insert(vec![], root_node);
-        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action "1" (Call) -- path [1] not in cache, should reset
         let _state = game_play_action_core(&gss, "1").unwrap();
         // Cache should be cleared
-        assert!(gss.solve_state.solve_cache.read().is_empty());
-        assert!(gss.solve_state.solve_path.read().is_empty());
+        assert!(gss.subgame_solve.solve_cache.read().is_empty());
+        assert!(gss.subgame_solve.solve_path.read().is_empty());
     }
 
     #[test]
@@ -3598,19 +3640,19 @@ mod tests {
         // Instead, pre-populate cache and navigate within it:
         let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
         let child_node = make_cached_node("CHILD", &["Check", "Fold"], "SB");
-        gss.solve_state.solve_cache.write().insert(vec![], root_node);
-        gss.solve_state.solve_cache.write().insert(vec![1], child_node);
-        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action to get to child (within solved tree)
         let _ = game_play_action_core(&gss, "1").unwrap();
-        assert_eq!(*gss.solve_state.solve_path.read(), vec![1]);
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![1]);
 
         // Now go back -- should serve root cached matrix
         let state = game_back_core(&gss).unwrap();
         let matrix = state.matrix.expect("should have root cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "ROOT");
-        assert_eq!(*gss.solve_state.solve_path.read(), Vec::<usize>::new());
+        assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
     }
 
     #[test]
@@ -3632,14 +3674,14 @@ mod tests {
 
         // Set up solve cache at this position (the solve root is the current node)
         let root_node = make_cached_node("SOLVE_ROOT", &["Check", "Fold"], "SB");
-        gss.solve_state.solve_cache.write().insert(vec![], root_node);
-        gss.solve_state.iteration.store(100, Ordering::Relaxed);
+        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
         // Path is empty (at solve root)
 
         // Go back -- should clear cache (navigating before solve root)
         let _state = game_back_core(&gss).unwrap();
         // Cache should be cleared since we went before the solve root
-        assert!(gss.solve_state.solve_cache.read().is_empty());
+        assert!(gss.subgame_solve.solve_cache.read().is_empty());
     }
 
     #[test]
@@ -3649,15 +3691,15 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Set up completed solve with cache
-        gss.solve_state.solving.store(false, Ordering::Relaxed);
-        gss.solve_state.iteration.store(100, Ordering::Relaxed);
-        gss.solve_state.max_iterations.store(100, Ordering::Relaxed);
-        *gss.solve_state.solve_start.write() = Some(std::time::Instant::now());
+        gss.subgame_solve.solving.store(false, Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(100, Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         let root_node = make_cached_node("CACHE_ROOT", &["Fold", "Call"], "BB");
         let child_node = make_cached_node("CACHE_CHILD", &["Check", "Fold"], "SB");
-        gss.solve_state.solve_cache.write().insert(vec![], root_node);
-        gss.solve_state.solve_cache.write().insert(vec![1], child_node);
+        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
 
         // At solve root (empty path), should serve root cache
         let state = game_get_state_core(&gss).unwrap();
@@ -3665,7 +3707,7 @@ mod tests {
         assert_eq!(matrix.cells[0][0].hand, "CACHE_ROOT");
 
         // Navigate to child path
-        *gss.solve_state.solve_path.write() = vec![1];
+        *gss.subgame_solve.solve_path.write() = vec![1];
         let state = game_get_state_core(&gss).unwrap();
         let matrix = state.matrix.expect("should have child cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "CACHE_CHILD");
