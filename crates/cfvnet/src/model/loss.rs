@@ -58,6 +58,57 @@ pub fn cfvnet_loss<B: Backend>(
     huber + aux.mul_scalar(aux_weight)
 }
 
+/// Per-sample weighted Huber loss for importance-weighted training.
+///
+/// Computes Huber loss per sample (averaging over valid combos within each sample),
+/// multiplies by per-sample weight, then takes the weighted mean across the batch.
+fn weighted_masked_huber_loss<B: Backend>(
+    pred: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+    sample_weight: Tensor<B, 1>,
+    delta: f64,
+) -> Tensor<B, 1> {
+    let diff = (pred - target) * mask.clone();
+    let abs_diff = diff.abs();
+
+    let quadratic = abs_diff.clone().powf_scalar(2.0).mul_scalar(0.5);
+    let linear = abs_diff.clone().sub_scalar(0.5 * delta).mul_scalar(delta);
+
+    let within_delta = abs_diff.lower_equal_elem(delta);
+    let element_loss = quadratic.mask_where(within_delta.bool_not(), linear);
+
+    // Per-sample loss: sum masked elements, divide by per-sample valid count.
+    let masked_loss = element_loss * mask.clone();
+    // [batch, combos] -> sum over combos -> [batch]
+    let per_sample_loss: Tensor<B, 1> = masked_loss.sum_dim(1).squeeze(1);
+    let per_sample_valid: Tensor<B, 1> = mask.sum_dim(1).squeeze::<1>(1).clamp_min(1.0);
+    let per_sample_mean = per_sample_loss / per_sample_valid;
+
+    // Weighted average across batch.
+    let weighted = per_sample_mean * sample_weight.clone();
+    weighted.sum() / sample_weight.sum().clamp_min(1.0)
+}
+
+/// Combined loss with per-sample weighting: `L = weighted_huber + lambda * weighted_aux`.
+pub fn weighted_cfvnet_loss<B: Backend>(
+    pred: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    mask: Tensor<B, 2>,
+    range: Tensor<B, 2>,
+    game_value: Tensor<B, 1>,
+    sample_weight: Tensor<B, 1>,
+    huber_delta: f64,
+    aux_weight: f64,
+) -> Tensor<B, 1> {
+    let huber = weighted_masked_huber_loss(pred.clone(), target, mask, sample_weight.clone(), huber_delta);
+    // Weighted aux: per-sample squared residual, weighted average.
+    let weighted_sum: Tensor<B, 1> = (pred * range).sum_dim(1).squeeze(1);
+    let residual = (weighted_sum - game_value).powf_scalar(2.0);
+    let aux = (residual * sample_weight.clone()).sum() / sample_weight.sum().clamp_min(1.0);
+    huber + aux.mul_scalar(aux_weight)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

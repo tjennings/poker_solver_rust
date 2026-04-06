@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use crate::datagen::storage::{read_record, TrainingRecord};
 use crate::model::boundary_dataset::encode_boundary_record;
-use crate::model::loss::cfvnet_loss;
+use crate::model::loss::weighted_cfvnet_loss;
 use crate::model::boundary_net::BoundaryNet;
 use crate::model::network::{INPUT_SIZE, OUTPUT_SIZE};
 
@@ -48,6 +48,7 @@ struct PreEncoded {
     mask: Vec<f32>,
     range: Vec<f32>,
     game_value: Vec<f32>,
+    sample_weight: Vec<f32>,
     in_size: usize,
     len: usize,
 }
@@ -59,6 +60,7 @@ struct DeviceTensors<B: Backend> {
     mask: Tensor<B, 2>,
     range: Tensor<B, 2>,
     game_value: Tensor<B, 1>,
+    sample_weight: Tensor<B, 1>,
 }
 
 impl PreEncoded {
@@ -74,6 +76,7 @@ impl PreEncoded {
         let mut mask = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut range = Vec::with_capacity(n * OUTPUT_SIZE);
         let mut game_value = Vec::with_capacity(n);
+        let mut sample_weight = Vec::with_capacity(n);
 
         for item in &items {
             input.extend_from_slice(&item.input);
@@ -81,6 +84,7 @@ impl PreEncoded {
             mask.extend_from_slice(&item.mask);
             range.extend_from_slice(&item.range);
             game_value.push(item.game_value);
+            sample_weight.push(item.sample_weight);
         }
 
         Self {
@@ -89,6 +93,7 @@ impl PreEncoded {
             mask,
             range,
             game_value,
+            sample_weight,
             in_size,
             len: n,
         }
@@ -104,6 +109,7 @@ impl PreEncoded {
             mask: Tensor::from_data(TensorData::new(self.mask, [n, OUTPUT_SIZE]), device),
             range: Tensor::from_data(TensorData::new(self.range, [n, OUTPUT_SIZE]), device),
             game_value: Tensor::from_data(TensorData::new(self.game_value, [n]), device),
+            sample_weight: Tensor::from_data(TensorData::new(self.sample_weight, [n]), device),
         }
     }
 
@@ -115,6 +121,7 @@ impl PreEncoded {
             mask: self.mask.clone(),
             range: self.range.clone(),
             game_value: self.game_value.clone(),
+            sample_weight: self.sample_weight.clone(),
             in_size: self.in_size,
             len: self.len,
         };
@@ -154,14 +161,16 @@ fn compute_val_loss<B: AutodiffBackend>(
         let b_mask = val_tensors.mask.clone().narrow(0, batch_start, len);
         let b_range = val_tensors.range.clone().narrow(0, batch_start, len);
         let b_gv = val_tensors.game_value.clone().narrow(0, batch_start, len);
+        let b_sw = val_tensors.sample_weight.clone().narrow(0, batch_start, len);
 
         let pred = valid_model.forward(b_input);
-        let loss = cfvnet_loss(
+        let loss = weighted_cfvnet_loss(
             pred,
             b_target,
             b_mask,
             b_range,
             b_gv,
+            b_sw,
             config.huber_delta,
             config.aux_loss_weight,
         );
@@ -630,13 +639,15 @@ pub fn train_boundary<B: AutodiffBackend>(
             let mask = Tensor::<B, 2>::from_inner(batch.mask);
             let range = Tensor::<B, 2>::from_inner(batch.range);
             let game_value = Tensor::<B, 1>::from_inner(batch.game_value);
+            let sw = Tensor::<B, 1>::from_inner(batch.sample_weight);
             let pred = model.forward(input);
-            let loss = cfvnet_loss(
+            let loss = weighted_cfvnet_loss(
                 pred,
                 target,
                 mask,
                 range,
                 game_value,
+                sw,
                 config.huber_delta,
                 config.aux_loss_weight,
             );

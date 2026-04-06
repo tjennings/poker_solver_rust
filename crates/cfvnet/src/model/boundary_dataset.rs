@@ -9,6 +9,9 @@ pub struct BoundaryItem {
     pub mask: Vec<f32>,
     pub range: Vec<f32>,
     pub game_value: f32,
+    /// Per-sample loss weight based on SPR. Low SPR spots get higher weight
+    /// because they represent higher-stakes decisions.
+    pub sample_weight: f32,
 }
 
 /// Encode a TrainingRecord into a BoundaryItem with normalized pot/stack and targets.
@@ -61,12 +64,22 @@ pub fn encode_boundary_record(rec: &TrainingRecord) -> BoundaryItem {
     // rather than scaling raw game_value (which is a weighted sum, not a single value).
     let game_value: f32 = range.iter().zip(target.iter()).map(|(&r, &t)| r * t).sum();
 
+    // SPR-based sample weight: low SPR → higher weight.
+    // weight = 1 / max(SPR, 0.1), capped at 10.
+    let spr = if rec.pot > 0.0 {
+        rec.effective_stack / rec.pot
+    } else {
+        1.0
+    };
+    let sample_weight = (1.0 / spr.max(0.1)).min(10.0);
+
     BoundaryItem {
         input,
         target,
         mask,
         range,
         game_value,
+        sample_weight,
     }
 }
 
