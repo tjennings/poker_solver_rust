@@ -118,6 +118,24 @@ enum Commands {
         #[arg(long, default_value = "1")]
         threads: usize,
     },
+    /// Train the BoundaryNet model (normalized EV output for range-solver integration)
+    TrainBoundary {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(short, long)]
+        data: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = default_backend())]
+        backend: String,
+    },
+    /// Evaluate BoundaryNet on held-out data
+    EvalBoundary {
+        #[arg(short, long)]
+        model: PathBuf,
+        #[arg(short, long)]
+        data: PathBuf,
+    },
     /// Precompute average turn entry ranges from a blueprint strategy, bucketed by SPR.
     #[command(name = "precompute-ranges")]
     PrecomputeRanges {
@@ -225,6 +243,16 @@ fn main() {
             model,
             num_spots,
         } => cmd_compare_exact(model, num_spots),
+        Commands::TrainBoundary {
+            config,
+            data,
+            output,
+            backend,
+        } => {
+            ensure_parent_dir(&output);
+            cmd_train_boundary(config, data, output, &backend);
+        }
+        Commands::EvalBoundary { model, data } => cmd_eval_boundary(model, data),
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
@@ -312,6 +340,89 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
             let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            println!("Training complete. Final loss: {}", result.final_train_loss);
+        }
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => {
+            eprintln!("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release");
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("unknown backend '{other}', expected 'ndarray', 'wgpu', or 'cuda'");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str) {
+    let yaml = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("failed to read config {}: {e}", config_path.display());
+        std::process::exit(1);
+    });
+
+    let cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+        eprintln!("failed to parse config: {e}");
+        std::process::exit(1);
+    });
+
+    let board_cards = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
+
+    // Create output directory and write config before training starts.
+    std::fs::create_dir_all(&output).unwrap_or_else(|e| {
+        eprintln!("failed to create output directory {}: {e}", output.display());
+        std::process::exit(1);
+    });
+    let config_out = output.join("config.yaml");
+    let config_yaml = serde_yaml::to_string(&cfg).unwrap_or_else(|e| {
+        eprintln!("failed to serialize config: {e}");
+        std::process::exit(1);
+    });
+    std::fs::write(&config_out, &config_yaml).unwrap_or_else(|e| {
+        eprintln!("failed to write config to {}: {e}", config_out.display());
+        std::process::exit(1);
+    });
+    println!("Config saved to {}", config_out.display());
+
+    let train_config = cfvnet::model::boundary_training::BoundaryTrainConfig {
+        hidden_layers: cfg.training.hidden_layers,
+        hidden_size: cfg.training.hidden_size,
+        batch_size: cfg.training.batch_size,
+        epochs: cfg.training.epochs,
+        learning_rate: cfg.training.learning_rate,
+        lr_min: cfg.training.lr_min,
+        huber_delta: cfg.training.huber_delta,
+        aux_loss_weight: cfg.training.aux_loss_weight,
+        validation_split: cfg.training.validation_split,
+        checkpoint_every_n_epochs: cfg.training.checkpoint_every_n_epochs,
+        shuffle_buffer_size: cfg.training.shuffle_buffer_size,
+        prefetch_depth: cfg.training.prefetch_depth,
+        encoder_threads: cfg.training.encoder_threads,
+    };
+
+    match backend {
+        "wgpu" => {
+            use burn::backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}};
+            type B = Autodiff<Wgpu>;
+            let device = WgpuDevice::DefaultDevice;
+            println!("Using wgpu backend (Metal GPU on macOS)");
+            let result = cfvnet::model::boundary_training::train_boundary::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            println!("Training complete. Final loss: {}", result.final_train_loss);
+        }
+        "ndarray" => {
+            use burn::backend::{Autodiff, NdArray};
+            type B = Autodiff<NdArray>;
+            let device = Default::default();
+            println!("Using ndarray backend (CPU)");
+            let result = cfvnet::model::boundary_training::train_boundary::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            println!("Training complete. Final loss: {}", result.final_train_loss);
+        }
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            use burn::backend::{Autodiff, CudaJit, cuda_jit::CudaDevice};
+            type B = Autodiff<CudaJit<f32>>;
+            let device = CudaDevice::default();
+            println!("Using CUDA backend (NVIDIA GPU)");
+            let result = cfvnet::model::boundary_training::train_boundary::<B>(&device, &data, board_cards, &train_config, Some(&output));
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(not(feature = "cuda"))]
@@ -620,6 +731,115 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     println!("  MAE:       {:.6}", total_mae / n);
     println!("  Max Error: {:.6}", total_max_error / n);
     println!("  mBB:       {:.2}", total_mbb / n);
+}
+
+fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
+    use burn::backend::NdArray;
+    use burn::module::Module;
+    use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
+    use burn::tensor::{Tensor, TensorData};
+    use cfvnet::datagen::storage::{read_record, record_size};
+    use cfvnet::eval::metrics::compute_normalized_mae;
+    use cfvnet::model::boundary_dataset::encode_boundary_record;
+    use cfvnet::model::boundary_net::BoundaryNet;
+    use cfvnet::model::network::INPUT_SIZE;
+
+    let cfg = load_model_config(&model_dir);
+    let board_cards = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
+
+    type B = NdArray;
+    let device = Default::default();
+    let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
+    let model_path = resolve_model_path(&model_dir);
+
+    let model = BoundaryNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size)
+        .load_file(&model_path, &recorder, &device)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    // Count records
+    let rec_size = record_size(board_cards) as u64;
+    let file_size = std::fs::metadata(&data_path)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to read data file {}: {e}", data_path.display());
+            std::process::exit(1);
+        })
+        .len();
+    let num_records = file_size / rec_size;
+    println!("Evaluating {num_records} records...");
+
+    let file = std::fs::File::open(&data_path).unwrap_or_else(|e| {
+        eprintln!("failed to open data file {}: {e}", data_path.display());
+        std::process::exit(1);
+    });
+    let mut reader = std::io::BufReader::new(file);
+
+    let mut total_mae = 0.0_f64;
+    let mut count = 0_u64;
+
+    // SPR buckets: <1, 1-3, 3-10, 10+
+    let mut spr_mae = [0.0_f64; 4];
+    let mut spr_count = [0_u64; 4];
+
+    while let Ok(rec) = read_record(&mut reader) {
+        let item = encode_boundary_record(&rec);
+        let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
+
+        let input = Tensor::<B, 2>::from_data(
+            TensorData::new(item.input.clone(), [1, INPUT_SIZE]),
+            &device,
+        );
+        let pred = model.forward(input);
+        let pred_vec: Vec<f32> = pred.into_data().to_vec::<f32>().unwrap();
+
+        let mae = compute_normalized_mae(&pred_vec, &item.target, &mask);
+        total_mae += mae;
+        count += 1;
+
+        // SPR bucket
+        let spr = if rec.pot > 0.0 {
+            rec.effective_stack as f64 / rec.pot as f64
+        } else {
+            0.0
+        };
+        let bucket = if spr < 1.0 {
+            0
+        } else if spr < 3.0 {
+            1
+        } else if spr < 10.0 {
+            2
+        } else {
+            3
+        };
+        spr_mae[bucket] += mae;
+        spr_count[bucket] += 1;
+    }
+
+    if count == 0 {
+        println!("No records to evaluate.");
+        return;
+    }
+
+    let n = count as f64;
+    println!("Results ({count} records):");
+    println!("  Normalized MAE: {:.6}", total_mae / n);
+
+    let bucket_labels = ["<1", "1-3", "3-10", "10+"];
+    println!("\nMAE by SPR bucket:");
+    for (i, label) in bucket_labels.iter().enumerate() {
+        if spr_count[i] > 0 {
+            println!(
+                "  SPR {:<5}: {:.6}  ({} records)",
+                label,
+                spr_mae[i] / spr_count[i] as f64,
+                spr_count[i]
+            );
+        } else {
+            println!("  SPR {:<5}: N/A     (0 records)", label);
+        }
+    }
 }
 
 fn cmd_compare(
