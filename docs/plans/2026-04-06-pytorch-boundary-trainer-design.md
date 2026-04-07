@@ -153,6 +153,7 @@ The burn-based `train-boundary` CLI command and `BoundaryNet` model struct remai
 
 ## Project Standards
 
+- **Dependency management**: uv
 - **Python version**: 3.10+
 - **Type hints**: All function signatures fully annotated
 - **Docstrings**: All public functions, Google style
