@@ -1,0 +1,54 @@
+# BoundaryNet River — datagen with bet size fuzzing
+#
+# Generates diverse river training data with randomized bet sizes
+# to improve generalization across different bet tree structures.
+#
+# Run (CPU, 16 threads):
+#   cargo run -p cfvnet --release -- generate \
+#     -c sample_configurations/boundary_net_river_datagen.yaml \
+#     -o local_data/cfvnet/river_fuzzed \
+#     --num-samples 5000000 \
+#     --threads 16 \
+#     --per-file 10000
+#
+# Run (GPU):
+#   cargo run -p cfvnet --release --features gpu-datagen -- generate \
+#     -c sample_configurations/boundary_net_river_datagen.yaml \
+#     -o local_data/cfvnet/river_fuzzed \
+#     --num-samples 5000000
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["25%", "75%", "a"]
+  board_size: 5
+
+datagen:
+  street: "river"
+  mode: "exact"
+  blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
+  num_samples: 5000000
+  per_file: 10000
+  bet_size_fuzz: 0.20
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
+  solver_iterations: 500
+  threads: 10
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 32000
+  epochs: 500
+  learning_rate: 0.006
+  lr_min: 0.00004
+  huber_delta: 1.0
+  aux_loss_weight: 0.1
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 10
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  encoder_threads: 14
+  gpu_prefetch: 3
+  grad_clip_norm: 1.0
