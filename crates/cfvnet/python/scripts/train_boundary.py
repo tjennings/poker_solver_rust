@@ -74,14 +74,23 @@ def _export_latest_checkpoint(config, output_dir: Path) -> None:
     """
     from cfvnet.model import BoundaryNet
 
-    checkpoints = sorted(output_dir.glob("checkpoint_*.pt"))
-    if not checkpoints:
-        print("Warning: no checkpoints found, skipping ONNX export")
-        return
+    best_path = output_dir / "best.pt"
+    if not best_path.exists():
+        # Fall back to latest checkpoint.
+        checkpoints = sorted(output_dir.glob("checkpoint_epoch*.pt"))
+        if not checkpoints:
+            print("Warning: no checkpoints found, skipping ONNX export")
+            return
+        best_path = checkpoints[-1]
+        print(f"No best.pt found, using latest: {best_path.name}")
 
     model = BoundaryNet(config.hidden_layers, config.hidden_size)
-    ckpt = torch.load(checkpoints[-1], weights_only=False)
+    ckpt = torch.load(best_path, weights_only=False, map_location="cpu")
     model.load_state_dict(ckpt["model_state_dict"])
+    epoch = ckpt.get("epoch", "?")
+    losses = ckpt.get("losses", {})
+    val_huber = losses.get("val_huber", "?")
+    print(f"Exporting best model (epoch {epoch}, val_huber={val_huber})")
 
     onnx_path = output_dir / "model.onnx"
     export_onnx(model, onnx_path)
