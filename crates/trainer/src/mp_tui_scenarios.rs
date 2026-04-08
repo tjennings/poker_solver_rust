@@ -1,10 +1,15 @@
-//! Spot resolution for multiplayer game trees.
+//! Spot resolution and strategy extraction for multiplayer game trees.
 //!
 //! Resolves position-aware spot notation strings (e.g. `"utg:5bb,hj:fold"`)
-//! by walking an `MpGameTree`.
+//! by walking an `MpGameTree`, and extracts 13x13 strategy grids from
+//! MP storage for TUI display.
 
 use poker_solver_core::blueprint_mp::game_tree::{MpGameNode, MpGameTree, TreeAction};
+use poker_solver_core::blueprint_mp::storage::MpStorage;
+use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{self, Card};
+
+use crate::blueprint_tui_widgets::{CellStrategy, HandGridState};
 
 /// Walk the MP game tree following a position-aware spot string.
 /// Returns (node_idx, board_cards) or None if any action fails to match.
@@ -120,6 +125,75 @@ fn parse_board_segment(segment: &str, board: &mut Vec<Card>) -> Option<()> {
         }
     }
     Some(())
+}
+
+/// Extract a 13x13 strategy grid from MP storage for a decision node.
+pub fn extract_mp_grid(
+    tree: &MpGameTree,
+    storage: &MpStorage,
+    node_idx: u32,
+    iteration: u64,
+    scenario_name: &str,
+) -> HandGridState {
+    let mut cells: [[CellStrategy; 13]; 13] =
+        std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
+    if let MpGameNode::Decision { ref actions, street, .. } = tree.nodes[node_idx as usize] {
+        let num_actions = actions.len();
+        let bucket_count = storage.bucket_counts[street.index()] as usize;
+        let labels: Vec<String> = actions.iter().map(format_mp_action).collect();
+        fill_grid_cells(&mut cells, storage, node_idx, num_actions, bucket_count, &labels);
+    }
+    HandGridState {
+        cells,
+        prev_cells: None,
+        scenario_name: scenario_name.to_string(),
+        action_path: vec![],
+        board_display: None,
+        cluster_id: None,
+        street_label: "Preflop".to_string(),
+        iteration_at_snapshot: iteration,
+        error_message: None,
+    }
+}
+
+fn fill_grid_cells(
+    cells: &mut [[CellStrategy; 13]; 13],
+    storage: &MpStorage,
+    node_idx: u32,
+    num_actions: usize,
+    bucket_count: usize,
+    labels: &[String],
+) {
+    let mut out = vec![0.0_f64; num_actions];
+    for row in 0..13 {
+        for col in 0..13 {
+            let hand = CanonicalHand::from_matrix_position(row, col).unwrap();
+            let bucket = (hand.index() % bucket_count) as u16;
+            storage.average_strategy(node_idx, bucket, num_actions, &mut out);
+            cells[row][col] = build_cell_strategy(&out, labels);
+        }
+    }
+}
+
+fn build_cell_strategy(probs: &[f64], labels: &[String]) -> CellStrategy {
+    let actions: Vec<(String, f32)> = labels
+        .iter()
+        .zip(probs.iter())
+        .map(|(label, &freq)| (label.clone(), freq as f32))
+        .collect();
+    CellStrategy { actions, ev: None }
+}
+
+/// Format an MP `TreeAction` for TUI display.
+pub fn format_mp_action(action: &TreeAction) -> String {
+    match action {
+        TreeAction::Fold => "fold".into(),
+        TreeAction::Check => "check".into(),
+        TreeAction::Call => "call".into(),
+        TreeAction::AllIn => "all-in".into(),
+        TreeAction::Lead(chips) => format!("bet {}bb", (*chips / 2.0).round() as u32),
+        TreeAction::Raise(chips) => format!("raise {}bb", (*chips / 2.0).round() as u32),
+    }
 }
 
 fn skip_chance_mp(tree: &MpGameTree, mut node_idx: u32) -> u32 {
@@ -385,5 +459,191 @@ mod tests {
         let mut board = Vec::new();
         parse_board_segment("", &mut board).unwrap();
         assert!(board.is_empty());
+    }
+
+    // -- format_mp_action tests --
+
+    #[timed_test]
+    fn format_mp_action_fold() {
+        assert_eq!(format_mp_action(&TreeAction::Fold), "fold");
+    }
+
+    #[timed_test]
+    fn format_mp_action_check() {
+        assert_eq!(format_mp_action(&TreeAction::Check), "check");
+    }
+
+    #[timed_test]
+    fn format_mp_action_call() {
+        assert_eq!(format_mp_action(&TreeAction::Call), "call");
+    }
+
+    #[timed_test]
+    fn format_mp_action_all_in() {
+        assert_eq!(format_mp_action(&TreeAction::AllIn), "all-in");
+    }
+
+    #[timed_test]
+    fn format_mp_action_lead_bb() {
+        assert_eq!(format_mp_action(&TreeAction::Lead(10.0)), "bet 5bb");
+    }
+
+    #[timed_test]
+    fn format_mp_action_raise_bb() {
+        assert_eq!(format_mp_action(&TreeAction::Raise(20.0)), "raise 10bb");
+    }
+
+    #[timed_test]
+    fn format_mp_action_lead_rounds_to_nearest() {
+        // 7.0 chips / 2.0 = 3.5, rounds to 4
+        assert_eq!(format_mp_action(&TreeAction::Lead(7.0)), "bet 4bb");
+    }
+
+    #[timed_test]
+    fn format_mp_action_raise_zero_chips() {
+        assert_eq!(format_mp_action(&TreeAction::Raise(0.0)), "raise 0bb");
+    }
+
+    // -- extract_mp_grid tests --
+
+    fn test_2p_config() -> (MpGameConfig, MpActionAbstractionConfig) {
+        let game = MpGameConfig {
+            name: "2p-grid-test".into(),
+            num_players: 2,
+            stack_depth: 100.0,
+            blinds: vec![
+                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
+                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("5bb".into())],
+            raise: vec![vec![serde_yaml::Value::String("3.0x".into())]],
+        };
+        let postflop = MpStreetSizes {
+            lead: vec![yaml_f64(0.67)],
+            raise: vec![vec![yaml_f64(1.0)]],
+        };
+        let action = MpActionAbstractionConfig {
+            preflop,
+            flop: postflop.clone(),
+            turn: postflop.clone(),
+            river: postflop,
+        };
+        (game, action)
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_returns_13x13() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let grid = extract_mp_grid(&tree, &storage, tree.root, 0, "test");
+        assert_eq!(grid.cells.len(), 13);
+        for row in &grid.cells {
+            assert_eq!(row.len(), 13);
+        }
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_at_root_has_actions() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let grid = extract_mp_grid(&tree, &storage, tree.root, 0, "root");
+        // Root is a decision node with fold/call/raise/all-in,
+        // so every cell should have actions (uniform strategy from fresh storage).
+        let has_actions = grid.cells.iter().any(|row| {
+            row.iter().any(|cell| !cell.actions.is_empty())
+        });
+        assert!(has_actions, "at least some cells should have actions");
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_scenario_name_set() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let grid = extract_mp_grid(&tree, &storage, tree.root, 0, "UTG open");
+        assert_eq!(grid.scenario_name, "UTG open");
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_iteration_recorded() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let grid = extract_mp_grid(&tree, &storage, tree.root, 42, "test");
+        assert_eq!(grid.iteration_at_snapshot, 42);
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_action_labels_match_tree() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let grid = extract_mp_grid(&tree, &storage, tree.root, 0, "test");
+        // Get action names from tree root
+        let MpGameNode::Decision { ref actions, .. } = tree.nodes[tree.root as usize] else {
+            panic!("root should be Decision");
+        };
+        let expected_labels: Vec<String> = actions.iter().map(format_mp_action).collect();
+        // Cell [0][0] (AA) should have the same action labels
+        let cell_labels: Vec<&str> = grid.cells[0][0].actions.iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(cell_labels.len(), expected_labels.len());
+        for label in &expected_labels {
+            assert!(
+                cell_labels.contains(&label.as_str()),
+                "expected label {label} in cell actions {cell_labels:?}"
+            );
+        }
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_frequencies_sum_to_one() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let grid = extract_mp_grid(&tree, &storage, tree.root, 0, "test");
+        for row in &grid.cells {
+            for cell in row.iter() {
+                if !cell.actions.is_empty() {
+                    let sum: f32 = cell.actions.iter().map(|(_, f)| f).sum();
+                    assert!(
+                        (sum - 1.0).abs() < 0.01,
+                        "frequencies should sum to ~1.0, got {sum}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[timed_test(10)]
+    fn extract_mp_grid_non_decision_returns_empty_actions() {
+        use poker_solver_core::blueprint_mp::storage::MpStorage;
+        let (game, action) = test_2p_config();
+        let tree = MpGameTree::build(&game, &action);
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        // Find a terminal node index
+        let terminal_idx = tree.nodes.iter().position(|n| {
+            matches!(n, MpGameNode::Terminal { .. })
+        }).unwrap() as u32;
+        let grid = extract_mp_grid(&tree, &storage, terminal_idx, 0, "terminal");
+        // All cells should be empty since this is not a decision node
+        for row in &grid.cells {
+            for cell in row.iter() {
+                assert!(cell.actions.is_empty());
+            }
+        }
     }
 }
