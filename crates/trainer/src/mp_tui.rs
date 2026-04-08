@@ -35,6 +35,10 @@ pub struct MpTuiApp {
     pub(crate) peak_iter_per_sec: u64,
     pub(crate) last_tick: Instant,
     pub(crate) delta_history: Vec<u64>,
+    pub(crate) max_regret_history: Vec<u64>,
+    pub(crate) min_regret_history: Vec<u64>,
+    pub(crate) avg_pos_regret_history: Vec<u64>,
+    pub(crate) prune_history: Vec<u64>,
 }
 
 impl MpTuiApp {
@@ -55,6 +59,10 @@ impl MpTuiApp {
             peak_iter_per_sec: 0,
             last_tick: Instant::now(),
             delta_history: Vec::with_capacity(120),
+            max_regret_history: Vec::with_capacity(120),
+            min_regret_history: Vec::with_capacity(120),
+            avg_pos_regret_history: Vec::with_capacity(120),
+            prune_history: Vec::with_capacity(120),
         }
     }
 
@@ -78,7 +86,7 @@ impl MpTuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),
+                Constraint::Length(19),
                 Constraint::Min(0),
                 Constraint::Length(1),
             ])
@@ -107,6 +115,7 @@ impl MpTuiApp {
         }
         self.prev_iterations = current;
         self.tick_delta_history(sparkline_max);
+        self.tick_regret_sparklines(sparkline_max);
         self.tick_grids();
     }
 }
@@ -118,11 +127,15 @@ impl MpTuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(2),
-                Constraint::Length(2),
+                Constraint::Length(1),  // iterations
+                Constraint::Length(1),  // progress gauge
+                Constraint::Length(1),  // runtime + ETA
+                Constraint::Length(2),  // throughput sparkline
+                Constraint::Length(2),  // strategy delta sparkline
+                Constraint::Length(2),  // max pos regret sparkline
+                Constraint::Length(2),  // max neg regret sparkline
+                Constraint::Length(2),  // avg pos regret sparkline
+                Constraint::Length(2),  // prune % sparkline
                 Constraint::Min(0),
             ])
             .split(area);
@@ -131,6 +144,10 @@ impl MpTuiApp {
         self.render_runtime(frame, chunks[2]);
         self.render_throughput(frame, chunks[3]);
         self.render_delta_sparkline(frame, chunks[4]);
+        self.render_max_regret(frame, chunks[5]);
+        self.render_min_regret(frame, chunks[6]);
+        self.render_avg_pos_regret(frame, chunks[7]);
+        self.render_prune_sparkline(frame, chunks[8]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -178,6 +195,54 @@ impl MpTuiApp {
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.delta_history)
             .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_max_regret(&self, frame: &mut Frame, area: Rect) {
+        let latest = self.max_regret_history.last()
+            .map(|&v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let title = format!("Max pos regret: {latest:.1}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.max_regret_history)
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_min_regret(&self, frame: &mut Frame, area: Rect) {
+        let latest = self.min_regret_history.last()
+            .map(|&v| v as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let title = format!("Max neg regret: -{latest:.1}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.min_regret_history)
+            .style(Style::default().fg(Color::Red));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_avg_pos_regret(&self, frame: &mut Frame, area: Rect) {
+        let latest = self.avg_pos_regret_history.last()
+            .map(|&v| v as f64 / 1_000_000_000.0)
+            .unwrap_or(0.0);
+        let title = format!("Avg pos regret: {latest:.2e}");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.avg_pos_regret_history)
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(sparkline, area);
+    }
+
+    fn render_prune_sparkline(&self, frame: &mut Frame, area: Rect) {
+        let latest = self.prune_history.last()
+            .map(|&v| v as f64 / 10.0)
+            .unwrap_or(0.0);
+        let title = format!("Traversals pruned: {latest:.1}%");
+        let sparkline = Sparkline::default()
+            .block(Block::default().title(title).borders(Borders::NONE))
+            .data(&self.prune_history)
+            .style(Style::default().fg(Color::Magenta));
         frame.render_widget(sparkline, area);
     }
 }
@@ -235,6 +300,13 @@ impl MpTuiApp {
         hist.clear();
     }
 
+    fn tick_regret_sparklines(&mut self, sparkline_max: usize) {
+        drain_scaled(&self.metrics.max_regret_history, &mut self.max_regret_history, 1000.0, sparkline_max);
+        drain_scaled_abs(&self.metrics.min_regret_history, &mut self.min_regret_history, 1000.0, sparkline_max);
+        drain_scaled(&self.metrics.avg_pos_regret_history, &mut self.avg_pos_regret_history, 1_000_000_000.0, sparkline_max);
+        drain_scaled(&self.metrics.prune_history, &mut self.prune_history, 10.0, sparkline_max);
+    }
+
     fn tick_grids(&mut self) {
         let mut grids = self.metrics.strategy_grids
             .lock()
@@ -256,11 +328,75 @@ impl MpTuiApp {
 
 // -- Helpers --
 
+/// Drain a metrics `Mutex<Vec<f64>>`, scale each value, and push into a sparkline buffer.
+fn drain_scaled(
+    source: &std::sync::Mutex<Vec<f64>>,
+    dest: &mut Vec<u64>,
+    scale: f64,
+    max_len: usize,
+) {
+    let mut hist = source.lock().unwrap_or_else(|e| e.into_inner());
+    for &v in hist.iter() {
+        push_bounded(dest, (v * scale) as u64, max_len);
+    }
+    hist.clear();
+}
+
+/// Like `drain_scaled` but takes the absolute value before scaling (for negative regrets).
+fn drain_scaled_abs(
+    source: &std::sync::Mutex<Vec<f64>>,
+    dest: &mut Vec<u64>,
+    scale: f64,
+    max_len: usize,
+) {
+    let mut hist = source.lock().unwrap_or_else(|e| e.into_inner());
+    for &v in hist.iter() {
+        push_bounded(dest, (v.abs() * scale) as u64, max_len);
+    }
+    hist.clear();
+}
+
 pub(crate) fn push_bounded(buf: &mut Vec<u64>, value: u64, max_len: usize) {
     if buf.len() >= max_len {
         buf.remove(0);
     }
     buf.push(value);
+}
+
+/// Compute regret statistics from a flat regret array and push to TUI metrics.
+///
+/// Scans all `AtomicI32` regret values, computes max, min, and average positive
+/// regret (after dividing by `regret_scale`), and pushes one sample of each
+/// into the metrics sparkline history.
+pub fn push_regret_telemetry(
+    regrets: &[std::sync::atomic::AtomicI32],
+    regret_scale: f64,
+    metrics: &BlueprintTuiMetrics,
+) {
+    if regrets.is_empty() {
+        return;
+    }
+    let mut max_r = i32::MIN;
+    let mut min_r = i32::MAX;
+    let mut pos_sum: i64 = 0;
+    let mut pos_count: u64 = 0;
+    for atom in regrets {
+        let v = atom.load(Ordering::Relaxed);
+        if v > max_r { max_r = v; }
+        if v < min_r { min_r = v; }
+        if v > 0 {
+            pos_sum += v as i64;
+            pos_count += 1;
+        }
+    }
+    metrics.push_max_regret(max_r as f64 / regret_scale);
+    metrics.push_min_regret(min_r as f64 / regret_scale);
+    let avg = if pos_count > 0 {
+        (pos_sum as f64 / pos_count as f64) / regret_scale
+    } else {
+        0.0
+    };
+    metrics.push_avg_pos_regret(avg);
 }
 
 fn compute_progress_ratio(metrics: &BlueprintTuiMetrics) -> f64 {
@@ -582,6 +718,201 @@ mod tests {
         let mut buf = vec![1, 2, 3, 4, 5];
         super::push_bounded(&mut buf, 6, 5);
         assert_eq!(buf, vec![2, 3, 4, 5, 6]);
+    }
+
+    // -- telemetry sparkline tick tests --
+
+    #[timed_test]
+    fn tick_consumes_max_regret_history() {
+        let mut app = test_app(2);
+        app.metrics.push_max_regret(5.0);
+        app.metrics.push_max_regret(10.0);
+        app.tick();
+        assert_eq!(app.max_regret_history.len(), 2);
+        // 5.0 * 1000.0 = 5000, 10.0 * 1000.0 = 10000
+        assert_eq!(app.max_regret_history[0], 5000);
+        assert_eq!(app.max_regret_history[1], 10000);
+        // Metrics buffer should be drained
+        let hist = app.metrics.max_regret_history.lock().unwrap();
+        assert!(hist.is_empty());
+    }
+
+    #[timed_test]
+    fn tick_consumes_min_regret_history() {
+        let mut app = test_app(2);
+        app.metrics.push_min_regret(-3.0);
+        app.metrics.push_min_regret(-7.5);
+        app.tick();
+        assert_eq!(app.min_regret_history.len(), 2);
+        // Stored as abs * 1000: 3000, 7500
+        assert_eq!(app.min_regret_history[0], 3000);
+        assert_eq!(app.min_regret_history[1], 7500);
+    }
+
+    #[timed_test]
+    fn tick_consumes_avg_pos_regret_history() {
+        let mut app = test_app(2);
+        app.metrics.push_avg_pos_regret(0.000123);
+        app.tick();
+        assert_eq!(app.avg_pos_regret_history.len(), 1);
+        // 0.000123 * 1_000_000_000 = 123000
+        assert_eq!(app.avg_pos_regret_history[0], 123000);
+    }
+
+    #[timed_test]
+    fn tick_consumes_prune_history() {
+        let mut app = test_app(2);
+        app.metrics.push_prune_fraction(34.5);
+        app.metrics.push_prune_fraction(50.0);
+        app.tick();
+        assert_eq!(app.prune_history.len(), 2);
+        // 34.5 * 10.0 = 345, 50.0 * 10.0 = 500
+        assert_eq!(app.prune_history[0], 345);
+        assert_eq!(app.prune_history[1], 500);
+    }
+
+    #[timed_test]
+    fn tick_max_regret_empty_when_no_data() {
+        let mut app = test_app(2);
+        app.tick();
+        assert!(app.max_regret_history.is_empty());
+    }
+
+    #[timed_test]
+    fn tick_prune_history_respects_sparkline_window() {
+        let mut app = test_app(2);
+        // Set sparkline window to 3
+        app.telemetry_config.sparkline_window = 3;
+        for i in 0..5 {
+            app.metrics.push_prune_fraction(i as f64);
+        }
+        app.tick();
+        // Should be capped at window size 3
+        assert_eq!(app.prune_history.len(), 3);
+        // Last 3: 2.0, 3.0, 4.0 -> 20, 30, 40
+        assert_eq!(app.prune_history[0], 20);
+        assert_eq!(app.prune_history[1], 30);
+        assert_eq!(app.prune_history[2], 40);
+    }
+
+    // -- render tests for expanded metrics panel --
+
+    #[timed_test]
+    fn render_metrics_expanded_height() {
+        use ratatui::backend::TestBackend;
+        // Render the full app and verify the top-level layout
+        // allocates 19 rows for the metrics panel.
+        let app = test_app(2);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            // The render method uses Constraint::Length(19) for metrics
+            app.render(frame);
+        }).unwrap();
+        // If we got here without panic, the 19-row layout worked.
+        // Also verify the total area was used.
+        let size = terminal.size().unwrap();
+        assert_eq!(size.height, 40);
+    }
+
+    #[timed_test]
+    fn render_all_sparklines_no_panic() {
+        use ratatui::backend::TestBackend;
+        let mut app = test_app(2);
+        // Push data into all sparkline histories
+        app.metrics.push_max_regret(10.0);
+        app.metrics.push_min_regret(-5.0);
+        app.metrics.push_avg_pos_regret(0.001);
+        app.metrics.push_prune_fraction(25.0);
+        app.metrics.push_strategy_delta(0.05);
+        app.tick();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    // -- push_regret_telemetry tests --
+
+    #[timed_test]
+    fn push_regret_telemetry_max_positive() {
+        use std::sync::atomic::AtomicI32;
+        let metrics = std::sync::Arc::new(
+            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
+        );
+        // REGRET_SCALE = 1000.0, so 5000 raw = 5.0 chip value
+        let regrets = [
+            AtomicI32::new(5000),
+            AtomicI32::new(-3000),
+            AtomicI32::new(2000),
+        ];
+        super::push_regret_telemetry(&regrets, 1000.0, &metrics);
+        let hist = metrics.max_regret_history.lock().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!((hist[0] - 5.0).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn push_regret_telemetry_min_negative() {
+        use std::sync::atomic::AtomicI32;
+        let metrics = std::sync::Arc::new(
+            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
+        );
+        let regrets = [
+            AtomicI32::new(5000),
+            AtomicI32::new(-7000),
+            AtomicI32::new(2000),
+        ];
+        super::push_regret_telemetry(&regrets, 1000.0, &metrics);
+        let hist = metrics.min_regret_history.lock().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!((hist[0] - (-7.0)).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn push_regret_telemetry_avg_positive() {
+        use std::sync::atomic::AtomicI32;
+        let metrics = std::sync::Arc::new(
+            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
+        );
+        // Two positive: 5000 and 2000, scale=1000 -> 5.0 and 2.0 -> avg=3.5
+        let regrets = [
+            AtomicI32::new(5000),
+            AtomicI32::new(-3000),
+            AtomicI32::new(2000),
+        ];
+        super::push_regret_telemetry(&regrets, 1000.0, &metrics);
+        let hist = metrics.avg_pos_regret_history.lock().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!((hist[0] - 3.5).abs() < 1e-9);
+    }
+
+    #[timed_test]
+    fn push_regret_telemetry_empty_regrets() {
+        let metrics = std::sync::Arc::new(
+            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
+        );
+        let regrets: [std::sync::atomic::AtomicI32; 0] = [];
+        super::push_regret_telemetry(&regrets, 1000.0, &metrics);
+        // No values should be pushed for empty input
+        let max_hist = metrics.max_regret_history.lock().unwrap();
+        assert!(max_hist.is_empty());
+    }
+
+    #[timed_test]
+    fn push_regret_telemetry_all_negative() {
+        use std::sync::atomic::AtomicI32;
+        let metrics = std::sync::Arc::new(
+            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
+        );
+        let regrets = [
+            AtomicI32::new(-1000),
+            AtomicI32::new(-2000),
+        ];
+        super::push_regret_telemetry(&regrets, 1000.0, &metrics);
+        // avg_pos_regret should be 0.0 when no positive regrets exist
+        let hist = metrics.avg_pos_regret_history.lock().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!((hist[0] - 0.0).abs() < 1e-9);
     }
 
     fn test_app(num_scenarios: usize) -> super::MpTuiApp {

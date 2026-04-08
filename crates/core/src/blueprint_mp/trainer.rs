@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
 use super::game_tree::MpGameTree;
 use super::mccfr::{sample_deal, traverse_external};
-use super::storage::MpStorage;
+use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
 use super::MAX_PLAYERS;
 
@@ -92,7 +92,9 @@ fn training_loop(
     iterations: &AtomicU64,
 ) -> TrainResult {
     let max_iters = config.iterations.unwrap_or(u64::MAX);
+    let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE) as i32;
     let mut meta_iter: u64 = 0;
+    let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
 
     loop {
         if meta_iter >= max_iters {
@@ -104,9 +106,11 @@ fn training_loop(
             break;
         }
 
+        let prune = should_prune(meta_iter, config, &mut rng);
         run_batch(
             tree, storage, num_players, bucket_counts,
             rake_rate, rake_cap, batch, meta_iter,
+            prune, scaled_threshold,
         );
         meta_iter += batch;
         iterations.store(meta_iter, Ordering::Relaxed);
@@ -122,6 +126,19 @@ fn training_loop(
     }
 }
 
+/// Determine whether the current batch should use pruning.
+///
+/// Pruning activates after `prune_after_iterations` have elapsed and
+/// applies to `1 - prune_explore_pct` of batches (the rest explore
+/// all actions to avoid permanently losing information).
+fn should_prune(meta_iter: u64, config: &MpTrainingConfig, rng: &mut impl Rng) -> bool {
+    if meta_iter < config.prune_after_iterations {
+        return false;
+    }
+    let explore: f64 = rng.random();
+    explore >= config.prune_explore_pct
+}
+
 fn run_batch(
     tree: &MpGameTree,
     storage: &MpStorage,
@@ -131,6 +148,8 @@ fn run_batch(
     rake_cap: Chips,
     batch_size: u64,
     base_iter: u64,
+    prune: bool,
+    prune_threshold: i32,
 ) {
     (0..batch_size).into_par_iter().for_each(|i| {
         let seed = base_iter.wrapping_add(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -147,6 +166,8 @@ fn run_batch(
                 &mut rng,
                 rake_rate,
                 rake_cap,
+                prune,
+                prune_threshold,
             );
         }
     });
@@ -269,6 +290,7 @@ mod tests {
             lcfr_discount_interval: 50,
             prune_after_iterations: 1_000_000,
             prune_threshold: -250,
+            prune_explore_pct: 0.05,
             batch_size: 10,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.0,
@@ -303,6 +325,7 @@ mod tests {
             lcfr_discount_interval: 50,
             prune_after_iterations: 1_000_000,
             prune_threshold: -250,
+            prune_explore_pct: 0.05,
             batch_size: 10,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.0,
@@ -414,6 +437,51 @@ mod tests {
         config.lcfr_warmup_iterations = 0;
         // interval=50, iter=50 => 50 % 50 == 0
         assert!(should_discount(50, &config));
+    }
+
+    // -- should_prune tests --
+
+    #[timed_test]
+    fn should_prune_false_before_warmup() {
+        let mut config = toy_training_config(1000);
+        config.prune_after_iterations = 100;
+        config.prune_explore_pct = 0.0; // never explore => always prune if past warmup
+        let mut rng = SmallRng::seed_from_u64(42);
+        // iter 50 < prune_after_iterations=100 => never prune
+        assert!(!should_prune(50, &config, &mut rng));
+    }
+
+    #[timed_test]
+    fn should_prune_true_after_warmup_no_explore() {
+        let mut config = toy_training_config(1000);
+        config.prune_after_iterations = 100;
+        config.prune_explore_pct = 0.0; // explore_pct=0 => always prune
+        let mut rng = SmallRng::seed_from_u64(42);
+        assert!(should_prune(200, &config, &mut rng));
+    }
+
+    #[timed_test]
+    fn should_prune_false_when_explore_pct_is_one() {
+        let mut config = toy_training_config(1000);
+        config.prune_after_iterations = 0;
+        config.prune_explore_pct = 1.0; // explore_pct=1 => never prune
+        let mut rng = SmallRng::seed_from_u64(42);
+        // rng.random() is in [0,1), always < 1.0, so always explores
+        assert!(!should_prune(200, &config, &mut rng));
+    }
+
+    #[timed_test]
+    fn should_prune_respects_warmup() {
+        let mut config = toy_training_config(1000);
+        config.prune_after_iterations = 500;
+        config.prune_explore_pct = 0.0;
+        let mut rng = SmallRng::seed_from_u64(42);
+        // Before warmup
+        assert!(!should_prune(499, &config, &mut rng));
+        // At warmup boundary
+        assert!(should_prune(500, &config, &mut rng));
+        // After warmup
+        assert!(should_prune(1000, &config, &mut rng));
     }
 
     // -- regret_discount_factors tests --
@@ -559,7 +627,7 @@ mod tests {
         let bucket_counts = [10u16, 10, 10, 10];
         let storage = MpStorage::new(&tree, bucket_counts);
 
-        run_batch(&tree, &storage, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0);
+        run_batch(&tree, &storage, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
 
         let any_nonzero = storage
             .regrets
@@ -574,7 +642,7 @@ mod tests {
         let bucket_counts = [10u16, 10, 10, 10];
         let storage = MpStorage::new(&tree, bucket_counts);
 
-        run_batch(&tree, &storage, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0);
+        run_batch(&tree, &storage, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
 
         let any_nonzero = storage
             .strategy_sums
@@ -589,7 +657,7 @@ mod tests {
         let bucket_counts = [10u16, 10, 10, 10];
         let storage = MpStorage::new(&tree, bucket_counts);
 
-        run_batch(&tree, &storage, 3, bucket_counts, 0.0, Chips::ZERO, 10, 0);
+        run_batch(&tree, &storage, 3, bucket_counts, 0.0, Chips::ZERO, 10, 0, false, 0);
 
         let any_nonzero = storage
             .regrets

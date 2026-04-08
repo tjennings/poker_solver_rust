@@ -2056,6 +2056,9 @@ fn run_mp_with_tui(
         config.training.time_limit_minutes,
     ));
     let shared_iters = Arc::clone(&ctx.iterations);
+    let storage = Arc::clone(&ctx.storage);
+    let tree = Arc::clone(&ctx.tree);
+    let scenario_node_ids: Vec<u32> = scenarios.iter().map(|s| s.node_idx).collect();
     let tui_handle = spawn_mp_tui(
         &metrics, scenarios, tui_config, config.game.num_players,
     );
@@ -2063,7 +2066,10 @@ fn run_mp_with_tui(
     let train_handle = std::thread::spawn(move || {
         run_training(&ctx, &train_config.training, &train_config.game)
     });
-    bridge_iterations(&shared_iters, &metrics, &train_handle);
+    bridge_mp_iterations(
+        &shared_iters, &storage, &tree, &scenario_node_ids,
+        &metrics, &train_handle,
+    );
     metrics.quit_requested.store(true, Ordering::Relaxed);
     let result = train_handle.join().expect("training thread panicked");
     let _ = tui_handle.join();
@@ -2087,22 +2093,54 @@ fn spawn_mp_tui(
     )
 }
 
-fn bridge_iterations<T>(
+fn bridge_mp_iterations<T>(
     source: &Arc<AtomicU64>,
+    storage: &Arc<poker_solver_core::blueprint_mp::storage::MpStorage>,
+    tree: &Arc<poker_solver_core::blueprint_mp::game_tree::MpGameTree>,
+    scenario_node_ids: &[u32],
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     handle: &std::thread::JoinHandle<T>,
 ) {
+    let mut last_telemetry = Instant::now();
+    let telemetry_interval = Duration::from_secs(10);
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
+        if last_telemetry.elapsed() >= telemetry_interval {
+            push_mp_telemetry(storage, tree, scenario_node_ids, metrics, iters);
+            last_telemetry = Instant::now();
+        }
         if handle.is_finished() {
-            let final_iters = source.load(Ordering::Relaxed);
-            metrics.iterations.store(final_iters, Ordering::Relaxed);
+            metrics.iterations.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
             break;
         }
         if metrics.quit_requested.load(Ordering::Relaxed) {
             break;
+        }
+    }
+}
+
+fn push_mp_telemetry(
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
+    scenario_node_ids: &[u32],
+    metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
+    iters: u64,
+) {
+    // Push regret telemetry
+    mp_tui::push_regret_telemetry(
+        &storage.regrets,
+        poker_solver_core::blueprint_mp::storage::REGRET_SCALE,
+        metrics,
+    );
+    // Push strategy grids for each scenario
+    for (idx, &node_idx) in scenario_node_ids.iter().enumerate() {
+        let grid_state = mp_tui_scenarios::extract_mp_grid(tree, storage, node_idx, iters, "");
+        if let Ok(mut grids) = metrics.strategy_grids.lock() {
+            if idx < grids.len() {
+                grids[idx] = Some(grid_state.cells);
+            }
         }
     }
 }

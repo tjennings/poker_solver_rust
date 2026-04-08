@@ -91,6 +91,7 @@ fn build_full_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         lcfr_discount_interval: 50,
         prune_after_iterations: 1_000_000,
         prune_threshold: -250,
+        prune_explore_pct: 0.05,
         batch_size: 10,
         dcfr_alpha: 1.5,
         dcfr_beta: 0.0,
@@ -125,7 +126,7 @@ fn run_iterations(
         for seat in 0..n {
             traverse_external(
                 tree, storage, &buckets, Seat::from_raw(seat),
-                tree.root, &mut rng, 0.0, Chips::ZERO,
+                tree.root, &mut rng, 0.0, Chips::ZERO, false, 0,
             );
         }
     }

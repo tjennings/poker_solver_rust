@@ -176,6 +176,8 @@ pub struct MpTrainingConfig {
     pub prune_after_iterations: u64,
     #[serde(default = "default_prune_threshold")]
     pub prune_threshold: i32,
+    #[serde(default = "default_prune_explore")]
+    pub prune_explore_pct: f64,
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
     #[serde(default = "default_dcfr_alpha")]
@@ -224,6 +226,10 @@ const fn default_prune_after() -> u64 {
 
 const fn default_prune_threshold() -> i32 {
     -250
+}
+
+fn default_prune_explore() -> f64 {
+    0.05
 }
 
 const fn default_batch_size() -> u64 {
@@ -598,6 +604,7 @@ snapshots:
         assert_eq!(cfg.lcfr_discount_interval, 500_000);
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
         assert_eq!(cfg.prune_threshold, -250);
+        assert!((cfg.prune_explore_pct - 0.05).abs() < f64::EPSILON);
         assert_eq!(cfg.batch_size, 200);
         assert!((cfg.dcfr_alpha - 1.5).abs() < f64::EPSILON);
         assert!((cfg.dcfr_beta).abs() < f64::EPSILON);
