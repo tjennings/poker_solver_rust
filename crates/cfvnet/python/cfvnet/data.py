@@ -205,16 +205,22 @@ def _load_bulk(files: list[Path]) -> BoundaryDataset:
     # Count total records across all files.
     total = 0
     file_counts: list[int] = []
+    skipped = 0
     for f in files:
         n = _count_records_in_file(f)
         if n < 0:
-            # Fall back to slow path for non-standard files
-            print(f"  Warning: {f.name} has non-standard size, using slow reader")
-            records = read_records_from_path(f)
-            items = [encode_boundary_record(r) for r in records]
-            return BoundaryDataset(items)
+            print(f"  Skipping {f.name}: non-standard record size")
+            skipped += 1
+            file_counts.append(0)
+            continue
+        if n == 0:
+            file_counts.append(0)
+            continue
         file_counts.append(n)
         total += n
+
+    if skipped > 0:
+        print(f"  Skipped {skipped} files with non-standard record sizes")
 
     print(f"  Loading {total:,} records from {len(files)} files...")
 
