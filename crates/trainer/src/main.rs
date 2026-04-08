@@ -7,6 +7,7 @@ mod blueprint_tui_resolve;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod inspect_spot;
+mod mp_tui;
 mod mp_tui_scenarios;
 mod mp_tui_widgets;
 #[allow(dead_code)]
