@@ -19,6 +19,94 @@ cargo run -p poker-solver-trainer --release -- train-blueprint \
   -c sample_configurations/blueprint_v2_with_tui.yaml
 ```
 
+### train-blueprint-mp
+
+Train a multiplayer (2-8 player) blueprint strategy using external-sampling MCCFR.
+
+```bash
+cargo run -p poker-solver-trainer --release -- train-blueprint-mp <config.yaml>
+```
+
+#### Config Format
+
+The N-player config uses a different format from the 2-player `train-blueprint` command:
+
+```yaml
+game:
+  name: "6-max 100bb BB-ante"
+  num_players: 6
+  stack_depth: 200        # chips (1 BB = 2 chips)
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1
+    - seat: 1
+      type: big_blind
+      amount: 2
+    - seat: 1
+      type: bb_ante
+      amount: 2
+
+action_abstraction:
+  preflop:
+    lead: ["5bb", "6bb"]        # opening raise sizes
+    raise:
+      - ["3.0x"]                 # 3-bet sizes (first raise depth)
+      - ["2.5x"]                 # 4-bet+ sizes (repeats for deeper)
+  flop:
+    lead: [0.33, 0.67, 1.0]     # pot fractions for opening bets
+    raise:
+      - [0.5, 1.0, 2.0]         # raise sizes (first raise)
+  turn:
+    lead: [0.5, 1.0]
+    raise:
+      - [0.67, 1.0]
+  river:
+    lead: [0.5, 1.0]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+training:
+  iterations: 100000
+  batch_size: 200
+  dcfr_alpha: 1.5
+  dcfr_beta: 0.0
+  dcfr_gamma: 2.0
+  lcfr_warmup_iterations: 5000000
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/data/blueprint_mp_6p"
+```
+
+#### Key Differences from `train-blueprint`
+
+| Feature | `train-blueprint` (v2) | `train-blueprint-mp` |
+|---------|----------------------|---------------------|
+| Players | 2 only | 2-8 |
+| Blind structure | `small_blind` + `big_blind` fields | Per-seat `blinds` list with types |
+| Bet sizing | Per-street, indexed by raise depth | Lead/raise split per street |
+| Info key | 64-bit, 6 action slots | 128-bit, 22 action slots |
+| Side pots | N/A (2 players) | Full multi-way resolution |
+
+#### Sample Configs
+
+- `sample_configurations/blueprint_mp_3player.yaml` -- 3-player 50bb test
+- `sample_configurations/blueprint_mp_6player_ante.yaml` -- 6-player 100bb with BB-ante
+
+---
+
 ### range-solve
 
 Solve a postflop spot with exact (no abstraction) Discounted CFR. Uses the `range-solver` crate -- a self-contained reimplementation of b-inary/postflop-solver producing identical output.

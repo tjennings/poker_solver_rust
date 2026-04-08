@@ -25,6 +25,7 @@ poker_solver_rust/
 │   │       ├── game/          # Action/Player types, HunlPostflop game
 │   │       ├── cfr/           # CFR utilities (regret matching, shared DCFR/LCFR logic)
 │   │       ├── blueprint_v2/  # MCCFR blueprint trainer, strategy storage, config
+│   │       ├── blueprint_mp/  # N-player (2-8) MCCFR blueprint trainer
 │   │       ├── abstraction/   # Card abstraction (isomorphism, EHS2, HandClassV2)
 │   │       ├── hand_class.rs  # 19-variant hand classification system
 │   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
@@ -142,6 +143,36 @@ All variants store canonical `PackedBoard` entries in the `BucketFile.boards` fi
 - K-means: `crates/core/src/blueprint_v2/clustering.rs`
 - Diagnostics: `crates/core/src/blueprint_v2/cluster_diagnostics.rs`
 - Config: `crates/core/src/blueprint_v2/config.rs` (`ClusteringConfig`)
+
+## N-Player Blueprint (`blueprint_mp`)
+
+A clean-room N-player (2-8) MCCFR solver module alongside the existing `blueprint_v2`. Uses strong domain types and supports configurable blind/ante structures.
+
+### Module Structure
+
+```
+crates/core/src/blueprint_mp/
+├── types.rs            # Domain types: Seat, PlayerSet, Chips, Bucket, Street, Deal
+├── config.rs           # BlueprintMpConfig with lead/raise split, ForcedBet blinds
+├── game_tree.rs        # N-player game tree with fold-continuation
+├── info_key.rs         # 128-bit InfoKey (seat + bucket + street + SPR + 22 actions)
+├── terminal.rs         # Side pot resolution, showdown, fold payoffs
+├── storage.rs          # Flat-buffer atomic regret/strategy storage
+├── mccfr.rs            # External-sampling MCCFR traversal (Pluribus-style)
+├── trainer.rs          # Training loop with per-seat traverser cycling, DCFR
+└── exploitability.rs   # Per-seat best-response diagnostic
+```
+
+### Key Design Decisions
+
+- **2-8 players** with `MAX_PLAYERS = 8`
+- **Configurable blinds**: SB, BB, ante, BB-ante, straddle via per-seat config
+- **Lead/raise split**: Separate bet sizes for opening bets vs raises
+- **Full side pot resolution** at showdown terminals
+- **128-bit info set keys** with 22 action slots (panics on overflow)
+- **Pre-allocated storage** (lazy allocation planned as future optimization)
+- **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
+- Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ## Range Solver (Exact Postflop Solver)
 
