@@ -13,4 +13,6 @@ pub const MAX_PLAYERS: usize = 8;
 
 pub use config::*;
 pub use info_key::InfoKey128;
-pub use types::{Bucket, Chips, Deal, DealWithBuckets, PlayerSet, Seat, Street};
+pub use types::{
+    parse_position, position_label, Bucket, Chips, Deal, DealWithBuckets, PlayerSet, Seat, Street,
+};
