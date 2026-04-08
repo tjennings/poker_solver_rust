@@ -227,8 +227,16 @@ impl MpGameTree {
             nodes: Vec::new(),
         };
         let root = builder.build_node(&state);
+        let nodes = builder.nodes;
+        let decision_count = nodes.iter().filter(|n| matches!(n, MpGameNode::Decision { .. })).count();
+        let chance_count = nodes.iter().filter(|n| matches!(n, MpGameNode::Chance { .. })).count();
+        let terminal_count = nodes.iter().filter(|n| matches!(n, MpGameNode::Terminal { .. })).count();
+        eprintln!(
+            "  MP Tree: {} nodes ({} decision, {} chance, {} terminal)",
+            nodes.len(), decision_count, chance_count, terminal_count,
+        );
         Self {
-            nodes: builder.nodes,
+            nodes,
             root,
             num_players: config.num_players,
             starting_stack: stack,

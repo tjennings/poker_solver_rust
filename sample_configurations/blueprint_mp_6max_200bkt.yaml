@@ -1,0 +1,99 @@
+# Blueprint MP Config — 100BB 6-max, 200 buckets, DCFR
+# Coarse blueprint (Pluribus-style): fine preflop, coarse postflop.
+# Postflop quality comes from subgame re-solving, not the blueprint.
+game:
+  name: "6-max 100bb Apr 8"
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 4
+      type: small_blind
+      amount: 1
+    - seat: 5
+      type: big_blind
+      amount: 2
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+action_abstraction:
+  # Preflop: fine (played directly from blueprint, never re-solved)
+  preflop:
+    lead: ["2bb"]
+    raise:
+      - ["3.0x"]
+      - ["2.5x"]
+  # Postflop: coarse (1 lead + 1 raise depth + all-in)
+  # Real-time subgame solving adds finer sizes at query time
+  flop:
+    lead: [0.67]
+    raise:
+      - [2.0]
+  turn:
+    lead: [0.67]
+    raise:
+      - [2.0]
+  river:
+    lead: [0.67]
+    raise:
+      - [2.0]
+
+training:
+  cluster_path: "./local_data/buckets/200_v1"
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 300000000
+  prune_after_iterations: 100000000
+  prune_threshold: -250000
+  batch_size: 2000
+  dcfr_alpha: 1.5
+  dcfr_beta: 0.0
+  dcfr_gamma: 2.0
+  exploitability_interval_minutes: 30
+  exploitability_samples: 10000
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/mp_6max_100bb_200bkt"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 20
+    sparkline_window: 60
+  scenarios:
+    # Page 1: Opening ranges
+    - name: "UTG open"
+      spot: ""
+    - name: "HJ open"
+      spot: "utg:fold"
+    - name: "CO open"
+      spot: "utg:fold,hj:fold"
+    - name: "BTN open"
+      spot: "utg:fold,hj:fold,co:fold"
+    - name: "SB open"
+      spot: "utg:fold,hj:fold,co:fold,btn:fold"
+    - name: "BB vs limp"
+      spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:call"
+    # Page 2: 3-bet ranges vs UTG
+    - name: "HJ vs UTG"
+      spot: "utg:5bb"
+    - name: "CO vs UTG"
+      spot: "utg:5bb,hj:fold"
+    - name: "BTN vs UTG"
+      spot: "utg:5bb,hj:fold,co:fold"
+    - name: "SB vs UTG"
+      spot: "utg:5bb,hj:fold,co:fold,btn:fold"
+    - name: "BB vs UTG"
+      spot: "utg:5bb,hj:fold,co:fold,btn:fold,sb:fold"
+    - name: "BTN vs CO"
+      spot: "utg:fold,hj:fold,co:5bb"

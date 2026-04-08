@@ -42,6 +42,15 @@ impl MpStorage {
     #[must_use]
     pub fn new(tree: &MpGameTree, bucket_counts: [u16; 4]) -> Self {
         let (layout, total) = build_layout(&tree.nodes, bucket_counts);
+        let decision_count = tree.nodes.iter().filter(|n| matches!(n, MpGameNode::Decision { .. })).count();
+        let regret_bytes = total * std::mem::size_of::<AtomicI32>();
+        let strat_bytes = total * std::mem::size_of::<AtomicI64>();
+        let total_bytes = regret_bytes + strat_bytes;
+        eprintln!(
+            "  MP Storage: {} nodes ({} decision), {} slots ({:.1} GB regret + {:.1} GB strategy = {:.1} GB total)",
+            tree.nodes.len(), decision_count, total,
+            regret_bytes as f64 / 1e9, strat_bytes as f64 / 1e9, total_bytes as f64 / 1e9,
+        );
         Self {
             regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
             strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
