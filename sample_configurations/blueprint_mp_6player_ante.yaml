@@ -52,3 +52,19 @@ snapshots:
   warmup_minutes: 10
   snapshot_every_minutes: 10
   output_dir: "/tmp/blueprint_mp_6p"
+
+tui:
+  enabled: false
+  scenarios:
+    - name: "UTG open"
+      spot: ""
+    - name: "HJ vs UTG"
+      spot: "utg:5bb"
+    - name: "CO vs UTG"
+      spot: "utg:5bb,hj:fold"
+    - name: "BTN vs UTG"
+      spot: "utg:5bb,hj:fold,co:fold"
+    - name: "SB vs UTG"
+      spot: "utg:5bb,hj:fold,co:fold,btn:fold"
+    - name: "BB vs UTG"
+      spot: "utg:5bb,hj:fold,co:fold,btn:fold,sb:fold"

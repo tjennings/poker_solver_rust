@@ -16,6 +16,7 @@ use crate::mp_tui_widgets::{compact_grid_height, compact_grid_width, compute_gri
 pub const GRIDS_PER_PAGE: usize = 6;
 
 /// A scenario resolved to an MP game-tree node with its hand grid.
+#[allow(dead_code)] // Fields consumed by TUI metrics integration (Task 6).
 pub struct ResolvedMpScenario {
     pub name: String,
     pub node_idx: u32,

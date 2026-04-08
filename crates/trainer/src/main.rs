@@ -52,6 +52,9 @@ enum Commands {
         /// YAML config file (BlueprintMpConfig)
         #[arg(short, long)]
         config: PathBuf,
+        /// Disable the TUI dashboard even when tui.enabled is true in config
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Run the clustering pipeline to build bucket assignments (Blueprint V2)
     Cluster {
@@ -585,8 +588,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             eprintln!("\nTraining complete: {} iterations", trainer.iterations);
         }
-        Commands::TrainBlueprintMp { config } => {
-            run_train_blueprint_mp(config.to_str().expect("invalid config path"))?;
+        Commands::TrainBlueprintMp { config, no_tui } => {
+            run_train_blueprint_mp(config.to_str().expect("invalid config path"), no_tui)?;
         }
         Commands::Cluster { config, output } => {
             let yaml = std::fs::read_to_string(&config)?;
@@ -2014,25 +2017,87 @@ fn format_board_suffix(turn: Option<&str>, river: Option<&str>) -> String {
 // N-player blueprint training
 // ---------------------------------------------------------------------------
 
-fn run_train_blueprint_mp(path: &str) -> Result<(), Box<dyn Error>> {
+fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(path)?;
     let config: BlueprintMpConfig = serde_yaml::from_str(&yaml)?;
     config
         .game
         .validate()
         .map_err(|e| format!("invalid config: {e}"))?;
+    let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
     eprintln!(
         "Starting N-player blueprint training: {} ({} players, {}bb deep)",
         config.game.name,
         config.game.num_players,
         config.game.stack_depth / 2.0
     );
-    let result = train_blueprint_mp(&config);
-    eprintln!(
-        "Training complete: {} meta-iterations",
-        result.meta_iterations
-    );
+    if tui_config.enabled && !no_tui {
+        run_mp_with_tui(&config, &tui_config)?;
+    } else {
+        let result = train_blueprint_mp(&config);
+        eprintln!("Training complete: {} meta-iterations", result.meta_iterations);
+    }
     Ok(())
+}
+
+fn run_mp_with_tui(
+    config: &BlueprintMpConfig,
+    tui_config: &blueprint_tui_config::BlueprintTuiConfig,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
+    let tree = MpGameTree::build(&config.game, &config.action_abstraction);
+    let scenarios = resolve_tui_scenarios(&tree, &tui_config.scenarios, config.game.num_players);
+    let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
+        config.training.iterations,
+        config.training.time_limit_minutes,
+    ));
+    let refresh = Duration::from_millis(tui_config.refresh_rate_ms);
+    let tui_handle = mp_tui::run_mp_tui(
+        Arc::clone(&metrics),
+        scenarios,
+        tui_config.telemetry.clone(),
+        refresh,
+        config.game.num_players,
+    );
+    let result = train_blueprint_mp(config);
+    metrics
+        .quit_requested
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = tui_handle.join();
+    eprintln!("Training complete: {} meta-iterations", result.meta_iterations);
+    Ok(())
+}
+
+fn resolve_tui_scenarios(
+    tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
+    configs: &[blueprint_tui_config::ScenarioConfig],
+    num_players: u8,
+) -> Vec<mp_tui::ResolvedMpScenario> {
+    configs
+        .iter()
+        .filter_map(|sc| {
+            let (node_idx, _board) = mp_tui_scenarios::resolve_mp_spot(tree, &sc.spot, num_players)?;
+            Some(mp_tui::ResolvedMpScenario {
+                name: sc.name.clone(),
+                node_idx,
+                grid: default_hand_grid_state(&sc.name),
+            })
+        })
+        .collect()
+}
+
+fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
+    blueprint_tui_widgets::HandGridState {
+        cells: std::array::from_fn(|_| std::array::from_fn(|_| Default::default())),
+        prev_cells: None,
+        scenario_name: name.to_string(),
+        action_path: vec![],
+        board_display: None,
+        cluster_id: None,
+        street_label: "Preflop".to_string(),
+        iteration_at_snapshot: 0,
+        error_message: None,
+    }
 }
 
 #[cfg(test)]
@@ -2215,7 +2280,7 @@ mod tests {
     /// run_train_blueprint_mp returns an error for a non-existent file.
     #[timed_test]
     fn run_train_blueprint_mp_missing_file_errors() {
-        let result = super::run_train_blueprint_mp("/tmp/nonexistent_mp_config.yaml");
+        let result = super::run_train_blueprint_mp("/tmp/nonexistent_mp_config.yaml", false);
         assert!(result.is_err());
     }
 
@@ -2225,7 +2290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.yaml");
         std::fs::write(&path, "not: valid: blueprint: mp: config: [").unwrap();
-        let result = super::run_train_blueprint_mp(path.to_str().unwrap());
+        let result = super::run_train_blueprint_mp(path.to_str().unwrap(), false);
         assert!(result.is_err());
     }
 
@@ -2281,7 +2346,96 @@ snapshots:
   output_dir: "/tmp/bad"
 "#;
         std::fs::write(&path, yaml).unwrap();
-        let result = super::run_train_blueprint_mp(path.to_str().unwrap());
+        let result = super::run_train_blueprint_mp(path.to_str().unwrap(), false);
         assert!(result.is_err(), "should reject num_players=99");
+    }
+
+    /// The 6-player ante sample config should have a tui section after update.
+    #[timed_test]
+    fn mp_6player_tui_section_parses() {
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_mp_6player_ante.yaml"
+        ))
+        .expect("blueprint_mp_6player_ante.yaml must exist");
+        let tui_cfg = crate::blueprint_tui_config::parse_tui_config(&yaml);
+        // TUI should be disabled by default but scenarios should be present
+        assert!(!tui_cfg.enabled);
+        assert!(!tui_cfg.scenarios.is_empty(), "should have TUI scenarios");
+    }
+
+    /// The train-blueprint-mp subcommand should accept --no-tui.
+    #[timed_test]
+    fn train_blueprint_mp_no_tui_cli_parses() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "train-blueprint-mp",
+            "--config",
+            "/tmp/test.yaml",
+            "--no-tui",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "train-blueprint-mp --no-tui must parse: {:?}",
+            cli.err()
+        );
+    }
+
+    /// resolve_tui_scenarios should produce ResolvedMpScenario from configs.
+    #[timed_test(10)]
+    fn resolve_tui_scenarios_from_tree() {
+        use poker_solver_core::blueprint_mp::config::*;
+        use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
+
+        fn yaml_f64(v: f64) -> serde_yaml::Value {
+            serde_yaml::Value::Number(serde_yaml::Number::from(v))
+        }
+
+        let game = MpGameConfig {
+            name: "test".into(),
+            num_players: 6,
+            stack_depth: 200.0,
+            blinds: vec![
+                ForcedBet { seat: 4, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
+                ForcedBet { seat: 5, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("5bb".into())],
+            raise: vec![vec![serde_yaml::Value::String("5bb".into())]],
+        };
+        let postflop = MpStreetSizes {
+            lead: vec![yaml_f64(0.67)],
+            raise: vec![vec![yaml_f64(1.0)]],
+        };
+        let action = MpActionAbstractionConfig {
+            preflop,
+            flop: postflop.clone(),
+            turn: postflop.clone(),
+            river: postflop,
+        };
+        let tree = MpGameTree::build(&game, &action);
+        let scenarios = vec![
+            crate::blueprint_tui_config::ScenarioConfig {
+                name: "UTG open".into(),
+                spot: String::new(),
+            },
+            crate::blueprint_tui_config::ScenarioConfig {
+                name: "HJ vs UTG".into(),
+                spot: "utg:5bb".into(),
+            },
+            crate::blueprint_tui_config::ScenarioConfig {
+                name: "Invalid spot".into(),
+                spot: "xyz:999bb".into(),
+            },
+        ];
+        let resolved = super::resolve_tui_scenarios(&tree, &scenarios, 6);
+        // First two should resolve; third should be filtered out
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "UTG open");
+        assert_eq!(resolved[1].name, "HJ vs UTG");
     }
 }
