@@ -1,9 +1,11 @@
 pub mod config;
+pub mod exploitability;
 pub mod game_tree;
 pub mod info_key;
 pub mod mccfr;
 pub mod storage;
 pub mod terminal;
+pub mod trainer;
 pub mod types;
 
 /// Maximum number of players supported in multiplayer blueprints.
