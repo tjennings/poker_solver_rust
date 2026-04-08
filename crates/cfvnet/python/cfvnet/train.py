@@ -31,7 +31,7 @@ def train_boundary(
     output_dir: Path | None,
     device: torch.device,
     num_workers: int = 4,
-    gpu_buffer_size: int = 2_000_000,
+    gpu_buffer_size: int = 1_000_000,
 ) -> TrainResult:
     """Train a BoundaryNet model.
 
