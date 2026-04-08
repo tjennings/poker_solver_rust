@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,6 +106,7 @@ def _train_with_gpu_buffer(
     steps_per_epoch = max(buf._total_records // config.batch_size, 1)
 
     final_loss = float("inf")
+    best_val_huber = float("inf")
     prep_thread: threading.Thread | None = None
     pending_ctx: dict | None = None
     prep_lock = threading.Lock()
@@ -171,6 +173,15 @@ def _train_with_gpu_buffer(
         _maybe_save_checkpoint(
             model, optimizer, scheduler, scaler, epoch, config, output_dir, losses,
         )
+
+        # Save best model by val huber loss.
+        if output_dir and val_huber < best_val_huber and not math.isnan(val_huber):
+            best_val_huber = val_huber
+            _save_checkpoint(
+                model, optimizer, scheduler, scaler, epoch + 1, output_dir, losses,
+                filename="best.pt",
+            )
+            print(f"  New best val_huber={val_huber:.6f} at epoch {epoch + 1}")
 
     if prep_thread is not None:
         prep_thread.join()
@@ -415,9 +426,10 @@ def _save_checkpoint(
     epoch: int,
     output_dir: Path,
     losses: dict[str, float] | None = None,
+    filename: str | None = None,
 ) -> None:
     """Save training checkpoint with optional loss values."""
-    path = output_dir / f"checkpoint_epoch{epoch}.pt"
+    path = output_dir / (filename or f"checkpoint_epoch{epoch}.pt")
     data = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
