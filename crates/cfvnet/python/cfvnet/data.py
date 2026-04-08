@@ -434,13 +434,16 @@ class BoundaryDataset:
 class LazyBoundaryDataset:
     """Memory-efficient dataset that reads records from disk on demand.
 
-    Builds an index of (file_path, byte_offset) at init (fast — just stats
-    each file). Records are decoded in __getitem__, called by DataLoader
-    workers in parallel. Uses negligible RAM regardless of dataset size.
+    Builds an index of (file_index, byte_offset) at init. Records are decoded
+    in __getitem__, called by DataLoader workers in parallel. Each worker
+    maintains its own file handle cache to avoid open/close per record.
+    Uses negligible RAM regardless of dataset size.
     """
 
     def __init__(self, files: list[Path]) -> None:
-        self._index: list[tuple[Path, int]] = []
+        self._files: list[Path] = []
+        # (file_index, byte_offset) per record
+        self._index: list[tuple[int, int]] = []
         skipped = 0
         for f in files:
             n = _count_records_in_file(f)
@@ -448,12 +451,18 @@ class LazyBoundaryDataset:
                 if n < 0:
                     skipped += 1
                 continue
+            file_idx = len(self._files)
+            self._files.append(f)
             for i in range(n):
-                self._index.append((f, i * RECORD_SIZE_RIVER))
+                self._index.append((file_idx, i * RECORD_SIZE_RIVER))
+
+        # Per-worker file handle cache (populated lazily in __getitem__).
+        # Each DataLoader worker is a separate process with its own copy.
+        self._handle_cache: dict[int, object] = {}
 
         if skipped > 0:
             print(f"  Skipped {skipped} files with non-standard record sizes")
-        print(f"  Indexed {len(self._index):,} records from {len(files)} files")
+        print(f"  Indexed {len(self._index):,} records from {len(self._files)} files")
 
     @classmethod
     def from_path(cls, path: Path) -> LazyBoundaryDataset:
@@ -474,20 +483,22 @@ class LazyBoundaryDataset:
     def __getitem__(self, idx: int) -> tuple:
         """Read and encode a single record from disk.
 
-        Called by DataLoader workers — each worker has its own file handles.
+        Called by DataLoader workers — each worker maintains its own
+        file handle cache for fast repeated access.
         """
-        file_path, byte_offset = self._index[idx]
-        raw = _read_raw_record(file_path, byte_offset)
+        file_idx, byte_offset = self._index[idx]
+        raw = self._read_record(file_idx, byte_offset)
         return _encode_raw_to_tensors(raw)
 
-
-def _read_raw_record(path: Path, offset: int) -> np.ndarray:
-    """Read a single record's raw bytes from a file at a given offset."""
-    buf = np.empty(RECORD_SIZE_RIVER, dtype=np.uint8)
-    with open(path, "rb") as f:
-        f.seek(offset)
-        f.readinto(buf)  # type: ignore[arg-type]
-    return buf
+    def _read_record(self, file_idx: int, offset: int) -> np.ndarray:
+        """Read a single record using cached file handles."""
+        fh = self._handle_cache.get(file_idx)
+        if fh is None:
+            fh = open(self._files[file_idx], "rb")  # noqa: SIM115
+            self._handle_cache[file_idx] = fh
+        fh.seek(offset)
+        buf = fh.read(RECORD_SIZE_RIVER)
+        return np.frombuffer(buf, dtype=np.uint8).copy()
 
 
 def _encode_raw_to_tensors(raw: np.ndarray) -> tuple:

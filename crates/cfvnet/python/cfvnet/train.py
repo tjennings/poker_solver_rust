@@ -137,7 +137,7 @@ def _make_dataloader(
     dataset: LazyBoundaryDataset,
     batch_size: int,
     shuffle: bool,
-    num_workers: int = 4,
+    num_workers: int = 8,
 ) -> DataLoader:
     """Create a DataLoader with pin_memory for GPU transfer.
 
