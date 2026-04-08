@@ -1,4 +1,4 @@
-use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
 use super::MAX_PLAYERS;
 
@@ -172,6 +172,58 @@ impl Mul<u8> for Chips {
     }
 }
 
+impl Div<f64> for Chips {
+    type Output = Self;
+    fn div(self, rhs: f64) -> Self {
+        Self(self.0 / rhs)
+    }
+}
+
+impl Neg for Chips {
+    type Output = Self;
+    fn neg(self) -> Self {
+        Self(-self.0)
+    }
+}
+
+impl std::iter::Sum for Chips {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::ZERO, |acc, x| acc + x)
+    }
+}
+
+impl<'a> std::iter::Sum<&'a Chips> for Chips {
+    fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
+        iter.fold(Self::ZERO, |acc, &x| acc + x)
+    }
+}
+
+impl Chips {
+    /// Clamp to `[min, max]` range.
+    #[must_use]
+    pub fn clamp(self, min: Self, max: Self) -> Self {
+        if self.0 < min.0 {
+            min
+        } else if self.0 > max.0 {
+            max
+        } else {
+            self
+        }
+    }
+
+    /// Return the smaller of `self` and `other`.
+    #[must_use]
+    pub fn min(self, other: Self) -> Self {
+        if self.0 <= other.0 { self } else { other }
+    }
+
+    /// Return the larger of `self` and `other`.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        if self.0 >= other.0 { self } else { other }
+    }
+}
+
 // === Bucket ===
 
 /// Bucket index for hand abstraction.
@@ -218,6 +270,17 @@ impl Street {
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+}
+
+impl std::fmt::Display for Street {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preflop => f.write_str("preflop"),
+            Self::Flop => f.write_str("flop"),
+            Self::Turn => f.write_str("turn"),
+            Self::River => f.write_str("river"),
+        }
     }
 }
 
@@ -458,5 +521,72 @@ mod tests {
     #[timed_test]
     fn bucket_default_is_zero() {
         assert_eq!(Bucket::default(), Bucket(0));
+    }
+
+    // ── Chips additional ops tests ──
+
+    #[timed_test]
+    fn chips_neg() {
+        assert_eq!(-Chips(10.0), Chips(-10.0));
+        assert_eq!(-Chips(-5.0), Chips(5.0));
+        assert_eq!(-Chips::ZERO, Chips::ZERO);
+    }
+
+    #[timed_test]
+    fn chips_div_f64() {
+        assert_eq!(Chips(10.0) / 2.0, Chips(5.0));
+        assert_eq!(Chips(100.0) / 3.0, Chips(100.0 / 3.0));
+    }
+
+    #[timed_test]
+    fn chips_sum_owned() {
+        let chips = vec![Chips(1.0), Chips(2.0), Chips(3.0)];
+        let total: Chips = chips.into_iter().sum();
+        assert_eq!(total, Chips(6.0));
+    }
+
+    #[timed_test]
+    fn chips_sum_ref() {
+        let chips = [Chips(10.0), Chips(20.0), Chips(30.0)];
+        let total: Chips = chips.iter().sum();
+        assert_eq!(total, Chips(60.0));
+    }
+
+    #[timed_test]
+    fn chips_sum_empty() {
+        let chips: Vec<Chips> = vec![];
+        let total: Chips = chips.into_iter().sum();
+        assert_eq!(total, Chips::ZERO);
+    }
+
+    #[timed_test]
+    fn chips_clamp_within_range() {
+        assert_eq!(Chips(5.0).clamp(Chips(1.0), Chips(10.0)), Chips(5.0));
+    }
+
+    #[timed_test]
+    fn chips_clamp_below_min() {
+        assert_eq!(Chips(-1.0).clamp(Chips::ZERO, Chips(10.0)), Chips::ZERO);
+    }
+
+    #[timed_test]
+    fn chips_clamp_above_max() {
+        assert_eq!(Chips(15.0).clamp(Chips::ZERO, Chips(10.0)), Chips(10.0));
+    }
+
+    #[timed_test]
+    fn chips_min_max() {
+        assert_eq!(Chips(3.0).min(Chips(5.0)), Chips(3.0));
+        assert_eq!(Chips(3.0).max(Chips(5.0)), Chips(5.0));
+    }
+
+    // ── Street Display tests ──
+
+    #[timed_test]
+    fn street_display_all_variants() {
+        assert_eq!(format!("{}", Street::Preflop), "preflop");
+        assert_eq!(format!("{}", Street::Flop), "flop");
+        assert_eq!(format!("{}", Street::Turn), "turn");
+        assert_eq!(format!("{}", Street::River), "river");
     }
 }
