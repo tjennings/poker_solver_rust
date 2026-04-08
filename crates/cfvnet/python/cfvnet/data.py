@@ -391,10 +391,9 @@ class BoundaryDataset:
 
     @classmethod
     def from_path(cls, path: Path) -> BoundaryDataset:
-        """Load from a file or directory of .bin files.
+        """Load from a file or directory of .bin files into memory.
 
-        Uses fast bulk loading for large datasets (reads directly into numpy
-        arrays without Python object intermediary).
+        For large datasets that don't fit in RAM, use LazyBoundaryDataset instead.
 
         Args:
             path: Single .bin file or directory containing .bin files.
@@ -430,3 +429,75 @@ class BoundaryDataset:
             self._game_values[idx],
             self._sample_weights[idx],
         )
+
+
+class LazyBoundaryDataset:
+    """Memory-efficient dataset that reads records from disk on demand.
+
+    Builds an index of (file_path, byte_offset) at init (fast — just stats
+    each file). Records are decoded in __getitem__, called by DataLoader
+    workers in parallel. Uses negligible RAM regardless of dataset size.
+    """
+
+    def __init__(self, files: list[Path]) -> None:
+        self._index: list[tuple[Path, int]] = []
+        skipped = 0
+        for f in files:
+            n = _count_records_in_file(f)
+            if n <= 0:
+                if n < 0:
+                    skipped += 1
+                continue
+            for i in range(n):
+                self._index.append((f, i * RECORD_SIZE_RIVER))
+
+        if skipped > 0:
+            print(f"  Skipped {skipped} files with non-standard record sizes")
+        print(f"  Indexed {len(self._index):,} records from {len(files)} files")
+
+    @classmethod
+    def from_path(cls, path: Path) -> LazyBoundaryDataset:
+        """Create a lazy dataset from a file or directory.
+
+        Args:
+            path: Single .bin file or directory containing .bin files.
+
+        Returns:
+            LazyBoundaryDataset ready for use with DataLoader.
+        """
+        files = _resolve_bin_files(path)
+        return cls(files)
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int) -> tuple:
+        """Read and encode a single record from disk.
+
+        Called by DataLoader workers — each worker has its own file handles.
+        """
+        file_path, byte_offset = self._index[idx]
+        raw = _read_raw_record(file_path, byte_offset)
+        return _encode_raw_to_tensors(raw)
+
+
+def _read_raw_record(path: Path, offset: int) -> np.ndarray:
+    """Read a single record's raw bytes from a file at a given offset."""
+    buf = np.empty(RECORD_SIZE_RIVER, dtype=np.uint8)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        f.readinto(buf)  # type: ignore[arg-type]
+    return buf
+
+
+def _encode_raw_to_tensors(raw: np.ndarray) -> tuple:
+    """Decode raw bytes into the 6-tuple returned by __getitem__."""
+    inp = np.zeros(INPUT_SIZE, dtype=np.float32)
+    target = np.zeros(NUM_COMBOS, dtype=np.float32)
+    mask = np.zeros(NUM_COMBOS, dtype=np.float32)
+    player_range = np.zeros(NUM_COMBOS, dtype=np.float32)
+    gv = np.zeros(1, dtype=np.float32)
+    sw = np.zeros(1, dtype=np.float32)
+
+    _decode_single_record(raw, 0, inp, target, mask, player_range, gv, sw, 0)
+    return inp, target, mask, player_range, gv[0], sw[0]

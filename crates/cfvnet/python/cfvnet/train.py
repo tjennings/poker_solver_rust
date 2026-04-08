@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, random_split
 
 from cfvnet.config import TrainConfig
-from cfvnet.data import BoundaryDataset
+from cfvnet.data import LazyBoundaryDataset
 from cfvnet.loss import boundary_loss
 from cfvnet.model import BoundaryNet
 
@@ -44,7 +44,7 @@ def train_boundary(
     Returns:
         TrainResult with final training loss.
     """
-    dataset = BoundaryDataset.from_path(data_path)
+    dataset = LazyBoundaryDataset.from_path(data_path)
     train_ds, val_ds = _split_dataset(dataset, config.validation_split)
     train_loader = _make_dataloader(train_ds, config.batch_size, shuffle=True,
                                     num_workers=num_workers)
@@ -112,9 +112,9 @@ def _format_epoch_msg(
 
 
 def _split_dataset(
-    dataset: BoundaryDataset,
+    dataset: LazyBoundaryDataset,
     val_split: float,
-) -> tuple[BoundaryDataset, BoundaryDataset | None]:
+) -> tuple[LazyBoundaryDataset, LazyBoundaryDataset | None]:
     """Split dataset into train and val sets.
 
     Args:
@@ -134,7 +134,7 @@ def _split_dataset(
 
 
 def _make_dataloader(
-    dataset: BoundaryDataset,
+    dataset: LazyBoundaryDataset,
     batch_size: int,
     shuffle: bool,
     num_workers: int = 4,
