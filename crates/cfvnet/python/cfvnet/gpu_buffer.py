@@ -1,12 +1,13 @@
-"""GPU ring buffer for training data with shared-memory refill pipeline.
+"""GPU ring buffer with shared-memory refill pipeline.
 
 Architecture:
-  - GPU buffer: large contiguous tensors on GPU, sampled for training
-  - CPU staging ring: shared-memory numpy arrays, workers write encoded records
-  - Reader processes: read from disk, encode, write to staging (no pickle)
-  - Upload thread: batch-copies staging → GPU, replaces consumed slots
+  - GPU buffer: 1M+ records as contiguous tensors on GPU
+  - CPU staging ring: shared-memory numpy arrays (no pickle)
+  - Reader processes: continuously read random records, encode, write to staging
+  - Upload thread: batch-copies ready staging slots to GPU
 
-No per-record serialization. Workers write directly to shared memory.
+Readers run independently — they don't wait for training to consume records.
+They continuously replace random GPU slots with fresh data from disk.
 """
 
 from __future__ import annotations
@@ -29,26 +30,16 @@ from cfvnet.data import (
     _resolve_bin_files,
 )
 
-# Staging slot states.
-_SLOT_EMPTY = 0
-_SLOT_WRITING = 1
-_SLOT_READY = 2
+# Staging slot states (int32).
+_EMPTY = 0
+_READY = 1
 
-# Size of each field per record.
-_RECORD_FLOATS = INPUT_SIZE + NUM_COMBOS * 3 + 2  # inp + target + mask + range + gv + sw
+# Floats per record in staging buffer.
+_FLOATS_PER_RECORD = INPUT_SIZE + NUM_COMBOS * 3 + 2  # 6722
 
 
 class GpuRingBuffer:
-    """GPU-resident ring buffer with shared-memory refill pipeline.
-
-    Usage:
-        buf = GpuRingBuffer(data_path, capacity=1_000_000, device=device)
-        buf.start_refill()
-        for step in range(total_steps):
-            batch = buf.sample_batch(batch_size)
-            ...
-        buf.stop()
-    """
+    """GPU-resident training buffer with continuous background refresh."""
 
     def __init__(
         self,
@@ -56,15 +47,16 @@ class GpuRingBuffer:
         capacity: int,
         device: torch.device,
         num_workers: int = 8,
-        staging_size: int = 10_000,
+        staging_size: int = 4096,
     ) -> None:
         self._device = device
         self._capacity = capacity
         self._num_workers = num_workers
+        self._staging_size = staging_size
 
-        # Build file index.
+        # Build file index (str paths for cross-process compatibility).
         files = _resolve_bin_files(data_path)
-        self._file_index: list[tuple[str, int]] = []  # str paths for pickling
+        self._file_index: list[tuple[str, int]] = []
         skipped = 0
         for f in files:
             n = _count_records_in_file(f)
@@ -77,13 +69,13 @@ class GpuRingBuffer:
                 self._file_index.append((fstr, i * RECORD_SIZE_RIVER))
 
         if skipped > 0:
-            print(f"  Skipped {skipped} files with non-standard record sizes")
+            print(f"  Skipped {skipped} non-standard files")
         self._total_records = len(self._file_index)
         print(f"  Indexed {self._total_records:,} records")
 
         # GPU tensors.
-        gb = capacity * _RECORD_FLOATS * 4 / 1024**3
-        print(f"  Allocating GPU buffer for {capacity:,} records ({gb:.1f} GB)...")
+        gb = capacity * _FLOATS_PER_RECORD * 4 / 1024**3
+        print(f"  Allocating GPU buffer: {capacity:,} records ({gb:.1f} GB)...")
         self.inputs = torch.zeros(capacity, INPUT_SIZE, device=device)
         self.targets = torch.zeros(capacity, NUM_COMBOS, device=device)
         self.masks = torch.zeros(capacity, NUM_COMBOS, device=device)
@@ -91,81 +83,60 @@ class GpuRingBuffer:
         self.game_values = torch.zeros(capacity, device=device)
         self.sample_weights = torch.zeros(capacity, device=device)
 
-        # Shared-memory staging ring.
-        self._staging_size = staging_size
-        self._staging_data = mp.Array(ctypes.c_float, staging_size * _RECORD_FLOATS, lock=False)
-        self._staging_slots = mp.Array(ctypes.c_int32, staging_size * 2, lock=False)
-        # Each staging slot has: [status, gpu_slot_index]
-        # Initialize all as empty.
-        for i in range(staging_size):
-            self._staging_slots[i * 2] = _SLOT_EMPTY
-            self._staging_slots[i * 2 + 1] = -1
-
-        # Consumed GPU slots queue — training puts slot indices here.
-        self._consumed_queue: mp.Queue = mp.Queue()
+        # Shared-memory staging: data + status + gpu_slot per staging slot.
+        self._staging_data = mp.Array(
+            ctypes.c_float, staging_size * _FLOATS_PER_RECORD, lock=False,
+        )
+        self._staging_meta = mp.Array(
+            ctypes.c_int32, staging_size * 2, lock=False,
+        )  # [status, gpu_slot] per staging slot
 
         # Tracking.
         self._filled = 0
         self._stop_event = mp.Event()
-        self._refill_count = 0
-        self._refill_count_lock = threading.Lock()
+        self._refill_count = mp.Value(ctypes.c_int64, 0)
 
-        # Initial fill.
         self._initial_fill()
 
     def _initial_fill(self) -> None:
-        """Fill GPU buffer with first `capacity` records (single-threaded)."""
+        """Fill GPU buffer sequentially (single-threaded)."""
         n = min(self._capacity, self._total_records)
-        print(f"  Initial fill: loading {n:,} records to GPU...")
+        print(f"  Initial fill: {n:,} records...")
 
         handles: OrderedDict = OrderedDict()
-        chunk = 10_000
-        for start in range(0, n, chunk):
-            end = min(start + chunk, n)
-            self._fill_range_direct(start, end, handles)
-            if start > 0 and (start // chunk) % 10 == 0:
-                print(f"    [{100.0 * end / n:.0f}%] {end:,}/{n:,}", flush=True)
+        inp = np.zeros(INPUT_SIZE, dtype=np.float32)
+        tgt = np.zeros(NUM_COMBOS, dtype=np.float32)
+        msk = np.zeros(NUM_COMBOS, dtype=np.float32)
+        rng = np.zeros(NUM_COMBOS, dtype=np.float32)
+        gv = np.zeros(1, dtype=np.float32)
+        sw = np.zeros(1, dtype=np.float32)
+
+        for slot in range(n):
+            fstr, offset = self._file_index[slot % self._total_records]
+            fh = _get_handle(handles, fstr, 128)
+            fh.seek(offset)
+            raw = np.frombuffer(fh.read(RECORD_SIZE_RIVER), dtype=np.uint8).copy()
+            _decode_single_record(raw, 0, inp, tgt, msk, rng, gv, sw, 0)
+
+            self.inputs[slot] = torch.from_numpy(inp)
+            self.targets[slot] = torch.from_numpy(tgt)
+            self.masks[slot] = torch.from_numpy(msk)
+            self.ranges[slot] = torch.from_numpy(rng)
+            self.game_values[slot] = float(gv[0])
+            self.sample_weights[slot] = float(sw[0])
+
+            if slot > 0 and slot % 100_000 == 0:
+                print(f"    [{100 * slot // n}%] {slot:,}/{n:,}", flush=True)
 
         for fh in handles.values():
             fh.close()
         self._filled = n
         print(f"  Initial fill complete: {n:,} records on GPU")
 
-    def _fill_range_direct(self, start: int, end: int, handles: OrderedDict) -> None:
-        """Fill GPU slots directly (for initial fill, no staging)."""
-        inp = np.zeros(INPUT_SIZE, dtype=np.float32)
-        target = np.zeros(NUM_COMBOS, dtype=np.float32)
-        mask = np.zeros(NUM_COMBOS, dtype=np.float32)
-        rng = np.zeros(NUM_COMBOS, dtype=np.float32)
-        gv = np.zeros(1, dtype=np.float32)
-        sw = np.zeros(1, dtype=np.float32)
-
-        for slot in range(start, end):
-            rec_idx = slot % self._total_records
-            fstr, offset = self._file_index[rec_idx]
-            fh = _get_cached_handle(handles, fstr, 128)
-            fh.seek(offset)
-            raw = np.frombuffer(fh.read(RECORD_SIZE_RIVER), dtype=np.uint8).copy()
-
-            _decode_single_record(raw, 0, inp, target, mask, rng, gv, sw, 0)
-
-            self.inputs[slot] = torch.from_numpy(inp)
-            self.targets[slot] = torch.from_numpy(target)
-            self.masks[slot] = torch.from_numpy(mask)
-            self.ranges[slot] = torch.from_numpy(rng)
-            self.game_values[slot] = float(gv[0])
-            self.sample_weights[slot] = float(sw[0])
-
     def sample_batch(self, batch_size: int) -> tuple:
-        """Sample a random batch from GPU. Queues consumed slots for refill."""
+        """Sample a random batch from GPU (no I/O, no transfer)."""
         n = min(self._filled, self._capacity)
         indices = torch.randint(0, n, (batch_size,), device=self._device)
-
-        # Queue consumed indices for refill (batch put).
-        idx_list = indices.cpu().tolist()
-        for idx in idx_list:
-            self._consumed_queue.put_nowait(idx)
-
         return (
             self.inputs[indices],
             self.targets[indices],
@@ -176,16 +147,10 @@ class GpuRingBuffer:
         )
 
     def start_refill(self) -> None:
-        """Start refill pipeline: dispatcher + reader processes + upload thread."""
+        """Start continuous background refresh."""
         self._stop_event.clear()
 
-        # Dispatcher thread: moves consumed GPU slots to staging slots.
-        self._dispatcher = threading.Thread(
-            target=self._dispatch_worker, name="dispatcher", daemon=True,
-        )
-        self._dispatcher.start()
-
-        # Reader processes: read from disk, encode, write to staging.
+        # Reader processes: read + encode → shared staging.
         self._processes: list[mp.Process] = []
         for i in range(self._num_workers):
             p = mp.Process(
@@ -193,10 +158,13 @@ class GpuRingBuffer:
                 args=(
                     self._file_index,
                     self._total_records,
+                    self._capacity,
                     self._staging_data,
-                    self._staging_slots,
+                    self._staging_meta,
                     self._staging_size,
                     self._stop_event,
+                    i,  # worker_id for slot assignment
+                    self._num_workers,
                 ),
                 name=f"reader-{i}",
                 daemon=True,
@@ -204,54 +172,31 @@ class GpuRingBuffer:
             p.start()
             self._processes.append(p)
 
-        # Upload thread: copies ready staging slots to GPU.
+        # Upload thread: staging → GPU.
         self._upload_thread = threading.Thread(
             target=self._upload_worker, name="gpu-upload", daemon=True,
         )
         self._upload_thread.start()
-
-        print(f"  Started {self._num_workers} reader processes + upload pipeline")
-
-    def _dispatch_worker(self) -> None:
-        """Move consumed GPU slot indices into staging ring for refill."""
-        while not self._stop_event.is_set():
-            try:
-                gpu_slot = self._consumed_queue.get(timeout=0.1)
-            except Exception:
-                continue
-
-            # Find an empty staging slot.
-            placed = False
-            for _ in range(self._staging_size * 2):
-                for i in range(self._staging_size):
-                    base = i * 2
-                    if self._staging_slots[base] == _SLOT_EMPTY:
-                        self._staging_slots[base + 1] = gpu_slot
-                        self._staging_slots[base] = _SLOT_WRITING
-                        placed = True
-                        break
-                if placed:
-                    break
-                time.sleep(0.001)
-            # If we couldn't place it, drop it (buffer stays stale for this slot).
+        print(f"  Started {self._num_workers} reader processes + 1 upload thread")
 
     def _upload_worker(self) -> None:
-        """Batch-copy ready staging slots to GPU."""
+        """Continuously scan staging for READY slots, batch-copy to GPU."""
         staging_np = np.frombuffer(self._staging_data, dtype=np.float32).reshape(
-            self._staging_size, _RECORD_FLOATS,
+            self._staging_size, _FLOATS_PER_RECORD,
+        )
+        meta = np.frombuffer(self._staging_meta, dtype=np.int32).reshape(
+            self._staging_size, 2,
         )
 
         while not self._stop_event.is_set():
             uploaded = 0
             for i in range(self._staging_size):
-                base = i * 2
-                if self._staging_slots[base] != _SLOT_READY:
+                if meta[i, 0] != _READY:
                     continue
 
-                gpu_slot = self._staging_slots[base + 1]
+                gpu_slot = meta[i, 1]
                 row = staging_np[i]
 
-                # Unpack: inp(2720) + target(1326) + mask(1326) + range(1326) + gv(1) + sw(1)
                 off = 0
                 self.inputs[gpu_slot] = torch.from_numpy(row[off:off + INPUT_SIZE].copy())
                 off += INPUT_SIZE
@@ -264,28 +209,25 @@ class GpuRingBuffer:
                 self.game_values[gpu_slot] = float(row[off])
                 self.sample_weights[gpu_slot] = float(row[off + 1])
 
-                # Mark slot empty for reuse.
-                self._staging_slots[base] = _SLOT_EMPTY
+                meta[i, 0] = _EMPTY
                 uploaded += 1
 
             if uploaded > 0:
-                with self._refill_count_lock:
-                    self._refill_count += uploaded
+                with self._refill_count.get_lock():
+                    self._refill_count.value += uploaded
             else:
                 time.sleep(0.001)
 
     def refill_count(self) -> int:
-        """Return records replaced since last call and reset counter."""
-        with self._refill_count_lock:
-            count = self._refill_count
-            self._refill_count = 0
+        """Return records replaced since last call, reset counter."""
+        with self._refill_count.get_lock():
+            count = self._refill_count.value
+            self._refill_count.value = 0
         return count
 
     def stop(self) -> None:
         """Stop all background workers."""
         self._stop_event.set()
-        if hasattr(self, "_dispatcher"):
-            self._dispatcher.join(timeout=5.0)
         if hasattr(self, "_upload_thread"):
             self._upload_thread.join(timeout=5.0)
         for p in getattr(self, "_processes", []):
@@ -297,75 +239,80 @@ class GpuRingBuffer:
 def _reader_worker(
     file_index: list[tuple[str, int]],
     total_records: int,
+    gpu_capacity: int,
     staging_data_raw: mp.Array,
-    staging_slots_raw: mp.Array,
+    staging_meta_raw: mp.Array,
     staging_size: int,
     stop_event: mp.Event,
+    worker_id: int,
+    num_workers: int,
 ) -> None:
-    """Reader process: find WRITING slots, read+encode from disk, mark READY.
+    """Reader process: continuously read records and write to staging.
 
-    Writes directly to shared memory — no serialization.
+    Each worker owns a stripe of staging slots (worker_id, worker_id + N, ...).
+    No contention between workers — each slot has exactly one writer.
     """
     staging_np = np.frombuffer(staging_data_raw, dtype=np.float32).reshape(
-        staging_size, _RECORD_FLOATS,
+        staging_size, _FLOATS_PER_RECORD,
     )
-    staging_slots = np.frombuffer(staging_slots_raw, dtype=np.int32).reshape(staging_size, 2)
+    meta = np.frombuffer(staging_meta_raw, dtype=np.int32).reshape(staging_size, 2)
 
-    rng_gen = np.random.default_rng()
+    rng_gen = np.random.default_rng(seed=worker_id * 12345 + 1)
     handles: OrderedDict = OrderedDict()
 
-    # Scratch buffers (reused per record).
+    # Scratch buffers.
     inp = np.zeros(INPUT_SIZE, dtype=np.float32)
-    target = np.zeros(NUM_COMBOS, dtype=np.float32)
-    mask = np.zeros(NUM_COMBOS, dtype=np.float32)
+    tgt = np.zeros(NUM_COMBOS, dtype=np.float32)
+    msk = np.zeros(NUM_COMBOS, dtype=np.float32)
     range_buf = np.zeros(NUM_COMBOS, dtype=np.float32)
     gv = np.zeros(1, dtype=np.float32)
     sw = np.zeros(1, dtype=np.float32)
 
+    # This worker's staging slots: [worker_id, worker_id + N, worker_id + 2N, ...]
+    my_slots = list(range(worker_id, staging_size, num_workers))
+
     while not stop_event.is_set():
-        # Scan for a WRITING slot to claim.
-        found = -1
-        for i in range(staging_size):
-            if staging_slots[i, 0] == _SLOT_WRITING:
-                found = i
+        for slot_idx in my_slots:
+            if stop_event.is_set():
                 break
 
-        if found < 0:
-            time.sleep(0.001)
-            continue
+            # Wait for slot to be empty (uploaded or initial).
+            if meta[slot_idx, 0] != _EMPTY:
+                continue
 
-        # Read a random record from disk.
-        rec_idx = rng_gen.integers(0, total_records)
-        fstr, byte_offset = file_index[rec_idx]
-        fh = _get_cached_handle(handles, fstr, 128)
-        fh.seek(byte_offset)
-        raw = np.frombuffer(fh.read(RECORD_SIZE_RIVER), dtype=np.uint8).copy()
+            # Pick random record and GPU destination.
+            rec_idx = rng_gen.integers(0, total_records)
+            gpu_slot = rng_gen.integers(0, gpu_capacity)
 
-        # Encode into scratch buffers.
-        _decode_single_record(raw, 0, inp, target, mask, range_buf, gv, sw, 0)
+            fstr, byte_offset = file_index[rec_idx]
+            fh = _get_handle(handles, fstr, 128)
+            fh.seek(byte_offset)
+            raw = np.frombuffer(fh.read(RECORD_SIZE_RIVER), dtype=np.uint8).copy()
 
-        # Write to shared memory staging slot (zero-copy within process).
-        row = staging_np[found]
-        off = 0
-        row[off:off + INPUT_SIZE] = inp
-        off += INPUT_SIZE
-        row[off:off + NUM_COMBOS] = target
-        off += NUM_COMBOS
-        row[off:off + NUM_COMBOS] = mask
-        off += NUM_COMBOS
-        row[off:off + NUM_COMBOS] = range_buf
-        off += NUM_COMBOS
-        row[off] = gv[0]
-        row[off + 1] = sw[0]
+            _decode_single_record(raw, 0, inp, tgt, msk, range_buf, gv, sw, 0)
 
-        # Mark ready for GPU upload.
-        staging_slots[found, 0] = _SLOT_READY
+            # Write to shared staging (this worker owns this slot).
+            row = staging_np[slot_idx]
+            off = 0
+            row[off:off + INPUT_SIZE] = inp
+            off += INPUT_SIZE
+            row[off:off + NUM_COMBOS] = tgt
+            off += NUM_COMBOS
+            row[off:off + NUM_COMBOS] = msk
+            off += NUM_COMBOS
+            row[off:off + NUM_COMBOS] = range_buf
+            off += NUM_COMBOS
+            row[off] = gv[0]
+            row[off + 1] = sw[0]
+
+            meta[slot_idx, 1] = gpu_slot
+            meta[slot_idx, 0] = _READY
 
     for fh in handles.values():
         fh.close()
 
 
-def _get_cached_handle(handles: OrderedDict, path: str, max_handles: int):
+def _get_handle(handles: OrderedDict, path: str, max_handles: int):
     """Get or open a file handle with LRU eviction."""
     fh = handles.get(path)
     if fh is not None:
