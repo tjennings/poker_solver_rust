@@ -135,8 +135,8 @@ class GpuRingBuffer:
         self.targets[slot] = torch.from_numpy(target)
         self.masks[slot] = torch.from_numpy(mask)
         self.ranges[slot] = torch.from_numpy(rng)
-        self.game_values[slot] = gv
-        self.sample_weights[slot] = sw
+        self.game_values[slot] = float(gv)
+        self.sample_weights[slot] = float(sw)
 
     def _read_cached(self, path: Path, offset: int) -> np.ndarray:
         """Read record bytes using thread-local file handle cache."""
