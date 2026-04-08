@@ -92,9 +92,10 @@ def _train_with_gpu_buffer(
     num_workers: int,
 ) -> float:
     """Train using GPU ring buffer — zero CPU-GPU transfer per batch."""
+    import threading
     from cfvnet.gpu_buffer import GpuRingBuffer
 
-    # Refresh 10% of the pool between epochs.
+    # Refresh 10% of the pool per epoch, overlapped with training.
     refresh_count = buffer_size // 10
 
     buf = GpuRingBuffer(data_path, capacity=buffer_size, device=device,
@@ -104,22 +105,26 @@ def _train_with_gpu_buffer(
     steps_per_epoch = max(buf._total_records // config.batch_size, 1)
 
     final_loss = float("inf")
+    refresh_thread: threading.Thread | None = None
+    last_refresh_time = 0.0
+
     for epoch in range(start_epoch, config.epochs):
+        # Wait for previous refresh to finish before logging its time.
+        if refresh_thread is not None:
+            refresh_thread.join()
+            refresh_thread = None
+
         t0 = time.time()
         train_combined, train_huber, train_aux = _train_epoch_buffer(
             model, buf, optimizer, scaler, config, device, steps_per_epoch,
         )
         scheduler.step()
 
-        # Validation: sample from the buffer.
         val_combined, val_huber, val_aux = _val_from_buffer(
             model, buf, config, device, num_val_batches=10,
         )
 
         train_elapsed = time.time() - t0
-
-        # Refresh pool between epochs (parallel disk read → bulk GPU copy).
-        refresh_time = buf.refresh(refresh_count)
         pool_pct = 100.0 * refresh_count / buf._capacity
 
         lr = scheduler.get_last_lr()[0]
@@ -127,11 +132,24 @@ def _train_with_gpu_buffer(
             f"Epoch {epoch + 1}/{config.epochs} lr={lr:.2e} "
             f"train={train_combined:.6f} (h={train_huber:.4f} a={train_aux:.4f}) "
             f"val={val_combined:.6f} (h={val_huber:.4f} a={val_aux:.4f}) "
-            f"[{train_elapsed:.0f}s] refresh={pool_pct:.0f}% [{refresh_time:.0f}s]"
+            f"[{train_elapsed:.0f}s] refresh={pool_pct:.0f}% [{last_refresh_time:.0f}s]"
         )
         print(msg)
         final_loss = train_combined
         _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
+
+        # Kick off refresh in background — overlaps with next epoch's training.
+        # The CPU workers read from disk while GPU trains on existing buffer.
+        def _do_refresh():
+            nonlocal last_refresh_time
+            last_refresh_time = buf.refresh(refresh_count)
+
+        refresh_thread = threading.Thread(target=_do_refresh, daemon=True)
+        refresh_thread.start()
+
+    # Wait for final refresh.
+    if refresh_thread is not None:
+        refresh_thread.join()
 
     return final_loss
 
