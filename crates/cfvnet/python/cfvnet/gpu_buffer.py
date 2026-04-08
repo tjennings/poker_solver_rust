@@ -8,6 +8,7 @@ CPU-GPU transfer.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import threading
 import time
 from pathlib import Path
@@ -94,7 +95,7 @@ class GpuRingBuffer:
         self._filled = 0  # How many slots have valid data.
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._refill_queue: Queue[int] = Queue()  # Slot indices to refill.
+        self._refill_queue: mp.Queue = mp.Queue()  # Slot indices to refill.
         self._workers: list[threading.Thread] = []
 
         # Refill rate tracking.
@@ -196,30 +197,61 @@ class GpuRingBuffer:
         )
 
     def start_refill(self) -> None:
-        """Start background refill threads."""
+        """Start background refill: reader processes + GPU upload thread.
+
+        Reader processes read and encode records on CPU (bypasses GIL).
+        A single GPU upload thread drains the encoded queue and writes
+        to GPU tensors.
+        """
         self._stop_event.clear()
+        self._mp_stop = mp.Event()
+
+        # Queue for encoded records: (slot, inp, target, mask, range, gv, sw)
+        self._encoded_queue: mp.Queue = mp.Queue(maxsize=self._num_workers * 64)
+
+        # Start reader processes.
+        self._processes: list[mp.Process] = []
         for i in range(self._num_workers):
-            t = threading.Thread(
-                target=self._refill_worker,
+            p = mp.Process(
+                target=_reader_process,
+                args=(
+                    self._file_index,
+                    self._total_records,
+                    self._refill_queue,
+                    self._encoded_queue,
+                    self._mp_stop,
+                ),
                 name=f"refill-{i}",
                 daemon=True,
             )
-            t.start()
-            self._workers.append(t)
-        print(f"  Started {self._num_workers} refill workers")
+            p.start()
+            self._processes.append(p)
 
-    def _refill_worker(self) -> None:
-        """Background worker that replaces consumed buffer slots."""
-        rng = np.random.default_rng()
+        # Start single GPU upload thread.
+        self._upload_thread = threading.Thread(
+            target=self._gpu_upload_worker,
+            name="gpu-upload",
+            daemon=True,
+        )
+        self._upload_thread.start()
+        print(f"  Started {self._num_workers} refill processes + 1 GPU upload thread")
+
+    def _gpu_upload_worker(self) -> None:
+        """Single thread that uploads encoded records to GPU tensors."""
         while not self._stop_event.is_set():
             try:
-                slot = self._refill_queue.get(timeout=0.1)
+                item = self._encoded_queue.get(timeout=0.1)
             except Exception:
                 continue
 
-            # Pick a random record from the full dataset.
-            record_idx = rng.integers(0, self._total_records)
-            self._fill_slot(slot, record_idx)
+            slot, inp, target, mask, rng_arr, gv, sw = item
+            self.inputs[slot] = torch.from_numpy(inp)
+            self.targets[slot] = torch.from_numpy(target)
+            self.masks[slot] = torch.from_numpy(mask)
+            self.ranges[slot] = torch.from_numpy(rng_arr)
+            self.game_values[slot] = gv
+            self.sample_weights[slot] = sw
+
             with self._refill_count_lock:
                 self._refill_count += 1
 
@@ -234,13 +266,68 @@ class GpuRingBuffer:
         return count / max(elapsed, 0.001)
 
     def stop(self) -> None:
-        """Stop background refill threads."""
+        """Stop background refill processes and upload thread."""
         self._stop_event.set()
-        for t in self._workers:
-            t.join(timeout=5.0)
-        self._workers.clear()
+        if hasattr(self, "_mp_stop"):
+            self._mp_stop.set()
+        if hasattr(self, "_upload_thread"):
+            self._upload_thread.join(timeout=5.0)
+        for p in getattr(self, "_processes", []):
+            p.terminate()
+            p.join(timeout=2.0)
+        self._processes = []
 
-        # Close cached file handles.
-        cache = getattr(self._local, "handles", {})
-        for fh in cache.values():
-            fh.close()
+
+def _reader_process(
+    file_index: list[tuple[Path, int]],
+    total_records: int,
+    slot_queue: Queue,
+    encoded_queue: mp.Queue,
+    stop_event: mp.Event,
+) -> None:
+    """Subprocess: read records from disk, encode, put on queue.
+
+    Runs in a separate process to bypass the GIL. Each process has its
+    own file handle cache.
+    """
+    from collections import OrderedDict
+
+    rng = np.random.default_rng()
+    handles: OrderedDict = OrderedDict()
+    max_handles = 128
+
+    while not stop_event.is_set():
+        try:
+            slot = slot_queue.get(timeout=0.1)
+        except Exception:
+            continue
+
+        record_idx = rng.integers(0, total_records)
+        file_path, byte_offset = file_index[record_idx]
+
+        # Read with LRU file handle cache.
+        fh = handles.get(file_path)
+        if fh is not None:
+            handles.move_to_end(file_path)
+        else:
+            if len(handles) >= max_handles:
+                _, old_fh = handles.popitem(last=False)
+                old_fh.close()
+            fh = open(file_path, "rb")  # noqa: SIM115
+            handles[file_path] = fh
+
+        fh.seek(byte_offset)
+        buf = fh.read(RECORD_SIZE_RIVER)
+        raw = np.frombuffer(buf, dtype=np.uint8).copy()
+
+        # Encode on CPU (no GIL contention with other processes).
+        inp, target, mask, rng_arr, gv, sw = _encode_raw_to_tensors(raw)
+
+        try:
+            encoded_queue.put((slot, inp, target, mask, rng_arr, float(gv), float(sw)), timeout=1.0)
+        except Exception:
+            continue
+
+    # Clean up file handles.
+    for fh in handles.values():
+        fh.close()
