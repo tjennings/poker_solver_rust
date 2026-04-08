@@ -49,7 +49,7 @@ class GpuRingBuffer:
         data_path: Path,
         capacity: int,
         device: torch.device,
-        num_workers: int = 4,
+        num_workers: int = 8,
     ) -> None:
         """Initialize the GPU buffer.
 
@@ -255,15 +255,12 @@ class GpuRingBuffer:
             with self._refill_count_lock:
                 self._refill_count += 1
 
-    def refill_rate(self) -> float:
-        """Return records/second refill rate since last call, and reset counter."""
-        now = time.time()
+    def refill_count(self) -> int:
+        """Return number of records replaced since last call, and reset counter."""
         with self._refill_count_lock:
             count = self._refill_count
             self._refill_count = 0
-        elapsed = now - self._last_refill_time
-        self._last_refill_time = now
-        return count / max(elapsed, 0.001)
+        return count
 
     def stop(self) -> None:
         """Stop background refill processes and upload thread."""

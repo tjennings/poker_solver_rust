@@ -116,14 +116,15 @@ def _train_with_gpu_buffer(
                 model, buf, config, device, num_val_batches=10,
             )
 
-            refill_rate = buf.refill_rate()
+            refilled = buf.refill_count()
+            pool_pct = 100.0 * refilled / buf._capacity if buf._capacity > 0 else 0.0
             elapsed = time.time() - t0
             lr = scheduler.get_last_lr()[0]
             msg = (
                 f"Epoch {epoch + 1}/{config.epochs} lr={lr:.2e} "
                 f"train={train_combined:.6f} (h={train_huber:.4f} a={train_aux:.4f}) "
                 f"val={val_combined:.6f} (h={val_huber:.4f} a={val_aux:.4f}) "
-                f"[{elapsed:.0f}s] refill={refill_rate:.0f} rec/s"
+                f"[{elapsed:.0f}s] refresh={pool_pct:.1f}%"
             )
             print(msg)
             final_loss = train_combined
