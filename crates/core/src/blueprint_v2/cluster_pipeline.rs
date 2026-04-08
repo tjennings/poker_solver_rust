@@ -36,7 +36,9 @@ use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
 use crate::hands::CanonicalHand;
 use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
-use crate::showdown_equity::rank_hand;
+use crate::showdown_equity::{
+    delta_bin, equity_delta, nut_distance, nut_distance_bin, pack_heuristic_v3, rank_hand,
+};
 
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
 use super::centroid_file::CentroidFile;
@@ -45,7 +47,7 @@ use super::clustering::{
     kmeans_1d, nearest_centroid_1d, nearest_centroid_u8, nearest_centroid_u8_weighted,
     sort_centroids_by_ev,
 };
-use super::config::ClusteringConfig;
+use super::config::{ClusteringAlgorithm, ClusteringConfig};
 use super::per_flop_bucket_file::PerFlopBucketFile;
 use super::Street;
 
@@ -901,6 +903,18 @@ pub fn run_clustering_pipeline(
     output_dir: &Path,
     progress: impl Fn(&str, &str, f64) + Sync,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // HeuristicV3 has its own pipeline — dispatch and return early.
+    if matches!(config.algorithm, ClusteringAlgorithm::HeuristicV3) {
+        run_heuristic_v3_pipeline(
+            config.nut_distance_bits,
+            config.equity_delta_bits,
+            output_dir,
+            None,
+            progress,
+        );
+        return Ok(());
+    }
+
     // 1. River (equity clustering — independent)
     // cfvnet path already produces exhaustive bucket files; otherwise use
     // two-phase exhaustive clustering. sample_boards controls the sampling
@@ -1161,6 +1175,181 @@ pub fn cluster_single_flop(
         river_cards_per_turn,
         river_buckets_per_turn,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic V3 per-flop bucketing
+// ---------------------------------------------------------------------------
+
+/// Generate a [`PerFlopBucketFile`] for one flop using heuristic V3 bucketing.
+///
+/// For each turn card, computes nut distance + equity delta for all valid
+/// hole-card combos. For river cards, delta is always 0 (no future street).
+/// Buckets are deterministic: `pack_heuristic_v3(nd_bin, delta_bin)`.
+#[allow(clippy::cast_possible_truncation)]
+pub fn heuristic_v3_single_flop(
+    flop: [Card; 3],
+    nut_distance_bits: u8,
+    equity_delta_bits: u8,
+    progress: impl Fn(&str, u32, u32) + Sync,
+) -> PerFlopBucketFile {
+    let max_bucket = (1u16 << nut_distance_bits) * (1u16 << equity_delta_bits);
+    let deck = build_deck();
+
+    // Turn cards = deck minus flop
+    let turn_cards: Vec<Card> = deck
+        .iter()
+        .filter(|c| !flop.iter().any(|f| f.value == c.value && f.suit == c.suit))
+        .copied()
+        .collect();
+    let total_turns = turn_cards.len() as u32;
+
+    let per_turn_results: Vec<_> = turn_cards
+        .par_iter()
+        .enumerate()
+        .map(|(t_idx, &turn_card)| {
+            let turn_board = [flop[0], flop[1], flop[2], turn_card];
+
+            // Turn buckets for all 1326 combos
+            let mut turn_buckets = vec![0u16; 1326];
+            for i in 0..deck.len() {
+                if board_contains(&turn_board, deck[i]) {
+                    continue;
+                }
+                for j in (i + 1)..deck.len() {
+                    if board_contains(&turn_board, deck[j]) {
+                        continue;
+                    }
+                    let hole = [deck[i], deck[j]];
+                    let cidx = combo_index(deck[i], deck[j]) as usize;
+                    let nd = nut_distance(hole, &turn_board);
+                    let ed = equity_delta(hole, &turn_board);
+                    let nd_bin = nut_distance_bin(nd, nut_distance_bits);
+                    let ed_bin = delta_bin(ed, equity_delta_bits);
+                    turn_buckets[cidx] =
+                        pack_heuristic_v3(nd_bin, ed_bin, equity_delta_bits);
+                }
+            }
+
+            // River cards = deck minus flop minus turn
+            let river_cards: Vec<Card> = deck
+                .iter()
+                .filter(|c| !board_contains(&turn_board, **c))
+                .copied()
+                .collect();
+
+            // River buckets (delta = 0 on river, so delta_bin is midpoint)
+            let mid_delta = delta_bin(0.0, equity_delta_bits);
+            let mut all_river_buckets = vec![0u16; river_cards.len() * 1326];
+            for (r_idx, &river_card) in river_cards.iter().enumerate() {
+                let river_board =
+                    [flop[0], flop[1], flop[2], turn_card, river_card];
+                for i in 0..deck.len() {
+                    if board_contains(&river_board, deck[i]) {
+                        continue;
+                    }
+                    for j in (i + 1)..deck.len() {
+                        if board_contains(&river_board, deck[j]) {
+                            continue;
+                        }
+                        let hole = [deck[i], deck[j]];
+                        let cidx = combo_index(deck[i], deck[j]) as usize;
+                        let nd = nut_distance(hole, &river_board);
+                        let nd_bin = nut_distance_bin(nd, nut_distance_bits);
+                        all_river_buckets[r_idx * 1326 + cidx] =
+                            pack_heuristic_v3(nd_bin, mid_delta, equity_delta_bits);
+                    }
+                }
+            }
+
+            progress("turn", t_idx as u32 + 1, total_turns);
+            (turn_card, turn_buckets, river_cards, all_river_buckets)
+        })
+        .collect();
+
+    // Assemble PerFlopBucketFile
+    let mut all_turn_buckets = Vec::with_capacity(turn_cards.len() * 1326);
+    let mut river_cards_per_turn = Vec::with_capacity(turn_cards.len());
+    let mut river_buckets_per_turn = Vec::with_capacity(turn_cards.len());
+    let mut sorted_turn_cards = Vec::with_capacity(turn_cards.len());
+
+    for (tc, tb, rc, rb) in per_turn_results {
+        sorted_turn_cards.push(tc);
+        all_turn_buckets.extend_from_slice(&tb);
+        river_cards_per_turn.push(rc);
+        river_buckets_per_turn.push(rb);
+    }
+
+    PerFlopBucketFile {
+        flop_cards: flop,
+        turn_bucket_count: max_bucket,
+        river_bucket_count: max_bucket,
+        turn_cards: sorted_turn_cards,
+        turn_buckets: all_turn_buckets,
+        river_cards_per_turn,
+        river_buckets_per_turn,
+    }
+}
+
+/// Check if a board array contains a specific card (by value AND suit).
+fn board_contains(board: &[Card], card: Card) -> bool {
+    board
+        .iter()
+        .any(|b| b.value == card.value && b.suit == card.suit)
+}
+
+/// Run the full heuristic V3 per-flop bucketing pipeline.
+///
+/// 1. Compute preflop buckets (deterministic 169 canonical hands).
+/// 2. Enumerate canonical flops and compute per-flop bucket files in parallel.
+///
+/// Each flop produces a [`PerFlopBucketFile`] saved as `flop_NNNN.buckets`.
+///
+/// # Panics
+///
+/// Panics if the output directory cannot be created or if a bucket file
+/// cannot be saved (I/O failure).
+pub fn run_heuristic_v3_pipeline(
+    nut_distance_bits: u8,
+    equity_delta_bits: u8,
+    output_dir: &Path,
+    max_flops: Option<usize>,
+    progress: impl Fn(&str, &str, f64) + Sync,
+) {
+    std::fs::create_dir_all(output_dir).expect("failed to create output dir");
+
+    progress("preflop", "mapping", 0.0);
+    let preflop = cluster_preflop(|phase, p| progress("preflop", phase, p));
+    preflop
+        .save(&output_dir.join("preflop.buckets"))
+        .expect("failed to save preflop");
+
+    let canonical_flops = enumerate_canonical_flops();
+    let total = max_flops
+        .unwrap_or(canonical_flops.len())
+        .min(canonical_flops.len());
+    let flops_to_process = &canonical_flops[..total];
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+
+    flops_to_process
+        .par_iter()
+        .enumerate()
+        .for_each(|(idx, wb)| {
+            let flop = [wb.cards[0], wb.cards[1], wb.cards[2]];
+            let pf = heuristic_v3_single_flop(
+                flop,
+                nut_distance_bits,
+                equity_delta_bits,
+                |_, _, _| {},
+            );
+            let path = output_dir.join(format!("flop_{idx:04}.buckets"));
+            pf.save(&path)
+                .unwrap_or_else(|e| panic!("failed to save {}: {e}", path.display()));
+            let done =
+                completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            #[allow(clippy::cast_precision_loss)]
+            progress("per_flop", "bucketing", done as f64 / total as f64);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,5 +2832,198 @@ mod tests {
         assert!(!output_dir.path().join("flop_0002.buckets").exists());
     }
 
+    // -----------------------------------------------------------------------
+    // heuristic_v3_single_flop tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // slow: equity enumeration for all combos on all turn/river cards
+    fn heuristic_v3_single_flop_produces_valid_buckets() {
+        let flop = [
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Nine, Suit::Heart),
+            Card::new(Value::Seven, Suit::Diamond),
+        ];
+        let pf = heuristic_v3_single_flop(flop, 6, 4, |_, _, _| {});
+        let max_bucket = (1u16 << 6) * (1u16 << 4);
+        assert!(pf.turn_bucket_count <= max_bucket);
+        assert!(pf.river_bucket_count <= max_bucket);
+        for &b in &pf.turn_buckets {
+            assert!(b < max_bucket, "turn bucket {b} >= {max_bucket}");
+        }
+        for river_buckets in &pf.river_buckets_per_turn {
+            for &b in river_buckets {
+                assert!(b < max_bucket, "river bucket {b} >= {max_bucket}");
+            }
+        }
+        assert!(!pf.turn_cards.is_empty());
+        assert_eq!(pf.river_cards_per_turn.len(), pf.turn_cards.len());
+        // Should have many distinct buckets
+        let unique: std::collections::HashSet<u16> =
+            pf.turn_buckets.iter().copied().collect();
+        assert!(
+            unique.len() > 10,
+            "should have many distinct turn buckets, got {}",
+            unique.len()
+        );
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration for all combos on all turn/river cards
+    fn heuristic_v3_single_flop_turn_card_count() {
+        // With a 3-card flop, should have 49 turn cards (52 - 3)
+        let flop = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Queen, Suit::Spade),
+        ];
+        let pf = heuristic_v3_single_flop(flop, 4, 2, |_, _, _| {});
+        assert_eq!(pf.turn_cards.len(), 49);
+        assert_eq!(pf.turn_buckets.len(), 49 * 1326);
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration for all combos on all turn/river cards
+    fn heuristic_v3_single_flop_river_cards_per_turn() {
+        // Each turn should have 48 river cards (52 - 3 flop - 1 turn)
+        let flop = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Queen, Suit::Spade),
+        ];
+        let pf = heuristic_v3_single_flop(flop, 4, 2, |_, _, _| {});
+        for (ti, river_cards) in pf.river_cards_per_turn.iter().enumerate() {
+            assert_eq!(
+                river_cards.len(),
+                48,
+                "turn {ti} should have 48 river cards, got {}",
+                river_cards.len()
+            );
+        }
+        // Each river_buckets_per_turn entry should be 48 * 1326
+        for (ti, rb) in pf.river_buckets_per_turn.iter().enumerate() {
+            assert_eq!(
+                rb.len(),
+                48 * 1326,
+                "turn {ti} river buckets should be 48*1326, got {}",
+                rb.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration for all combos on all turn/river cards
+    fn heuristic_v3_single_flop_bucket_counts_match() {
+        let flop = [
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Three, Suit::Club),
+            Card::new(Value::Four, Suit::Club),
+        ];
+        let pf = heuristic_v3_single_flop(flop, 6, 4, |_, _, _| {});
+        assert_eq!(pf.turn_bucket_count, (1u16 << 6) * (1u16 << 4));
+        assert_eq!(pf.river_bucket_count, (1u16 << 6) * (1u16 << 4));
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration for all combos on all turn/river cards
+    fn heuristic_v3_single_flop_progress_called() {
+        let flop = [
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Three, Suit::Club),
+            Card::new(Value::Four, Suit::Club),
+        ];
+        let calls = std::sync::Mutex::new(Vec::new());
+        heuristic_v3_single_flop(flop, 4, 2, |phase, done, total| {
+            calls.lock().unwrap().push((phase.to_string(), done, total));
+        });
+        let calls = calls.into_inner().unwrap();
+        assert!(!calls.is_empty(), "progress should be called at least once");
+        // All calls should be "turn" phase
+        for (phase, done, total) in &calls {
+            assert_eq!(phase, "turn");
+            assert!(*done <= *total);
+            assert!(*total > 0);
+        }
+    }
+
+    #[test]
+    #[ignore] // slow: equity enumeration for all combos on all turn/river cards
+    fn heuristic_v3_single_flop_min_bits() {
+        // Minimum bits: 2 nut_distance, 2 delta -> 4*4 = 16 max buckets
+        let flop = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Queen, Suit::Spade),
+        ];
+        let pf = heuristic_v3_single_flop(flop, 2, 2, |_, _, _| {});
+        let max_bucket = (1u16 << 2) * (1u16 << 2); // 16
+        assert_eq!(pf.turn_bucket_count, max_bucket);
+        assert_eq!(pf.river_bucket_count, max_bucket);
+        for &b in &pf.turn_buckets {
+            assert!(b < max_bucket, "turn bucket {b} >= {max_bucket}");
+        }
+    }
+
+    #[test]
+    fn heuristic_v3_pipeline_dispatch_compiles() {
+        // Verify that run_heuristic_v3_pipeline has the expected signature.
+        let _: fn(u8, u8, &Path, Option<usize>, fn(&str, &str, f64)) =
+            |a, b, c, d, e| run_heuristic_v3_pipeline(a, b, c, d, e);
+    }
+
+    #[test]
+    fn heuristic_v3_board_contains_helper() {
+        let board = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+        ];
+        assert!(board_contains(&board, Card::new(Value::Ace, Suit::Spade)));
+        assert!(!board_contains(&board, Card::new(Value::Ace, Suit::Heart)));
+        assert!(!board_contains(&board, Card::new(Value::Two, Suit::Club)));
+    }
+
+    #[test]
+    #[ignore] // slow: full per-flop pipeline with equity enumeration
+    fn heuristic_v3_pipeline_creates_output_files() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        run_heuristic_v3_pipeline(
+            4,
+            2,
+            output_dir.path(),
+            Some(1), // only 1 flop for speed
+            |_, _, _| {},
+        );
+        assert!(
+            output_dir.path().join("preflop.buckets").exists(),
+            "should create preflop.buckets"
+        );
+        assert!(
+            output_dir.path().join("flop_0000.buckets").exists(),
+            "should create flop_0000.buckets"
+        );
+    }
+
+    #[test]
+    #[ignore] // slow: full per-flop pipeline with equity enumeration
+    fn heuristic_v3_pipeline_progress_reports() {
+        let output_dir = tempfile::TempDir::new().unwrap();
+        let stages = std::sync::Mutex::new(Vec::new());
+        run_heuristic_v3_pipeline(4, 2, output_dir.path(), Some(1), |stage, phase, _p| {
+            stages
+                .lock()
+                .unwrap()
+                .push((stage.to_string(), phase.to_string()));
+        });
+        let stages = stages.into_inner().unwrap();
+        assert!(
+            stages.iter().any(|(s, _)| s == "preflop"),
+            "expected preflop progress, got {stages:?}"
+        );
+        assert!(
+            stages.iter().any(|(s, _)| s == "per_flop"),
+            "expected per_flop progress, got {stages:?}"
+        );
+    }
 
 }
