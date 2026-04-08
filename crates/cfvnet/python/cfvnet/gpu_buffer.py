@@ -138,15 +138,23 @@ class GpuRingBuffer:
         self.game_values[slot] = float(gv)
         self.sample_weights[slot] = float(sw)
 
+    _MAX_OPEN_FILES = 128  # Per-thread file handle cache limit.
+
     def _read_cached(self, path: Path, offset: int) -> np.ndarray:
-        """Read record bytes using thread-local file handle cache."""
+        """Read record bytes using thread-local LRU file handle cache."""
         cache = getattr(self._local, "handles", None)
         if cache is None:
-            cache = {}
+            from collections import OrderedDict
+            cache = OrderedDict()
             self._local.handles = cache
 
         fh = cache.get(path)
-        if fh is None:
+        if fh is not None:
+            cache.move_to_end(path)
+        else:
+            if len(cache) >= self._MAX_OPEN_FILES:
+                _, old_fh = cache.popitem(last=False)
+                old_fh.close()
             fh = open(path, "rb")  # noqa: SIM115
             cache[path] = fh
 
