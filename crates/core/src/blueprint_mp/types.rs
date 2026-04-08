@@ -284,6 +284,46 @@ impl std::fmt::Display for Street {
     }
 }
 
+// === Position labels ===
+
+const POS_2: &[&str] = &["btn", "bb"];
+const POS_3: &[&str] = &["btn", "sb", "bb"];
+const POS_4: &[&str] = &["co", "btn", "sb", "bb"];
+const POS_5: &[&str] = &["hj", "co", "btn", "sb", "bb"];
+const POS_6: &[&str] = &["utg", "hj", "co", "btn", "sb", "bb"];
+const POS_7: &[&str] = &["utg", "mp", "hj", "co", "btn", "sb", "bb"];
+const POS_8: &[&str] = &["utg", "utg1", "mp", "hj", "co", "btn", "sb", "bb"];
+
+fn pos_table(num_players: u8) -> &'static [&'static str] {
+    match num_players {
+        2 => POS_2,
+        3 => POS_3,
+        4 => POS_4,
+        5 => POS_5,
+        6 => POS_6,
+        7 => POS_7,
+        8 => POS_8,
+        _ => panic!("unsupported player count: {num_players}"),
+    }
+}
+
+/// Map a seat index to its position label (e.g., "utg", "btn", "bb").
+#[must_use]
+pub fn position_label(seat: Seat, num_players: u8) -> &'static str {
+    pos_table(num_players)[seat.index() as usize]
+}
+
+/// Parse a position label back to a [`Seat`]. Returns `None` if the label is
+/// invalid for the given player count.
+#[must_use]
+pub fn parse_position(label: &str, num_players: u8) -> Option<Seat> {
+    let lower = label.to_ascii_lowercase();
+    pos_table(num_players)
+        .iter()
+        .position(|&p| p == lower)
+        .map(|i| Seat::from_raw(i as u8))
+}
+
 // === Deal ===
 
 use crate::poker::Card;
@@ -608,5 +648,65 @@ mod tests {
         assert_eq!(format!("{}", Street::Flop), "flop");
         assert_eq!(format!("{}", Street::Turn), "turn");
         assert_eq!(format!("{}", Street::River), "river");
+    }
+
+    // ── position_label / parse_position tests ──
+
+    #[timed_test]
+    fn position_label_2_players() {
+        assert_eq!(position_label(Seat::from_raw(0), 2), "btn");
+        assert_eq!(position_label(Seat::from_raw(1), 2), "bb");
+    }
+
+    #[timed_test]
+    fn position_label_3_players() {
+        assert_eq!(position_label(Seat::from_raw(0), 3), "btn");
+        assert_eq!(position_label(Seat::from_raw(1), 3), "sb");
+        assert_eq!(position_label(Seat::from_raw(2), 3), "bb");
+    }
+
+    #[timed_test]
+    fn position_label_6_players() {
+        assert_eq!(position_label(Seat::from_raw(0), 6), "utg");
+        assert_eq!(position_label(Seat::from_raw(3), 6), "btn");
+        assert_eq!(position_label(Seat::from_raw(5), 6), "bb");
+    }
+
+    #[timed_test]
+    fn position_label_8_players() {
+        assert_eq!(position_label(Seat::from_raw(0), 8), "utg");
+        assert_eq!(position_label(Seat::from_raw(1), 8), "utg1");
+        assert_eq!(position_label(Seat::from_raw(7), 8), "bb");
+    }
+
+    #[timed_test]
+    fn parse_position_round_trips_all() {
+        for n in 2..=8u8 {
+            for s in 0..n {
+                let label = position_label(Seat::from_raw(s), n);
+                let parsed = parse_position(label, n);
+                assert_eq!(
+                    parsed,
+                    Some(Seat::from_raw(s)),
+                    "round-trip failed: seat {s} in {n}-player, label={label}"
+                );
+            }
+        }
+    }
+
+    #[timed_test]
+    fn parse_position_case_insensitive() {
+        assert_eq!(parse_position("UTG", 6), Some(Seat::from_raw(0)));
+        assert_eq!(parse_position("Btn", 6), Some(Seat::from_raw(3)));
+    }
+
+    #[timed_test]
+    fn parse_position_invalid_label() {
+        assert_eq!(parse_position("xyz", 6), None);
+    }
+
+    #[timed_test]
+    fn parse_position_wrong_player_count() {
+        assert_eq!(parse_position("utg", 2), None);
     }
 }
