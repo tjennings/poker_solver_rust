@@ -94,43 +94,44 @@ def _train_with_gpu_buffer(
     """Train using GPU ring buffer — zero CPU-GPU transfer per batch."""
     from cfvnet.gpu_buffer import GpuRingBuffer
 
+    # Refresh 10% of the pool between epochs.
+    refresh_count = buffer_size // 10
+
     buf = GpuRingBuffer(data_path, capacity=buffer_size, device=device,
                         num_workers=num_workers)
-    buf.start_refill()
 
     # Steps per epoch = total records / batch_size (approximate).
     steps_per_epoch = max(buf._total_records // config.batch_size, 1)
 
     final_loss = float("inf")
-    try:
-        for epoch in range(start_epoch, config.epochs):
-            t0 = time.time()
-            train_combined, train_huber, train_aux = _train_epoch_buffer(
-                model, buf, optimizer, scaler, config, device, steps_per_epoch,
-            )
-            scheduler.step()
+    for epoch in range(start_epoch, config.epochs):
+        t0 = time.time()
+        train_combined, train_huber, train_aux = _train_epoch_buffer(
+            model, buf, optimizer, scaler, config, device, steps_per_epoch,
+        )
+        scheduler.step()
 
-            # Validation: sample from the buffer (no separate val set needed —
-            # buffer is continuously refreshed with random records).
-            val_combined, val_huber, val_aux = _val_from_buffer(
-                model, buf, config, device, num_val_batches=10,
-            )
+        # Validation: sample from the buffer.
+        val_combined, val_huber, val_aux = _val_from_buffer(
+            model, buf, config, device, num_val_batches=10,
+        )
 
-            refilled = buf.refill_count()
-            pool_pct = 100.0 * refilled / buf._capacity if buf._capacity > 0 else 0.0
-            elapsed = time.time() - t0
-            lr = scheduler.get_last_lr()[0]
-            msg = (
-                f"Epoch {epoch + 1}/{config.epochs} lr={lr:.2e} "
-                f"train={train_combined:.6f} (h={train_huber:.4f} a={train_aux:.4f}) "
-                f"val={val_combined:.6f} (h={val_huber:.4f} a={val_aux:.4f}) "
-                f"[{elapsed:.0f}s] refresh={pool_pct:.1f}%"
-            )
-            print(msg)
-            final_loss = train_combined
-            _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
-    finally:
-        buf.stop()
+        train_elapsed = time.time() - t0
+
+        # Refresh pool between epochs (parallel disk read → bulk GPU copy).
+        refresh_time = buf.refresh(refresh_count)
+        pool_pct = 100.0 * refresh_count / buf._capacity
+
+        lr = scheduler.get_last_lr()[0]
+        msg = (
+            f"Epoch {epoch + 1}/{config.epochs} lr={lr:.2e} "
+            f"train={train_combined:.6f} (h={train_huber:.4f} a={train_aux:.4f}) "
+            f"val={val_combined:.6f} (h={val_huber:.4f} a={val_aux:.4f}) "
+            f"[{train_elapsed:.0f}s] refresh={pool_pct:.0f}% [{refresh_time:.0f}s]"
+        )
+        print(msg)
+        final_loss = train_combined
+        _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
 
     return final_loss
 
