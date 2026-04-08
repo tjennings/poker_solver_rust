@@ -31,26 +31,24 @@ def train_boundary(
     output_dir: Path | None,
     device: torch.device,
     num_workers: int = 4,
+    gpu_buffer_size: int = 500_000,
 ) -> TrainResult:
     """Train a BoundaryNet model.
+
+    On CUDA, uses a GPU ring buffer for zero-transfer training. On CPU,
+    falls back to DataLoader with lazy dataset.
 
     Args:
         data_path: Path to training data (file or directory).
         config: Training configuration.
         output_dir: Directory for checkpoints (None to skip saving).
         device: Torch device (cpu or cuda).
-        num_workers: Number of DataLoader workers (0 for single-process).
+        num_workers: Workers for DataLoader (CPU) or refill threads (CUDA).
+        gpu_buffer_size: Number of records in GPU ring buffer (CUDA only).
 
     Returns:
         TrainResult with final training loss.
     """
-    dataset = LazyBoundaryDataset.from_path(data_path)
-    train_ds, val_ds = _split_dataset(dataset, config.validation_split)
-    train_loader = _make_dataloader(train_ds, config.batch_size, shuffle=True,
-                                    num_workers=num_workers)
-    val_loader = (_make_dataloader(val_ds, config.batch_size, shuffle=False,
-                                   num_workers=num_workers) if val_ds else None)
-
     model = BoundaryNet(config.hidden_layers, config.hidden_size).to(device)
     optimizer = Adam(model.parameters(), lr=config.learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=config.lr_min)
@@ -61,32 +59,129 @@ def train_boundary(
 
     start_epoch = _maybe_resume(model, optimizer, scheduler, scaler, output_dir)
 
-    final_loss = _run_training_loop(
-        model, train_loader, val_loader, optimizer, scheduler, scaler,
-        config, device, output_dir, start_epoch,
-    )
+    if device.type == "cuda":
+        final_loss = _train_with_gpu_buffer(
+            model, optimizer, scheduler, scaler, config, device,
+            data_path, output_dir, start_epoch, gpu_buffer_size, num_workers,
+        )
+    else:
+        final_loss = _train_with_dataloader(
+            model, optimizer, scheduler, scaler, config, device,
+            data_path, output_dir, start_epoch, num_workers,
+        )
 
     return TrainResult(final_train_loss=final_loss)
 
 
-def _run_training_loop(
+# ---------------------------------------------------------------------------
+# GPU ring buffer training path
+# ---------------------------------------------------------------------------
+
+
+def _train_with_gpu_buffer(
     model: BoundaryNet,
-    train_loader: DataLoader,
-    val_loader: DataLoader | None,
     optimizer: Adam,
     scheduler: CosineAnnealingLR,
     scaler: torch.amp.GradScaler,
     config: TrainConfig,
     device: torch.device,
+    data_path: Path,
     output_dir: Path | None,
     start_epoch: int,
+    buffer_size: int,
+    num_workers: int,
 ) -> float:
-    """Execute the epoch loop. Returns the final training loss."""
-    final_loss = float("inf")
+    """Train using GPU ring buffer — zero CPU-GPU transfer per batch."""
+    from cfvnet.gpu_buffer import GpuRingBuffer
 
+    buf = GpuRingBuffer(data_path, capacity=buffer_size, device=device,
+                        num_workers=num_workers)
+    buf.start_refill()
+
+    # Steps per epoch = total records / batch_size (approximate).
+    steps_per_epoch = max(buf._total_records // config.batch_size, 1)
+
+    final_loss = float("inf")
+    try:
+        for epoch in range(start_epoch, config.epochs):
+            t0 = time.time()
+            train_loss = _train_epoch_buffer(
+                model, buf, optimizer, scaler, config, device, steps_per_epoch,
+            )
+            scheduler.step()
+
+            msg = _format_epoch_msg(epoch, config.epochs, scheduler, train_loss, time.time() - t0)
+            print(msg)
+            final_loss = train_loss
+            _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
+    finally:
+        buf.stop()
+
+    return final_loss
+
+
+def _train_epoch_buffer(
+    model: BoundaryNet,
+    buf: object,  # GpuRingBuffer (avoid circular import in type hint)
+    optimizer: Adam,
+    scaler: torch.amp.GradScaler,
+    config: TrainConfig,
+    device: torch.device,
+    steps: int,
+) -> float:
+    """Run one training epoch sampling from GPU buffer. Returns mean loss."""
+    model.train()
+    total_loss = 0.0
+
+    for _ in range(steps):
+        inp, target, mask, rng, gv, sw = buf.sample_batch(config.batch_size)  # type: ignore[attr-defined]
+
+        with torch.amp.autocast(device_type=device.type):
+            pred = model(inp)
+            loss, _, _ = boundary_loss(pred, target, mask, rng, gv, sw,
+                                       config.huber_delta, config.aux_loss_weight)
+
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+
+    return total_loss / max(steps, 1)
+
+
+# ---------------------------------------------------------------------------
+# DataLoader training path (CPU fallback / tests)
+# ---------------------------------------------------------------------------
+
+
+def _train_with_dataloader(
+    model: BoundaryNet,
+    optimizer: Adam,
+    scheduler: CosineAnnealingLR,
+    scaler: torch.amp.GradScaler,
+    config: TrainConfig,
+    device: torch.device,
+    data_path: Path,
+    output_dir: Path | None,
+    start_epoch: int,
+    num_workers: int,
+) -> float:
+    """Train using standard DataLoader — for CPU or small datasets."""
+    dataset = LazyBoundaryDataset.from_path(data_path)
+    train_ds, val_ds = _split_dataset(dataset, config.validation_split)
+    train_loader = _make_dataloader(train_ds, config.batch_size, shuffle=True,
+                                    num_workers=num_workers)
+    val_loader = (_make_dataloader(val_ds, config.batch_size, shuffle=False,
+                                   num_workers=num_workers) if val_ds else None)
+
+    final_loss = float("inf")
     for epoch in range(start_epoch, config.epochs):
         t0 = time.time()
-        train_loss = _train_epoch(model, train_loader, optimizer, scaler, config, device)
+        train_loss = _train_epoch_loader(model, train_loader, optimizer, scaler, config, device)
         scheduler.step()
 
         msg = _format_epoch_msg(epoch, config.epochs, scheduler, train_loss, time.time() - t0)
@@ -102,68 +197,7 @@ def _run_training_loop(
     return final_loss
 
 
-def _format_epoch_msg(
-    epoch: int, total_epochs: int, scheduler: CosineAnnealingLR,
-    train_loss: float, elapsed: float,
-) -> str:
-    """Format a single epoch log line."""
-    lr = scheduler.get_last_lr()[0]
-    return f"Epoch {epoch + 1}/{total_epochs} lr={lr:.2e} train={train_loss:.6f} [{elapsed:.0f}s]"
-
-
-def _split_dataset(
-    dataset: LazyBoundaryDataset,
-    val_split: float,
-) -> tuple[LazyBoundaryDataset, LazyBoundaryDataset | None]:
-    """Split dataset into train and val sets.
-
-    Args:
-        dataset: Full dataset.
-        val_split: Fraction for validation (0.0 to skip).
-
-    Returns:
-        Tuple of (train_set, val_set or None).
-    """
-    if val_split <= 0.0:
-        return dataset, None
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    if val_size == 0:
-        return dataset, None
-    return random_split(dataset, [train_size, val_size])
-
-
-def _make_dataloader(
-    dataset: LazyBoundaryDataset,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int = 8,
-) -> DataLoader:
-    """Create a DataLoader with pin_memory for GPU transfer.
-
-    Args:
-        dataset: Dataset to load from.
-        batch_size: Batch size.
-        shuffle: Whether to shuffle.
-        num_workers: Number of worker processes (0 for in-process).
-
-    Returns:
-        Configured DataLoader.
-    """
-    kwargs: dict = {
-        "dataset": dataset,
-        "batch_size": batch_size,
-        "shuffle": shuffle,
-        "num_workers": num_workers,
-        "pin_memory": num_workers > 0,
-    }
-    if num_workers > 0:
-        kwargs["prefetch_factor"] = 2
-        kwargs["persistent_workers"] = True
-    return DataLoader(**kwargs)
-
-
-def _train_epoch(
+def _train_epoch_loader(
     model: BoundaryNet,
     loader: DataLoader,
     optimizer: Adam,
@@ -171,7 +205,7 @@ def _train_epoch(
     config: TrainConfig,
     device: torch.device,
 ) -> float:
-    """Run one training epoch. Returns mean loss."""
+    """Run one training epoch from DataLoader. Returns mean loss."""
     model.train()
     total_loss = 0.0
     count = 0
@@ -195,6 +229,54 @@ def _train_epoch(
         count += 1
 
     return total_loss / max(count, 1)
+
+
+# ---------------------------------------------------------------------------
+# Shared utilities
+# ---------------------------------------------------------------------------
+
+
+def _format_epoch_msg(
+    epoch: int, total_epochs: int, scheduler: CosineAnnealingLR,
+    train_loss: float, elapsed: float,
+) -> str:
+    """Format a single epoch log line."""
+    lr = scheduler.get_last_lr()[0]
+    return f"Epoch {epoch + 1}/{total_epochs} lr={lr:.2e} train={train_loss:.6f} [{elapsed:.0f}s]"
+
+
+def _split_dataset(
+    dataset: LazyBoundaryDataset,
+    val_split: float,
+) -> tuple:
+    """Split dataset into train and val sets."""
+    if val_split <= 0.0:
+        return dataset, None
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    if val_size == 0:
+        return dataset, None
+    return random_split(dataset, [train_size, val_size])
+
+
+def _make_dataloader(
+    dataset: object,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 4,
+) -> DataLoader:
+    """Create a DataLoader with pin_memory for GPU transfer."""
+    kwargs: dict = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2
+        kwargs["persistent_workers"] = True
+    return DataLoader(**kwargs)
 
 
 @torch.no_grad()
@@ -233,16 +315,7 @@ def _save_checkpoint(
     epoch: int,
     output_dir: Path,
 ) -> None:
-    """Save training checkpoint.
-
-    Args:
-        model: Trained model.
-        optimizer: Adam optimizer.
-        scheduler: LR scheduler.
-        scaler: AMP gradient scaler.
-        epoch: Current epoch (1-indexed, already completed).
-        output_dir: Directory to save checkpoint.
-    """
+    """Save training checkpoint."""
     path = output_dir / f"checkpoint_epoch{epoch}.pt"
     torch.save({
         "epoch": epoch,
@@ -277,18 +350,7 @@ def _maybe_resume(
     scaler: torch.amp.GradScaler,
     output_dir: Path | None,
 ) -> int:
-    """Resume from latest checkpoint if available.
-
-    Args:
-        model: Model to load weights into.
-        optimizer: Optimizer to restore state.
-        scheduler: LR scheduler to restore state.
-        scaler: AMP scaler to restore state.
-        output_dir: Directory to search for checkpoints.
-
-    Returns:
-        Start epoch number (0 if no checkpoint found).
-    """
+    """Resume from latest checkpoint if available. Returns start epoch."""
     if output_dir is None:
         return 0
     checkpoints = sorted(output_dir.glob("checkpoint_epoch*.pt"))
