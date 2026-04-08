@@ -18,6 +18,7 @@ mod validation_spots;
 
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -2044,28 +2045,66 @@ fn run_mp_with_tui(
     config: &BlueprintMpConfig,
     tui_config: &blueprint_tui_config::BlueprintTuiConfig,
 ) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
-    let tree = MpGameTree::build(&config.game, &config.action_abstraction);
-    let scenarios = resolve_tui_scenarios(&tree, &tui_config.scenarios, config.game.num_players);
+    use poker_solver_core::blueprint_mp::trainer::{run_training, setup_training};
+
+    let ctx = setup_training(config);
+    let scenarios = resolve_tui_scenarios(
+        &ctx.tree, &tui_config.scenarios, config.game.num_players,
+    );
     let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
         config.training.iterations,
         config.training.time_limit_minutes,
     ));
-    let refresh = Duration::from_millis(tui_config.refresh_rate_ms);
-    let tui_handle = mp_tui::run_mp_tui(
-        Arc::clone(&metrics),
-        scenarios,
-        tui_config.telemetry.clone(),
-        refresh,
-        config.game.num_players,
+    let shared_iters = Arc::clone(&ctx.iterations);
+    let tui_handle = spawn_mp_tui(
+        &metrics, scenarios, tui_config, config.game.num_players,
     );
-    let result = train_blueprint_mp(config);
-    metrics
-        .quit_requested
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let train_config = config.clone();
+    let train_handle = std::thread::spawn(move || {
+        run_training(&ctx, &train_config.training, &train_config.game)
+    });
+    bridge_iterations(&shared_iters, &metrics, &train_handle);
+    metrics.quit_requested.store(true, Ordering::Relaxed);
+    let result = train_handle.join().expect("training thread panicked");
     let _ = tui_handle.join();
     eprintln!("Training complete: {} meta-iterations", result.meta_iterations);
     Ok(())
+}
+
+fn spawn_mp_tui(
+    metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
+    scenarios: Vec<mp_tui::ResolvedMpScenario>,
+    tui_config: &blueprint_tui_config::BlueprintTuiConfig,
+    num_players: u8,
+) -> std::thread::JoinHandle<()> {
+    let refresh = Duration::from_millis(tui_config.refresh_rate_ms);
+    mp_tui::run_mp_tui(
+        Arc::clone(metrics),
+        scenarios,
+        tui_config.telemetry.clone(),
+        refresh,
+        num_players,
+    )
+}
+
+fn bridge_iterations<T>(
+    source: &Arc<AtomicU64>,
+    metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
+    handle: &std::thread::JoinHandle<T>,
+) {
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let iters = source.load(Ordering::Relaxed);
+        metrics.iterations.store(iters, Ordering::Relaxed);
+        if handle.is_finished() {
+            let final_iters = source.load(Ordering::Relaxed);
+            metrics.iterations.store(final_iters, Ordering::Relaxed);
+            break;
+        }
+        if metrics.quit_requested.load(Ordering::Relaxed) {
+            break;
+        }
+    }
 }
 
 fn resolve_tui_scenarios(

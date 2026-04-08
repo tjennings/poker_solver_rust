@@ -10,13 +10,14 @@
     clippy::too_many_arguments
 )]
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
-use super::config::{BlueprintMpConfig, MpTrainingConfig};
+use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
 use super::game_tree::MpGameTree;
 use super::mccfr::{sample_deal, traverse_external};
 use super::storage::MpStorage;
@@ -29,26 +30,55 @@ pub struct TrainResult {
     pub final_strategy_delta: f64,
 }
 
-/// Train an N-player blueprint strategy.
+/// Shared training state accessible from outside the training loop.
+pub struct TrainContext {
+    pub tree: Arc<MpGameTree>,
+    pub storage: Arc<MpStorage>,
+    pub iterations: Arc<AtomicU64>,
+    pub num_players: u8,
+    pub bucket_counts: [u16; 4],
+}
+
+/// Build tree and storage without starting training.
+#[must_use]
+pub fn setup_training(config: &BlueprintMpConfig) -> TrainContext {
+    let tree = MpGameTree::build(&config.game, &config.action_abstraction);
+    let bucket_counts = config.clustering.bucket_counts();
+    let storage = MpStorage::new(&tree, bucket_counts);
+    TrainContext {
+        tree: Arc::new(tree),
+        storage: Arc::new(storage),
+        iterations: Arc::new(AtomicU64::new(0)),
+        num_players: config.game.num_players,
+        bucket_counts,
+    }
+}
+
+/// Run training on an existing context. Updates `ctx.iterations` atomically.
+pub fn run_training(
+    ctx: &TrainContext,
+    training: &MpTrainingConfig,
+    game: &MpGameConfig,
+) -> TrainResult {
+    training_loop(
+        &ctx.tree,
+        &ctx.storage,
+        training,
+        ctx.num_players,
+        ctx.bucket_counts,
+        game.rake_rate,
+        Chips(game.rake_cap),
+        &ctx.iterations,
+    )
+}
+
+/// Train an N-player blueprint strategy (convenience wrapper).
 ///
 /// One meta-iteration = N traversals (one per seat as traverser).
 #[must_use]
 pub fn train_blueprint_mp(config: &BlueprintMpConfig) -> TrainResult {
-    let tree = MpGameTree::build(&config.game, &config.action_abstraction);
-    let bucket_counts = config.clustering.bucket_counts();
-    let storage = MpStorage::new(&tree, bucket_counts);
-    let num_players = config.game.num_players;
-    let rake_rate = config.game.rake_rate;
-    let rake_cap = Chips(config.game.rake_cap);
-    training_loop(
-        &tree,
-        &storage,
-        &config.training,
-        num_players,
-        bucket_counts,
-        rake_rate,
-        rake_cap,
-    )
+    let ctx = setup_training(config);
+    run_training(&ctx, &config.training, &config.game)
 }
 
 fn training_loop(
@@ -59,6 +89,7 @@ fn training_loop(
     bucket_counts: [u16; 4],
     rake_rate: f64,
     rake_cap: Chips,
+    iterations: &AtomicU64,
 ) -> TrainResult {
     let max_iters = config.iterations.unwrap_or(u64::MAX);
     let mut meta_iter: u64 = 0;
@@ -74,16 +105,11 @@ fn training_loop(
         }
 
         run_batch(
-            tree,
-            storage,
-            num_players,
-            bucket_counts,
-            rake_rate,
-            rake_cap,
-            batch,
-            meta_iter,
+            tree, storage, num_players, bucket_counts,
+            rake_rate, rake_cap, batch, meta_iter,
         );
         meta_iter += batch;
+        iterations.store(meta_iter, Ordering::Relaxed);
 
         if should_discount(meta_iter, config) {
             apply_dcfr_discount(storage, meta_iter, config);
@@ -589,6 +615,64 @@ mod tests {
         let result = train_blueprint_mp(&config);
         // With batch_size=10 and max=25: batches of 10,10,5 = 25
         assert_eq!(result.meta_iterations, 25);
+    }
+
+    // -- setup_training tests --
+
+    #[timed_test]
+    fn setup_training_builds_nonempty_tree() {
+        let config = toy_config(2, 100);
+        let ctx = setup_training(&config);
+        assert!(!ctx.tree.nodes.is_empty(), "tree should have nodes");
+    }
+
+    #[timed_test]
+    fn setup_training_populates_bucket_counts() {
+        let config = toy_config(3, 50);
+        let ctx = setup_training(&config);
+        assert_eq!(ctx.bucket_counts, [10, 10, 10, 10]);
+    }
+
+    #[timed_test]
+    fn setup_training_sets_num_players() {
+        let config = toy_config(3, 50);
+        let ctx = setup_training(&config);
+        assert_eq!(ctx.num_players, 3);
+    }
+
+    #[timed_test]
+    fn setup_training_iterations_start_at_zero() {
+        let config = toy_config(2, 100);
+        let ctx = setup_training(&config);
+        assert_eq!(ctx.iterations.load(Ordering::Relaxed), 0);
+    }
+
+    // -- run_training tests --
+
+    #[timed_test]
+    fn run_training_returns_correct_meta_iterations() {
+        let config = toy_config(2, 50);
+        let ctx = setup_training(&config);
+        let result = run_training(&ctx, &config.training, &config.game);
+        assert_eq!(result.meta_iterations, 50);
+    }
+
+    #[timed_test]
+    fn run_training_updates_shared_iterations() {
+        let config = toy_config(2, 30);
+        let ctx = setup_training(&config);
+        let result = run_training(&ctx, &config.training, &config.game);
+        let shared = ctx.iterations.load(Ordering::Relaxed);
+        assert_eq!(shared, result.meta_iterations);
+    }
+
+    #[timed_test]
+    fn run_training_zero_iterations() {
+        let config = toy_config(2, 0);
+        let ctx = setup_training(&config);
+        let result = run_training(&ctx, &config.training, &config.game);
+        assert_eq!(result.meta_iterations, 0);
+        assert_eq!(ctx.iterations.load(Ordering::Relaxed), 0);
     }
 
     // -- Helper --
