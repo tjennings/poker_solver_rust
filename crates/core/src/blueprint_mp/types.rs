@@ -5,7 +5,7 @@ use super::MAX_PLAYERS;
 // === Seat ===
 
 /// Player seat index (0-based). Validated against table size on construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Seat(u8);
 
 impl Seat {
@@ -282,6 +282,26 @@ impl std::fmt::Display for Street {
             Self::River => f.write_str("river"),
         }
     }
+}
+
+// === Deal ===
+
+use crate::poker::Card;
+
+/// A sampled deal: hole cards for each player plus the full 5-card board.
+#[derive(Debug, Clone)]
+pub struct Deal {
+    pub hole_cards: [[Card; 2]; MAX_PLAYERS],
+    pub board: [Card; 5],
+    pub num_players: u8,
+}
+
+/// A deal with pre-computed bucket assignments for all streets and players.
+#[derive(Debug, Clone)]
+pub struct DealWithBuckets {
+    pub deal: Deal,
+    /// Pre-computed bucket indices: `buckets[seat][street]`.
+    pub buckets: [[Bucket; 4]; MAX_PLAYERS],
 }
 
 #[cfg(test)]
