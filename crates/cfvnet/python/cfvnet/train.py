@@ -160,7 +160,17 @@ def _train_with_gpu_buffer(
         )
         print(msg)
         final_loss = train_combined
-        _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
+
+        losses = {
+            "train_combined": train_combined, "train_huber": train_huber,
+            "train_aux": train_aux, "val_combined": val_combined,
+            "val_huber": val_huber, "val_aux": val_aux, "lr": lr,
+        }
+        if output_dir:
+            _append_training_log(output_dir, epoch + 1, losses)
+        _maybe_save_checkpoint(
+            model, optimizer, scheduler, scaler, epoch, config, output_dir, losses,
+        )
 
     if prep_thread is not None:
         prep_thread.join()
@@ -274,7 +284,15 @@ def _train_with_dataloader(
 
         print(msg)
         final_loss = train_loss
-        _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
+
+        losses = {"train_loss": train_loss, "lr": scheduler.get_last_lr()[0]}
+        if val_loader:
+            losses.update({"val_combined": val_combined, "val_huber": val_huber, "val_aux": val_aux})
+        if output_dir:
+            _append_training_log(output_dir, epoch + 1, losses)
+        _maybe_save_checkpoint(
+            model, optimizer, scheduler, scaler, epoch, config, output_dir, losses,
+        )
 
     return final_loss
 
@@ -396,16 +414,20 @@ def _save_checkpoint(
     scaler: torch.amp.GradScaler,
     epoch: int,
     output_dir: Path,
+    losses: dict[str, float] | None = None,
 ) -> None:
-    """Save training checkpoint."""
+    """Save training checkpoint with optional loss values."""
     path = output_dir / f"checkpoint_epoch{epoch}.pt"
-    torch.save({
+    data = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
-    }, path)
+    }
+    if losses:
+        data["losses"] = losses
+    torch.save(data, path)
     print(f"  Saved checkpoint: {path}")
 
 
@@ -417,12 +439,25 @@ def _maybe_save_checkpoint(
     epoch: int,
     config: TrainConfig,
     output_dir: Path | None,
+    losses: dict[str, float] | None = None,
 ) -> None:
     """Save checkpoint if conditions are met."""
     if not output_dir or config.checkpoint_every_n_epochs <= 0:
         return
     if (epoch + 1) % config.checkpoint_every_n_epochs == 0:
-        _save_checkpoint(model, optimizer, scheduler, scaler, epoch + 1, output_dir)
+        _save_checkpoint(model, optimizer, scheduler, scaler, epoch + 1, output_dir, losses)
+
+
+def _append_training_log(output_dir: Path, epoch: int, losses: dict[str, float]) -> None:
+    """Append one row to training_log.csv."""
+    log_path = output_dir / "training_log.csv"
+    write_header = not log_path.exists()
+    cols = sorted(losses.keys())
+    with open(log_path, "a") as f:
+        if write_header:
+            f.write("epoch," + ",".join(cols) + "\n")
+        vals = ",".join(f"{losses[c]:.6f}" for c in cols)
+        f.write(f"{epoch},{vals}\n")
 
 
 def _maybe_resume(
