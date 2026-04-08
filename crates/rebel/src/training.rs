@@ -106,6 +106,8 @@ pub fn build_train_config(
             .unwrap_or(4)
             .saturating_sub(2)
             .max(1),
+        gpu_prefetch: 1,
+        grad_clip_norm: 1.0,
     }
 }
 
