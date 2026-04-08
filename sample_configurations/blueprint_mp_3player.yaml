@@ -1,0 +1,48 @@
+game:
+  name: "3-max 50bb test"
+  num_players: 3
+  stack_depth: 100
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1
+    - seat: 1
+      type: big_blind
+      amount: 2
+
+action_abstraction:
+  preflop:
+    lead: ["5bb"]
+    raise:
+      - ["3.0x"]
+  flop:
+    lead: [0.67]
+    raise:
+      - [1.0]
+  turn:
+    lead: [0.67]
+    raise:
+      - [1.0]
+  river:
+    lead: [0.67]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 50
+  turn:
+    buckets: 50
+  river:
+    buckets: 50
+
+training:
+  iterations: 1000
+  batch_size: 50
+
+snapshots:
+  warmup_minutes: 5
+  snapshot_every_minutes: 5
+  output_dir: "/tmp/blueprint_mp_3p"

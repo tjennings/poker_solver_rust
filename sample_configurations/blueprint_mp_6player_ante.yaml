@@ -1,0 +1,54 @@
+game:
+  name: "6-max 100bb BB-ante"
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1
+    - seat: 1
+      type: big_blind
+      amount: 2
+    - seat: 1
+      type: bb_ante
+      amount: 2
+
+action_abstraction:
+  preflop:
+    lead: ["5bb", "6bb"]
+    raise:
+      - ["3.0x"]
+  flop:
+    lead: [0.33, 0.67]
+    raise:
+      - [0.5, 1.0]
+  turn:
+    lead: [0.5, 1.0]
+    raise:
+      - [0.67, 1.0]
+  river:
+    lead: [0.5, 1.0]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 100
+  turn:
+    buckets: 100
+  river:
+    buckets: 100
+
+training:
+  iterations: 5000
+  batch_size: 100
+  dcfr_alpha: 1.5
+  dcfr_beta: 0.0
+  dcfr_gamma: 2.0
+
+snapshots:
+  warmup_minutes: 10
+  snapshot_every_minutes: 10
+  output_dir: "/tmp/blueprint_mp_6p"

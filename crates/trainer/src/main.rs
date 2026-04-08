@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
+use poker_solver_core::blueprint_mp::trainer::train_blueprint_mp;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 
@@ -41,6 +43,12 @@ enum Commands {
         /// Disable the TUI dashboard even when tui.enabled is true in config
         #[arg(long)]
         no_tui: bool,
+    },
+    /// Train an N-player blueprint strategy using MCCFR (multiplayer)
+    TrainBlueprintMp {
+        /// YAML config file (BlueprintMpConfig)
+        #[arg(short, long)]
+        config: PathBuf,
     },
     /// Run the clustering pipeline to build bucket assignments (Blueprint V2)
     Cluster {
@@ -573,6 +581,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             eprintln!("\nTraining complete: {} iterations", trainer.iterations);
+        }
+        Commands::TrainBlueprintMp { config } => {
+            run_train_blueprint_mp(config.to_str().expect("invalid config path"))?;
         }
         Commands::Cluster { config, output } => {
             let yaml = std::fs::read_to_string(&config)?;
@@ -1996,10 +2007,37 @@ fn format_board_suffix(turn: Option<&str>, river: Option<&str>) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// N-player blueprint training
+// ---------------------------------------------------------------------------
+
+fn run_train_blueprint_mp(path: &str) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(path)?;
+    let config: BlueprintMpConfig = serde_yaml::from_str(&yaml)?;
+    config
+        .game
+        .validate()
+        .map_err(|e| format!("invalid config: {e}"))?;
+    eprintln!(
+        "Starting N-player blueprint training: {} ({} players, {}bb deep)",
+        config.game.name,
+        config.game.num_players,
+        config.game.stack_depth / 2.0
+    );
+    let result = train_blueprint_mp(&config);
+    eprintln!(
+        "Training complete: {} meta-iterations",
+        result.meta_iterations
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
     use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
     use poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig;
+    use test_macros::timed_test;
 
     /// The sample per_flop_200bkt.yaml must parse and have per_flop set.
     #[test]
@@ -2120,5 +2158,127 @@ mod tests {
         );
         assert_eq!(tui_cfg.regret_audits[1].name, "72o SB open");
         assert_eq!(tui_cfg.regret_audits[1].hand, "72o");
+    }
+
+    // -- train-blueprint-mp CLI tests --
+
+    /// The train-blueprint-mp subcommand should be parseable by clap.
+    #[timed_test]
+    fn train_blueprint_mp_cli_parses() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "train-blueprint-mp",
+            "--config",
+            "/tmp/test.yaml",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "train-blueprint-mp CLI must parse: {:?}",
+            cli.err()
+        );
+    }
+
+    /// The 3-player sample config must parse as BlueprintMpConfig.
+    #[timed_test]
+    fn mp_3player_sample_yaml_parses() {
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_mp_3player.yaml"
+        ))
+        .expect("blueprint_mp_3player.yaml must exist");
+        let cfg: BlueprintMpConfig =
+            serde_yaml::from_str(&yaml).expect("YAML must parse as BlueprintMpConfig");
+        assert_eq!(cfg.game.num_players, 3);
+        assert_eq!(cfg.game.blinds.len(), 2);
+        assert!(cfg.game.validate().is_ok());
+    }
+
+    /// The 6-player ante sample config must parse as BlueprintMpConfig.
+    #[timed_test]
+    fn mp_6player_ante_sample_yaml_parses() {
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_mp_6player_ante.yaml"
+        ))
+        .expect("blueprint_mp_6player_ante.yaml must exist");
+        let cfg: BlueprintMpConfig =
+            serde_yaml::from_str(&yaml).expect("YAML must parse as BlueprintMpConfig");
+        assert_eq!(cfg.game.num_players, 6);
+        assert_eq!(cfg.game.blinds.len(), 3);
+        assert!(cfg.game.validate().is_ok());
+    }
+
+    /// run_train_blueprint_mp returns an error for a non-existent file.
+    #[timed_test]
+    fn run_train_blueprint_mp_missing_file_errors() {
+        let result = super::run_train_blueprint_mp("/tmp/nonexistent_mp_config.yaml");
+        assert!(result.is_err());
+    }
+
+    /// run_train_blueprint_mp returns an error for invalid YAML content.
+    #[timed_test]
+    fn run_train_blueprint_mp_invalid_yaml_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "not: valid: blueprint: mp: config: [").unwrap();
+        let result = super::run_train_blueprint_mp(path.to_str().unwrap());
+        assert!(result.is_err());
+    }
+
+    /// run_train_blueprint_mp returns an error when game config is invalid.
+    #[timed_test]
+    fn run_train_blueprint_mp_invalid_game_config_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid_game.yaml");
+        let yaml = r#"
+game:
+  name: "bad"
+  num_players: 99
+  stack_depth: 100
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1
+
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop:
+    buckets: 10
+  flop:
+    buckets: 10
+  turn:
+    buckets: 10
+  river:
+    buckets: 10
+
+training:
+  iterations: 1
+
+snapshots:
+  warmup_minutes: 1
+  snapshot_every_minutes: 1
+  output_dir: "/tmp/bad"
+"#;
+        std::fs::write(&path, yaml).unwrap();
+        let result = super::run_train_blueprint_mp(path.to_str().unwrap());
+        assert!(result.is_err(), "should reject num_players=99");
     }
 }
