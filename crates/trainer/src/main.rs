@@ -2056,6 +2056,7 @@ fn run_mp_with_tui(
         config.training.time_limit_minutes,
     ));
     let shared_iters = Arc::clone(&ctx.iterations);
+    let quit_flag = Arc::clone(&ctx.quit);
     let storage = Arc::clone(&ctx.storage);
     let tree = Arc::clone(&ctx.tree);
     let scenario_node_ids: Vec<u32> = scenarios.iter().map(|s| s.node_idx).collect();
@@ -2068,9 +2069,11 @@ fn run_mp_with_tui(
     });
     bridge_mp_iterations(
         &shared_iters, &storage, &tree, &scenario_node_ids,
-        &metrics, &train_handle,
+        &metrics, &quit_flag, &train_handle,
     );
+    // Signal both the TUI and training thread to stop
     metrics.quit_requested.store(true, Ordering::Relaxed);
+    quit_flag.store(true, Ordering::Relaxed);
     let result = train_handle.join().expect("training thread panicked");
     let _ = tui_handle.join();
     eprintln!("Training complete: {} meta-iterations", result.meta_iterations);
@@ -2099,6 +2102,7 @@ fn bridge_mp_iterations<T>(
     tree: &Arc<poker_solver_core::blueprint_mp::game_tree::MpGameTree>,
     scenario_node_ids: &[u32],
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
+    quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
 ) {
     let mut last_telemetry = Instant::now();
@@ -2116,6 +2120,7 @@ fn bridge_mp_iterations<T>(
             break;
         }
         if metrics.quit_requested.load(Ordering::Relaxed) {
+            quit_flag.store(true, Ordering::Relaxed);
             break;
         }
     }

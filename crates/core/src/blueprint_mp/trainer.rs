@@ -10,7 +10,7 @@
     clippy::too_many_arguments
 )]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rand::prelude::*;
@@ -35,6 +35,8 @@ pub struct TrainContext {
     pub tree: Arc<MpGameTree>,
     pub storage: Arc<MpStorage>,
     pub iterations: Arc<AtomicU64>,
+    /// Set to `true` to signal the training loop to stop after the current batch.
+    pub quit: Arc<AtomicBool>,
     pub num_players: u8,
     pub bucket_counts: [u16; 4],
 }
@@ -49,6 +51,7 @@ pub fn setup_training(config: &BlueprintMpConfig) -> TrainContext {
         tree: Arc::new(tree),
         storage: Arc::new(storage),
         iterations: Arc::new(AtomicU64::new(0)),
+        quit: Arc::new(AtomicBool::new(false)),
         num_players: config.game.num_players,
         bucket_counts,
     }
@@ -69,6 +72,7 @@ pub fn run_training(
         game.rake_rate,
         Chips(game.rake_cap),
         &ctx.iterations,
+        &ctx.quit,
     )
 }
 
@@ -90,6 +94,7 @@ fn training_loop(
     rake_rate: f64,
     rake_cap: Chips,
     iterations: &AtomicU64,
+    quit: &AtomicBool,
 ) -> TrainResult {
     let max_iters = config.iterations.unwrap_or(u64::MAX);
     let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE) as i32;
@@ -97,7 +102,7 @@ fn training_loop(
     let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
 
     loop {
-        if meta_iter >= max_iters {
+        if meta_iter >= max_iters || quit.load(Ordering::Relaxed) {
             break;
         }
         let remaining = max_iters.saturating_sub(meta_iter);
