@@ -1,6 +1,7 @@
 pub mod config;
 pub mod game_tree;
 pub mod info_key;
+pub mod storage;
 pub mod terminal;
 pub mod types;
 
