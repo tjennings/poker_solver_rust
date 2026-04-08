@@ -105,15 +105,25 @@ def _train_with_gpu_buffer(
     steps_per_epoch = max(buf._total_records // config.batch_size, 1)
 
     final_loss = float("inf")
-    refresh_thread: threading.Thread | None = None
-    last_refresh_time = 0.0
+    prep_thread: threading.Thread | None = None
+    pending_ctx: dict | None = None
+    prep_lock = threading.Lock()
+    last_prep_time = 0.0
+
+    def _bg_prepare():
+        """Background: read records from disk into CPU buffer."""
+        nonlocal pending_ctx, last_prep_time
+        t0 = time.time()
+        ctx = buf.prepare_refresh(refresh_count)
+        last_prep_time = time.time() - t0
+        with prep_lock:
+            pending_ctx = ctx
+
+    # Start first prep immediately.
+    prep_thread = threading.Thread(target=_bg_prepare, daemon=True)
+    prep_thread.start()
 
     for epoch in range(start_epoch, config.epochs):
-        # Wait for previous refresh to finish before logging its time.
-        if refresh_thread is not None:
-            refresh_thread.join()
-            refresh_thread = None
-
         t0 = time.time()
         train_combined, train_huber, train_aux = _train_epoch_buffer(
             model, buf, optimizer, scaler, config, device, steps_per_epoch,
@@ -125,31 +135,35 @@ def _train_with_gpu_buffer(
         )
 
         train_elapsed = time.time() - t0
-        pool_pct = 100.0 * refresh_count / buf._capacity
+
+        # Apply any ready refresh (fast GPU copy) and start next prep.
+        refresh_status = ""
+        with prep_lock:
+            ctx = pending_ctx
+            pending_ctx = None
+        if ctx is not None:
+            buf.apply_refresh(ctx)
+            pct = 100.0 * refresh_count / buf._capacity
+            refresh_status = f" refresh={pct:.0f}% [prep {last_prep_time:.0f}s]"
+
+        # Start next prep if not already running.
+        if prep_thread is None or not prep_thread.is_alive():
+            prep_thread = threading.Thread(target=_bg_prepare, daemon=True)
+            prep_thread.start()
 
         lr = scheduler.get_last_lr()[0]
         msg = (
             f"Epoch {epoch + 1}/{config.epochs} lr={lr:.2e} "
             f"train={train_combined:.6f} (h={train_huber:.4f} a={train_aux:.4f}) "
             f"val={val_combined:.6f} (h={val_huber:.4f} a={val_aux:.4f}) "
-            f"[{train_elapsed:.0f}s] refresh={pool_pct:.0f}% [{last_refresh_time:.0f}s]"
+            f"[{train_elapsed:.0f}s]{refresh_status}"
         )
         print(msg)
         final_loss = train_combined
         _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
 
-        # Kick off refresh in background — overlaps with next epoch's training.
-        # The CPU workers read from disk while GPU trains on existing buffer.
-        def _do_refresh():
-            nonlocal last_refresh_time
-            last_refresh_time = buf.refresh(refresh_count)
-
-        refresh_thread = threading.Thread(target=_do_refresh, daemon=True)
-        refresh_thread.start()
-
-    # Wait for final refresh.
-    if refresh_thread is not None:
-        refresh_thread.join()
+    if prep_thread is not None:
+        prep_thread.join()
 
     return final_loss
 

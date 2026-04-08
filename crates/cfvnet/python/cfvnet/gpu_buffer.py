@@ -169,29 +169,82 @@ class GpuRingBuffer:
             self.sample_weights[indices],
         )
 
-    def refresh(self, num_records: int) -> float:
-        """Replace random GPU slots with fresh records from disk.
+    def prepare_refresh(self, num_records: int) -> dict:
+        """Read records from disk into CPU buffer (no GPU access).
+
+        Can run in a background thread while GPU trains.
 
         Args:
-            num_records: Number of records to replace.
+            num_records: Number of records to prepare.
 
         Returns:
-            Time taken in seconds.
+            Refresh context to pass to apply_refresh().
         """
         n = min(num_records, self._capacity)
         rng = np.random.default_rng()
 
-        # Random GPU slots to replace.
         gpu_slots = rng.integers(0, self._filled, size=n).tolist()
-        # Random records to read.
         record_indices = rng.integers(0, self._total_records, size=n).tolist()
 
-        t0 = time.time()
-        self._bulk_fill_slots(gpu_slots, record_indices)
-        return time.time() - t0
+        # Parallel CPU read + encode into shared buffer.
+        shared_buf = mp.Array(ctypes.c_float, n * _FLOATS_PER_RECORD, lock=False)
+        chunk_size = (n + self._num_workers - 1) // self._num_workers
+        processes: list[mp.Process] = []
+        for i in range(self._num_workers):
+            start = i * chunk_size
+            end = min(start + chunk_size, n)
+            if start >= n:
+                break
+            p = mp.Process(
+                target=_fill_chunk,
+                args=(
+                    self._file_index, self._total_records,
+                    record_indices[start:end], shared_buf, start, end - start,
+                ),
+                daemon=True,
+            )
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join()
+
+        return {"shared_buf": shared_buf, "gpu_slots": gpu_slots, "n": n}
+
+    def apply_refresh(self, ctx: dict) -> None:
+        """Bulk copy prepared CPU buffer to GPU (fast, ~milliseconds).
+
+        Call from main thread between training steps.
+
+        Args:
+            ctx: Context dict from prepare_refresh().
+        """
+        n = ctx["n"]
+        gpu_slots = ctx["gpu_slots"]
+        cpu_flat = np.frombuffer(ctx["shared_buf"], dtype=np.float32).reshape(
+            n, _FLOATS_PER_RECORD,
+        )
+        gpu_indices = torch.tensor(gpu_slots, dtype=torch.long, device=self._device)
+
+        off = 0
+        self.inputs[gpu_indices] = torch.from_numpy(
+            cpu_flat[:, off:off + INPUT_SIZE].copy()).to(self._device)
+        off += INPUT_SIZE
+        self.targets[gpu_indices] = torch.from_numpy(
+            cpu_flat[:, off:off + NUM_COMBOS].copy()).to(self._device)
+        off += NUM_COMBOS
+        self.masks[gpu_indices] = torch.from_numpy(
+            cpu_flat[:, off:off + NUM_COMBOS].copy()).to(self._device)
+        off += NUM_COMBOS
+        self.ranges[gpu_indices] = torch.from_numpy(
+            cpu_flat[:, off:off + NUM_COMBOS].copy()).to(self._device)
+        off += NUM_COMBOS
+        self.game_values[gpu_indices] = torch.from_numpy(
+            cpu_flat[:, off].copy()).to(self._device)
+        self.sample_weights[gpu_indices] = torch.from_numpy(
+            cpu_flat[:, off + 1].copy()).to(self._device)
 
     def stop(self) -> None:
-        """No-op (no background workers to stop)."""
+        """No-op (no persistent background workers)."""
         pass
 
 
