@@ -9,6 +9,7 @@ CPU-GPU transfer.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -95,6 +96,11 @@ class GpuRingBuffer:
         self._stop_event = threading.Event()
         self._refill_queue: Queue[int] = Queue()  # Slot indices to refill.
         self._workers: list[threading.Thread] = []
+
+        # Refill rate tracking.
+        self._refill_count = 0
+        self._refill_count_lock = threading.Lock()
+        self._last_refill_time = time.time()
 
         # File handle cache per thread (thread-local).
         self._local = threading.local()
@@ -214,6 +220,18 @@ class GpuRingBuffer:
             # Pick a random record from the full dataset.
             record_idx = rng.integers(0, self._total_records)
             self._fill_slot(slot, record_idx)
+            with self._refill_count_lock:
+                self._refill_count += 1
+
+    def refill_rate(self) -> float:
+        """Return records/second refill rate since last call, and reset counter."""
+        now = time.time()
+        with self._refill_count_lock:
+            count = self._refill_count
+            self._refill_count = 0
+        elapsed = now - self._last_refill_time
+        self._last_refill_time = now
+        return count / max(elapsed, 0.001)
 
     def stop(self) -> None:
         """Stop background refill threads."""

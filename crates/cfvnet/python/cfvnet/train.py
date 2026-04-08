@@ -105,14 +105,28 @@ def _train_with_gpu_buffer(
     try:
         for epoch in range(start_epoch, config.epochs):
             t0 = time.time()
-            train_loss = _train_epoch_buffer(
+            train_combined, train_huber, train_aux = _train_epoch_buffer(
                 model, buf, optimizer, scaler, config, device, steps_per_epoch,
             )
             scheduler.step()
 
-            msg = _format_epoch_msg(epoch, config.epochs, scheduler, train_loss, time.time() - t0)
+            # Validation: sample from the buffer (no separate val set needed —
+            # buffer is continuously refreshed with random records).
+            val_combined, val_huber, val_aux = _val_from_buffer(
+                model, buf, config, device, num_val_batches=10,
+            )
+
+            refill_rate = buf.refill_rate()
+            elapsed = time.time() - t0
+            lr = scheduler.get_last_lr()[0]
+            msg = (
+                f"Epoch {epoch + 1}/{config.epochs} lr={lr:.2e} "
+                f"train={train_combined:.6f} (h={train_huber:.4f} a={train_aux:.4f}) "
+                f"val={val_combined:.6f} (h={val_huber:.4f} a={val_aux:.4f}) "
+                f"[{elapsed:.0f}s] refill={refill_rate:.0f} rec/s"
+            )
             print(msg)
-            final_loss = train_loss
+            final_loss = train_combined
             _maybe_save_checkpoint(model, optimizer, scheduler, scaler, epoch, config, output_dir)
     finally:
         buf.stop()
@@ -122,24 +136,24 @@ def _train_with_gpu_buffer(
 
 def _train_epoch_buffer(
     model: BoundaryNet,
-    buf: object,  # GpuRingBuffer (avoid circular import in type hint)
+    buf: object,  # GpuRingBuffer
     optimizer: Adam,
     scaler: torch.amp.GradScaler,
     config: TrainConfig,
     device: torch.device,
     steps: int,
-) -> float:
-    """Run one training epoch sampling from GPU buffer. Returns mean loss."""
+) -> tuple[float, float, float]:
+    """Run one training epoch from GPU buffer. Returns (combined, huber, aux)."""
     model.train()
-    total_loss = 0.0
+    total_combined = total_huber = total_aux = 0.0
 
-    for _ in range(steps):
+    for step in range(steps):
         inp, target, mask, rng, gv, sw = buf.sample_batch(config.batch_size)  # type: ignore[attr-defined]
 
         with torch.amp.autocast(device_type=device.type):
             pred = model(inp)
-            loss, _, _ = boundary_loss(pred, target, mask, rng, gv, sw,
-                                       config.huber_delta, config.aux_loss_weight)
+            loss, huber, aux = boundary_loss(pred, target, mask, rng, gv, sw,
+                                             config.huber_delta, config.aux_loss_weight)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -148,9 +162,43 @@ def _train_epoch_buffer(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item()
+        total_combined += loss.item()
+        total_huber += huber.item()
+        total_aux += aux.item()
 
-    return total_loss / max(steps, 1)
+        if (step + 1) % 50 == 0 or step + 1 == steps:
+            print(f"\r  [{step + 1}/{steps}]", end="", flush=True)
+
+    print()  # newline after progress
+    n = max(steps, 1)
+    return total_combined / n, total_huber / n, total_aux / n
+
+
+@torch.no_grad()
+def _val_from_buffer(
+    model: BoundaryNet,
+    buf: object,  # GpuRingBuffer
+    config: TrainConfig,
+    device: torch.device,
+    num_val_batches: int = 10,
+) -> tuple[float, float, float]:
+    """Run validation by sampling from the GPU buffer. Returns (combined, huber, aux)."""
+    model.eval()
+    total_combined = total_huber = total_aux = 0.0
+
+    for _ in range(num_val_batches):
+        inp, target, mask, rng, gv, sw = buf.sample_batch(config.batch_size)  # type: ignore[attr-defined]
+        pred = model(inp)
+        combined, huber, aux = boundary_loss(
+            pred, target, mask, rng, gv, sw,
+            config.huber_delta, config.aux_loss_weight,
+        )
+        total_combined += combined.item()
+        total_huber += huber.item()
+        total_aux += aux.item()
+
+    n = max(num_val_batches, 1)
+    return total_combined / n, total_huber / n, total_aux / n
 
 
 # ---------------------------------------------------------------------------
