@@ -218,15 +218,17 @@ fn strategy_discount_factor(epoch: u64, gamma: f64) -> f64 {
 }
 
 fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuckets {
+    use crate::hands::CanonicalHand;
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
     for (seat_buckets, hole) in buckets
         .iter_mut()
         .zip(deal.hole_cards.iter())
         .take(deal.num_players as usize)
     {
-        let card_idx = hole[0].value as u16;
+        // Preflop: canonical hand index (0-168) for 169 unique buckets
+        let hand_idx = CanonicalHand::from_cards(hole[0], hole[1]).index() as u16;
         for (street, &count) in bucket_counts.iter().enumerate() {
-            seat_buckets[street] = Bucket(card_idx % count);
+            seat_buckets[street] = Bucket(hand_idx % count);
         }
     }
     DealWithBuckets {
