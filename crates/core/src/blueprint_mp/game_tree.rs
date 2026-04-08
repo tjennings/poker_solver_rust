@@ -122,13 +122,10 @@ impl TreeBuildConfig {
 
     fn raise_sizes_at_depth(&self, street: Street, depth: usize) -> RaiseSizes<'_> {
         match street {
-            Street::Preflop => {
-                let sizes = get_raise_depth_preflop(&self.preflop_raise, depth);
-                RaiseSizes::Preflop(sizes)
-            }
-            Street::Flop => RaiseSizes::Postflop(get_raise_depth(&self.flop_raise, depth)),
-            Street::Turn => RaiseSizes::Postflop(get_raise_depth(&self.turn_raise, depth)),
-            Street::River => RaiseSizes::Postflop(get_raise_depth(&self.river_raise, depth)),
+            Street::Preflop => RaiseSizes::Preflop(get_depth_or_last(&self.preflop_raise, depth)),
+            Street::Flop => RaiseSizes::Postflop(get_depth_or_last(&self.flop_raise, depth)),
+            Street::Turn => RaiseSizes::Postflop(get_depth_or_last(&self.turn_raise, depth)),
+            Street::River => RaiseSizes::Postflop(get_depth_or_last(&self.river_raise, depth)),
         }
     }
 
@@ -154,20 +151,8 @@ enum RaiseSizes<'a> {
     Postflop(&'a [f64]),
 }
 
-fn get_raise_depth(depths: &[Vec<f64>], idx: usize) -> &[f64] {
-    if idx < depths.len() {
-        &depths[idx]
-    } else {
-        depths.last().map_or(&[], Vec::as_slice)
-    }
-}
-
-fn get_raise_depth_preflop(depths: &[Vec<PreflopSize>], idx: usize) -> &[PreflopSize] {
-    if idx < depths.len() {
-        &depths[idx]
-    } else {
-        depths.last().map_or(&[], Vec::as_slice)
-    }
+fn get_depth_or_last<T>(depths: &[Vec<T>], idx: usize) -> &[T] {
+    depths.get(idx).or_else(|| depths.last()).map_or(&[], Vec::as_slice)
 }
 
 // ── Internal: YAML parsing helpers ──────────────────────────────────
@@ -237,10 +222,13 @@ impl MpGameTree {
         let tree_config = TreeBuildConfig::from_action_config(action_config);
         let stack = Chips(config.stack_depth);
         let state = init_build_state(config, stack);
-        let mut nodes = Vec::new();
-        let root = build_node(&tree_config, &state, &mut nodes);
+        let mut builder = TreeBuilder {
+            config: &tree_config,
+            nodes: Vec::new(),
+        };
+        let root = builder.build_node(&state);
         Self {
-            nodes,
+            nodes: builder.nodes,
             root,
             num_players: config.num_players,
             starting_stack: stack,
@@ -248,83 +236,72 @@ impl MpGameTree {
     }
 }
 
+struct TreeBuilder<'a> {
+    config: &'a TreeBuildConfig,
+    nodes: Vec<MpGameNode>,
+}
+
 // ── Initialization ──────────────────────────────────────────────────
 
 fn init_build_state(config: &MpGameConfig, stack: Chips) -> BuildState {
     let n = config.num_players;
-    let mut stacks = [Chips::ZERO; MAX_PLAYERS];
-    let mut street_bets = [Chips::ZERO; MAX_PLAYERS];
-    let mut contributions = [Chips::ZERO; MAX_PLAYERS];
-    let mut pot = Chips::ZERO;
-    let mut big_blind_amount = Chips(2.0);
-    let mut bb_seat: u8 = 1;
-    let mut has_straddle = false;
-    let mut straddle_seat: u8 = 0;
-
-    for s in stacks.iter_mut().take(n as usize) {
-        *s = stack;
-    }
-
-    for blind in &config.blinds {
-        let s = blind.seat as usize;
-        let amt = Chips(blind.amount);
-        apply_forced_bet(&mut stacks, &mut street_bets, &mut contributions, &mut pot, s, amt);
-        if blind.kind == ForcedBetKind::BigBlind {
-            big_blind_amount = amt;
-            bb_seat = blind.seat;
-        }
-        if blind.kind == ForcedBetKind::Straddle {
-            has_straddle = true;
-            straddle_seat = blind.seat;
-        }
-    }
-
-    let first_to_act = find_preflop_first_to_act(
-        n, bb_seat, has_straddle, straddle_seat,
-    );
-
-    let dealer = find_dealer(config);
-
-    BuildState {
-        stacks,
-        street_bets,
-        contributions,
+    let mut state = BuildState {
+        stacks: [Chips::ZERO; MAX_PLAYERS],
+        street_bets: [Chips::ZERO; MAX_PLAYERS],
+        contributions: [Chips::ZERO; MAX_PLAYERS],
         active: PlayerSet::all(n),
         all_in: PlayerSet::empty(),
         acted_since_aggression: PlayerSet::empty(),
         street: Street::Preflop,
-        pot,
+        pot: Chips::ZERO,
         num_players: n,
         raise_count: 0,
-        to_act: first_to_act,
+        to_act: Seat::from_raw(0),
         facing_bet: true,
-        last_raise_to: big_blind_amount,
-        dealer,
-        big_blind_amount,
+        last_raise_to: Chips(2.0),
+        dealer: find_dealer(config),
+        big_blind_amount: Chips(2.0),
+    };
+
+    for s in state.stacks.iter_mut().take(n as usize) {
+        *s = stack;
     }
+
+    let mut bb_seat: u8 = 1;
+    let mut straddle_seat: Option<u8> = None;
+
+    for blind in &config.blinds {
+        let amt = Chips(blind.amount);
+        state.apply_forced_bet(blind.seat as usize, amt);
+        if blind.kind == ForcedBetKind::BigBlind {
+            state.big_blind_amount = amt;
+            bb_seat = blind.seat;
+        }
+        if blind.kind == ForcedBetKind::Straddle {
+            straddle_seat = Some(blind.seat);
+        }
+    }
+
+    state.last_raise_to = state.big_blind_amount;
+    state.to_act = find_preflop_first_to_act(n, bb_seat, straddle_seat);
+    state
 }
 
-fn apply_forced_bet(
-    stacks: &mut [Chips; MAX_PLAYERS],
-    street_bets: &mut [Chips; MAX_PLAYERS],
-    contributions: &mut [Chips; MAX_PLAYERS],
-    pot: &mut Chips,
-    seat: usize,
-    amount: Chips,
-) {
-    stacks[seat] -= amount;
-    street_bets[seat] += amount;
-    contributions[seat] += amount;
-    *pot += amount;
+impl BuildState {
+    fn apply_forced_bet(&mut self, seat: usize, amount: Chips) {
+        self.stacks[seat] -= amount;
+        self.street_bets[seat] += amount;
+        self.contributions[seat] += amount;
+        self.pot += amount;
+    }
 }
 
 fn find_preflop_first_to_act(
     num_players: u8,
     bb_seat: u8,
-    has_straddle: bool,
-    straddle_seat: u8,
+    straddle_seat: Option<u8>,
 ) -> Seat {
-    let after = if has_straddle { straddle_seat } else { bb_seat };
+    let after = straddle_seat.unwrap_or(bb_seat);
     let next = (after + 1) % num_players;
     Seat::new(next, num_players)
 }
@@ -351,98 +328,7 @@ fn find_dealer(config: &MpGameConfig) -> u8 {
     }
 }
 
-// ── Recursive tree builder ──────────────────────────────────────────
-
-fn build_node(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let seat = state.to_act;
-    let remaining = state.stacks[seat.index() as usize];
-
-    if remaining < Chips(SIZE_EPSILON) && state.active.contains(seat) {
-        return advance_past_zero_stack(config, state, nodes);
-    }
-
-    // Preflop: BB sees limps as check opportunity, not a facing bet.
-    let state = if is_bb_facing_limps(state, seat) {
-        let mut s = state.clone();
-        s.facing_bet = false;
-        s
-    } else {
-        state.clone()
-    };
-    let state = &state;
-
-    let actions = generate_actions(config, state);
-
-    let node_idx = nodes.len() as u32;
-    nodes.push(placeholder_terminal());
-
-    let children = build_children(config, state, &actions, nodes);
-
-    nodes[node_idx as usize] = MpGameNode::Decision {
-        seat,
-        street: state.street,
-        actions,
-        children,
-    };
-
-    node_idx
-}
-
-fn build_children(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    actions: &[TreeAction],
-    nodes: &mut Vec<MpGameNode>,
-) -> Vec<u32> {
-    actions
-        .iter()
-        .map(|action| build_child(config, state, *action, nodes))
-        .collect()
-}
-
-fn placeholder_terminal() -> MpGameNode {
-    MpGameNode::Terminal {
-        kind: TerminalKind::Showdown {
-            active: PlayerSet::empty(),
-        },
-        pot: Chips::ZERO,
-        contributions: [Chips::ZERO; MAX_PLAYERS],
-    }
-}
-
-// ── Advance helpers ─────────────────────────────────────────────────
-
-fn advance_past_zero_stack(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    // Skip to next active non-all-in player; if none, advance street.
-    if let Some(next) = next_active_non_allin(state, state.to_act) {
-        let mut next_state = state.clone();
-        next_state.to_act = next;
-        build_node(config, &next_state, nodes)
-    } else {
-        make_showdown_or_chance(config, state, nodes)
-    }
-}
-
-fn next_active_non_allin(state: &BuildState, after: Seat) -> Option<Seat> {
-    let n = state.num_players;
-    for offset in 1..n {
-        let candidate = Seat::from_raw((after.index() + offset) % n);
-        if state.active.contains(candidate) && !state.all_in.contains(candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-// ── Action generation ───────────────────────────────────────────────
+// ── Action generation (pure functions on BuildState) ─────────────────
 
 fn generate_actions(config: &TreeBuildConfig, state: &BuildState) -> Vec<TreeAction> {
     let mut actions = Vec::new();
@@ -485,33 +371,31 @@ fn add_sized_actions(
         return;
     }
 
-    let seat = state.to_act;
-    let remaining = state.stacks[seat.index() as usize];
+    let remaining = state.stacks[state.to_act.index() as usize];
     if remaining < Chips(SIZE_EPSILON) {
         return;
     }
 
     if state.facing_bet {
-        let sizes = config.raise_sizes_at_depth(state.street, depth);
-        add_raise_sizes(state, sizes, actions);
+        add_raise_sizes(state, config.raise_sizes_at_depth(state.street, depth), actions);
     } else {
-        let sizes = config.lead_sizes(state.street);
-        add_lead_sizes(state, sizes, actions);
+        add_lead_sizes(state, config.lead_sizes(state.street), actions);
     }
 }
 
+// NOTE: add_lead_sizes and add_raise_sizes share structure (match/loop/resolve)
+// but differ in how amounts are computed: leads use pot*frac, raises use
+// call+pot_after_call*frac. Unifying would require closures and hurt readability.
 fn add_lead_sizes(state: &BuildState, sizes: LeadSizes<'_>, actions: &mut Vec<TreeAction>) {
     match sizes {
         LeadSizes::Preflop(preflop) => {
             for &size in preflop {
-                let amount = resolve_preflop_size(state, size);
-                try_add_lead(state, amount, actions);
+                try_add_lead(state, resolve_preflop_size(state, size), actions);
             }
         }
         LeadSizes::Postflop(fractions) => {
             for &frac in fractions {
-                let amount = state.pot * frac;
-                try_add_lead(state, amount, actions);
+                try_add_lead(state, state.pot * frac, actions);
             }
         }
     }
@@ -521,14 +405,12 @@ fn add_raise_sizes(state: &BuildState, sizes: RaiseSizes<'_>, actions: &mut Vec<
     match sizes {
         RaiseSizes::Preflop(preflop) => {
             for &size in preflop {
-                let raise_to = resolve_preflop_raise_to(state, size);
-                try_add_raise(state, raise_to, actions);
+                try_add_raise(state, resolve_preflop_raise_to(state, size), actions);
             }
         }
         RaiseSizes::Postflop(fractions) => {
             for &frac in fractions {
-                let raise_to = compute_postflop_raise_to(state, frac);
-                try_add_raise(state, raise_to, actions);
+                try_add_raise(state, compute_postflop_raise_to(state, frac), actions);
             }
         }
     }
@@ -542,16 +424,11 @@ fn resolve_preflop_size(state: &BuildState, size: PreflopSize) -> Chips {
 }
 
 fn resolve_preflop_raise_to(state: &BuildState, size: PreflopSize) -> Chips {
-    let raw = match size {
-        PreflopSize::Absolute(bb) => state.big_blind_amount * bb,
-        PreflopSize::Multiplier(mult) => state.last_raise_to * mult,
-    };
-    raw.max(min_raise_to(state))
+    resolve_preflop_size(state, size).max(min_raise_to(state))
 }
 
 fn compute_postflop_raise_to(state: &BuildState, frac: f64) -> Chips {
-    let seat = state.to_act;
-    let my_bet = state.street_bets[seat.index() as usize];
+    let my_bet = state.street_bets[state.to_act.index() as usize];
     let call_amount = max_street_bet(state) - my_bet;
     let pot_after_call = state.pot + call_amount;
     let raise_amount = call_amount + pot_after_call * frac;
@@ -559,55 +436,41 @@ fn compute_postflop_raise_to(state: &BuildState, frac: f64) -> Chips {
 }
 
 fn try_add_lead(state: &BuildState, amount: Chips, actions: &mut Vec<TreeAction>) {
-    let seat = state.to_act;
-    let remaining = state.stacks[seat.index() as usize];
-    let my_bet = state.street_bets[seat.index() as usize];
-    let raise_to = my_bet + amount;
-
-    let raise_to = raise_to.max(min_raise_to(state));
-    let all_in_to = my_bet + remaining;
-
-    if raise_to >= all_in_to - Chips(SIZE_EPSILON) {
-        return; // all-in added separately
-    }
-    if amount > remaining + Chips(SIZE_EPSILON) {
-        return;
-    }
-    if is_size_duplicate_lead(actions, raise_to) {
-        return;
-    }
-    actions.push(TreeAction::Lead(raise_to.0));
+    let my_bet = state.street_bets[state.to_act.index() as usize];
+    let raise_to = (my_bet + amount).max(min_raise_to(state));
+    try_add_sized_action(state, actions, raise_to, TreeAction::Lead);
 }
 
 fn try_add_raise(state: &BuildState, raise_to: Chips, actions: &mut Vec<TreeAction>) {
-    let seat = state.to_act;
-    let remaining = state.stacks[seat.index() as usize];
-    let my_bet = state.street_bets[seat.index() as usize];
-    let all_in_to = my_bet + remaining;
+    try_add_sized_action(state, actions, raise_to, TreeAction::Raise);
+}
+
+fn try_add_sized_action(
+    state: &BuildState,
+    actions: &mut Vec<TreeAction>,
+    raise_to: Chips,
+    variant: fn(f64) -> TreeAction,
+) {
+    let idx = state.to_act.index() as usize;
+    let remaining = state.stacks[idx];
+    let all_in_to = state.street_bets[idx] + remaining;
+    let additional = raise_to - state.street_bets[idx];
 
     if raise_to >= all_in_to - Chips(SIZE_EPSILON) {
         return; // all-in added separately
     }
-    let additional = raise_to - my_bet;
     if additional > remaining + Chips(SIZE_EPSILON) {
         return;
     }
-    if is_size_duplicate_raise(actions, raise_to) {
+    if is_size_duplicate(actions, raise_to) {
         return;
     }
-    actions.push(TreeAction::Raise(raise_to.0));
+    actions.push(variant(raise_to.0));
 }
 
-fn is_size_duplicate_lead(actions: &[TreeAction], amount: Chips) -> bool {
+fn is_size_duplicate(actions: &[TreeAction], amount: Chips) -> bool {
     actions.iter().any(|a| match a {
-        TreeAction::Lead(v) => (Chips(*v) - amount).0.abs() < SIZE_EPSILON,
-        _ => false,
-    })
-}
-
-fn is_size_duplicate_raise(actions: &[TreeAction], amount: Chips) -> bool {
-    actions.iter().any(|a| match a {
-        TreeAction::Raise(v) => (Chips(*v) - amount).0.abs() < SIZE_EPSILON,
+        TreeAction::Lead(v) | TreeAction::Raise(v) => (Chips(*v) - amount).0.abs() < SIZE_EPSILON,
         _ => false,
     })
 }
@@ -618,8 +481,7 @@ fn add_all_in_if_needed(state: &BuildState, actions: &mut Vec<TreeAction>) {
     if remaining < Chips(SIZE_EPSILON) {
         return;
     }
-    let my_bet = state.street_bets[seat.index() as usize];
-    let all_in_to = my_bet + remaining;
+    let all_in_to = state.street_bets[seat.index() as usize] + remaining;
     let already = actions.iter().any(|a| match a {
         TreeAction::Lead(v) | TreeAction::Raise(v) => {
             (Chips(*v) - all_in_to).0.abs() < SIZE_EPSILON
@@ -656,8 +518,7 @@ fn max_street_bet(state: &BuildState) -> Chips {
 }
 
 fn min_raise_to(state: &BuildState) -> Chips {
-    let seat = state.to_act;
-    let my_bet = state.street_bets[seat.index() as usize];
+    let my_bet = state.street_bets[state.to_act.index() as usize];
     if state.facing_bet {
         let current_max = max_street_bet(state);
         let call_amount = current_max - my_bet;
@@ -668,164 +529,22 @@ fn min_raise_to(state: &BuildState) -> Chips {
     }
 }
 
-// ── Build child (apply action) ──────────────────────────────────────
+// ── State query helpers ─────────────────────────────────────────────
 
-fn build_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    action: TreeAction,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    match action {
-        TreeAction::Fold => build_fold_child(config, state, nodes),
-        TreeAction::Check => build_check_child(config, state, nodes),
-        TreeAction::Call => build_call_child(config, state, nodes),
-        TreeAction::Lead(amount) => build_bet_child(config, state, Chips(amount), nodes),
-        TreeAction::Raise(amount) => build_raise_child(config, state, Chips(amount), nodes),
-        TreeAction::AllIn => build_allin_child(config, state, nodes),
-    }
-}
-
-fn build_fold_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let mut next = state.clone();
-    next.active.remove(state.to_act);
-
-    if next.active.count() == 1 {
-        let winner = next.active.iter().next().unwrap();
-        return make_terminal_last_standing(state, winner, nodes);
-    }
-
-    advance_to_next_player(config, &next, nodes)
-}
-
-fn build_check_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let mut next = state.clone();
-    next.acted_since_aggression.insert(state.to_act);
-
-    if is_round_closed(&next) {
-        return make_showdown_or_chance(config, &next, nodes);
-    }
-
-    advance_to_next_player(config, &next, nodes)
-}
-
-fn build_call_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let seat = state.to_act;
-    let idx = seat.index() as usize;
-    let current_max = max_street_bet(state);
-    let call_amount = current_max - state.street_bets[idx];
-
-    let mut next = state.clone();
-    next.stacks[idx] -= call_amount;
-    next.street_bets[idx] = current_max;
-    next.contributions[idx] += call_amount;
-    next.pot += call_amount;
-    next.acted_since_aggression.insert(seat);
-
-    if next.stacks[idx] < Chips(SIZE_EPSILON) {
-        next.all_in.insert(seat);
-    }
-
-    if is_round_closed(&next) {
-        return make_showdown_or_chance(config, &next, nodes);
-    }
-
-    advance_to_next_player(config, &next, nodes)
-}
-
-fn build_bet_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    raise_to: Chips,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    apply_aggression(config, state, raise_to, nodes)
-}
-
-fn build_raise_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    raise_to: Chips,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    apply_aggression(config, state, raise_to, nodes)
-}
-
-fn apply_aggression(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    raise_to: Chips,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let seat = state.to_act;
-    let idx = seat.index() as usize;
-    let additional = raise_to - state.street_bets[idx];
-
-    let mut next = state.clone();
-    next.stacks[idx] -= additional;
-    next.street_bets[idx] = raise_to;
-    next.contributions[idx] += additional;
-    next.pot += additional;
-    next.raise_count += 1;
-    next.facing_bet = true;
-    next.last_raise_to = raise_to;
-    next.acted_since_aggression = PlayerSet::empty();
-    next.acted_since_aggression.insert(seat);
-
-    advance_to_next_player(config, &next, nodes)
-}
-
-fn build_allin_child(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let seat = state.to_act;
-    let idx = seat.index() as usize;
-    let remaining = state.stacks[idx];
-    let raise_to = state.street_bets[idx] + remaining;
-
-    let is_call_allin = state.facing_bet
-        && raise_to <= max_street_bet(state) + Chips(SIZE_EPSILON);
-
-    let mut next = state.clone();
-    next.stacks[idx] = Chips::ZERO;
-    next.street_bets[idx] = raise_to;
-    next.contributions[idx] += remaining;
-    next.pot += remaining;
-    next.all_in.insert(seat);
-    next.acted_since_aggression.insert(seat);
-
-    if is_call_allin {
-        if is_round_closed(&next) {
-            return make_showdown_or_chance(config, &next, nodes);
+fn next_active_non_allin(state: &BuildState, after: Seat) -> Option<Seat> {
+    let n = state.num_players;
+    for offset in 1..n {
+        let candidate = Seat::from_raw((after.index() + offset) % n);
+        if state.active.contains(candidate) && !state.all_in.contains(candidate) {
+            return Some(candidate);
         }
-        return advance_to_next_player(config, &next, nodes);
     }
-
-    // All-in raise: reset aggression tracking
-    next.raise_count += 1;
-    next.facing_bet = true;
-    next.last_raise_to = raise_to;
-    next.acted_since_aggression = PlayerSet::empty();
-    next.acted_since_aggression.insert(seat);
-
-    advance_to_next_player(config, &next, nodes)
+    None
 }
 
-// ── Round closing and street transitions ────────────────────────────
+fn count_active_non_allin(state: &BuildState) -> u8 {
+    state.active.iter().filter(|s| !state.all_in.contains(*s)).count() as u8
+}
 
 fn is_bb_facing_limps(state: &BuildState, seat: Seat) -> bool {
     if state.street != Street::Preflop || state.raise_count != 0 || !state.facing_bet {
@@ -833,8 +552,6 @@ fn is_bb_facing_limps(state: &BuildState, seat: Seat) -> bool {
     }
     let my_bet = state.street_bets[seat.index() as usize];
     let current_max = max_street_bet(state);
-    // BB is facing limps when their street bet equals the current max
-    // (everyone matched their blind).
     (my_bet - current_max).0.abs() < SIZE_EPSILON
 }
 
@@ -854,99 +571,6 @@ fn is_round_closed(state: &BuildState) -> bool {
     true
 }
 
-fn advance_to_next_player(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    // Find next active non-all-in player
-    if let Some(next_seat) = next_active_non_allin(state, state.to_act) {
-        let mut next = state.clone();
-        next.to_act = next_seat;
-        build_node(config, &next, nodes)
-    } else {
-        // All remaining players are all-in (or only one non-all-in)
-        make_showdown_or_chance(config, state, nodes)
-    }
-}
-
-fn make_showdown_or_chance(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let active_non_allin = count_active_non_allin(state);
-
-    // If all active players are all-in or only 1 non-all-in with no bet,
-    // run out remaining streets.
-    let should_runout = active_non_allin <= 1;
-
-    match state.street.next() {
-        Some(next_street) if !should_runout => {
-            make_chance_node(config, state, next_street, nodes)
-        }
-        Some(next_street) if should_runout => {
-            // Runout: chain chance nodes to showdown
-            make_runout_chain(state, next_street, nodes)
-        }
-        _ => {
-            // River or no next street: showdown
-            make_terminal_showdown(state, nodes)
-        }
-    }
-}
-
-fn count_active_non_allin(state: &BuildState) -> u8 {
-    let mut count = 0;
-    for seat in state.active.iter() {
-        if !state.all_in.contains(seat) {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn make_chance_node(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    next_street: Street,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let chance_idx = nodes.len() as u32;
-    nodes.push(placeholder_terminal());
-
-    let next = new_street_state(state, next_street);
-    let child = build_node(config, &next, nodes);
-
-    nodes[chance_idx as usize] = MpGameNode::Chance {
-        next_street,
-        child,
-    };
-
-    chance_idx
-}
-
-fn make_runout_chain(
-    state: &BuildState,
-    next_street: Street,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let chance_idx = nodes.len() as u32;
-    nodes.push(placeholder_terminal());
-
-    let child = match next_street.next() {
-        Some(further) => make_runout_chain(state, further, nodes),
-        None => make_terminal_showdown(state, nodes),
-    };
-
-    nodes[chance_idx as usize] = MpGameNode::Chance {
-        next_street,
-        child,
-    };
-
-    chance_idx
-}
-
 fn new_street_state(state: &BuildState, next_street: Street) -> BuildState {
     let mut next = state.clone();
     next.street = next_street;
@@ -961,7 +585,6 @@ fn new_street_state(state: &BuildState, next_street: Street) -> BuildState {
 
 fn find_postflop_first_to_act(state: &BuildState) -> Seat {
     let n = state.num_players;
-    // First active non-all-in player left of BTN
     for offset in 1..=n {
         let candidate = (state.dealer + offset) % n;
         let seat = Seat::from_raw(candidate);
@@ -969,36 +592,230 @@ fn find_postflop_first_to_act(state: &BuildState) -> Seat {
             return seat;
         }
     }
-    // Fallback: first active player (all are all-in)
     state.active.iter().next().unwrap_or(Seat::from_raw(0))
 }
 
-// ── Terminal node constructors ──────────────────────────────────────
+// ── TreeBuilder: recursive tree construction ────────────────────────
 
-fn make_terminal_last_standing(
-    state: &BuildState,
-    winner: Seat,
-    nodes: &mut Vec<MpGameNode>,
-) -> u32 {
-    let idx = nodes.len() as u32;
-    nodes.push(MpGameNode::Terminal {
-        kind: TerminalKind::LastStanding { winner },
-        pot: state.pot,
-        contributions: state.contributions,
-    });
-    idx
-}
+impl TreeBuilder<'_> {
+    fn build_node(&mut self, state: &BuildState) -> u32 {
+        let seat = state.to_act;
+        let remaining = state.stacks[seat.index() as usize];
 
-fn make_terminal_showdown(state: &BuildState, nodes: &mut Vec<MpGameNode>) -> u32 {
-    let idx = nodes.len() as u32;
-    nodes.push(MpGameNode::Terminal {
-        kind: TerminalKind::Showdown {
-            active: state.active,
-        },
-        pot: state.pot,
-        contributions: state.contributions,
-    });
-    idx
+        if remaining < Chips(SIZE_EPSILON) && state.active.contains(seat) {
+            return self.advance_past_zero_stack(state);
+        }
+
+        let state = if is_bb_facing_limps(state, seat) {
+            let mut s = state.clone();
+            s.facing_bet = false;
+            s
+        } else {
+            state.clone()
+        };
+
+        let actions = generate_actions(self.config, &state);
+        let node_idx = self.push_placeholder();
+        let children: Vec<u32> = actions.iter().map(|a| self.build_child(&state, *a)).collect();
+
+        self.nodes[node_idx as usize] = MpGameNode::Decision {
+            seat,
+            street: state.street,
+            actions,
+            children,
+        };
+        node_idx
+    }
+
+    fn push_placeholder(&mut self) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(MpGameNode::Terminal {
+            kind: TerminalKind::Showdown { active: PlayerSet::empty() },
+            pot: Chips::ZERO,
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+        });
+        idx
+    }
+
+    fn advance_past_zero_stack(&mut self, state: &BuildState) -> u32 {
+        if let Some(next) = next_active_non_allin(state, state.to_act) {
+            let mut next_state = state.clone();
+            next_state.to_act = next;
+            self.build_node(&next_state)
+        } else {
+            self.make_showdown_or_chance(state)
+        }
+    }
+
+    fn build_child(&mut self, state: &BuildState, action: TreeAction) -> u32 {
+        match action {
+            TreeAction::Fold => self.build_fold_child(state),
+            TreeAction::Check => self.build_check_child(state),
+            TreeAction::Call => self.build_call_child(state),
+            TreeAction::Lead(amt) | TreeAction::Raise(amt) => {
+                self.apply_aggression(state, Chips(amt))
+            }
+            TreeAction::AllIn => self.build_allin_child(state),
+        }
+    }
+
+    fn build_fold_child(&mut self, state: &BuildState) -> u32 {
+        let mut next = state.clone();
+        next.active.remove(state.to_act);
+
+        if next.active.count() == 1 {
+            let winner = next.active.iter().next().unwrap();
+            return self.make_terminal_last_standing(state, winner);
+        }
+        self.advance_to_next_player(&next)
+    }
+
+    fn build_check_child(&mut self, state: &BuildState) -> u32 {
+        let mut next = state.clone();
+        next.acted_since_aggression.insert(state.to_act);
+
+        if is_round_closed(&next) {
+            return self.make_showdown_or_chance(&next);
+        }
+        self.advance_to_next_player(&next)
+    }
+
+    fn build_call_child(&mut self, state: &BuildState) -> u32 {
+        let seat = state.to_act;
+        let idx = seat.index() as usize;
+        let current_max = max_street_bet(state);
+        let call_amount = current_max - state.street_bets[idx];
+
+        let mut next = state.clone();
+        next.stacks[idx] -= call_amount;
+        next.street_bets[idx] = current_max;
+        next.contributions[idx] += call_amount;
+        next.pot += call_amount;
+        next.acted_since_aggression.insert(seat);
+
+        if next.stacks[idx] < Chips(SIZE_EPSILON) {
+            next.all_in.insert(seat);
+        }
+        if is_round_closed(&next) {
+            return self.make_showdown_or_chance(&next);
+        }
+        self.advance_to_next_player(&next)
+    }
+
+    fn apply_aggression(&mut self, state: &BuildState, raise_to: Chips) -> u32 {
+        let seat = state.to_act;
+        let idx = seat.index() as usize;
+        let additional = raise_to - state.street_bets[idx];
+
+        let mut next = state.clone();
+        next.stacks[idx] -= additional;
+        next.street_bets[idx] = raise_to;
+        next.contributions[idx] += additional;
+        next.pot += additional;
+        next.raise_count += 1;
+        next.facing_bet = true;
+        next.last_raise_to = raise_to;
+        next.acted_since_aggression = PlayerSet::empty();
+        next.acted_since_aggression.insert(seat);
+
+        self.advance_to_next_player(&next)
+    }
+
+    fn build_allin_child(&mut self, state: &BuildState) -> u32 {
+        let seat = state.to_act;
+        let idx = seat.index() as usize;
+        let remaining = state.stacks[idx];
+        let raise_to = state.street_bets[idx] + remaining;
+        let is_call_allin = state.facing_bet
+            && raise_to <= max_street_bet(state) + Chips(SIZE_EPSILON);
+
+        let mut next = state.clone();
+        next.stacks[idx] = Chips::ZERO;
+        next.street_bets[idx] = raise_to;
+        next.contributions[idx] += remaining;
+        next.pot += remaining;
+        next.all_in.insert(seat);
+        next.acted_since_aggression.insert(seat);
+
+        if is_call_allin {
+            if is_round_closed(&next) {
+                return self.make_showdown_or_chance(&next);
+            }
+            return self.advance_to_next_player(&next);
+        }
+
+        next.raise_count += 1;
+        next.facing_bet = true;
+        next.last_raise_to = raise_to;
+        next.acted_since_aggression = PlayerSet::empty();
+        next.acted_since_aggression.insert(seat);
+
+        self.advance_to_next_player(&next)
+    }
+
+    fn advance_to_next_player(&mut self, state: &BuildState) -> u32 {
+        if let Some(next_seat) = next_active_non_allin(state, state.to_act) {
+            let mut next = state.clone();
+            next.to_act = next_seat;
+            self.build_node(&next)
+        } else {
+            self.make_showdown_or_chance(state)
+        }
+    }
+
+    fn make_showdown_or_chance(&mut self, state: &BuildState) -> u32 {
+        let should_runout = count_active_non_allin(state) <= 1;
+
+        match state.street.next() {
+            Some(next_street) if !should_runout => {
+                self.make_chance_node(state, next_street)
+            }
+            Some(next_street) if should_runout => {
+                self.make_runout_chain(state, next_street)
+            }
+            _ => self.make_terminal_showdown(state),
+        }
+    }
+
+    fn make_chance_node(&mut self, state: &BuildState, next_street: Street) -> u32 {
+        let chance_idx = self.push_placeholder();
+        let next = new_street_state(state, next_street);
+        let child = self.build_node(&next);
+
+        self.nodes[chance_idx as usize] = MpGameNode::Chance { next_street, child };
+        chance_idx
+    }
+
+    fn make_runout_chain(&mut self, state: &BuildState, next_street: Street) -> u32 {
+        let chance_idx = self.push_placeholder();
+        let child = match next_street.next() {
+            Some(further) => self.make_runout_chain(state, further),
+            None => self.make_terminal_showdown(state),
+        };
+
+        self.nodes[chance_idx as usize] = MpGameNode::Chance { next_street, child };
+        chance_idx
+    }
+
+    fn make_terminal_last_standing(&mut self, state: &BuildState, winner: Seat) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(MpGameNode::Terminal {
+            kind: TerminalKind::LastStanding { winner },
+            pot: state.pot,
+            contributions: state.contributions,
+        });
+        idx
+    }
+
+    fn make_terminal_showdown(&mut self, state: &BuildState) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(MpGameNode::Terminal {
+            kind: TerminalKind::Showdown { active: state.active },
+            pot: state.pot,
+            contributions: state.contributions,
+        });
+        idx
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1394,6 +1211,219 @@ mod tests {
                     "Node {i}: contributions sum {sum:?} != pot {pot:?}"
                 );
             }
+        }
+    }
+
+    // ── Tests for refactored helpers ────────────────────────────────
+
+    #[timed_test]
+    fn get_depth_or_last_returns_idx_when_in_range() {
+        let depths = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        assert_eq!(get_depth_or_last(&depths, 0), &[1.0, 2.0]);
+        assert_eq!(get_depth_or_last(&depths, 1), &[3.0, 4.0]);
+    }
+
+    #[timed_test]
+    fn get_depth_or_last_falls_back_to_last() {
+        let depths = vec![vec![1.0], vec![2.0, 3.0]];
+        assert_eq!(get_depth_or_last(&depths, 5), &[2.0, 3.0]);
+        assert_eq!(get_depth_or_last(&depths, 99), &[2.0, 3.0]);
+    }
+
+    #[timed_test]
+    fn get_depth_or_last_returns_empty_when_no_depths() {
+        let depths: Vec<Vec<f64>> = vec![];
+        let result: &[f64] = get_depth_or_last(&depths, 0);
+        assert!(result.is_empty());
+    }
+
+    #[timed_test]
+    fn is_size_duplicate_detects_lead_match() {
+        let actions = vec![TreeAction::Lead(10.0)];
+        assert!(is_size_duplicate(&actions, Chips(10.005)));
+        assert!(!is_size_duplicate(&actions, Chips(11.0)));
+    }
+
+    #[timed_test]
+    fn is_size_duplicate_detects_raise_match() {
+        let actions = vec![TreeAction::Raise(20.0)];
+        assert!(is_size_duplicate(&actions, Chips(20.005)));
+        assert!(!is_size_duplicate(&actions, Chips(21.0)));
+    }
+
+    #[timed_test]
+    fn is_size_duplicate_ignores_non_sized_actions() {
+        let actions = vec![TreeAction::Fold, TreeAction::Check, TreeAction::AllIn];
+        assert!(!is_size_duplicate(&actions, Chips(10.0)));
+    }
+
+    #[timed_test]
+    fn is_size_duplicate_empty_actions() {
+        assert!(!is_size_duplicate(&[], Chips(10.0)));
+    }
+
+    #[timed_test]
+    fn find_preflop_first_to_act_no_straddle() {
+        // 3 players, BB at seat 1, no straddle -> first to act is seat 2
+        let seat = find_preflop_first_to_act(3, 1, None);
+        assert_eq!(seat.index(), 2);
+    }
+
+    #[timed_test]
+    fn find_preflop_first_to_act_with_straddle() {
+        // 4 players, BB at seat 1, straddle at seat 2 -> first to act is seat 3
+        let seat = find_preflop_first_to_act(4, 1, Some(2));
+        assert_eq!(seat.index(), 3);
+    }
+
+    #[timed_test]
+    fn find_preflop_first_to_act_wraps_around() {
+        // 3 players, BB at seat 2, no straddle -> first to act wraps to seat 0
+        let seat = find_preflop_first_to_act(3, 2, None);
+        assert_eq!(seat.index(), 0);
+    }
+
+    #[timed_test]
+    fn build_state_apply_forced_bet_updates_all_fields() {
+        let mut state = BuildState {
+            stacks: [Chips(100.0); MAX_PLAYERS],
+            street_bets: [Chips::ZERO; MAX_PLAYERS],
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+            active: PlayerSet::all(2),
+            all_in: PlayerSet::empty(),
+            acted_since_aggression: PlayerSet::empty(),
+            street: Street::Preflop,
+            pot: Chips::ZERO,
+            num_players: 2,
+            raise_count: 0,
+            to_act: Seat::from_raw(0),
+            facing_bet: false,
+            last_raise_to: Chips::ZERO,
+            dealer: 0,
+            big_blind_amount: Chips(2.0),
+        };
+
+        state.apply_forced_bet(0, Chips(1.0));
+        assert_eq!(state.stacks[0], Chips(99.0));
+        assert_eq!(state.street_bets[0], Chips(1.0));
+        assert_eq!(state.contributions[0], Chips(1.0));
+        assert_eq!(state.pot, Chips(1.0));
+
+        state.apply_forced_bet(1, Chips(2.0));
+        assert_eq!(state.stacks[1], Chips(98.0));
+        assert_eq!(state.street_bets[1], Chips(2.0));
+        assert_eq!(state.contributions[1], Chips(2.0));
+        assert_eq!(state.pot, Chips(3.0));
+    }
+
+    #[timed_test]
+    fn try_add_sized_action_skips_allin_equivalent() {
+        let state = BuildState {
+            stacks: [Chips(10.0), Chips(100.0), Chips::ZERO, Chips::ZERO,
+                     Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO],
+            street_bets: [Chips::ZERO; MAX_PLAYERS],
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+            active: PlayerSet::all(2),
+            all_in: PlayerSet::empty(),
+            acted_since_aggression: PlayerSet::empty(),
+            street: Street::Flop,
+            pot: Chips(20.0),
+            num_players: 2,
+            raise_count: 0,
+            to_act: Seat::from_raw(0),
+            facing_bet: false,
+            last_raise_to: Chips::ZERO,
+            dealer: 0,
+            big_blind_amount: Chips(2.0),
+        };
+
+        let mut actions = Vec::new();
+        // raise_to of 10.0 = all-in for seat 0 (stack=10), should be skipped
+        try_add_sized_action(&state, &mut actions, Chips(10.0), TreeAction::Lead);
+        assert!(actions.is_empty(), "Should skip all-in equivalent size");
+    }
+
+    #[timed_test]
+    fn try_add_sized_action_adds_valid_size() {
+        let state = BuildState {
+            stacks: [Chips(100.0), Chips(100.0), Chips::ZERO, Chips::ZERO,
+                     Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO],
+            street_bets: [Chips::ZERO; MAX_PLAYERS],
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+            active: PlayerSet::all(2),
+            all_in: PlayerSet::empty(),
+            acted_since_aggression: PlayerSet::empty(),
+            street: Street::Flop,
+            pot: Chips(20.0),
+            num_players: 2,
+            raise_count: 0,
+            to_act: Seat::from_raw(0),
+            facing_bet: false,
+            last_raise_to: Chips::ZERO,
+            dealer: 0,
+            big_blind_amount: Chips(2.0),
+        };
+
+        let mut actions = Vec::new();
+        try_add_sized_action(&state, &mut actions, Chips(15.0), TreeAction::Lead);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], TreeAction::Lead(v) if (v - 15.0).abs() < 0.01));
+    }
+
+    #[timed_test]
+    fn try_add_sized_action_skips_duplicate() {
+        let state = BuildState {
+            stacks: [Chips(100.0), Chips(100.0), Chips::ZERO, Chips::ZERO,
+                     Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO],
+            street_bets: [Chips::ZERO; MAX_PLAYERS],
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+            active: PlayerSet::all(2),
+            all_in: PlayerSet::empty(),
+            acted_since_aggression: PlayerSet::empty(),
+            street: Street::Flop,
+            pot: Chips(20.0),
+            num_players: 2,
+            raise_count: 0,
+            to_act: Seat::from_raw(0),
+            facing_bet: false,
+            last_raise_to: Chips::ZERO,
+            dealer: 0,
+            big_blind_amount: Chips(2.0),
+        };
+
+        let mut actions = vec![TreeAction::Lead(15.0)];
+        try_add_sized_action(&state, &mut actions, Chips(15.005), TreeAction::Lead);
+        assert_eq!(actions.len(), 1, "Should skip near-duplicate size");
+    }
+
+    #[timed_test]
+    fn straddle_config_builds_tree_without_panic() {
+        let blinds = vec![
+            ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
+            ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+            ForcedBet { seat: 2, kind: ForcedBetKind::Straddle, amount: 4.0 },
+        ];
+        let game = MpGameConfig {
+            name: "straddle-test".into(),
+            num_players: 4,
+            stack_depth: 100.0,
+            blinds,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let empty = MpStreetSizes { lead: vec![], raise: vec![] };
+        let action = MpActionAbstractionConfig {
+            preflop: empty.clone(),
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        let tree = MpGameTree::build(&game, &action);
+        // With straddle at seat 2, first to act should be seat 3
+        if let MpGameNode::Decision { seat, .. } = &tree.nodes[tree.root as usize] {
+            assert_eq!(seat.index(), 3, "First to act with straddle should be seat 3");
+        } else {
+            panic!("Root should be Decision");
         }
     }
 }
