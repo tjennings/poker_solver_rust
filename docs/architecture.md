@@ -144,6 +144,28 @@ All variants store canonical `PackedBoard` entries in the `BucketFile.boards` fi
 - Diagnostics: `crates/core/src/blueprint_v2/cluster_diagnostics.rs`
 - Config: `crates/core/src/blueprint_v2/config.rs` (`ClusteringConfig`)
 
+### Heuristic V3 Bucketing
+
+An alternative card abstraction that uses two deterministic axes instead of EMD clustering:
+
+- **Nut distance** (configurable, default 6 bits / 64 bins): fraction of possible opponent holdings that beat the hero's hand on the current board. 0 = absolute nuts, 63 = pure air.
+- **Equity delta** (configurable, default 4 bits / 16 bins): expected change in equity from current street to next. Positive = draws improving, negative = vulnerable made hands. Zero on river (no future cards).
+
+Default configuration produces **1,024 buckets per street** (64 on river where delta collapses to midpoint). Buckets are precomputed per-flop and stored in the existing `PerFlopBucketFile` format.
+
+Key advantages over EMD clustering:
+- **Deterministic**: same inputs always produce same buckets (no k-means convergence)
+- **Fast precomputation**: direct bin assignment, no iterative clustering
+- **Interpretable**: each bucket maps to a (nut_distance, equity_delta) pair
+
+Select via config:
+```yaml
+clustering:
+  algorithm: heuristic_v3
+  nut_distance_bits: 6
+  equity_delta_bits: 4
+```
+
 ## N-Player Blueprint (`blueprint_mp`)
 
 A clean-room N-player (2-8) MCCFR solver module alongside the existing `blueprint_v2`. Uses strong domain types and supports configurable blind/ante structures.

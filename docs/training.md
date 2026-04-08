@@ -227,6 +227,24 @@ Clustering config parameters (in the `clustering` section of the YAML):
 | `kmeans_iterations` | 100 | K-means iterations per street |
 | `seed` | 42 | Random seed for board sampling |
 
+### Heuristic V3 Algorithm
+
+Set `algorithm: heuristic_v3` in the clustering config to use deterministic two-axis bucketing instead of the default `potential_aware_emd` clustering.
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `nut_distance_bits` | 6 | 2-8 | Bits for nut distance quantization (2^N bins) |
+| `equity_delta_bits` | 4 | 2-8 | Bits for equity delta quantization (2^N bins) |
+
+Total buckets per street = `2^nut_distance_bits * 2^equity_delta_bits`. Default: 1,024.
+
+Example config: `sample_configurations/heuristic_v3_1024bkt.yaml`
+
+To generate bucket files:
+```bash
+cargo run -p poker-solver-trainer --release -- cluster -c sample_configurations/heuristic_v3_1024bkt.yaml -o ./local_data/clusters_heuristic_v3
+```
+
 ### diag-clusters
 
 Diagnostics for pre-computed cluster bucket files.
