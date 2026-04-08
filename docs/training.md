@@ -311,6 +311,85 @@ Use `--no-tui` to disable the dashboard and use text output instead.
 
 See `sample_configurations/blueprint_v2_with_tui.yaml` for a complete example.
 
+### N-Player TUI (`train-blueprint-mp`)
+
+The multiplayer trainer supports the same TUI dashboard. Enable it in the YAML config:
+
+```yaml
+tui:
+  enabled: true
+  scenarios:
+    - name: "UTG open"
+      spot: ""
+```
+
+Alternatively, omit `--no-tui` from the command line (the TUI is enabled by default when `tui.enabled: true`).
+
+#### Position Labels
+
+Seat positions are assigned standard poker labels based on the number of players:
+
+| Players | Seat 0 | Seat 1 | Seat 2 | Seat 3 | Seat 4 | Seat 5 | Seat 6 | Seat 7 |
+|---------|--------|--------|--------|--------|--------|--------|--------|--------|
+| 2       | SB     | BB     |        |        |        |        |        |        |
+| 3       | BTN    | SB     | BB     |        |        |        |        |        |
+| 4       | CO     | BTN    | SB     | BB     |        |        |        |        |
+| 5       | HJ     | CO     | BTN    | SB     | BB     |        |        |        |
+| 6       | UTG    | HJ     | CO     | BTN    | SB     | BB     |        |        |
+| 7       | UTG    | UTG1   | HJ     | CO     | BTN    | SB     | BB     |        |
+| 8       | UTG    | UTG1   | UTG2   | HJ     | CO     | BTN    | SB     | BB     |
+
+Action order is UTG-first (seat after BB), proceeding clockwise.
+
+#### Spot Encoding
+
+Each scenario's `spot` field encodes the action sequence leading to the decision point. The format is a comma-separated list of `position:action` pairs in action order:
+
+- Empty string `""` -- first to act (UTG in 6-max), no preceding actions
+- `"utg:fold"` -- UTG folded, now HJ's turn
+- `"utg:5bb"` -- UTG raised to 5bb (in chips), now HJ faces a raise
+- `"utg:fold,hj:fold,co:fold,btn:fold,sb:call"` -- everyone folds to SB who limps, now BB acts
+
+Actions use the same size labels as `action_abstraction.preflop.lead` (e.g., `5bb`, `6bb`) or the keyword `fold`/`call`.
+
+#### Example Scenarios
+
+**Opening ranges** (who raises first when it folds to them):
+
+```yaml
+scenarios:
+  - name: "UTG open"
+    spot: ""
+  - name: "HJ open"
+    spot: "utg:fold"
+  - name: "CO open"
+    spot: "utg:fold,hj:fold"
+  - name: "BTN open"
+    spot: "utg:fold,hj:fold,co:fold"
+  - name: "SB open"
+    spot: "utg:fold,hj:fold,co:fold,btn:fold"
+  - name: "BB vs limp"
+    spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:call"
+```
+
+**3-bet ranges** (who re-raises a UTG open):
+
+```yaml
+scenarios:
+  - name: "HJ vs UTG"
+    spot: "utg:5bb"
+  - name: "CO vs UTG"
+    spot: "utg:5bb,hj:fold"
+  - name: "BTN vs CO"
+    spot: "utg:fold,hj:fold,co:5bb"
+```
+
+#### Pagination
+
+The TUI displays up to 6 strategy grids per page. When more than 6 scenarios are configured, they are split across multiple pages. Use the left/right arrow keys to navigate between pages.
+
+See `sample_configurations/blueprint_mp_6player_ante.yaml` for a full 12-scenario config spanning 2 pages.
+
 ## Blueprint Training Configuration
 
 All `game:` section values are in **chips** (1 BB = 2 chips). Example: `stack_depth: 200` = 100 BB, `small_blind: 1`, `big_blind: 2`. Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` = raise to 5 chips (2.5 BB). Display converts to BB at the UI/CLI boundary only (dividing by 2). See `docs/architecture.md` for full unit convention.

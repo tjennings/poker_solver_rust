@@ -54,10 +54,22 @@ snapshots:
   output_dir: "/tmp/blueprint_mp_6p"
 
 tui:
-  enabled: false
+  enabled: true
   scenarios:
+    # Page 1: Opening ranges
     - name: "UTG open"
       spot: ""
+    - name: "HJ open"
+      spot: "utg:fold"
+    - name: "CO open"
+      spot: "utg:fold,hj:fold"
+    - name: "BTN open"
+      spot: "utg:fold,hj:fold,co:fold"
+    - name: "SB open"
+      spot: "utg:fold,hj:fold,co:fold,btn:fold"
+    - name: "BB vs limp"
+      spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:call"
+    # Page 2: 3-bet ranges
     - name: "HJ vs UTG"
       spot: "utg:5bb"
     - name: "CO vs UTG"
@@ -68,3 +80,5 @@ tui:
       spot: "utg:5bb,hj:fold,co:fold,btn:fold"
     - name: "BB vs UTG"
       spot: "utg:5bb,hj:fold,co:fold,btn:fold,sb:fold"
+    - name: "BTN vs CO"
+      spot: "utg:fold,hj:fold,co:5bb"
