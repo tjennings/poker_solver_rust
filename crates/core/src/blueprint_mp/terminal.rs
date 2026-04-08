@@ -33,7 +33,7 @@ fn collect_active_contributions(
         .iter()
         .map(|s| (s, contributions[s.index() as usize]))
         .collect();
-    result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    result.sort_by(|a, b| a.1 .0.total_cmp(&b.1 .0));
     result
 }
 
@@ -324,5 +324,58 @@ mod tests {
         assert_eq!(payoffs[0], Chips(40.0));
         assert_eq!(payoffs[1], Chips(60.0));
         assert_eq!(payoffs[2], Chips(-100.0));
+    }
+
+    #[timed_test]
+    fn showdown_folded_player_dead_money_included() {
+        // P0 folds after putting in 40, P1 all-in 30, P2 calls 100.
+        // P0 is NOT active (folded). P1 and P2 are active.
+        // Main pot: min(30,40) + 30 + 30 = 90 (P0 contributes 30 at P1's level)
+        // Side pot: (100-30)*1 = 70 from P2 only, plus P0's extra 10 above P1's level
+        //   Actually: P0 contributed 40, so at the 30-100 layer: min(40-30, 100-30) = 10 from P0
+        //   Side pot = 10 + 70 = 80, only P2 is eligible (P1 is all-in at 30)
+        // P1 wins main pot (best hand): 90 - 30 = +60
+        // P2 wins side pot (only eligible): 80 - 100 = net -20
+        // P0 folded: -40
+        let contribs = [
+            Chips(40.0), Chips(30.0), Chips(100.0),
+            Chips::ZERO, Chips::ZERO, Chips::ZERO,
+            Chips::ZERO, Chips::ZERO,
+        ];
+        let ranks = [0, 999, 500, 0, 0, 0, 0, 0]; // P0 rank irrelevant (folded)
+        let active = PlayerSet::from_bits(0b0000_0110); // P1, P2 active
+        let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
+        // Total pot = 40 + 30 + 100 = 170. Must all be distributed.
+        assert_eq!(payoffs[0], Chips(-40.0), "P0 (folded) loses contribution");
+        // P1 wins main pot (30*3 players = 90), net = 90 - 30 = +60
+        assert_eq!(payoffs[1], Chips(60.0), "P1 wins main pot");
+        // P2 wins side pot (170 - 90 = 80), net = 80 - 100 = -20
+        assert_eq!(payoffs[2], Chips(-20.0), "P2 wins side pot");
+        // Verify zero-sum
+        let sum: Chips = payoffs.iter().take(3).copied().sum();
+        assert!(sum.0.abs() < 1e-9, "payoffs must sum to zero, got {}", sum.0);
+    }
+
+    #[timed_test]
+    fn showdown_rake_cap_across_multiple_pots() {
+        // P0 all-in 30, P1 puts in 100. P0 has best hand.
+        // Rake 10%, cap 5 chips.
+        // Main pot: 30*2 = 60, rake = min(6, 5) = 5, net = 55
+        // Side pot: 70*1 = 70, rake = min(7, 0 remaining cap) = 0, net = 70
+        let contribs = [
+            Chips(30.0), Chips(100.0),
+            Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO,
+            Chips::ZERO, Chips::ZERO,
+        ];
+        let ranks = [200, 100, 0, 0, 0, 0, 0, 0];
+        let active = PlayerSet::from_bits(0b0000_0011);
+        let payoffs = resolve_showdown(&contribs, &ranks, active, 2, 0.10, Chips(5.0));
+        // P0 wins main pot net: 55 - 30 = +25
+        assert!((payoffs[0].0 - 25.0).abs() < 1e-9, "P0: {}", payoffs[0].0);
+        // P1 wins side pot (uncontested, no more rake room): 70 - 100 = -30
+        assert!((payoffs[1].0 - (-30.0)).abs() < 1e-9, "P1: {}", payoffs[1].0);
+        // Total rake should be exactly 5 (cap hit on first pot)
+        let sum: f64 = payoffs.iter().take(2).map(|c| c.0).sum();
+        assert!((sum + 5.0).abs() < 1e-9, "sum should be -5 (rake), got {sum}");
     }
 }
