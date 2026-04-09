@@ -1,0 +1,52 @@
+# Turn GPU datagen — uses BoundaryNet for river leaf evaluation
+#
+# Requires GPU with CUDA + TensorRT, and a trained river BoundaryNet ONNX model.
+#
+# Run:
+#   cargo run -p cfvnet --release --features gpu-turn-datagen -- generate \
+#     -c sample_configurations/turn_gpu_datagen.yaml \
+#     -o local_data/cfvnet/turn/gpu_v1 \
+#     --per-file 10000
+#
+# Run (CPU fallback, no GPU features needed):
+#   cargo run -p cfvnet --release -- generate \
+#     -c sample_configurations/turn_gpu_datagen.yaml \
+#     -o local_data/cfvnet/turn/cpu_v1 \
+#     --per-file 10000
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["25%", "75%", "a"]
+  board_size: 4
+  add_allin_threshold: 1.5
+  force_allin_threshold: 0.15
+  river_model_path: "local_data/models/cfvnet_river_py_v2/model.onnx"
+
+datagen:
+  street: "turn"
+  mode: "domain"
+  num_samples: 10000000
+  backend: "gpu"
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
+  solver_iterations: 300
+  leaf_eval_interval: 50
+  bet_size_fuzz: 0.15
+  threads: 12
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 8192
+  epochs: 500
+  learning_rate: 0.002
+  lr_min: 0.00002
+  huber_delta: 1.0
+  aux_loss_weight: 0.1
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 10
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  grad_clip_norm: 1.0

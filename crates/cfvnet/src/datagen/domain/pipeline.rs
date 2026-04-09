@@ -753,7 +753,7 @@ impl DomainPipeline {
     fn build_turn_terminal_data(
         game: &range_solver::PostFlopGame,
         turn_topo: &gpu_range_solver::extract::TreeTopology,
-        leaf_node_ids: &[usize],
+        _leaf_node_ids: &[usize],
     ) -> gpu_range_solver::extract::TerminalData {
         use gpu_range_solver::extract::{FoldData, NodeType, ShowdownData, TerminalData};
 
