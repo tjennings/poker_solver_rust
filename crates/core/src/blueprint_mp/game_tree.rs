@@ -384,10 +384,19 @@ fn add_sized_actions(
         return;
     }
 
-    if state.facing_bet {
-        add_raise_sizes(state, config.raise_sizes_at_depth(state.street, depth), actions);
-    } else {
+    // Preflop open-raise (raise_count=0, facing the BB blind) uses lead sizes.
+    // Subsequent raises (3-bet, 4-bet) use raise depth sizes.
+    let is_preflop_open = state.street == Street::Preflop && state.raise_count == 0;
+    if is_preflop_open || !state.facing_bet {
         add_lead_sizes(state, config.lead_sizes(state.street), actions);
+    } else {
+        let raise_depth = if state.street == Street::Preflop {
+            // 3-bet = depth 0, 4-bet = depth 1, etc.
+            (depth - 1).max(0)
+        } else {
+            depth
+        };
+        add_raise_sizes(state, config.raise_sizes_at_depth(state.street, raise_depth), actions);
     }
 }
 
