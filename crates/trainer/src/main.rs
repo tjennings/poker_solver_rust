@@ -2139,6 +2139,13 @@ fn push_mp_telemetry(
         poker_solver_core::blueprint_mp::storage::REGRET_SCALE,
         metrics,
     );
+    // Push prune stats
+    use poker_solver_core::blueprint_mp::trainer::{PRUNE_HITS, PRUNE_TOTAL};
+    let hits = PRUNE_HITS.swap(0, Ordering::Relaxed);
+    let total = PRUNE_TOTAL.swap(0, Ordering::Relaxed);
+    if total > 0 {
+        metrics.push_prune_fraction(hits as f64 / total as f64);
+    }
     // Push strategy grids for each scenario
     for (idx, &node_idx) in scenario_node_ids.iter().enumerate() {
         let grid_state = mp_tui_scenarios::extract_mp_grid(tree, storage, node_idx, iters, "");

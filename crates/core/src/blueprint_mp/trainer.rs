@@ -13,6 +13,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Global prune counters — accumulated per batch, read+reset by TUI bridge.
+pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static PRUNE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
@@ -156,26 +160,27 @@ fn run_batch(
     prune: bool,
     prune_threshold: i32,
 ) {
-    (0..batch_size).into_par_iter().for_each(|i| {
-        let seed = base_iter.wrapping_add(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut rng = SmallRng::seed_from_u64(seed);
-        let deal = sample_deal(num_players, &mut rng);
-        let buckets = compute_buckets_trivial(&deal, bucket_counts);
-        for traverser in 0..num_players {
-            traverse_external(
-                tree,
-                storage,
-                &buckets,
-                Seat::from_raw(traverser),
-                tree.root,
-                &mut rng,
-                rake_rate,
-                rake_cap,
-                prune,
-                prune_threshold,
-            );
-        }
-    });
+    use super::mccfr::PruneStats;
+    let batch_stats: PruneStats = (0..batch_size)
+        .into_par_iter()
+        .map(|i| {
+            let seed = base_iter.wrapping_add(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let deal = sample_deal(num_players, &mut rng);
+            let buckets = compute_buckets_trivial(&deal, bucket_counts);
+            let mut local = PruneStats::default();
+            for traverser in 0..num_players {
+                let (_, stats) = traverse_external(
+                    tree, storage, &buckets, Seat::from_raw(traverser),
+                    tree.root, &mut rng, rake_rate, rake_cap, prune, prune_threshold,
+                );
+                local.merge(stats);
+            }
+            local
+        })
+        .reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
+    PRUNE_HITS.fetch_add(batch_stats.hits, Ordering::Relaxed);
+    PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
 }
 
 fn should_discount(meta_iter: u64, config: &MpTrainingConfig) -> bool {
