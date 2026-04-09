@@ -15,9 +15,11 @@ use super::mmap_buffer::MmapBuffer;
 /// Fixed-point scaling factor for regret values.
 ///
 /// Regret deltas are stored as `(chip_value * REGRET_SCALE) as i16`.
-/// At scale 20, max storable chip value is +/-1638, covering
-/// 6-player 100bb max pot (~1200 chips).
-pub const REGRET_SCALE: f64 = 20.0;
+/// At scale 1, max storable value is +/-32767 chips (~163bb in a 6-player game).
+/// Single-iteration max delta is ~1200 chips (3.7% of i16 range), allowing
+/// ~27 iterations of pure positive accumulation before saturation.
+/// DCFR discounting keeps actual values well below saturation.
+pub const REGRET_SCALE: f64 = 1.0;
 
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct MpStorage {
@@ -424,13 +426,14 @@ mod tests {
     }
 
     #[timed_test]
-    fn regret_scale_20_covers_max_pot() {
+    fn regret_scale_1_covers_max_pot() {
         // 6-player 100bb max pot = ~1200 chips
-        // At REGRET_SCALE=20: 1200 * 20 = 24000, fits in i16 (max 32767)
+        // At REGRET_SCALE=1: 1200 * 1 = 1200, fits in i16 (max 32767)
+        // Leaves 27x headroom for accumulation before saturation
         let max_pot_chips = 1200.0_f64;
         let scaled = (max_pot_chips * REGRET_SCALE) as i16;
-        assert_eq!(scaled, 24000);
-        assert!(scaled < i16::MAX);
+        assert_eq!(scaled, 1200);
+        assert!(scaled < i16::MAX / 20, "should have substantial headroom");
     }
 
     #[timed_test]
