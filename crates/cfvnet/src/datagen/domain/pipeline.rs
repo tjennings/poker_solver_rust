@@ -242,6 +242,9 @@ impl DomainPipeline {
         let board_size = config.game.board_size;
         let max_iterations = config.datagen.solver_iterations;
 
+        if board_size == 4 {
+            return Self::run_gpu_turn(config, output_path);
+        }
         if board_size < 5 {
             return Err("GPU datagen currently supports river (board_size=5) only".into());
         }
@@ -425,6 +428,453 @@ impl DomainPipeline {
 
         pb.finish_with_message("done");
         eprintln!("Wrote {total} GPU records to {}", output_path.display());
+        Ok(())
+    }
+
+    /// GPU-accelerated turn datagen with periodic BoundaryNet re-evaluation.
+    ///
+    /// Builds depth-limited turn trees (chance nodes at river), decomposes at chance,
+    /// solves the turn subtree on GPU with leaf injection, and periodically re-evaluates
+    /// boundary CFVs using the BoundaryNet.
+    ///
+    /// When `river_model_path` is `None`, uses zero-initialized leaf CFVs (no boundary
+    /// evaluation). When a model is provided (requires `gpu-turn-datagen` feature),
+    /// loads the BoundaryNet and re-evaluates at `leaf_eval_interval` intervals.
+    #[cfg(feature = "gpu-datagen")]
+    fn run_gpu_turn(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
+        use gpu_range_solver::extract::{decompose_at_chance, extract_topology};
+        use gpu_range_solver::{compute_evs_from_strategy_sum, GpuBatchSolver, SubgameSpec};
+        use range_solver::card::card_pair_to_index;
+
+        use crate::datagen::range_gen::NUM_COMBOS;
+        use crate::datagen::storage::TrainingRecord;
+
+        let num_samples = config.datagen.num_samples;
+        let seed = crate::config::resolve_seed(config.datagen.seed);
+        let initial_stack = config.game.initial_stack;
+        let max_iterations = config.datagen.solver_iterations;
+        let leaf_eval_interval = config.datagen.leaf_eval_interval;
+
+        let bet_sizes = super::game_tree::parse_bet_sizes_all(&config.game.bet_sizes);
+        if bet_sizes.is_empty() {
+            return Err("no valid bet sizes".into());
+        }
+
+        // Load BoundaryNet if model path provided; otherwise use zero leaf CFVs.
+        #[cfg(feature = "gpu-turn-datagen")]
+        let boundary_evaluator = config
+            .game
+            .river_model_path
+            .as_deref()
+            .map(|p| {
+                crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator::load(
+                    std::path::Path::new(p),
+                )
+            })
+            .transpose()?;
+        #[cfg(not(feature = "gpu-turn-datagen"))]
+        let _boundary_evaluator: Option<()> = None;
+
+        let range_source = super::RangeSource::from_config(&config.datagen)?;
+        let mut sit_gen = SituationGenerator::new(
+            &config.datagen,
+            initial_stack,
+            4, // board_size for turn
+            seed,
+            num_samples,
+        )
+        .with_range_source(range_source);
+
+        // Build full turn+river trees (exact=true) so chance nodes are present.
+        // decompose_at_chance splits the tree and turns chance nodes into leaf nodes
+        // where we inject boundary CFVs.
+        let builder = GameBuilder::new(bet_sizes, &SolveStrategy::Exact)
+            .with_fuzz(config.datagen.bet_size_fuzz);
+
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            super::writer::RecordWriter::create(output_path, config.datagen.per_file)?,
+        ));
+
+        let pb = indicatif::ProgressBar::new(num_samples);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template(
+                    "{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}",
+                )
+                .expect("valid template"),
+        );
+
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+
+        for sit in &mut sit_gen {
+            let game = match builder.build(&sit, &mut rng) {
+                Some(g) => g,
+                None => {
+                    pb.inc(1);
+                    continue;
+                }
+            };
+
+            // Extract full topology (includes chance nodes), then decompose.
+            let full_topo = extract_topology(game.inner());
+            if full_topo.chance_nodes.is_empty() {
+                // No chance nodes (degenerate tree) -- skip.
+                pb.inc(1);
+                continue;
+            }
+
+            let decomp = decompose_at_chance(&full_topo);
+            let turn_topo = &decomp.turn_topo;
+            // Build terminal data excluding chance-node-leaves (which are classified as
+            // Showdown in the turn topo but are actually leaf injection points).
+            let turn_term = Self::build_turn_terminal_data(
+                game.inner(), turn_topo, &decomp.turn_leaf_node_ids,
+            );
+
+            let num_hands = game.inner().private_cards(0).len()
+                .max(game.inner().private_cards(1).len());
+
+            // CUDA blocks have max 1024 threads; fall back to CPU for large ranges.
+            if num_hands > 1024 {
+                let solver_config = super::solver::SolverConfig {
+                    max_iterations,
+                    target_exploitability: config.datagen.target_exploitability,
+                    leaf_eval_interval,
+                };
+                // CPU fallback uses exact mode (full solve through river).
+                let mut solver_obj =
+                    super::solver::Solver::new(game, &solver_config, SolveStrategy::Exact);
+                let solved = loop {
+                    match solver_obj.step() {
+                        None => continue,
+                        Some(sg) => break sg,
+                    }
+                };
+                let records = solved.extract_records();
+                let mut w = writer.lock().unwrap();
+                if let Err(e) = w.write(&records) {
+                    return Err(e);
+                }
+                drop(w);
+                pb.inc(1);
+                continue;
+            }
+
+            // Create GPU solver for the turn subtree topology.
+            let mut solver = GpuBatchSolver::new(
+                turn_topo,
+                &turn_term,
+                1,
+                num_hands,
+                max_iterations,
+            )
+            .map_err(|e| format!("GPU solver init failed: {e}"))?;
+
+            // Set leaf injection at boundary nodes (where chance nodes were).
+            let leaf_node_ids: Vec<i32> = decomp
+                .turn_leaf_node_ids
+                .iter()
+                .map(|&id| id as i32)
+                .collect();
+            let leaf_depths: Vec<i32> = decomp
+                .turn_leaf_node_ids
+                .iter()
+                .map(|&id| turn_topo.node_depth[id] as i32)
+                .collect();
+            solver
+                .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+                .map_err(|e| format!("set_leaf_injection failed: {e}"))?;
+
+            let spec = SubgameSpec::from_game(game.inner(), turn_topo, &turn_term, num_hands);
+            solver
+                .prepare_batch(&[spec.clone()])
+                .map_err(|e| format!("prepare_batch failed: {e}"))?;
+
+            // Number of boundary nodes where chance nodes were (used for boundary eval).
+            #[allow(unused_variables)]
+            let num_boundaries = decomp.turn_leaf_node_ids.len();
+
+            // Boundary evaluation setup (only with gpu-turn-datagen feature and model).
+            #[cfg(feature = "gpu-turn-datagen")]
+            let has_boundary_eval = boundary_evaluator.is_some() && num_boundaries > 0;
+            #[cfg(not(feature = "gpu-turn-datagen"))]
+            let has_boundary_eval = false;
+
+            #[cfg(feature = "gpu-turn-datagen")]
+            let hand_cards: Vec<(u8, u8)> = game.inner().private_cards(0).to_vec();
+            #[cfg(feature = "gpu-turn-datagen")]
+            let board_4: [u8; 4] = [
+                sit.board[0],
+                sit.board[1],
+                sit.board[2],
+                sit.board[3],
+            ];
+
+            // Initial boundary evaluation (before any iterations).
+            #[cfg(feature = "gpu-turn-datagen")]
+            if has_boundary_eval {
+                Self::evaluate_and_upload_boundaries(
+                    boundary_evaluator.as_ref().unwrap(),
+                    &mut solver,
+                    &sit,
+                    &board_4,
+                    &hand_cards,
+                    num_boundaries,
+                )?;
+            }
+
+            // Iterative solving with periodic boundary re-evaluation.
+            let mut iter = 0u32;
+            while iter < max_iterations {
+                let end = if leaf_eval_interval > 0 && has_boundary_eval {
+                    (iter + leaf_eval_interval).min(max_iterations)
+                } else {
+                    max_iterations
+                };
+
+                solver
+                    .run_iterations(iter, end)
+                    .map_err(|e| format!("run_iterations failed: {e}"))?;
+                iter = end;
+
+                // Re-evaluate boundaries if not done yet and model available.
+                #[cfg(feature = "gpu-turn-datagen")]
+                if iter < max_iterations
+                    && has_boundary_eval
+                    && leaf_eval_interval > 0
+                {
+                    Self::evaluate_and_upload_boundaries(
+                        boundary_evaluator.as_ref().unwrap(),
+                        &mut solver,
+                        &sit,
+                        &board_4,
+                        &hand_cards,
+                        num_boundaries,
+                    )?;
+                }
+            }
+
+            // Extract results and compute EVs.
+            let results = solver
+                .extract_results()
+                .map_err(|e| format!("extract_results failed: {e}"))?;
+
+            let evs = compute_evs_from_strategy_sum(
+                turn_topo,
+                &turn_term,
+                &results[0].strategy_sum,
+                &spec.initial_weights,
+                num_hands,
+            );
+
+            // Build training records (same scaling as river GPU path).
+            let pot = f64::from(sit.pot);
+            let half_pot = pot / 2.0;
+            let norm = if half_pot > 0.0 { half_pot } else { 1.0 };
+
+            let oop_hands = game.inner().private_cards(0);
+            let ip_hands = game.inner().private_cards(1);
+
+            let mut oop_cfvs = [0.0_f32; NUM_COMBOS];
+            let mut ip_cfvs = [0.0_f32; NUM_COMBOS];
+            let mut valid_mask = [0_u8; NUM_COMBOS];
+
+            let comb = turn_term.num_combinations as f32;
+            for (h, &(c0, c1)) in oop_hands.iter().enumerate() {
+                let idx = card_pair_to_index(c0, c1);
+                let ev_chips = evs[0][h] * comb;
+                oop_cfvs[idx] = ((f64::from(ev_chips) - half_pot) / norm) as f32;
+                valid_mask[idx] = 1;
+            }
+            for (h, &(c0, c1)) in ip_hands.iter().enumerate() {
+                let idx = card_pair_to_index(c0, c1);
+                let ev_chips = evs[1][h] * comb;
+                ip_cfvs[idx] = ((f64::from(ev_chips) - half_pot) / norm) as f32;
+                valid_mask[idx] = 1;
+            }
+
+            let oop_gv: f32 = sit.ranges[0]
+                .iter()
+                .zip(oop_cfvs.iter())
+                .map(|(&r, &c)| r * c)
+                .sum();
+            let ip_gv: f32 = sit.ranges[1]
+                .iter()
+                .zip(ip_cfvs.iter())
+                .map(|(&r, &c)| r * c)
+                .sum();
+
+            let board = sit.board_cards().to_vec();
+            let records = vec![
+                TrainingRecord {
+                    board: board.clone(),
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 0,
+                    game_value: oop_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: oop_cfvs,
+                    valid_mask,
+                },
+                TrainingRecord {
+                    board,
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    player: 1,
+                    game_value: ip_gv,
+                    oop_range: sit.ranges[0],
+                    ip_range: sit.ranges[1],
+                    cfvs: ip_cfvs,
+                    valid_mask,
+                },
+            ];
+
+            let mut w = writer.lock().unwrap();
+            if let Err(e) = w.write(&records) {
+                return Err(e);
+            }
+            drop(w);
+
+            pb.inc(1);
+        }
+
+        let mut w = writer.lock().unwrap();
+        w.flush()?;
+        let total = w.count();
+        drop(w);
+
+        pb.finish_with_message("done");
+        eprintln!("Wrote {total} GPU turn records to {}", output_path.display());
+        Ok(())
+    }
+
+    /// Build `TerminalData` for the turn subtree, excluding chance-node-leaves.
+    ///
+    /// `decompose_at_chance` converts chance nodes into `NodeType::Showdown` in the turn
+    /// topology, but they're not real showdowns (no valid river card for strength evaluation).
+    /// This function builds terminal data with only real fold nodes, skipping the leaf nodes.
+    #[cfg(feature = "gpu-datagen")]
+    fn build_turn_terminal_data(
+        game: &range_solver::PostFlopGame,
+        turn_topo: &gpu_range_solver::extract::TreeTopology,
+        leaf_node_ids: &[usize],
+    ) -> gpu_range_solver::extract::TerminalData {
+        use gpu_range_solver::extract::{FoldData, NodeType, ShowdownData, TerminalData};
+
+        let tree_config = game.tree_config();
+        let num_combinations = game.num_combinations_f64();
+
+        let hand_cards: [Vec<(u8, u8)>; 2] = [
+            game.private_cards(0).to_vec(),
+            game.private_cards(1).to_vec(),
+        ];
+        let same_hand_index: [Vec<u16>; 2] = [
+            game.same_hand_index(0).to_vec(),
+            game.same_hand_index(1).to_vec(),
+        ];
+
+        // Fold payoffs for real fold nodes only.
+        let fold_payoffs: Vec<FoldData> = turn_topo
+            .fold_nodes
+            .iter()
+            .map(|&node_id| {
+                let amount = turn_topo.node_amount[node_id];
+                let pot = (tree_config.starting_pot + 2 * amount) as f64;
+                let half_pot = 0.5 * pot;
+                let rake = (pot * tree_config.rake_rate).min(tree_config.rake_cap);
+                let folded_player = match turn_topo.node_type[node_id] {
+                    NodeType::Fold { folded_player } => folded_player,
+                    _ => unreachable!(),
+                };
+                FoldData {
+                    folded_player,
+                    amount_win: (half_pot - rake) / num_combinations,
+                    amount_lose: -half_pot / num_combinations,
+                }
+            })
+            .collect();
+
+        // No real showdown outcomes in the turn subtree. The chance-node-leaves are
+        // handled by leaf injection, not showdown evaluation.
+        // Filter out leaf_node_ids from the showdown list.
+        let leaf_set: std::collections::HashSet<usize> =
+            leaf_node_ids.iter().copied().collect();
+        let real_showdown_nodes: Vec<usize> = turn_topo
+            .showdown_nodes
+            .iter()
+            .filter(|&&id| !leaf_set.contains(&id))
+            .copied()
+            .collect();
+
+        // In a turn tree, all showdown nodes should be chance-node-leaves.
+        // Real showdowns only occur after the river card is dealt.
+        debug_assert!(
+            real_showdown_nodes.is_empty(),
+            "turn subtree should not have real showdown nodes, found {}",
+            real_showdown_nodes.len(),
+        );
+        let showdown_outcomes: Vec<ShowdownData> = Vec::new();
+
+        TerminalData {
+            fold_payoffs,
+            showdown_outcomes,
+            hand_cards,
+            same_hand_index,
+            num_combinations,
+        }
+    }
+
+    /// Download reach from GPU, evaluate boundaries via BoundaryNet, and upload leaf CFVs.
+    ///
+    /// Uses the situation's root ranges in 1326-combo space as inputs to the BoundaryNet,
+    /// matching the CPU `NeuralNetEvaluator` approach.
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn evaluate_and_upload_boundaries(
+        evaluator: &crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator,
+        solver: &mut gpu_range_solver::GpuBatchSolver,
+        sit: &crate::datagen::sampler::Situation,
+        board: &[u8; 4],
+        hand_cards: &[(u8, u8)],
+        num_boundaries: usize,
+    ) -> Result<(), String> {
+        use crate::datagen::gpu_boundary_eval::{evaluate_boundaries_batched, BoundaryEvalRequest};
+        use crate::datagen::range_gen::NUM_COMBOS;
+
+        // Use root ranges repeated for each boundary (same as CPU solver approach).
+        let oop_reach: Vec<f32> = sit.ranges[0]
+            .iter()
+            .copied()
+            .cycle()
+            .take(NUM_COMBOS * num_boundaries)
+            .collect();
+        let ip_reach: Vec<f32> = sit.ranges[1]
+            .iter()
+            .copied()
+            .cycle()
+            .take(NUM_COMBOS * num_boundaries)
+            .collect();
+
+        let request = BoundaryEvalRequest {
+            board: *board,
+            pot: sit.pot as f32,
+            effective_stack: sit.effective_stack as f32,
+            oop_reach,
+            ip_reach,
+            num_boundaries,
+        };
+
+        let results =
+            evaluate_boundaries_batched(evaluator, &[request], hand_cards)
+                .map_err(|e| format!("boundary eval failed: {e}"))?;
+
+        let result = &results[0];
+
+        // Upload leaf CFVs to GPU: [num_leaves * num_hands] per player.
+        solver
+            .update_leaf_cfvs(&result.leaf_cfv_p0, &result.leaf_cfv_p1)
+            .map_err(|e| format!("update_leaf_cfvs failed: {e}"))?;
+
         Ok(())
     }
 }
@@ -682,6 +1132,58 @@ mod tests {
 
             assert!(gpu_count >= 2, "GPU should produce at least 2 records");
             assert!(cpu_count >= 2, "CPU should produce at least 2 records");
+        }
+    }
+
+    #[cfg(feature = "gpu-datagen")]
+    mod gpu_turn_tests {
+        use super::*;
+
+        fn gpu_turn_test_config(num_samples: u64) -> CfvnetConfig {
+            CfvnetConfig {
+                game: GameConfig {
+                    initial_stack: 200,
+                    board_size: 4,
+                    // No river_model_path: run_gpu_turn uses zero leaf CFVs when None
+                    ..Default::default()
+                },
+                datagen: DatagenConfig {
+                    num_samples,
+                    mode: "domain".into(),
+                    solver_iterations: 10,
+                    seed: Some(42),
+                    backend: "gpu".into(),
+                    gpu_batch_size: Some(1),
+                    leaf_eval_interval: 0,
+                    ..Default::default()
+                },
+                training: Default::default(),
+                evaluation: Default::default(),
+            }
+        }
+
+        #[test]
+        fn gpu_turn_pipeline_produces_records() {
+            range_solver::set_force_sequential(true);
+            let tmp = NamedTempFile::new().unwrap();
+            let config = gpu_turn_test_config(1);
+            DomainPipeline::run(&config, tmp.path()).unwrap();
+
+            let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
+            let mut count = 0;
+            while let Ok(rec) = read_record(&mut reader) {
+                assert_eq!(rec.board.len(), 4, "turn records should have 4-card board");
+                assert!(rec.pot > 0.0);
+                assert!(rec.effective_stack > 0.0);
+                assert!(rec.game_value.is_finite(), "game_value must be finite");
+                assert!(rec.player == 0 || rec.player == 1);
+                for (i, &cfv) in rec.cfvs.iter().enumerate() {
+                    assert!(cfv.is_finite(), "cfv[{i}] must be finite");
+                }
+                count += 1;
+            }
+            assert!(count >= 2, "expected at least 2 records, got {count}");
+            assert_eq!(count % 2, 0, "records should come in pairs (OOP+IP)");
         }
     }
 }
