@@ -357,9 +357,10 @@ impl GpuBatchSolver {
         let n = self.num_nodes;
         let e = self.num_edges;
 
+        let block_threads = (h as u32).min(1024);
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
-            block_dim: (h as u32, 1, 1),
+            block_dim: (block_threads, 1, 1),
             shared_mem_bytes: self.shared_mem_bytes,
         };
 
@@ -492,20 +493,21 @@ impl GpuBatchSolver {
     }
 }
 
-/// Compute per-player per-hand expected values from GPU strategy_sum.
+/// Shared setup for avg-strategy tree walks: normalizes `strategy_sum` and builds edge mappings.
+struct AvgStrategySetup {
+    avg_strategy: Vec<f32>,
+    original_edge_for_sorted: Vec<usize>,
+    node_first_sorted_edge: Vec<usize>,
+}
+
+/// Build the normalized average strategy and edge mappings from `strategy_sum`.
 ///
-/// Performs a CPU tree walk using the normalized average strategy from strategy_sum.
-/// Returns `[oop_evs, ip_evs]` where each is a `Vec<f32>` of length `num_hands`.
-///
-/// The strategy_sum layout is `[E * H]` where E = num_edges, H = num_hands.
-/// Edges are sorted by parent depth (same ordering as `build_sorted_topology`).
-pub fn compute_evs_from_strategy_sum(
+/// This is shared by `compute_evs_from_strategy_sum` and `compute_reach_at_nodes`.
+fn build_avg_strategy_setup(
     topo: &TreeTopology,
-    term: &TerminalData,
     strategy_sum: &[f32],
-    initial_weights: &[Vec<f32>; 2],
     num_hands: usize,
-) -> [Vec<f32>; 2] {
+) -> AvgStrategySetup {
     let n = topo.num_nodes;
     let e = topo.num_edges;
     let h = num_hands;
@@ -516,19 +518,11 @@ pub fn compute_evs_from_strategy_sum(
         let parent_depth = topo.node_depth[topo.edge_parent[edge]];
         edges_by_depth[parent_depth].push(edge);
     }
-    let mut sorted_edges: Vec<usize> = Vec::with_capacity(e);
-    for depth_edges in &edges_by_depth {
-        sorted_edges.extend(depth_edges);
-    }
-    // sorted_edge_idx -> original edge index
-    // strategy_sum[sorted_idx * H + hand] = strategy_sum value
 
     // Normalize strategy_sum to average strategy per sorted edge
-    // For each parent node, normalize across its child edges
     let mut avg_strategy = vec![0.0f32; e * h];
     let mut sorted_idx = 0;
     for depth_edges in &edges_by_depth {
-        // Group edges by parent node within this depth
         let mut idx = 0;
         while idx < depth_edges.len() {
             let parent = topo.edge_parent[depth_edges[idx]];
@@ -571,66 +565,143 @@ pub fn compute_evs_from_strategy_sum(
         }
     }
 
+    AvgStrategySetup {
+        avg_strategy,
+        original_edge_for_sorted,
+        node_first_sorted_edge,
+    }
+}
+
+/// Forward-walk reach propagation for one player using the average strategy.
+///
+/// Returns `reach[node * h + hand]` for all nodes. When `player=0`, reach holds
+/// P1's (opponent's) reach; when `player=1`, reach holds P0's reach.
+fn forward_walk_reach(
+    topo: &TreeTopology,
+    setup: &AvgStrategySetup,
+    initial_weights: &[Vec<f32>; 2],
+    num_hands: usize,
+    player: usize,
+) -> Vec<f32> {
+    let n = topo.num_nodes;
+    let h = num_hands;
+    let opp = player ^ 1;
+
+    let mut reach = vec![0.0f32; n * h];
+    // Root reach = opponent's initial weights
+    for hand in 0..initial_weights[opp].len().min(h) {
+        reach[hand] = initial_weights[opp][hand];
+    }
+
+    for depth in 0..=topo.max_depth {
+        for &node_id in &topo.level_nodes[depth] {
+            let n_actions = topo.node_num_actions[node_id];
+            if n_actions == 0 {
+                continue;
+            }
+            let sorted_start = setup.node_first_sorted_edge[node_id];
+            if sorted_start == usize::MAX {
+                continue;
+            }
+
+            match topo.node_type[node_id] {
+                NodeType::Player { player: acting } => {
+                    for a in 0..n_actions {
+                        let sorted_i = sorted_start + a;
+                        let child =
+                            topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
+                        for hand in 0..h {
+                            let parent_reach = reach[node_id * h + hand];
+                            if acting == player {
+                                reach[child * h + hand] =
+                                    parent_reach * setup.avg_strategy[sorted_i * h + hand];
+                            } else {
+                                reach[child * h + hand] += parent_reach;
+                            }
+                        }
+                    }
+                }
+                NodeType::Chance => {
+                    for a in 0..n_actions {
+                        let sorted_i = sorted_start + a;
+                        let child =
+                            topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
+                        for hand in 0..h {
+                            reach[child * h + hand] += reach[node_id * h + hand];
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    reach
+}
+
+/// Compute per-player reach probabilities at specific nodes using the average strategy.
+///
+/// Normalizes `strategy_sum` into an average strategy, then forward-walks the tree
+/// to compute reach at each node. Returns `[oop_reach, ip_reach]` where each is
+/// `[target_nodes.len() * num_hands]` -- reach values at the target nodes for the
+/// opponent of each player (i.e., `result[0]` is P1's reach from P0's traversal,
+/// `result[1]` is P0's reach from P1's traversal).
+pub fn compute_reach_at_nodes(
+    topo: &TreeTopology,
+    strategy_sum: &[f32],
+    initial_weights: &[Vec<f32>; 2],
+    num_hands: usize,
+    target_nodes: &[usize],
+) -> [Vec<f32>; 2] {
+    let h = num_hands;
+    let setup = build_avg_strategy_setup(topo, strategy_sum, h);
+
+    let mut result = [
+        vec![0.0f32; target_nodes.len() * h],
+        vec![0.0f32; target_nodes.len() * h],
+    ];
+
+    for player in 0..2 {
+        let reach = forward_walk_reach(topo, &setup, initial_weights, h, player);
+        for (ti, &node_id) in target_nodes.iter().enumerate() {
+            for hand in 0..h {
+                result[player][ti * h + hand] = reach[node_id * h + hand];
+            }
+        }
+    }
+
+    result
+}
+
+/// Compute per-player per-hand expected values from GPU strategy_sum.
+///
+/// Performs a CPU tree walk using the normalized average strategy from strategy_sum.
+/// Returns `[oop_evs, ip_evs]` where each is a `Vec<f32>` of length `num_hands`.
+///
+/// The strategy_sum layout is `[E * H]` where E = num_edges, H = num_hands.
+/// Edges are sorted by parent depth (same ordering as `build_sorted_topology`).
+pub fn compute_evs_from_strategy_sum(
+    topo: &TreeTopology,
+    term: &TerminalData,
+    strategy_sum: &[f32],
+    initial_weights: &[Vec<f32>; 2],
+    num_hands: usize,
+) -> [Vec<f32>; 2] {
+    let n = topo.num_nodes;
+    let h = num_hands;
+
+    let setup = build_avg_strategy_setup(topo, strategy_sum, h);
+
     let mut result = [vec![0.0f32; h], vec![0.0f32; h]];
 
     for player in 0..2 {
         let opp = player ^ 1;
 
         // Forward pass: compute reach probabilities using avg strategy
-        let mut reach = vec![0.0f32; n * h];
-        // Root reach = opponent's initial weights
-        for hand in 0..initial_weights[opp].len().min(h) {
-            reach[hand] = initial_weights[opp][hand];
-        }
+        let reach = forward_walk_reach(topo, &setup, initial_weights, h, player);
 
         // CFV accumulator for each node
         let mut cfv = vec![0.0f32; n * h];
-
-        // Process tree depth by depth (top-down for reach, bottom-up for CFV)
-        // First: propagate reach top-down
-        for depth in 0..=topo.max_depth {
-            for &node_id in &topo.level_nodes[depth] {
-                let n_actions = topo.node_num_actions[node_id];
-                if n_actions == 0 {
-                    continue;
-                }
-                let sorted_start = node_first_sorted_edge[node_id];
-                if sorted_start == usize::MAX {
-                    continue;
-                }
-
-                match topo.node_type[node_id] {
-                    NodeType::Player { player: acting } => {
-                        for a in 0..n_actions {
-                            let sorted_i = sorted_start + a;
-                            let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
-                            for hand in 0..h {
-                                let parent_reach = reach[node_id * h + hand];
-                                if acting == player {
-                                    // Player's action: multiply by strategy
-                                    reach[child * h + hand] =
-                                        parent_reach * avg_strategy[sorted_i * h + hand];
-                                } else {
-                                    // Opponent's action: pass reach through
-                                    reach[child * h + hand] += parent_reach;
-                                }
-                            }
-                        }
-                    }
-                    NodeType::Chance => {
-                        // Chance node: equal weight to each child (or could be card-specific)
-                        for a in 0..n_actions {
-                            let sorted_i = sorted_start + a;
-                            let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
-                            for hand in 0..h {
-                                reach[child * h + hand] += reach[node_id * h + hand];
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
 
         // Evaluate terminal nodes
         for (fold_idx, &node_id) in topo.fold_nodes.iter().enumerate() {
@@ -699,7 +770,7 @@ pub fn compute_evs_from_strategy_sum(
                 if n_actions == 0 {
                     continue;
                 }
-                let sorted_start = node_first_sorted_edge[node_id];
+                let sorted_start = setup.node_first_sorted_edge[node_id];
                 if sorted_start == usize::MAX {
                     continue;
                 }
@@ -708,12 +779,12 @@ pub fn compute_evs_from_strategy_sum(
                     NodeType::Player { player: acting } => {
                         for a in 0..n_actions {
                             let sorted_i = sorted_start + a;
-                            let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                            let child = topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
                             for hand in 0..h {
                                 if acting == player {
                                     // Player's own action: weight by strategy
                                     cfv[node_id * h + hand] +=
-                                        avg_strategy[sorted_i * h + hand]
+                                        setup.avg_strategy[sorted_i * h + hand]
                                             * cfv[child * h + hand];
                                 } else {
                                     // Opponent's action: sum all children
@@ -725,7 +796,7 @@ pub fn compute_evs_from_strategy_sum(
                     NodeType::Chance => {
                         for a in 0..n_actions {
                             let sorted_i = sorted_start + a;
-                            let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                            let child = topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
                             for hand in 0..h {
                                 cfv[node_id * h + hand] += cfv[child * h + hand];
                             }
@@ -1097,6 +1168,107 @@ mod tests {
         let reach = solver.download_reach().unwrap();
         // B=1, N=num_nodes, H=num_hands
         assert_eq!(reach.len(), 1 * topo.num_nodes * num_hands);
+    }
+
+    #[test]
+    fn compute_reach_at_nodes_matches_evs_function() {
+        use super::*;
+        use crate::extract::{extract_terminal_data, extract_topology};
+
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        // Solve to get strategy_sum.
+        let mut solver = GpuBatchSolver::new(&topo, &term, 1, num_hands, 100).unwrap();
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        let results = solver.solve_batch(&[spec.clone()]).unwrap();
+
+        // Pick some internal nodes (non-root, non-terminal).
+        let target_nodes: Vec<usize> = topo
+            .level_nodes
+            .iter()
+            .flat_map(|level| level.iter())
+            .filter(|&&n| topo.node_num_actions[n] > 0 && n > 0)
+            .take(3)
+            .copied()
+            .collect();
+
+        if target_nodes.is_empty() {
+            return;
+        }
+
+        let reach = compute_reach_at_nodes(
+            &topo,
+            &results[0].strategy_sum,
+            &spec.initial_weights,
+            num_hands,
+            &target_nodes,
+        );
+
+        // Verify: reach values are non-negative, and at least some are positive.
+        for player in 0..2 {
+            assert_eq!(reach[player].len(), target_nodes.len() * num_hands);
+            assert!(reach[player].iter().all(|&r| r >= 0.0 && r.is_finite()));
+            assert!(
+                reach[player].iter().any(|&r| r > 0.0),
+                "player {player} should have some positive reach"
+            );
+        }
+    }
+
+    fn make_wide_turn_game() -> range_solver::PostFlopGame {
+        // Full ranges on a turn board: C(48,2) = 1128 hands per player (> 1024).
+        let oop_range = range_solver::range::Range::ones();
+        let ip_range = range_solver::range::Range::ones();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: range_solver::card::NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("100%", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        let mut game =
+            range_solver::PostFlopGame::with_config(card_config, action_tree).unwrap();
+        game.allocate_memory(false);
+        game
+    }
+
+    #[test]
+    fn solve_batch_handles_more_than_1024_hands() {
+        use super::*;
+
+        let game = make_wide_turn_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        // This should be > 1024 for a full-range turn game.
+        assert!(
+            num_hands > 1024,
+            "expected >1024 hands for full-range turn game, got {num_hands}"
+        );
+
+        let mut solver = GpuBatchSolver::new(&topo, &term, 1, num_hands, 50).unwrap();
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        let results = solver.solve_batch(&[spec]).unwrap();
+
+        // Verify we get a result with non-zero strategy_sum.
+        assert!(!results[0].strategy_sum.is_empty());
+        assert!(
+            results[0].strategy_sum.iter().any(|&v| v != 0.0),
+            "strategy_sum should have non-zero values after solving"
+        );
     }
 
 }
