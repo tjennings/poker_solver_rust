@@ -243,7 +243,10 @@ impl DomainPipeline {
         let max_iterations = config.datagen.solver_iterations;
 
         if board_size == 4 {
+            #[cfg(feature = "gpu-turn-datagen")]
             return Self::run_gpu_turn(config, output_path);
+            #[cfg(not(feature = "gpu-turn-datagen"))]
+            return Err("GPU turn datagen requires --features gpu-turn-datagen".into());
         }
         if board_size < 5 {
             return Err("GPU datagen currently supports river (board_size=5) only".into());
@@ -431,16 +434,15 @@ impl DomainPipeline {
         Ok(())
     }
 
-    /// GPU-accelerated turn datagen with periodic BoundaryNet re-evaluation.
+    /// GPU-accelerated turn datagen with reach-based BoundaryNet re-evaluation.
     ///
     /// Builds depth-limited turn trees (chance nodes at river), decomposes at chance,
     /// solves the turn subtree on GPU with leaf injection, and periodically re-evaluates
-    /// boundary CFVs using the BoundaryNet.
+    /// boundary CFVs using the BoundaryNet with reach computed from the evolving
+    /// average strategy (strategy_sum).
     ///
-    /// When `river_model_path` is `None`, uses zero-initialized leaf CFVs (no boundary
-    /// evaluation). When a model is provided (requires `gpu-turn-datagen` feature),
-    /// loads the BoundaryNet and re-evaluates at `leaf_eval_interval` intervals.
-    #[cfg(feature = "gpu-datagen")]
+    /// Requires `river_model_path` in config -- there is no zero-CFV fallback.
+    #[cfg(feature = "gpu-turn-datagen")]
     fn run_gpu_turn(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
         use gpu_range_solver::extract::{decompose_at_chance, extract_topology};
         use gpu_range_solver::{compute_evs_from_strategy_sum, GpuBatchSolver, SubgameSpec};
@@ -453,27 +455,19 @@ impl DomainPipeline {
         let seed = crate::config::resolve_seed(config.datagen.seed);
         let initial_stack = config.game.initial_stack;
         let max_iterations = config.datagen.solver_iterations;
-        let leaf_eval_interval = config.datagen.leaf_eval_interval;
+        let leaf_eval_interval = config.datagen.leaf_eval_interval.max(1);
 
         let bet_sizes = super::game_tree::parse_bet_sizes_all(&config.game.bet_sizes);
         if bet_sizes.is_empty() {
             return Err("no valid bet sizes".into());
         }
 
-        // Load BoundaryNet if model path provided; otherwise use zero leaf CFVs.
-        #[cfg(feature = "gpu-turn-datagen")]
-        let boundary_evaluator = config
-            .game
-            .river_model_path
-            .as_deref()
-            .map(|p| {
-                crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator::load(
-                    std::path::Path::new(p),
-                )
-            })
-            .transpose()?;
-        #[cfg(not(feature = "gpu-turn-datagen"))]
-        let _boundary_evaluator: Option<()> = None;
+        // Unconditionally require BoundaryNet model.
+        let model_path = config.game.river_model_path.as_deref()
+            .ok_or("river_model_path is required for GPU turn datagen")?;
+        let evaluator = crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator::load(
+            std::path::Path::new(model_path),
+        )?;
 
         let range_source = super::RangeSource::from_config(&config.datagen)?;
         let mut sit_gen = SituationGenerator::new(
@@ -590,19 +584,8 @@ impl DomainPipeline {
                 .prepare_batch(&[spec.clone()])
                 .map_err(|e| format!("prepare_batch failed: {e}"))?;
 
-            // Number of boundary nodes where chance nodes were (used for boundary eval).
-            #[allow(unused_variables)]
-            let num_boundaries = decomp.turn_leaf_node_ids.len();
-
-            // Boundary evaluation setup (only with gpu-turn-datagen feature and model).
-            #[cfg(feature = "gpu-turn-datagen")]
-            let has_boundary_eval = boundary_evaluator.is_some() && num_boundaries > 0;
-            #[cfg(not(feature = "gpu-turn-datagen"))]
-            let has_boundary_eval = false;
-
-            #[cfg(feature = "gpu-turn-datagen")]
+            let boundary_node_ids = &decomp.turn_leaf_node_ids;
             let hand_cards: Vec<(u8, u8)> = game.inner().private_cards(0).to_vec();
-            #[cfg(feature = "gpu-turn-datagen")]
             let board_4: [u8; 4] = [
                 sit.board[0],
                 sit.board[1],
@@ -610,43 +593,38 @@ impl DomainPipeline {
                 sit.board[3],
             ];
 
-            // Initial boundary evaluation (before any iterations).
-            #[cfg(feature = "gpu-turn-datagen")]
-            if has_boundary_eval {
-                Self::evaluate_and_upload_boundaries(
-                    boundary_evaluator.as_ref().unwrap(),
-                    &mut solver,
-                    &sit,
-                    &board_4,
-                    &hand_cards,
-                    num_boundaries,
-                )?;
-            }
+            // Initial boundary eval: strategy_sum is zeros -> uniform strategy ->
+            // initial_weights propagated through uniform play.
+            let initial_ss = vec![0.0f32; turn_topo.num_edges * num_hands];
+            Self::evaluate_and_upload_boundaries_from_reach(
+                &evaluator, &mut solver, turn_topo, &initial_ss,
+                &spec.initial_weights, num_hands, &board_4,
+                sit.pot as f32, sit.effective_stack as f32,
+                &hand_cards, boundary_node_ids,
+            )?;
 
-            // Iterative solving with periodic boundary re-evaluation.
+            // Iterative solving with periodic reach-based boundary re-evaluation.
             let mut iter = 0u32;
             while iter < max_iterations {
-                let end = if leaf_eval_interval > 0 && has_boundary_eval {
-                    (iter + leaf_eval_interval).min(max_iterations)
-                } else {
-                    max_iterations
-                };
+                let end = (iter + leaf_eval_interval).min(max_iterations);
 
                 solver
                     .run_iterations(iter, end)
                     .map_err(|e| format!("run_iterations failed: {e}"))?;
                 iter = end;
 
-                // TODO: Re-evaluate boundaries using reach at boundary nodes
-                // instead of root ranges. Currently uses root ranges (matching
-                // the CPU NeuralNetEvaluator), which means re-evaluation produces
-                // identical results each time. Once reach-based evaluation is
-                // implemented, uncomment this block.
-                //
-                // #[cfg(feature = "gpu-turn-datagen")]
-                // if iter < max_iterations && has_boundary_eval && leaf_eval_interval > 0 {
-                //     Self::evaluate_and_upload_boundaries(...)?;
-                // }
+                if iter < max_iterations {
+                    // Download strategy_sum mid-solve for reach computation.
+                    let mid_results = solver
+                        .extract_results()
+                        .map_err(|e| format!("mid-solve extract: {e}"))?;
+                    Self::evaluate_and_upload_boundaries_from_reach(
+                        &evaluator, &mut solver, turn_topo, &mid_results[0].strategy_sum,
+                        &spec.initial_weights, num_hands, &board_4,
+                        sit.pot as f32, sit.effective_stack as f32,
+                        &hand_cards, boundary_node_ids,
+                    )?;
+                }
             }
 
             // Extract results and compute EVs.
@@ -749,7 +727,7 @@ impl DomainPipeline {
     /// `decompose_at_chance` converts chance nodes into `NodeType::Showdown` in the turn
     /// topology, but they're not real showdowns (no valid river card for strength evaluation).
     /// This function builds terminal data with only real fold nodes, skipping the leaf nodes.
-    #[cfg(feature = "gpu-datagen")]
+    #[cfg(feature = "gpu-turn-datagen")]
     fn build_turn_terminal_data(
         game: &range_solver::PostFlopGame,
         turn_topo: &gpu_range_solver::extract::TreeTopology,
@@ -818,54 +796,63 @@ impl DomainPipeline {
         }
     }
 
-    /// Download reach from GPU, evaluate boundaries via BoundaryNet, and upload leaf CFVs.
+    /// Evaluate boundaries via BoundaryNet using reach from average strategy, upload leaf CFVs.
     ///
-    /// Uses the situation's root ranges in 1326-combo space as inputs to the BoundaryNet,
-    /// matching the CPU `NeuralNetEvaluator` approach.
+    /// Computes per-player reach at boundary nodes from `strategy_sum` (the evolving
+    /// average strategy), maps to 1326-combo space, runs BoundaryNet inference, and
+    /// uploads the resulting leaf CFVs to the GPU solver.
     #[cfg(feature = "gpu-turn-datagen")]
-    fn evaluate_and_upload_boundaries(
+    fn evaluate_and_upload_boundaries_from_reach(
         evaluator: &crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator,
         solver: &mut gpu_range_solver::GpuBatchSolver,
-        sit: &crate::datagen::sampler::Situation,
+        topo: &gpu_range_solver::extract::TreeTopology,
+        strategy_sum: &[f32],
+        initial_weights: &[Vec<f32>; 2],
+        num_hands: usize,
         board: &[u8; 4],
+        pot: f32,
+        effective_stack: f32,
         hand_cards: &[(u8, u8)],
-        num_boundaries: usize,
+        boundary_node_ids: &[usize],
     ) -> Result<(), String> {
+        use gpu_range_solver::compute_reach_at_nodes;
         use crate::datagen::gpu_boundary_eval::{evaluate_boundaries_batched, BoundaryEvalRequest};
         use crate::datagen::range_gen::NUM_COMBOS;
 
-        // Use root ranges repeated for each boundary (same as CPU solver approach).
-        let oop_reach: Vec<f32> = sit.ranges[0]
-            .iter()
-            .copied()
-            .cycle()
-            .take(NUM_COMBOS * num_boundaries)
-            .collect();
-        let ip_reach: Vec<f32> = sit.ranges[1]
-            .iter()
-            .copied()
-            .cycle()
-            .take(NUM_COMBOS * num_boundaries)
-            .collect();
+        let reach = compute_reach_at_nodes(
+            topo, strategy_sum, initial_weights, num_hands, boundary_node_ids,
+        );
+
+        // reach[0] = P1 (IP) reach at boundaries (from P0 traversal -- opponent reach)
+        // reach[1] = P0 (OOP) reach at boundaries (from P1 traversal -- opponent reach)
+        let num_boundaries = boundary_node_ids.len();
+        let mut oop_reach_1326 = vec![0.0f32; num_boundaries * NUM_COMBOS];
+        let mut ip_reach_1326 = vec![0.0f32; num_boundaries * NUM_COMBOS];
+
+        for (bi, _) in boundary_node_ids.iter().enumerate() {
+            for (hi, &(c0, c1)) in hand_cards.iter().enumerate() {
+                let combo_idx = range_solver::card::card_pair_to_index(c0, c1);
+                // OOP (P0) reach = from P1's traversal (index 1)
+                oop_reach_1326[bi * NUM_COMBOS + combo_idx] = reach[1][bi * num_hands + hi];
+                // IP (P1) reach = from P0's traversal (index 0)
+                ip_reach_1326[bi * NUM_COMBOS + combo_idx] = reach[0][bi * num_hands + hi];
+            }
+        }
 
         let request = BoundaryEvalRequest {
             board: *board,
-            pot: sit.pot as f32,
-            effective_stack: sit.effective_stack as f32,
-            oop_reach,
-            ip_reach,
+            pot,
+            effective_stack,
+            oop_reach: oop_reach_1326,
+            ip_reach: ip_reach_1326,
             num_boundaries,
         };
 
-        let results =
-            evaluate_boundaries_batched(evaluator, &[request], hand_cards)
-                .map_err(|e| format!("boundary eval failed: {e}"))?;
+        let results = evaluate_boundaries_batched(evaluator, &[request], hand_cards)
+            .map_err(|e| format!("boundary eval failed: {e}"))?;
 
-        let result = &results[0];
-
-        // Upload leaf CFVs to GPU: [num_leaves * num_hands] per player.
         solver
-            .update_leaf_cfvs(&result.leaf_cfv_p0, &result.leaf_cfv_p1)
+            .update_leaf_cfvs(&results[0].leaf_cfv_p0, &results[0].leaf_cfv_p1)
             .map_err(|e| format!("update_leaf_cfvs failed: {e}"))?;
 
         Ok(())
@@ -1132,16 +1119,21 @@ mod tests {
     mod gpu_turn_tests {
         use super::*;
 
-        fn gpu_turn_test_config(num_samples: u64) -> CfvnetConfig {
-            CfvnetConfig {
+        /// GPU turn datagen without a model path should return an error
+        /// (zero-CFV fallback has been removed).
+        #[cfg(feature = "gpu-turn-datagen")]
+        #[test]
+        fn gpu_turn_pipeline_requires_model_path() {
+            let tmp = NamedTempFile::new().unwrap();
+            let config = CfvnetConfig {
                 game: GameConfig {
                     initial_stack: 200,
                     board_size: 4,
-                    // No river_model_path: run_gpu_turn uses zero leaf CFVs when None
+                    // No river_model_path
                     ..Default::default()
                 },
                 datagen: DatagenConfig {
-                    num_samples,
+                    num_samples: 1,
                     mode: "domain".into(),
                     solver_iterations: 10,
                     seed: Some(42),
@@ -1152,14 +1144,48 @@ mod tests {
                 },
                 training: Default::default(),
                 evaluation: Default::default(),
-            }
+            };
+            let result = DomainPipeline::run(&config, tmp.path());
+            assert!(result.is_err(), "should error without river_model_path");
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("river_model_path"),
+                "error should mention river_model_path, got: {err}"
+            );
         }
 
+        /// GPU turn datagen with a model produces valid records with
+        /// reach-based boundary re-evaluation.
+        #[cfg(feature = "gpu-turn-datagen")]
         #[test]
         fn gpu_turn_pipeline_produces_records() {
+            let model_path = "../../local_data/models/cfvnet_river_py_v2/model.onnx";
+            if !std::path::Path::new(model_path).exists() {
+                eprintln!("Skipping: ONNX model not found at {model_path}");
+                return;
+            }
             range_solver::set_force_sequential(true);
             let tmp = NamedTempFile::new().unwrap();
-            let config = gpu_turn_test_config(1);
+            let config = CfvnetConfig {
+                game: GameConfig {
+                    initial_stack: 200,
+                    board_size: 4,
+                    river_model_path: Some(model_path.into()),
+                    ..Default::default()
+                },
+                datagen: DatagenConfig {
+                    num_samples: 1,
+                    mode: "domain".into(),
+                    solver_iterations: 10,
+                    seed: Some(42),
+                    backend: "gpu".into(),
+                    gpu_batch_size: Some(1),
+                    leaf_eval_interval: 5,
+                    ..Default::default()
+                },
+                training: Default::default(),
+                evaluation: Default::default(),
+            };
             DomainPipeline::run(&config, tmp.path()).unwrap();
 
             let mut reader = BufReader::new(std::fs::File::open(tmp.path()).unwrap());
