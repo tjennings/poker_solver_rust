@@ -101,7 +101,8 @@ fn training_loop(
     quit: &AtomicBool,
 ) -> TrainResult {
     let max_iters = config.iterations.unwrap_or(u64::MAX);
-    let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE) as i32;
+    let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
     let mut meta_iter: u64 = 0;
     let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
 
@@ -158,7 +159,7 @@ fn run_batch(
     batch_size: u64,
     base_iter: u64,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i16,
 ) {
     use super::mccfr::PruneStats;
     let batch_stats: PruneStats = (0..batch_size)
@@ -200,11 +201,11 @@ fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingC
     storage.regrets.par_iter().for_each(|atom| {
         let v = atom.load(Ordering::Relaxed);
         let d = if v >= 0 { d_pos } else { d_neg };
-        atom.store((f64::from(v) * d) as i32, Ordering::Relaxed);
+        atom.store((f64::from(v) * d) as i16, Ordering::Relaxed);
     });
     storage.strategy_sums.par_iter().for_each(|atom| {
         let v = atom.load(Ordering::Relaxed);
-        atom.store((v as f64 * d_strat) as i64, Ordering::Relaxed);
+        atom.store((f64::from(v) * d_strat) as i32, Ordering::Relaxed);
     });
 }
 

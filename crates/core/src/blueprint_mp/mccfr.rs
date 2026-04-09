@@ -87,7 +87,7 @@ pub fn traverse_external(
     rake_rate: f64,
     rake_cap: Chips,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i16,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         MpGameNode::Terminal {
@@ -140,7 +140,7 @@ fn traverse_traverser(
     rake_rate: f64,
     rake_cap: Chips,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i16,
 ) -> (f64, PruneStats) {
     let mut strategy = [0.0_f64; MAX_ACTIONS];
     storage.regret_matched_strategy(node_idx, bucket, num_actions, &mut strategy);
@@ -175,7 +175,7 @@ fn should_prune_action(
     tree: &MpGameTree,
     storage: &MpStorage,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i16,
     child_idx: u32,
     node_idx: u32,
     bucket: u16,
@@ -210,7 +210,8 @@ fn update_regrets_with_pruning(
         if pruned[a] {
             continue;
         }
-        let delta = ((val - node_value) * REGRET_SCALE) as i32;
+        let raw = (val - node_value) * REGRET_SCALE;
+        let delta = raw.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
         storage.add_regret(node_idx, bucket, a, delta);
     }
 }
@@ -223,7 +224,8 @@ fn update_traverser_strategy_sums(
     strategy: &[f64; MAX_ACTIONS],
 ) {
     for (a, &prob) in strategy[..num_actions].iter().enumerate() {
-        let delta = (prob * REGRET_SCALE) as i64;
+        let raw = prob * REGRET_SCALE;
+        let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
         storage.add_strategy_sum(node_idx, bucket, a, delta);
     }
 }
@@ -243,7 +245,7 @@ fn traverse_opponent(
     rake_rate: f64,
     rake_cap: Chips,
     prune: bool,
-    prune_threshold: i32,
+    prune_threshold: i16,
 ) -> (f64, PruneStats) {
     let mut strategy = [0.0_f64; MAX_ACTIONS];
     storage.regret_matched_strategy(node_idx, bucket, num_actions, &mut strategy);
@@ -251,7 +253,8 @@ fn traverse_opponent(
     let sampled = sample_action(&strategy[..num_actions], rng);
 
     // Update strategy sums for the sampled action
-    let delta = (strategy[sampled] * REGRET_SCALE) as i64;
+    let raw = strategy[sampled] * REGRET_SCALE;
+    let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
     storage.add_strategy_sum(node_idx, bucket, sampled, delta);
 
     traverse_external(
@@ -740,7 +743,7 @@ mod tests {
                 let bkts = bucket_counts[street.index()];
                 for bucket in 0..bkts {
                     for a in 0..actions.len() {
-                        storage.add_regret(i as u32, bucket, a, -50_000);
+                        storage.add_regret(i as u32, bucket, a, -30_000);
                     }
                 }
             }

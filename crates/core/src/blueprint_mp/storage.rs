@@ -7,27 +7,29 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI16, AtomicI32, Ordering};
 
 use super::game_tree::{MpGameNode, MpGameTree};
 
 /// Fixed-point scaling factor for regret values.
 ///
-/// Regret deltas are stored as `(chip_value * REGRET_SCALE) as i32`.
-pub const REGRET_SCALE: f64 = 1_000.0;
+/// Regret deltas are stored as `(chip_value * REGRET_SCALE) as i16`.
+/// At scale 20, max storable chip value is +/-1638, covering
+/// 6-player 100bb max pot (~1200 chips).
+pub const REGRET_SCALE: f64 = 20.0;
 
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct MpStorage {
-    /// Cumulative regrets: one `AtomicI32` per (node, bucket, action).
-    pub regrets: Vec<AtomicI32>,
-    /// Strategy sums: one `AtomicI64` per (node, bucket, action).
-    pub strategy_sums: Vec<AtomicI64>,
+    /// Cumulative regrets: one `AtomicI16` per (node, bucket, action).
+    pub regrets: Vec<AtomicI16>,
+    /// Strategy sums: one `AtomicI32` per (node, bucket, action).
+    pub strategy_sums: Vec<AtomicI32>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata.
     layout: Vec<NodeLayout>,
-    /// Floor for cumulative regret. `i32::MIN` = no floor (default).
-    pub regret_floor: i32,
+    /// Floor for cumulative regret. `i16::MIN` = no floor (default).
+    pub regret_floor: i16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -42,21 +44,26 @@ impl MpStorage {
     #[must_use]
     pub fn new(tree: &MpGameTree, bucket_counts: [u16; 4]) -> Self {
         let (layout, total) = build_layout(&tree.nodes, bucket_counts);
-        let decision_count = tree.nodes.iter().filter(|n| matches!(n, MpGameNode::Decision { .. })).count();
-        let regret_bytes = total * std::mem::size_of::<AtomicI32>();
-        let strat_bytes = total * std::mem::size_of::<AtomicI64>();
+        let decisions = tree.nodes.iter()
+            .filter(|n| matches!(n, MpGameNode::Decision { .. }))
+            .count();
+        let regret_bytes = total * std::mem::size_of::<AtomicI16>();
+        let strat_bytes = total * std::mem::size_of::<AtomicI32>();
         let total_bytes = regret_bytes + strat_bytes;
         eprintln!(
-            "  MP Storage: {} nodes ({} decision), {} slots ({:.1} GB regret + {:.1} GB strategy = {:.1} GB total)",
-            tree.nodes.len(), decision_count, total,
-            regret_bytes as f64 / 1e9, strat_bytes as f64 / 1e9, total_bytes as f64 / 1e9,
+            "  MP Storage: {} nodes ({} decision), {} slots \
+             ({:.1} GB regret + {:.1} GB strategy = {:.1} GB total)",
+            tree.nodes.len(), decisions, total,
+            regret_bytes as f64 / 1e9,
+            strat_bytes as f64 / 1e9,
+            total_bytes as f64 / 1e9,
         );
         Self {
-            regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
-            strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
+            regrets: (0..total).map(|_| AtomicI16::new(0)).collect(),
+            strategy_sums: (0..total).map(|_| AtomicI32::new(0)).collect(),
             bucket_counts,
             layout,
-            regret_floor: i32::MIN,
+            regret_floor: i16::MIN,
         }
     }
 
@@ -67,22 +74,22 @@ impl MpStorage {
         self.layout[node_idx as usize].num_actions as usize
     }
 
-    /// Read a single regret value atomically (raw scaled i32).
+    /// Read a single regret value atomically (raw scaled i16).
     #[inline]
     #[must_use]
-    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i16 {
         self.regrets[self.slot(node_idx, bucket, action)].load(Ordering::Relaxed)
     }
 
     /// Add a delta to a single regret value atomically with saturation.
     #[inline]
-    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i16) {
         let idx = self.slot(node_idx, bucket, action);
         let floor = self.regret_floor;
         self.regrets[idx]
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 let val = old.saturating_add(delta);
-                Some(if floor == i32::MIN { val } else { val.max(floor) })
+                Some(if floor == i16::MIN { val } else { val.max(floor) })
             })
             .ok();
     }
@@ -90,13 +97,13 @@ impl MpStorage {
     /// Read a single strategy sum value atomically.
     #[inline]
     #[must_use]
-    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
+    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
         self.strategy_sums[self.slot(node_idx, bucket, action)].load(Ordering::Relaxed)
     }
 
     /// Add a delta to a single strategy sum value atomically.
     #[inline]
-    pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
+    pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         self.strategy_sums[self.slot(node_idx, bucket, action)]
             .fetch_add(delta, Ordering::Relaxed);
     }
@@ -112,7 +119,8 @@ impl MpStorage {
         let start = self.slot(node_idx, bucket, 0);
         let mut positive_sum = 0.0_f64;
         for (i, slot) in out[..num_actions].iter_mut().enumerate() {
-            let r = f64::from(self.regrets[start + i].load(Ordering::Relaxed).max(0));
+            let raw = self.regrets[start + i].load(Ordering::Relaxed);
+            let r = f64::from(raw.max(0));
             *slot = r;
             positive_sum += r;
         }
@@ -130,7 +138,7 @@ impl MpStorage {
         let start = self.slot(node_idx, bucket, 0);
         let mut total = 0.0_f64;
         for (i, slot) in out[..num_actions].iter_mut().enumerate() {
-            let s = self.strategy_sums[start + i].load(Ordering::Relaxed) as f64;
+            let s = f64::from(self.strategy_sums[start + i].load(Ordering::Relaxed));
             *slot = s;
             total += s;
         }
@@ -371,14 +379,25 @@ mod tests {
     }
 
     #[timed_test]
-    fn regret_saturates_at_i32_max() {
+    fn regret_i16_saturates_on_overflow() {
         let tree = minimal_tree(2);
         let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
         let node = first_decision_node(&tree);
 
-        storage.add_regret(node, 0, 0, i32::MAX - 10);
+        storage.add_regret(node, 0, 0, i16::MAX - 10);
         storage.add_regret(node, 0, 0, 100);
-        assert_eq!(storage.get_regret(node, 0, 0), i32::MAX);
+        assert_eq!(storage.get_regret(node, 0, 0), i16::MAX);
+    }
+
+    #[timed_test]
+    fn regret_i16_saturates_negative_overflow() {
+        let tree = minimal_tree(2);
+        let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
+        let node = first_decision_node(&tree);
+
+        storage.add_regret(node, 0, 0, i16::MIN + 10);
+        storage.add_regret(node, 0, 0, -100);
+        assert_eq!(storage.get_regret(node, 0, 0), i16::MIN);
     }
 
     #[timed_test]
@@ -393,14 +412,25 @@ mod tests {
     }
 
     #[timed_test]
-    fn strategy_sum_holds_large_i64() {
+    fn strategy_sum_i32_round_trip() {
         let tree = minimal_tree(2);
         let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
         let node = first_decision_node(&tree);
 
-        let large: i64 = 3_000_000_000;
-        storage.add_strategy_sum(node, 0, 0, large);
-        assert_eq!(storage.get_strategy_sum(node, 0, 0), large);
+        storage.add_strategy_sum(node, 0, 0, 1_000_000);
+        assert_eq!(storage.get_strategy_sum(node, 0, 0), 1_000_000);
+        storage.add_strategy_sum(node, 0, 0, 500_000);
+        assert_eq!(storage.get_strategy_sum(node, 0, 0), 1_500_000);
+    }
+
+    #[timed_test]
+    fn regret_scale_20_covers_max_pot() {
+        // 6-player 100bb max pot = ~1200 chips
+        // At REGRET_SCALE=20: 1200 * 20 = 24000, fits in i16 (max 32767)
+        let max_pot_chips = 1200.0_f64;
+        let scaled = (max_pot_chips * REGRET_SCALE) as i16;
+        assert_eq!(scaled, 24000);
+        assert!(scaled < i16::MAX);
     }
 
     #[timed_test]
