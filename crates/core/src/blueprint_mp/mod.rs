@@ -3,6 +3,7 @@ pub mod exploitability;
 pub mod game_tree;
 pub mod info_key;
 pub mod mccfr;
+pub mod mmap_buffer;
 pub mod storage;
 pub mod terminal;
 pub mod trainer;

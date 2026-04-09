@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicI16, AtomicI32, Ordering};
 
 use super::game_tree::{MpGameNode, MpGameTree};
+use super::mmap_buffer::MmapBuffer;
 
 /// Fixed-point scaling factor for regret values.
 ///
@@ -21,9 +22,9 @@ pub const REGRET_SCALE: f64 = 20.0;
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct MpStorage {
     /// Cumulative regrets: one `AtomicI16` per (node, bucket, action).
-    pub regrets: Vec<AtomicI16>,
+    pub regrets: MmapBuffer<AtomicI16>,
     /// Strategy sums: one `AtomicI32` per (node, bucket, action).
-    pub strategy_sums: Vec<AtomicI32>,
+    pub strategy_sums: MmapBuffer<AtomicI32>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata.
@@ -44,23 +45,22 @@ impl MpStorage {
     #[must_use]
     pub fn new(tree: &MpGameTree, bucket_counts: [u16; 4]) -> Self {
         let (layout, total) = build_layout(&tree.nodes, bucket_counts);
-        let decisions = tree.nodes.iter()
+        let decision_count = tree.nodes.iter()
             .filter(|n| matches!(n, MpGameNode::Decision { .. }))
             .count();
         let regret_bytes = total * std::mem::size_of::<AtomicI16>();
         let strat_bytes = total * std::mem::size_of::<AtomicI32>();
-        let total_bytes = regret_bytes + strat_bytes;
+        let virtual_total = regret_bytes + strat_bytes;
+        let estimated_physical = virtual_total as f64 * 0.6;
         eprintln!(
             "  MP Storage: {} nodes ({} decision), {} slots \
-             ({:.1} GB regret + {:.1} GB strategy = {:.1} GB total)",
-            tree.nodes.len(), decisions, total,
-            regret_bytes as f64 / 1e9,
-            strat_bytes as f64 / 1e9,
-            total_bytes as f64 / 1e9,
+             (virtual: {:.1} GB, est. physical: {:.1} GB at 60% visit rate)",
+            tree.nodes.len(), decision_count, total,
+            virtual_total as f64 / 1e9, estimated_physical / 1e9,
         );
         Self {
-            regrets: (0..total).map(|_| AtomicI16::new(0)).collect(),
-            strategy_sums: (0..total).map(|_| AtomicI32::new(0)).collect(),
+            regrets: MmapBuffer::new(total),
+            strategy_sums: MmapBuffer::new(total),
             bucket_counts,
             layout,
             regret_floor: i16::MIN,
