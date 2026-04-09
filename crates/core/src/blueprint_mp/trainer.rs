@@ -27,6 +27,8 @@ use super::mccfr::{sample_deal, traverse_external};
 use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
 use super::MAX_PLAYERS;
+use crate::blueprint_v2::mccfr::AllBuckets;
+use crate::blueprint_v2::trainer::load_bucket_files;
 
 /// Result of a training run.
 pub struct TrainResult {
@@ -38,6 +40,7 @@ pub struct TrainResult {
 pub struct TrainContext {
     pub tree: Arc<MpGameTree>,
     pub storage: Arc<MpStorage>,
+    pub buckets: Arc<AllBuckets>,
     pub iterations: Arc<AtomicU64>,
     /// Set to `true` to signal the training loop to stop after the current batch.
     pub quit: Arc<AtomicBool>,
@@ -51,9 +54,15 @@ pub fn setup_training(config: &BlueprintMpConfig) -> TrainContext {
     let tree = MpGameTree::build(&config.game, &config.action_abstraction);
     let bucket_counts = config.clustering.bucket_counts();
     let storage = MpStorage::new(&tree, bucket_counts);
+    let bucket_files = config.training.cluster_path.as_ref().map_or_else(
+        || [None, None, None, None],
+        |path| load_bucket_files(std::path::Path::new(path)),
+    );
+    let all_buckets = AllBuckets::new(bucket_counts, bucket_files);
     TrainContext {
         tree: Arc::new(tree),
         storage: Arc::new(storage),
+        buckets: Arc::new(all_buckets),
         iterations: Arc::new(AtomicU64::new(0)),
         quit: Arc::new(AtomicBool::new(false)),
         num_players: config.game.num_players,
@@ -70,6 +79,7 @@ pub fn run_training(
     training_loop(
         &ctx.tree,
         &ctx.storage,
+        &ctx.buckets,
         training,
         ctx.num_players,
         ctx.bucket_counts,
@@ -92,6 +102,7 @@ pub fn train_blueprint_mp(config: &BlueprintMpConfig) -> TrainResult {
 fn training_loop(
     tree: &MpGameTree,
     storage: &MpStorage,
+    all_buckets: &AllBuckets,
     config: &MpTrainingConfig,
     num_players: u8,
     bucket_counts: [u16; 4],
@@ -118,7 +129,7 @@ fn training_loop(
 
         let prune = should_prune(meta_iter, config, &mut rng);
         run_batch(
-            tree, storage, num_players, bucket_counts,
+            tree, storage, all_buckets, num_players, bucket_counts,
             rake_rate, rake_cap, batch, meta_iter,
             prune, scaled_threshold,
         );
@@ -152,6 +163,7 @@ fn should_prune(meta_iter: u64, config: &MpTrainingConfig, rng: &mut impl Rng) -
 fn run_batch(
     tree: &MpGameTree,
     storage: &MpStorage,
+    all_buckets: &AllBuckets,
     num_players: u8,
     bucket_counts: [u16; 4],
     rake_rate: f64,
@@ -168,7 +180,7 @@ fn run_batch(
             let seed = base_iter.wrapping_add(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut rng = SmallRng::seed_from_u64(seed);
             let deal = sample_deal(num_players, &mut rng);
-            let buckets = compute_buckets_trivial(&deal, bucket_counts);
+            let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
             let mut local = PruneStats::default();
             for traverser in 0..num_players {
                 let (_, stats) = traverse_external(
@@ -223,6 +235,26 @@ fn strategy_discount_factor(epoch: u64, gamma: f64) -> f64 {
     (t / (t + 1.0)).powf(gamma)
 }
 
+/// Compute bucket assignments for a deal using real clustering when available.
+fn compute_deal_buckets(deal: &Deal, all_buckets: &AllBuckets, bucket_counts: [u16; 4]) -> DealWithBuckets {
+    use crate::blueprint_v2::Street as V2Street;
+    let streets = [V2Street::Preflop, V2Street::Flop, V2Street::Turn, V2Street::River];
+    let board_slices: [&[crate::poker::Card]; 4] = [
+        &[],
+        &deal.board[..3],
+        &deal.board[..4],
+        &deal.board[..5],
+    ];
+    let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
+    for p in 0..deal.num_players as usize {
+        for (s, (&street, board)) in streets.iter().zip(board_slices.iter()).enumerate() {
+            buckets[p][s] = Bucket(all_buckets.get_bucket(street, deal.hole_cards[p], board));
+        }
+    }
+    DealWithBuckets { deal: deal.clone(), buckets }
+}
+
+/// Trivial fallback bucketing (for tests without cluster files).
 fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuckets {
     use crate::hands::CanonicalHand;
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
@@ -640,7 +672,8 @@ mod tests {
         let bucket_counts = [10u16, 10, 10, 10];
         let storage = MpStorage::new(&tree, bucket_counts);
 
-        run_batch(&tree, &storage, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
+        let ab = test_all_buckets(bucket_counts);
+        run_batch(&tree, &storage, &ab, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
 
         let any_nonzero = storage
             .regrets
@@ -655,7 +688,8 @@ mod tests {
         let bucket_counts = [10u16, 10, 10, 10];
         let storage = MpStorage::new(&tree, bucket_counts);
 
-        run_batch(&tree, &storage, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
+        let ab = test_all_buckets(bucket_counts);
+        run_batch(&tree, &storage, &ab, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
 
         let any_nonzero = storage
             .strategy_sums
@@ -670,7 +704,8 @@ mod tests {
         let bucket_counts = [10u16, 10, 10, 10];
         let storage = MpStorage::new(&tree, bucket_counts);
 
-        run_batch(&tree, &storage, 3, bucket_counts, 0.0, Chips::ZERO, 10, 0, false, 0);
+        let ab = test_all_buckets(bucket_counts);
+        run_batch(&tree, &storage, &ab, 3, bucket_counts, 0.0, Chips::ZERO, 10, 0, false, 0);
 
         let any_nonzero = storage
             .regrets
@@ -757,6 +792,12 @@ mod tests {
     }
 
     // -- Helper --
+
+    fn test_all_buckets(bucket_counts: [u16; 4]) -> AllBuckets {
+        let mut ab = AllBuckets::new(bucket_counts, [None, None, None, None]);
+        ab.equity_fallback = true;
+        ab
+    }
 
     fn first_decision_node(tree: &MpGameTree) -> u32 {
         tree.nodes
