@@ -2112,7 +2112,13 @@ fn bridge_mp_iterations<T>(
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if last_telemetry.elapsed() >= telemetry_interval {
-            push_mp_telemetry(storage, tree, scenario_node_ids, metrics, iters);
+            // Spawn telemetry scan on a background thread to avoid blocking
+            // the iteration counter bridge (the scan touches billions of entries).
+            let s = Arc::clone(storage);
+            let t = Arc::clone(tree);
+            let m = Arc::clone(metrics);
+            let nodes = scenario_node_ids.to_vec();
+            std::thread::spawn(move || push_mp_telemetry(&s, &t, &nodes, &m, iters));
             last_telemetry = Instant::now();
         }
         if handle.is_finished() {

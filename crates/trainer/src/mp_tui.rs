@@ -373,22 +373,32 @@ pub fn push_regret_telemetry(
     regret_scale: f64,
     metrics: &BlueprintTuiMetrics,
 ) {
+    use rayon::prelude::*;
     if regrets.is_empty() {
         return;
     }
-    let mut max_r = i32::MIN;
-    let mut min_r = i32::MAX;
-    let mut pos_sum: i64 = 0;
-    let mut pos_count: u64 = 0;
-    for atom in regrets {
-        let v = atom.load(Ordering::Relaxed);
-        if v > max_r { max_r = v; }
-        if v < min_r { min_r = v; }
-        if v > 0 {
-            pos_sum += v as i64;
-            pos_count += 1;
-        }
-    }
+    // Parallel reduce over chunks for max/min/pos_sum/pos_count
+    let (max_r, min_r, pos_sum, pos_count) = regrets
+        .par_chunks(1_000_000)
+        .map(|chunk| {
+            let mut mx = i32::MIN;
+            let mut mn = i32::MAX;
+            let mut ps: i64 = 0;
+            let mut pc: u64 = 0;
+            for atom in chunk {
+                let v = atom.load(Ordering::Relaxed);
+                if v > mx { mx = v; }
+                if v < mn { mn = v; }
+                if v > 0 { ps += v as i64; pc += 1; }
+            }
+            (mx, mn, ps, pc)
+        })
+        .reduce(
+            || (i32::MIN, i32::MAX, 0i64, 0u64),
+            |(mx1, mn1, ps1, pc1), (mx2, mn2, ps2, pc2)| {
+                (mx1.max(mx2), mn1.min(mn2), ps1 + ps2, pc1 + pc2)
+            },
+        );
     metrics.push_max_regret(max_r as f64 / regret_scale);
     metrics.push_min_regret(min_r as f64 / regret_scale);
     let avg = if pos_count > 0 {
