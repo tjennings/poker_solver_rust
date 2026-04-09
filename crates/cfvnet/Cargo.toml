@@ -27,6 +27,8 @@ default = []
 cuda = ["burn/cuda-jit"]
 gpu-datagen = ["gpu-range-solver"]
 onnx = ["ort"]
+onnx-gpu = ["ort", "ort/cuda", "ort/tensorrt"]
+gpu-turn-datagen = ["gpu-datagen", "onnx-gpu"]
 
 [dev-dependencies]
 tempfile = "3"
