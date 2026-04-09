@@ -249,7 +249,11 @@ impl GpuBatchSolver {
     ///
     /// Call before `prepare_batch` for turn solving with leaf injection.
     /// `node_ids` and `depths` are parallel arrays of leaf nodes in the topology.
-    pub fn set_leaf_injection(&mut self, node_ids: &[i32], depths: &[i32]) {
+    pub fn set_leaf_injection(
+        &mut self,
+        node_ids: &[i32],
+        depths: &[i32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             node_ids.len(),
             depths.len(),
@@ -257,16 +261,11 @@ impl GpuBatchSolver {
         );
         self.num_leaves = node_ids.len();
         let leaf_cfv_size = (self.num_leaves * self.num_hands).max(1);
-        self.d_leaf_node_ids = self.stream.clone_htod(node_ids).expect("upload leaf_node_ids");
-        self.d_leaf_depths = self.stream.clone_htod(depths).expect("upload leaf_depths");
-        self.d_leaf_cfv_p0 = self
-            .stream
-            .alloc_zeros::<f32>(leaf_cfv_size)
-            .expect("alloc leaf_cfv_p0");
-        self.d_leaf_cfv_p1 = self
-            .stream
-            .alloc_zeros::<f32>(leaf_cfv_size)
-            .expect("alloc leaf_cfv_p1");
+        self.d_leaf_node_ids = self.stream.clone_htod(node_ids)?;
+        self.d_leaf_depths = self.stream.clone_htod(depths)?;
+        self.d_leaf_cfv_p0 = self.stream.alloc_zeros::<f32>(leaf_cfv_size)?;
+        self.d_leaf_cfv_p1 = self.stream.alloc_zeros::<f32>(leaf_cfv_size)?;
+        Ok(())
     }
 
     /// Upload per-subgame data and initialize solver state.
@@ -436,7 +435,10 @@ impl GpuBatchSolver {
         Ok(reach)
     }
 
-    /// Copy new leaf CFV data into the pre-allocated GPU buffers.
+    /// Copy new leaf CFV data to GPU. Uses `clone_htod` (new allocation) rather
+    /// than in-place copy because cudarc does not expose a host-to-device memcpy
+    /// into an existing slice. The old buffer is freed on drop. This runs only at
+    /// boundary re-evaluation intervals, so the alloc overhead is negligible.
     ///
     /// `p0` and `p1` are `[num_leaves * num_hands]` each.
     pub fn update_leaf_cfvs(
@@ -1035,7 +1037,7 @@ mod tests {
         let num_leaves = leaf_node_ids.len();
 
         let mut solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
-        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths);
+        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths).unwrap();
 
         let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
         solver.prepare_batch(&[spec]).unwrap();
@@ -1073,7 +1075,7 @@ mod tests {
 
         let leaf_node_ids = vec![1i32, 2];
         let leaf_depths = vec![1i32, 1];
-        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths);
+        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths).unwrap();
 
         assert_eq!(solver.num_leaves, 2);
     }
