@@ -29,13 +29,13 @@ training:
   hidden_layers: 7
   hidden_size: 768
   batch_size: 16000
-  epochs: 500
+  epochs: 2000
   learning_rate: 0.004
   lr_min: 0.00004
   huber_delta: 1.0
-  aux_loss_weight: 0.1
+  aux_loss_weight: 0.00001
   validation_split: 0.05
-  checkpoint_every_n_epochs: 10
+  checkpoint_every_n_epochs: 25
   shuffle_buffer_size: 262144
   prefetch_depth: 4
   encoder_threads: 14
