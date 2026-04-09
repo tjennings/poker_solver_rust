@@ -406,11 +406,16 @@ fn add_sized_actions(
 fn add_lead_sizes(state: &BuildState, sizes: LeadSizes<'_>, actions: &mut Vec<TreeAction>) {
     match sizes {
         LeadSizes::Preflop(preflop) => {
+            // Preflop: resolve_preflop_size returns a raise-TO amount (e.g., "2bb" = 4 chips total).
+            // Pass directly to try_add_sized_action, bypassing try_add_lead which would
+            // incorrectly add the existing street_bet on top.
             for &size in preflop {
-                try_add_lead(state, resolve_preflop_size(state, size), actions);
+                let raise_to = resolve_preflop_size(state, size).max(min_raise_to(state));
+                try_add_sized_action(state, actions, raise_to, TreeAction::Lead);
             }
         }
         LeadSizes::Postflop(fractions) => {
+            // Postflop: amount is additional chips (pot * fraction), added on top of my_bet.
             for &frac in fractions {
                 try_add_lead(state, state.pot * frac, actions);
             }
