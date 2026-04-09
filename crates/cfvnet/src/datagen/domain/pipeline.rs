@@ -637,21 +637,16 @@ impl DomainPipeline {
                     .map_err(|e| format!("run_iterations failed: {e}"))?;
                 iter = end;
 
-                // Re-evaluate boundaries if not done yet and model available.
-                #[cfg(feature = "gpu-turn-datagen")]
-                if iter < max_iterations
-                    && has_boundary_eval
-                    && leaf_eval_interval > 0
-                {
-                    Self::evaluate_and_upload_boundaries(
-                        boundary_evaluator.as_ref().unwrap(),
-                        &mut solver,
-                        &sit,
-                        &board_4,
-                        &hand_cards,
-                        num_boundaries,
-                    )?;
-                }
+                // TODO: Re-evaluate boundaries using reach at boundary nodes
+                // instead of root ranges. Currently uses root ranges (matching
+                // the CPU NeuralNetEvaluator), which means re-evaluation produces
+                // identical results each time. Once reach-based evaluation is
+                // implemented, uncomment this block.
+                //
+                // #[cfg(feature = "gpu-turn-datagen")]
+                // if iter < max_iterations && has_boundary_eval && leaf_eval_interval > 0 {
+                //     Self::evaluate_and_upload_boundaries(...)?;
+                // }
             }
 
             // Extract results and compute EVs.
@@ -795,26 +790,24 @@ impl DomainPipeline {
             })
             .collect();
 
-        // No real showdown outcomes in the turn subtree. The chance-node-leaves are
-        // handled by leaf injection, not showdown evaluation.
-        // Filter out leaf_node_ids from the showdown list.
-        let leaf_set: std::collections::HashSet<usize> =
-            leaf_node_ids.iter().copied().collect();
-        let real_showdown_nodes: Vec<usize> = turn_topo
+        // decompose_at_chance classifies ex-chance-node leaves as NodeType::Showdown,
+        // so they appear in turn_topo.showdown_nodes. build_mega_terminal_data requires
+        // showdown_outcomes.len() == topo.showdown_nodes.len(). We produce dummy zero-payoff
+        // entries for these leaf nodes — the CUDA kernel's leaf injection overwrites cfv
+        // at these nodes during the backward pass, so the zero showdown eval is harmless.
+        let num_oop = hand_cards[0].len();
+        let num_ip = hand_cards[1].len();
+        let showdown_outcomes: Vec<ShowdownData> = turn_topo
             .showdown_nodes
             .iter()
-            .filter(|&&id| !leaf_set.contains(&id))
-            .copied()
+            .map(|_| ShowdownData {
+                num_player_hands: [num_oop, num_ip],
+                outcome_matrix_p0: vec![0.0; num_oop * num_ip],
+                amount_win: 0.0,
+                amount_tie: 0.0,
+                amount_lose: 0.0,
+            })
             .collect();
-
-        // In a turn tree, all showdown nodes should be chance-node-leaves.
-        // Real showdowns only occur after the river card is dealt.
-        debug_assert!(
-            real_showdown_nodes.is_empty(),
-            "turn subtree should not have real showdown nodes, found {}",
-            real_showdown_nodes.len(),
-        );
-        let showdown_outcomes: Vec<ShowdownData> = Vec::new();
 
         TerminalData {
             fold_payoffs,
