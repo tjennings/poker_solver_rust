@@ -1492,9 +1492,10 @@ pub fn gpu_solve_hand_parallel(
     let shared_mem_bytes =
         compute_hand_parallel_shared_mem(topo.num_edges, topo.max_depth, topo.num_nodes) as u32;
 
+    let block_threads = (num_hands as u32).min(1024);
     let cfg = LaunchConfig {
         grid_dim: (batch_size as u32, 1, 1),
-        block_dim: (num_hands as u32, 1, 1),
+        block_dim: (block_threads, 1, 1),
         shared_mem_bytes,
     };
 

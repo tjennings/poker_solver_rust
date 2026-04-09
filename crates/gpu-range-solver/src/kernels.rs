@@ -427,8 +427,8 @@ extern "C" __global__ void cfr_solve(
 
         // --- DCFR discount: per-thread, no sync ---
         for (int e = 0; e < E; e++) {
-            int idx = bid * EH + e * H + tid;
-            if (tid < H) {
+            for (int h = tid; h < H; h += blockDim.x) {
+                int idx = bid * EH + e * H + h;
                 float r = regrets[idx];
                 regrets[idx] = (r >= 0.0f) ? r * alpha : r * beta;
                 strategy_sum[idx] *= gamma;
@@ -442,16 +442,16 @@ extern "C" __global__ void cfr_solve(
             int num_oh = player_num_hands[opp];
 
             // --- Zero reach and cfv: per-thread ---
-            if (tid < H) {
+            for (int h = tid; h < H; h += blockDim.x) {
                 for (int n = 0; n < N; n++) {
-                    reach[bid * NH + n * H + tid] = 0.0f;
-                    cfv[bid * NH + n * H + tid] = 0.0f;
+                    reach[bid * NH + n * H + h] = 0.0f;
+                    cfv[bid * NH + n * H + h] = 0.0f;
                 }
             }
 
             // --- Set root reach = opponent initial weights ---
-            if (tid < H) {
-                reach[bid * NH + tid] = initial_weights[bid * 2 * H + opp * H + tid];
+            for (int h = tid; h < H; h += blockDim.x) {
+                reach[bid * NH + h] = initial_weights[bid * 2 * H + opp * H + h];
             }
 
             // --- Forward pass: sequential over levels, parallel over hands ---
@@ -465,25 +465,25 @@ extern "C" __global__ void cfr_solve(
                     int n_actions = (int)s_actions[parent];
                     if (n_actions == 0) { e++; continue; }
 
-                    if (tid < H) {
+                    for (int h = tid; h < H; h += blockDim.x) {
                         // Regret match for this node
                         float denom = 0.0f;
                         for (int a = 0; a < n_actions; a++) {
-                            denom += fmaxf(regrets[bid * EH + (e + a) * H + tid], 0.0f);
+                            denom += fmaxf(regrets[bid * EH + (e + a) * H + h], 0.0f);
                         }
                         float uniform = 1.0f / (float)n_actions;
 
                         for (int a = 0; a < n_actions; a++) {
                             int edge = e + a;
                             int child = s_child[edge];
-                            float clipped = fmaxf(regrets[bid * EH + edge * H + tid], 0.0f);
+                            float clipped = fmaxf(regrets[bid * EH + edge * H + h], 0.0f);
                             float strat = (denom > 1e-30f) ? clipped / denom : uniform;
-                            float pr = reach[bid * NH + parent * H + tid];
+                            float pr = reach[bid * NH + parent * H + h];
 
                             if (s_player[edge] == player) {
-                                reach[bid * NH + child * H + tid] = pr;
+                                reach[bid * NH + child * H + h] = pr;
                             } else {
-                                reach[bid * NH + child * H + tid] = pr * strat;
+                                reach[bid * NH + child * H + h] = pr * strat;
                             }
                         }
                     }
@@ -555,8 +555,8 @@ extern "C" __global__ void cfr_solve(
                     if (leaf_depths[li] != depth) continue;
                     int node_id = leaf_node_ids[li];
                     const float* leaf_cfv = (player == 0) ? leaf_cfv_p0 : leaf_cfv_p1;
-                    if (tid < player_num_hands[player]) {
-                        cfv[bid * NH + node_id * H + tid] = leaf_cfv[li * H + tid];
+                    for (int h = tid; h < player_num_hands[player]; h += blockDim.x) {
+                        cfv[bid * NH + node_id * H + h] = leaf_cfv[li * H + h];
                     }
                 }
 
@@ -570,30 +570,30 @@ extern "C" __global__ void cfr_solve(
                     int n_actions = (int)s_actions[parent];
                     if (n_actions == 0) { e++; continue; }
 
-                    if (tid < H) {
+                    for (int h = tid; h < H; h += blockDim.x) {
                         // Recompute strategy
                         float denom = 0.0f;
                         for (int a = 0; a < n_actions; a++)
-                            denom += fmaxf(regrets[bid * EH + (e + a) * H + tid], 0.0f);
+                            denom += fmaxf(regrets[bid * EH + (e + a) * H + h], 0.0f);
                         float uniform = 1.0f / (float)n_actions;
 
                         if (s_player[e] == player) {
                             // Traverser: cfv[parent] = sum(strat * child_cfv)
                             float node_cfv = 0.0f;
                             for (int a = 0; a < n_actions; a++) {
-                                float clipped = fmaxf(regrets[bid * EH + (e + a) * H + tid], 0.0f);
+                                float clipped = fmaxf(regrets[bid * EH + (e + a) * H + h], 0.0f);
                                 float strat = (denom > 1e-30f) ? clipped / denom : uniform;
-                                float child_cfv = cfv[bid * NH + s_child[e + a] * H + tid];
+                                float child_cfv = cfv[bid * NH + s_child[e + a] * H + h];
                                 node_cfv += strat * child_cfv;
                             }
-                            cfv[bid * NH + parent * H + tid] = node_cfv;
+                            cfv[bid * NH + parent * H + h] = node_cfv;
 
                             // Regret + strategy_sum update
                             for (int a = 0; a < n_actions; a++) {
-                                float clipped = fmaxf(regrets[bid * EH + (e + a) * H + tid], 0.0f);
+                                float clipped = fmaxf(regrets[bid * EH + (e + a) * H + h], 0.0f);
                                 float strat = (denom > 1e-30f) ? clipped / denom : uniform;
-                                float child_cfv = cfv[bid * NH + s_child[e + a] * H + tid];
-                                int idx = bid * EH + (e + a) * H + tid;
+                                float child_cfv = cfv[bid * NH + s_child[e + a] * H + h];
+                                int idx = bid * EH + (e + a) * H + h;
                                 regrets[idx] += child_cfv - node_cfv;
                                 strategy_sum[idx] += strat;
                             }
@@ -601,8 +601,8 @@ extern "C" __global__ void cfr_solve(
                             // Opponent/chance: cfv[parent] = sum(child_cfv)
                             float node_cfv = 0.0f;
                             for (int a = 0; a < n_actions; a++)
-                                node_cfv += cfv[bid * NH + s_child[e + a] * H + tid];
-                            cfv[bid * NH + parent * H + tid] = node_cfv;
+                                node_cfv += cfv[bid * NH + s_child[e + a] * H + h];
+                            cfv[bid * NH + parent * H + h] = node_cfv;
                         }
                     }
                     e += n_actions;
