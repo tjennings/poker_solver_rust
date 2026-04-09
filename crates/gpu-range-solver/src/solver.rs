@@ -1047,7 +1047,8 @@ fn launch_mega_solve(
     let e_i32 = num_edges as i32;
     let h_i32 = num_hands as i32;
     let max_depth_i32 = max_depth as i32;
-    let max_iter_i32 = max_iterations as i32;
+    let start_iter_i32 = 0i32;
+    let end_iter_i32 = max_iterations as i32;
     let num_folds_i32 = state.num_folds as i32;
     let num_showdowns_i32 = state.num_showdowns as i32;
     let num_leaves_i32 = state.num_leaves as i32;
@@ -1092,7 +1093,8 @@ fn launch_mega_solve(
         b.arg(&e_i32);
         b.arg(&h_i32);
         b.arg(&max_depth_i32);
-        b.arg(&max_iter_i32);
+        b.arg(&start_iter_i32);
+        b.arg(&end_iter_i32);
         b.arg(&num_folds_i32);
         b.arg(&num_showdowns_i32);
         b.arg(&num_leaves_i32);
@@ -1502,7 +1504,8 @@ pub fn gpu_solve_hand_parallel(
     let e_i32 = topo.num_edges as i32;
     let h_i32 = num_hands as i32;
     let max_depth_i32 = topo.max_depth as i32;
-    let max_iter_i32 = config.max_iterations as i32;
+    let start_iter_i32 = 0i32;
+    let end_iter_i32 = config.max_iterations as i32;
     let num_folds_i32 = mtd.fold_node_ids.len() as i32;
     let num_showdowns_i32 = mtd.showdown_node_ids.len() as i32;
     let num_leaves_i32 = 0i32;
@@ -1545,7 +1548,8 @@ pub fn gpu_solve_hand_parallel(
         b.arg(&e_i32);
         b.arg(&h_i32);
         b.arg(&max_depth_i32);
-        b.arg(&max_iter_i32);
+        b.arg(&start_iter_i32);
+        b.arg(&end_iter_i32);
         b.arg(&num_folds_i32);
         b.arg(&num_showdowns_i32);
         b.arg(&num_leaves_i32);

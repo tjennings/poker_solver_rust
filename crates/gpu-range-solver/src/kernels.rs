@@ -352,7 +352,8 @@ extern "C" __global__ void cfr_solve(
     // Scalar dimensions
     int B, int N, int E, int H,
     int max_depth,
-    int max_iterations,
+    int start_iteration,
+    int end_iteration,
     int num_folds,
     int num_showdowns,
     int num_leaves,
@@ -409,7 +410,7 @@ extern "C" __global__ void cfr_solve(
     // ============================================
     // DCFR iteration loop
     // ============================================
-    for (int iter = 0; iter < max_iterations; iter++) {
+    for (int iter = start_iteration; iter < end_iteration; iter++) {
 
         // --- Compute DCFR discount params ---
         float alpha, beta, gamma;
@@ -700,7 +701,8 @@ extern "C" __global__ void cfr_solve(
     int E,
     int H,
     int max_depth,
-    int max_iterations,
+    int start_iteration,
+    int end_iteration,
     int num_folds,
     int num_showdowns,
     int num_leaves,
@@ -718,7 +720,7 @@ extern "C" __global__ void cfr_solve(
     int showdown_stride = num_showdowns * H * H;
     int player_num_hands[2] = {num_hands_p0, num_hands_p1};
 
-    for (int iter = 0; iter < max_iterations; iter++) {
+    for (int iter = start_iteration; iter < end_iteration; iter++) {
 
         // === DCFR Discount ===
         // Compute alpha, beta, gamma from iteration number
@@ -1023,8 +1025,12 @@ mod tests {
     #[test]
     fn mega_kernel_source_has_iteration_loop() {
         assert!(
-            CFR_MEGA_KERNEL_SOURCE.contains("max_iterations"),
-            "mega-kernel must have max_iterations parameter"
+            CFR_MEGA_KERNEL_SOURCE.contains("start_iteration"),
+            "mega-kernel must have start_iteration parameter"
+        );
+        assert!(
+            CFR_MEGA_KERNEL_SOURCE.contains("end_iteration"),
+            "mega-kernel must have end_iteration parameter"
         );
         assert!(
             CFR_MEGA_KERNEL_SOURCE.contains("for (int iter"),
@@ -1136,8 +1142,12 @@ mod tests {
     #[test]
     fn hand_parallel_kernel_has_iteration_loop() {
         assert!(
-            HAND_PARALLEL_KERNEL_SOURCE.contains("max_iterations"),
-            "must have max_iterations parameter"
+            HAND_PARALLEL_KERNEL_SOURCE.contains("start_iteration"),
+            "must have start_iteration parameter"
+        );
+        assert!(
+            HAND_PARALLEL_KERNEL_SOURCE.contains("end_iteration"),
+            "must have end_iteration parameter"
         );
         assert!(
             HAND_PARALLEL_KERNEL_SOURCE.contains("for (int iter"),

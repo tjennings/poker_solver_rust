@@ -109,6 +109,14 @@ pub struct GpuBatchSolver {
     num_hands_p1: usize,
     max_batch: usize,
     shared_mem_bytes: u32,
+    // Persistent state for incremental solving
+    active_state: Option<GpuHandParallelState>,
+    active_d_initial_weights: Option<CudaSlice<f32>>,
+    active_d_showdown_p0: Option<CudaSlice<f32>>,
+    active_d_showdown_p1: Option<CudaSlice<f32>>,
+    active_batch_size: usize,
+    /// Number of leaf nodes for leaf injection (0 for river).
+    pub num_leaves: usize,
 }
 
 impl GpuBatchSolver {
@@ -212,6 +220,12 @@ impl GpuBatchSolver {
             num_hands_p1: term.hand_cards[1].len(),
             max_batch,
             shared_mem_bytes,
+            active_state: None,
+            active_d_initial_weights: None,
+            active_d_showdown_p0: None,
+            active_d_showdown_p1: None,
+            active_batch_size: 0,
+            num_leaves: 0,
         })
     }
 
@@ -226,6 +240,42 @@ impl GpuBatchSolver {
         if specs.is_empty() {
             return Ok(Vec::new());
         }
+        self.prepare_batch(specs)?;
+        self.run_iterations(0, self.max_iterations)?;
+        self.extract_results()
+    }
+
+    /// Upload leaf node IDs and depths, pre-allocate leaf CFV buffers.
+    ///
+    /// Call before `prepare_batch` for turn solving with leaf injection.
+    /// `node_ids` and `depths` are parallel arrays of leaf nodes in the topology.
+    pub fn set_leaf_injection(&mut self, node_ids: &[i32], depths: &[i32]) {
+        assert_eq!(
+            node_ids.len(),
+            depths.len(),
+            "node_ids and depths must have same length"
+        );
+        self.num_leaves = node_ids.len();
+        let leaf_cfv_size = (self.num_leaves * self.num_hands).max(1);
+        self.d_leaf_node_ids = self.stream.clone_htod(node_ids).expect("upload leaf_node_ids");
+        self.d_leaf_depths = self.stream.clone_htod(depths).expect("upload leaf_depths");
+        self.d_leaf_cfv_p0 = self
+            .stream
+            .alloc_zeros::<f32>(leaf_cfv_size)
+            .expect("alloc leaf_cfv_p0");
+        self.d_leaf_cfv_p1 = self
+            .stream
+            .alloc_zeros::<f32>(leaf_cfv_size)
+            .expect("alloc leaf_cfv_p1");
+    }
+
+    /// Upload per-subgame data and initialize solver state.
+    ///
+    /// Call before `run_iterations()`. Stores state on self for incremental use.
+    pub fn prepare_batch(
+        &mut self,
+        specs: &[SubgameSpec],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let batch_size = specs.len();
         assert!(
             batch_size <= self.max_batch,
@@ -238,7 +288,7 @@ impl GpuBatchSolver {
         let n = self.num_nodes;
 
         // Allocate solver state for this batch
-        let mut state = GpuHandParallelState::new(&self.stream, batch_size, n, e, h)?;
+        let state = GpuHandParallelState::new(&self.stream, batch_size, n, e, h)?;
 
         // Build batched initial_weights: [B * 2 * H]
         let mut weights_flat = vec![0.0f32; batch_size * 2 * h];
@@ -261,34 +311,72 @@ impl GpuBatchSolver {
         for (b, spec) in specs.iter().enumerate() {
             let base = b * sd_per_batch;
             let src_len = spec.showdown_outcomes_p0.len().min(sd_per_batch);
-            batched_sd_p0[base..base + src_len].copy_from_slice(&spec.showdown_outcomes_p0[..src_len]);
+            batched_sd_p0[base..base + src_len]
+                .copy_from_slice(&spec.showdown_outcomes_p0[..src_len]);
             let src_len = spec.showdown_outcomes_p1.len().min(sd_per_batch);
-            batched_sd_p1[base..base + src_len].copy_from_slice(&spec.showdown_outcomes_p1[..src_len]);
+            batched_sd_p1[base..base + src_len]
+                .copy_from_slice(&spec.showdown_outcomes_p1[..src_len]);
         }
-        let d_showdown_outcomes_p0 = upload_or_dummy_f32(&self.stream, &batched_sd_p0)?;
-        let d_showdown_outcomes_p1 = upload_or_dummy_f32(&self.stream, &batched_sd_p1)?;
+        let d_showdown_p0 = upload_or_dummy_f32(&self.stream, &batched_sd_p0)?;
+        let d_showdown_p1 = upload_or_dummy_f32(&self.stream, &batched_sd_p1)?;
 
-        // Launch config: one block per subgame, threads = num_hands
+        self.active_state = Some(state);
+        self.active_d_initial_weights = Some(d_initial_weights);
+        self.active_d_showdown_p0 = Some(d_showdown_p0);
+        self.active_d_showdown_p1 = Some(d_showdown_p1);
+        self.active_batch_size = batch_size;
+        Ok(())
+    }
+
+    /// Launch the DCFR kernel for iteration range `[start, end)`.
+    ///
+    /// Requires `prepare_batch()` to have been called first. Uses stored GPU state.
+    pub fn run_iterations(
+        &mut self,
+        start: u32,
+        end: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = self
+            .active_state
+            .as_mut()
+            .expect("run_iterations called before prepare_batch");
+        let d_initial_weights = self
+            .active_d_initial_weights
+            .as_ref()
+            .expect("no active initial_weights");
+        let d_showdown_p0 = self
+            .active_d_showdown_p0
+            .as_ref()
+            .expect("no active showdown_p0");
+        let d_showdown_p1 = self
+            .active_d_showdown_p1
+            .as_ref()
+            .expect("no active showdown_p1");
+
+        let batch_size = self.active_batch_size;
+        let h = self.num_hands;
+        let n = self.num_nodes;
+        let e = self.num_edges;
+
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
             block_dim: (h as u32, 1, 1),
             shared_mem_bytes: self.shared_mem_bytes,
         };
 
-        // Scalar parameters (same as gpu_solve_hand_parallel)
         let b_i32 = batch_size as i32;
         let n_i32 = n as i32;
         let e_i32 = e as i32;
         let h_i32 = h as i32;
         let max_depth_i32 = self.max_depth as i32;
-        let max_iter_i32 = self.max_iterations as i32;
+        let start_iter_i32 = start as i32;
+        let end_iter_i32 = end as i32;
         let num_folds_i32 = self.num_folds as i32;
         let num_showdowns_i32 = self.num_showdowns as i32;
-        let num_leaves_i32 = 0i32;
+        let num_leaves_i32 = self.num_leaves as i32;
         let num_hands_p0_i32 = self.num_hands_p0 as i32;
         let num_hands_p1_i32 = self.num_hands_p1 as i32;
 
-        // Launch kernel - IDENTICAL arg order to gpu_solve_hand_parallel
         unsafe {
             let mut builder = self.stream.launch_builder(&self.kernel.cfr_solve);
             builder.arg(&mut state.regrets);
@@ -306,8 +394,8 @@ impl GpuBatchSolver {
             builder.arg(&self.d_fold_payoffs_p1);
             builder.arg(&self.d_fold_depths);
             builder.arg(&self.d_showdown_node_ids);
-            builder.arg(&d_showdown_outcomes_p0);
-            builder.arg(&d_showdown_outcomes_p1);
+            builder.arg(d_showdown_p0);
+            builder.arg(d_showdown_p1);
             builder.arg(&self.d_showdown_num_player);
             builder.arg(&self.d_showdown_depths);
             builder.arg(&self.d_player_card1);
@@ -315,7 +403,7 @@ impl GpuBatchSolver {
             builder.arg(&self.d_opp_card1);
             builder.arg(&self.d_opp_card2);
             builder.arg(&self.d_same_hand_idx);
-            builder.arg(&d_initial_weights);
+            builder.arg(d_initial_weights);
             builder.arg(&self.d_leaf_cfv_p0);
             builder.arg(&self.d_leaf_cfv_p1);
             builder.arg(&self.d_leaf_node_ids);
@@ -325,7 +413,8 @@ impl GpuBatchSolver {
             builder.arg(&e_i32);
             builder.arg(&h_i32);
             builder.arg(&max_depth_i32);
-            builder.arg(&max_iter_i32);
+            builder.arg(&start_iter_i32);
+            builder.arg(&end_iter_i32);
             builder.arg(&num_folds_i32);
             builder.arg(&num_showdowns_i32);
             builder.arg(&num_leaves_i32);
@@ -334,11 +423,59 @@ impl GpuBatchSolver {
             builder.launch(cfg)?;
         }
         self.stream.synchronize()?;
+        Ok(())
+    }
 
-        // Download strategy_sum for all batches
+    /// Download the reach array `[B * N * H]` from GPU to CPU.
+    pub fn download_reach(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let state = self
+            .active_state
+            .as_ref()
+            .expect("download_reach called before prepare_batch");
+        let reach: Vec<f32> = self.stream.clone_dtoh(&state.reach)?;
+        Ok(reach)
+    }
+
+    /// Copy new leaf CFV data into the pre-allocated GPU buffers.
+    ///
+    /// `p0` and `p1` are `[num_leaves * num_hands]` each.
+    pub fn update_leaf_cfvs(
+        &mut self,
+        p0: &[f32],
+        p1: &[f32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let expected = self.num_leaves * self.num_hands;
+        assert_eq!(
+            p0.len(),
+            expected,
+            "p0 len {} != num_leaves*num_hands {}",
+            p0.len(),
+            expected
+        );
+        assert_eq!(
+            p1.len(),
+            expected,
+            "p1 len {} != num_leaves*num_hands {}",
+            p1.len(),
+            expected
+        );
+        self.d_leaf_cfv_p0 = self.stream.clone_htod(p0)?;
+        self.d_leaf_cfv_p1 = self.stream.clone_htod(p1)?;
+        Ok(())
+    }
+
+    /// Download strategy_sum and split per subgame.
+    pub fn extract_results(&self) -> Result<Vec<SubgameResult>, Box<dyn std::error::Error>> {
+        let state = self
+            .active_state
+            .as_ref()
+            .expect("extract_results called before prepare_batch");
+        let e = self.num_edges;
+        let h = self.num_hands;
+        let batch_size = self.active_batch_size;
+
         let strategy_sum_all: Vec<f32> = self.stream.clone_dtoh(&state.strategy_sum)?;
 
-        // Split per subgame
         let eh = e * h;
         let results = (0..batch_size)
             .map(|b| {
@@ -822,4 +959,142 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn incremental_matches_batch() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        // Baseline: single solve_batch call with 150 iterations
+        let mut solver1 = GpuBatchSolver::new(&topo, &term, 4, num_hands, 150).unwrap();
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        let baseline = solver1.solve_batch(&[spec.clone()]).unwrap();
+
+        // Incremental: prepare + 3 chunks of 50 iterations
+        let mut solver2 = GpuBatchSolver::new(&topo, &term, 4, num_hands, 150).unwrap();
+        solver2.prepare_batch(&[spec]).unwrap();
+        solver2.run_iterations(0, 50).unwrap();
+        solver2.run_iterations(50, 100).unwrap();
+        solver2.run_iterations(100, 150).unwrap();
+        let incremental = solver2.extract_results().unwrap();
+
+        assert_eq!(baseline.len(), incremental.len());
+        assert_eq!(baseline[0].strategy_sum.len(), incremental[0].strategy_sum.len());
+
+        // strategy_sum must match within 1e-4
+        for (i, (b, inc)) in baseline[0]
+            .strategy_sum
+            .iter()
+            .zip(incremental[0].strategy_sum.iter())
+            .enumerate()
+        {
+            let diff = (b - inc).abs();
+            assert!(
+                diff < 1e-4,
+                "strategy_sum[{i}] mismatch: baseline={b} incremental={inc} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_leaf_injection_incremental() {
+        use super::*;
+        use crate::extract::{extract_terminal_data, extract_topology, NodeType};
+
+        // Use a river game and pick some internal nodes as "leaf injection" targets
+        // to verify the machinery works end-to-end.
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        // Find some non-root, non-terminal nodes to use as fake leaf injection points
+        let mut leaf_nodes = Vec::new();
+        for nid in 1..topo.num_nodes {
+            if topo.node_num_actions[nid] > 0 {
+                if let NodeType::Player { .. } = topo.node_type[nid] {
+                    leaf_nodes.push(nid);
+                    if leaf_nodes.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            !leaf_nodes.is_empty(),
+            "need at least one internal node for leaf injection test"
+        );
+        let leaf_node_ids: Vec<i32> = leaf_nodes.iter().map(|&n| n as i32).collect();
+        let leaf_depths: Vec<i32> = leaf_nodes
+            .iter()
+            .map(|&n| topo.node_depth[n] as i32)
+            .collect();
+        let num_leaves = leaf_node_ids.len();
+
+        let mut solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths);
+
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        solver.prepare_batch(&[spec]).unwrap();
+
+        // Run 50 iters with zero leaf CFVs
+        solver.run_iterations(0, 50).unwrap();
+
+        // Update leaf CFVs with non-zero dummy values
+        let leaf_cfv_size = num_leaves * num_hands;
+        let p0_cfvs = vec![1.0f32; leaf_cfv_size];
+        let p1_cfvs = vec![1.0f32; leaf_cfv_size];
+        solver.update_leaf_cfvs(&p0_cfvs, &p1_cfvs).unwrap();
+
+        // Run 50 more
+        solver.run_iterations(50, 100).unwrap();
+
+        let results = solver.extract_results().unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].strategy_sum.is_empty());
+        // All values should be finite
+        for (i, &v) in results[0].strategy_sum.iter().enumerate() {
+            assert!(v.is_finite(), "strategy_sum[{i}] is not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn set_leaf_injection_allocates_buffers() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        let mut solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+
+        let leaf_node_ids = vec![1i32, 2];
+        let leaf_depths = vec![1i32, 1];
+        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths);
+
+        assert_eq!(solver.num_leaves, 2);
+    }
+
+    #[test]
+    fn download_reach_has_correct_size() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        let mut solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 50).unwrap();
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+
+        solver.prepare_batch(&[spec]).unwrap();
+        solver.run_iterations(0, 50).unwrap();
+
+        let reach = solver.download_reach().unwrap();
+        // B=1, N=num_nodes, H=num_hands
+        assert_eq!(reach.len(), 1 * topo.num_nodes * num_hands);
+    }
+
 }
