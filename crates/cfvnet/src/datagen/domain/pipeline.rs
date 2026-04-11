@@ -528,33 +528,8 @@ impl DomainPipeline {
             let num_hands = game.inner().private_cards(0).len()
                 .max(game.inner().private_cards(1).len());
 
-            // CUDA blocks have max 1024 threads; fall back to CPU for large ranges.
-            if num_hands > 1024 {
-                let solver_config = super::solver::SolverConfig {
-                    max_iterations,
-                    target_exploitability: config.datagen.target_exploitability,
-                    leaf_eval_interval,
-                };
-                // CPU fallback uses exact mode (full solve through river).
-                let mut solver_obj =
-                    super::solver::Solver::new(game, &solver_config, SolveStrategy::Exact);
-                let solved = loop {
-                    match solver_obj.step() {
-                        None => continue,
-                        Some(sg) => break sg,
-                    }
-                };
-                let records = solved.extract_records();
-                let mut w = writer.lock().unwrap();
-                if let Err(e) = w.write(&records) {
-                    return Err(e);
-                }
-                drop(w);
-                pb.inc(1);
-                continue;
-            }
-
             // Create GPU solver for the turn subtree topology.
+            // The kernel uses a stride loop to handle num_hands > 1024.
             let mut solver = GpuBatchSolver::new(
                 turn_topo,
                 &turn_term,

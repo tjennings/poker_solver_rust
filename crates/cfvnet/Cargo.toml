@@ -19,7 +19,7 @@ thiserror = { workspace = true }
 burn = { version = "0.16", features = ["train", "wgpu", "ndarray"] }
 burn-cuda = { version = "0.16", optional = true }
 gpu-range-solver = { path = "../gpu-range-solver", optional = true }
-ort = { version = "=2.0.0-rc.9", optional = true, default-features = false, features = ["ndarray", "half", "copy-dylibs"] }
+ort = { version = "=2.0.0-rc.9", optional = true, default-features = false, features = ["ndarray", "half", "copy-dylibs", "download-binaries"] }
 half = "2"
 
 [features]
