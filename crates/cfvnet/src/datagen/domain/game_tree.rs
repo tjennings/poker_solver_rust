@@ -190,6 +190,45 @@ pub fn build_turn_game_exact(
     build_turn_game_inner(board_u8, pot, effective_stack, ranges, bet_sizes, true)
 }
 
+/// Build a canonical (maximum-SPR) turn tree for batched datagen.
+///
+/// Uses a fixed non-conflicting board, `pot=100`, `effective_stack=10_000`
+/// (SPR=100, so no bet size collapses to all-in), and uniform ranges across
+/// all non-board-conflicting hand pairs. The resulting `PostFlopGame` has a
+/// depth-limited tree (boundary nodes at the river transition) whose
+/// topology is structurally identical to what every turn situation with the
+/// same bet sizes would produce at sufficiently deep effective stack.
+///
+/// The canonical game is intended for one-shot topology extraction; per-game
+/// data (pot-scaled fold payoffs, initial weights with board blockers, etc.)
+/// is supplied through `SubgameSpec` at `prepare_batch` time.
+///
+/// Returns `None` if the canonical tree fails to build (e.g. empty bet sizes).
+pub fn build_canonical_turn_tree(bet_sizes: &[Vec<f64>]) -> Option<PostFlopGame> {
+    // Arbitrary non-conflicting board. Card ids: 0=2c, 4=3c, 8=4c, 12=5c.
+    let board: [u8; 4] = [0, 4, 8, 12];
+    let pot = 100.0_f64;
+    let effective_stack = 10_000.0_f64; // SPR=100
+
+    // Uniform ranges over every non-board-conflicting hand pair.
+    let mut ranges = [[0.0_f32; NUM_COMBOS]; 2];
+    let board_mask: u64 =
+        (1u64 << board[0]) | (1u64 << board[1]) | (1u64 << board[2]) | (1u64 << board[3]);
+    for c0 in 0u8..52 {
+        for c1 in (c0 + 1)..52 {
+            let hand_mask = (1u64 << c0) | (1u64 << c1);
+            if hand_mask & board_mask != 0 {
+                continue;
+            }
+            let idx = range_solver::card::card_pair_to_index(c0, c1);
+            ranges[0][idx] = 1.0;
+            ranges[1][idx] = 1.0;
+        }
+    }
+
+    build_turn_game(&board, pot, effective_stack, &ranges, bet_sizes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
