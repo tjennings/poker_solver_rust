@@ -21,6 +21,23 @@ pub trait BoundaryEvaluator: Send + Sync {
     }
 }
 
+/// Boundary evaluator that returns zero CFVs. Used as a placeholder when the
+/// GPU pipeline handles boundary evaluation externally (via GpuBoundaryEvaluator).
+pub struct ZeroBoundaryEvaluator;
+impl BoundaryEvaluator for ZeroBoundaryEvaluator {
+    fn evaluate(&self, game: &Game) -> Vec<BoundaryCfvs> {
+        (0..game.num_boundaries())
+            .flat_map(|ord| {
+                (0..2).map(move |player| BoundaryCfvs {
+                    ordinal: ord,
+                    player,
+                    cfvs: vec![0.0; game.num_private_hands(player)],
+                })
+            })
+            .collect()
+    }
+}
+
 /// Strategy for solving a game tree.
 #[derive(Clone)]
 pub enum SolveStrategy {

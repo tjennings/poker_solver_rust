@@ -444,7 +444,7 @@ impl DomainPipeline {
     /// Requires `river_model_path` in config -- there is no zero-CFV fallback.
     #[cfg(feature = "gpu-turn-datagen")]
     fn run_gpu_turn(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
-        use gpu_range_solver::extract::{decompose_at_chance, extract_topology};
+        use gpu_range_solver::extract::extract_topology;
         use gpu_range_solver::{compute_evs_from_strategy_sum, GpuBatchSolver, SubgameSpec};
         use range_solver::card::card_pair_to_index;
 
@@ -479,11 +479,18 @@ impl DomainPipeline {
         )
         .with_range_source(range_source);
 
-        // Build full turn+river trees (exact=true) so chance nodes are present.
-        // decompose_at_chance splits the tree and turns chance nodes into leaf nodes
-        // where we inject boundary CFVs.
-        let builder = GameBuilder::new(bet_sizes, &SolveStrategy::Exact)
-            .with_fuzz(config.datagen.bet_size_fuzz);
+        // Build depth-limited turn trees (exact=false, depth_limit=0).
+        // The tree stops at the river boundary — no river actions are expanded.
+        // Boundary terminals appear as NodeType::Showdown with zero outcomes;
+        // the CUDA kernel's leaf injection overwrites CFVs at these nodes.
+        // A dummy DepthLimited evaluator is needed to set exact=false in GameBuilder.
+        let dummy_eval: std::sync::Arc<dyn super::evaluator::BoundaryEvaluator> =
+            std::sync::Arc::new(super::evaluator::ZeroBoundaryEvaluator);
+        let builder = GameBuilder::new(
+            bet_sizes,
+            &SolveStrategy::DepthLimited { evaluator: dummy_eval },
+        )
+        .with_fuzz(config.datagen.bet_size_fuzz);
 
         let writer = std::sync::Arc::new(std::sync::Mutex::new(
             super::writer::RecordWriter::create(output_path, config.datagen.per_file)?,
@@ -509,29 +516,26 @@ impl DomainPipeline {
                 }
             };
 
-            // Extract full topology (includes chance nodes), then decompose.
-            let full_topo = extract_topology(game.inner());
-            if full_topo.chance_nodes.is_empty() {
-                // No chance nodes (degenerate tree) -- skip.
+            // Extract topology from the depth-limited tree.
+            // In a turn-only tree, showdown_nodes ARE the boundary nodes
+            // (no real showdowns exist without a river).
+            let topo = extract_topology(game.inner());
+            if topo.showdown_nodes.is_empty() {
                 pb.inc(1);
                 continue;
             }
 
-            let decomp = decompose_at_chance(&full_topo);
-            let turn_topo = &decomp.turn_topo;
-            // Build terminal data excluding chance-node-leaves (which are classified as
-            // Showdown in the turn topo but are actually leaf injection points).
+            let boundary_node_ids: Vec<usize> = topo.showdown_nodes.clone();
             let turn_term = Self::build_turn_terminal_data(
-                game.inner(), turn_topo, &decomp.turn_leaf_node_ids,
+                game.inner(), &topo, &boundary_node_ids,
             );
 
             let num_hands = game.inner().private_cards(0).len()
                 .max(game.inner().private_cards(1).len());
 
-            // Create GPU solver for the turn subtree topology.
-            // The kernel uses a stride loop to handle num_hands > 1024.
+            // Create GPU solver. Stride loop handles num_hands > 1024.
             let mut solver = GpuBatchSolver::new(
-                turn_topo,
+                &topo,
                 &turn_term,
                 1,
                 num_hands,
@@ -539,27 +543,19 @@ impl DomainPipeline {
             )
             .map_err(|e| format!("GPU solver init failed: {e}"))?;
 
-            // Set leaf injection at boundary nodes (where chance nodes were).
-            let leaf_node_ids: Vec<i32> = decomp
-                .turn_leaf_node_ids
-                .iter()
-                .map(|&id| id as i32)
-                .collect();
-            let leaf_depths: Vec<i32> = decomp
-                .turn_leaf_node_ids
-                .iter()
-                .map(|&id| turn_topo.node_depth[id] as i32)
-                .collect();
+            // Set leaf injection at boundary nodes (showdown_nodes in depth-limited tree).
+            let leaf_ids_i32: Vec<i32> = boundary_node_ids.iter().map(|&id| id as i32).collect();
+            let leaf_depths: Vec<i32> = boundary_node_ids.iter()
+                .map(|&id| topo.node_depth[id] as i32).collect();
             solver
-                .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+                .set_leaf_injection(&leaf_ids_i32, &leaf_depths)
                 .map_err(|e| format!("set_leaf_injection failed: {e}"))?;
 
-            let spec = SubgameSpec::from_game(game.inner(), turn_topo, &turn_term, num_hands);
+            let spec = SubgameSpec::from_game(game.inner(), &topo, &turn_term, num_hands);
             solver
                 .prepare_batch(&[spec.clone()])
                 .map_err(|e| format!("prepare_batch failed: {e}"))?;
 
-            let boundary_node_ids = &decomp.turn_leaf_node_ids;
             let hand_cards: Vec<(u8, u8)> = game.inner().private_cards(0).to_vec();
             let board_4: [u8; 4] = [
                 sit.board[0],
@@ -568,14 +564,13 @@ impl DomainPipeline {
                 sit.board[3],
             ];
 
-            // Initial boundary eval: strategy_sum is zeros -> uniform strategy ->
-            // initial_weights propagated through uniform play.
-            let initial_ss = vec![0.0f32; turn_topo.num_edges * num_hands];
+            // Initial boundary eval: strategy_sum is zeros -> uniform strategy.
+            let initial_ss = vec![0.0f32; topo.num_edges * num_hands];
             Self::evaluate_and_upload_boundaries_from_reach(
-                &evaluator, &mut solver, turn_topo, &initial_ss,
+                &evaluator, &mut solver, &topo, &initial_ss,
                 &spec.initial_weights, num_hands, &board_4,
                 sit.pot as f32, sit.effective_stack as f32,
-                &hand_cards, boundary_node_ids,
+                &hand_cards, &boundary_node_ids,
             )?;
 
             // Iterative solving with periodic reach-based boundary re-evaluation.
@@ -589,15 +584,14 @@ impl DomainPipeline {
                 iter = end;
 
                 if iter < max_iterations {
-                    // Download strategy_sum mid-solve for reach computation.
                     let mid_results = solver
                         .extract_results()
                         .map_err(|e| format!("mid-solve extract: {e}"))?;
                     Self::evaluate_and_upload_boundaries_from_reach(
-                        &evaluator, &mut solver, turn_topo, &mid_results[0].strategy_sum,
+                        &evaluator, &mut solver, &topo, &mid_results[0].strategy_sum,
                         &spec.initial_weights, num_hands, &board_4,
                         sit.pot as f32, sit.effective_stack as f32,
-                        &hand_cards, boundary_node_ids,
+                        &hand_cards, &boundary_node_ids,
                     )?;
                 }
             }
@@ -608,7 +602,7 @@ impl DomainPipeline {
                 .map_err(|e| format!("extract_results failed: {e}"))?;
 
             let evs = compute_evs_from_strategy_sum(
-                turn_topo,
+                &topo,
                 &turn_term,
                 &results[0].strategy_sum,
                 &spec.initial_weights,
