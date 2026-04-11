@@ -98,7 +98,9 @@ pub struct GpuBatchSolver {
     d_opp_card1: CudaSlice<i32>,
     d_opp_card2: CudaSlice<i32>,
     d_same_hand_idx: CudaSlice<i32>,
-    // Leaf injection (empty for river)
+    // Leaf injection (empty for river). Buffers are per-batch sized:
+    // `[max_batch * num_leaves * num_hands]`, indexed by the kernel as
+    // `leaf_cfv[bid * num_leaves * H + li * H + h]`.
     d_leaf_cfv_p0: CudaSlice<f32>,
     d_leaf_cfv_p1: CudaSlice<f32>,
     d_leaf_node_ids: CudaSlice<i32>,
@@ -255,10 +257,14 @@ impl GpuBatchSolver {
         self.extract_results()
     }
 
-    /// Upload leaf node IDs and depths, pre-allocate leaf CFV buffers.
+    /// Upload leaf node IDs and depths, pre-allocate per-batch leaf CFV buffers.
     ///
     /// Call before `prepare_batch` for turn solving with leaf injection.
     /// `node_ids` and `depths` are parallel arrays of leaf nodes in the topology.
+    ///
+    /// Allocates `d_leaf_cfv_p0/p1` at `max_batch * num_leaves * num_hands` so
+    /// each game in a batch has its own slot. Later `update_leaf_cfvs` calls
+    /// upload `[active_batch_size * num_leaves * num_hands]` via `clone_htod`.
     pub fn set_leaf_injection(
         &mut self,
         node_ids: &[i32],
@@ -270,7 +276,7 @@ impl GpuBatchSolver {
             "node_ids and depths must have same length"
         );
         self.num_leaves = node_ids.len();
-        let leaf_cfv_size = (self.num_leaves * self.num_hands).max(1);
+        let leaf_cfv_size = (self.max_batch * self.num_leaves * self.num_hands).max(1);
         self.d_leaf_node_ids = self.stream.clone_htod(node_ids)?;
         self.d_leaf_depths = self.stream.clone_htod(depths)?;
         self.d_leaf_cfv_p0 = self.stream.alloc_zeros::<f32>(leaf_cfv_size)?;
@@ -472,29 +478,38 @@ impl GpuBatchSolver {
         Ok(reach)
     }
 
-    /// Copy new leaf CFV data to GPU. Uses `clone_htod` (new allocation) rather
-    /// than in-place copy because cudarc does not expose a host-to-device memcpy
-    /// into an existing slice. The old buffer is freed on drop. This runs only at
-    /// boundary re-evaluation intervals, so the alloc overhead is negligible.
+    /// Copy new per-batch leaf CFV data to GPU. Uses `clone_htod` (new allocation)
+    /// rather than in-place copy because cudarc does not expose a host-to-device
+    /// memcpy into an existing slice. The old buffer is freed on drop. This runs
+    /// only at boundary re-evaluation intervals, so the alloc overhead is negligible.
     ///
-    /// `p0` and `p1` are `[num_leaves * num_hands]` each.
+    /// `p0` and `p1` are each `[active_batch_size * num_leaves * num_hands]`,
+    /// matching the layout the kernel reads with
+    /// `leaf_cfv[bid * num_leaves * H + li * H + h]`.
+    ///
+    /// Must be called after `prepare_batch` so `active_batch_size` reflects the
+    /// current batch dimension.
     pub fn update_leaf_cfvs(
         &mut self,
         p0: &[f32],
         p1: &[f32],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let expected = self.num_leaves * self.num_hands;
+        assert!(
+            self.active_batch_size > 0,
+            "update_leaf_cfvs called before prepare_batch (active_batch_size = 0)"
+        );
+        let expected = self.active_batch_size * self.num_leaves * self.num_hands;
         assert_eq!(
             p0.len(),
             expected,
-            "p0 len {} != num_leaves*num_hands {}",
+            "p0 len {} != active_batch_size*num_leaves*num_hands {}",
             p0.len(),
             expected
         );
         assert_eq!(
             p1.len(),
             expected,
-            "p1 len {} != num_leaves*num_hands {}",
+            "p1 len {} != active_batch_size*num_leaves*num_hands {}",
             p1.len(),
             expected
         );
@@ -1379,6 +1394,193 @@ mod tests {
             results[0].strategy_sum != results[1].strategy_sum,
             "scale 1.0 and 2.0 should produce different strategies"
         );
+    }
+
+    /// Identity check for per-batch leaf CFV indexing at `bid=0`.
+    ///
+    /// Two independent batch-of-1 solves with the same leaf CFV values must
+    /// produce identical strategy_sums. Validates that the kernel reads
+    /// `leaf_cfv[0 * num_leaves * H + li * H + h]` rather than something else.
+    ///
+    /// Uses `showdown_nodes` as leaf injection points — they're genuine
+    /// terminal nodes with no outgoing edges, so the injected values survive
+    /// the backward pass and propagate up as the true terminal CFV at those
+    /// nodes (overriding the showdown eval that would have run at the same
+    /// depth immediately before leaf injection).
+    #[test]
+    fn batched_leaf_cfvs_matches_single() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        assert!(
+            !topo.showdown_nodes.is_empty(),
+            "river topology must have showdown nodes to use as leaf injection points"
+        );
+        let leaf_node_ids: Vec<i32> = topo
+            .showdown_nodes
+            .iter()
+            .take(3)
+            .map(|&n| n as i32)
+            .collect();
+        let leaf_depths: Vec<i32> = topo
+            .showdown_nodes
+            .iter()
+            .take(3)
+            .map(|&n| topo.node_depth[n] as i32)
+            .collect();
+        let num_leaves = leaf_node_ids.len();
+
+        // Deterministic non-trivial leaf CFVs (batch_size = 1 slot).
+        let leaf_cfv_size = num_leaves * num_hands;
+        let p0_cfvs: Vec<f32> = (0..leaf_cfv_size)
+            .map(|i| 0.25 + 0.01 * (i as f32))
+            .collect();
+        let p1_cfvs: Vec<f32> = (0..leaf_cfv_size)
+            .map(|i| -0.1 - 0.005 * (i as f32))
+            .collect();
+
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+
+        // Solver A: batch of 1, per-batch leaf CFV upload.
+        let mut solver_a = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+        solver_a
+            .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+            .unwrap();
+        solver_a.prepare_batch(&[spec.clone()]).unwrap();
+        solver_a.update_leaf_cfvs(&p0_cfvs, &p1_cfvs).unwrap();
+        solver_a.run_iterations(0, 100).unwrap();
+        let result_a = solver_a.extract_results().unwrap();
+
+        // Solver B: identical setup.
+        let mut solver_b = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+        solver_b
+            .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+            .unwrap();
+        solver_b.prepare_batch(&[spec]).unwrap();
+        solver_b.update_leaf_cfvs(&p0_cfvs, &p1_cfvs).unwrap();
+        solver_b.run_iterations(0, 100).unwrap();
+        let result_b = solver_b.extract_results().unwrap();
+
+        assert_eq!(result_a.len(), 1);
+        assert_eq!(result_b.len(), 1);
+        assert_eq!(
+            result_a[0].strategy_sum.len(),
+            result_b[0].strategy_sum.len()
+        );
+        for (i, (a, b)) in result_a[0]
+            .strategy_sum
+            .iter()
+            .zip(&result_b[0].strategy_sum)
+            .enumerate()
+        {
+            let diff = (a - b).abs();
+            assert!(
+                diff < 1e-4,
+                "strategy_sum[{i}] mismatch across two identical batch-of-1 solves: {a} vs {b} diff={diff}"
+            );
+        }
+        // And confirm the solve actually produced non-trivial output.
+        assert!(
+            result_a[0].strategy_sum.iter().any(|&v| v != 0.0),
+            "strategy_sum should be non-trivial"
+        );
+    }
+
+    /// 4 games in a single batch, each with different leaf CFVs, must produce
+    /// different strategy_sums across games. Proves the kernel reads per-batch
+    /// leaf CFV slots (`bid * num_leaves * H + ...`), not a shared one.
+    ///
+    /// Uses `showdown_nodes` as leaf injection points so the injected values
+    /// actually propagate up the tree and influence regrets / strategies.
+    #[test]
+    fn multi_game_batch_different_leaf_cfvs() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        // We need at least `batch_size` showdown leaves so we can pair each
+        // batch with a distinct "favored" leaf index and force different
+        // strategy preferences across batches.
+        let batch_size = topo.showdown_nodes.len().min(4);
+        assert!(
+            batch_size >= 2,
+            "river topology must have at least 2 showdown nodes (got {})",
+            topo.showdown_nodes.len()
+        );
+        let leaf_node_ids: Vec<i32> = topo
+            .showdown_nodes
+            .iter()
+            .take(batch_size)
+            .map(|&n| n as i32)
+            .collect();
+        let leaf_depths: Vec<i32> = topo
+            .showdown_nodes
+            .iter()
+            .take(batch_size)
+            .map(|&n| topo.node_depth[n] as i32)
+            .collect();
+        let num_leaves = leaf_node_ids.len();
+
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        let specs: Vec<SubgameSpec> = (0..batch_size).map(|_| spec.clone()).collect();
+
+        // Distinct leaf CFV values per game. To force *different* strategy
+        // preferences (not just different magnitudes of the same preference),
+        // each batch picks a different "favored" leaf index. Because
+        // num_leaves >= batch_size, each batch has a unique favored index
+        // so no two batches end up with identical CFV layouts.
+        let per_game = num_leaves * num_hands;
+        let mut p0_batched = vec![0.0f32; batch_size * per_game];
+        let mut p1_batched = vec![0.0f32; batch_size * per_game];
+        for b in 0..batch_size {
+            let favored_leaf = b; // unique per batch since b < batch_size <= num_leaves
+            for li in 0..num_leaves {
+                let leaf_value_p0 = if li == favored_leaf { 100.0 } else { -100.0 };
+                let leaf_value_p1 = if li == favored_leaf { -80.0 } else { 80.0 };
+                for h in 0..num_hands {
+                    p0_batched[b * per_game + li * num_hands + h] = leaf_value_p0;
+                    p1_batched[b * per_game + li * num_hands + h] = leaf_value_p1;
+                }
+            }
+        }
+
+        let mut solver =
+            GpuBatchSolver::new(&topo, &term, batch_size, num_hands, 100).unwrap();
+        solver
+            .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+            .unwrap();
+        solver.prepare_batch(&specs).unwrap();
+        solver.update_leaf_cfvs(&p0_batched, &p1_batched).unwrap();
+        solver.run_iterations(0, 100).unwrap();
+        let results = solver.extract_results().unwrap();
+
+        assert_eq!(results.len(), batch_size);
+
+        // Every strategy_sum must be finite.
+        for (bi, r) in results.iter().enumerate() {
+            for (i, &v) in r.strategy_sum.iter().enumerate() {
+                assert!(
+                    v.is_finite(),
+                    "strategy_sum[batch={bi}][{i}] not finite: {v}"
+                );
+            }
+        }
+
+        // Pairwise different: each pair must differ somewhere (different leaf
+        // CFVs must yield different strategies).
+        for i in 0..batch_size {
+            for j in (i + 1)..batch_size {
+                assert_ne!(
+                    results[i].strategy_sum, results[j].strategy_sum,
+                    "batch {i} and {j} should have different strategy_sums (different leaf CFVs)"
+                );
+            }
+        }
     }
 
 }

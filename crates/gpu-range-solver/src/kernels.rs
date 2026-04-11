@@ -343,9 +343,9 @@ extern "C" __global__ void cfr_solve(
     // Initial weights — [B * 2 * H]
     const float* initial_weights,
 
-    // Leaf value injection (for two-pass turn solve)
-    const float* leaf_cfv_p0,     // [num_leaves * H]
-    const float* leaf_cfv_p1,     // [num_leaves * H]
+    // Leaf value injection (for two-pass turn solve) — per-batch: [B * num_leaves * H]
+    const float* leaf_cfv_p0,     // [B * num_leaves * H]
+    const float* leaf_cfv_p1,     // [B * num_leaves * H]
     const int* leaf_node_ids,     // [num_leaves]
     const int* leaf_depths,       // [num_leaves]
 
@@ -552,13 +552,13 @@ extern "C" __global__ void cfr_solve(
                     }
                 }
 
-                // --- Leaf value injection ---
+                // --- Leaf value injection (per-batch: leaf_cfv is [B * num_leaves * H]) ---
                 for (int li = 0; li < num_leaves; li++) {
                     if (leaf_depths[li] != depth) continue;
                     int node_id = leaf_node_ids[li];
                     const float* leaf_cfv = (player == 0) ? leaf_cfv_p0 : leaf_cfv_p1;
                     for (int h = tid; h < player_num_hands[player]; h += blockDim.x) {
-                        cfv[bid * NH + node_id * H + h] = leaf_cfv[li * H + h];
+                        cfv[bid * NH + node_id * H + h] = leaf_cfv[bid * num_leaves * H + li * H + h];
                     }
                 }
 
@@ -692,9 +692,9 @@ extern "C" __global__ void cfr_solve(
     const int* same_hand_idx,
     // Initial weights — [B * 2 * H]: per-batch [p0_weights..., p1_weights...]
     const float* initial_weights,
-    // Leaf value injection — pre-computed CFVs at leaf nodes (for two-pass turn solve)
-    const float* leaf_cfv_p0,     // [num_leaves * H]
-    const float* leaf_cfv_p1,     // [num_leaves * H]
+    // Leaf value injection — pre-computed CFVs at leaf nodes (per-batch: [B * num_leaves * H])
+    const float* leaf_cfv_p0,     // [B * num_leaves * H]
+    const float* leaf_cfv_p1,     // [B * num_leaves * H]
     const int* leaf_node_ids,     // [num_leaves]
     const int* leaf_depths,       // [num_leaves]
     // Scalar dimensions
@@ -888,7 +888,7 @@ extern "C" __global__ void cfr_solve(
                 }
                 grid.sync();
 
-                // --- Leaf value injection (pre-computed CFVs for two-pass solve) ---
+                // --- Leaf value injection (per-batch: leaf_cfv is [B * num_leaves * H]) ---
                 for (int li = 0; li < num_leaves; li++) {
                     if (leaf_depths[li] != depth) continue;
                     int node_id = leaf_node_ids[li];
@@ -898,7 +898,7 @@ extern "C" __global__ void cfr_solve(
                     for (int i = tid; i < total; i += stride) {
                         int b = i / num_ph;
                         int h = i % num_ph;
-                        cfv[b * NH + node_id * H + h] = leaf_cfv[li * H + h];
+                        cfv[b * NH + node_id * H + h] = leaf_cfv[b * num_leaves * H + li * H + h];
                     }
                 }
                 if (num_leaves > 0) grid.sync();
