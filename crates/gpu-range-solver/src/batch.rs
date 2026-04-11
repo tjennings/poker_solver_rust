@@ -10,7 +10,7 @@ use crate::solver::{build_mega_terminal_data, build_sorted_topology, upload_or_d
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
-/// Per-subgame input: initial weights and showdown outcome matrices.
+/// Per-subgame input: initial weights, showdown outcome matrices, and fold payoffs.
 #[derive(Clone)]
 pub struct SubgameSpec {
     /// Per-player initial weights, length `num_hands` each.
@@ -19,6 +19,10 @@ pub struct SubgameSpec {
     pub showdown_outcomes_p0: Vec<f32>,
     /// Pre-scaled showdown outcomes for player 1 traversal: `[num_showdowns * H * H]`.
     pub showdown_outcomes_p1: Vec<f32>,
+    /// Per-game fold payoffs for P0 traversal: `[num_folds]`.
+    pub fold_payoffs_p0: Vec<f32>,
+    /// Per-game fold payoffs for P1 traversal: `[num_folds]`.
+    pub fold_payoffs_p1: Vec<f32>,
 }
 
 impl SubgameSpec {
@@ -54,6 +58,8 @@ impl SubgameSpec {
             initial_weights,
             showdown_outcomes_p0: mtd.showdown_outcomes_p0,
             showdown_outcomes_p1: mtd.showdown_outcomes_p1,
+            fold_payoffs_p0: mtd.fold_payoffs_p0,
+            fold_payoffs_p1: mtd.fold_payoffs_p1,
         }
     }
 }
@@ -114,6 +120,8 @@ pub struct GpuBatchSolver {
     active_d_initial_weights: Option<CudaSlice<f32>>,
     active_d_showdown_p0: Option<CudaSlice<f32>>,
     active_d_showdown_p1: Option<CudaSlice<f32>>,
+    active_d_fold_payoffs_p0: Option<CudaSlice<f32>>,
+    active_d_fold_payoffs_p1: Option<CudaSlice<f32>>,
     active_batch_size: usize,
     /// Number of leaf nodes for leaf injection (0 for river).
     pub num_leaves: usize,
@@ -224,6 +232,8 @@ impl GpuBatchSolver {
             active_d_initial_weights: None,
             active_d_showdown_p0: None,
             active_d_showdown_p1: None,
+            active_d_fold_payoffs_p0: None,
+            active_d_fold_payoffs_p1: None,
             active_batch_size: 0,
             num_leaves: 0,
         })
@@ -319,10 +329,28 @@ impl GpuBatchSolver {
         let d_showdown_p0 = upload_or_dummy_f32(&self.stream, &batched_sd_p0)?;
         let d_showdown_p1 = upload_or_dummy_f32(&self.stream, &batched_sd_p1)?;
 
+        // Build batched fold payoffs: [B * num_folds] for each player
+        let num_folds = self.num_folds;
+        let mut batched_fold_p0 = vec![0.0f32; batch_size * num_folds];
+        let mut batched_fold_p1 = vec![0.0f32; batch_size * num_folds];
+        for (b, spec) in specs.iter().enumerate() {
+            let base = b * num_folds;
+            let src_len = spec.fold_payoffs_p0.len().min(num_folds);
+            batched_fold_p0[base..base + src_len]
+                .copy_from_slice(&spec.fold_payoffs_p0[..src_len]);
+            let src_len = spec.fold_payoffs_p1.len().min(num_folds);
+            batched_fold_p1[base..base + src_len]
+                .copy_from_slice(&spec.fold_payoffs_p1[..src_len]);
+        }
+        let d_fold_p0 = upload_or_dummy_f32(&self.stream, &batched_fold_p0)?;
+        let d_fold_p1 = upload_or_dummy_f32(&self.stream, &batched_fold_p1)?;
+
         self.active_state = Some(state);
         self.active_d_initial_weights = Some(d_initial_weights);
         self.active_d_showdown_p0 = Some(d_showdown_p0);
         self.active_d_showdown_p1 = Some(d_showdown_p1);
+        self.active_d_fold_payoffs_p0 = Some(d_fold_p0);
+        self.active_d_fold_payoffs_p1 = Some(d_fold_p1);
         self.active_batch_size = batch_size;
         Ok(())
     }
@@ -389,9 +417,17 @@ impl GpuBatchSolver {
             builder.arg(&self.d_actions_per_node);
             builder.arg(&self.d_level_starts);
             builder.arg(&self.d_level_counts);
+            let fold_p0 = self
+                .active_d_fold_payoffs_p0
+                .as_ref()
+                .unwrap_or(&self.d_fold_payoffs_p0);
+            let fold_p1 = self
+                .active_d_fold_payoffs_p1
+                .as_ref()
+                .unwrap_or(&self.d_fold_payoffs_p1);
             builder.arg(&self.d_fold_node_ids);
-            builder.arg(&self.d_fold_payoffs_p0);
-            builder.arg(&self.d_fold_payoffs_p1);
+            builder.arg(fold_p0);
+            builder.arg(fold_p1);
             builder.arg(&self.d_fold_depths);
             builder.arg(&self.d_showdown_node_ids);
             builder.arg(d_showdown_p0);
@@ -998,6 +1034,9 @@ mod tests {
         let num_showdowns = topo.showdown_nodes.len();
         assert_eq!(spec.showdown_outcomes_p0.len(), num_showdowns * num_hands * num_hands);
         assert_eq!(spec.showdown_outcomes_p1.len(), num_showdowns * num_hands * num_hands);
+        let num_folds = topo.fold_nodes.len();
+        assert_eq!(spec.fold_payoffs_p0.len(), num_folds);
+        assert_eq!(spec.fold_payoffs_p1.len(), num_folds);
     }
 
     #[test]
@@ -1268,6 +1307,77 @@ mod tests {
         assert!(
             results[0].strategy_sum.iter().any(|&v| v != 0.0),
             "strategy_sum should have non-zero values after solving"
+        );
+    }
+
+    #[test]
+    fn batched_fold_payoffs_matches_single() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+
+        // Path 1: solve_batch (calls prepare_batch internally, per-batch fold payoffs)
+        let mut solver1 = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+        let result1 = solver1.solve_batch(&[spec.clone()]).unwrap();
+
+        // Path 2: prepare_batch + run_iterations + extract_results (explicit per-batch)
+        let mut solver2 = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+        solver2.prepare_batch(&[spec]).unwrap();
+        solver2.run_iterations(0, 100).unwrap();
+        let result2 = solver2.extract_results().unwrap();
+
+        // Strategy sums must match within 1e-4
+        assert_eq!(result1[0].strategy_sum.len(), result2[0].strategy_sum.len());
+        for (i, (a, b)) in result1[0]
+            .strategy_sum
+            .iter()
+            .zip(&result2[0].strategy_sum)
+            .enumerate()
+        {
+            let diff = (a - b).abs();
+            assert!(
+                diff < 1e-4,
+                "strategy_sum[{i}] mismatch: solve_batch={a} vs prepare+run={b} diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_game_batch_different_payoffs() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        let scales = [1.0f32, 2.0, 0.5, 3.0];
+        let mut specs = Vec::new();
+        for &scale in &scales {
+            let mut spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+            // Scale fold payoffs to simulate different pot sizes
+            for v in &mut spec.fold_payoffs_p0 {
+                *v *= scale;
+            }
+            for v in &mut spec.fold_payoffs_p1 {
+                *v *= scale;
+            }
+            specs.push(spec);
+        }
+
+        let mut solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
+        solver.prepare_batch(&specs).unwrap();
+        solver.run_iterations(0, 100).unwrap();
+        let results = solver.extract_results().unwrap();
+
+        assert_eq!(results.len(), 4);
+        // Different payoff scales should produce different strategies
+        assert!(
+            results[0].strategy_sum != results[1].strategy_sum,
+            "scale 1.0 and 2.0 should produce different strategies"
         );
     }
 

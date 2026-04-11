@@ -320,10 +320,10 @@ extern "C" __global__ void cfr_solve(
     const int* level_starts,      // [max_depth+1]
     const int* level_counts,      // [max_depth+1]
 
-    // Terminal node data
+    // Terminal node data — fold (per-batch: B copies of payoffs)
     const int* fold_node_ids,     // [num_folds]
-    const float* fold_payoffs_p0, // [num_folds]
-    const float* fold_payoffs_p1, // [num_folds]
+    const float* fold_payoffs_p0, // [B * num_folds]
+    const float* fold_payoffs_p1, // [B * num_folds]
     const int* fold_depths,       // [num_folds]
 
     // Showdown terminal data
@@ -498,7 +498,9 @@ extern "C" __global__ void cfr_solve(
                 for (int fi = 0; fi < num_folds; fi++) {
                     if (fold_depths[fi] != depth) continue;
                     int node_id = fold_node_ids[fi];
-                    float payoff = (player == 0) ? fold_payoffs_p0[fi] : fold_payoffs_p1[fi];
+                    float payoff = (player == 0)
+                        ? fold_payoffs_p0[bid * num_folds + fi]
+                        : fold_payoffs_p1[bid * num_folds + fi];
 
                     // Phase 1: zero accumulators (cooperative loop for H < 52)
                     for (int i = tid; i < 52; i += blockDim.x) s_card_reach[i] = 0.0f;
@@ -671,10 +673,10 @@ extern "C" __global__ void cfr_solve(
     const float* actions_per_edge, // [E]
     const int* level_starts,      // [max_depth+1]
     const int* level_counts,      // [max_depth+1]
-    // Terminal data — fold
+    // Terminal data — fold (per-batch: B copies of payoffs)
     const int* fold_node_ids,     // [num_folds]
-    const float* fold_payoffs_p0, // [num_folds]
-    const float* fold_payoffs_p1, // [num_folds]
+    const float* fold_payoffs_p0, // [B * num_folds]
+    const float* fold_payoffs_p1, // [B * num_folds]
     const int* fold_depths,       // [num_folds]
     // Terminal data — showdown (per-batch: B copies of outcome matrices)
     const int* showdown_node_ids,     // [num_showdowns]
@@ -822,12 +824,14 @@ extern "C" __global__ void cfr_solve(
                 for (int fi = 0; fi < num_folds; fi++) {
                     if (fold_depths[fi] != depth) continue;
                     int node_id = fold_node_ids[fi];
-                    float payoff = (player == 0) ? fold_payoffs_p0[fi] : fold_payoffs_p1[fi];
 
                     // Per-batch fold eval using registers for card_reach
                     int num_ph_fold = player_num_hands[player];
                     int num_oh_fold = player_num_hands[opp];
                     for (int bi = tid; bi < B; bi += stride) {
+                        float payoff = (player == 0)
+                            ? fold_payoffs_p0[bi * num_folds + fi]
+                            : fold_payoffs_p1[bi * num_folds + fi];
                         float total_r = 0.0f;
                         float card_r[52];
                         for (int c = 0; c < 52; c++) card_r[c] = 0.0f;
