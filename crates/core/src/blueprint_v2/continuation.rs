@@ -122,6 +122,9 @@ pub struct RolloutContext<'a> {
     /// Starting stack per player (in the same units as pot/invested).
     /// Used for all-in calculations in the rollout.
     pub starting_stack: f64,
+    /// Optional counter incremented once per rollout terminal reached.
+    /// Used for hands/sec telemetry. `None` disables the counter (no overhead).
+    pub hand_counter: Option<&'a std::sync::atomic::AtomicU64>,
 }
 
 /// Walk the abstract game tree using a (biased) blueprint strategy with
@@ -175,6 +178,9 @@ fn rollout_inner(
 ) -> f64 {
     match &ctx.abstract_tree.nodes[abstract_node as usize] {
         GameNode::Terminal { kind, .. } => {
+            if let Some(counter) = ctx.hand_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Use carried pot/invested, NOT the abstract tree's stored values.
             let p = ctx.player as usize;
             match kind {
@@ -459,6 +465,7 @@ mod tests {
             player,
             num_rollouts,
             starting_stack: 100.0,
+            hand_counter: None,
         }
     }
 

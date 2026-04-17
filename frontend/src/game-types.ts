@@ -13,6 +13,7 @@ export interface SolveStatus {
   max_iterations: number;
   exploitability: number;
   elapsed_secs: number;
+  rollout_hands_per_sec: number;
   solver_name: string;
   is_complete: boolean;
 }

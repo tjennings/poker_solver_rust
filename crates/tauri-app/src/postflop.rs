@@ -22,7 +22,7 @@ use range_solver::range::Range;
 use range_solver::{PostFlopGame, solve_step, finalize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::exploration::ActionInfo;
@@ -126,6 +126,9 @@ pub struct PostflopProgress {
     pub matrix: Option<PostflopStrategyMatrix>,
     /// Seconds elapsed since solve started.
     pub elapsed_secs: f64,
+    /// Rate of rollout terminals reached per second (averaged over solve lifetime).
+    /// 0.0 when no rollout evaluator is active or solve has not started.
+    pub rollout_hands_per_sec: f32,
     /// Which solver is running (e.g. "range" or "subgame").
     pub solver_name: String,
 }
@@ -369,6 +372,8 @@ pub(crate) struct RolloutLeafEvaluator {
     /// Stack-to-pot ratio at the subgame root, used to scale the unit
     /// game's starting stack so rollout dynamics match the real game.
     root_spr: f64,
+    /// Optional atomic counter for rollout terminals reached (hands/sec telemetry).
+    pub(crate) hand_counter: Option<Arc<AtomicU64>>,
 }
 
 impl RolloutLeafEvaluator {
@@ -399,8 +404,10 @@ impl RolloutLeafEvaluator {
             num_opponent_samples,
             starting_stack,
             root_spr,
+            hand_counter: None,
         }
     }
+
 }
 
 
@@ -459,6 +466,7 @@ impl RolloutLeafEvaluator {
                     player: traverser,
                     num_rollouts: self.num_rollouts,
                     starting_stack: unit_stack,
+                    hand_counter: self.hand_counter.as_deref(),
                 };
 
                 let total: f64 = sampled
@@ -572,6 +580,7 @@ pub fn build_subgame_solver(
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
     neural_boundary_evaluator: Option<Arc<dyn range_solver::game::BoundaryEvaluator>>,
+    hand_counter: Option<Arc<AtomicU64>>,
 ) -> Result<(PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64), String> {
     use range_solver::card::CardConfig;
     use range_solver::{ActionTree, TreeConfig, BoardState};
@@ -702,7 +711,7 @@ pub fn build_subgame_solver(
             let map0 = build_map(0, &combos);
             let map1 = build_map(1, &combos);
 
-            let rollout = RolloutLeafEvaluator::new(
+            let mut rollout = RolloutLeafEvaluator::new(
                 Arc::clone(&ctx.strategy),
                 Arc::new(ctx.abstract_tree.clone()),
                 Arc::clone(&ctx.all_buckets),
@@ -714,6 +723,9 @@ pub fn build_subgame_solver(
                 starting_stack,
                 pot_f,
             );
+            if let Some(ref counter) = hand_counter {
+                rollout.hand_counter = Some(Arc::clone(counter));
+            }
 
             game.boundary_evaluator = Some(Arc::new(
                 crate::game_session::SolveBoundaryEvaluator {
@@ -909,6 +921,10 @@ pub struct PostflopState {
     /// Path to a trained BoundaryNet model directory. When set, the solver
     /// uses a neural boundary evaluator instead of rollout-based evaluation.
     pub boundary_model_path: RwLock<Option<PathBuf>>,
+    /// Total rollout terminals reached across the current solve. Reset when
+    /// `solve_start` is reset. Used for hands/sec telemetry.
+    /// Wrapped in `Arc` so it can be shared with the `RolloutLeafEvaluator`.
+    pub rollout_hands: Arc<AtomicU64>,
 }
 
 impl Default for PostflopState {
@@ -930,6 +946,7 @@ impl Default for PostflopState {
             subgame_node: AtomicU32::new(0),
             cbv_context: RwLock::new(None),
             boundary_model_path: RwLock::new(None),
+            rollout_hands: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1254,6 +1271,7 @@ fn postflop_solve_street_impl(
     state.current_iteration.store(0, Ordering::Relaxed);
     state.solve_complete.store(false, Ordering::Relaxed);
     state.subgame_node.store(0, Ordering::Relaxed);
+    state.rollout_hands.store(0, Ordering::Relaxed);
     *state.solve_start.write() = Some(std::time::Instant::now());
     *state.matrix_snapshot.write() = None;
 
@@ -1351,6 +1369,7 @@ fn solve_depth_limited(
     let shared = Arc::clone(state);
     let board_strings = board;
     let boundary_model = state.boundary_model_path.read().clone();
+    let hand_counter = Arc::clone(&state.rollout_hands);
     std::thread::spawn(move || {
         match build_subgame_solver(
             &board_cards,
@@ -1366,6 +1385,7 @@ fn solve_depth_limited(
             rollout_num_samples,
             rollout_opponent_samples,
             None, // neural boundary evaluator (constructed below if model path set)
+            Some(hand_counter),
         ) {
             Ok((mut game, hands, action_infos, initial_pot, starting_stack)) => {
                 // If a boundary model path is configured, load it and override
@@ -1528,6 +1548,13 @@ pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
         .map(|t| t.elapsed().as_secs_f64())
         .unwrap_or(0.0);
 
+    let rollout_hands = state.rollout_hands.load(Ordering::Relaxed);
+    let rollout_hands_per_sec = if elapsed_secs > 0.0 {
+        (rollout_hands as f64 / elapsed_secs) as f32
+    } else {
+        0.0
+    };
+
     let solver_name = state.solver_name.read().clone();
 
     PostflopProgress {
@@ -1537,6 +1564,7 @@ pub fn postflop_get_progress_core(state: &PostflopState) -> PostflopProgress {
         is_complete,
         matrix,
         elapsed_secs,
+        rollout_hands_per_sec,
         solver_name,
     }
 }
@@ -2207,6 +2235,24 @@ mod tests {
         assert_eq!(progress.max_iterations, 0);
         assert!(!progress.is_complete);
         assert!(progress.matrix.is_none());
+        assert_eq!(progress.rollout_hands_per_sec, 0.0);
+    }
+
+    #[test]
+    fn test_get_progress_resets_rollout_counter() {
+        let state = PostflopState::default();
+        // Simulate a previous solve that accumulated hands.
+        state.rollout_hands.store(1234, std::sync::atomic::Ordering::Relaxed);
+        // Simulate solve start: set start time and reset counter (as postflop_solve_street_impl does).
+        *state.solve_start.write() = Some(std::time::Instant::now());
+        state.rollout_hands.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Simulate some rollout terminals reached.
+        state.rollout_hands.store(500, std::sync::atomic::Ordering::Relaxed);
+        // Ensure a measurable elapsed_secs.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let progress = postflop_get_progress_core(&state);
+        assert!(progress.rollout_hands_per_sec > 0.0,
+            "expected positive hands/sec, got {}", progress.rollout_hands_per_sec);
     }
 
     #[test]
@@ -2451,7 +2497,7 @@ mod tests {
             0,
             None,
             None,
-            None, None, None, None,
+            None, None, None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
 
@@ -2515,7 +2561,7 @@ mod tests {
             0,
             None,
             None,
-            None, None, None, None,
+            None, None, None, None, None,
         );
         assert!(result.is_ok());
 
@@ -2625,7 +2671,7 @@ mod tests {
             Some(5.0),  // rollout_bias_factor
             Some(5),     // rollout_num_samples
             Some(12),    // rollout_opponent_samples
-            None,
+            None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with rollout params failed: {:?}", result.err());
 
@@ -2662,7 +2708,7 @@ mod tests {
             None, // rollout_bias_factor
             None, // rollout_num_samples
             None, // rollout_opponent_samples
-            None,
+            None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with None rollout params failed: {:?}", result.err());
         // Verify the tuple shape: (PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64)
@@ -2727,7 +2773,7 @@ mod tests {
 
         let (mut game, _hands, _actions, _pot, _stack) = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
         ).unwrap();
 
         // 2. Capture the initial (uniform) strategy at root.
@@ -2844,7 +2890,7 @@ mod tests {
 
         let (game, _, _, _, _) = build_subgame_solver(
             &board_cards, &bet_sizes, 80, [150, 150],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
         ).unwrap();
 
         // Build a trivial empty tree with just a terminal.
@@ -2884,7 +2930,7 @@ mod tests {
         // Build the game first to get private_cards for the evaluator.
         let (game_for_cards, _, _, _, _) = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
         ).unwrap();
 
         // Construct a fresh (untrained) BoundaryNet as a stand-in.
@@ -2910,7 +2956,7 @@ mod tests {
         let result = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
             &oop_w, &ip_w, 0, None, None, None, None, None,
-            Some(neural_eval),
+            Some(neural_eval), None,
         );
         assert!(result.is_ok(), "build_subgame_solver with neural evaluator failed: {:?}", result.err());
 
@@ -2937,7 +2983,7 @@ mod tests {
 
         let result = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with None neural eval failed: {:?}", result.err());
     }

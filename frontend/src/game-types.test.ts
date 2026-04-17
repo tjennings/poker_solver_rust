@@ -110,6 +110,7 @@ describe('GameState types', () => {
       max_iterations: 1000,
       exploitability: 0.05,
       elapsed_secs: 2.5,
+      rollout_hands_per_sec: 0,
       solver_name: 'CfvSubgame',
       is_complete: false,
     };

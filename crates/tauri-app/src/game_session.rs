@@ -1433,7 +1433,7 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
             let hero_combo_reach = vec![1.0f64; self.combos.len()];
 
             let boundary_starting_stack = remaining_stack + pot as f64 / 2.0;
-            let eval = RolloutLeafEvaluator::new(
+            let mut eval = RolloutLeafEvaluator::new(
                 rollout.strategy.clone(),
                 rollout.abstract_tree.clone(),
                 rollout.all_buckets.clone(),
@@ -1445,6 +1445,9 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
                 boundary_starting_stack,
                 pot as f64,
             );
+            if let Some(ref counter) = rollout.hand_counter {
+                eval.hand_counter = Some(Arc::clone(counter));
+            }
             let requests = vec![(pot as f64, 0.0, player as u8)];
             let results = eval.evaluate_boundaries(
                 &self.combos, &self.board_cards, &hero_combo_reach, &opp_combo_reach, &requests,
