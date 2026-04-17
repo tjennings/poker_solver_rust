@@ -50,7 +50,7 @@ training:
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000000
   prune_after_iterations: 100000000
-  prune_threshold: -250000
+  prune_threshold: -500
   batch_size: 2000
   dcfr_alpha: 1.5
   dcfr_beta: 0.0
@@ -62,13 +62,13 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/mp_6max_100bb_200bkt"
+  output_dir: "./local_data/blueprints/mp_6max_100bb_200bkt_v2"
 
 tui:
   enabled: true
   refresh_rate_ms: 2000
   telemetry:
-    strategy_delta_interval_seconds: 20
+    strategy_delta_interval_seconds: 120
     sparkline_window: 60
   scenarios:
     # Page 1: Opening ranges
