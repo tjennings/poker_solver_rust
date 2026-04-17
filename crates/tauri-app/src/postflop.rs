@@ -257,7 +257,7 @@ pub struct SubgameSolveResult {
 // ---------------------------------------------------------------------------
 
 /// Parse a 2-char card string (e.g. "Ks") into an `rs_poker` Card.
-pub(crate) fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
+pub fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
     if s.len() != 2 {
         return Err(format!("Invalid card string: {s}"));
     }
@@ -357,7 +357,7 @@ fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
 /// For each hero combo, samples opponent hands weighted by reach probabilities,
 /// performs fixed-strategy rollouts from the boundary node, and averages the
 /// results.  Returns per-combo CFVs in pot-fraction units.
-pub(crate) struct RolloutLeafEvaluator {
+pub struct RolloutLeafEvaluator {
     pub(crate) strategy: Arc<BlueprintV2Strategy>,
     pub(crate) abstract_tree: Arc<GameTree>,
     pub(crate) all_buckets: Arc<AllBuckets>,
@@ -415,7 +415,7 @@ impl RolloutLeafEvaluator {
     /// Compute rollout chip values per combo, passing the subgame's actual
     /// pot and invested amounts through the abstract tree traversal.
     #[allow(clippy::too_many_arguments)]
-    fn rollout_chip_values_with_state(
+    pub fn rollout_chip_values_with_state(
         &self,
         combos: &[[RsPokerCard; 2]],
         board: &[RsPokerCard],
@@ -752,6 +752,105 @@ pub fn build_subgame_solver(
     eprintln!("[subgame] initial reach: OOP={nonzero_oop} IP={nonzero_ip} combos with nonzero reach");
 
     Ok((game, hands, action_infos, pot_f, starting_stack))
+}
+
+// ---------------------------------------------------------------------------
+// Rollout bench helper
+// ---------------------------------------------------------------------------
+
+/// Everything needed to drive rollout evaluation in a benchmark loop,
+/// without constructing a full DCFR subgame solver.
+pub struct RolloutBenchContext {
+    /// The rollout evaluator (with hand_counter already wired).
+    pub evaluator: RolloutLeafEvaluator,
+    /// All non-board card pairs in canonical order.
+    pub combos: Vec<[RsPokerCard; 2]>,
+    /// The flop/turn/river board cards.
+    pub board: Vec<RsPokerCard>,
+    /// Per-combo OOP range weights (0.0 for blocked/out-of-range combos).
+    pub oop_range: Vec<f64>,
+    /// Per-combo IP range weights (0.0 for blocked/out-of-range combos).
+    pub ip_range: Vec<f64>,
+}
+
+/// Build a standalone rollout evaluator for bench/test use.
+///
+/// Constructs a [`RolloutLeafEvaluator`] and the combo/range data it needs,
+/// without building a full DCFR subgame solver.  The caller drives the
+/// evaluator directly via [`RolloutLeafEvaluator::rollout_chip_values_with_state`].
+///
+/// `oop_range` and `ip_range` are optional; when `None`, uniform weights (1.0)
+/// are assigned to all unblocked combos.
+#[allow(clippy::too_many_arguments)]
+pub fn build_rollout_evaluator(
+    board_cards: &[RsPokerCard],
+    ctx: &CbvContext,
+    abstract_node: u32,
+    pot: f64,
+    starting_stack: f64,
+    hand_counter: Option<Arc<AtomicU64>>,
+    oop_range: Option<&Range>,
+    ip_range: Option<&Range>,
+) -> RolloutBenchContext {
+    use poker_solver_core::hands::all_hands;
+
+    // Build combos: all non-board card pairs in canonical order.
+    let mut combos: Vec<[RsPokerCard; 2]> = Vec::new();
+    for hand in all_hands() {
+        for (c0, c1) in hand.combos() {
+            if board_cards.iter().any(|b| *b == c0 || *b == c1) {
+                continue;
+            }
+            combos.push([c0, c1]);
+        }
+    }
+
+    // Map ranges to per-combo weights.  When a range is provided, look up
+    // each combo's weight via card_pair_to_index; otherwise default to 1.0.
+    let map_range = |range_opt: Option<&Range>, combos: &[[RsPokerCard; 2]]| -> Vec<f64> {
+        match range_opt {
+            Some(range) => {
+                let raw = range.raw_data();
+                combos.iter().map(|combo| {
+                    let id0 = rs_poker_card_to_id(combo[0]);
+                    let id1 = rs_poker_card_to_id(combo[1]);
+                    let idx = card_pair_to_index(id0, id1);
+                    raw[idx] as f64
+                }).collect()
+            }
+            None => vec![1.0_f64; combos.len()],
+        }
+    };
+    let oop_weights = map_range(oop_range, &combos);
+    let ip_weights = map_range(ip_range, &combos);
+
+    let bias_factor = 10.0;
+    let num_rollouts = 3;
+    let opp_samples = 8;
+
+    let mut evaluator = RolloutLeafEvaluator::new(
+        Arc::clone(&ctx.strategy),
+        Arc::new(ctx.abstract_tree.clone()),
+        Arc::clone(&ctx.all_buckets),
+        abstract_node,
+        BiasType::Unbiased,
+        bias_factor,
+        num_rollouts,
+        opp_samples,
+        starting_stack,
+        pot,
+    );
+    if let Some(counter) = hand_counter {
+        evaluator.hand_counter = Some(counter);
+    }
+
+    RolloutBenchContext {
+        evaluator,
+        combos,
+        board: board_cards.to_vec(),
+        oop_range: oop_weights,
+        ip_range: ip_weights,
+    }
 }
 
 // ---------------------------------------------------------------------------

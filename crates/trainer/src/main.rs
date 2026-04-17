@@ -6,6 +6,7 @@ mod blueprint_tui_metrics;
 mod blueprint_tui_resolve;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
+mod bench_rollout;
 mod inspect_spot;
 mod mp_tui;
 mod mp_tui_scenarios;
@@ -268,6 +269,31 @@ enum Commands {
         /// Spot encoding string (e.g. "sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb")
         #[arg(long)]
         spot: String,
+    },
+    /// Benchmark rollout throughput: drives the rollout evaluator directly
+    /// (does not run DCFR). Reports hands/sec.
+    /// Requires a bundle with buckets/ and strategy.bin.
+    BenchRollout {
+        /// Path to blueprint bundle directory (must contain config.yaml,
+        /// strategy.bin or snapshot_*/strategy.bin, and buckets/)
+        #[arg(short, long)]
+        bundle: PathBuf,
+
+        /// Wall-time duration in seconds
+        #[arg(long, default_value = "10")]
+        duration_secs: u64,
+
+        /// Flop board cards (e.g. "Ks7h2c"). Default: Ks7h2c.
+        #[arg(long, default_value = "Ks7h2c")]
+        board: String,
+
+        /// Starting pot size (chips)
+        #[arg(long, default_value = "100")]
+        pot: u32,
+
+        /// Starting stack per player (chips)
+        #[arg(long, default_value = "200")]
+        stacks: u32,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1143,6 +1169,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::InspectSpot { config, spot } => {
             inspect_spot::run(&config, &spot)
+                .map_err(|e| -> Box<dyn Error> { e.into() })?;
+        }
+        Commands::BenchRollout {
+            bundle,
+            duration_secs,
+            board,
+            pot,
+            stacks,
+        } => {
+            bench_rollout::run(&bundle, duration_secs, &board, pot, stacks)
                 .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
         Commands::RebelSeed { config } => {
