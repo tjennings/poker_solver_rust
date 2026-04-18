@@ -1,5 +1,9 @@
 # Subgame Rollout Perf + Hands/Sec Telemetry — Implementation Plan
 
+> **Status: superseded (2026-04-18).** Pivoted to depth-gated MCCFR sampling after ml-researcher
+> findings — the original plan's per-hand allocation fixes would yield ~5-10x while the sampling
+> pivot yielded 164x. See `2026-04-18-subgame-rollout-sampling-impl.md`.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use hex:executing-plans to implement this plan task-by-task.
 
 **Goal:** Close the rollout-throughput gap to MCCFR's ~100k hands/sec and add live hands/sec telemetry to the Tauri progress bar.

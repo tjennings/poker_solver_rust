@@ -278,6 +278,29 @@ Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game
 - CLI: `crates/cfvnet/src/main.rs`
 - Sample config: `sample_configurations/river_cfvnet.yaml`
 
+## Sampled Rollout Evaluator
+
+The default boundary evaluator for subgame re-solving is a **depth-gated MCCFR sampling rollout**. When the range-solver hits a depth boundary (e.g., at river during a turn solve), it queries the blueprint strategy to estimate continuation values for each hero combo.
+
+**Hybrid algorithm:** The evaluator uses exhaustive enumeration at shallow decision depths and Monte Carlo sampling at deeper ones. At decision depth < `enumerate_decision_depth` (default 2), all children are enumerated exactly weighted by the biased blueprint strategy. At decision depth >= the threshold, a single action is sampled from the biased strategy distribution and recursed into. Chance nodes always sample `num_rollouts` random cards (with a 3x sample boost at the first two chance levels for variance reduction).
+
+This follows the approach described in **Modicum** (Brown, Sandholm & Amos, NeurIPS 2018): the first 1-2 decision levels carry the most entropy and have low branching cost, so exhaustive enumeration there preserves accuracy; deeper levels contribute geometrically less to the final value, making sampling sufficient. The stochastic noise at deeper levels is absorbed by DCFR's across-iteration averaging in the outer solver -- the same convergence property that Libratus, Pluribus, and Modicum rely on.
+
+**Configurable knobs** (tunable via Tauri settings or CLI flags):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `rollout_enumerate_depth` | 2 | Decision levels to enumerate before sampling. Set to 255 for fully exhaustive rollouts (old behavior). |
+| `rollout_opponent_samples` | 8 | Opponent hands sampled per hero combo. Higher = less variance, slower. |
+| `rollout_num_samples` | 3 | Chance-node samples (random runout cards) per evaluation. |
+
+**Performance:** The sampling pivot yields ~100-200x speedup over exhaustive enumeration (e.g., 50ms vs 8.2s per evaluator call on a 1176-combo flop scenario) with < 1 mbb/hand mean error, validated by the `validate-rollout` CLI harness.
+
+**Key files:**
+- Rollout logic: `crates/core/src/blueprint_v2/continuation.rs`
+- Evaluator construction: `crates/tauri-app/src/postflop.rs` (`build_rollout_evaluator`)
+- Bench/validate CLI: `crates/trainer/src/bench_rollout.rs`, `crates/trainer/src/validate_rollout.rs`
+
 ## Known Limitations
 
 - **No real-time subgame solving yet:** The blueprint is a static strategy. Pluribus-style real-time search is planned but not implemented.

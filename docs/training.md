@@ -176,6 +176,75 @@ Options:
 
 ---
 
+### bench-rollout
+
+Benchmark the rollout boundary evaluator in isolation (does not run DCFR). Loads a blueprint bundle and drives the rollout evaluator in a tight loop for a bounded wall time, reporting throughput metrics: ms/call, calls/sec, total hands, and hands/sec.
+
+```bash
+cargo run -p poker-solver-trainer --release -- bench-rollout \
+  --bundle /path/to/blueprint/bundle \
+  --duration-secs 10 \
+  --board Ks7h2c \
+  --pot 100 --stacks 200 \
+  --enumerate-depth 2 \
+  --opponent-samples 8
+```
+
+Options:
+- `--bundle <DIR>` -- Path to blueprint bundle directory (must contain `config.yaml`, `strategy.bin` or `snapshot_*/strategy.bin`, and `buckets/`) (required)
+- `--duration-secs <N>` -- Wall-time duration in seconds (default: 10)
+- `--board <CARDS>` -- Flop board cards, e.g. `"Ks7h2c"` (default: `Ks7h2c`)
+- `--pot <N>` -- Starting pot size in chips (default: 100)
+- `--stacks <N>` -- Starting stack per player in chips (default: 200)
+- `--enumerate-depth <N>` -- Decision levels to enumerate before sampling (default: 2). Higher = more accurate but slower.
+- `--opponent-samples <N>` -- Opponent hands sampled per hero combo (default: 8). Higher = less variance but slower.
+
+---
+
+### validate-rollout
+
+Compare sampled rollout CFVs against exhaustive (exact) rollout CFVs per combo. Runs the exhaustive evaluator once as a baseline, then runs the sampled evaluator multiple times and aggregates the results to separate stochastic noise from systematic bias. Reports max/mean/L2 diffs in both pot-fraction and mbb/hand units.
+
+The current PASS criterion is `max_abs_diff < 2 mbb/hand` (strict). In practice, `mean_abs_diff` under 1 mbb/hand is the more important signal for DCFR convergence, since the outer solver averages over many iterations.
+
+```bash
+cargo run -p poker-solver-trainer --release -- validate-rollout \
+  --bundle /path/to/blueprint/bundle \
+  --board Ks7h2c \
+  --pot 100 --stacks 200 \
+  --num-runs 5 \
+  --enumerate-depth 2 \
+  --opponent-samples 8
+```
+
+Options:
+- `--bundle <DIR>` -- Path to blueprint bundle directory (required)
+- `--board <CARDS>` -- Flop board cards (default: `Ks7h2c`)
+- `--pot <N>` -- Starting pot size in chips (default: 100)
+- `--stacks <N>` -- Starting stack per player in chips (default: 200)
+- `--num-runs <N>` -- Number of sampled runs to aggregate (default: 5)
+- `--pass-threshold <F>` -- Pass threshold for max_abs_diff in pot-fraction units (default: 0.02, i.e. 2 mbb/hand)
+- `--enumerate-depth <N>` -- Decision levels to enumerate before sampling (default: 2)
+- `--opponent-samples <N>` -- Opponent hands sampled per hero combo (default: 8)
+
+**Output:** Per-traverser (OOP, IP) reports showing nonzero combos, max/mean/L2 diffs with stddev across runs, and PASS/FAIL verdict.
+
+---
+
+### Rollout Config Parameters
+
+When using the Tauri explorer or dev server for subgame solving, the following rollout parameters are configurable via the settings UI:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `rollout_enumerate_depth` | 2 | Decision levels to fully enumerate before sampling. Set to 255 for exhaustive rollouts (pre-sampling behavior). |
+| `rollout_opponent_samples` | 8 | Opponent hands sampled per hero combo. More samples = less variance, higher accuracy, slower. |
+| `rollout_num_samples` | 3 | Chance-node samples (random runout cards) per rollout evaluation. |
+
+See `docs/architecture.md` (Sampled Rollout Evaluator) for algorithmic details.
+
+---
+
 ### gpu-range-solve
 
 GPU-accelerated version of `range-solve` using custom CUDA kernels via the `gpu-range-solver` crate. Same inputs and output format as `range-solve`. Requires an NVIDIA GPU with CUDA 12.1+.
