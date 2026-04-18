@@ -374,6 +374,11 @@ pub struct RolloutLeafEvaluator {
     root_spr: f64,
     /// Optional atomic counter for rollout terminals reached (hands/sec telemetry).
     pub(crate) hand_counter: Option<Arc<AtomicU64>>,
+    /// Monotonically increasing counter so successive calls to
+    /// `rollout_chip_values_with_state` seed their per-combo RNGs
+    /// differently. Shared via `Arc` so sub-evaluators (clones) see a
+    /// single global sequence.
+    pub(crate) call_counter: Arc<AtomicU64>,
     /// When true, enumerate at every decision depth (exhaustive rollout).
     /// When false (default), sample at depth >= `SAMPLE_AFTER_DECISION_DEPTH`.
     pub exhaustive: bool,
@@ -408,10 +413,15 @@ impl RolloutLeafEvaluator {
             starting_stack,
             root_spr,
             hand_counter: None,
+            call_counter: Arc::new(AtomicU64::new(0)),
             exhaustive: false,
         }
     }
 
+    /// Returns the current value of the call counter (test helper).
+    pub fn call_counter_for_test(&self) -> u64 {
+        self.call_counter.load(Ordering::Relaxed)
+    }
 }
 
 
@@ -429,6 +439,11 @@ impl RolloutLeafEvaluator {
         boundary_pot: f64,
         boundary_invested: [f64; 2],
     ) -> Vec<f64> {
+        /// Golden-ratio constant for mixing combo index into RNG seed.
+        /// SplitMix64-adjacent scramble: avoids correlated streams across combos.
+        const SEED_MIX_PRIME: u64 = 0x9e37_79b9_7f4a_7c15;
+
+        let call_idx = self.call_counter.fetch_add(1, Ordering::Relaxed);
         let hero_range = if traverser == 0 { oop_range } else { ip_range };
         let opp_range = if traverser == 0 { ip_range } else { oop_range };
 
@@ -452,7 +467,8 @@ impl RolloutLeafEvaluator {
                     })
                     .collect();
 
-                let mut rng = SmallRng::seed_from_u64(i as u64);
+                let seed = (i as u64).wrapping_mul(SEED_MIX_PRIME).wrapping_add(call_idx);
+                let mut rng = SmallRng::seed_from_u64(seed);
                 let sampled = sample_weighted(&mut rng, &weights, self.num_opponent_samples);
                 if sampled.is_empty() {
                     return 0.0;
@@ -2098,6 +2114,151 @@ mod tests {
         // Compile-time check: RolloutLeafEvaluator implements LeafEvaluator.
         fn _assert_impl<T: LeafEvaluator>() {}
         _assert_impl::<RolloutLeafEvaluator>();
+    }
+
+    #[test]
+    fn rollout_evaluator_call_counter_starts_at_zero_and_increments() {
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = Arc::new(GameTree::build_subgame(
+            poker_solver_core::blueprint_v2::Street::Turn,
+            100.0,
+            [50.0; 2],
+            200.0,
+            &[vec![1.0]],
+            Some(1),
+            0,
+        ));
+        let all_buckets = Arc::new(AllBuckets::new(
+            [2, 2, 2, 2],
+            [None, None, None, None],
+        ));
+
+        let eval = RolloutLeafEvaluator::new(
+            Arc::clone(&strategy),
+            Arc::clone(&tree),
+            Arc::clone(&all_buckets),
+            0,
+            BiasType::Unbiased,
+            10.0,
+            3,
+            8,
+            100.0,
+            10.0,
+        );
+
+        // Counter starts at zero.
+        assert_eq!(eval.call_counter_for_test(), 0);
+
+        // Simulate what rollout_chip_values_with_state does at the top:
+        let val = eval.call_counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(val, 0); // first call returns previous value
+        assert_eq!(eval.call_counter_for_test(), 1);
+
+        let val2 = eval.call_counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(val2, 1);
+        assert_eq!(eval.call_counter_for_test(), 2);
+    }
+
+    #[test]
+    fn rollout_evaluator_call_counter_advances_per_rollout_call() {
+        // Verify that rollout_chip_values_with_state increments the call
+        // counter each time it is invoked.
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = Arc::new(GameTree::build_subgame(
+            poker_solver_core::blueprint_v2::Street::Turn,
+            100.0,
+            [50.0; 2],
+            200.0,
+            &[vec![1.0]],
+            Some(1),
+            0,
+        ));
+        let all_buckets = Arc::new(AllBuckets::new(
+            [2, 2, 2, 2],
+            [None, None, None, None],
+        ));
+
+        let eval = RolloutLeafEvaluator::new(
+            Arc::clone(&strategy),
+            Arc::clone(&tree),
+            Arc::clone(&all_buckets),
+            0,
+            BiasType::Unbiased,
+            10.0,
+            3,
+            8,
+            100.0,
+            10.0,
+        );
+
+        // Zero-weight ranges so rollout returns immediately (no strategy lookup)
+        // but the counter must still advance.
+        let combos: Vec<[RsPokerCard; 2]> = vec![
+            [
+                RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+                RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Spade),
+            ],
+        ];
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Five, RsPokerSuit::Heart),
+        ];
+        let zero_range = vec![0.0];
+
+        assert_eq!(eval.call_counter_for_test(), 0);
+
+        let _ = eval.rollout_chip_values_with_state(
+            &combos, &board, &zero_range, &zero_range, 0, 100.0, [50.0, 50.0],
+        );
+        assert_eq!(eval.call_counter_for_test(), 1);
+
+        let _ = eval.rollout_chip_values_with_state(
+            &combos, &board, &zero_range, &zero_range, 0, 100.0, [50.0, 50.0],
+        );
+        assert_eq!(eval.call_counter_for_test(), 2);
+    }
+
+    #[test]
+    fn rollout_evaluator_call_counter_shared_across_cloned_arcs() {
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = Arc::new(GameTree::build_subgame(
+            poker_solver_core::blueprint_v2::Street::Turn,
+            100.0,
+            [50.0; 2],
+            200.0,
+            &[vec![1.0]],
+            Some(1),
+            0,
+        ));
+        let all_buckets = Arc::new(AllBuckets::new(
+            [2, 2, 2, 2],
+            [None, None, None, None],
+        ));
+
+        let eval = RolloutLeafEvaluator::new(
+            Arc::clone(&strategy),
+            Arc::clone(&tree),
+            Arc::clone(&all_buckets),
+            0,
+            BiasType::Unbiased,
+            10.0,
+            3,
+            8,
+            100.0,
+            10.0,
+        );
+
+        // Clone the Arc counter (simulating what a sub-evaluator would do).
+        let shared_counter = Arc::clone(&eval.call_counter);
+
+        // Incrementing via the shared counter is visible to the evaluator.
+        shared_counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(eval.call_counter_for_test(), 1);
+
+        shared_counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(eval.call_counter_for_test(), 2);
     }
 
     #[test]
