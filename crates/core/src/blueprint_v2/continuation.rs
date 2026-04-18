@@ -3,7 +3,20 @@ use rand::Rng;
 use crate::blueprint_v2::bundle::BlueprintV2Strategy;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
 use crate::blueprint_v2::mccfr::AllBuckets;
+use crate::blueprint_v2::Street;
 use crate::poker::Card;
+
+/// Decision-depth threshold: enumerate all children at depths 0 and 1,
+/// sample a single action from the biased distribution at depth >= 2.
+/// Follows Modicum (Brown/Sandholm/Amos, NeurIPS 2018): first decision
+/// levels enumerate because entropy is highest and branching cost is low;
+/// deeper levels sample to cut the combinatorial explosion.
+const SAMPLE_AFTER_DECISION_DEPTH: u8 = 2;
+
+/// Chance-depth at which the sample-count boost stops applying.
+const CHANCE_BOOST_DEPTH: u8 = 2;
+/// Multiplier applied to num_rollouts at chance nodes shallower than CHANCE_BOOST_DEPTH.
+const CHANCE_BOOST_FACTOR: u32 = 3;
 
 /// Classification of poker actions for biasing purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +138,29 @@ pub struct RolloutContext<'a> {
     /// Optional counter incremented once per rollout terminal reached.
     /// Used for hands/sec telemetry. `None` disables the counter (no overhead).
     pub hand_counter: Option<&'a std::sync::atomic::AtomicU64>,
+    /// When true, enumerate at every decision depth (old exhaustive behavior).
+    /// When false (default for production), sample at depth >= SAMPLE_AFTER_DECISION_DEPTH.
+    /// Temporary gate for commit-3 validation; will be deleted once CFV equivalence
+    /// is confirmed.
+    pub exhaustive: bool,
+}
+
+/// Sample an action index from a probability distribution using inverse-CDF.
+///
+/// Falls through to the last index if the cumulative threshold is not
+/// crossed, which handles floating-point drift where probabilities do not
+/// sum to exactly 1.0.
+fn sample_action_index(rng: &mut impl Rng, probs: &[f32]) -> usize {
+    debug_assert!(!probs.is_empty(), "sample_action_index requires non-empty probs");
+    let r: f32 = rng.random_range(0.0..1.0);
+    let mut cum = 0.0_f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cum += p;
+        if r < cum {
+            return i;
+        }
+    }
+    probs.len() - 1
 }
 
 /// Walk the abstract game tree using a (biased) blueprint strategy with
@@ -153,18 +189,174 @@ pub fn rollout_from_boundary(
     pot: f64,
     invested: [f64; 2],
 ) -> f64 {
-    rollout_inner(hero_hand, opponent_hand, board, ctx, abstract_node, rng, None, pot, invested)
+    let state = RolloutState {
+        pot,
+        invested,
+        decision_depth: 0,
+        chance_depth: 0,
+        cached_buckets: None,
+    };
+    rollout_inner(
+        hero_hand, opponent_hand, board, ctx, abstract_node, rng,
+        state,
+    )
+}
+
+/// Mutable per-path state carried through rollout recursion.
+#[derive(Clone, Copy)]
+struct RolloutState {
+    pot: f64,
+    invested: [f64; 2],
+    decision_depth: u8,
+    chance_depth: u8,
+    cached_buckets: Option<[u16; 2]>,
+}
+
+/// Evaluate a terminal node, returning the payoff for `ctx.player`.
+fn eval_terminal(
+    kind: &TerminalKind,
+    hero_hand: [Card; 2],
+    opponent_hand: [Card; 2],
+    board: &[Card],
+    ctx: &RolloutContext<'_>,
+    state: &RolloutState,
+) -> f64 {
+    if let Some(counter) = ctx.hand_counter {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let p = ctx.player as usize;
+    match kind {
+        TerminalKind::Fold { winner } => {
+            if ctx.player == *winner {
+                state.pot - state.invested[p]
+            } else {
+                -state.invested[p]
+            }
+        }
+        TerminalKind::Showdown => {
+            let player_rank = crate::showdown_equity::rank_hand(hero_hand, board);
+            let opponent_rank =
+                crate::showdown_equity::rank_hand(opponent_hand, board);
+            match player_rank.cmp(&opponent_rank) {
+                std::cmp::Ordering::Greater => state.pot - state.invested[p],
+                std::cmp::Ordering::Less => -state.invested[p],
+                std::cmp::Ordering::Equal => state.pot / 2.0 - state.invested[p],
+            }
+        }
+        TerminalKind::DepthBoundary => {
+            panic!("DepthBoundary should not appear during rollout");
+        }
+    }
+}
+
+/// Evaluate a decision node by enumerating or sampling child actions.
+#[allow(clippy::too_many_arguments)]
+fn eval_decision(
+    acting_player: u8,
+    street: Street,
+    actions: &[TreeAction],
+    children: &[u32],
+    hero_hand: [Card; 2],
+    opponent_hand: [Card; 2],
+    board: &[Card],
+    ctx: &RolloutContext<'_>,
+    rng: &mut impl Rng,
+    state: &RolloutState,
+    abstract_node: u32,
+) -> f64 {
+    let actor = acting_player as usize;
+    let buckets = state.cached_buckets.unwrap_or_else(|| [
+        ctx.buckets.get_bucket(street, hero_hand, board),
+        ctx.buckets.get_bucket(street, opponent_hand, board),
+    ]);
+    let acting_bucket = if acting_player == ctx.player { buckets[0] } else { buckets[1] };
+    let decision_idx = ctx.decision_idx_map[abstract_node as usize];
+    let probs = ctx.strategy.get_action_probs(decision_idx as usize, acting_bucket);
+    let action_classes: Vec<ActionClass> = actions.iter().map(classify_action).collect();
+    let biased = bias_strategy(probs, &action_classes, ctx.bias, ctx.bias_factor);
+    let base = RolloutState {
+        decision_depth: state.decision_depth + 1,
+        cached_buckets: Some(buckets),
+        ..*state
+    };
+
+    if ctx.exhaustive || state.decision_depth < SAMPLE_AFTER_DECISION_DEPTH {
+        let mut ev = 0.0;
+        for (i, &child) in children.iter().enumerate() {
+            let (p, inv) = apply_action(&actions[i], state.pot, state.invested, actor, ctx.starting_stack);
+            let child_ev = rollout_inner(
+                hero_hand, opponent_hand, board, ctx, child, rng,
+                RolloutState { pot: p, invested: inv, ..base },
+            );
+            ev += f64::from(biased[i]) * child_ev;
+        }
+        ev
+    } else {
+        let chosen = sample_action_index(rng, &biased);
+        let (p, inv) = apply_action(&actions[chosen], state.pot, state.invested, actor, ctx.starting_stack);
+        rollout_inner(
+            hero_hand, opponent_hand, board, ctx, children[chosen], rng,
+            RolloutState { pot: p, invested: inv, ..base },
+        )
+    }
+}
+
+/// Evaluate a chance node by sampling random board cards.
+fn eval_chance(
+    child: u32,
+    hero_hand: [Card; 2],
+    opponent_hand: [Card; 2],
+    board: &[Card],
+    ctx: &RolloutContext<'_>,
+    rng: &mut impl Rng,
+    state: &RolloutState,
+) -> f64 {
+    let deck = remaining_deck(hero_hand, opponent_hand, board);
+    #[allow(clippy::cast_possible_truncation)]
+    let deck_len = deck.len() as u32;
+    let chance_boost: u32 =
+        if state.chance_depth < CHANCE_BOOST_DEPTH { CHANCE_BOOST_FACTOR } else { 1 };
+    let n = (ctx.num_rollouts * chance_boost).min(deck_len);
+    if n == 0 {
+        return 0.0;
+    }
+
+    let next_chance = state.chance_depth + 1;
+    let mut total = 0.0;
+    for _ in 0..n {
+        let idx = rng.random_range(0..deck.len());
+        let card = deck[idx];
+        let mut new_board = board.to_vec();
+        new_board.push(card);
+        let child_state = RolloutState {
+            cached_buckets: None,
+            chance_depth: next_chance,
+            ..*state
+        };
+        let child_ev = rollout_inner(
+            hero_hand, opponent_hand, &new_board, ctx, child, rng,
+            child_state,
+        );
+        total += child_ev;
+    }
+    total / f64::from(n)
 }
 
 /// Inner recursive function with bucket caching.
 ///
-/// `cached_buckets` holds `[hero_bucket, opponent_bucket]` for the current
-/// street. Computed on the first Decision node of each street, invalidated
-/// (set to `None`) at Chance nodes when the board changes.
+/// `state.cached_buckets` holds `[hero_bucket, opponent_bucket]` for the
+/// current street. Computed on the first Decision node of each street,
+/// invalidated (set to `None`) at Chance nodes when the board changes.
 ///
-/// `pot` and `invested` are carried from the subgame's boundary state and
-/// updated at each action so terminal payoffs reflect the actual chip amounts.
-#[allow(clippy::too_many_arguments)]
+/// `state.pot` and `state.invested` are carried from the subgame's boundary
+/// and updated at each action so terminal payoffs reflect actual chip amounts.
+///
+/// `state.decision_depth` counts Decision nodes traversed on this path.
+/// At depth >= `SAMPLE_AFTER_DECISION_DEPTH` (and `!ctx.exhaustive`),
+/// a single action is sampled instead of enumerating all children.
+///
+/// `state.chance_depth` counts Chance nodes traversed. The first transitions
+/// sample more runouts to offset decision-sampling variance.
 fn rollout_inner(
     hero_hand: [Card; 2],
     opponent_hand: [Card; 2],
@@ -172,105 +364,25 @@ fn rollout_inner(
     ctx: &RolloutContext<'_>,
     abstract_node: u32,
     rng: &mut impl Rng,
-    cached_buckets: Option<[u16; 2]>,
-    pot: f64,
-    invested: [f64; 2],
+    state: RolloutState,
 ) -> f64 {
     match &ctx.abstract_tree.nodes[abstract_node as usize] {
         GameNode::Terminal { kind, .. } => {
-            if let Some(counter) = ctx.hand_counter {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            // Use carried pot/invested, NOT the abstract tree's stored values.
-            let p = ctx.player as usize;
-            match kind {
-                TerminalKind::Fold { winner } => {
-                    if ctx.player == *winner {
-                        // Winner gains pot minus own investment
-                        pot - invested[p]
-                    } else {
-                        // Folder loses own investment
-                        -invested[p]
-                    }
-                }
-                TerminalKind::Showdown => {
-                    let player_rank = crate::showdown_equity::rank_hand(hero_hand, board);
-                    let opponent_rank = crate::showdown_equity::rank_hand(opponent_hand, board);
-                    match player_rank.cmp(&opponent_rank) {
-                        std::cmp::Ordering::Greater => pot - invested[p],
-                        std::cmp::Ordering::Less => -invested[p],
-                        std::cmp::Ordering::Equal => pot / 2.0 - invested[p],
-                    }
-                }
-                TerminalKind::DepthBoundary => {
-                    panic!("DepthBoundary should not appear during rollout");
-                }
-            }
+            eval_terminal(kind, hero_hand, opponent_hand, board, ctx, &state)
         }
-        GameNode::Decision { player: acting_player, street, actions, children, .. } => {
-            let acting_player = *acting_player;
-            let actor = acting_player as usize;
-            let street = *street;
-            let actions = actions.clone();
-            let children = children.clone();
-
-            // Compute buckets for both players once per street, reuse
-            // across all Decision nodes until a Chance node changes the board.
-            let buckets = cached_buckets.unwrap_or_else(|| [
-                ctx.buckets.get_bucket(street, hero_hand, board),
-                ctx.buckets.get_bucket(street, opponent_hand, board),
-            ]);
-
-            let acting_bucket = if acting_player == ctx.player {
-                buckets[0] // hero
-            } else {
-                buckets[1] // opponent
-            };
-
-            let decision_idx = ctx.decision_idx_map[abstract_node as usize];
-            let probs = ctx.strategy.get_action_probs(decision_idx as usize, acting_bucket);
-
-            let action_classes: Vec<ActionClass> = actions.iter().map(classify_action).collect();
-            let biased = bias_strategy(probs, &action_classes, ctx.bias, ctx.bias_factor);
-
-            let mut ev = 0.0;
-            for (i, &child) in children.iter().enumerate() {
-                // Compute new invested/pot for this action.
-                let (child_pot, child_invested) = apply_action(
-                    &actions[i], pot, invested, actor, ctx.starting_stack,
-                );
-                let child_ev = rollout_inner(
-                    hero_hand, opponent_hand, board, ctx, child, rng,
-                    Some(buckets), child_pot, child_invested,
-                );
-                ev += f64::from(biased[i]) * child_ev;
-            }
-            ev
+        GameNode::Decision {
+            player: acting_player, street, actions, children, ..
+        } => {
+            eval_decision(
+                *acting_player, *street, actions, children,
+                hero_hand, opponent_hand, board, ctx, rng,
+                &state, abstract_node,
+            )
         }
-        GameNode::Chance { next_street: _, child } => {
-            let child = *child;
-            let deck = remaining_deck(hero_hand, opponent_hand, board);
-            #[allow(clippy::cast_possible_truncation)]
-            let deck_len = deck.len() as u32;
-            let n = ctx.num_rollouts.min(deck_len);
-            if n == 0 {
-                return 0.0;
-            }
-
-            let mut total = 0.0;
-            for _ in 0..n {
-                let idx = rng.random_range(0..deck.len());
-                let card = deck[idx];
-                let mut new_board = board.to_vec();
-                new_board.push(card);
-                let child_ev = rollout_inner(
-                    hero_hand, opponent_hand, &new_board, ctx, child, rng,
-                    None, // invalidate cache — board changed
-                    pot, invested, // pot/invested unchanged through chance
-                );
-                total += child_ev;
-            }
-            total / f64::from(n)
+        GameNode::Chance { child, .. } => {
+            eval_chance(
+                *child, hero_hand, opponent_hand, board, ctx, rng, &state,
+            )
         }
     }
 }
@@ -466,6 +578,7 @@ mod tests {
             num_rollouts,
             starting_stack: 100.0,
             hand_counter: None,
+            exhaustive: false,
         }
     }
 
@@ -857,6 +970,208 @@ mod tests {
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 3.0]);
         assert!((ev - 7.0).abs() < 0.01, "EV should be 7.0, got {ev}");
+    }
+
+    #[test]
+    fn sample_action_index_respects_probabilities() {
+        use rand::rngs::SmallRng;
+        let probs = [0.0_f32, 0.8, 0.2];
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut counts = [0usize; 3];
+        for _ in 0..10_000 {
+            counts[sample_action_index(&mut rng, &probs)] += 1;
+        }
+        assert_eq!(counts[0], 0, "Zero-probability action should never be chosen");
+        assert!(
+            (counts[1] as f64 / 10_000.0 - 0.8).abs() < 0.02,
+            "Action 1 should be ~80%, got {}",
+            counts[1] as f64 / 10_000.0
+        );
+        assert!(
+            (counts[2] as f64 / 10_000.0 - 0.2).abs() < 0.02,
+            "Action 2 should be ~20%, got {}",
+            counts[2] as f64 / 10_000.0
+        );
+    }
+
+    #[test]
+    fn sample_action_index_single_action() {
+        use rand::rngs::SmallRng;
+        let probs = [1.0_f32];
+        let mut rng = SmallRng::seed_from_u64(99);
+        for _ in 0..100 {
+            assert_eq!(sample_action_index(&mut rng, &probs), 0);
+        }
+    }
+
+    #[test]
+    fn sample_action_index_uniform() {
+        use rand::rngs::SmallRng;
+        let probs = [0.5_f32, 0.5];
+        let mut rng = SmallRng::seed_from_u64(7);
+        let mut counts = [0usize; 2];
+        for _ in 0..10_000 {
+            counts[sample_action_index(&mut rng, &probs)] += 1;
+        }
+        assert!(
+            (counts[0] as f64 / 10_000.0 - 0.5).abs() < 0.02,
+            "Each action should be ~50%"
+        );
+    }
+
+    /// Build a 3-level decision tree for convergence testing.
+    ///
+    /// Tree structure:
+    ///   Node 0: Player 0 decides (depth 0) - Fold/Call
+    ///     Node 1: Fold terminal, winner=1
+    ///     Node 2: Player 1 decides (depth 1) - Check/Bet
+    ///       Node 3: Check -> Player 0 decides (depth 2) - Fold/Call
+    ///         Node 5: Fold terminal, winner=1
+    ///         Node 6: Showdown
+    ///       Node 4: Bet -> Showdown terminal
+    ///
+    /// Strategy: 3 decision nodes, 2 actions each, 10 river buckets.
+    ///   Node 0 (P0): [0.3 fold, 0.7 call]
+    ///   Node 1 (P1): [0.6 check, 0.4 bet]
+    ///   Node 2 (P0): [0.5 fold, 0.5 call]
+    fn make_three_level_tree() -> (GameTree, Vec<u32>, BlueprintV2Strategy) {
+        use crate::blueprint_v2::game_tree::TreeAction;
+
+        let nodes = vec![
+            GameNode::Decision {
+                player: 0,
+                street: Street::River,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![1, 2],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 1 },
+                pot: 10.0,
+                stacks: [97.0, 95.0],
+            },
+            GameNode::Decision {
+                player: 1,
+                street: Street::River,
+                actions: vec![TreeAction::Check, TreeAction::Bet(10.0)],
+                children: vec![3, 4],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Decision {
+                player: 0,
+                street: Street::River,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![5, 6],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 20.0,
+                stacks: [90.0, 90.0],
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 1 },
+                pot: 10.0,
+                stacks: [95.0, 95.0],
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 14.0,
+                stacks: [93.0, 93.0],
+            },
+        ];
+        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let decision_idx_map = vec![0, u32::MAX, 1, 2, u32::MAX, u32::MAX, u32::MAX];
+
+        let bucket_counts: [u16; 4] = [169, 10, 10, 10];
+        let river_buckets = bucket_counts[3] as usize;
+        let mut action_probs = Vec::new();
+        for _ in 0..river_buckets {
+            action_probs.push(0.3_f32);
+            action_probs.push(0.7_f32);
+        }
+        for _ in 0..river_buckets {
+            action_probs.push(0.6_f32);
+            action_probs.push(0.4_f32);
+        }
+        for _ in 0..river_buckets {
+            action_probs.push(0.5_f32);
+            action_probs.push(0.5_f32);
+        }
+        let strategy = BlueprintV2Strategy::from_parts(
+            action_probs,
+            vec![2, 2, 2],
+            vec![Street::River as u8, Street::River as u8, Street::River as u8],
+            bucket_counts,
+        );
+
+        (tree, decision_idx_map, strategy)
+    }
+
+    /// Verify that sampled rollout (exhaustive=false) matches exhaustive
+    /// rollout (exhaustive=true) in expectation over many samples.
+    ///
+    /// Uses a 3-level decision tree (depth 0, 1, 2) where depth 2 triggers
+    /// sampling. By averaging 10,000 sampled runs, the mean should converge
+    /// to the exact exhaustive value within 1%.
+    #[test]
+    fn rollout_inner_sampled_matches_exhaustive_in_expectation() {
+        use rand::rngs::SmallRng;
+
+        let (tree, decision_idx_map, strategy) = make_three_level_tree();
+        let buckets = dummy_buckets();
+
+        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
+        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let board = [
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Queen, Suit::Club),
+            Card::new(Value::Seven, Suit::Diamond),
+            Card::new(Value::Four, Suit::Club),
+        ];
+
+        // Exhaustive run (exact)
+        let ctx_exhaustive = RolloutContext {
+            abstract_tree: &tree,
+            decision_idx_map: &decision_idx_map,
+            strategy: &strategy,
+            buckets: &buckets,
+            bias: BiasType::Unbiased,
+            bias_factor: 1.0,
+            player: 0,
+            num_rollouts: 1,
+            starting_stack: 100.0,
+            hand_counter: None,
+            exhaustive: true,
+        };
+        let mut rng_ex = SmallRng::seed_from_u64(0);
+        let exact_ev = rollout_from_boundary(
+            hero, opp, &board, &ctx_exhaustive, 0, &mut rng_ex,
+            10.0, [3.0, 7.0],
+        );
+
+        // Sampled run — only `exhaustive` differs
+        let ctx_sampled = RolloutContext { exhaustive: false, ..ctx_exhaustive };
+
+        let n_samples = 10_000;
+        let mut total = 0.0;
+        let mut rng_s = SmallRng::seed_from_u64(123);
+        for _ in 0..n_samples {
+            total += rollout_from_boundary(
+                hero, opp, &board, &ctx_sampled, 0, &mut rng_s,
+                10.0, [3.0, 7.0],
+            );
+        }
+        let sampled_mean = total / n_samples as f64;
+
+        // Assert agreement within 1%
+        let diff = (sampled_mean - exact_ev).abs();
+        let tolerance = exact_ev.abs() * 0.01 + 0.01; // 1% relative + small absolute
+        assert!(
+            diff < tolerance,
+            "Sampled mean {sampled_mean:.4} should match exact {exact_ev:.4}, diff={diff:.4} > tol={tolerance:.4}"
+        );
     }
 
     #[test]

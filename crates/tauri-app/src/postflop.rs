@@ -467,6 +467,7 @@ impl RolloutLeafEvaluator {
                     num_rollouts: self.num_rollouts,
                     starting_stack: unit_stack,
                     hand_counter: self.hand_counter.as_deref(),
+                    exhaustive: false,
                 };
 
                 let total: f64 = sampled
