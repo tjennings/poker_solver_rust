@@ -374,6 +374,9 @@ pub struct RolloutLeafEvaluator {
     root_spr: f64,
     /// Optional atomic counter for rollout terminals reached (hands/sec telemetry).
     pub(crate) hand_counter: Option<Arc<AtomicU64>>,
+    /// When true, enumerate at every decision depth (exhaustive rollout).
+    /// When false (default), sample at depth >= `SAMPLE_AFTER_DECISION_DEPTH`.
+    pub exhaustive: bool,
 }
 
 impl RolloutLeafEvaluator {
@@ -405,6 +408,7 @@ impl RolloutLeafEvaluator {
             starting_stack,
             root_spr,
             hand_counter: None,
+            exhaustive: false,
         }
     }
 
@@ -467,7 +471,7 @@ impl RolloutLeafEvaluator {
                     num_rollouts: self.num_rollouts,
                     starting_stack: unit_stack,
                     hand_counter: self.hand_counter.as_deref(),
-                    exhaustive: false,
+                    exhaustive: self.exhaustive,
                 };
 
                 let total: f64 = sampled

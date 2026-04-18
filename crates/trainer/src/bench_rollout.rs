@@ -97,7 +97,7 @@ fn format_result(elapsed_secs: f64, iterations: u32, hands: u64, hands_per_sec: 
 ///
 /// Walks preflop actions until it hits a Chance node transitioning to Flop,
 /// then returns the child (the first flop decision node index).
-fn find_first_flop_node(tree: &GameTree) -> Option<u32> {
+pub(crate) fn find_first_flop_node(tree: &GameTree) -> Option<u32> {
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(tree.root);
     while let Some(idx) = queue.pop_front() {
@@ -123,7 +123,7 @@ fn find_first_flop_node(tree: &GameTree) -> Option<u32> {
 /// Load a blueprint bundle and construct the `CbvContext` needed for rollout.
 ///
 /// Reuses the loading pattern from `inspect_spot::load_blueprint`.
-fn load_bundle(
+pub(crate) fn load_bundle(
     bundle_dir: &Path,
 ) -> Result<(Arc<CbvContext>, GameTree, Vec<u32>), String> {
     let config = load_config(bundle_dir)
@@ -321,7 +321,7 @@ pub fn run(
 }
 
 /// Parse a compact board string (e.g. "Ks7h2c") into rs_poker Cards.
-fn parse_board_cards(board_str: &str) -> Result<Vec<RsPokerCard>, String> {
+pub(crate) fn parse_board_cards(board_str: &str) -> Result<Vec<RsPokerCard>, String> {
     if board_str.len() % 2 != 0 {
         return Err(format!("Board string must have even length: '{board_str}'"));
     }

@@ -8,6 +8,7 @@ mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod bench_rollout;
 mod inspect_spot;
+mod validate_rollout;
 mod mp_tui;
 mod mp_tui_scenarios;
 mod mp_tui_widgets;
@@ -294,6 +295,34 @@ enum Commands {
         /// Starting stack per player (chips)
         #[arg(long, default_value = "200")]
         stacks: u32,
+    },
+    /// Compare exhaustive vs sampled rollout CFVs per combo.
+    /// Reports max/mean/L2 diff in pot-fraction and mbb/hand units.
+    /// Runs the sampled side multiple times and aggregates.
+    ValidateRollout {
+        /// Path to blueprint bundle directory
+        #[arg(short, long)]
+        bundle: PathBuf,
+
+        /// Flop board cards (e.g. "Ks7h2c"). Default: Ks7h2c.
+        #[arg(long, default_value = "Ks7h2c")]
+        board: String,
+
+        /// Starting pot size (chips)
+        #[arg(long, default_value = "100")]
+        pot: u32,
+
+        /// Starting stack per player (chips)
+        #[arg(long, default_value = "200")]
+        stacks: u32,
+
+        /// Number of sampled runs to aggregate
+        #[arg(long, default_value = "5")]
+        num_runs: usize,
+
+        /// Pass threshold for max_abs_diff in pot-fraction units
+        #[arg(long, default_value = "0.02")]
+        pass_threshold: f64,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1180,6 +1209,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         } => {
             bench_rollout::run(&bundle, duration_secs, &board, pot, stacks)
                 .map_err(|e| -> Box<dyn Error> { e.into() })?;
+        }
+        Commands::ValidateRollout {
+            bundle,
+            board,
+            pot,
+            stacks,
+            num_runs,
+            pass_threshold,
+        } => {
+            validate_rollout::run(
+                &bundle, &board, pot, stacks, num_runs, pass_threshold,
+            )
+            .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
         Commands::RebelSeed { config } => {
             run_rebel_seed(&config)?;
