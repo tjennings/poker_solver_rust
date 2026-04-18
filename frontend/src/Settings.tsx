@@ -344,9 +344,30 @@ export default function Settings() {
               }}
             />
           </div>
+          <div>
+            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Enum. Depth</span>
+            <input
+              type="text"
+              value={config.rollout_enumerate_depth ?? 2}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v >= 1 && v <= 10) setConfig({ rollout_enumerate_depth: v });
+              }}
+              style={{
+                width: 45,
+                padding: '0.45rem 0.6rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
         </div>
         <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
-          Bias factor multiplies fold/call/raise probabilities in continuation strategies. Rollouts = Monte Carlo samples per street transition. Eval Interval = re-evaluate leaf boundaries every N iterations. Opp. Samples = opponent hands sampled per combo at boundaries.
+          Bias factor multiplies fold/call/raise probabilities in continuation strategies. Rollouts = Monte Carlo samples per street transition. Eval Interval = re-evaluate leaf boundaries every N iterations. Opp. Samples = opponent hands sampled per combo at boundaries. Enum. Depth = decision levels to fully enumerate before sampling (higher = more accurate, slower).
         </p>
       </div>
 

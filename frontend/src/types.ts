@@ -155,6 +155,7 @@ export interface GlobalConfig {
   rollout_bias_factor: number;
   rollout_num_samples: number;
   rollout_opponent_samples: number;
+  rollout_enumerate_depth: number;
   leaf_eval_interval: number;
   range_clamp_threshold: number;
 }

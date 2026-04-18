@@ -257,7 +257,7 @@ pub struct SubgameSolveResult {
 // ---------------------------------------------------------------------------
 
 /// Parse a 2-char card string (e.g. "Ks") into an `rs_poker` Card.
-pub fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
+pub(crate) fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
     if s.len() != 2 {
         return Err(format!("Invalid card string: {s}"));
     }
@@ -289,6 +289,28 @@ pub fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
         c => return Err(format!("Unknown suit: {c}")),
     };
     Ok(RsPokerCard::new(value, suit))
+}
+
+/// Parse a compact board string (e.g. "Ks7h2c") into rs_poker Cards.
+///
+/// Accepts 3-5 cards (flop, turn, or river boards).
+pub fn parse_board_cards(board_str: &str) -> Result<Vec<RsPokerCard>, String> {
+    if board_str.len() % 2 != 0 {
+        return Err(format!("Board string must have even length: '{board_str}'"));
+    }
+    let chars: Vec<char> = board_str.chars().collect();
+    let mut cards = Vec::new();
+    for chunk in chars.chunks(2) {
+        let s: String = chunk.iter().collect();
+        cards.push(parse_rs_poker_card(&s)?);
+    }
+    if cards.len() < 3 || cards.len() > 5 {
+        return Err(format!(
+            "Board must have 3-5 cards, got {}",
+            cards.len()
+        ));
+    }
+    Ok(cards)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +388,7 @@ pub struct RolloutLeafEvaluator {
     pub(crate) bias: BiasType,
     pub(crate) bias_factor: f64,
     pub(crate) num_rollouts: u32,
-    pub(crate) num_opponent_samples: u32,
+    pub num_opponent_samples: u32,
     #[allow(dead_code)]
     pub(crate) starting_stack: f64,
     /// Stack-to-pot ratio at the subgame root, used to scale the unit
@@ -379,9 +401,10 @@ pub struct RolloutLeafEvaluator {
     /// differently. Shared via `Arc` so sub-evaluators (clones) see a
     /// single global sequence.
     pub(crate) call_counter: Arc<AtomicU64>,
-    /// When true, enumerate at every decision depth (exhaustive rollout).
-    /// When false (default), sample at depth >= `SAMPLE_AFTER_DECISION_DEPTH`.
-    pub exhaustive: bool,
+    /// How many decision levels to fully enumerate before sampling.
+    /// Use `u8::MAX` for fully exhaustive rollouts (no sampling).
+    /// Default: `SAMPLE_AFTER_DECISION_DEPTH`.
+    pub enumerate_decision_depth: u8,
 }
 
 impl RolloutLeafEvaluator {
@@ -414,11 +437,12 @@ impl RolloutLeafEvaluator {
             root_spr,
             hand_counter: None,
             call_counter: Arc::new(AtomicU64::new(0)),
-            exhaustive: false,
+            enumerate_decision_depth: poker_solver_core::blueprint_v2::continuation::SAMPLE_AFTER_DECISION_DEPTH,
         }
     }
 
     /// Returns the current value of the call counter (test helper).
+    #[cfg(test)]
     pub fn call_counter_for_test(&self) -> u64 {
         self.call_counter.load(Ordering::Relaxed)
     }
@@ -487,7 +511,7 @@ impl RolloutLeafEvaluator {
                     num_rollouts: self.num_rollouts,
                     starting_stack: unit_stack,
                     hand_counter: self.hand_counter.as_deref(),
-                    exhaustive: self.exhaustive,
+                    enumerate_decision_depth: self.enumerate_decision_depth,
                 };
 
                 let total: f64 = sampled
@@ -600,6 +624,7 @@ pub fn build_subgame_solver(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     neural_boundary_evaluator: Option<Arc<dyn range_solver::game::BoundaryEvaluator>>,
     hand_counter: Option<Arc<AtomicU64>>,
 ) -> Result<(PostFlopGame, SubgameHands, Vec<ActionInfo>, f64, f64), String> {
@@ -744,6 +769,9 @@ pub fn build_subgame_solver(
                 starting_stack,
                 pot_f,
             );
+            if let Some(depth) = rollout_enumerate_depth {
+                rollout.enumerate_decision_depth = depth;
+            }
             if let Some(ref counter) = hand_counter {
                 rollout.hand_counter = Some(Arc::clone(counter));
             }
@@ -1350,12 +1378,13 @@ pub fn postflop_solve_street_core(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     leaf_eval_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     postflop_solve_street_impl(state, board, max_iterations, target_exploitability, vec![],
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
-        range_clamp_threshold)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, rollout_enumerate_depth,
+        leaf_eval_interval, range_clamp_threshold)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1368,6 +1397,7 @@ fn postflop_solve_street_impl(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     leaf_eval_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
@@ -1398,8 +1428,8 @@ fn postflop_solve_street_impl(
     // Always use depth-limited solver (full-depth range-solver path removed).
     let cbv_ctx = state.cbv_context.read().clone();
     solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
-        range_clamp_threshold)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, rollout_enumerate_depth,
+        leaf_eval_interval, range_clamp_threshold)
 }
 
 /// Depth-limited solve using `PostFlopGame` from range-solver.
@@ -1416,6 +1446,7 @@ fn solve_depth_limited(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     leaf_eval_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
@@ -1504,6 +1535,7 @@ fn solve_depth_limited(
             rollout_bias_factor,
             rollout_num_samples,
             rollout_opponent_samples,
+            rollout_enumerate_depth,
             None, // neural boundary evaluator (constructed below if model path set)
             Some(hand_counter),
         ) {
@@ -1631,12 +1663,13 @@ pub async fn postflop_solve_street(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     leaf_eval_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     postflop_solve_street_core(&state, board, max_iterations, target_exploitability,
-        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, leaf_eval_interval,
-        range_clamp_threshold)
+        rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, rollout_enumerate_depth,
+        leaf_eval_interval, range_clamp_threshold)
 }
 
 // ---------------------------------------------------------------------------
@@ -2419,7 +2452,7 @@ mod tests {
         // River board — single street, fast even in debug mode
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
         let result =
-            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None, None);
+            postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None, None, None);
         assert!(result.is_ok(), "solve_street failed: {:?}", result.err());
 
         // Wait for the background thread to finish (generous timeout for debug builds).
@@ -2443,7 +2476,7 @@ mod tests {
 
         let board = vec!["Td".into(), "9d".into(), "6h".into()];
         let result =
-            postflop_solve_street_core(&state, board, None, None, None, None, None, None, None);
+            postflop_solve_street_core(&state, board, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2475,7 +2508,7 @@ mod tests {
         *state.config.write() = config;
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None, None).unwrap();
+        postflop_solve_street_core(&state, board, Some(2), Some(f32::MAX), None, None, None, None, None, None).unwrap();
 
         // Wait for the background thread to finish.
         for _ in 0..600 {
@@ -2547,7 +2580,7 @@ mod tests {
         postflop_set_config_core(&state, config).unwrap();
 
         let board = vec!["Td".into(), "9d".into(), "6h".into(), "2c".into(), "3s".into()];
-        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None, None, None).unwrap();
+        postflop_solve_street_core(&state, board, Some(5), Some(f32::MAX), None, None, None, None, None, None).unwrap();
 
         // Wait for background solve to finish.
         for _ in 0..600 {
@@ -2632,7 +2665,7 @@ mod tests {
 
         // Solve flop — should dispatch to subgame due to wide ranges.
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(5), Some(1e9), None, None, None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2688,7 +2721,7 @@ mod tests {
             "Tc".to_string(),
             "2d".to_string(),
         ];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2730,7 +2763,7 @@ mod tests {
         *state.filtered_ip_weights.write() = Some(narrow_ip);
 
         let board = vec!["Ks".to_string(), "Qh".to_string(), "Jd".to_string()];
-        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None, None);
+        let result = postflop_solve_street_core(&state, board, Some(10), Some(1e9), None, None, None, None, None, None);
         assert!(result.is_ok(), "solve should succeed: {:?}", result);
 
         let solver_name = state.solver_name.read().clone();
@@ -2762,7 +2795,7 @@ mod tests {
             0,
             None,
             None,
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver failed: {:?}", result.err());
 
@@ -2826,7 +2859,7 @@ mod tests {
             0,
             None,
             None,
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         assert!(result.is_ok());
 
@@ -2936,6 +2969,7 @@ mod tests {
             Some(5.0),  // rollout_bias_factor
             Some(5),     // rollout_num_samples
             Some(12),    // rollout_opponent_samples
+            None,        // rollout_enumerate_depth
             None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with rollout params failed: {:?}", result.err());
@@ -2973,6 +3007,7 @@ mod tests {
             None, // rollout_bias_factor
             None, // rollout_num_samples
             None, // rollout_opponent_samples
+            None, // rollout_enumerate_depth
             None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with None rollout params failed: {:?}", result.err());
@@ -3038,7 +3073,7 @@ mod tests {
 
         let (mut game, _hands, _actions, _pot, _stack) = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
         ).unwrap();
 
         // 2. Capture the initial (uniform) strategy at root.
@@ -3155,7 +3190,7 @@ mod tests {
 
         let (game, _, _, _, _) = build_subgame_solver(
             &board_cards, &bet_sizes, 80, [150, 150],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
         ).unwrap();
 
         // Build a trivial empty tree with just a terminal.
@@ -3195,7 +3230,7 @@ mod tests {
         // Build the game first to get private_cards for the evaluator.
         let (game_for_cards, _, _, _, _) = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
         ).unwrap();
 
         // Construct a fresh (untrained) BoundaryNet as a stand-in.
@@ -3220,7 +3255,7 @@ mod tests {
         // Build again, this time passing the neural evaluator.
         let result = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None,
             Some(neural_eval), None,
         );
         assert!(result.is_ok(), "build_subgame_solver with neural evaluator failed: {:?}", result.err());
@@ -3248,7 +3283,7 @@ mod tests {
 
         let result = build_subgame_solver(
             &board_cards, &bet_sizes, 100, [200, 200],
-            &oop_w, &ip_w, 0, None, None, None, None, None, None, None,
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with None neural eval failed: {:?}", result.err());
     }

@@ -5,7 +5,7 @@
 //! `game_deal_card`, `game_back`, `game_solve`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1448,6 +1448,8 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
             if let Some(ref counter) = rollout.hand_counter {
                 eval.hand_counter = Some(Arc::clone(counter));
             }
+            eval.enumerate_decision_depth = rollout.enumerate_decision_depth;
+            eval.call_counter = Arc::clone(&rollout.call_counter);
             let requests = vec![(pot as f64, 0.0, player as u8)];
             let results = eval.evaluate_boundaries(
                 &self.combos, &self.board_cards, &hero_combo_reach, &opp_combo_reach, &requests,
@@ -1681,6 +1683,7 @@ pub fn game_solve_core(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
@@ -1862,7 +1865,7 @@ pub fn game_solve_core(
                 let num_rollouts = rollout_num_samples.unwrap_or(3);
                 let opp_samples = rollout_opponent_samples.unwrap_or(8);
                 let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-                RolloutLeafEvaluator::new(
+                let mut eval = RolloutLeafEvaluator::new(
                     Arc::clone(&ctx.strategy),
                     Arc::new(ctx.abstract_tree.clone()),
                     Arc::clone(&ctx.all_buckets),
@@ -1873,7 +1876,11 @@ pub fn game_solve_core(
                     opp_samples,
                     starting_stack,
                     f64::from(pot),
-                )
+                );
+                if let Some(depth) = rollout_enumerate_depth {
+                    eval.enumerate_decision_depth = depth;
+                }
+                eval
             });
 
             // Clone for multi-continuation precomputation (before move into evaluator).
@@ -1902,6 +1909,7 @@ pub fn game_solve_core(
                 let ctx = cbv_ctx.as_ref().unwrap();
                 let bias_factor = rollout_bias_factor.unwrap_or(10.0);
                 let biases = [BiasType::Unbiased, BiasType::Fold, BiasType::Call, BiasType::Raise];
+                let precomp_counter = Arc::new(AtomicU64::new(0));
                 let start = std::time::Instant::now();
 
                 for ordinal in 0..n_boundaries {
@@ -1914,7 +1922,7 @@ pub fn game_solve_core(
                             let num_rollouts = rollout_num_samples.unwrap_or(3);
                             let opp_samples = rollout_opponent_samples.unwrap_or(8);
                             let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-                            let eval = RolloutLeafEvaluator::new(
+                            let mut eval = RolloutLeafEvaluator::new(
                                 Arc::clone(&ctx.strategy),
                                 Arc::new(ctx.abstract_tree.clone()),
                                 Arc::clone(&ctx.all_buckets),
@@ -1926,6 +1934,10 @@ pub fn game_solve_core(
                                 starting_stack,
                                 f64::from(pot),
                             );
+                            if let Some(depth) = rollout_enumerate_depth {
+                                eval.enumerate_decision_depth = depth;
+                            }
+                            eval.call_counter = Arc::clone(&precomp_counter);
                             // Map game-ordering initial weights to combo-ordering reach.
                             let opp = player ^ 1;
                             let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
@@ -2139,6 +2151,7 @@ pub fn game_solve(
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
+    rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     game_solve_core(
@@ -2150,6 +2163,7 @@ pub fn game_solve(
         rollout_bias_factor,
         rollout_num_samples,
         rollout_opponent_samples,
+        rollout_enumerate_depth,
         range_clamp_threshold,
     )
 }
@@ -2779,7 +2793,7 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -2792,7 +2806,7 @@ mod tests {
         gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Default mode (subgame) should reject when subgame is already solving
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2805,7 +2819,7 @@ mod tests {
         gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should reject when exact is already solving
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2821,7 +2835,7 @@ mod tests {
         // Exact mode should NOT be rejected (different mode)
         // It will still fail because it's a preflop node, but the error
         // should NOT be "already in progress"
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("already in progress"));
     }

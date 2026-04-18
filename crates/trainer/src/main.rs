@@ -295,6 +295,14 @@ enum Commands {
         /// Starting stack per player (chips)
         #[arg(long, default_value = "200")]
         stacks: u32,
+
+        /// Decision levels to enumerate before sampling (higher = more accurate, slower)
+        #[arg(long)]
+        enumerate_depth: Option<u8>,
+
+        /// Opponent hands sampled per hero combo (higher = less variance, slower)
+        #[arg(long)]
+        opponent_samples: Option<u32>,
     },
     /// Compare exhaustive vs sampled rollout CFVs per combo.
     /// Reports max/mean/L2 diff in pot-fraction and mbb/hand units.
@@ -323,6 +331,14 @@ enum Commands {
         /// Pass threshold for max_abs_diff in pot-fraction units
         #[arg(long, default_value = "0.02")]
         pass_threshold: f64,
+
+        /// Decision levels to enumerate before sampling (higher = more accurate, slower)
+        #[arg(long)]
+        enumerate_depth: Option<u8>,
+
+        /// Opponent hands sampled per hero combo (higher = less variance, slower)
+        #[arg(long)]
+        opponent_samples: Option<u32>,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1206,9 +1222,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             board,
             pot,
             stacks,
+            enumerate_depth,
+            opponent_samples,
         } => {
-            bench_rollout::run(&bundle, duration_secs, &board, pot, stacks)
-                .map_err(|e| -> Box<dyn Error> { e.into() })?;
+            bench_rollout::run(
+                &bundle, duration_secs, &board, pot, stacks,
+                enumerate_depth, opponent_samples,
+            )
+            .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
         Commands::ValidateRollout {
             bundle,
@@ -1217,9 +1238,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             stacks,
             num_runs,
             pass_threshold,
+            enumerate_depth,
+            opponent_samples,
         } => {
             validate_rollout::run(
                 &bundle, &board, pot, stacks, num_runs, pass_threshold,
+                enumerate_depth, opponent_samples,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }

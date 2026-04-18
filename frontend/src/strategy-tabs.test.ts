@@ -35,6 +35,7 @@ describe('buildSolveParams', () => {
     rollout_bias_factor: 10.0,
     rollout_num_samples: 3,
     rollout_opponent_samples: 8,
+    rollout_enumerate_depth: 2,
     range_clamp_threshold: 0.05,
   };
 
@@ -61,6 +62,7 @@ describe('buildSolveParams', () => {
     expect(params.rolloutBiasFactor).toBe(10.0);
     expect(params.rolloutNumSamples).toBe(3);
     expect(params.rolloutOpponentSamples).toBe(8);
+    expect(params.rolloutEnumerateDepth).toBe(2);
     expect(params.rangeClampThreshold).toBe(0.05);
   });
 
@@ -72,6 +74,7 @@ describe('buildSolveParams', () => {
       rollout_bias_factor: 5.0,
       rollout_num_samples: 5,
       rollout_opponent_samples: 12,
+      rollout_enumerate_depth: 4,
       range_clamp_threshold: 0.1,
     };
     const params = buildSolveParams('subgame', config);
@@ -81,6 +84,7 @@ describe('buildSolveParams', () => {
     expect(params.rolloutBiasFactor).toBe(5.0);
     expect(params.rolloutNumSamples).toBe(5);
     expect(params.rolloutOpponentSamples).toBe(12);
+    expect(params.rolloutEnumerateDepth).toBe(4);
     expect(params.rangeClampThreshold).toBe(0.1);
   });
 

@@ -17,11 +17,15 @@ use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::Street;
-use poker_solver_core::poker::Card as RsPokerCard;
 use poker_solver_tauri::postflop::{
-    build_rollout_evaluator, parse_rs_poker_card, CbvContext, RolloutBenchContext,
+    build_rollout_evaluator, CbvContext, RolloutBenchContext,
 };
 use range_solver::range::Range;
+
+/// Default OOP range for bench/validate scenarios.
+pub(crate) const DEFAULT_OOP_RANGE: &str = "TT+,AQs+,AKo";
+/// Default IP range for bench/validate scenarios.
+pub(crate) const DEFAULT_IP_RANGE: &str = "JJ+,AKs,AQs";
 
 /// Result of a benchmark run.
 struct BenchResult {
@@ -125,7 +129,7 @@ pub(crate) fn find_first_flop_node(tree: &GameTree) -> Option<u32> {
 /// Reuses the loading pattern from `inspect_spot::load_blueprint`.
 pub(crate) fn load_bundle(
     bundle_dir: &Path,
-) -> Result<(Arc<CbvContext>, GameTree, Vec<u32>), String> {
+) -> Result<(Arc<CbvContext>, GameTree), String> {
     let config = load_config(bundle_dir)
         .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
@@ -169,7 +173,6 @@ pub(crate) fn load_bundle(
         &aa.turn,
         &aa.river,
     );
-    let decision_map = tree.decision_index_map();
 
     // Load bucket files
     let cluster_dir = if bundle_dir.join("buckets").exists() {
@@ -242,7 +245,38 @@ pub(crate) fn load_bundle(
         strategy: Arc::new(strategy),
     });
 
-    Ok((ctx, tree, decision_map))
+    Ok((ctx, tree))
+}
+
+/// Build the rollout evaluator for the bench scenario.
+fn build_bench_scenario(
+    board_cards: &[poker_solver_core::poker::Card],
+    ctx: &CbvContext,
+    flop_node: u32,
+    pot_f: f64,
+    starting_stack: f64,
+    counter: &Arc<AtomicU64>,
+    enumerate_depth: Option<u8>,
+    opponent_samples: Option<u32>,
+) -> Result<RolloutBenchContext, String> {
+    let oop_range: Range = DEFAULT_OOP_RANGE
+        .parse()
+        .map_err(|e| format!("Bad OOP range: {e}"))?;
+    let ip_range: Range = DEFAULT_IP_RANGE
+        .parse()
+        .map_err(|e| format!("Bad IP range: {e}"))?;
+
+    let mut bench_ctx = build_rollout_evaluator(
+        board_cards, ctx, flop_node, pot_f, starting_stack,
+        Some(Arc::clone(counter)), Some(&oop_range), Some(&ip_range),
+    );
+    if let Some(depth) = enumerate_depth {
+        bench_ctx.evaluator.enumerate_decision_depth = depth;
+    }
+    if let Some(opp_samples) = opponent_samples {
+        bench_ctx.evaluator.num_opponent_samples = opp_samples;
+    }
+    Ok(bench_ctx)
 }
 
 /// Run the bench-rollout command.
@@ -258,6 +292,8 @@ pub fn run(
     board_str: &str,
     pot: u32,
     stacks: u32,
+    enumerate_depth: Option<u8>,
+    opponent_samples: Option<u32>,
 ) -> Result<(), String> {
     let board_cards = parse_board_cards(board_str)?;
     if board_cards.len() != 3 {
@@ -267,45 +303,26 @@ pub fn run(
         ));
     }
 
-    let (ctx, tree, _decision_map) = load_bundle(bundle_dir)?;
-
-    // Find the first flop decision node in the abstract tree.
+    let (ctx, tree) = load_bundle(bundle_dir)?;
     let flop_node = find_first_flop_node(&tree)
         .ok_or("No flop decision node found in abstract tree")?;
     eprintln!("[bench] abstract flop node index: {flop_node}");
 
     let pot_f = f64::from(pot);
     let starting_stack = f64::from(stacks) + pot_f / 2.0;
-
-    // Use a moderate-width range to keep each evaluator call tractable while
-    // still exercising the rollout path with realistic combo counts.
-    // ~100 OOP combos, ~80 IP combos gives fast iterations.
-    let oop_range: Range = "TT+,AQs+,AKo"
-        .parse()
-        .map_err(|e| format!("Bad OOP range: {e}"))?;
-    let ip_range: Range = "JJ+,AKs,AQs"
-        .parse()
-        .map_err(|e| format!("Bad IP range: {e}"))?;
-
-    eprintln!(
-        "[bench] board={board_str} pot={pot} stacks={stacks} duration={duration_secs}s"
-    );
+    eprintln!("[bench] board={board_str} pot={pot} stacks={stacks} duration={duration_secs}s");
 
     let counter = Arc::new(AtomicU64::new(0));
-    let bench_ctx = build_rollout_evaluator(
-        &board_cards,
-        &ctx,
-        flop_node,
-        pot_f,
-        starting_stack,
-        Some(Arc::clone(&counter)),
-        Some(&oop_range),
-        Some(&ip_range),
-    );
+    let bench_ctx = build_bench_scenario(
+        &board_cards, &ctx, flop_node, pot_f, starting_stack,
+        &counter, enumerate_depth, opponent_samples,
+    )?;
 
     eprintln!(
-        "[bench] {} combos, starting rollout benchmark...",
-        bench_ctx.combos.len()
+        "[bench] {} combos, enumerate_depth={}, opp_samples={}, starting rollout benchmark...",
+        bench_ctx.combos.len(),
+        bench_ctx.evaluator.enumerate_decision_depth,
+        bench_ctx.evaluator.num_opponent_samples,
     );
     let result = bench_loop(&bench_ctx, &counter, Duration::from_secs(duration_secs));
 
@@ -320,25 +337,8 @@ pub fn run(
     Ok(())
 }
 
-/// Parse a compact board string (e.g. "Ks7h2c") into rs_poker Cards.
-pub(crate) fn parse_board_cards(board_str: &str) -> Result<Vec<RsPokerCard>, String> {
-    if board_str.len() % 2 != 0 {
-        return Err(format!("Board string must have even length: '{board_str}'"));
-    }
-    let chars: Vec<char> = board_str.chars().collect();
-    let mut cards = Vec::new();
-    for chunk in chars.chunks(2) {
-        let s: String = chunk.iter().collect();
-        cards.push(parse_rs_poker_card(&s)?);
-    }
-    if cards.len() < 3 || cards.len() > 5 {
-        return Err(format!(
-            "Board must have 3-5 cards, got {}",
-            cards.len()
-        ));
-    }
-    Ok(cards)
-}
+/// Re-export `parse_board_cards` from the tauri crate for use by validate_rollout.
+pub(crate) use poker_solver_tauri::postflop::parse_board_cards;
 
 #[cfg(test)]
 mod tests {

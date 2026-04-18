@@ -11,7 +11,9 @@ use crate::poker::Card;
 /// Follows Modicum (Brown/Sandholm/Amos, NeurIPS 2018): first decision
 /// levels enumerate because entropy is highest and branching cost is low;
 /// deeper levels sample to cut the combinatorial explosion.
-const SAMPLE_AFTER_DECISION_DEPTH: u8 = 2;
+/// Default decision-depth threshold: enumerate all children at depths below
+/// this value, sample a single action at depths >= this value.
+pub const SAMPLE_AFTER_DECISION_DEPTH: u8 = 2;
 
 /// Chance-depth at which the sample-count boost stops applying.
 const CHANCE_BOOST_DEPTH: u8 = 2;
@@ -138,11 +140,12 @@ pub struct RolloutContext<'a> {
     /// Optional counter incremented once per rollout terminal reached.
     /// Used for hands/sec telemetry. `None` disables the counter (no overhead).
     pub hand_counter: Option<&'a std::sync::atomic::AtomicU64>,
-    /// When true, enumerate at every decision depth (old exhaustive behavior).
-    /// When false (default for production), sample at depth >= SAMPLE_AFTER_DECISION_DEPTH.
-    /// Temporary gate for commit-3 validation; will be deleted once CFV equivalence
-    /// is confirmed.
-    pub exhaustive: bool,
+    /// How many decision levels to fully enumerate before sampling.
+    /// At decision_depth < this value, all children are enumerated (exact).
+    /// At decision_depth >= this value, a single action is sampled.
+    /// Use `u8::MAX` for fully exhaustive rollouts (no sampling).
+    /// Default: `SAMPLE_AFTER_DECISION_DEPTH` (balanced accuracy/perf).
+    pub enumerate_decision_depth: u8,
 }
 
 /// Sample an action index from a probability distribution using inverse-CDF.
@@ -280,7 +283,7 @@ fn eval_decision(
         ..*state
     };
 
-    if ctx.exhaustive || state.decision_depth < SAMPLE_AFTER_DECISION_DEPTH {
+    if state.decision_depth < ctx.enumerate_decision_depth {
         let mut ev = 0.0;
         for (i, &child) in children.iter().enumerate() {
             let (p, inv) = apply_action(&actions[i], state.pot, state.invested, actor, ctx.starting_stack);
@@ -352,8 +355,8 @@ fn eval_chance(
 /// and updated at each action so terminal payoffs reflect actual chip amounts.
 ///
 /// `state.decision_depth` counts Decision nodes traversed on this path.
-/// At depth >= `SAMPLE_AFTER_DECISION_DEPTH` (and `!ctx.exhaustive`),
-/// a single action is sampled instead of enumerating all children.
+/// At depth >= `ctx.enumerate_decision_depth`, a single action is sampled
+/// instead of enumerating all children.
 ///
 /// `state.chance_depth` counts Chance nodes traversed. The first transitions
 /// sample more runouts to offset decision-sampling variance.
@@ -578,7 +581,7 @@ mod tests {
             num_rollouts,
             starting_stack: 100.0,
             hand_counter: None,
-            exhaustive: false,
+            enumerate_decision_depth: SAMPLE_AFTER_DECISION_DEPTH,
         }
     }
 
@@ -1108,8 +1111,8 @@ mod tests {
         (tree, decision_idx_map, strategy)
     }
 
-    /// Verify that sampled rollout (exhaustive=false) matches exhaustive
-    /// rollout (exhaustive=true) in expectation over many samples.
+    /// Verify that sampled rollout (low enumerate_decision_depth) matches exhaustive
+    /// rollout (enumerate_decision_depth=u8::MAX) in expectation over many samples.
     ///
     /// Uses a 3-level decision tree (depth 0, 1, 2) where depth 2 triggers
     /// sampling. By averaging 10,000 sampled runs, the mean should converge
@@ -1131,7 +1134,7 @@ mod tests {
             Card::new(Value::Four, Suit::Club),
         ];
 
-        // Exhaustive run (exact)
+        // Exhaustive run (enumerate_decision_depth=u8::MAX => enumerate all depths)
         let ctx_exhaustive = RolloutContext {
             abstract_tree: &tree,
             decision_idx_map: &decision_idx_map,
@@ -1143,7 +1146,7 @@ mod tests {
             num_rollouts: 1,
             starting_stack: 100.0,
             hand_counter: None,
-            exhaustive: true,
+            enumerate_decision_depth: u8::MAX,
         };
         let mut rng_ex = SmallRng::seed_from_u64(0);
         let exact_ev = rollout_from_boundary(
@@ -1151,8 +1154,11 @@ mod tests {
             10.0, [3.0, 7.0],
         );
 
-        // Sampled run — only `exhaustive` differs
-        let ctx_sampled = RolloutContext { exhaustive: false, ..ctx_exhaustive };
+        // Sampled run — uses default enumerate depth (SAMPLE_AFTER_DECISION_DEPTH)
+        let ctx_sampled = RolloutContext {
+            enumerate_decision_depth: SAMPLE_AFTER_DECISION_DEPTH,
+            ..ctx_exhaustive
+        };
 
         let n_samples = 10_000;
         let mut total = 0.0;
