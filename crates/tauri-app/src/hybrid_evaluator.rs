@@ -143,6 +143,27 @@ impl HybridBoundaryEvaluator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BoundaryEvaluator trait placeholder
+// ---------------------------------------------------------------------------
+
+impl range_solver::game::BoundaryEvaluator for HybridBoundaryEvaluator {
+    fn compute_cfvs(
+        &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        panic!(
+            "HybridBoundaryEvaluator: use compute_cfvs with boundary_id, \
+             combos, board, ranges, pot, and invested args instead"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +324,27 @@ mod tests {
         // Re-query first boundary → cached (still 1.0)
         let r1_again = eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
         assert_eq!(r1_again.oop_cfvs, vec![1.0]);
+    }
+
+    #[test]
+    fn hybrid_evaluator_implements_boundary_evaluator() {
+        // Compile-time check: HybridBoundaryEvaluator implements BoundaryEvaluator.
+        fn assert_impl<T: range_solver::game::BoundaryEvaluator>() {}
+        assert_impl::<HybridBoundaryEvaluator>();
+    }
+
+    #[test]
+    #[should_panic(expected = "use compute_cfvs")]
+    fn boundary_evaluator_compute_cfvs_panics_with_message() {
+        use range_solver::game::BoundaryEvaluator;
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(NoOpSampler),
+            10,
+            1,
+        );
+        // The BoundaryEvaluator::compute_cfvs method should panic
+        // because the real entry point is HybridBoundaryEvaluator::compute_cfvs
+        // with different arguments.
+        let _ = BoundaryEvaluator::compute_cfvs(&eval, 0, 100, 50.0, &[], 0, 0);
     }
 }
