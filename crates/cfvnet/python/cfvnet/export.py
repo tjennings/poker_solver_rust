@@ -23,14 +23,13 @@ def export_onnx(model: BoundaryNet, path: Path) -> None:
     model.eval()
     dummy = torch.zeros(1, INPUT_SIZE)
 
-    batch_dim = torch.export.Dim("batch", min=1)
     torch.onnx.export(
         model,
         dummy,
         str(path),
         input_names=["input"],
         output_names=["output"],
-        dynamic_shapes={"x": {0: batch_dim}},
+        dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
         opset_version=17,
     )
 

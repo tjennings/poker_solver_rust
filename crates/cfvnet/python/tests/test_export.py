@@ -51,7 +51,13 @@ def test_onnx_supports_dynamic_batch():
 
         session = ort.InferenceSession(str(path))
 
-        for batch_size in [1, 4, 16]:
+        input_meta = session.get_inputs()[0]
+        batch_dim = input_meta.shape[0]
+        assert not isinstance(batch_dim, int), (
+            f"ONNX batch dim should be dynamic, got literal {batch_dim!r}"
+        )
+
+        for batch_size in [1, 7, 32]:
             x = np.random.randn(batch_size, INPUT_SIZE).astype(np.float32)
             out = session.run(None, {"input": x})[0]
             assert out.shape == (batch_size, OUTPUT_SIZE)
