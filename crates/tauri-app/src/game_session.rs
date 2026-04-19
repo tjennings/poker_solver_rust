@@ -1148,7 +1148,6 @@ fn build_solve_game(
         // River: no boundaries needed in either mode (already at showdown).
         depth_limit: if exact || initial_state == range_solver::BoardState::River { None } else { Some(0) },
     };
-    eprintln!("[solve] build_solve_game: exact={}, initial_state={:?}, depth_limit={:?}", exact, initial_state, tree_config.depth_limit);
 
     let action_tree =
         ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
@@ -1688,7 +1687,6 @@ pub fn game_solve_core(
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
-    eprintln!("[solve] game_solve_core received mode={:?}, is_exact={}", mode, is_exact);
     let ss_ref = session_state.solve_for(&mode);
 
     // Guard: reject if this mode is already solving
@@ -1756,10 +1754,14 @@ pub fn game_solve_core(
                 }
             }
             if found_next_street {
-                eprintln!("[solve] boundary rollout starts at abstract node {idx} (next street)");
+                if !is_exact {
+                    eprintln!("[solve] boundary rollout starts at abstract node {idx} (next street)");
+                }
                 Some(idx)
             } else {
-                eprintln!("[solve] could not find next-street node, using current: {}", session.node_idx);
+                if !is_exact {
+                    eprintln!("[solve] could not find next-street node, using current: {}", session.node_idx);
+                }
                 Some(session.node_idx)
             }
         };
@@ -1832,7 +1834,6 @@ pub fn game_solve_core(
         // Set up lazy boundary evaluator if boundaries exist.
         // Exact mode has no boundaries (depth_limit=None), so this block is skipped.
         let n_boundaries = game.num_boundary_nodes();
-        eprintln!("[solve] post-build: n_boundaries={}, is_exact={}, evaluator_will_install={}", n_boundaries, is_exact, n_boundaries > 0 && !is_exact);
         if n_boundaries > 0 && !is_exact {
             let board_cards: Vec<rs_poker::core::Card> = board_clone
                 .iter()

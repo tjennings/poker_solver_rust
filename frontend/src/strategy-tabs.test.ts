@@ -49,9 +49,9 @@ describe('buildSolveParams', () => {
     expect(params.leafEvalInterval).toBe(10);
   });
 
-  it('forces leafEvalInterval to 0 for exact mode', () => {
+  it('uses config leafEvalInterval for exact mode (same as subgame)', () => {
     const params = buildSolveParams('exact', defaultConfig);
-    expect(params.leafEvalInterval).toBe(0);
+    expect(params.leafEvalInterval).toBe(10);
   });
 
   it('uses default values when config is empty', () => {
@@ -88,9 +88,9 @@ describe('buildSolveParams', () => {
     expect(params.rangeClampThreshold).toBe(0.1);
   });
 
-  it('overrides leaf_eval_interval config to 0 for exact mode even when config has a value', () => {
+  it('uses leaf_eval_interval from config for exact mode', () => {
     const config = { leaf_eval_interval: 20 };
     const params = buildSolveParams('exact', config);
-    expect(params.leafEvalInterval).toBe(0);
+    expect(params.leafEvalInterval).toBe(20);
   });
 });

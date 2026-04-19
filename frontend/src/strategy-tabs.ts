@@ -24,15 +24,12 @@ export interface SolveParams {
 
 /**
  * Build solve parameters from a mode and global config.
- * For exact mode, leafEvalInterval is always 0 (solve to showdown).
  */
 export function buildSolveParams(
   mode: SolveMode,
   config: Record<string, unknown>,
 ): SolveParams {
-  const leafEvalInterval = mode === 'exact'
-    ? 0
-    : (config.leaf_eval_interval as number | undefined) ?? 10;
+  const leafEvalInterval = (config.leaf_eval_interval as number | undefined) ?? 10;
 
   return {
     mode,
