@@ -2045,13 +2045,19 @@ pub fn game_solve_core(
             t += 1;
             ss_clone.iteration.store(t, Ordering::Relaxed);
 
-            // Snapshot matrix periodically.
-            // Note: exploitability can't be computed during depth-limited solves
-            // because the boundary CFV cache is strategy-dependent and would give
-            // incorrect values for the best-response traversal.
+            // Snapshot matrix periodically, and in exact mode also update exploitability.
+            // Exploitability cannot be computed during subgame (depth-limited) solves because
+            // the boundary CFV cache is strategy-dependent and would give incorrect values
+            // for the best-response traversal. Exact mode has no boundaries so the traversal
+            // is clean.
             if t.is_multiple_of(snapshot_interval) {
                 let matrix = build_solve_matrix(&mut game, None);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
+
+                if is_exact {
+                    let exp = compute_exploitability(&game);
+                    ss_clone.exploitability_bits.store(exp.to_bits(), Ordering::Relaxed);
+                }
             }
         }
 
