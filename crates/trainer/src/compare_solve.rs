@@ -836,6 +836,7 @@ pub fn run(
     opponent_samples: Option<u32>,
     verbose: bool,
     dump_boundary_cfvs: bool,
+    subgame_depth_limit: Option<u8>,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -897,15 +898,16 @@ pub fn run(
     println!("board: {board_str}  pot: {pot_bb:.0}  eff_stack: {eff_bb:.0}");
     println!("position: {position}");
     println!(
-        "iters: {iters}  subgame enumerate_depth: {}  opp_samples: {}",
+        "iters: {iters}  subgame enumerate_depth: {}  opp_samples: {}  depth_limit: {}",
         enumerate_depth.unwrap_or(2),
-        opponent_samples.unwrap_or(8)
+        opponent_samples.unwrap_or(8),
+        subgame_depth_limit.map_or("default(0)".to_string(), |d| d.to_string()),
     );
     println!();
 
     // 4. Build exact game
     eprintln!("[compare] building exact game...");
-    let mut exact_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, true)?;
+    let mut exact_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, true, None)?;
 
     let (mem_exact, _) = exact_game.memory_usage();
     if verbose {
@@ -919,7 +921,7 @@ pub fn run(
 
     // 5. Build subgame game
     eprintln!("[compare] building subgame game...");
-    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, false)?;
+    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, false, subgame_depth_limit)?;
 
     let n_boundaries = subgame_game.num_boundary_nodes();
     let (mem_subgame, _) = subgame_game.memory_usage();
@@ -1014,13 +1016,17 @@ pub fn run(
     let subgame_exp_mbb = subgame_exp * 500.0;
 
     println!("=== Exact solve ===");
-    println!("wall: {exact_wall:.1}s  final_exp: {exact_exp_mbb:.2} mbb/hand");
+    println!(
+        "wall: {exact_wall:.1}s  final_exp: {exact_exp_mbb:.2} mbb/hand  memory: {:.1} MB",
+        mem_exact as f64 / 1_048_576.0,
+    );
     println!();
 
     println!("=== Subgame solve ===");
     println!(
-        "precompute: {precomp_wall:.1}s  solve: {subgame_wall:.1}s  wall: {:.1}s  final_exp: {subgame_exp_mbb:.2} mbb/hand",
+        "precompute: {precomp_wall:.1}s  solve: {subgame_wall:.1}s  wall: {:.1}s  final_exp: {subgame_exp_mbb:.2} mbb/hand  memory: {:.1} MB  boundaries: {n_boundaries}",
         precomp_wall + subgame_wall,
+        mem_subgame as f64 / 1_048_576.0,
     );
     println!();
 

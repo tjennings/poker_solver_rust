@@ -313,6 +313,36 @@ export default function Settings() {
         </p>
       </div>
 
+      {/* Subgame Depth */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+          Subgame Depth
+        </label>
+        <input
+          type="number"
+          min={0}
+          max={3}
+          value={config.subgame_depth_limit ?? 0}
+          onChange={e => {
+            const v = parseInt(e.target.value);
+            if (!isNaN(v) && v >= 0 && v <= 3) setConfig({ subgame_depth_limit: v });
+          }}
+          style={{
+            width: 60,
+            padding: '0.45rem 0.6rem',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 6,
+            color: '#eee',
+            fontSize: '0.85rem',
+            fontFamily: 'inherit',
+          }}
+        />
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Number of street transitions in the subgame tree. 0 = current street only (fastest), 1 = current + next, 2 = full solve from flop. Higher values improve accuracy but use more memory and time.
+        </p>
+      </div>
+
       {/* Range Clamp Threshold */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>

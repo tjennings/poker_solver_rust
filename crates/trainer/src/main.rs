@@ -376,6 +376,11 @@ enum Commands {
         /// Dump per-boundary CFV statistics after precompute (before DCFR)
         #[arg(long)]
         dump_boundary_cfvs: bool,
+
+        /// Subgame depth limit: number of street transitions allowed.
+        /// 0 = current street only (default), 1 = current + next, 2 = flop through river.
+        #[arg(long)]
+        subgame_depth_limit: Option<u8>,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1293,6 +1298,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             opponent_samples,
             verbose,
             dump_boundary_cfvs,
+            subgame_depth_limit,
         } => {
             compare_solve::run(
                 &bundle,
@@ -1303,6 +1309,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(opponent_samples),
                 verbose,
                 dump_boundary_cfvs,
+                subgame_depth_limit,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }

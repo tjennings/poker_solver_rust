@@ -20,6 +20,7 @@ export interface SolveParams {
   rolloutOpponentSamples: number;
   rolloutEnumerateDepth: number;
   rangeClampThreshold: number;
+  subgameDepthLimit: number;
 }
 
 /**
@@ -41,5 +42,6 @@ export function buildSolveParams(
     rolloutOpponentSamples: (config.rollout_opponent_samples as number | undefined) ?? 8,
     rolloutEnumerateDepth: (config.rollout_enumerate_depth as number | undefined) ?? 2,
     rangeClampThreshold: (config.range_clamp_threshold as number | undefined) ?? 0.05,
+    subgameDepthLimit: (config.subgame_depth_limit as number | undefined) ?? 0,
   };
 }

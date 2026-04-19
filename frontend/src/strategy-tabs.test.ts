@@ -93,4 +93,15 @@ describe('buildSolveParams', () => {
     const params = buildSolveParams('exact', config);
     expect(params.matrixSnapshotInterval).toBe(20);
   });
+
+  it('includes subgameDepthLimit with default value 0', () => {
+    const params = buildSolveParams('subgame', {});
+    expect(params.subgameDepthLimit).toBe(0);
+  });
+
+  it('uses subgame_depth_limit from config when provided', () => {
+    const config = { subgame_depth_limit: 2 };
+    const params = buildSolveParams('subgame', config);
+    expect(params.subgameDepthLimit).toBe(2);
+  });
 });

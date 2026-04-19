@@ -1114,6 +1114,7 @@ pub fn build_solve_game(
     effective_stack: i32,
     bet_sizes: &[Vec<f64>],
     exact: bool,
+    depth_limit_override: Option<u8>,
 ) -> Result<PostFlopGame, String> {
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::CardConfig;
@@ -1154,9 +1155,16 @@ pub fn build_solve_game(
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
         // Exact mode: solve through all streets to showdown (no boundaries).
-        // Subgame mode: solve current street only, with boundaries at next street transition.
+        // Subgame mode: boundaries placed after depth_limit street transitions.
+        //   depth_limit=0: current street only (boundaries at next transition)
+        //   depth_limit=1: current + next street (e.g., flop+turn, boundaries at river)
+        //   depth_limit=2: from flop = full solve (flop+turn+river)
         // River: no boundaries needed in either mode (already at showdown).
-        depth_limit: if exact || initial_state == range_solver::BoardState::River { None } else { Some(0) },
+        depth_limit: if exact || initial_state == range_solver::BoardState::River {
+            None
+        } else {
+            Some(depth_limit_override.unwrap_or(0))
+        },
     };
 
     let action_tree =
@@ -1696,6 +1704,7 @@ pub fn game_solve_core(
     rollout_opponent_samples: Option<u32>,
     rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
+    subgame_depth_limit: Option<u8>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
@@ -1821,7 +1830,7 @@ pub fn game_solve_core(
     let board_clone = board.clone();
     std::thread::spawn(move || {
         // Build game
-        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes, is_exact) {
+        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes, is_exact, subgame_depth_limit) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("[solve] failed to build game: {e}");
@@ -2016,7 +2025,7 @@ pub fn game_solve_core(
         }
 
         let (mem_est, _) = game.memory_usage();
-        eprintln!("[solve] boundary nodes: {n_boundaries}, evaluator: {}", game.boundary_evaluator.is_some());
+        eprintln!("[solve] depth_limit: {:?}, boundary nodes: {n_boundaries}, evaluator: {}", subgame_depth_limit, game.boundary_evaluator.is_some());
         eprintln!("[solve] abstract_node_idx: {:?}", abstract_node_idx);
         eprintln!("[solve] pot={pot}, eff_stack={eff_stack}, board={board:?}");
         eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
@@ -2193,6 +2202,7 @@ pub fn game_solve(
     rollout_opponent_samples: Option<u32>,
     rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
+    subgame_depth_limit: Option<u8>,
 ) -> Result<(), String> {
     game_solve_core(
         &session_state,
@@ -2205,6 +2215,7 @@ pub fn game_solve(
         rollout_opponent_samples,
         rollout_enumerate_depth,
         range_clamp_threshold,
+        subgame_depth_limit,
     )
 }
 
@@ -2833,7 +2844,7 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -2846,7 +2857,7 @@ mod tests {
         gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Default mode (subgame) should reject when subgame is already solving
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2859,7 +2870,7 @@ mod tests {
         gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should reject when exact is already solving
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2875,7 +2886,7 @@ mod tests {
         // Exact mode should NOT be rejected (different mode)
         // It will still fail because it's a preflop node, but the error
         // should NOT be "already in progress"
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("already in progress"));
     }
@@ -2990,7 +3001,7 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false).unwrap();
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, None).unwrap();
         // Flop solve with depth_limit=Some(0) should have boundary nodes
         assert!(game.num_boundary_nodes() > 0);
     }
@@ -3001,8 +3012,65 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true).unwrap();
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true, None).unwrap();
         // Exact solve with depth_limit=None should have no boundary nodes
+        assert_eq!(game.num_boundary_nodes(), 0);
+    }
+
+    #[test]
+    fn build_solve_game_depth_limit_1_allows_flop_to_turn() {
+        // depth_limit_override=1 on flop: flop->turn allowed, turn->river blocked
+        // Should still have boundary nodes (at turn->river transition)
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(1)).unwrap();
+        // With depth_limit=1, there should still be boundary nodes (at turn->river)
+        assert!(game.num_boundary_nodes() > 0);
+    }
+
+    #[test]
+    fn build_solve_game_depth_limit_2_from_flop_has_no_boundaries() {
+        // depth_limit_override=2 on flop: flop->turn->river both allowed = full solve
+        // Should have no boundary nodes (equivalent to exact)
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(2)).unwrap();
+        // depth_limit=2 from flop = full solve, no boundaries
+        assert_eq!(game.num_boundary_nodes(), 0);
+    }
+
+    #[test]
+    fn build_solve_game_depth_limit_none_defaults_to_zero() {
+        // depth_limit_override=None should behave like depth_limit=0 (current behavior)
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, None).unwrap();
+        // Should have boundary nodes (same as depth_limit=0)
+        assert!(game.num_boundary_nodes() > 0);
+    }
+
+    #[test]
+    fn build_solve_game_exact_ignores_depth_limit_override() {
+        // exact=true should always use depth_limit=None regardless of override
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true, Some(0)).unwrap();
+        // Exact mode ignores depth_limit_override
+        assert_eq!(game.num_boundary_nodes(), 0);
+    }
+
+    #[test]
+    fn build_solve_game_river_ignores_depth_limit_override() {
+        // River solve should always use depth_limit=None regardless of override
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string(), "7s".to_string(), "2h".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(0)).unwrap();
+        // River solve has no boundaries regardless of depth_limit_override
         assert_eq!(game.num_boundary_nodes(), 0);
     }
 

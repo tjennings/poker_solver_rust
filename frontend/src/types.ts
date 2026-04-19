@@ -156,6 +156,7 @@ export interface GlobalConfig {
   rollout_enumerate_depth: number;
   matrix_snapshot_interval: number;
   range_clamp_threshold: number;
+  subgame_depth_limit: number;
 }
 
 export interface BlueprintListEntry {

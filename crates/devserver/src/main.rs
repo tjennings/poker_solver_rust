@@ -173,6 +173,7 @@ struct GameSolveParams {
     rollout_opponent_samples: Option<u32>,
     rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
+    subgame_depth_limit: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -662,6 +663,7 @@ async fn handle_game_solve(
         params.rollout_opponent_samples,
         params.rollout_enumerate_depth,
         params.range_clamp_threshold,
+        params.subgame_depth_limit,
     ))
 }
 
