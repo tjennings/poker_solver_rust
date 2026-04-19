@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-f3ic
 title: Fix Python cfvnet bugs found in pre-turn-datagen review
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-04-19T20:03:47Z
-updated_at: 2026-04-19T20:13:08Z
+updated_at: 2026-04-19T20:21:15Z
 ---
 
 Code review (2026-04-19) of `crates/cfvnet/python/` found four bugs that must be fixed before turn-net training can begin. Two are critical (silently corrupt or skip turn data), one breaks ONNX dynamic batch export, one breaks checkpoint resume past epoch 9.
@@ -53,9 +53,31 @@ Fix: `sorted(..., key=lambda p: int(p.stem.replace("checkpoint_epoch", "")))`
 - [x] Add a test that asserts the ONNX export accepts batch=1 and batch=N
 - [x] Add a test for checkpoint sort ordering past epoch 9
 - [x] Run full Python test suite (`pytest crates/cfvnet/python/`) — all pass
-- [ ] Manual smoke: load a real turn shard if one exists, decode N records, sanity-check field ranges (pot ≥ 0, ranges sum ≤ 1, etc.)
+- [ ] Manual smoke (deferred): no turn shard exists yet — will validate with first real turn datagen run after the OOM blocker is fixed
 
 ## Out of scope
 
 - Finding 5 (val sampled from training buffer) — design issue, separate bean if needed.
 - Pre-existing failing Rust tests `mp_tui_scenarios::tests::resolve_empty_returns_root`, `tests::mp_6player_tui_section_parses` — separate beans.
+
+
+
+## Summary of Changes
+
+Cherry-picked from worktree `agent-ac865e53` to main as 4 commits:
+
+| SHA | Commit |
+|-|-|
+| `d91894f` | fix(cfvnet): variable board_size in Python record decoder (fixes 1+2) |
+| `c1f5fd5` | fix(cfvnet): use dynamic_axes for ONNX batch dimension (fix 3) |
+| `6c0e8a1` | fix(cfvnet): sort checkpoints by numeric epoch, not alphabetically (fix 4) |
+| `6812547` | test(cfvnet): fix off-by-one in record_size comment |
+
+**Verified:**
+- `record_size(b) = 17252 + b` matches Rust `cfvnet::datagen::storage::record_size` exactly. River=17257, turn=17256, flop=17255.
+- All 36 Python tests pass in 5.20s (10 newly added).
+- Code-reviewer agent confirmed all 4 fixes correct, tests grounded in the Rust binary contract (not tautological encode/decode round-trips), production code paths exercised.
+
+**Files changed:** `cfvnet/{constants,data,gpu_buffer,export,train}.py`, `scripts/{eval,train}_boundary.py`, `tests/{test_data,test_export,test_train}.py`. No Rust changes.
+
+**Deferred:** manual smoke test on a real turn shard — to run as part of first real turn datagen run after the OOM blocker is fixed.
