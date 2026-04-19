@@ -446,6 +446,31 @@ impl PostFlopGame {
         }
     }
 
+    /// Returns a clone of the stored CFVs for a specific continuation at a boundary.
+    ///
+    /// With multi-continuation mode (`num_continuations > 1`), the index is
+    /// `ordinal * 2 * K + player * K + continuation`.
+    /// Returns an empty vec if the index is out of bounds or CFVs haven't been set.
+    pub fn get_boundary_cfvs_multi(
+        &self,
+        ordinal: usize,
+        player: usize,
+        continuation: usize,
+    ) -> Vec<f32> {
+        let k = self.num_continuations.max(1);
+        let idx = ordinal * 2 * k + player * k + continuation;
+        if idx < self.boundary_cfvs.len() {
+            self.boundary_cfvs[idx].lock().unwrap().clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns the number of continuations per boundary (K).
+    pub fn num_continuations(&self) -> usize {
+        self.num_continuations.max(1)
+    }
+
     /// Update DCFR discount parameters for boundary continuation regrets/strategy.
     /// Call once per solve_step iteration with the same DiscountParams the solver uses.
     pub fn set_boundary_discount(&self, alpha_t: f32, beta_t: f32, gamma_t: f32) {

@@ -30,6 +30,128 @@ use range_solver::card::card_to_string;
 use range_solver::interface::Game;
 use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
 
+// ---------------------------------------------------------------------------
+// Boundary CFV diagnostic types
+// ---------------------------------------------------------------------------
+
+/// Summary statistics for a slice of boundary CFVs.
+#[derive(Debug, Clone)]
+pub struct BoundaryCfvStats {
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    pub stddev: f32,
+    pub count_nonzero: usize,
+}
+
+impl BoundaryCfvStats {
+    /// Compute summary statistics from a slice of per-hand CFVs.
+    pub fn from_slice(cfvs: &[f32]) -> Self {
+        if cfvs.is_empty() {
+            return Self { min: 0.0, max: 0.0, mean: 0.0, stddev: 0.0, count_nonzero: 0 };
+        }
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut count_nonzero = 0usize;
+        for &v in cfvs {
+            if v < min { min = v; }
+            if v > max { max = v; }
+            sum += v as f64;
+            if v != 0.0 { count_nonzero += 1; }
+        }
+        let n = cfvs.len() as f64;
+        let mean = sum / n;
+        let var = cfvs.iter().map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        }).sum::<f64>() / n;
+        Self {
+            min,
+            max,
+            mean: mean as f32,
+            stddev: var.sqrt() as f32,
+            count_nonzero,
+        }
+    }
+}
+
+/// Check if any CFV exceeds the expected chip range.
+/// Returns warning strings for out-of-range values.
+pub fn check_cfv_out_of_range(stats: &BoundaryCfvStats, chip_range: f32) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if stats.max.abs() > chip_range || stats.min.abs() > chip_range {
+        warnings.push(format!(
+            "CFV out of range: min={:.4} max={:.4} exceeds chip_range={:.0}",
+            stats.min, stats.max, chip_range,
+        ));
+    }
+    warnings
+}
+
+/// Check if any CFV summary stat is NaN or Infinity.
+pub fn check_cfv_non_finite(stats: &BoundaryCfvStats) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let vals = [stats.min, stats.max, stats.mean, stats.stddev];
+    let names = ["min", "max", "mean", "stddev"];
+    for (val, name) in vals.iter().zip(&names) {
+        if !val.is_finite() {
+            warnings.push(format!("non-finite CFV {name}={val}"));
+        }
+    }
+    warnings
+}
+
+/// Check if boundary CFV magnitudes vary wildly across boundaries,
+/// suggesting a unit mismatch (e.g., chips vs pot-fractions).
+pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let magnitudes: Vec<f64> = all_stats.iter().map(|s| {
+        let m = s.mean.abs().max(s.stddev.abs()) as f64;
+        if m < 1e-10 { 1e-10 } else { m }
+    }).collect();
+    if magnitudes.len() < 2 {
+        return warnings;
+    }
+    let max_mag = magnitudes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min_mag = magnitudes.iter().cloned().fold(f64::INFINITY, f64::min);
+    if max_mag / min_mag > 100.0 {
+        warnings.push(format!(
+            "unit mismatch suspected: magnitude range {:.4}..{:.4} (ratio {:.0}x)",
+            min_mag, max_mag, max_mag / min_mag,
+        ));
+    }
+    warnings
+}
+
+/// Check if biased CFVs diverge wildly from the unbiased baseline.
+/// `bias_stats[0]` is assumed to be Unbiased.
+pub fn check_bias_divergence(
+    bias_stats: &[&BoundaryCfvStats],
+    bias_names: &[&str],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if bias_stats.is_empty() {
+        return warnings;
+    }
+    let base_mag = {
+        let m = bias_stats[0].mean.abs().max(bias_stats[0].stddev.abs()) as f64;
+        if m < 1e-10 { 1e-10 } else { m }
+    };
+    for i in 1..bias_stats.len() {
+        let mag = bias_stats[i].mean.abs().max(bias_stats[i].stddev.abs()) as f64;
+        let ratio = if mag < 1e-10 { 0.0 } else { mag / base_mag };
+        if ratio > 100.0 || (base_mag > 1e-6 && ratio < 0.01) {
+            let name = if i < bias_names.len() { bias_names[i] } else { "?" };
+            warnings.push(format!(
+                "{name} bias divergence: mean={:.4} vs unbiased={:.4} (ratio {:.0}x)",
+                bias_stats[i].mean, bias_stats[0].mean, ratio,
+            ));
+        }
+    }
+    warnings
+}
+
 /// Per-hand L1 distance (mass moved) between two strategy vectors.
 ///
 /// Returns `(mean_mass, max_mass, max_hand_idx)`.
@@ -479,6 +601,176 @@ fn run_dcfr_solve(
     (wall, exp as f64)
 }
 
+/// Find indices in private_cards matching representative sample hands.
+///
+/// Returns (hand_label, game_index) for each match found. Looks for
+/// AA, AKs, JJ, 54s, 72o as strong/medium/weak representatives.
+fn find_sample_hand_indices(private_cards: &[(u8, u8)]) -> Vec<(String, usize)> {
+    // Card IDs: rank = card >> 2, suit = card & 3
+    // 2=0..A=12, club=0 diamond=1 heart=2 spade=3
+    let targets: Vec<(&str, u8, u8)> = vec![
+        ("AA",  48, 51), // Ac As
+        ("AKs", 48, 44), // Ac Kc
+        ("JJ",  36, 37), // Jc Jd
+        ("54s", 12,  8), // 5c 4c
+        ("72o", 20,  1), // 7c 2d
+    ];
+
+    let mut result = Vec::new();
+    for (label, c1, c2) in &targets {
+        for (i, &(pc1, pc2)) in private_cards.iter().enumerate() {
+            if (pc1 == *c1 && pc2 == *c2) || (pc1 == *c2 && pc2 == *c1) {
+                result.push((label.to_string(), i));
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Dump boundary CFV statistics after precompute.
+///
+/// For each boundary ordinal, prints per-player, per-bias summary stats
+/// and flags sanity check violations.
+fn dump_boundary_cfv_stats(
+    game: &PostFlopGame,
+    pot: i32,
+    eff_stack: i32,
+) {
+    let n_boundaries = game.num_boundary_nodes();
+    let k = game.num_continuations();
+    let bias_names = ["Unbiased", "Fold", "Call", "Raise"];
+    let chip_range = (pot + 2 * eff_stack) as f32;
+    let boundary_indices = game.boundary_node_indices();
+
+    println!();
+    println!("=== Boundary CFV Dump ({n_boundaries} boundaries, K={k}) ===");
+    println!("chip_range (pot + 2*eff_stack): {chip_range:.0}");
+    println!();
+
+    // Collect all unbiased stats for cross-boundary unit mismatch check
+    let mut all_unbiased_stats: Vec<BoundaryCfvStats> = Vec::new();
+    let mut all_warnings: Vec<String> = Vec::new();
+
+    for ordinal in 0..n_boundaries {
+        let pot_at = game.boundary_pot(ordinal);
+        let node_idx = boundary_indices[ordinal];
+        let node = game.node_at(node_idx);
+        let invested = node.bet_amount();
+        let turn_card = node.turn_card();
+        let river_card = node.river_card();
+        let acting = node.acting_player();
+        drop(node);
+
+        let turn_str = card_to_string(turn_card)
+            .unwrap_or_else(|_| "--".to_string());
+        let river_str = card_to_string(river_card)
+            .unwrap_or_else(|_| "--".to_string());
+
+        println!(
+            "--- boundary {ordinal}: pot={pot_at} invested={invested} \
+             acting_player={acting} turn={turn_str} river={river_str} ---"
+        );
+
+        for player in 0..2 {
+            let player_label = if player == 0 { "OOP" } else { "IP" };
+            let num_hands = game.num_private_hands(player);
+            let sample_hands = find_sample_hand_indices(
+                game.private_cards(player),
+            );
+
+            let mut bias_stats_vec: Vec<BoundaryCfvStats> = Vec::new();
+
+            for ki in 0..k.min(bias_names.len()) {
+                let cfvs = game.get_boundary_cfvs_multi(ordinal, player, ki);
+                let stats = BoundaryCfvStats::from_slice(&cfvs);
+
+                println!(
+                    "  {player_label} {}: n={num_hands} min={:.6} max={:.6} \
+                     mean={:.6} stddev={:.6} nonzero={}",
+                    bias_names[ki], stats.min, stats.max,
+                    stats.mean, stats.stddev, stats.count_nonzero,
+                );
+
+                // Print sample hands
+                if !sample_hands.is_empty() && !cfvs.is_empty() {
+                    let samples: Vec<String> = sample_hands.iter()
+                        .map(|(label, idx)| {
+                            let val = if *idx < cfvs.len() {
+                                cfvs[*idx]
+                            } else {
+                                f32::NAN
+                            };
+                            format!("{label}={val:.6}")
+                        })
+                        .collect();
+                    println!("    samples: {}", samples.join("  "));
+                }
+
+                // Per-bias sanity checks
+                for w in check_cfv_out_of_range(&stats, chip_range) {
+                    let msg = format!(
+                        "boundary {ordinal} {player_label} {}: {w}",
+                        bias_names[ki],
+                    );
+                    println!("    WARNING {msg}");
+                    all_warnings.push(msg);
+                }
+                for w in check_cfv_non_finite(&stats) {
+                    let msg = format!(
+                        "boundary {ordinal} {player_label} {}: {w}",
+                        bias_names[ki],
+                    );
+                    println!("    ERROR {msg}");
+                    all_warnings.push(msg);
+                }
+
+                if ki == 0 && player == 0 {
+                    all_unbiased_stats.push(stats.clone());
+                }
+                bias_stats_vec.push(stats);
+            }
+
+            // Check bias divergence for this boundary x player
+            if bias_stats_vec.len() >= 2 {
+                let refs: Vec<&BoundaryCfvStats> =
+                    bias_stats_vec.iter().collect();
+                let names: Vec<&str> = bias_names[..refs.len()]
+                    .iter()
+                    .copied()
+                    .collect();
+                for w in check_bias_divergence(&refs, &names) {
+                    let msg = format!(
+                        "boundary {ordinal} {player_label}: {w}",
+                    );
+                    println!("    WARNING {msg}");
+                    all_warnings.push(msg);
+                }
+            }
+        }
+        println!();
+    }
+
+    // Cross-boundary unit mismatch check
+    if all_unbiased_stats.len() >= 2 {
+        for w in check_unit_mismatch(&all_unbiased_stats) {
+            println!("WARNING (cross-boundary): {w}");
+            all_warnings.push(w);
+        }
+    }
+
+    // Summary
+    if all_warnings.is_empty() {
+        println!("=== All boundary CFV sanity checks passed ===");
+    } else {
+        println!("=== {} sanity check issues found ===", all_warnings.len());
+        for (i, w) in all_warnings.iter().enumerate() {
+            println!("  {}: {w}", i + 1);
+        }
+    }
+    println!();
+}
+
 /// Format a range-solver action for display.
 fn format_action(action: &range_solver::Action) -> String {
     match action {
@@ -528,6 +820,7 @@ pub fn run(
     enumerate_depth: Option<u8>,
     opponent_samples: Option<u32>,
     verbose: bool,
+    dump_boundary_cfvs: bool,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -645,6 +938,11 @@ pub fn run(
         enumerate_depth, opponent_samples, verbose,
     );
     let precomp_wall = precomp_start.elapsed().as_secs_f64();
+
+    // 7b. Dump boundary CFVs if requested
+    if dump_boundary_cfvs {
+        dump_boundary_cfv_stats(&subgame_game, pot, eff_stack);
+    }
 
     // 8. Solve exact
     eprintln!("[compare] solving exact ({iters} iters)...");
@@ -974,5 +1272,222 @@ mod tests {
         let result = find_strategy_path(&dir, None);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // BoundaryCfvStats tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cfv_stats_basic_values() {
+        let cfvs = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let stats = BoundaryCfvStats::from_slice(&cfvs);
+        assert!((stats.min - 1.0).abs() < 1e-6);
+        assert!((stats.max - 5.0).abs() < 1e-6);
+        assert!((stats.mean - 3.0).abs() < 1e-6);
+        // stddev of [1,2,3,4,5] = sqrt(2.0) ~= 1.4142
+        assert!((stats.stddev - 2.0f64.sqrt() as f32).abs() < 1e-4);
+        assert_eq!(stats.count_nonzero, 5);
+    }
+
+    #[test]
+    fn cfv_stats_with_zeros() {
+        let cfvs = vec![0.0f32, 0.0, 3.0, 0.0, 5.0];
+        let stats = BoundaryCfvStats::from_slice(&cfvs);
+        assert!((stats.min - 0.0).abs() < 1e-6);
+        assert!((stats.max - 5.0).abs() < 1e-6);
+        assert_eq!(stats.count_nonzero, 2);
+    }
+
+    #[test]
+    fn cfv_stats_empty_slice() {
+        let cfvs: Vec<f32> = vec![];
+        let stats = BoundaryCfvStats::from_slice(&cfvs);
+        assert_eq!(stats.min, 0.0);
+        assert_eq!(stats.max, 0.0);
+        assert_eq!(stats.mean, 0.0);
+        assert_eq!(stats.stddev, 0.0);
+        assert_eq!(stats.count_nonzero, 0);
+    }
+
+    #[test]
+    fn cfv_stats_single_value() {
+        let cfvs = vec![42.0f32];
+        let stats = BoundaryCfvStats::from_slice(&cfvs);
+        assert!((stats.min - 42.0).abs() < 1e-6);
+        assert!((stats.max - 42.0).abs() < 1e-6);
+        assert!((stats.mean - 42.0).abs() < 1e-6);
+        assert!((stats.stddev - 0.0).abs() < 1e-6);
+        assert_eq!(stats.count_nonzero, 1);
+    }
+
+    #[test]
+    fn cfv_stats_all_same_value() {
+        let cfvs = vec![7.0f32; 100];
+        let stats = BoundaryCfvStats::from_slice(&cfvs);
+        assert!((stats.min - 7.0).abs() < 1e-6);
+        assert!((stats.max - 7.0).abs() < 1e-6);
+        assert!((stats.mean - 7.0).abs() < 1e-6);
+        assert!((stats.stddev - 0.0).abs() < 1e-6);
+        assert_eq!(stats.count_nonzero, 100);
+    }
+
+    // ---------------------------------------------------------------
+    // find_sample_hand_indices tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn find_sample_hands_finds_matching_cards() {
+        // AA target: (48, 51) = Ac, As
+        let private_cards = vec![(48u8, 51u8), (20, 1), (36, 37)];
+        let result = find_sample_hand_indices(&private_cards);
+        // Should find AA at index 0, 72o at index 1, JJ at index 2
+        assert!(result.iter().any(|(l, i)| l == "AA" && *i == 0));
+        assert!(result.iter().any(|(l, i)| l == "72o" && *i == 1));
+        assert!(result.iter().any(|(l, i)| l == "JJ" && *i == 2));
+    }
+
+    #[test]
+    fn find_sample_hands_handles_reversed_order() {
+        // Cards might be stored in reverse order
+        let private_cards = vec![(51u8, 48u8)]; // As, Ac (reversed)
+        let result = find_sample_hand_indices(&private_cards);
+        assert!(result.iter().any(|(l, _)| l == "AA"));
+    }
+
+    #[test]
+    fn find_sample_hands_empty_input() {
+        let private_cards: Vec<(u8, u8)> = vec![];
+        let result = find_sample_hand_indices(&private_cards);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn cfv_stats_negative_values() {
+        let cfvs = vec![-10.0f32, -5.0, 0.0, 5.0, 10.0];
+        let stats = BoundaryCfvStats::from_slice(&cfvs);
+        assert!((stats.min - (-10.0)).abs() < 1e-6);
+        assert!((stats.max - 10.0).abs() < 1e-6);
+        assert!((stats.mean - 0.0).abs() < 1e-6);
+        assert_eq!(stats.count_nonzero, 4);
+    }
+
+    // ---------------------------------------------------------------
+    // Sanity check tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn check_out_of_range_flags_large_cfvs() {
+        let stats = BoundaryCfvStats {
+            min: -5.0, max: 2000.0, mean: 100.0, stddev: 500.0, count_nonzero: 10,
+        };
+        let warnings = check_cfv_out_of_range(&stats, 200.0);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("out of range"));
+    }
+
+    #[test]
+    fn check_out_of_range_passes_normal_values() {
+        let stats = BoundaryCfvStats {
+            min: -50.0, max: 80.0, mean: 10.0, stddev: 20.0, count_nonzero: 10,
+        };
+        let warnings = check_cfv_out_of_range(&stats, 200.0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn check_non_finite_flags_nan() {
+        let stats = BoundaryCfvStats {
+            min: f32::NAN, max: 5.0, mean: f32::NAN, stddev: 1.0, count_nonzero: 5,
+        };
+        let warnings = check_cfv_non_finite(&stats);
+        assert!(!warnings.is_empty());
+        assert!(warnings[0].contains("non-finite"));
+    }
+
+    #[test]
+    fn check_non_finite_flags_inf() {
+        let stats = BoundaryCfvStats {
+            min: -1.0, max: f32::INFINITY, mean: 5.0, stddev: 1.0, count_nonzero: 5,
+        };
+        let warnings = check_cfv_non_finite(&stats);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn check_non_finite_passes_normal() {
+        let stats = BoundaryCfvStats {
+            min: -10.0, max: 10.0, mean: 0.0, stddev: 5.0, count_nonzero: 10,
+        };
+        let warnings = check_cfv_non_finite(&stats);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn check_unit_mismatch_flags_large_ratio() {
+        // One boundary has mean magnitude ~0.001, another ~1000
+        let stats_a = BoundaryCfvStats {
+            min: -0.002, max: 0.002, mean: 0.001, stddev: 0.0005, count_nonzero: 10,
+        };
+        let stats_b = BoundaryCfvStats {
+            min: -2000.0, max: 2000.0, mean: 1000.0, stddev: 500.0, count_nonzero: 10,
+        };
+        let warnings = check_unit_mismatch(&[stats_a, stats_b]);
+        assert!(!warnings.is_empty());
+        assert!(warnings[0].contains("unit mismatch"));
+    }
+
+    #[test]
+    fn check_unit_mismatch_passes_similar_scales() {
+        let stats_a = BoundaryCfvStats {
+            min: -50.0, max: 50.0, mean: 10.0, stddev: 20.0, count_nonzero: 10,
+        };
+        let stats_b = BoundaryCfvStats {
+            min: -80.0, max: 80.0, mean: 15.0, stddev: 30.0, count_nonzero: 10,
+        };
+        let warnings = check_unit_mismatch(&[stats_a, stats_b]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn check_bias_divergence_flags_extreme_ratio() {
+        // Unbiased mean=1.0, Fold mean=1000.0 -> 1000x ratio
+        let unbiased = BoundaryCfvStats {
+            min: 0.5, max: 1.5, mean: 1.0, stddev: 0.2, count_nonzero: 10,
+        };
+        let fold = BoundaryCfvStats {
+            min: 500.0, max: 1500.0, mean: 1000.0, stddev: 200.0, count_nonzero: 10,
+        };
+        let call = BoundaryCfvStats {
+            min: 0.4, max: 1.6, mean: 1.1, stddev: 0.3, count_nonzero: 10,
+        };
+        let raise = BoundaryCfvStats {
+            min: 0.3, max: 1.7, mean: 0.9, stddev: 0.25, count_nonzero: 10,
+        };
+        let bias_names = ["Unbiased", "Fold", "Call", "Raise"];
+        let all = [&unbiased, &fold, &call, &raise];
+        let warnings = check_bias_divergence(&all, &bias_names);
+        assert!(!warnings.is_empty());
+        assert!(warnings[0].contains("Fold"));
+    }
+
+    #[test]
+    fn check_bias_divergence_passes_similar() {
+        let unbiased = BoundaryCfvStats {
+            min: -10.0, max: 50.0, mean: 20.0, stddev: 15.0, count_nonzero: 10,
+        };
+        let fold = BoundaryCfvStats {
+            min: -15.0, max: 55.0, mean: 22.0, stddev: 16.0, count_nonzero: 10,
+        };
+        let call = BoundaryCfvStats {
+            min: -12.0, max: 48.0, mean: 18.0, stddev: 14.0, count_nonzero: 10,
+        };
+        let raise = BoundaryCfvStats {
+            min: -8.0, max: 52.0, mean: 21.0, stddev: 15.5, count_nonzero: 10,
+        };
+        let bias_names = ["Unbiased", "Fold", "Call", "Raise"];
+        let all = [&unbiased, &fold, &call, &raise];
+        let warnings = check_bias_divergence(&all, &bias_names);
+        assert!(warnings.is_empty());
     }
 }

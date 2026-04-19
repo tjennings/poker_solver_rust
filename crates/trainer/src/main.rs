@@ -372,6 +372,10 @@ enum Commands {
         /// Print per-iteration progress
         #[arg(long)]
         verbose: bool,
+
+        /// Dump per-boundary CFV statistics after precompute (before DCFR)
+        #[arg(long)]
+        dump_boundary_cfvs: bool,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1288,6 +1292,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             subgame_enumerate_depth,
             opponent_samples,
             verbose,
+            dump_boundary_cfvs,
         } => {
             compare_solve::run(
                 &bundle,
@@ -1297,6 +1302,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(subgame_enumerate_depth),
                 Some(opponent_samples),
                 verbose,
+                dump_boundary_cfvs,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
