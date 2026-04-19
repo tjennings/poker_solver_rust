@@ -77,7 +77,10 @@ def _export_latest_checkpoint(config, output_dir: Path) -> None:
     best_path = output_dir / "best.pt"
     if not best_path.exists():
         # Fall back to latest checkpoint.
-        checkpoints = sorted(output_dir.glob("checkpoint_epoch*.pt"))
+        checkpoints = sorted(
+            output_dir.glob("checkpoint_epoch*.pt"),
+            key=lambda p: int(p.stem.replace("checkpoint_epoch", "")),
+        )
         if not checkpoints:
             print("Warning: no checkpoints found, skipping ONNX export")
             return

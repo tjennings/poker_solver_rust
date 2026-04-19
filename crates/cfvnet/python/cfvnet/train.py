@@ -482,7 +482,10 @@ def _maybe_resume(
     """Resume from latest checkpoint if available. Returns start epoch."""
     if output_dir is None:
         return 0
-    checkpoints = sorted(output_dir.glob("checkpoint_epoch*.pt"))
+    checkpoints = sorted(
+        output_dir.glob("checkpoint_epoch*.pt"),
+        key=lambda p: int(p.stem.replace("checkpoint_epoch", "")),
+    )
     if not checkpoints:
         return 0
     latest = checkpoints[-1]

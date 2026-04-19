@@ -67,7 +67,10 @@ def _load_model(model_path: Path) -> ort.InferenceSession:
             print(f"Loading ONNX model: {onnx_path}")
             return ort.InferenceSession(str(onnx_path))
         # Find latest checkpoint.
-        checkpoints = sorted(model_path.glob("checkpoint_epoch*.pt"))
+        checkpoints = sorted(
+            model_path.glob("checkpoint_epoch*.pt"),
+            key=lambda p: int(p.stem.replace("checkpoint_epoch", "")),
+        )
         if checkpoints:
             return _export_and_load(checkpoints[-1])
         raise FileNotFoundError(f"No .onnx or .pt files found in {model_path}")

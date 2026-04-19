@@ -9,7 +9,7 @@ import torch
 
 from cfvnet.config import TrainConfig
 from cfvnet.constants import NUM_COMBOS
-from cfvnet.train import train_boundary
+from cfvnet.train import _maybe_resume, train_boundary
 
 
 def _write_test_data(path: Path, n: int = 32) -> None:
@@ -70,3 +70,44 @@ def test_training_reduces_loss():
         )
 
     assert result.final_train_loss < 0.1, f"expected loss < 0.1, got {result.final_train_loss}"
+
+
+def test_maybe_resume_picks_numerically_latest_checkpoint():
+    """Checkpoint resume must sort numerically, not lexicographically.
+
+    Alphabetic sort of `checkpoint_epoch{N}.pt` picks epoch 9 over epoch 200,
+    which silently corrupts LR schedule and optimizer state past epoch 9.
+    """
+    from torch.optim import Adam
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+
+    from cfvnet.model import BoundaryNet
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_dir = Path(tmpdir)
+
+        # Save small checkpoints for each epoch in {1, 2, 9, 10, 11, 100, 200}.
+        template = BoundaryNet(num_layers=1, hidden_size=8)
+        t_opt = Adam(template.parameters(), lr=1e-3)
+        t_sched = CosineAnnealingLR(t_opt, T_max=10)
+        t_scaler = torch.amp.GradScaler(enabled=False)
+        for epoch in [1, 2, 9, 10, 11, 100, 200]:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": template.state_dict(),
+                    "optimizer_state_dict": t_opt.state_dict(),
+                    "scheduler_state_dict": t_sched.state_dict(),
+                    "scaler_state_dict": t_scaler.state_dict(),
+                },
+                output_dir / f"checkpoint_epoch{epoch}.pt",
+            )
+
+        # Resume should load epoch 200.
+        model = BoundaryNet(num_layers=1, hidden_size=8)
+        opt = Adam(model.parameters(), lr=1e-3)
+        sched = CosineAnnealingLR(opt, T_max=10)
+        scaler = torch.amp.GradScaler(enabled=False)
+        epoch = _maybe_resume(model, opt, sched, scaler, output_dir)
+
+    assert epoch == 200, f"expected resume from epoch 200, got {epoch}"
