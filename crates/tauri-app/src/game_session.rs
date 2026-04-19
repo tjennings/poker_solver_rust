@@ -275,6 +275,16 @@ impl GameSession {
         self.cbv_context = Some(ctx);
     }
 
+    /// Current abstract tree node index.
+    pub fn node_idx(&self) -> u32 {
+        self.node_idx
+    }
+
+    /// Current OOP and IP reaching weights (BB=0, SB=1).
+    pub fn weights(&self) -> (&[f32], &[f32]) {
+        (&self.weights[0], &self.weights[1])
+    }
+
     /// Create a session from already-loaded exploration state.
     pub fn from_exploration_state(
         exploration: &crate::exploration::ExplorationState,
@@ -1096,7 +1106,7 @@ fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
 /// When `exact` is true, `depth_limit` is set to `None` so the game tree
 /// extends through all remaining streets to showdown (no boundary nodes).
 #[allow(clippy::too_many_arguments)]
-fn build_solve_game(
+pub fn build_solve_game(
     board: &[String],
     oop_weights: &[f32],
     ip_weights: &[f32],
@@ -1344,20 +1354,20 @@ fn build_solve_cache_recursive(
 
 /// Adapter implementing `BoundaryEvaluator` for the range-solver.
 /// SPR=0 boundaries use exact matchup equity; SPR>0 uses RolloutLeafEvaluator.
-pub(crate) struct SolveBoundaryEvaluator {
+pub struct SolveBoundaryEvaluator {
     /// Private cards per player, in range-solver ordering (card ID pairs).
-    pub(crate) private_cards: [Vec<(u8, u8)>; 2],
+    pub private_cards: [Vec<(u8, u8)>; 2],
     /// Board cards as rs_poker Cards (for equity computation).
-    pub(crate) board_cards: Vec<rs_poker::core::Card>,
+    pub board_cards: Vec<rs_poker::core::Card>,
     /// Effective stack at game start.
     #[allow(dead_code)]
-    pub(crate) eff_stack: f64,
+    pub eff_stack: f64,
     /// Rollout evaluator for SPR>0 boundaries (None if CbvContext unavailable).
-    pub(crate) rollout: Option<RolloutLeafEvaluator>,
+    pub rollout: Option<RolloutLeafEvaluator>,
     /// Combos in rollout ordering + card mappings per player.
-    pub(crate) combos: Vec<[rs_poker::core::Card; 2]>,
+    pub combos: Vec<[rs_poker::core::Card; 2]>,
     /// Maps game private_cards index → combo index, per player.
-    pub(crate) game_to_combo: [Vec<usize>; 2],
+    pub game_to_combo: [Vec<usize>; 2],
 }
 
 impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {

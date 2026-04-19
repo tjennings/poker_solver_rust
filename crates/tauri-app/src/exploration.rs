@@ -2633,7 +2633,7 @@ pub(crate) fn rs_card_to_range_solver(card: Card) -> u8 {
 }
 
 /// Convert a range-solver card ID (0..51) to an rs_poker Card.
-pub(crate) fn range_solver_to_rs_card(id: u8) -> Card {
+pub fn range_solver_to_rs_card(id: u8) -> Card {
     let rank = id / 4;
     let suit = id % 4;
     let value = match rank {

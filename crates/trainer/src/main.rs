@@ -7,6 +7,7 @@ mod blueprint_tui_resolve;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod bench_rollout;
+mod compare_solve;
 mod inspect_spot;
 mod validate_rollout;
 mod mp_tui;
@@ -339,6 +340,38 @@ enum Commands {
         /// Opponent hands sampled per hero combo (higher = less variance, slower)
         #[arg(long)]
         opponent_samples: Option<u32>,
+    },
+    /// Compare subgame vs exact solve on a given spot.
+    /// Reports per-hand mass moved, per-action-class bias, and exploitability delta.
+    #[command(name = "compare-solve")]
+    CompareSolve {
+        /// Path to blueprint bundle directory
+        #[arg(short, long)]
+        bundle: PathBuf,
+
+        /// Snapshot name (e.g. snapshot_0013); defaults to latest
+        #[arg(long)]
+        snapshot: Option<String>,
+
+        /// Spot encoding (e.g. "sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d")
+        #[arg(long)]
+        spot: String,
+
+        /// DCFR iterations for each solve
+        #[arg(long, default_value_t = 200)]
+        iters: u32,
+
+        /// Subgame enumerate depth (255 for exhaustive)
+        #[arg(long, default_value_t = 2)]
+        subgame_enumerate_depth: u8,
+
+        /// Opponent samples for rollout
+        #[arg(long, default_value_t = 8)]
+        opponent_samples: u32,
+
+        /// Print per-iteration progress
+        #[arg(long)]
+        verbose: bool,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1244,6 +1277,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             validate_rollout::run(
                 &bundle, &board, pot, stacks, num_runs, pass_threshold,
                 enumerate_depth, opponent_samples,
+            )
+            .map_err(|e| -> Box<dyn Error> { e.into() })?;
+        }
+        Commands::CompareSolve {
+            bundle,
+            snapshot,
+            spot,
+            iters,
+            subgame_enumerate_depth,
+            opponent_samples,
+            verbose,
+        } => {
+            compare_solve::run(
+                &bundle,
+                snapshot.as_deref(),
+                &spot,
+                iters,
+                Some(subgame_enumerate_depth),
+                Some(opponent_samples),
+                verbose,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }

@@ -21,6 +21,7 @@ pub use exploration::{
     start_bucket_computation_core,
     // Helpers
     blueprint_sizes_to_range_solver, load_hand_ev_bin, populate_cbv_context,
+    range_solver_to_rs_card,
     // Types
     BlueprintListEntry, ExplorationState, SnapshotEntry, SubgameProgressEvent,
     // Additional types needed by consumers of core functions
@@ -39,6 +40,8 @@ pub use postflop::{
     postflop_set_filtered_weights, postflop_set_filtered_weights_core,
     postflop_solve_street, postflop_solve_street_core,
     CbvContext, PostflopState, set_cbv_context,
+    parse_rs_poker_card, RolloutLeafEvaluator,
+    seed_solver_with_blueprint,
 };
 
 pub use simulation::{
@@ -61,4 +64,5 @@ pub use game_session::{
     game_encode_spot_core, game_load_spot_core,
     // Types
     GameSession, GameSessionState, GameState, GameMatrix, GameMatrixCell, GameAction,
+    SolveBoundaryEvaluator, build_solve_game,
 };

@@ -246,7 +246,7 @@ pub struct SubgameSolveResult {
 // ---------------------------------------------------------------------------
 
 /// Parse a 2-char card string (e.g. "Ks") into an `rs_poker` Card.
-pub(crate) fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
+pub fn parse_rs_poker_card(s: &str) -> Result<RsPokerCard, String> {
     if s.len() != 2 {
         return Err(format!("Invalid card string: {s}"));
     }
@@ -389,7 +389,7 @@ pub struct RolloutLeafEvaluator {
     /// `rollout_chip_values_with_state` seed their per-combo RNGs
     /// differently. Shared via `Arc` so sub-evaluators (clones) see a
     /// single global sequence.
-    pub(crate) call_counter: Arc<AtomicU64>,
+    pub call_counter: Arc<AtomicU64>,
     /// How many decision levels to fully enumerate before sampling.
     /// Use `u8::MAX` for fully exhaustive rollouts (no sampling).
     /// Default: `SAMPLE_AFTER_DECISION_DEPTH`.
