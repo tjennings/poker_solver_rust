@@ -508,7 +508,7 @@ fn setup_subgame_boundaries(
                         num_rollouts,
                         opp_samples,
                         starting_stack,
-                        f64::from(pot),
+                        f64::from(pot_at_boundary),
                     );
                     if let Some(depth) = enumerate_depth {
                         eval.enumerate_decision_depth = depth;
