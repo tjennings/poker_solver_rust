@@ -90,6 +90,57 @@ impl HybridBoundaryEvaluator {
     pub fn should_refresh(&self, iter: u32, last_refresh: u32) -> bool {
         iter.wrapping_sub(last_refresh) >= self.refresh_interval
     }
+
+    /// Look up or compute boundary CFVs for the given boundary.
+    ///
+    /// Fast path: if a cached entry exists and is still fresh (within the
+    /// refresh interval), return it immediately under a read lock.
+    ///
+    /// Slow path: re-sample via the underlying `BoundarySampler`, then
+    /// update the cache under a write lock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_cfvs(
+        &self,
+        boundary_id: u64,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        boundary_pot: f64,
+        boundary_invested: [f64; 2],
+    ) -> BoundaryCfvs {
+        let iter = self.current_iter.load(Ordering::SeqCst);
+
+        // Fast path: read-lock, return cached if fresh.
+        {
+            let guard = self.cached.read().unwrap();
+            if let Some(entry) = guard.get(&boundary_id) {
+                if !self.should_refresh(iter, entry.refreshed_at_iter) {
+                    return entry.cfvs.clone();
+                }
+            }
+        }
+
+        // Slow path: re-sample, write-lock, update cache.
+        let fresh = self.sampler.sample_boundary_cfvs(
+            combos,
+            board,
+            oop_range,
+            ip_range,
+            boundary_pot,
+            boundary_invested,
+            self.samples_per_refresh,
+        );
+        let mut guard = self.cached.write().unwrap();
+        guard.insert(
+            boundary_id,
+            CachedEntry {
+                cfvs: fresh.clone(),
+                refreshed_at_iter: iter,
+            },
+        );
+        fresh
+    }
 }
 
 #[cfg(test)]
@@ -153,5 +204,104 @@ mod tests {
             10,
             0,
         );
+    }
+
+    /// Mock sampler that returns incrementing values on each call,
+    /// allowing tests to distinguish cached vs fresh results.
+    struct CountingSampler {
+        call_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl CountingSampler {
+        fn new() -> Self {
+            Self {
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl BoundarySampler for CountingSampler {
+        fn sample_boundary_cfvs(
+            &self,
+            _combos: &[[RsPokerCard; 2]],
+            _board: &[RsPokerCard],
+            _oop_range: &[f64],
+            _ip_range: &[f64],
+            _boundary_pot: f64,
+            _boundary_invested: [f64; 2],
+            _num_samples: u32,
+        ) -> BoundaryCfvs {
+            let n = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let val = f64::from(n + 1); // 1.0, 2.0, 3.0, ...
+            BoundaryCfvs {
+                oop_cfvs: vec![val],
+                ip_cfvs: vec![val * 10.0],
+            }
+        }
+    }
+
+    #[test]
+    fn compute_cfvs_caches_between_refreshes() {
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(CountingSampler::new()),
+            10, // refresh every 10 iterations
+            1,  // 1 sample per refresh
+        );
+
+        let combos: Vec<[RsPokerCard; 2]> = vec![];
+        let board: Vec<RsPokerCard> = vec![];
+        let empty: Vec<f64> = vec![];
+        let boundary_id = 42u64;
+
+        // iter=0: no cache entry → sampler called (returns 1.0 / 10.0)
+        eval.begin_iteration(0);
+        let result0 = eval.compute_cfvs(
+            boundary_id, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0],
+        );
+        assert_eq!(result0.oop_cfvs, vec![1.0]);
+        assert_eq!(result0.ip_cfvs, vec![10.0]);
+
+        // iter=3: cached entry exists, 3 < 10 → cache hit (still 1.0 / 10.0)
+        eval.begin_iteration(3);
+        let result3 = eval.compute_cfvs(
+            boundary_id, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0],
+        );
+        assert_eq!(result3.oop_cfvs, vec![1.0], "should return cached value at iter=3");
+        assert_eq!(result3.ip_cfvs, vec![10.0], "should return cached value at iter=3");
+
+        // iter=10: refresh interval reached → sampler called again (returns 2.0 / 20.0)
+        eval.begin_iteration(10);
+        let result10 = eval.compute_cfvs(
+            boundary_id, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0],
+        );
+        assert_eq!(result10.oop_cfvs, vec![2.0], "should return fresh value at iter=10");
+        assert_eq!(result10.ip_cfvs, vec![20.0], "should return fresh value at iter=10");
+    }
+
+    #[test]
+    fn compute_cfvs_different_boundary_ids_cached_independently() {
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(CountingSampler::new()),
+            10,
+            1,
+        );
+
+        let combos: Vec<[RsPokerCard; 2]> = vec![];
+        let board: Vec<RsPokerCard> = vec![];
+        let empty: Vec<f64> = vec![];
+
+        eval.begin_iteration(0);
+
+        // First boundary → sampler call #1 (1.0)
+        let r1 = eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        assert_eq!(r1.oop_cfvs, vec![1.0]);
+
+        // Second boundary → sampler call #2 (2.0)
+        let r2 = eval.compute_cfvs(2, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        assert_eq!(r2.oop_cfvs, vec![2.0]);
+
+        // Re-query first boundary → cached (still 1.0)
+        let r1_again = eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        assert_eq!(r1_again.oop_cfvs, vec![1.0]);
     }
 }
