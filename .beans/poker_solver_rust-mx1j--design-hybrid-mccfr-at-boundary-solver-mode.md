@@ -1,0 +1,30 @@
+---
+# poker_solver_rust-mx1j
+title: Design hybrid MCCFR-at-boundary solver mode
+status: in-progress
+type: feature
+priority: high
+created_at: 2026-04-19T17:57:41Z
+updated_at: 2026-04-19T19:56:57Z
+---
+
+Extend full-resolution solver with configurable depth limit + MCCFR sampling at boundary leaves. Replaces Modicum K-continuation rollout precompute with live/on-demand MC sampling during DCFR iterations. Tracks: brainstorm, design doc, implementation plan.
+
+## Design complete 2026-04-19
+
+Design doc: `docs/plans/2026-04-19-hybrid-mccfr-solver-design.md`
+Research context: `docs/research/2026-04-19-subgame-solving-literature.md`
+
+### Decisions
+- (C) Replace existing Subgame mode in place.
+- (A) Live per-iteration MCCFR sampling with bulk refresh every R iterations.
+- (D1) Drop K=4 biased continuations; sample against unbiased blueprint only.
+- Three config knobs: `depth_limit`, `boundary_refresh_interval`, `samples_per_refresh`.
+- Boundary evaluator API takes OOP/IP ranges, returns both players' CFVs in one sampling pass.
+- Tauri UI gets new 'Hybrid Solver' panel + Solver Telemetry panel for MCCFR metrics.
+- Success criteria: depth=1 Hybrid within 500 mbb/hand of Exact at ≤2× wall-time.
+
+### Next
+- [ ] Invoke hex:writing-plans to generate implementation plan
+- [ ] Create follow-up beans for each plan step
+- [ ] Dispatch rust-developer agents per CLAUDE.md manager-mode workflow

@@ -5,7 +5,7 @@ status: todo
 type: bug
 priority: critical
 created_at: 2026-04-19T02:04:29Z
-updated_at: 2026-04-19T02:04:29Z
+updated_at: 2026-04-19T19:57:01Z
 ---
 
 **Severity: critical — subgame solver is anti-refining the blueprint.**
@@ -38,3 +38,31 @@ User observation: on SB:2bb, BB:10bb, SB:22bb, BB:call | Jd9d7d, a full 4000-ite
 - validate-rollout `mean_signed_diff` should be small (< 0.5 mbb/hand) under fixed settings
 
 Context: Found by user during 2026-04-19 post-merge testing. Related beans: jpwu (parallelize precompute), eqkm (completed sampling work).
+
+## Partial Fixes Landed 2026-04-19
+
+All 4 fixes merged to main at de40cdd4.
+
+**Progression:**
+- Baseline: 33,127 mbb/hand
+- After fix #1 (pot-at-boundary): 14,677 mbb/hand (-55%)
+- After fix #2 (action clamping): 14,308 mbb/hand (-2%)
+- After fix #3 (boundary reach): 11,354 mbb/hand (-21%, biggest Check/Bet bias reduction)
+- Fix #4 (depth_limit knob exposed, still defaults to 0)
+
+**Remaining problem: architectural dead-end at depth=0.** Measurement confirmed at depth=2 (=exact), Subgame exploitability equals Exact. At depth=1, precompute explodes to 1495 boundaries × 8 evaluator calls = 20+ min wall — blocked by jpwu (parallelize precompute).
+
+**Subgame at depth=0 still produces catastrophically wrong strategies (11k mbb/hand vs 38 for exact).** Should not be shipped to users as-is.
+
+Bean remains OPEN pending either:
+- jpwu (parallelize precompute) to unlock depth=1 as a practical option
+- New: cfvnet as boundary evaluator (replace rollout precompute with neural eval)
+- New: lazy on-demand boundary CFV computation
+
+Leaving status as todo (was critical).
+
+## Superseded by hybrid MCCFR design (mx1j) — 2026-04-19
+
+Instead of continuing to patch Modicum K=4 rollout precompute, the Subgame solver will be replaced in place with live MCCFR-at-boundary sampling. See `docs/plans/2026-04-19-hybrid-mccfr-solver-design.md`.
+
+This bean remains open as a regression target: the hybrid implementation must produce <500 mbb/hand exploitability on the izod repro spot at depth=1 (vs Exact's 38.6 mbb/hand) to be considered fixed. Will close when compare-solve confirms.
