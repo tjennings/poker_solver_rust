@@ -385,6 +385,7 @@ pub struct BoundaryCfvs {
 /// For each hero combo, samples opponent hands weighted by reach probabilities,
 /// performs fixed-strategy rollouts from the boundary node, and averages the
 /// results.  Returns per-combo CFVs in pot-fraction units.
+#[derive(Clone)]
 pub struct RolloutLeafEvaluator {
     pub(crate) strategy: Arc<BlueprintV2Strategy>,
     pub(crate) abstract_tree: Arc<GameTree>,
@@ -445,6 +446,44 @@ impl RolloutLeafEvaluator {
             call_counter: Arc::new(AtomicU64::new(0)),
             enumerate_decision_depth: poker_solver_core::blueprint_v2::continuation::SAMPLE_AFTER_DECISION_DEPTH,
         }
+    }
+
+    /// Create a clone with a different `num_rollouts` value.
+    ///
+    /// The returned evaluator shares the same `call_counter` Arc so that
+    /// RNG seeds remain unique across the original and the clone.
+    pub fn clone_with_num_rollouts(&self, num_rollouts: u32) -> Self {
+        let mut cloned = self.clone();
+        cloned.num_rollouts = num_rollouts;
+        cloned
+    }
+
+    /// Sample boundary CFVs for both players via Monte Carlo rollouts.
+    ///
+    /// Calls `rollout_chip_values_with_state` once per traverser (0=OOP,
+    /// 1=IP) with `n_samples` rollouts, returning per-combo chip-value
+    /// CFVs in a `BoundaryCfvs`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_boundary_cfvs(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        boundary_pot: f64,
+        boundary_invested: [f64; 2],
+        n_samples: u32,
+    ) -> BoundaryCfvs {
+        let eval = self.clone_with_num_rollouts(n_samples);
+        let oop_cfvs = eval.rollout_chip_values_with_state(
+            combos, board, oop_range, ip_range, 0,
+            boundary_pot, boundary_invested,
+        );
+        let ip_cfvs = eval.rollout_chip_values_with_state(
+            combos, board, oop_range, ip_range, 1,
+            boundary_pot, boundary_invested,
+        );
+        BoundaryCfvs { oop_cfvs, ip_cfvs }
     }
 
     /// Returns the current value of the call counter (test helper).
@@ -3790,5 +3829,159 @@ mod tests {
         assert_eq!(cloned.ip_cfvs, cfvs.ip_cfvs);
         // Debug must compile
         let _ = format!("{:?}", cfvs);
+    }
+
+    // -----------------------------------------------------------------------
+    // clone_with_num_rollouts tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal RolloutLeafEvaluator for testing.
+    fn make_test_rollout_evaluator(num_rollouts: u32) -> RolloutLeafEvaluator {
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = Arc::new(GameTree::build_subgame(
+            poker_solver_core::blueprint_v2::Street::Turn,
+            100.0,
+            [50.0; 2],
+            200.0,
+            &[vec![1.0]],
+            Some(1),
+            0,
+        ));
+        let all_buckets = Arc::new(AllBuckets::new(
+            [2, 2, 2, 2],
+            [None, None, None, None],
+        ));
+        RolloutLeafEvaluator::new(
+            strategy,
+            tree,
+            all_buckets,
+            0,
+            BiasType::Unbiased,
+            10.0,
+            num_rollouts,
+            8,
+            100.0,
+            10.0,
+        )
+    }
+
+    #[test]
+    fn clone_with_num_rollouts_changes_rollout_count() {
+        let eval = make_test_rollout_evaluator(3);
+        assert_eq!(eval.num_rollouts, 3);
+
+        let cloned = eval.clone_with_num_rollouts(128);
+        assert_eq!(cloned.num_rollouts, 128);
+        // Other fields preserved
+        assert_eq!(cloned.num_opponent_samples, eval.num_opponent_samples);
+        assert_eq!(cloned.abstract_start_node, eval.abstract_start_node);
+    }
+
+    #[test]
+    fn clone_with_num_rollouts_shares_call_counter() {
+        let eval = make_test_rollout_evaluator(3);
+        let cloned = eval.clone_with_num_rollouts(64);
+        // Incrementing via the clone is visible to the original.
+        cloned.call_counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(eval.call_counter_for_test(), 1);
+    }
+
+    #[test]
+    fn rollout_leaf_evaluator_is_clone() {
+        let eval = make_test_rollout_evaluator(3);
+        let cloned = eval.clone();
+        assert_eq!(cloned.num_rollouts, eval.num_rollouts);
+        assert_eq!(cloned.num_opponent_samples, eval.num_opponent_samples);
+    }
+
+    // -----------------------------------------------------------------------
+    // sample_boundary_cfvs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sample_boundary_cfvs_returns_correct_lengths() {
+        let eval = make_test_rollout_evaluator(3);
+
+        // Two combos with zero ranges — avoids needing bucket files but
+        // still exercises the full call path and verifies output shape.
+        let combos = vec![
+            [
+                RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+                RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Spade),
+            ],
+            [
+                RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Heart),
+                RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Heart),
+            ],
+        ];
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Five, RsPokerSuit::Diamond),
+        ];
+        let zero_range = vec![0.0, 0.0];
+
+        let result = eval.sample_boundary_cfvs(
+            &combos, &board, &zero_range, &zero_range,
+            100.0, [50.0, 50.0], 4,
+        );
+
+        assert_eq!(result.oop_cfvs.len(), combos.len());
+        assert_eq!(result.ip_cfvs.len(), combos.len());
+    }
+
+    #[test]
+    fn sample_boundary_cfvs_zero_range_gives_zero_cfvs() {
+        let eval = make_test_rollout_evaluator(3);
+
+        let combos = vec![
+            [
+                RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+                RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Spade),
+            ],
+        ];
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Five, RsPokerSuit::Diamond),
+        ];
+        let zero_range = vec![0.0];
+
+        let result = eval.sample_boundary_cfvs(
+            &combos, &board, &zero_range, &zero_range,
+            100.0, [50.0, 50.0], 4,
+        );
+
+        assert_eq!(result.oop_cfvs[0], 0.0);
+        assert_eq!(result.ip_cfvs[0], 0.0);
+    }
+
+    #[test]
+    fn sample_boundary_cfvs_advances_call_counter_twice() {
+        let eval = make_test_rollout_evaluator(3);
+
+        let combos = vec![
+            [
+                RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+                RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Spade),
+            ],
+        ];
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Five, RsPokerSuit::Diamond),
+        ];
+        let zero_range = vec![0.0];
+
+        assert_eq!(eval.call_counter_for_test(), 0);
+        let _ = eval.sample_boundary_cfvs(
+            &combos, &board, &zero_range, &zero_range,
+            100.0, [50.0, 50.0], 4,
+        );
+        // Should have called rollout_chip_values_with_state twice (once per traverser)
+        assert_eq!(eval.call_counter_for_test(), 2);
     }
 }
