@@ -195,6 +195,7 @@ pub fn rollout_from_boundary(
     let state = RolloutState {
         pot,
         invested,
+        street_start_invested: invested,
         decision_depth: 0,
         chance_depth: 0,
         cached_buckets: None,
@@ -210,6 +211,10 @@ pub fn rollout_from_boundary(
 struct RolloutState {
     pot: f64,
     invested: [f64; 2],
+    /// Investment at the start of the current street. Used to convert
+    /// `TreeAction::Bet`/`Raise` street-level "raise-TO" amounts into
+    /// total game investment. Reset at Chance nodes (new street).
+    street_start_invested: [f64; 2],
     decision_depth: u8,
     chance_depth: u8,
     cached_buckets: Option<[u16; 2]>,
@@ -283,10 +288,12 @@ fn eval_decision(
         ..*state
     };
 
+    let scale = ctx.starting_stack / ctx.abstract_tree.starting_stack;
+
     if state.decision_depth < ctx.enumerate_decision_depth {
         let mut ev = 0.0;
         for (i, &child) in children.iter().enumerate() {
-            let (p, inv) = apply_action(&actions[i], state.pot, state.invested, actor, ctx.starting_stack);
+            let (p, inv) = apply_action(&actions[i], state.pot, state.invested, actor, ctx.starting_stack, scale, state.street_start_invested);
             let child_ev = rollout_inner(
                 hero_hand, opponent_hand, board, ctx, child, rng,
                 RolloutState { pot: p, invested: inv, ..base },
@@ -296,7 +303,7 @@ fn eval_decision(
         ev
     } else {
         let chosen = sample_action_index(rng, &biased);
-        let (p, inv) = apply_action(&actions[chosen], state.pot, state.invested, actor, ctx.starting_stack);
+        let (p, inv) = apply_action(&actions[chosen], state.pot, state.invested, actor, ctx.starting_stack, scale, state.street_start_invested);
         rollout_inner(
             hero_hand, opponent_hand, board, ctx, children[chosen], rng,
             RolloutState { pot: p, invested: inv, ..base },
@@ -334,6 +341,8 @@ fn eval_chance(
         let child_state = RolloutState {
             cached_buckets: None,
             chance_depth: next_chance,
+            // New street: reset street-start to current invested values
+            street_start_invested: state.invested,
             ..*state
         };
         let child_ev = rollout_inner(
@@ -391,13 +400,25 @@ fn rollout_inner(
 }
 
 /// Compute new pot and invested amounts after an action.
-/// Mirrors the logic in `GameTree::build_child`.
+///
+/// `TreeAction::Bet(amount)` / `Raise(amount)` store "raise-TO" values
+/// representing the actor's total **street** bet in abstract-tree chip
+/// units. The rollout tracks cumulative **game** investment, so we
+/// convert: `total_game_invested = street_start + scaled_street_bet`.
+///
+/// `chip_to_unit_scale` converts tree-chip amounts into the rollout's
+/// unit-game space. Equals `ctx.starting_stack / abstract_tree.starting_stack`.
+///
+/// `street_start` is the actor's game investment at the start of the
+/// current street. Reset at each Chance node.
 fn apply_action(
     action: &TreeAction,
     pot: f64,
     invested: [f64; 2],
     actor: usize,
     starting_stack: f64,
+    chip_to_unit_scale: f64,
+    street_start: [f64; 2],
 ) -> (f64, [f64; 2]) {
     let opponent = 1 - actor;
     let mut new_invested = invested;
@@ -414,12 +435,13 @@ fn apply_action(
             (new_pot, new_invested)
         }
         TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
-            // Bet/raise TO this amount (absolute, not increment).
-            // Cap to starting_stack — the abstract tree's amounts may exceed
-            // the unit game's stack when SPR is small.
+            // `amount` is a "raise-TO" street bet in tree-chip units.
+            // Convert to unit-game space and add to street-start base.
+            let scaled_street_bet = *amount * chip_to_unit_scale;
+            let total = (street_start[actor] + scaled_street_bet).min(starting_stack);
             let old = invested[actor];
-            new_invested[actor] = (*amount).min(starting_stack);
-            let new_pot = pot + (new_invested[actor] - old);
+            new_invested[actor] = total;
+            let new_pot = pot + (total - old);
             (new_pot, new_invested)
         }
         TreeAction::AllIn => {
@@ -1199,5 +1221,201 @@ mod tests {
 
         let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
         rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [5.0, 5.0]);
+    }
+
+    // ---- apply_action unit-conversion tests ----
+
+    #[test]
+    fn apply_action_scales_bet_and_adds_to_street_start() {
+        // Abstract tree: starting_stack=200 (chip units).
+        // Unit game: starting_stack=2.27 (unit-game units).
+        // Bet(29) in tree chips = 33% pot bet.
+        // scale = 2.27 / 200 = 0.01136
+        // scaled_street_bet = 29 * 0.01136 = 0.3295
+        // invested[0] = street_start[0] + scaled = 0.5 + 0.3295 = 0.8295
+        let scale = 2.27 / 200.0;
+        let action = TreeAction::Bet(29.0);
+        let pot = 1.0;
+        let invested = [0.5, 0.5];
+        let street_start = [0.5, 0.5];
+        let actor = 0;
+        let starting_stack = 2.27;
+
+        let (new_pot, new_invested) = apply_action(
+            &action, pot, invested, actor, starting_stack, scale, street_start,
+        );
+
+        // invested[0] = 0.5 + 29 * scale = 0.8295
+        let expected_invested = 0.5 + 29.0 * scale;
+        assert!(
+            (new_invested[actor] - expected_invested).abs() < 1e-6,
+            "Bet(29) should give invested={expected_invested:.4}, got {:.4}",
+            new_invested[actor]
+        );
+        // Pot increases by the additional: 0.8295 - 0.5 = 0.3295
+        let expected_pot = pot + (expected_invested - invested[actor]);
+        assert!(
+            (new_pot - expected_pot).abs() < 1e-6,
+            "Pot should be {expected_pot:.4}, got {new_pot:.4}",
+        );
+        // Pot should INCREASE (not decrease)
+        assert!(new_pot > pot, "Pot must increase after a bet");
+    }
+
+    #[test]
+    fn apply_action_raise_after_bet_uses_street_start() {
+        // P0 bet Bet(29), now P1 raises Raise(66).
+        // P0's invested is now 0.83 (from previous bet), P1 still at 0.5.
+        // street_start is still [0.5, 0.5] (same street).
+        // P1 Raise(66): invested[1] = street_start[1] + 66*scale = 0.5 + 0.75 = 1.25
+        let scale = 2.27 / 200.0;
+        let action = TreeAction::Raise(66.0);
+        let pot = 1.33; // after P0's bet
+        let invested = [0.83, 0.5]; // P0 already bet
+        let street_start = [0.5, 0.5]; // same street
+        let actor = 1; // P1 raising
+
+        let (new_pot, new_invested) = apply_action(
+            &action, pot, invested, actor, 2.27, scale, street_start,
+        );
+
+        let expected_invested = 0.5 + 66.0 * scale; // ~1.25
+        assert!(
+            (new_invested[actor] - expected_invested).abs() < 1e-4,
+            "Raise(66) should give invested={expected_invested:.4}, got {:.4}",
+            new_invested[actor]
+        );
+        assert!(new_pot > pot, "Pot must increase after a raise");
+    }
+
+    #[test]
+    fn apply_action_clamps_scaled_bet_to_starting_stack() {
+        // If street_start + scaled bet exceeds starting_stack, clamp to all-in.
+        let scale = 2.27 / 200.0;
+        // Bet(180) in tree chips: street_start[0] + 180 * scale = 0.5 + 2.043 = 2.543
+        // But starting_stack=2.27, so clamp to 2.27.
+        let action = TreeAction::Bet(180.0);
+        let pot = 1.0;
+        let invested = [0.5, 0.5];
+        let street_start = [0.5, 0.5];
+        let actor = 0;
+        let starting_stack = 2.27;
+
+        let (_, new_invested) = apply_action(
+            &action, pot, invested, actor, starting_stack, scale, street_start,
+        );
+
+        assert!(
+            (new_invested[actor] - starting_stack).abs() < 1e-6,
+            "Over-sized bet should clamp to starting_stack={starting_stack}, got {:.4}",
+            new_invested[actor]
+        );
+    }
+
+    #[test]
+    fn apply_action_allin_unaffected_by_scale() {
+        let scale = 0.0227;
+        let action = TreeAction::AllIn;
+        let pot = 1.0;
+        let invested = [0.5, 0.5];
+        let street_start = [0.5, 0.5];
+        let actor = 0;
+        let starting_stack = 2.27;
+
+        let (new_pot, new_invested) = apply_action(
+            &action, pot, invested, actor, starting_stack, scale, street_start,
+        );
+
+        assert!(
+            (new_invested[actor] - starting_stack).abs() < 1e-6,
+            "AllIn should set to starting_stack"
+        );
+        let expected_pot = pot + (starting_stack - invested[actor]);
+        assert!(
+            (new_pot - expected_pot).abs() < 1e-6,
+            "Pot should reflect all-in amount"
+        );
+    }
+
+    #[test]
+    fn apply_action_call_unaffected_by_scale() {
+        let scale = 0.0227;
+        let action = TreeAction::Call;
+        let pot = 1.5;
+        let invested = [0.5, 0.75];
+        let street_start = [0.5, 0.5];
+        let actor = 0;
+        let starting_stack = 2.27;
+
+        let (new_pot, new_invested) = apply_action(
+            &action, pot, invested, actor, starting_stack, scale, street_start,
+        );
+
+        // Call matches opponent's investment
+        assert!(
+            (new_invested[actor] - invested[1]).abs() < 1e-6,
+            "Call should match opponent investment"
+        );
+        let expected_pot = pot + (invested[1] - invested[actor]);
+        assert!(
+            (new_pot - expected_pot).abs() < 1e-6,
+            "Pot should reflect call amount"
+        );
+    }
+
+    #[test]
+    fn apply_action_with_scale_1_adds_bet_to_street_start() {
+        // When scale=1.0 (tree units = rollout units), Bet(22) means
+        // "22 chips on this street" added to street_start.
+        let action = TreeAction::Bet(22.0);
+        let pot = 50.0;
+        let invested = [5.0, 10.0];
+        let street_start = [5.0, 10.0]; // same as invested (start of street)
+        let actor = 0;
+        let starting_stack = 100.0;
+        let scale = 1.0;
+
+        let (new_pot, new_invested) = apply_action(
+            &action, pot, invested, actor, starting_stack, scale, street_start,
+        );
+
+        // invested[0] = street_start[0] + 22 * 1.0 = 5 + 22 = 27
+        assert!(
+            (new_invested[actor] - 27.0).abs() < 1e-6,
+            "With scale=1.0, Bet(22) should add to street_start: got {:.4}",
+            new_invested[actor]
+        );
+        let expected_pot = pot + (27.0 - invested[actor]);
+        assert!((new_pot - expected_pot).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_action_bet_then_call_sequence() {
+        // Full sequence: P0 Bet(29), P1 Call on flop
+        let scale = 2.27 / 200.0;
+        let street_start = [0.5, 0.5];
+
+        // P0 bets
+        let (pot1, inv1) = apply_action(
+            &TreeAction::Bet(29.0), 1.0, [0.5, 0.5], 0, 2.27, scale, street_start,
+        );
+        // P1 calls (matches P0's investment)
+        let (pot2, inv2) = apply_action(
+            &TreeAction::Call, pot1, inv1, 1, 2.27, scale, street_start,
+        );
+
+        // Both players should have equal investment after call
+        assert!(
+            (inv2[0] - inv2[1]).abs() < 1e-6,
+            "After call, investments should match: {:.4} vs {:.4}",
+            inv2[0], inv2[1]
+        );
+        // Pot should have increased by bet amount twice (bet + call)
+        let bet_amount = 29.0 * scale;
+        let expected_pot = 1.0 + bet_amount + bet_amount;
+        assert!(
+            (pot2 - expected_pot).abs() < 1e-6,
+            "Pot should be {expected_pot:.4}, got {pot2:.4}",
+        );
     }
 }
