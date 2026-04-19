@@ -425,4 +425,22 @@ mod tests {
         assert_eq!(item.strength, 42);
         assert_eq!(item.index, 7);
     }
+
+    #[test]
+    fn boundary_evaluator_default_compute_cfvs_both_delegates_to_single_side() {
+        // Mock evaluator that returns [player as f32; num_hands]
+        struct MockEval;
+        impl BoundaryEvaluator for MockEval {
+            fn compute_cfvs(
+                &self, player: usize, _pot: i32, _rs: f64,
+                _opp: &[f32], num_hands: usize, _ci: usize,
+            ) -> Vec<f32> {
+                vec![player as f32; num_hands]
+            }
+        }
+        let e = MockEval;
+        let (oop, ip) = e.compute_cfvs_both(100, 50.0, &vec![0.5; 5], &vec![0.3; 7], 5, 7, 0);
+        assert_eq!(oop, vec![0.0; 5]);
+        assert_eq!(ip, vec![1.0; 7]);
+    }
 }
