@@ -2,7 +2,7 @@ use parking_lot::RwLock;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::continuation::{BiasType, RolloutContext, rollout_from_boundary};
 use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
-use poker_solver_core::blueprint_v2::solver_dispatch::SolverConfig;
+
 use poker_solver_core::blueprint_v2::subgame_cfr::cards_overlap;
 use poker_solver_core::blueprint_v2::{
     LeafEvaluator, Street, SubgameHands,
@@ -43,19 +43,10 @@ pub struct PostflopConfig {
     pub ip_raise_sizes: String,
     pub rake_rate: f64,
     pub rake_cap: f64,
-    /// Max live combos on flop before switching to depth-limited solver.
-    #[serde(default = "default_flop_combo_threshold")]
-    pub flop_combo_threshold: usize,
-    /// Max live combos on turn before switching to depth-limited solver.
-    #[serde(default = "default_turn_combo_threshold")]
-    pub turn_combo_threshold: usize,
     /// Abstract tree node index at the postflop start (for CBV boundary mapping).
     #[serde(default)]
     pub abstract_node_idx: Option<u32>,
 }
-
-fn default_flop_combo_threshold() -> usize { 200 }
-fn default_turn_combo_threshold() -> usize { 300 }
 
 impl Default for PostflopConfig {
     fn default() -> Self {
@@ -70,8 +61,6 @@ impl Default for PostflopConfig {
             ip_raise_sizes: "a".to_string(),
             rake_rate: 0.0,
             rake_cap: 0.0,
-            flop_combo_threshold: default_flop_combo_threshold(),
-            turn_combo_threshold: default_turn_combo_threshold(),
             abstract_node_idx: None,
         }
     }
@@ -1411,12 +1400,6 @@ fn postflop_solve_street_impl(
     let filtered_oop = state.filtered_oop_weights.read().clone();
     let filtered_ip = state.filtered_ip_weights.read().clone();
 
-    let solver_config = SolverConfig {
-        flop_combo_threshold: config.flop_combo_threshold,
-        turn_combo_threshold: config.turn_combo_threshold,
-        ..SolverConfig::default()
-    };
-
     // Reset progress atomics.
     state.current_iteration.store(0, Ordering::Relaxed);
     state.solve_complete.store(false, Ordering::Relaxed);
@@ -1427,7 +1410,7 @@ fn postflop_solve_street_impl(
 
     // Always use depth-limited solver (full-depth range-solver path removed).
     let cbv_ctx = state.cbv_context.read().clone();
-    solve_depth_limited(state, &config, board, max_iterations, &solver_config, &filtered_oop, &filtered_ip, cbv_ctx,
+    solve_depth_limited(state, &config, board, max_iterations, &filtered_oop, &filtered_ip, cbv_ctx,
         rollout_bias_factor, rollout_num_samples, rollout_opponent_samples, rollout_enumerate_depth,
         leaf_eval_interval, range_clamp_threshold)
 }
@@ -1439,7 +1422,6 @@ fn solve_depth_limited(
     config: &PostflopConfig,
     board: Vec<String>,
     max_iterations: Option<u32>,
-    solver_config: &SolverConfig,
     filtered_oop: &Option<Vec<f32>>,
     filtered_ip: &Option<Vec<f32>>,
     cbv_context: Option<Arc<CbvContext>>,
@@ -1450,7 +1432,7 @@ fn solve_depth_limited(
     leaf_eval_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
 ) -> Result<(), String> {
-    let max_iters = max_iterations.unwrap_or(solver_config.depth_limited_iterations);
+    let max_iters = max_iterations.unwrap_or(200);
     state.max_iterations.store(max_iters, Ordering::Relaxed);
     state
         .exploitability_bits

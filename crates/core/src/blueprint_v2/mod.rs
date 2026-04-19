@@ -14,7 +14,7 @@ pub mod exploitable_spots;
 pub mod full_depth_solver;
 pub mod game_tree;
 pub mod mccfr;
-pub mod solver_dispatch;
+
 pub mod storage;
 pub mod leaf_evaluator;
 pub mod subgame;
