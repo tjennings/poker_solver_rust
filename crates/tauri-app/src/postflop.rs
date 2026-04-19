@@ -28,20 +28,6 @@ use std::sync::Arc;
 use crate::exploration::ActionInfo;
 
 // ---------------------------------------------------------------------------
-// BoundaryCfvs — per-player boundary counterfactual values
-// ---------------------------------------------------------------------------
-
-/// Counterfactual values at a depth boundary for both players.
-///
-/// Each vector has one entry per combo in the canonical combo list.
-/// Values are in pot-fraction units (f64 precision for hybrid cache).
-#[derive(Clone, Debug, PartialEq)]
-pub struct BoundaryCfvs {
-    pub oop_cfvs: Vec<f64>,
-    pub ip_cfvs: Vec<f64>,
-}
-
-// ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
 
@@ -381,7 +367,7 @@ fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
 ///
 /// Values are in chip units (not pot-fraction).  Each vector is indexed by
 /// combo index (same ordering as `SubgameHands::combos`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundaryCfvs {
     /// CFVs for the out-of-position player (traverser=0).
     pub oop_cfvs: Vec<f64>,
