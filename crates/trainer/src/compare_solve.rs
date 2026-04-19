@@ -23,6 +23,7 @@ use poker_solver_core::hands::all_hands;
 use poker_solver_tauri::{
     GameSession, SolveBoundaryEvaluator, build_solve_game,
     parse_rs_poker_card, range_solver_to_rs_card, seed_solver_with_blueprint,
+    compute_boundary_reach,
 };
 use poker_solver_tauri::postflop::{CbvContext, RolloutLeafEvaluator};
 
@@ -412,6 +413,8 @@ fn setup_subgame_boundaries(
     ctx: &CbvContext,
     board_cards: &[poker_solver_core::poker::Card],
     abstract_node_idx: u32,
+    blueprint_root: u32,
+    street: Street,
     eff_stack: i32,
     pot: i32,
     enumerate_depth: Option<u8>,
@@ -491,6 +494,18 @@ fn setup_subgame_boundaries(
         let precomp_counter = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
 
+        // Compute per-boundary reach by walking the subgame tree
+        // with blueprint strategy probabilities.
+        let boundary_reach = compute_boundary_reach(
+            game,
+            &ctx.strategy,
+            &ctx.all_buckets,
+            &ctx.abstract_tree,
+            board_cards,
+            street,
+            blueprint_root,
+        );
+
         for ordinal in 0..n_boundaries {
             let pot_at_boundary = game.boundary_pot(ordinal);
 
@@ -517,14 +532,14 @@ fn setup_subgame_boundaries(
 
                     let opp = player ^ 1;
                     let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                    let opp_weights = game.initial_weights(opp);
+                    let opp_weights = &boundary_reach[ordinal][opp];
                     for (gi, &ci) in game_to_combo_for_precomp[opp].iter().enumerate() {
                         if ci < opp_combo_reach.len() && gi < opp_weights.len() {
                             opp_combo_reach[ci] = opp_weights[gi] as f64;
                         }
                     }
                     let mut hero_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                    let hero_weights = game.initial_weights(player);
+                    let hero_weights = &boundary_reach[ordinal][player];
                     for (gi, &ci) in game_to_combo_for_precomp[player].iter().enumerate() {
                         if ci < hero_combo_reach.len() && gi < hero_weights.len() {
                             hero_combo_reach[ci] = hero_weights[gi] as f64;
@@ -934,7 +949,8 @@ pub fn run(
     let precomp_start = Instant::now();
     setup_subgame_boundaries(
         &mut subgame_game, &ctx, &board_cards,
-        abstract_node_idx, eff_stack, pot,
+        abstract_node_idx, current_node, street,
+        eff_stack, pot,
         enumerate_depth, opponent_samples, verbose,
     );
     let precomp_wall = precomp_start.elapsed().as_secs_f64();

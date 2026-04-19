@@ -42,6 +42,7 @@ pub use postflop::{
     CbvContext, PostflopState, set_cbv_context,
     parse_rs_poker_card, RolloutLeafEvaluator,
     seed_solver_with_blueprint,
+    compute_boundary_reach,
 };
 
 pub use simulation::{

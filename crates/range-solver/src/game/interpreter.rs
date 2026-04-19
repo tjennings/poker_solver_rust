@@ -396,6 +396,18 @@ impl PostFlopGame {
         }
     }
 
+    /// Returns the boundary ordinal for a given node arena index, or `None`
+    /// if the node is not a depth boundary.
+    pub fn boundary_ordinal(&self, node_index: usize) -> Option<usize> {
+        if node_index < self.node_to_boundary.len() {
+            let ordinal = self.node_to_boundary[node_index];
+            if ordinal != u32::MAX {
+                return Some(ordinal as usize);
+            }
+        }
+        None
+    }
+
     /// Initialise multi-continuation boundary storage with K continuation
     /// strategies per boundary node.
     ///

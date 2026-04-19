@@ -1000,6 +1000,181 @@ pub fn seed_solver_with_blueprint(
 }
 
 // ---------------------------------------------------------------------------
+// Boundary reach propagation
+// ---------------------------------------------------------------------------
+
+/// Compute per-boundary opponent reach by walking the subgame tree from root,
+/// applying blueprint strategy probabilities at each decision node.
+///
+/// Returns `Vec<[Vec<f32>; 2]>` where `result[ordinal][player]` is the
+/// per-hand reach vector for that player at that boundary. Each hand's
+/// reach is `initial_weight * product(blueprint_prob for each action on
+/// the path where that player acts)`.
+///
+/// This replaces the naive `game.initial_weights(player)` which ignores
+/// the action path leading to each boundary.
+pub fn compute_boundary_reach(
+    game: &PostFlopGame,
+    strategy: &BlueprintV2Strategy,
+    all_buckets: &AllBuckets,
+    tree: &GameTree,
+    board: &[RsPokerCard],
+    street: Street,
+    blueprint_root: u32,
+) -> Vec<[Vec<f32>; 2]> {
+    use range_solver::interface::{Game, GameNode};
+
+    let n_boundaries = game.num_boundary_nodes();
+    let num_hands = [game.num_private_hands(0), game.num_private_hands(1)];
+
+    // Initialize result: one entry per boundary, each with per-player reach.
+    let mut result: Vec<[Vec<f32>; 2]> = (0..n_boundaries)
+        .map(|_| [vec![0.0f32; num_hands[0]], vec![0.0f32; num_hands[1]]])
+        .collect();
+
+    if n_boundaries == 0 {
+        return result;
+    }
+
+    // Build range-solver arena index -> blueprint decision index map,
+    // mirroring seed_solver_with_blueprint's parallel DFS.
+    let decision_map = tree.decision_index_map();
+    let mut arena_to_bp: std::collections::HashMap<usize, (usize, u8)> =
+        std::collections::HashMap::new();
+
+    // DFS stack: (range_solver_arena_index, blueprint_tree_arena_index).
+    let mut dfs_stack: Vec<(usize, u32)> = vec![(0, blueprint_root)];
+
+    while let Some((rs_idx, bp_idx)) = dfs_stack.pop() {
+        let bp_node = &tree.nodes[bp_idx as usize];
+
+        match bp_node {
+            BlueprintGameNode::Decision { children, player, .. } => {
+                let dec_idx = decision_map[bp_idx as usize];
+                if dec_idx != u32::MAX {
+                    arena_to_bp.insert(rs_idx, (dec_idx as usize, *player));
+                }
+
+                let rs_children = game.child_indices(rs_idx);
+                let n = rs_children.len().min(children.len());
+                for i in (0..n).rev() {
+                    dfs_stack.push((rs_children[i], children[i]));
+                }
+            }
+            BlueprintGameNode::Chance { child, .. } => {
+                let rs_children = game.child_indices(rs_idx);
+                if rs_children.len() == 1 {
+                    dfs_stack.push((rs_children[0], *child));
+                }
+                // Multi-child chance (card deals): can't match 1:1.
+                // For single-street subgames this shouldn't happen.
+            }
+            BlueprintGameNode::Terminal { .. } => {}
+        }
+    }
+
+    let board_rs: Vec<RsPokerCard> = board.to_vec();
+
+    // DFS with reach vectors.
+    // Stack entries: (rs_arena_index, reach_p0, reach_p1).
+    let initial_p0 = game.initial_weights(0).to_vec();
+    let initial_p1 = game.initial_weights(1).to_vec();
+    let mut reach_stack: Vec<(usize, Vec<f32>, Vec<f32>)> =
+        vec![(0, initial_p0, initial_p1)];
+
+    while let Some((rs_idx, reach_0, reach_1)) = reach_stack.pop() {
+        // Check if this node is a depth boundary.
+        let is_boundary = game.boundary_ordinal(rs_idx).is_some();
+        if is_boundary {
+            if let Some(ord) = game.boundary_ordinal(rs_idx) {
+                result[ord][0] = reach_0;
+                result[ord][1] = reach_1;
+            }
+            continue;
+        }
+
+        // Use child_indices (public API) to get children.
+        let child_indices = game.child_indices(rs_idx);
+        if child_indices.is_empty() {
+            // Terminal node (fold/showdown) — not a boundary.
+            continue;
+        }
+
+        // Inspect node properties via node_at.
+        let node = game.node_at(rs_idx);
+        let is_chance = node.is_chance();
+        let acting_player = node.acting_player();
+        drop(node); // release lock
+
+        let n_children = child_indices.len();
+
+        if is_chance {
+            // At chance nodes, reach passes through unchanged.
+            for &ci in &child_indices {
+                reach_stack.push((ci, reach_0.clone(), reach_1.clone()));
+            }
+            continue;
+        }
+
+        // Decision node: look up blueprint strategy and filter reach.
+        if let Some(&(dec_idx, _bp_player)) = arena_to_bp.get(&rs_idx) {
+            let private_cards = game.private_cards(acting_player);
+
+            // For each action (child), compute the reach after applying
+            // the blueprint probability for that action.
+            for (action_idx, &ci) in child_indices.iter().enumerate() {
+                let mut child_reach_0 = reach_0.clone();
+                let mut child_reach_1 = reach_1.clone();
+
+                // Apply blueprint strategy to the acting player's reach.
+                let reach_to_filter = if acting_player == 0 {
+                    &mut child_reach_0
+                } else {
+                    &mut child_reach_1
+                };
+
+                for (h, &(c1, c2)) in private_cards.iter().enumerate() {
+                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                    let bucket =
+                        all_buckets.get_bucket(street, [rs_c1, rs_c2], &board_rs);
+                    let probs = strategy.get_action_probs(dec_idx, bucket);
+
+                    let prob = if action_idx < probs.len() {
+                        probs[action_idx]
+                    } else {
+                        1.0 / n_children as f32
+                    };
+
+                    reach_to_filter[h] *= prob;
+                }
+
+                reach_stack.push((ci, child_reach_0, child_reach_1));
+            }
+        } else {
+            // No blueprint mapping — pass reach through uniformly
+            // (divide by num_actions to maintain reach sum invariant).
+            let scale = 1.0 / n_children as f32;
+            for &ci in &child_indices {
+                let mut child_reach_0 = reach_0.clone();
+                let mut child_reach_1 = reach_1.clone();
+                let reach_to_scale = if acting_player == 0 {
+                    &mut child_reach_0
+                } else {
+                    &mut child_reach_1
+                };
+                for r in reach_to_scale.iter_mut() {
+                    *r *= scale;
+                }
+                reach_stack.push((ci, child_reach_0, child_reach_1));
+            }
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Solve cache
 // ---------------------------------------------------------------------------
 
@@ -3268,5 +3443,306 @@ mod tests {
             &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
         );
         assert!(result.is_ok(), "build_subgame_solver with None neural eval failed: {:?}", result.err());
+    }
+
+    // ---- compute_boundary_reach tests ----
+
+    #[test]
+    fn boundary_reach_differs_from_initial_weights_with_nonuniform_blueprint() {
+        // Build a turn game with depth_limit=0 so boundaries exist at the
+        // river transition. The blueprint strategy is non-uniform (90% check),
+        // so opponent reach at check-path boundaries should be higher than at
+        // bet-path boundaries.
+        use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::interface::Game;
+
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![vec![1.0f32]]; // 100% pot bet
+        let oop_w = weights_from_range("AA,KK,QQ,JJ,TT");
+        let ip_w = weights_from_range("99,88,77,66,55");
+
+        let (game, _, _, _, _) = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
+        ).unwrap();
+
+        let n_boundaries = game.num_boundary_nodes();
+        assert!(n_boundaries > 0, "turn game should have boundary nodes");
+
+        // Build a blueprint tree for the turn.
+        let blueprint_tree = V2GameTree::build_subgame(
+            Street::Turn,
+            100.0,
+            [100.0; 2],
+            200.0,
+            &[vec![1.0]],
+            None, // no depth limit in blueprint (it models full game)
+            0,
+        );
+
+        // Create strategy: all decision nodes have 1 bucket,
+        // action 0 (check/fold) gets 90% probability.
+        let bucket_counts: [u16; 4] = [169, 1, 1, 1];
+        let mut action_probs = Vec::new();
+        let mut node_action_counts = Vec::new();
+        let mut node_street_indices = Vec::new();
+
+        for node in &blueprint_tree.nodes {
+            if let poker_solver_core::blueprint_v2::game_tree::GameNode::Decision { actions, street, .. } = node {
+                let n_actions = actions.len() as u16;
+                node_action_counts.push(n_actions);
+                node_street_indices.push(*street as u8);
+                let mut probs = vec![0.1 / (n_actions as f32 - 1.0); n_actions as usize];
+                probs[0] = 0.9;
+                action_probs.extend_from_slice(&probs);
+            }
+        }
+
+        let mut bp_strategy = BlueprintV2Strategy {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 100,
+            elapsed_minutes: 1,
+            node_offsets: Vec::new(),
+        };
+        bp_strategy.post_deserialize();
+
+        let mut all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        // Compute boundary reach.
+        let reach = compute_boundary_reach(
+            &game,
+            &bp_strategy,
+            &all_buckets,
+            &blueprint_tree,
+            &board_cards,
+            Street::Turn,
+            blueprint_tree.root,
+        );
+
+        assert_eq!(reach.len(), n_boundaries, "one reach entry per boundary");
+
+        // The reach should differ from initial_weights because the blueprint
+        // strategy is non-uniform. At least one boundary should have reach
+        // values that differ from the initial weights.
+        let initial_oop = game.initial_weights(0);
+        let initial_ip = game.initial_weights(1);
+
+        let mut any_differ_p0 = false;
+        let mut any_differ_p1 = false;
+        for ordinal in 0..n_boundaries {
+            for (h, &iw) in initial_oop.iter().enumerate() {
+                if iw > 0.0 && (reach[ordinal][0][h] - iw).abs() > 1e-6 {
+                    any_differ_p0 = true;
+                }
+            }
+            for (h, &iw) in initial_ip.iter().enumerate() {
+                if iw > 0.0 && (reach[ordinal][1][h] - iw).abs() > 1e-6 {
+                    any_differ_p1 = true;
+                }
+            }
+        }
+
+        assert!(
+            any_differ_p0 || any_differ_p1,
+            "boundary reach should differ from initial_weights with non-uniform blueprint"
+        );
+    }
+
+    #[test]
+    fn boundary_reach_equals_initial_weights_with_uniform_blueprint() {
+        // When the blueprint strategy is perfectly uniform, boundary reach
+        // should equal initial weights (every action equally likely means
+        // no filtering).
+        use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::interface::Game;
+
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+        let bet_sizes = vec![vec![1.0f32]];
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        let (game, _, _, _, _) = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
+        ).unwrap();
+
+        let n_boundaries = game.num_boundary_nodes();
+        assert!(n_boundaries > 0);
+
+        let blueprint_tree = V2GameTree::build_subgame(
+            Street::Turn, 100.0, [100.0; 2], 200.0,
+            &[vec![1.0]], None, 0,
+        );
+
+        // Uniform strategy: each action gets equal probability.
+        let bucket_counts: [u16; 4] = [169, 1, 1, 1];
+        let mut action_probs = Vec::new();
+        let mut node_action_counts = Vec::new();
+        let mut node_street_indices = Vec::new();
+
+        for node in &blueprint_tree.nodes {
+            if let poker_solver_core::blueprint_v2::game_tree::GameNode::Decision { actions, street, .. } = node {
+                let n_actions = actions.len() as u16;
+                node_action_counts.push(n_actions);
+                node_street_indices.push(*street as u8);
+                let prob = 1.0 / n_actions as f32;
+                let probs = vec![prob; n_actions as usize];
+                action_probs.extend_from_slice(&probs);
+            }
+        }
+
+        let mut bp_strategy = BlueprintV2Strategy {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 100,
+            elapsed_minutes: 1,
+            node_offsets: Vec::new(),
+        };
+        bp_strategy.post_deserialize();
+
+        let mut all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        let reach = compute_boundary_reach(
+            &game,
+            &bp_strategy,
+            &all_buckets,
+            &blueprint_tree,
+            &board_cards,
+            Street::Turn,
+            blueprint_tree.root,
+        );
+
+        // With uniform strategy, each boundary should have reach that sums
+        // to the product of 1/num_actions at each decision node along the path.
+        // But the reach for hands with non-zero initial weight should all be
+        // scaled by the same factor (uniform means no hand-specific filtering).
+        // In particular, all hands within a boundary should have proportional
+        // reach to their initial weights.
+        let initial_oop = game.initial_weights(0);
+        for ordinal in 0..n_boundaries {
+            let mut ratio: Option<f32> = None;
+            for (h, &iw) in initial_oop.iter().enumerate() {
+                if iw > 0.0 {
+                    let r = reach[ordinal][0][h] / iw;
+                    if let Some(prev) = ratio {
+                        assert!(
+                            (r - prev).abs() < 0.01,
+                            "uniform blueprint should produce proportional reach: \
+                             hand {h} ratio={r:.4} vs prev={prev:.4}"
+                        );
+                    }
+                    ratio = Some(r);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_reach_preserves_zero_weight_hands() {
+        // Hands with zero initial weight should have zero reach at all boundaries.
+        use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::interface::Game;
+
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Six, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Spade),
+        ];
+        let bet_sizes = vec![vec![0.5f32]];
+        // Narrow ranges mean most hands have zero weight.
+        let oop_w = weights_from_range("AA");
+        let ip_w = weights_from_range("KK");
+
+        let (game, _, _, _, _) = build_subgame_solver(
+            &board_cards, &bet_sizes, 100, [200, 200],
+            &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
+        ).unwrap();
+
+        let n_boundaries = game.num_boundary_nodes();
+        assert!(n_boundaries > 0);
+
+        let blueprint_tree = V2GameTree::build_subgame(
+            Street::Turn, 100.0, [100.0; 2], 200.0,
+            &[vec![0.5]], None, 0,
+        );
+
+        let bucket_counts: [u16; 4] = [169, 1, 1, 1];
+        let mut action_probs = Vec::new();
+        let mut node_action_counts = Vec::new();
+        let mut node_street_indices = Vec::new();
+
+        for node in &blueprint_tree.nodes {
+            if let poker_solver_core::blueprint_v2::game_tree::GameNode::Decision { actions, street, .. } = node {
+                let n = actions.len() as u16;
+                node_action_counts.push(n);
+                node_street_indices.push(*street as u8);
+                let mut probs = vec![0.05; n as usize];
+                probs[0] = 0.9;
+                // Normalize so they sum to ~1.
+                let remainder = 1.0 - 0.9;
+                for p in probs.iter_mut().skip(1) {
+                    *p = remainder / (n as f32 - 1.0);
+                }
+                action_probs.extend_from_slice(&probs);
+            }
+        }
+
+        let mut bp_strategy = BlueprintV2Strategy {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 100,
+            elapsed_minutes: 1,
+            node_offsets: Vec::new(),
+        };
+        bp_strategy.post_deserialize();
+
+        let mut all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        let reach = compute_boundary_reach(
+            &game,
+            &bp_strategy,
+            &all_buckets,
+            &blueprint_tree,
+            &board_cards,
+            Street::Turn,
+            blueprint_tree.root,
+        );
+
+        let initial_oop = game.initial_weights(0);
+        for ordinal in 0..n_boundaries {
+            for (h, &iw) in initial_oop.iter().enumerate() {
+                if iw == 0.0 {
+                    assert!(
+                        reach[ordinal][0][h] == 0.0,
+                        "zero-weight hand {h} should have zero reach at boundary {ordinal}, got {}",
+                        reach[ordinal][0][h]
+                    );
+                }
+            }
+        }
     }
 }

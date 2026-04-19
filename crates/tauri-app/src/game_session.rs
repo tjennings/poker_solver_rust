@@ -1927,6 +1927,25 @@ pub fn game_solve_core(
                 let precomp_counter = Arc::new(AtomicU64::new(0));
                 let start = std::time::Instant::now();
 
+                // Compute per-boundary reach by walking the subgame tree
+                // with blueprint strategy probabilities. This replaces
+                // game.initial_weights(player) which ignores the action
+                // path leading to each boundary.
+                let precomp_street = match board_cards_for_precomp.len() {
+                    3 => Street::Flop,
+                    4 => Street::Turn,
+                    _ => Street::River,
+                };
+                let boundary_reach = crate::postflop::compute_boundary_reach(
+                    &game,
+                    &ctx.strategy,
+                    &ctx.all_buckets,
+                    &ctx.abstract_tree,
+                    &board_cards_for_precomp,
+                    precomp_street,
+                    current_node_idx,
+                );
+
                 for ordinal in 0..n_boundaries {
                     let pot_at_boundary = game.boundary_pot(ordinal);
 
@@ -1953,17 +1972,17 @@ pub fn game_solve_core(
                                 eval.enumerate_decision_depth = depth;
                             }
                             eval.call_counter = Arc::clone(&precomp_counter);
-                            // Map game-ordering initial weights to combo-ordering reach.
+                            // Map per-boundary reach to combo-ordering reach.
                             let opp = player ^ 1;
                             let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                            let opp_weights = game.initial_weights(opp);
+                            let opp_weights = &boundary_reach[ordinal][opp];
                             for (gi, &ci) in game_to_combo_for_precomp[opp].iter().enumerate() {
                                 if ci < opp_combo_reach.len() && gi < opp_weights.len() {
                                     opp_combo_reach[ci] = opp_weights[gi] as f64;
                                 }
                             }
                             let mut hero_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                            let hero_weights = game.initial_weights(player);
+                            let hero_weights = &boundary_reach[ordinal][player];
                             for (gi, &ci) in game_to_combo_for_precomp[player].iter().enumerate() {
                                 if ci < hero_combo_reach.len() && gi < hero_weights.len() {
                                     hero_combo_reach[ci] = hero_weights[gi] as f64;
