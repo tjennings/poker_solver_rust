@@ -1549,6 +1549,26 @@ pub fn game_get_state_core(session_state: &GameSessionState, source: Option<Stri
                 state.position = position.clone();
             }
         }
+
+        // Diagnostic: rate-limited log when the polled matrix first-cell changes
+        {
+            use std::sync::atomic::AtomicU32;
+            static LAST_LOGGED_FIRST_CELL: AtomicU32 = AtomicU32::new(0);
+            if let Some(ref m) = state.matrix {
+                if let Some(first_row) = m.cells.first() {
+                    if let Some(first_cell) = first_row.first() {
+                        let bits = first_cell.probabilities.first().copied().unwrap_or(0.0).to_bits();
+                        let prev = LAST_LOGGED_FIRST_CELL.swap(bits, Ordering::Relaxed);
+                        if prev != bits {
+                            eprintln!(
+                                "[poll] matrix first_cell.probabilities[0] changed: {:.6}",
+                                first_cell.probabilities.first().copied().unwrap_or(0.0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(state)
@@ -2017,6 +2037,12 @@ pub fn game_solve_core(
         }
 
         // Initial matrix snapshot
+        {
+            game.back_to_root();
+            let strat = game.strategy();
+            let first_vals: Vec<f32> = strat.iter().take(8).copied().collect();
+            eprintln!("[solve] t=0 snapshot: strategy[0..8]={first_vals:?}");
+        }
         let matrix = build_solve_matrix(&mut game, None);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
 
@@ -2049,6 +2075,10 @@ pub fn game_solve_core(
             // because the boundary CFV cache is strategy-dependent and would give
             // incorrect values for the best-response traversal.
             if t.is_multiple_of(eval_interval) {
+                game.back_to_root();
+                let strat = game.strategy();
+                let first_vals: Vec<f32> = strat.iter().take(8).copied().collect();
+                eprintln!("[solve] t={t} snapshot: strategy[0..8]={first_vals:?}");
                 let matrix = build_solve_matrix(&mut game, None);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
             }
