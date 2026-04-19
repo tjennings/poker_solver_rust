@@ -9,17 +9,19 @@ from pathlib import Path
 
 import numpy as np
 
-from cfvnet.constants import DECK_SIZE, INPUT_SIZE, NUM_COMBOS, NUM_RANKS
+from cfvnet.constants import (
+    DECK_SIZE,
+    INPUT_SIZE,
+    NUM_COMBOS,
+    NUM_RANKS,
+    RECORD_SIZE_RIVER,
+    record_size,
+)
 
 # Byte sizes for the fixed portion of a record (after board).
 _F32_BYTES = 4
 _RANGE_BYTES = NUM_COMBOS * _F32_BYTES  # 5304
 _MASK_BYTES = NUM_COMBOS  # 1326
-
-# Fixed record size for 5-card boards (river).
-# layout: board_size(1) + board(5) + pot(4) + stack(4) + player(1) + game_value(4)
-#         + oop_range(5304) + ip_range(5304) + cfvs(5304) + valid_mask(1326) = 17257
-RECORD_SIZE_RIVER = 1 + 5 + 4 + 4 + 1 + 4 + _RANGE_BYTES * 3 + _MASK_BYTES
 
 
 @dataclass
@@ -188,12 +190,33 @@ def _resolve_bin_files(path: Path) -> list[Path]:
 
 
 def _count_records_in_file(path: Path) -> int:
-    """Count records in a binary file by dividing file size by record size."""
+    """Count records in a binary file by dividing file size by record size.
+
+    Peeks at the first byte (the board_size prefix) to determine the
+    per-record size. Assumes all records in a shard have the same board_size,
+    which matches the Rust producer's invariant.
+    """
     size = path.stat().st_size
-    if size % RECORD_SIZE_RIVER != 0:
-        # Variable board size or partial records — fall back to sequential read
+    if size == 0:
+        return 0
+    with open(path, "rb") as fh:
+        header = fh.read(1)
+    if len(header) < 1:
+        return 0
+    board_size = header[0]
+    rec_size = record_size(board_size)
+    if size % rec_size != 0:
         return -1
-    return size // RECORD_SIZE_RIVER
+    return size // rec_size
+
+
+def _peek_record_size(path: Path) -> int:
+    """Return the per-record byte size for a shard, based on its first byte."""
+    with open(path, "rb") as fh:
+        header = fh.read(1)
+    if len(header) < 1:
+        raise ValueError(f"Empty shard file: {path}")
+    return record_size(header[0])
 
 
 def _load_bulk(files: list[Path]) -> BoundaryDataset:
@@ -276,8 +299,13 @@ def _decode_file_records(
     """Decode raw bytes from one file into pre-allocated arrays.
 
     Parses the fixed-layout binary format directly with numpy slicing.
+    Assumes all records in this buffer share the same board_size (matching
+    the Rust producer's per-shard uniformity invariant).
     """
-    rec_size = RECORD_SIZE_RIVER
+    if n_records == 0:
+        return
+    board_size = int(raw[0])
+    rec_size = record_size(board_size)
     for i in range(n_records):
         base = i * rec_size
         row = offset + i
@@ -299,9 +327,10 @@ def _decode_single_record(
     row: int,
 ) -> None:
     """Decode one record from raw bytes into output arrays."""
-    # Skip board_size byte, read 5 board cards
-    board = raw[base + 1: base + 6].astype(np.int32)
-    pos = base + 6
+    # Read board_size prefix byte, then that many board cards.
+    board_size = int(raw[base])
+    board = raw[base + 1: base + 1 + board_size].astype(np.int32)
+    pos = base + 1 + board_size
 
     # pot(f32), stack(f32), player(u8), game_value(f32)
     pot = np.frombuffer(raw[pos:pos + 4].tobytes(), dtype=np.float32)[0]
@@ -442,6 +471,8 @@ class LazyBoundaryDataset:
 
     def __init__(self, files: list[Path]) -> None:
         self._files: list[Path] = []
+        # Per-file record size (bytes). Shards are uniform in board_size.
+        self._file_record_sizes: list[int] = []
         # (file_index, byte_offset) per record
         self._index: list[tuple[int, int]] = []
         skipped = 0
@@ -451,10 +482,12 @@ class LazyBoundaryDataset:
                 if n < 0:
                     skipped += 1
                 continue
+            rec_size = _peek_record_size(f)
             file_idx = len(self._files)
             self._files.append(f)
+            self._file_record_sizes.append(rec_size)
             for i in range(n):
-                self._index.append((file_idx, i * RECORD_SIZE_RIVER))
+                self._index.append((file_idx, i * rec_size))
 
         # Per-worker file handle cache (populated lazily in __getitem__).
         # Each DataLoader worker is a separate process with its own copy.
@@ -497,7 +530,7 @@ class LazyBoundaryDataset:
             fh = open(self._files[file_idx], "rb")  # noqa: SIM115
             self._handle_cache[file_idx] = fh
         fh.seek(offset)
-        buf = fh.read(RECORD_SIZE_RIVER)
+        buf = fh.read(self._file_record_sizes[file_idx])
         return np.frombuffer(buf, dtype=np.uint8).copy()
 
 

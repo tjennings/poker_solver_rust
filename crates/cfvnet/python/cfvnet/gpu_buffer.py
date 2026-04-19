@@ -21,9 +21,9 @@ import torch
 
 from cfvnet.constants import INPUT_SIZE, NUM_COMBOS
 from cfvnet.data import (
-    RECORD_SIZE_RIVER,
     _count_records_in_file,
     _decode_single_record,
+    _peek_record_size,
     _resolve_bin_files,
 )
 
@@ -53,9 +53,9 @@ class GpuRingBuffer:
         self._capacity = capacity
         self._num_workers = num_workers
 
-        # Build file index.
+        # Build file index.  Each entry: (path, byte_offset, record_size).
         files = _resolve_bin_files(data_path)
-        self._file_index: list[tuple[str, int]] = []
+        self._file_index: list[tuple[str, int, int]] = []
         skipped = 0
         for f in files:
             n = _count_records_in_file(f)
@@ -63,8 +63,9 @@ class GpuRingBuffer:
                 if n < 0:
                     skipped += 1
                 continue
+            rec_size = _peek_record_size(f)
             for i in range(n):
-                self._file_index.append((str(f), i * RECORD_SIZE_RIVER))
+                self._file_index.append((str(f), i * rec_size, rec_size))
 
         if skipped > 0:
             print(f"  Skipped {skipped} non-standard files")
@@ -249,7 +250,7 @@ class GpuRingBuffer:
 
 
 def _fill_chunk(
-    file_index: list[tuple[str, int]],
+    file_index: list[tuple[str, int, int]],
     total_records: int,
     record_indices: list[int],
     shared_buf: mp.Array,
@@ -273,11 +274,11 @@ def _fill_chunk(
 
     for i in range(count):
         rec_idx = record_indices[i]
-        fstr, byte_offset = file_index[rec_idx]
+        fstr, byte_offset, rec_size = file_index[rec_idx]
 
         fh = _get_handle(handles, fstr, 128)
         fh.seek(byte_offset)
-        raw = np.frombuffer(fh.read(RECORD_SIZE_RIVER), dtype=np.uint8).copy()
+        raw = np.frombuffer(fh.read(rec_size), dtype=np.uint8).copy()
         _decode_single_record(raw, 0, inp, tgt, msk, rng, gv, sw, 0)
 
         # Write to shared buffer (this worker's slice, no contention).

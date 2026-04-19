@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-19T20:03:47Z
-updated_at: 2026-04-19T20:03:47Z
+updated_at: 2026-04-19T20:10:50Z
 ---
 
 Code review (2026-04-19) of `crates/cfvnet/python/` found four bugs that must be fixed before turn-net training can begin. Two are critical (silently corrupt or skip turn data), one breaks ONNX dynamic batch export, one breaks checkpoint resume past epoch 9.
@@ -43,13 +43,13 @@ Fix: `sorted(..., key=lambda p: int(p.stem.replace("checkpoint_epoch", "")))`
 
 ## Todo
 
-- [ ] Fix 1: variable board_size in `_decode_single_record`
-- [ ] Fix 2: variable record_size everywhere (`_count_records_in_file`, `gpu_buffer.py` reads/seeks)
-- [ ] Add a `record_size(board_size)` helper that mirrors the Rust side
+- [x] Fix 1: variable board_size in `_decode_single_record`
+- [x] Fix 2: variable record_size everywhere (`_count_records_in_file`, `gpu_buffer.py` reads/seeks)
+- [x] Add a `record_size(board_size)` helper that mirrors the Rust side
 - [ ] Fix 3: ONNX export dynamic batch — use `dynamic_axes`, drop `torch.export.Dim`
 - [ ] Fix 4: numeric checkpoint sort in `train.py`, `eval_boundary.py`, `train_boundary.py`
-- [ ] Add a Python test that decodes a turn-format record (board_size=4) end-to-end and asserts every field matches what the Rust producer wrote
-- [ ] Add a Python test for `record_size` against known river/turn/flop sizes
+- [x] Add a Python test that decodes a turn-format record (board_size=4) end-to-end and asserts every field matches what the Rust producer wrote
+- [x] Add a Python test for `record_size` against known river/turn/flop sizes
 - [ ] Add a test that asserts the ONNX export accepts batch=1 and batch=N
 - [ ] Add a test for checkpoint sort ordering past epoch 9
 - [ ] Run full Python test suite (`pytest crates/cfvnet/python/`) — all pass
