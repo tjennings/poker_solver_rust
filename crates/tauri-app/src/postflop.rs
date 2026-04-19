@@ -28,6 +28,20 @@ use std::sync::Arc;
 use crate::exploration::ActionInfo;
 
 // ---------------------------------------------------------------------------
+// BoundaryCfvs — per-player boundary counterfactual values
+// ---------------------------------------------------------------------------
+
+/// Counterfactual values at a depth boundary for both players.
+///
+/// Each vector has one entry per combo in the canonical combo list.
+/// Values are in pot-fraction units (f64 precision for hybrid cache).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryCfvs {
+    pub oop_cfvs: Vec<f64>,
+    pub ip_cfvs: Vec<f64>,
+}
+
+// ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
 

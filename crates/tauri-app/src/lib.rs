@@ -1,5 +1,6 @@
 mod exploration;
 pub mod game_session;
+pub mod hybrid_evaluator;
 pub mod postflop;
 mod simulation;
 
