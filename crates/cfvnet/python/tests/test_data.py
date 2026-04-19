@@ -254,7 +254,7 @@ def test_count_records_in_file_corrupt_returns_negative():
     # a multiple of record_size(board_size) must return -1 (corrupt).
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
         # First byte is a valid board size (5), but write only 10 bytes total
-        # so size = 10, which is not divisible by record_size(5) = 17258.
+        # so size = 10, which is not divisible by record_size(5) = 17257.
         f.write(struct.pack("B", 5))
         f.write(b"\x00" * 9)
         f.flush()
