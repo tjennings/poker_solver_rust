@@ -359,6 +359,23 @@ fn sample_weighted(rng: &mut impl Rng, weights: &[f64], n: u32) -> Vec<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// BoundaryCfvs — per-combo counterfactual values at a depth boundary
+// ---------------------------------------------------------------------------
+
+/// Per-combo counterfactual values for both players at a depth boundary,
+/// produced by Monte Carlo rollouts through the blueprint strategy.
+///
+/// Values are in chip units (not pot-fraction).  Each vector is indexed by
+/// combo index (same ordering as `SubgameHands::combos`).
+#[derive(Debug, Clone)]
+pub struct BoundaryCfvs {
+    /// CFVs for the out-of-position player (traverser=0).
+    pub oop_cfvs: Vec<f64>,
+    /// CFVs for the in-position player (traverser=1).
+    pub ip_cfvs: Vec<f64>,
+}
+
+// ---------------------------------------------------------------------------
 // RolloutLeafEvaluator — Monte Carlo rollout-based evaluator
 // ---------------------------------------------------------------------------
 
@@ -3744,5 +3761,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BoundaryCfvs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn boundary_cfvs_stores_per_player_values() {
+        let cfvs = BoundaryCfvs {
+            oop_cfvs: vec![0.1, -0.2, 0.3],
+            ip_cfvs: vec![-0.1, 0.2, -0.3],
+        };
+        assert_eq!(cfvs.oop_cfvs.len(), 3);
+        assert_eq!(cfvs.ip_cfvs.len(), 3);
+        assert!((cfvs.oop_cfvs[0] - 0.1).abs() < 1e-12);
+        assert!((cfvs.ip_cfvs[2] - (-0.3)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn boundary_cfvs_debug_and_clone() {
+        let cfvs = BoundaryCfvs {
+            oop_cfvs: vec![1.0],
+            ip_cfvs: vec![-1.0],
+        };
+        let cloned = cfvs.clone();
+        assert_eq!(cloned.oop_cfvs, cfvs.oop_cfvs);
+        assert_eq!(cloned.ip_cfvs, cfvs.ip_cfvs);
+        // Debug must compile
+        let _ = format!("{:?}", cfvs);
     }
 }
