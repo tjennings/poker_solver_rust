@@ -31,7 +31,7 @@ describe('buildSolveParams', () => {
   const defaultConfig = {
     solve_iterations: 200,
     target_exploitability: 3.0,
-    leaf_eval_interval: 10,
+    matrix_snapshot_interval: 10,
     rollout_bias_factor: 10.0,
     rollout_num_samples: 3,
     rollout_opponent_samples: 8,
@@ -44,21 +44,21 @@ describe('buildSolveParams', () => {
     expect(params.mode).toBe('subgame');
   });
 
-  it('sets leafEvalInterval from config for subgame mode', () => {
+  it('sets matrixSnapshotInterval from config for subgame mode', () => {
     const params = buildSolveParams('subgame', defaultConfig);
-    expect(params.leafEvalInterval).toBe(10);
+    expect(params.matrixSnapshotInterval).toBe(10);
   });
 
-  it('uses config leafEvalInterval for exact mode (same as subgame)', () => {
+  it('uses config matrixSnapshotInterval for exact mode (same as subgame)', () => {
     const params = buildSolveParams('exact', defaultConfig);
-    expect(params.leafEvalInterval).toBe(10);
+    expect(params.matrixSnapshotInterval).toBe(10);
   });
 
   it('uses default values when config is empty', () => {
     const params = buildSolveParams('subgame', {});
     expect(params.maxIterations).toBe(200);
     expect(params.targetExploitability).toBe(3.0);
-    expect(params.leafEvalInterval).toBe(10);
+    expect(params.matrixSnapshotInterval).toBe(10);
     expect(params.rolloutBiasFactor).toBe(10.0);
     expect(params.rolloutNumSamples).toBe(3);
     expect(params.rolloutOpponentSamples).toBe(8);
@@ -70,7 +70,7 @@ describe('buildSolveParams', () => {
     const config = {
       solve_iterations: 500,
       target_exploitability: 1.0,
-      leaf_eval_interval: 20,
+      matrix_snapshot_interval: 20,
       rollout_bias_factor: 5.0,
       rollout_num_samples: 5,
       rollout_opponent_samples: 12,
@@ -80,7 +80,7 @@ describe('buildSolveParams', () => {
     const params = buildSolveParams('subgame', config);
     expect(params.maxIterations).toBe(500);
     expect(params.targetExploitability).toBe(1.0);
-    expect(params.leafEvalInterval).toBe(20);
+    expect(params.matrixSnapshotInterval).toBe(20);
     expect(params.rolloutBiasFactor).toBe(5.0);
     expect(params.rolloutNumSamples).toBe(5);
     expect(params.rolloutOpponentSamples).toBe(12);
@@ -88,9 +88,9 @@ describe('buildSolveParams', () => {
     expect(params.rangeClampThreshold).toBe(0.1);
   });
 
-  it('uses leaf_eval_interval from config for exact mode', () => {
-    const config = { leaf_eval_interval: 20 };
+  it('uses matrix_snapshot_interval from config for exact mode', () => {
+    const config = { matrix_snapshot_interval: 20 };
     const params = buildSolveParams('exact', config);
-    expect(params.leafEvalInterval).toBe(20);
+    expect(params.matrixSnapshotInterval).toBe(20);
   });
 });

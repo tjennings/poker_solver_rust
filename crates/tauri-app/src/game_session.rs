@@ -1550,25 +1550,6 @@ pub fn game_get_state_core(session_state: &GameSessionState, source: Option<Stri
             }
         }
 
-        // Diagnostic: rate-limited log when the polled matrix first-cell changes
-        {
-            use std::sync::atomic::AtomicU32;
-            static LAST_LOGGED_FIRST_CELL: AtomicU32 = AtomicU32::new(0);
-            if let Some(ref m) = state.matrix {
-                if let Some(first_row) = m.cells.first() {
-                    if let Some(first_cell) = first_row.first() {
-                        let bits = first_cell.probabilities.first().copied().unwrap_or(0.0).to_bits();
-                        let prev = LAST_LOGGED_FIRST_CELL.swap(bits, Ordering::Relaxed);
-                        if prev != bits {
-                            eprintln!(
-                                "[poll] matrix first_cell.probabilities[0] changed: {:.6}",
-                                first_cell.probabilities.first().copied().unwrap_or(0.0)
-                            );
-                        }
-                    }
-                }
-            }
-        }
     }
 
     Ok(state)
@@ -1699,7 +1680,7 @@ pub fn game_solve_core(
     mode: Option<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
-    leaf_eval_interval: Option<u32>,
+    matrix_snapshot_interval: Option<u32>,
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
@@ -1810,7 +1791,7 @@ pub fn game_solve_core(
     }
 
     let max_iters = max_iterations.unwrap_or(200);
-    let eval_interval = leaf_eval_interval.unwrap_or(10);
+    let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
     let _target_exp = target_exploitability.unwrap_or(3.0);
 
     // Reset solve state atomics
@@ -2037,12 +2018,6 @@ pub fn game_solve_core(
         }
 
         // Initial matrix snapshot
-        {
-            game.back_to_root();
-            let strat = game.strategy();
-            let first_vals: Vec<f32> = strat.iter().take(8).copied().collect();
-            eprintln!("[solve] t=0 snapshot: strategy[0..8]={first_vals:?}");
-        }
         let matrix = build_solve_matrix(&mut game, None);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
 
@@ -2074,11 +2049,7 @@ pub fn game_solve_core(
             // Note: exploitability can't be computed during depth-limited solves
             // because the boundary CFV cache is strategy-dependent and would give
             // incorrect values for the best-response traversal.
-            if t.is_multiple_of(eval_interval) {
-                game.back_to_root();
-                let strat = game.strategy();
-                let first_vals: Vec<f32> = strat.iter().take(8).copied().collect();
-                eprintln!("[solve] t={t} snapshot: strategy[0..8]={first_vals:?}");
+            if t.is_multiple_of(snapshot_interval) {
                 let matrix = build_solve_matrix(&mut game, None);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
             }
@@ -2181,7 +2152,7 @@ pub fn game_solve(
     mode: Option<String>,
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
-    leaf_eval_interval: Option<u32>,
+    matrix_snapshot_interval: Option<u32>,
     rollout_bias_factor: Option<f64>,
     rollout_num_samples: Option<u32>,
     rollout_opponent_samples: Option<u32>,
@@ -2193,7 +2164,7 @@ pub fn game_solve(
         mode,
         max_iterations,
         target_exploitability,
-        leaf_eval_interval,
+        matrix_snapshot_interval,
         rollout_bias_factor,
         rollout_num_samples,
         rollout_opponent_samples,

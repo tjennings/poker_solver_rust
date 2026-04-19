@@ -394,11 +394,6 @@ export default function GameExplorer() {
           try {
             const s = await invoke<GameState>('game_get_state', { source: mode });
             setState(s);
-            // Diagnostic: log first-cell strategy value on each poll
-            if (s.matrix) {
-              const firstCell = s.matrix.cells?.[0]?.[0]?.probabilities?.[0];
-              console.log('[poll] received matrix first_cell.probabilities[0]:', firstCell);
-            }
             if (s.solve?.is_complete) {
               clearInterval(pollId);
               setSolving(false);

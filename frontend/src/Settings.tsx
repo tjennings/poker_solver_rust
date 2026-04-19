@@ -245,13 +245,13 @@ export default function Settings() {
             />
           </div>
           <div>
-            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Eval Interval</span>
+            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Snapshot Interval</span>
             <input
               type="text"
-              value={config.leaf_eval_interval ?? 10}
+              value={config.matrix_snapshot_interval ?? 10}
               onChange={e => {
                 const v = parseInt(e.target.value);
-                if (!isNaN(v) && v > 0) setConfig({ leaf_eval_interval: v });
+                if (!isNaN(v) && v > 0) setConfig({ matrix_snapshot_interval: v });
               }}
               style={{
                 width: 45,
@@ -309,7 +309,7 @@ export default function Settings() {
           </div>
         </div>
         <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
-          Bias factor multiplies fold/call/raise probabilities in continuation strategies. Rollouts = Monte Carlo samples per street transition. Eval Interval = re-evaluate leaf boundaries every N iterations. Opp. Samples = opponent hands sampled per combo at boundaries. Enum. Depth = decision levels to fully enumerate before sampling (higher = more accurate, slower).
+          Bias factor multiplies fold/call/raise probabilities in continuation strategies. Rollouts = Monte Carlo samples per street transition. Snapshot Interval = re-evaluate leaf boundaries every N iterations. Opp. Samples = opponent hands sampled per combo at boundaries. Enum. Depth = decision levels to fully enumerate before sampling (higher = more accurate, slower).
         </p>
       </div>
 

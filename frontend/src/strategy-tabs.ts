@@ -14,7 +14,7 @@ export interface SolveParams {
   mode: SolveMode;
   maxIterations: number;
   targetExploitability: number;
-  leafEvalInterval: number;
+  matrixSnapshotInterval: number;
   rolloutBiasFactor: number;
   rolloutNumSamples: number;
   rolloutOpponentSamples: number;
@@ -29,13 +29,13 @@ export function buildSolveParams(
   mode: SolveMode,
   config: Record<string, unknown>,
 ): SolveParams {
-  const leafEvalInterval = (config.leaf_eval_interval as number | undefined) ?? 10;
+  const matrixSnapshotInterval = (config.matrix_snapshot_interval as number | undefined) ?? 10;
 
   return {
     mode,
     maxIterations: (config.solve_iterations as number | undefined) ?? 200,
     targetExploitability: (config.target_exploitability as number | undefined) ?? 3.0,
-    leafEvalInterval,
+    matrixSnapshotInterval,
     rolloutBiasFactor: (config.rollout_bias_factor as number | undefined) ?? 10.0,
     rolloutNumSamples: (config.rollout_num_samples as number | undefined) ?? 3,
     rolloutOpponentSamples: (config.rollout_opponent_samples as number | undefined) ?? 8,
