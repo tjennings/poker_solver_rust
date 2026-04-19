@@ -77,12 +77,14 @@ Expected (from prior session): Subgame ≈ 11,354 mbb/hand, Exact ≈ 38.6 mbb/h
 
 **Step 1:** Add a `BoundaryCfvs` struct near top of `postflop.rs` (alongside `RolloutLeafEvaluator`):
 ```rust
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BoundaryCfvs {
-    pub oop_cfvs: Vec<f32>,
-    pub ip_cfvs:  Vec<f32>,
+    pub oop_cfvs: Vec<f64>,   // f64 matches rollout_chip_values_with_state output; avoids lossy cast
+    pub ip_cfvs:  Vec<f64>,
 }
 ```
+
+> **Plan amendment (2026-04-19, ratified post-Phase-1 spec-compliance review):** `BoundaryCfvs` uses `Vec<f64>` not `Vec<f32>`. Downstream consumers in Phase 2/3 must accept f64 (cast to f32 at the trait boundary if needed).
 
 **Step 2:** Append a failing test to the `#[cfg(test)] mod tests` block at the bottom of `postflop.rs`:
 ```rust
@@ -632,7 +634,10 @@ impl<'a> range_solver::game::BoundaryEvaluator for HybridBoundaryAdapter<'a> {
             self.boundary_pot,
             self.boundary_invested,
         );
-        (cfvs.oop_cfvs, cfvs.ip_cfvs)
+        // BoundaryCfvs stores f64; trait returns f32.
+        let oop = cfvs.oop_cfvs.into_iter().map(|v| v as f32).collect();
+        let ip  = cfvs.ip_cfvs.into_iter().map(|v| v as f32).collect();
+        (oop, ip)
     }
 }
 ```
