@@ -40,6 +40,24 @@ pub trait BoundaryEvaluator: Send + Sync {
         num_hands: usize,
         continuation_index: usize,
     ) -> Vec<f32>;
+
+    /// Amortized: returns CFVs for both players in one pass.
+    /// Default impl calls compute_cfvs twice (backwards compat).
+    /// Implementations with internal amortization should override.
+    fn compute_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        num_oop: usize,
+        num_ip: usize,
+        continuation_index: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let oop = self.compute_cfvs(0, pot, remaining_stack, ip_reach, num_oop, continuation_index);
+        let ip = self.compute_cfvs(1, pot, remaining_stack, oop_reach, num_ip, continuation_index);
+        (oop, ip)
+    }
 }
 
 // ---------------------------------------------------------------------------
