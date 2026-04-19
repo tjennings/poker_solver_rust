@@ -3832,6 +3832,81 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Convergence test helpers
+    // -----------------------------------------------------------------------
+
+    /// Build a check-always blueprint: a river tree where the strategy puts
+    /// 100% weight on the first action (Check) for every decision node and
+    /// bucket.  Returns the tree, `AllBuckets`, and strategy.
+    fn make_check_always_river_blueprint()
+        -> (GameTree, AllBuckets, BlueprintV2Strategy)
+    {
+        use poker_solver_core::blueprint_v2::game_tree::GameNode as GN;
+
+        let bucket_counts: [u16; 4] = [169, 10, 10, 10];
+        let river_buckets = bucket_counts[3] as usize;
+
+        // Build a river tree with one bet size so it has
+        // Check + Bet + AllIn actions.
+        let tree = GameTree::build_subgame(
+            Street::River,
+            100.0,
+            [50.0; 2],
+            100.0,
+            &[vec![1.0]],
+            None,
+            0,
+        );
+
+        // Count decision nodes and their action counts.
+        let mut node_action_counts: Vec<u16> = Vec::new();
+        for node in &tree.nodes {
+            if let GN::Decision { actions, .. } = node {
+                node_action_counts.push(actions.len() as u16);
+            }
+        }
+
+        // Build strategy: for each decision node, for each bucket,
+        // put 100% on action 0 (Check when not facing bet, Fold when
+        // facing bet -- but Fold paths are never reached from root
+        // Check).
+        let mut action_probs = Vec::new();
+        for &n_actions in &node_action_counts {
+            for _ in 0..river_buckets {
+                action_probs.push(1.0_f32); // action 0 = Check (or Fold)
+                for _ in 1..n_actions {
+                    action_probs.push(0.0_f32);
+                }
+            }
+        }
+
+        let node_street_indices: Vec<u8> =
+            vec![Street::River as u8; node_action_counts.len()];
+
+        let mut strategy = BlueprintV2Strategy {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 1000,
+            elapsed_minutes: 0,
+            node_offsets: vec![],
+        };
+        strategy.post_deserialize();
+
+        let mut all_buckets = AllBuckets::new(
+            bucket_counts,
+            [None, None, None, None],
+        );
+        // Enable equity-based fallback so bucketing works without
+        // pre-computed bucket files (the core crate's #[cfg(test)]
+        // fallback is only active when compiling core tests).
+        all_buckets.equity_fallback = true;
+
+        (tree, all_buckets, strategy)
+    }
+
+    // -----------------------------------------------------------------------
     // clone_with_num_rollouts tests
     // -----------------------------------------------------------------------
 
@@ -3956,6 +4031,123 @@ mod tests {
 
         assert_eq!(result.oop_cfvs[0], 0.0);
         assert_eq!(result.ip_cfvs[0], 0.0);
+    }
+
+    /// Convergence test: with an always-check blueprint on the river,
+    /// `sample_boundary_cfvs` with N=2048 samples should produce CFVs
+    /// within 5% of the analytic equity: `pot * (equity - 0.5)`.
+    #[test]
+    fn sample_boundary_cfvs_converges_to_analytic_equity() {
+        let (tree, all_buckets, strategy) = make_check_always_river_blueprint();
+
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Five, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Heart),
+        ];
+
+        let hands = SubgameHands::enumerate(&board);
+
+        // Use every 20th combo for fast debug-mode execution while
+        // maintaining diversity across hand strengths.
+        let stride = 20;
+        let combos: Vec<[RsPokerCard; 2]> = hands.combos
+            .iter()
+            .step_by(stride)
+            .copied()
+            .collect();
+        let n = combos.len();
+
+        // Uniform ranges: every combo has weight 1.0.
+        let oop_range: Vec<f64> = vec![1.0; n];
+        let ip_range: Vec<f64> = vec![1.0; n];
+
+        let pot = 100.0;
+        let invested = [50.0, 50.0];
+
+        let eval = RolloutLeafEvaluator::new(
+            Arc::new(strategy),
+            Arc::new(tree),
+            Arc::new(all_buckets),
+            0,                    // abstract_start_node = root
+            BiasType::Unbiased,
+            1.0,
+            1,                    // num_rollouts (river: no chance nodes)
+            2048,                 // num_opponent_samples
+            100.0,                // starting_stack
+            pot,                  // root_pot
+        );
+
+        let n_samples = 1; // river has no chance nodes; num_rollouts unused
+        let result = eval.sample_boundary_cfvs(
+            &combos, &board, &oop_range, &ip_range,
+            pot, invested, n_samples,
+        );
+
+        // Compute analytic equities via compute_combo_equities.
+        let sub_hands = SubgameHands { combos: combos.clone() };
+        let oop_equities = compute_combo_equities(&sub_hands, &board, &ip_range);
+        let ip_equities = compute_combo_equities(&sub_hands, &board, &oop_range);
+
+        // Tolerance: 5% of half-pot (the max absolute CFV magnitude).
+        // Individual combo MC estimates have variance from opponent sampling;
+        // we verify the RMSE across all combos is within tolerance.
+        let half_pot = pot / 2.0;
+
+        // Compute RMSE for OOP
+        let mut oop_sse = 0.0;
+        let mut checked_oop = 0;
+        for i in 0..n {
+            if oop_range[i] <= 0.0 {
+                continue;
+            }
+            let analytic = pot * (oop_equities[i] - 0.5);
+            let sampled = result.oop_cfvs[i];
+            let diff = sampled - analytic;
+            oop_sse += diff * diff;
+            checked_oop += 1;
+        }
+        let oop_rmse = (oop_sse / checked_oop as f64).sqrt();
+
+        // Compute RMSE for IP
+        let mut ip_sse = 0.0;
+        let mut checked_ip = 0;
+        for i in 0..n {
+            if ip_range[i] <= 0.0 {
+                continue;
+            }
+            let analytic = pot * (ip_equities[i] - 0.5);
+            let sampled = result.ip_cfvs[i];
+            let diff = sampled - analytic;
+            ip_sse += diff * diff;
+            checked_ip += 1;
+        }
+        let ip_rmse = (ip_sse / checked_ip as f64).sqrt();
+
+        eprintln!(
+            "[convergence] OOP RMSE={oop_rmse:.4} ({:.2}% of half-pot), \
+             IP RMSE={ip_rmse:.4} ({:.2}% of half-pot), \
+             combos={n}, checked_oop={checked_oop}, checked_ip={checked_ip}",
+            oop_rmse / half_pot * 100.0,
+            ip_rmse / half_pot * 100.0,
+        );
+
+        // RMSE should be within 5% of half-pot
+        let tolerance = 0.05 * half_pot;
+        assert!(
+            oop_rmse < tolerance,
+            "OOP RMSE {oop_rmse:.4} exceeds 5% of half-pot ({tolerance:.4})"
+        );
+        assert!(
+            ip_rmse < tolerance,
+            "IP RMSE {ip_rmse:.4} exceeds 5% of half-pot ({tolerance:.4})"
+        );
+
+        // Sanity: we checked a meaningful number of combos.
+        assert!(checked_oop > 50, "expected >50 OOP combos checked, got {checked_oop}");
+        assert!(checked_ip > 50, "expected >50 IP combos checked, got {checked_ip}");
     }
 
     #[test]
