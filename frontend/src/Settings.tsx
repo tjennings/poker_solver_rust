@@ -141,7 +141,7 @@ export default function Settings() {
       {/* Target Exploitability */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
-          Target Exploitability (% of pot)
+          Target Exploitability
         </label>
         <input
           type="text"

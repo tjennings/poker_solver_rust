@@ -1833,7 +1833,7 @@ pub fn game_solve_core(
 
     let max_iters = max_iterations.unwrap_or(200);
     let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
-    let _target_exp = target_exploitability.unwrap_or(3.0);
+    let target_exp = target_exploitability.unwrap_or(3.0);
 
     // Reset solve state atomics
     let ss = ss_ref;
@@ -2198,6 +2198,15 @@ pub fn game_solve_core(
                 if is_exact {
                     let exp = compute_exploitability(&game);
                     ss_clone.exploitability_bits.store(exp.to_bits(), Ordering::Relaxed);
+                    // Early termination: stop once exploitability drops below target.
+                    // Only applies to exact mode (hybrid mode doesn't compute reliable
+                    // exploitability against strategy-dependent boundary CFVs).
+                    if exp.is_finite() && exp > 0.0 && exp <= target_exp {
+                        eprintln!(
+                            "[solve] exact converged: iter={t} exploitability={exp:.3} <= target={target_exp}"
+                        );
+                        break;
+                    }
                 }
             }
         }
