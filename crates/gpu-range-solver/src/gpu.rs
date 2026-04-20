@@ -348,15 +348,21 @@ impl GpuHandParallelState {
 
 /// Compute dynamic shared memory size needed for the hand-parallel kernel.
 /// Dynamic layout (extern __shared__):
-///   edge_parent[E] + edge_child[E] + edge_player[E] (int each)
-///   + level_starts[max_depth+1] + level_counts[max_depth+1] (int each)
+///   level_starts[max_depth+1] + level_counts[max_depth+1] (int each)
 ///   + actions_per_node[N] (float)
+/// Note: edge_parent/edge_child/edge_player are read directly from global
+/// memory (uniform-broadcast access pattern, L1-cached). They used to live
+/// in smem but that pushed the canonical turn tree over CUDA's per-block
+/// limit (~103 KB vs 48 KB default). See bean poker_solver_rust-oox2.
 /// Note: card_reach[52] and total_reach are static __shared__ (not dynamic).
-pub fn compute_hand_parallel_shared_mem(num_edges: usize, max_depth: usize, num_nodes: usize) -> usize {
-    let topology = 3 * num_edges * 4; // parent, child, player as int
+pub fn compute_hand_parallel_shared_mem(
+    _num_edges: usize,
+    max_depth: usize,
+    num_nodes: usize,
+) -> usize {
     let levels = 2 * (max_depth + 1) * 4; // starts + counts as int
     let actions = num_nodes * 4; // actions_per_node as float
-    topology + levels + actions
+    levels + actions
 }
 
 /// Launch helper: standard grid config for `n` elements.
@@ -512,10 +518,10 @@ mod tests {
 
     #[test]
     fn hand_parallel_shared_mem_size_computation() {
-        // E=10 edges, max_depth=3 (4 levels), N=5 nodes
+        // E=10 edges (unused after oox2 fix), max_depth=3 (4 levels), N=5 nodes
         let size = compute_hand_parallel_shared_mem(10, 3, 5);
-        // Dynamic only: 3*E*4 + 2*(max_depth+1)*4 + N*4
-        let expected = 3 * 10 * 4 + 2 * 4 * 4 + 5 * 4;
+        // Dynamic layout: 2*(max_depth+1)*4 + N*4 (edges now in global memory)
+        let expected = 2 * 4 * 4 + 5 * 4;
         assert_eq!(size, expected);
     }
 
