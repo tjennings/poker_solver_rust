@@ -174,6 +174,9 @@ struct GameSolveParams {
     rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
     subgame_depth_limit: Option<u8>,
+    hybrid_depth_limit: Option<u8>,
+    hybrid_refresh_interval: Option<u32>,
+    hybrid_samples_per_refresh: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -664,6 +667,9 @@ async fn handle_game_solve(
         params.rollout_enumerate_depth,
         params.range_clamp_threshold,
         params.subgame_depth_limit,
+        params.hybrid_depth_limit.or(params.subgame_depth_limit),
+        params.hybrid_refresh_interval,
+        params.hybrid_samples_per_refresh,
     ))
 }
 

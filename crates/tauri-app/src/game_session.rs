@@ -200,7 +200,7 @@ pub struct GameSessionState {
 
 impl GameSessionState {
     /// Return the `SolveState` for the given mode string.
-    /// `"exact"` -> `exact_solve`, anything else (including `None`) -> `subgame_solve`.
+    /// `"exact"` -> `exact_solve`, anything else (including `None`, `"hybrid"`, `"subgame"`) -> `subgame_solve`.
     pub fn solve_for(&self, mode: &Option<String>) -> &Arc<SolveState> {
         match mode.as_deref() {
             Some("exact") => &self.exact_solve,
@@ -1705,8 +1705,12 @@ pub fn game_solve_core(
     rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
     subgame_depth_limit: Option<u8>,
+    hybrid_depth_limit: Option<u8>,
+    hybrid_refresh_interval: Option<u32>,
+    hybrid_samples_per_refresh: Option<u32>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
+    let is_hybrid = mode.as_deref() == Some("hybrid");
     let ss_ref = session_state.solve_for(&mode);
 
     // Guard: reject if this mode is already solving
@@ -1830,7 +1834,12 @@ pub fn game_solve_core(
     let board_clone = board.clone();
     std::thread::spawn(move || {
         // Build game
-        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes, is_exact, subgame_depth_limit) {
+        let depth_limit_override = if is_hybrid {
+            hybrid_depth_limit.or(subgame_depth_limit)
+        } else {
+            subgame_depth_limit
+        };
+        let mut game = match build_solve_game(&board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes, is_exact, depth_limit_override) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("[solve] failed to build game: {e}");
@@ -1854,6 +1863,7 @@ pub fn game_solve_core(
         // Set up lazy boundary evaluator if boundaries exist.
         // Exact mode has no boundaries (depth_limit=None), so this block is skipped.
         let n_boundaries = game.num_boundary_nodes();
+        let mut hybrid_eval_arc: Option<Arc<crate::hybrid_evaluator::HybridBoundaryEvaluator>> = None;
         if n_boundaries > 0 && !is_exact {
             let board_cards: Vec<rs_poker::core::Card> = board_clone
                 .iter()
@@ -1884,148 +1894,199 @@ pub fn game_solve_core(
             let map0 = build_map(0, &combos);
             let map1 = build_map(1, &combos);
 
-            let rollout = cbv_ctx.as_ref().map(|ctx| {
-                let bias_factor = rollout_bias_factor.unwrap_or(10.0);
-                let num_rollouts = rollout_num_samples.unwrap_or(3);
+            if is_hybrid && cbv_ctx.is_some() {
+                // -- Hybrid mode: lazy HybridBoundaryEvaluator with per-boundary adapters --
+                let ctx = cbv_ctx.as_ref().unwrap();
+                let samples = hybrid_samples_per_refresh.unwrap_or(100);
+                let interval = hybrid_refresh_interval.unwrap_or(10);
                 let opp_samples = rollout_opponent_samples.unwrap_or(8);
                 let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-                let mut eval = RolloutLeafEvaluator::new(
+
+                let rollout_eval = RolloutLeafEvaluator::new(
                     Arc::clone(&ctx.strategy),
                     Arc::new(ctx.abstract_tree.clone()),
                     Arc::clone(&ctx.all_buckets),
                     abstract_node_idx.unwrap_or(0),
                     BiasType::Unbiased,
-                    bias_factor,
-                    num_rollouts,
+                    1.0, // bias_factor irrelevant for unbiased
+                    samples,
                     opp_samples,
                     starting_stack,
                     f64::from(pot),
                 );
-                if let Some(depth) = rollout_enumerate_depth {
-                    eval.enumerate_decision_depth = depth;
-                }
-                eval
-            });
 
-            // Clone for multi-continuation precomputation (before move into evaluator).
-            let combos_for_precomp = combos.clone();
-            let board_cards_for_precomp = board_cards.clone();
-            let game_to_combo_for_precomp = [map0.clone(), map1.clone()];
-
-            game.boundary_evaluator = Some(Arc::new(SolveBoundaryEvaluator {
-                private_cards: [
-                    game.private_cards(0).to_vec(),
-                    game.private_cards(1).to_vec(),
-                ],
-                board_cards,
-                eff_stack: f64::from(eff_stack),
-                rollout,
-                combos,
-                game_to_combo: [map0, map1],
-            }));
-
-            // Precompute multi-valued boundary CFVs (K=4 continuations).
-            // Run 4 rollouts per boundary: unbiased, fold-biased, call-biased, raise-biased.
-            // All values are fixed before CFR begins.
-            let k = game.boundary_evaluator.as_ref().map_or(1, |e| e.num_continuations());
-            if k > 1 && cbv_ctx.is_some() {
-                game.init_multi_continuation(k);
-                let ctx = cbv_ctx.as_ref().unwrap();
-                let bias_factor = rollout_bias_factor.unwrap_or(10.0);
-                let biases = [BiasType::Unbiased, BiasType::Fold, BiasType::Call, BiasType::Raise];
-                let precomp_counter = Arc::new(AtomicU64::new(0));
-                let start = std::time::Instant::now();
-
-                // Compute per-boundary reach by walking the subgame tree
-                // with blueprint strategy probabilities. This replaces
-                // game.initial_weights(player) which ignores the action
-                // path leading to each boundary.
-                let precomp_street = match board_cards_for_precomp.len() {
-                    3 => Street::Flop,
-                    4 => Street::Turn,
-                    _ => Street::River,
-                };
-                let boundary_reach = crate::postflop::compute_boundary_reach(
-                    &game,
-                    &ctx.strategy,
-                    &ctx.all_buckets,
-                    &ctx.abstract_tree,
-                    &board_cards_for_precomp,
-                    precomp_street,
-                    current_node_idx,
+                let hybrid_eval = Arc::new(
+                    crate::hybrid_evaluator::HybridBoundaryEvaluator::new(
+                        Box::new(rollout_eval),
+                        interval,
+                        samples,
+                    ),
                 );
+                hybrid_eval_arc = Some(Arc::clone(&hybrid_eval));
 
+                // Build per-boundary owned adapters.
+                let num_oop = game.num_private_hands(0);
+                let num_ip = game.num_private_hands(1);
+                let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
+                    Vec::with_capacity(n_boundaries);
                 for ordinal in 0..n_boundaries {
-                    let pot_at_boundary = game.boundary_pot(ordinal);
+                    let boundary_pot = game.boundary_pot(ordinal) as f64;
+                    let adapter = crate::hybrid_evaluator::OwnedHybridBoundaryAdapter {
+                        evaluator: Arc::clone(&hybrid_eval),
+                        boundary_id: ordinal as u64,
+                        combos: combos.clone(),
+                        board: board_cards.clone(),
+                        boundary_pot,
+                        boundary_invested: [boundary_pot / 2.0, boundary_pot / 2.0],
+                        num_oop,
+                        num_ip,
+                    };
+                    per_boundary.push(Arc::new(adapter));
+                }
+                game.per_boundary_evaluators = per_boundary;
 
-                    for player in 0..2 {
-                        let num_hands = game.num_private_hands(player);
+                eprintln!(
+                    "[solve] hybrid mode: {} boundaries, refresh_interval={}, samples_per_refresh={}",
+                    n_boundaries, interval, samples,
+                );
+            } else {
+                // -- Legacy subgame mode: SolveBoundaryEvaluator + K=4 precompute --
+                let rollout = cbv_ctx.as_ref().map(|ctx| {
+                    let bias_factor = rollout_bias_factor.unwrap_or(10.0);
+                    let num_rollouts = rollout_num_samples.unwrap_or(3);
+                    let opp_samples = rollout_opponent_samples.unwrap_or(8);
+                    let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
+                    let mut eval = RolloutLeafEvaluator::new(
+                        Arc::clone(&ctx.strategy),
+                        Arc::new(ctx.abstract_tree.clone()),
+                        Arc::clone(&ctx.all_buckets),
+                        abstract_node_idx.unwrap_or(0),
+                        BiasType::Unbiased,
+                        bias_factor,
+                        num_rollouts,
+                        opp_samples,
+                        starting_stack,
+                        f64::from(pot),
+                    );
+                    if let Some(depth) = rollout_enumerate_depth {
+                        eval.enumerate_decision_depth = depth;
+                    }
+                    eval
+                });
 
-                        for (ki, &bias) in biases.iter().enumerate().take(k) {
-                            let num_rollouts = rollout_num_samples.unwrap_or(3);
-                            let opp_samples = rollout_opponent_samples.unwrap_or(8);
-                            let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-                            let mut eval = RolloutLeafEvaluator::new(
-                                Arc::clone(&ctx.strategy),
-                                Arc::new(ctx.abstract_tree.clone()),
-                                Arc::clone(&ctx.all_buckets),
-                                abstract_node_idx.unwrap_or(0),
-                                bias,
-                                bias_factor,
-                                num_rollouts,
-                                opp_samples,
-                                starting_stack,
-                                f64::from(pot_at_boundary),
-                            );
-                            if let Some(depth) = rollout_enumerate_depth {
-                                eval.enumerate_decision_depth = depth;
-                            }
-                            eval.call_counter = Arc::clone(&precomp_counter);
-                            // Map per-boundary reach to combo-ordering reach.
-                            let opp = player ^ 1;
-                            let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                            let opp_weights = &boundary_reach[ordinal][opp];
-                            for (gi, &ci) in game_to_combo_for_precomp[opp].iter().enumerate() {
-                                if ci < opp_combo_reach.len() && gi < opp_weights.len() {
-                                    opp_combo_reach[ci] = opp_weights[gi] as f64;
+                // Clone for multi-continuation precomputation (before move into evaluator).
+                let combos_for_precomp = combos.clone();
+                let board_cards_for_precomp = board_cards.clone();
+                let game_to_combo_for_precomp = [map0.clone(), map1.clone()];
+
+                game.boundary_evaluator = Some(Arc::new(SolveBoundaryEvaluator {
+                    private_cards: [
+                        game.private_cards(0).to_vec(),
+                        game.private_cards(1).to_vec(),
+                    ],
+                    board_cards,
+                    eff_stack: f64::from(eff_stack),
+                    rollout,
+                    combos,
+                    game_to_combo: [map0, map1],
+                }));
+
+                // Precompute multi-valued boundary CFVs (K=4 continuations).
+                let k = game.boundary_evaluator.as_ref().map_or(1, |e| e.num_continuations());
+                if k > 1 && cbv_ctx.is_some() {
+                    game.init_multi_continuation(k);
+                    let ctx = cbv_ctx.as_ref().unwrap();
+                    let bias_factor = rollout_bias_factor.unwrap_or(10.0);
+                    let biases = [BiasType::Unbiased, BiasType::Fold, BiasType::Call, BiasType::Raise];
+                    let precomp_counter = Arc::new(AtomicU64::new(0));
+                    let start = std::time::Instant::now();
+
+                    let precomp_street = match board_cards_for_precomp.len() {
+                        3 => Street::Flop,
+                        4 => Street::Turn,
+                        _ => Street::River,
+                    };
+                    let boundary_reach = crate::postflop::compute_boundary_reach(
+                        &game,
+                        &ctx.strategy,
+                        &ctx.all_buckets,
+                        &ctx.abstract_tree,
+                        &board_cards_for_precomp,
+                        precomp_street,
+                        current_node_idx,
+                    );
+
+                    for ordinal in 0..n_boundaries {
+                        let pot_at_boundary = game.boundary_pot(ordinal);
+
+                        for player in 0..2 {
+                            let num_hands = game.num_private_hands(player);
+
+                            for (ki, &bias) in biases.iter().enumerate().take(k) {
+                                let num_rollouts = rollout_num_samples.unwrap_or(3);
+                                let opp_samples = rollout_opponent_samples.unwrap_or(8);
+                                let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
+                                let mut eval = RolloutLeafEvaluator::new(
+                                    Arc::clone(&ctx.strategy),
+                                    Arc::new(ctx.abstract_tree.clone()),
+                                    Arc::clone(&ctx.all_buckets),
+                                    abstract_node_idx.unwrap_or(0),
+                                    bias,
+                                    bias_factor,
+                                    num_rollouts,
+                                    opp_samples,
+                                    starting_stack,
+                                    f64::from(pot_at_boundary),
+                                );
+                                if let Some(depth) = rollout_enumerate_depth {
+                                    eval.enumerate_decision_depth = depth;
                                 }
-                            }
-                            let mut hero_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                            let hero_weights = &boundary_reach[ordinal][player];
-                            for (gi, &ci) in game_to_combo_for_precomp[player].iter().enumerate() {
-                                if ci < hero_combo_reach.len() && gi < hero_weights.len() {
-                                    hero_combo_reach[ci] = hero_weights[gi] as f64;
+                                eval.call_counter = Arc::clone(&precomp_counter);
+                                let opp = player ^ 1;
+                                let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
+                                let opp_weights = &boundary_reach[ordinal][opp];
+                                for (gi, &ci) in game_to_combo_for_precomp[opp].iter().enumerate() {
+                                    if ci < opp_combo_reach.len() && gi < opp_weights.len() {
+                                        opp_combo_reach[ci] = opp_weights[gi] as f64;
+                                    }
                                 }
-                            }
-                            let requests = vec![(pot_at_boundary as f64, 0.0, player as u8)];
-                            let results = eval.evaluate_boundaries(
-                                &combos_for_precomp, &board_cards_for_precomp,
-                                &hero_combo_reach, &opp_combo_reach, &requests,
-                            );
-                            let combo_cfvs = results.into_iter().next().unwrap_or_default();
-                            // Map combo ordering → game ordering
-                            let hero_map = &game_to_combo_for_precomp[player];
-                            let mut cfvs = vec![0.0f32; num_hands];
-                            for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
-                                if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
-                                    cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
+                                let mut hero_combo_reach = vec![0.0f64; combos_for_precomp.len()];
+                                let hero_weights = &boundary_reach[ordinal][player];
+                                for (gi, &ci) in game_to_combo_for_precomp[player].iter().enumerate() {
+                                    if ci < hero_combo_reach.len() && gi < hero_weights.len() {
+                                        hero_combo_reach[ci] = hero_weights[gi] as f64;
+                                    }
                                 }
+                                let requests = vec![(pot_at_boundary as f64, 0.0, player as u8)];
+                                let results = eval.evaluate_boundaries(
+                                    &combos_for_precomp, &board_cards_for_precomp,
+                                    &hero_combo_reach, &opp_combo_reach, &requests,
+                                );
+                                let combo_cfvs = results.into_iter().next().unwrap_or_default();
+                                let hero_map = &game_to_combo_for_precomp[player];
+                                let mut cfvs = vec![0.0f32; num_hands];
+                                for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
+                                    if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
+                                        cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
+                                    }
+                                }
+                                game.set_boundary_cfvs_multi(ordinal, player, ki, cfvs);
                             }
-                            game.set_boundary_cfvs_multi(ordinal, player, ki, cfvs);
                         }
                     }
-                }
 
-                let elapsed = start.elapsed();
-                eprintln!(
-                    "[solve] precomputed {} boundaries × {} continuations × 2 players in {:.1}s",
-                    n_boundaries, k, elapsed.as_secs_f64()
-                );
+                    let elapsed = start.elapsed();
+                    eprintln!(
+                        "[solve] precomputed {} boundaries × {} continuations × 2 players in {:.1}s",
+                        n_boundaries, k, elapsed.as_secs_f64()
+                    );
+                }
             }
         }
 
         let (mem_est, _) = game.memory_usage();
-        eprintln!("[solve] depth_limit: {:?}, boundary nodes: {n_boundaries}, evaluator: {}", subgame_depth_limit, game.boundary_evaluator.is_some());
+        eprintln!("[solve] depth_limit: {:?}, boundary nodes: {n_boundaries}, evaluator: {}, per_boundary: {}",
+            depth_limit_override, game.boundary_evaluator.is_some(), game.per_boundary_evaluators.len());
         eprintln!("[solve] abstract_node_idx: {:?}", abstract_node_idx);
         eprintln!("[solve] pot={pot}, eff_stack={eff_stack}, board={board:?}");
         eprintln!("[solve] OOP hands: {}, IP hands: {}", game.private_cards(0).len(), game.private_cards(1).len());
@@ -2060,10 +2121,21 @@ pub fn game_solve_core(
         *ss_clone.matrix_snapshot.write() = Some(matrix);
 
         // Solve loop
+        let refresh_interval = hybrid_refresh_interval.unwrap_or(10);
         let mut t = 0u32;
         while t < max_iters {
             if ss_clone.cancel.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // Hybrid mode: notify the evaluator of the current iteration
+            // and clear boundary CFV cache at refresh boundaries so the
+            // evaluator re-samples with current strategy-derived reaches.
+            if let Some(ref hybrid_eval) = hybrid_eval_arc {
+                hybrid_eval.begin_iteration(t);
+                if t == 0 || t % refresh_interval == 0 {
+                    game.clear_boundary_cfvs();
+                }
             }
 
             // Update DCFR discount params for boundary continuation regrets.
@@ -2203,6 +2275,9 @@ pub fn game_solve(
     rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
     subgame_depth_limit: Option<u8>,
+    hybrid_depth_limit: Option<u8>,
+    hybrid_refresh_interval: Option<u32>,
+    hybrid_samples_per_refresh: Option<u32>,
 ) -> Result<(), String> {
     game_solve_core(
         &session_state,
@@ -2216,6 +2291,9 @@ pub fn game_solve(
         rollout_enumerate_depth,
         range_clamp_threshold,
         subgame_depth_limit,
+        hybrid_depth_limit.or(subgame_depth_limit),
+        hybrid_refresh_interval,
+        hybrid_samples_per_refresh,
     )
 }
 
@@ -2844,7 +2922,7 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -2857,7 +2935,7 @@ mod tests {
         gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Default mode (subgame) should reject when subgame is already solving
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2870,7 +2948,7 @@ mod tests {
         gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should reject when exact is already solving
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2886,7 +2964,7 @@ mod tests {
         // Exact mode should NOT be rejected (different mode)
         // It will still fail because it's a preflop node, but the error
         // should NOT be "already in progress"
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("already in progress"));
     }

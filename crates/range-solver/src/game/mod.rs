@@ -220,6 +220,10 @@ pub struct PostFlopGame {
     /// Optional callback for lazy boundary CFV computation.
     /// When set, boundaries with empty CFVs call this instead of returning zero.
     pub boundary_evaluator: Option<Arc<dyn BoundaryEvaluator>>,
+    /// Optional per-boundary evaluators, indexed by boundary ordinal.
+    /// When set, takes priority over `boundary_evaluator` for the matching
+    /// ordinal. Used by hybrid mode where each boundary has different context.
+    pub per_boundary_evaluators: Vec<Arc<dyn BoundaryEvaluator>>,
 
     // -- multi-continuation boundary data --
     /// Number of continuation strategies per boundary. 1 = legacy, 4 = multi-valued.

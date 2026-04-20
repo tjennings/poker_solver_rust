@@ -234,6 +234,69 @@ impl<'a> range_solver::game::BoundaryEvaluator for HybridBoundaryAdapter<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// OwnedHybridBoundaryAdapter — owned variant for storage in per-boundary Vec
+// ---------------------------------------------------------------------------
+
+/// Owned version of `HybridBoundaryAdapter` that holds an `Arc` to the
+/// evaluator instead of a reference. Can be stored in `Vec<Arc<dyn BoundaryEvaluator>>`
+/// for per-boundary dispatch.
+pub struct OwnedHybridBoundaryAdapter {
+    pub evaluator: std::sync::Arc<HybridBoundaryEvaluator>,
+    pub boundary_id: u64,
+    pub combos: Vec<[RsPokerCard; 2]>,
+    pub board: Vec<RsPokerCard>,
+    pub boundary_pot: f64,
+    pub boundary_invested: [f64; 2],
+    pub num_oop: usize,
+    pub num_ip: usize,
+}
+
+impl range_solver::game::BoundaryEvaluator for OwnedHybridBoundaryAdapter {
+    fn num_continuations(&self) -> usize { 1 }
+
+    fn compute_cfvs(
+        &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        panic!(
+            "OwnedHybridBoundaryAdapter: use compute_cfvs_both \
+             (single-side compute_cfvs not supported)"
+        );
+    }
+
+    fn compute_cfvs_both(
+        &self,
+        _pot: i32,
+        _remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let oop_range: Vec<f64> = oop_reach.iter().map(|&v| f64::from(v)).collect();
+        let ip_range: Vec<f64> = ip_reach.iter().map(|&v| f64::from(v)).collect();
+        let cfvs = self.evaluator.compute_cfvs(
+            self.boundary_id,
+            &self.combos,
+            &self.board,
+            &oop_range,
+            &ip_range,
+            self.boundary_pot,
+            self.boundary_invested,
+        );
+        let oop = cfvs.oop_cfvs.into_iter().map(|v| v as f32).collect();
+        let ip = cfvs.ip_cfvs.into_iter().map(|v| v as f32).collect();
+        (oop, ip)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BoundaryEvaluator trait placeholder
 // ---------------------------------------------------------------------------
 
