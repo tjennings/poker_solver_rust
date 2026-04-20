@@ -168,15 +168,8 @@ struct GameSolveParams {
     max_iterations: Option<u32>,
     target_exploitability: Option<f32>,
     matrix_snapshot_interval: Option<u32>,
-    rollout_bias_factor: Option<f64>,
-    rollout_num_samples: Option<u32>,
-    rollout_opponent_samples: Option<u32>,
-    rollout_enumerate_depth: Option<u8>,
     range_clamp_threshold: Option<f64>,
-    subgame_depth_limit: Option<u8>,
-    hybrid_depth_limit: Option<u8>,
-    hybrid_refresh_interval: Option<u32>,
-    hybrid_samples_per_refresh: Option<u32>,
+    street_boundary_config: Option<poker_solver_tauri::StreetBoundaryConfig>,
 }
 
 #[derive(Deserialize)]
@@ -661,15 +654,8 @@ async fn handle_game_solve(
         params.max_iterations,
         params.target_exploitability,
         params.matrix_snapshot_interval,
-        params.rollout_bias_factor,
-        params.rollout_num_samples,
-        params.rollout_opponent_samples,
-        params.rollout_enumerate_depth,
         params.range_clamp_threshold,
-        params.subgame_depth_limit,
-        params.hybrid_depth_limit.or(params.subgame_depth_limit),
-        params.hybrid_refresh_interval,
-        params.hybrid_samples_per_refresh,
+        params.street_boundary_config,
     ))
 }
 

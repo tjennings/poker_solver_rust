@@ -4,7 +4,6 @@
 //! Built to debug bean izod — subgame converging worse than its blueprint seed.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,21 +11,16 @@ use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
-use poker_solver_core::blueprint_v2::continuation::BiasType;
-use poker_solver_core::blueprint_v2::game_tree::{
-    GameNode as V2GameNode, GameTree as V2GameTree,
-};
+use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
-use poker_solver_core::hands::all_hands;
+use poker_solver_core::blueprint_v2::Street;
 
 use poker_solver_tauri::{
-    GameSession, SolveBoundaryEvaluator, build_solve_game,
-    parse_rs_poker_card, range_solver_to_rs_card, seed_solver_with_blueprint,
-    compute_boundary_reach,
+    GameSession, build_solve_game,
+    parse_rs_poker_card, seed_solver_with_blueprint,
+    StreetBoundaryConfig, resolve_street_boundary,
 };
-use poker_solver_tauri::postflop::{CbvContext, RolloutLeafEvaluator};
-use poker_solver_tauri::hybrid_evaluator::{HybridBoundaryEvaluator, OwnedHybridBoundaryAdapter};
+use poker_solver_tauri::postflop::CbvContext;
 
 use range_solver::card::card_to_string;
 use range_solver::interface::Game;
@@ -388,320 +382,61 @@ fn load_bundle_with_snapshot(
     Ok((config, strategy, tree, decision_map, ctx))
 }
 
-/// Find the abstract_node_idx for boundary rollouts (first Chance node from current position).
-fn find_boundary_node(tree: &V2GameTree, node_idx: u32) -> u32 {
-    let mut idx = node_idx;
-    for _ in 0..100 {
-        match &tree.nodes[idx as usize] {
-            V2GameNode::Chance { .. } => return idx,
-            V2GameNode::Decision { children, .. } => {
-                if let Some(&first_child) = children.first() {
-                    idx = first_child;
-                } else {
-                    break;
-                }
-            }
-            V2GameNode::Terminal { .. } => break,
-        }
-    }
-    node_idx
-}
-
-/// Set up boundary evaluator and precompute multi-continuation CFVs for a subgame game.
-///
-/// Legacy path: retained for Phase 5 cleanup. Replaced by `setup_hybrid_boundaries`.
-#[allow(dead_code, clippy::too_many_arguments)]
-fn setup_subgame_boundaries(
-    game: &mut PostFlopGame,
-    ctx: &CbvContext,
-    board_cards: &[poker_solver_core::poker::Card],
-    abstract_node_idx: u32,
-    blueprint_root: u32,
-    street: Street,
-    eff_stack: i32,
-    pot: i32,
-    enumerate_depth: Option<u8>,
-    opponent_samples: Option<u32>,
-    verbose: bool,
-) {
+/// Load ONNX session and wire per-boundary `NeuralBoundaryEvaluator`s
+/// into the game's `per_boundary_evaluators` vector.
+fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
+    let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
-    if n_boundaries == 0 {
+
+    if boundary_boards.is_empty() {
+        eprintln!("[compare] no boundary boards found; skipping neural setup");
         return;
     }
 
-    // Build combos in rollout ordering
-    let mut combos: Vec<[poker_solver_core::poker::Card; 2]> = Vec::new();
-    for hand in all_hands() {
-        for (c0, c1) in hand.combos() {
-            if board_cards.iter().any(|b| *b == c0 || *b == c1) {
-                continue;
-            }
-            combos.push([c0, c1]);
+    let session = match cfvnet::eval::boundary_evaluator::load_shared_onnx_session(model_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[compare] ONNX session load failed: {e}");
+            return;
         }
-    }
-
-    let build_map = |player: usize, combos: &[[poker_solver_core::poker::Card; 2]]| -> Vec<usize> {
-        game.private_cards(player).iter().map(|&(c1, c2)| {
-            let rs_c1 = range_solver_to_rs_card(c1);
-            let rs_c2 = range_solver_to_rs_card(c2);
-            combos.iter().position(|c|
-                (c[0] == rs_c1 && c[1] == rs_c2) || (c[0] == rs_c2 && c[1] == rs_c1)
-            ).unwrap_or(usize::MAX)
-        }).collect()
     };
-    let map0 = build_map(0, &combos);
-    let map1 = build_map(1, &combos);
 
-    let bias_factor = 10.0;
-    let num_rollouts = 3;
-    let opp_samples = opponent_samples.unwrap_or(8);
-    let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-
-    let mut rollout = RolloutLeafEvaluator::new(
-        Arc::clone(&ctx.strategy),
-        Arc::new(ctx.abstract_tree.clone()),
-        Arc::clone(&ctx.all_buckets),
-        abstract_node_idx,
-        BiasType::Unbiased,
-        bias_factor,
-        num_rollouts,
-        opp_samples,
-        starting_stack,
-        f64::from(pot),
-    );
-    if let Some(depth) = enumerate_depth {
-        rollout.enumerate_decision_depth = depth;
-    }
-
-    let combos_for_precomp = combos.clone();
-    let board_cards_for_precomp = board_cards.to_vec();
-    let game_to_combo_for_precomp = [map0.clone(), map1.clone()];
-
-    game.boundary_evaluator = Some(Arc::new(SolveBoundaryEvaluator {
-        private_cards: [
-            game.private_cards(0).to_vec(),
-            game.private_cards(1).to_vec(),
-        ],
-        board_cards: board_cards.to_vec(),
-        eff_stack: f64::from(eff_stack),
-        rollout: Some(rollout),
-        combos,
-        game_to_combo: [map0, map1],
-    }));
-
-    // Precompute multi-valued boundary CFVs (K=4 continuations).
-    let k = game.boundary_evaluator.as_ref().map_or(1, |e| e.num_continuations());
-    if k > 1 {
-        game.init_multi_continuation(k);
-        let biases = [BiasType::Unbiased, BiasType::Fold, BiasType::Call, BiasType::Raise];
-        let precomp_counter = Arc::new(AtomicU64::new(0));
-        let start = Instant::now();
-
-        // Compute per-boundary reach by walking the subgame tree
-        // with blueprint strategy probabilities.
-        let boundary_reach = compute_boundary_reach(
-            game,
-            &ctx.strategy,
-            &ctx.all_buckets,
-            &ctx.abstract_tree,
-            board_cards,
-            street,
-            blueprint_root,
-        );
-
-        for ordinal in 0..n_boundaries {
-            let pot_at_boundary = game.boundary_pot(ordinal);
-
-            for player in 0..2 {
-                let num_hands = game.num_private_hands(player);
-
-                for (ki, &bias) in biases.iter().enumerate().take(k) {
-                    let mut eval = RolloutLeafEvaluator::new(
-                        Arc::clone(&ctx.strategy),
-                        Arc::new(ctx.abstract_tree.clone()),
-                        Arc::clone(&ctx.all_buckets),
-                        abstract_node_idx,
-                        bias,
-                        bias_factor,
-                        num_rollouts,
-                        opp_samples,
-                        starting_stack,
-                        f64::from(pot_at_boundary),
-                    );
-                    if let Some(depth) = enumerate_depth {
-                        eval.enumerate_decision_depth = depth;
-                    }
-                    eval.call_counter = Arc::clone(&precomp_counter);
-
-                    let opp = player ^ 1;
-                    let mut opp_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                    let opp_weights = &boundary_reach[ordinal][opp];
-                    for (gi, &ci) in game_to_combo_for_precomp[opp].iter().enumerate() {
-                        if ci < opp_combo_reach.len() && gi < opp_weights.len() {
-                            opp_combo_reach[ci] = opp_weights[gi] as f64;
-                        }
-                    }
-                    let mut hero_combo_reach = vec![0.0f64; combos_for_precomp.len()];
-                    let hero_weights = &boundary_reach[ordinal][player];
-                    for (gi, &ci) in game_to_combo_for_precomp[player].iter().enumerate() {
-                        if ci < hero_combo_reach.len() && gi < hero_weights.len() {
-                            hero_combo_reach[ci] = hero_weights[gi] as f64;
-                        }
-                    }
-
-                    let requests = vec![(pot_at_boundary as f64, 0.0, player as u8)];
-                    let results = eval.evaluate_boundaries(
-                        &combos_for_precomp, &board_cards_for_precomp,
-                        &hero_combo_reach, &opp_combo_reach, &requests,
-                    );
-                    let combo_cfvs = results.into_iter().next().unwrap_or_default();
-
-                    let hero_map = &game_to_combo_for_precomp[player];
-                    let mut cfvs = vec![0.0f32; num_hands];
-                    for (game_idx, &combo_idx) in hero_map.iter().enumerate() {
-                        if combo_idx < combo_cfvs.len() && game_idx < cfvs.len() {
-                            cfvs[game_idx] = combo_cfvs[combo_idx] as f32;
-                        }
-                    }
-                    game.set_boundary_cfvs_multi(ordinal, player, ki, cfvs);
-                }
-            }
-        }
-
-        let elapsed = start.elapsed();
-        eprintln!(
-            "[compare] precomputed {} boundaries x {} continuations x 2 players in {:.1}s",
-            n_boundaries, k, elapsed.as_secs_f64()
-        );
-        if verbose {
-            eprintln!("[compare] precompute rollout calls: {}", precomp_counter.load(Ordering::Relaxed));
-        }
-    }
-}
-
-/// Set up hybrid boundary evaluator with lazy per-boundary adapters.
-///
-/// Replaces the legacy K=4 precompute approach: instead of precomputing all
-/// boundary CFVs upfront, this creates a `HybridBoundaryEvaluator` that
-/// lazily samples and caches boundary CFVs during the DCFR iteration loop.
-///
-/// Returns the hybrid evaluator Arc (caller must hook `begin_iteration` per iter).
-#[allow(clippy::too_many_arguments)]
-fn setup_hybrid_boundaries(
-    game: &mut PostFlopGame,
-    ctx: &CbvContext,
-    board_cards: &[poker_solver_core::poker::Card],
-    abstract_node_idx: u32,
-    refresh_interval: u32,
-    samples_per_refresh: u32,
-    opponent_samples: u32,
-    eff_stack: i32,
-    pot: i32,
-) -> Arc<HybridBoundaryEvaluator> {
-    let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
-
-    // num_rollouts=1 (inner trajectory loop); num_opponent_samples =
-    // samples_per_refresh so the MC budget knob is proportional to actual work.
-    let _ = opponent_samples;
-    let rollout_eval = RolloutLeafEvaluator::new(
-        Arc::clone(&ctx.strategy),
-        Arc::new(ctx.abstract_tree.clone()),
-        Arc::clone(&ctx.all_buckets),
-        abstract_node_idx,
-        BiasType::Unbiased,
-        1.0, // bias_factor irrelevant for unbiased
-        1,                     // num_rollouts
-        samples_per_refresh,   // num_opponent_samples
-        starting_stack,
-        f64::from(pot),
-    );
-
-    let hybrid_eval = Arc::new(HybridBoundaryEvaluator::new(
-        Box::new(rollout_eval),
-        refresh_interval,
-        samples_per_refresh,
-    ));
-    hybrid_eval.set_total_boundaries(game.num_boundary_nodes() as u32);
-
-    // Build combos in rollout ordering
-    let mut combos: Vec<[poker_solver_core::poker::Card; 2]> = Vec::new();
-    for hand in all_hands() {
-        for (c0, c1) in hand.combos() {
-            if board_cards.iter().any(|b| *b == c0 || *b == c1) {
-                continue;
-            }
-            combos.push([c0, c1]);
-        }
-    }
-
-    // Game-space hand index → combo-space index (per player).
-    let build_map = |player: usize| -> Vec<usize> {
-        game.private_cards(player).iter().map(|&(c1, c2)| {
-            let rs_c1 = range_solver_to_rs_card(c1);
-            let rs_c2 = range_solver_to_rs_card(c2);
-            combos.iter().position(|c|
-                (c[0] == rs_c1 && c[1] == rs_c2) || (c[0] == rs_c2 && c[1] == rs_c1)
-            ).unwrap_or(usize::MAX)
-        }).collect()
-    };
-    let map0 = build_map(0);
-    let map1 = build_map(1);
-
-    // Build per-boundary owned adapters
-    let n_boundaries = game.num_boundary_nodes();
-    let num_oop = game.num_private_hands(0);
-    let num_ip = game.num_private_hands(1);
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
-    for ordinal in 0..n_boundaries {
-        let boundary_pot = game.boundary_pot(ordinal) as f64;
-        let adapter = OwnedHybridBoundaryAdapter {
-            evaluator: Arc::clone(&hybrid_eval),
-            boundary_id: ordinal as u64,
-            combos: combos.clone(),
-            board: board_cards.to_vec(),
-            boundary_pot,
-            boundary_invested: [boundary_pot / 2.0, boundary_pot / 2.0],
-            num_oop,
-            num_ip,
-            game_to_combo: [map0.clone(), map1.clone()],
-        };
-        per_boundary.push(Arc::new(adapter));
+    for board_4 in boundary_boards {
+        let private_cards_pair = [
+            game.private_cards(0).to_vec(),
+            game.private_cards(1).to_vec(),
+        ];
+        let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+            Arc::clone(&session),
+            board_4,
+            private_cards_pair,
+        );
+        per_boundary.push(Arc::new(eval));
     }
     game.per_boundary_evaluators = per_boundary;
-    // Hybrid path is dispatched via per_boundary_evaluators; disable legacy evaluator.
     game.boundary_evaluator = None;
 
-    hybrid_eval
+    eprintln!(
+        "[compare] neural-cfvnet mode: {} boundaries (ONNX)",
+        n_boundaries,
+    );
 }
 
 /// Run a DCFR solve loop, returning (wall_time, final_exploitability).
-///
-/// If `hybrid_eval` is provided, calls `begin_iteration` at the top of each
-/// iteration and clears cached boundary CFVs at refresh boundaries.
 fn run_dcfr_solve(
     game: &mut PostFlopGame,
     iters: u32,
     label: &str,
     verbose: bool,
-    hybrid_eval: Option<&HybridBoundaryEvaluator>,
-    refresh_interval: u32,
 ) -> (f64, f64) {
     let start = Instant::now();
     let has_per_boundary = !game.per_boundary_evaluators.is_empty();
     for t in 0..iters {
-        // Hybrid mode: notify the evaluator of the current iteration
-        // and clear boundary CFV cache at refresh boundaries so the
-        // evaluator re-samples with current strategy-derived reaches.
-        if let Some(eval) = hybrid_eval {
-            eval.begin_iteration(t);
-            if t == 0 || t % refresh_interval == 0 {
-                game.clear_boundary_cfvs();
-            }
-        } else if has_per_boundary {
-            // Neural cfvnet path: per-boundary evaluators are set but no
-            // HybridBoundaryEvaluator. Clear CFV cache every iteration so
-            // boundary values are recomputed with updated opponent reaches.
+        // Neural cfvnet path: clear CFV cache every iteration so boundary
+        // values are recomputed with updated opponent reaches.
+        if has_per_boundary {
             game.clear_boundary_cfvs();
         }
 
@@ -961,13 +696,9 @@ pub fn run(
     snapshot: Option<&str>,
     spot: &str,
     iters: u32,
-    _enumerate_depth: Option<u8>,
-    opponent_samples: Option<u32>,
     verbose: bool,
     dump_boundary_cfvs: bool,
-    subgame_depth_limit: Option<u8>,
-    hybrid_refresh_interval: u32,
-    hybrid_samples_per_refresh: u32,
+    street_boundary_config: StreetBoundaryConfig,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -1013,13 +744,14 @@ pub fn run(
         Street::Preflop => return Err("Cannot solve preflop".to_string()),
     };
 
-    // Find abstract_node_idx for boundary rollouts
-    let abstract_node_idx = find_boundary_node(&tree, session.node_idx());
-
     // Parse board cards for rs_poker
     let board_cards: Vec<poker_solver_core::poker::Card> = board.iter()
         .map(|s| parse_rs_poker_card(s))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Resolve boundary config
+    let boundary_cut = resolve_street_boundary(&street_boundary_config, street);
+    let depth_limit = boundary_cut.as_ref().map(|(d, _)| *d);
 
     // Print header (display values in BB = chips / 2)
     let pot_bb = pot as f64 / 2.0;
@@ -1029,10 +761,11 @@ pub fn run(
     println!("board: {board_str}  pot: {pot_bb:.0}  eff_stack: {eff_bb:.0}");
     println!("position: {position}");
     println!(
-        "iters: {iters}  depth_limit: {}  hybrid refresh_interval: {}  samples_per_refresh: {}",
-        subgame_depth_limit.map_or("default(0)".to_string(), |d| d.to_string()),
-        hybrid_refresh_interval,
-        hybrid_samples_per_refresh,
+        "iters: {iters}  boundary: {}",
+        match &boundary_cut {
+            Some((d, p)) => format!("depth={d}, model={p}"),
+            None => "all-exact".to_string(),
+        }
     );
     println!();
 
@@ -1050,9 +783,9 @@ pub fn run(
         );
     }
 
-    // 5. Build subgame game
+    // 5. Build subgame game (with depth limit from SBC)
     eprintln!("[compare] building subgame game...");
-    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, false, subgame_depth_limit)?;
+    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, false, depth_limit)?;
 
     let n_boundaries = subgame_game.num_boundary_nodes();
     let (mem_subgame, _) = subgame_game.memory_usage();
@@ -1077,92 +810,25 @@ pub fn run(
         &board_cards, seed_street, current_node,
     );
 
-    // 7. Set up boundary evaluator — prefer ONNX neural cfvnet, fall back to rollout
-    let opp_samples = opponent_samples.unwrap_or(8);
-    let hybrid_eval = if n_boundaries > 0 {
-        // Check if neural cfvnet path is applicable:
-        //   (a) ONNX model file exists, AND
-        //   (b) all boundary boards are 4-card (turn boards for river cfvnet)
-        let model_path = std::path::PathBuf::from(
-            "local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx",
-        );
-        let boundary_boards = subgame_game.boundary_boards();
-        let neural_applicable = model_path.exists()
-            && !boundary_boards.is_empty()
-            && boundary_boards.iter().all(|b| b.len() == 4);
-
-        let neural_session = if neural_applicable {
-            match cfvnet::eval::boundary_evaluator::load_shared_onnx_session(&model_path) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("[compare] ONNX session load failed, falling back to rollout: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        if let Some(session) = neural_session {
-            // -- Neural cfvnet mode: ONNX-based boundary evaluation --
-            let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
-                Vec::with_capacity(n_boundaries);
-            for board_4 in boundary_boards {
-                let private_cards_pair = [
-                    subgame_game.private_cards(0).to_vec(),
-                    subgame_game.private_cards(1).to_vec(),
-                ];
-                let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
-                    Arc::clone(&session),
-                    board_4,
-                    private_cards_pair,
-                );
-                per_boundary.push(Arc::new(eval));
-            }
-            subgame_game.per_boundary_evaluators = per_boundary;
-            subgame_game.boundary_evaluator = None;
-            eprintln!(
-                "[solve] neural-cfvnet mode: {} boundaries (ONNX), 0 samples",
-                n_boundaries,
-            );
-            None // No HybridBoundaryEvaluator needed for neural path
-        } else {
-            // -- Fallback: rollout-based hybrid path --
-            eprintln!(
-                "[compare] hybrid mode: {} boundaries, refresh_interval={}, samples_per_refresh={}",
-                n_boundaries, hybrid_refresh_interval, hybrid_samples_per_refresh,
-            );
-            Some(setup_hybrid_boundaries(
-                &mut subgame_game,
-                &ctx,
-                &board_cards,
-                abstract_node_idx,
-                hybrid_refresh_interval,
-                hybrid_samples_per_refresh,
-                opp_samples,
-                eff_stack,
-                pot,
-            ))
+    // 7. Set up neural boundary evaluators if a cut is active
+    if let Some((_, ref model_path)) = boundary_cut {
+        if n_boundaries > 0 {
+            setup_neural_boundaries(&mut subgame_game, Path::new(model_path));
         }
-    } else {
-        None
-    };
+    }
 
-    // 7b. Dump boundary CFVs if requested (only meaningful after at least
-    //     one iteration in hybrid mode; skip pre-solve dump for hybrid).
     let _ = dump_boundary_cfvs;
 
     // 8. Solve exact
     eprintln!("[compare] solving exact ({iters} iters)...");
     let (exact_wall, exact_exp) = run_dcfr_solve(
-        &mut exact_game, iters, "exact", verbose, None, hybrid_refresh_interval,
+        &mut exact_game, iters, "exact", verbose,
     );
 
-    // 9. Solve subgame (hybrid)
-    eprintln!("[compare] solving subgame/hybrid ({iters} iters)...");
+    // 9. Solve subgame
+    eprintln!("[compare] solving subgame ({iters} iters)...");
     let (subgame_wall, subgame_exp) = run_dcfr_solve(
         &mut subgame_game, iters, "subgame", verbose,
-        hybrid_eval.as_deref(), hybrid_refresh_interval,
     );
 
     // 10. Extract strategies at root
@@ -1217,9 +883,9 @@ pub fn run(
     );
     println!();
 
-    println!("=== Hybrid solve ===");
+    println!("=== Subgame solve ===");
     println!(
-        "solve: {subgame_wall:.1}s  final_exp: {subgame_exp_mbb:.2} mbb/hand  memory: {:.1} MB  boundaries: {n_boundaries}  refresh: {hybrid_refresh_interval}  samples: {hybrid_samples_per_refresh}",
+        "solve: {subgame_wall:.1}s  final_exp: {subgame_exp_mbb:.2} mbb/hand  memory: {:.1} MB  boundaries: {n_boundaries}",
         mem_subgame as f64 / 1_048_576.0,
     );
     println!();

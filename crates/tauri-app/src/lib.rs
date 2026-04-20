@@ -1,6 +1,5 @@
 mod exploration;
 pub mod game_session;
-pub mod hybrid_evaluator;
 pub mod postflop;
 mod simulation;
 
@@ -67,4 +66,5 @@ pub use game_session::{
     // Types
     GameSession, GameSessionState, GameState, GameMatrix, GameMatrixCell, GameAction,
     SolveBoundaryEvaluator, build_solve_game,
+    StreetBoundaryConfig, StreetBoundaryMode, resolve_street_boundary,
 };

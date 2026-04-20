@@ -361,14 +361,6 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         iters: u32,
 
-        /// Subgame enumerate depth (255 for exhaustive)
-        #[arg(long, default_value_t = 2)]
-        subgame_enumerate_depth: u8,
-
-        /// Opponent samples for rollout
-        #[arg(long, default_value_t = 8)]
-        opponent_samples: u32,
-
         /// Print per-iteration progress
         #[arg(long)]
         verbose: bool,
@@ -377,18 +369,29 @@ enum Commands {
         #[arg(long)]
         dump_boundary_cfvs: bool,
 
-        /// Depth limit for hybrid subgame: number of street transitions allowed.
-        /// 0 = current street only (default), 1 = current + next, 2 = flop through river.
-        #[arg(long, alias = "subgame-depth-limit")]
-        hybrid_depth_limit: Option<u8>,
+        /// Flop boundary mode: "exact" or "cfvnet"
+        #[arg(long, default_value = "exact")]
+        flop_boundary: String,
 
-        /// Hybrid evaluator refresh interval: re-sample boundary CFVs every N iters.
-        #[arg(long, default_value_t = 10)]
-        hybrid_refresh_interval: u32,
+        /// ONNX model path for flop boundary (required when --flop-boundary=cfvnet)
+        #[arg(long)]
+        flop_model: Option<String>,
 
-        /// Hybrid evaluator samples per refresh: number of rollout samples per boundary.
-        #[arg(long, default_value_t = 100)]
-        hybrid_samples_per_refresh: u32,
+        /// Turn boundary mode: "exact" or "cfvnet"
+        #[arg(long, default_value = "exact")]
+        turn_boundary: String,
+
+        /// ONNX model path for turn boundary (required when --turn-boundary=cfvnet)
+        #[arg(long)]
+        turn_model: Option<String>,
+
+        /// River boundary mode: "exact" or "cfvnet"
+        #[arg(long, default_value = "exact")]
+        river_boundary: String,
+
+        /// ONNX model path for river boundary (required when --river-boundary=cfvnet)
+        #[arg(long)]
+        river_model: Option<String>,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1302,26 +1305,43 @@ fn main() -> Result<(), Box<dyn Error>> {
             snapshot,
             spot,
             iters,
-            subgame_enumerate_depth,
-            opponent_samples,
             verbose,
             dump_boundary_cfvs,
-            hybrid_depth_limit,
-            hybrid_refresh_interval,
-            hybrid_samples_per_refresh,
+            flop_boundary,
+            flop_model,
+            turn_boundary,
+            turn_model,
+            river_boundary,
+            river_model,
         } => {
+            let parse_mode = |mode: &str, model: Option<String>, street: &str|
+                -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
+                match mode {
+                    "exact" => Ok(poker_solver_tauri::StreetBoundaryMode::Exact),
+                    "cfvnet" => {
+                        let path = model.ok_or_else(|| {
+                            format!("--{street}-model is required when --{street}-boundary=cfvnet")
+                        })?;
+                        Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet { model_path: path })
+                    }
+                    other => Err(format!(
+                        "invalid --{street}-boundary value '{other}': expected 'exact' or 'cfvnet'"
+                    ).into()),
+                }
+            };
+            let sbc = poker_solver_tauri::StreetBoundaryConfig {
+                flop: parse_mode(&flop_boundary, flop_model, "flop")?,
+                turn: parse_mode(&turn_boundary, turn_model, "turn")?,
+                river: parse_mode(&river_boundary, river_model, "river")?,
+            };
             compare_solve::run(
                 &bundle,
                 snapshot.as_deref(),
                 &spot,
                 iters,
-                Some(subgame_enumerate_depth),
-                Some(opponent_samples),
                 verbose,
                 dump_boundary_cfvs,
-                hybrid_depth_limit,
-                hybrid_refresh_interval,
-                hybrid_samples_per_refresh,
+                sbc,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -2713,57 +2733,53 @@ snapshots:
         assert_eq!(resolved[1].name, "HJ vs UTG");
     }
 
-    /// compare-solve should accept --hybrid-depth-limit, --hybrid-refresh-interval,
-    /// --hybrid-samples-per-refresh, and the --subgame-depth-limit alias.
+    /// compare-solve should accept per-street boundary flags.
     #[test]
-    fn compare_solve_hybrid_cli_flags_parse() {
+    fn compare_solve_street_boundary_cli_flags_parse() {
         use clap::Parser;
 
-        // New hybrid flags
+        // All-exact defaults
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
             "--bundle", "/tmp/test",
             "--spot", "sb:2bb,bb:call|Jd9d7d",
-            "--hybrid-depth-limit", "1",
-            "--hybrid-refresh-interval", "20",
-            "--hybrid-samples-per-refresh", "200",
         ]);
-        assert!(cli.is_ok(), "hybrid flags must parse: {:?}", cli.err());
+        assert!(cli.is_ok(), "default flags must parse: {:?}", cli.err());
 
         if let super::Commands::CompareSolve {
-            hybrid_depth_limit,
-            hybrid_refresh_interval,
-            hybrid_samples_per_refresh,
+            flop_boundary,
+            turn_boundary,
+            river_boundary,
+            river_model,
             ..
         } = cli.unwrap().command {
-            assert_eq!(hybrid_depth_limit, Some(1));
-            assert_eq!(hybrid_refresh_interval, 20);
-            assert_eq!(hybrid_samples_per_refresh, 200);
+            assert_eq!(flop_boundary, "exact");
+            assert_eq!(turn_boundary, "exact");
+            assert_eq!(river_boundary, "exact");
+            assert!(river_model.is_none());
         } else {
             panic!("expected CompareSolve variant");
         }
 
-        // Legacy alias: --subgame-depth-limit should map to hybrid_depth_limit
+        // River cfvnet with model path
         let cli2 = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
             "--bundle", "/tmp/test",
             "--spot", "sb:2bb,bb:call|Jd9d7d",
-            "--subgame-depth-limit", "2",
+            "--river-boundary", "cfvnet",
+            "--river-model", "/path/to/model.onnx",
         ]);
-        assert!(cli2.is_ok(), "--subgame-depth-limit alias must parse: {:?}", cli2.err());
+        assert!(cli2.is_ok(), "river-cfvnet flags must parse: {:?}", cli2.err());
 
         if let super::Commands::CompareSolve {
-            hybrid_depth_limit,
-            hybrid_refresh_interval,
-            hybrid_samples_per_refresh,
+            river_boundary,
+            river_model,
             ..
         } = cli2.unwrap().command {
-            assert_eq!(hybrid_depth_limit, Some(2));
-            // Defaults
-            assert_eq!(hybrid_refresh_interval, 10);
-            assert_eq!(hybrid_samples_per_refresh, 100);
+            assert_eq!(river_boundary, "cfvnet");
+            assert_eq!(river_model.as_deref(), Some("/path/to/model.onnx"));
         } else {
             panic!("expected CompareSolve variant");
         }
