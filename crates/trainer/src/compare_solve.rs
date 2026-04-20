@@ -618,6 +618,7 @@ fn setup_hybrid_boundaries(
         refresh_interval,
         samples_per_refresh,
     ));
+    hybrid_eval.set_total_boundaries(game.num_boundary_nodes() as u32);
 
     // Build combos in rollout ordering
     let mut combos: Vec<[poker_solver_core::poker::Card; 2]> = Vec::new();

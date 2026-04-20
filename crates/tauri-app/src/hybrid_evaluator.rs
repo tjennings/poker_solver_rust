@@ -81,6 +81,19 @@ pub struct HybridBoundaryEvaluator {
     /// `compute_cfvs` calls skip sampling and return cached-or-zero values so
     /// the solve unwinds promptly.
     cancel_flag: std::sync::Arc<AtomicBool>,
+    /// Expected number of boundaries to sample per refresh cycle. Set once by
+    /// solve setup via `set_total_boundaries`. Used for progress + ETA logging.
+    total_boundaries: AtomicU32,
+    /// Count of boundaries sampled in the current refresh cycle. Reset each
+    /// time a new refresh cycle begins (detected by iter change on sample).
+    refreshed_this_cycle: AtomicU32,
+    /// Iter at which the current refresh cycle started. `u32::MAX` means no
+    /// active cycle yet.
+    refresh_cycle_iter: AtomicU32,
+    /// Wall-clock start of the current refresh cycle.
+    refresh_start: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Rate-limit for progress log lines (throttles to ~1 every 500ms).
+    last_log: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl HybridBoundaryEvaluator {
@@ -123,7 +136,18 @@ impl HybridBoundaryEvaluator {
             cached: RwLock::new(HashMap::new()),
             current_iter: AtomicU32::new(0),
             cancel_flag,
+            total_boundaries: AtomicU32::new(0),
+            refreshed_this_cycle: AtomicU32::new(0),
+            refresh_cycle_iter: AtomicU32::new(u32::MAX),
+            refresh_start: std::sync::Mutex::new(None),
+            last_log: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Set the total boundary count for progress reporting. Call once after
+    /// construction, before the first solve iteration.
+    pub fn set_total_boundaries(&self, n: u32) {
+        self.total_boundaries.store(n, Ordering::Relaxed);
     }
 
     /// Update the current iteration counter. Called at the start of each
@@ -192,15 +216,70 @@ impl HybridBoundaryEvaluator {
             boundary_invested,
             self.samples_per_refresh,
         );
-        let mut guard = self.cached.write().unwrap();
-        guard.insert(
-            boundary_id,
-            CachedEntry {
-                cfvs: fresh.clone(),
-                refreshed_at_iter: iter,
-            },
-        );
+        {
+            let mut guard = self.cached.write().unwrap();
+            guard.insert(
+                boundary_id,
+                CachedEntry {
+                    cfvs: fresh.clone(),
+                    refreshed_at_iter: iter,
+                },
+            );
+        }
+        self.log_refresh_progress(iter);
         fresh
+    }
+
+    /// Tracks refresh-cycle progress and logs a rate-limited console line.
+    /// Called at the end of every successful sample.
+    fn log_refresh_progress(&self, iter: u32) {
+        // Detect a new refresh cycle (current sample is at a different iter
+        // than the one we're tracking).
+        let cycle_iter = self.refresh_cycle_iter.load(Ordering::Relaxed);
+        if cycle_iter != iter {
+            // New cycle: reset counters, record start.
+            self.refresh_cycle_iter.store(iter, Ordering::Relaxed);
+            self.refreshed_this_cycle.store(1, Ordering::Relaxed);
+            *self.refresh_start.lock().unwrap() = Some(std::time::Instant::now());
+            *self.last_log.lock().unwrap() = None;
+        } else {
+            self.refreshed_this_cycle.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let done = self.refreshed_this_cycle.load(Ordering::Relaxed);
+        let total = self.total_boundaries.load(Ordering::Relaxed);
+        let started = *self.refresh_start.lock().unwrap();
+
+        // Rate-limit: log at most every 500ms, plus always log on completion.
+        let now = std::time::Instant::now();
+        let mut last_log_guard = self.last_log.lock().unwrap();
+        let should_log = match *last_log_guard {
+            None => true,
+            Some(prev) => now.duration_since(prev).as_millis() >= 500,
+        } || (total > 0 && done >= total);
+        if !should_log {
+            return;
+        }
+        *last_log_guard = Some(now);
+        drop(last_log_guard);
+
+        if let (Some(started), true) = (started, total > 0) {
+            let elapsed = now.duration_since(started).as_secs_f64();
+            let pct = (done as f64 / total as f64) * 100.0;
+            let rate = done as f64 / elapsed.max(0.001);
+            let remaining = total.saturating_sub(done);
+            let eta = (remaining as f64 / rate.max(0.001)).round();
+            let msg = if done >= total {
+                format!(
+                    "[hybrid] refresh iter {iter}: {done}/{total} boundaries in {elapsed:.1}s ({rate:.0}/s)"
+                )
+            } else {
+                format!(
+                    "[hybrid] refresh iter {iter}: {done}/{total} ({pct:.0}%) elapsed {elapsed:.1}s, ETA {eta:.0}s"
+                )
+            };
+            eprintln!("{msg}");
+        }
     }
 }
 

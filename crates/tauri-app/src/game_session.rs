@@ -438,8 +438,10 @@ impl GameSession {
 
         let weight_idx = self.weight_index(player);
         let board_cards = parse_board(&self.board).ok();
-        eprintln!("[matrix] street={street:?}, board_len={}, cbv_context={}, board_cards={}",
-            self.board.len(), self.cbv_context.is_some(), board_cards.as_ref().map_or(0, |b| b.len()));
+        // [matrix] log intentionally silenced — fired on every strategy-matrix
+        // request (many per iter in the UI). Re-enable by uncommenting if needed.
+        // eprintln!("[matrix] street={street:?}, board_len={}, cbv_context={}, board_cards={}",
+        //     self.board.len(), self.cbv_context.is_some(), board_cards.as_ref().map_or(0, |b| b.len()));
 
         // Build the canonical-to-combo map for weight averaging.
         let combo_map = build_canonical_to_combo_map();
@@ -1928,6 +1930,11 @@ pub fn game_solve_core(
                         Arc::clone(&ss_clone.cancel),
                     ),
                 );
+                // DCFR's K<=1 boundary eval calls compute_cfvs_both once per
+                // boundary on the *first* traverser visit, populating both
+                // players' CFV slots. Second-traverser visits hit the cache.
+                // So per refresh cycle: n_boundaries samples, not × 2.
+                hybrid_eval.set_total_boundaries(n_boundaries as u32);
                 hybrid_eval_arc = Some(Arc::clone(&hybrid_eval));
 
                 // Build per-boundary owned adapters.
