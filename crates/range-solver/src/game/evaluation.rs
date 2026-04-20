@@ -89,7 +89,9 @@ impl PostFlopGame {
             let ordinal = self.node_to_boundary[node_index] as usize;
             let k = self.num_continuations.max(1);
 
-            // Update opponent reach at this boundary every visit.
+            // Update both players' reaches at this boundary every visit.
+            // Opponent reach comes from cfreach (the opponent's counterfactual reach).
+            // Player's own reach is also stashed so compute_cfvs_both can use it.
             let opp = player ^ 1;
             let reach_index = ordinal * 2 + opp;
             if reach_index < self.boundary_reach.len() {
@@ -100,6 +102,7 @@ impl PostFlopGame {
             if k <= 1 {
                 let bcfv_index = ordinal * 2 + player;
                 // Lazily compute and cache boundary CFVs on first visit.
+                // Use compute_cfvs_both to populate BOTH players' slots at once.
                 {
                     let guard = self.boundary_cfvs[bcfv_index].lock().unwrap();
                     if guard.is_empty() {
@@ -109,13 +112,31 @@ impl PostFlopGame {
                             let remaining = (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
                             let opp_reach = self.boundary_reach[reach_index].lock().unwrap().clone();
                             let opp_reach_ref = if opp_reach.is_empty() {
-                                self.initial_weights[opp].to_vec()
+                                &self.initial_weights[opp]
                             } else {
-                                opp_reach
+                                &opp_reach
                             };
-                            let num_hands = self.private_cards[player].len();
-                            let cfvs = evaluator.compute_cfvs(player, pot, remaining, &opp_reach_ref, num_hands, 0);
-                            *self.boundary_cfvs[bcfv_index].lock().unwrap() = cfvs;
+                            // Get the visiting player's own reach for compute_cfvs_both.
+                            let player_reach_index = ordinal * 2 + player;
+                            let player_reach = self.boundary_reach[player_reach_index].lock().unwrap().clone();
+                            let player_reach_ref = if player_reach.is_empty() {
+                                &self.initial_weights[player]
+                            } else {
+                                &player_reach
+                            };
+                            let num_oop = self.private_cards[0].len();
+                            let num_ip = self.private_cards[1].len();
+                            let (oop_reach, ip_reach) = if player == 0 {
+                                (player_reach_ref.as_slice(), opp_reach_ref.as_slice())
+                            } else {
+                                (opp_reach_ref.as_slice(), player_reach_ref.as_slice())
+                            };
+                            let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+                                pot, remaining, oop_reach, ip_reach,
+                                num_oop, num_ip, 0,
+                            );
+                            *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_cfvs;
+                            *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_cfvs;
                         } else {
                             panic!(
                                 "boundary_cfvs empty at ordinal {ordinal}, player {player} \
@@ -1187,5 +1208,105 @@ mod tests {
         let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
         let nonzero: Vec<f32> = values.into_iter().filter(|&v| v != 0.0).collect();
         assert!(!nonzero.is_empty(), "should have nonzero values");
+    }
+
+    // -----------------------------------------------------------------
+    // compute_cfvs_both usage in K<=1 boundary evaluation
+    // -----------------------------------------------------------------
+
+    /// Mock evaluator that records call counts for single-side vs both-side.
+    struct MockBothSidesEvaluator {
+        single_calls: std::sync::atomic::AtomicU32,
+        both_calls: std::sync::atomic::AtomicU32,
+        num_oop: usize,
+        num_ip: usize,
+    }
+
+    impl MockBothSidesEvaluator {
+        fn new(num_oop: usize, num_ip: usize) -> Self {
+            Self {
+                single_calls: std::sync::atomic::AtomicU32::new(0),
+                both_calls: std::sync::atomic::AtomicU32::new(0),
+                num_oop,
+                num_ip,
+            }
+        }
+    }
+
+    impl crate::game::BoundaryEvaluator for MockBothSidesEvaluator {
+        fn compute_cfvs(
+            &self,
+            player: usize,
+            _pot: i32,
+            _remaining_stack: f64,
+            _opponent_reach: &[f32],
+            _num_hands: usize,
+            _continuation_index: usize,
+        ) -> Vec<f32> {
+            self.single_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = if player == 0 { self.num_oop } else { self.num_ip };
+            vec![1.0; n]
+        }
+
+        fn compute_cfvs_both(
+            &self,
+            _pot: i32,
+            _remaining_stack: f64,
+            _oop_reach: &[f32],
+            _ip_reach: &[f32],
+            _num_oop: usize,
+            _num_ip: usize,
+            _continuation_index: usize,
+        ) -> (Vec<f32>, Vec<f32>) {
+            self.both_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (vec![1.0; self.num_oop], vec![1.0; self.num_ip])
+        }
+    }
+
+    #[test]
+    fn boundary_eval_uses_compute_cfvs_both_not_single() {
+        let game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "need boundary nodes");
+
+        let num_oop = game.num_private_hands(0);
+        let num_ip = game.num_private_hands(1);
+        let mock = Arc::new(MockBothSidesEvaluator::new(num_oop, num_ip));
+        // Intentionally do NOT pre-set boundary_cfvs — let the evaluator compute them.
+
+        // Set boundary evaluator on game (requires mutable access to the field).
+        // The field is pub so we can set it directly in test context.
+        let game = {
+            let mut g = game;
+            g.boundary_evaluator = Some(mock.clone() as Arc<dyn crate::game::BoundaryEvaluator>);
+            g
+        };
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let node = game.node_arena[bd_idx].lock();
+
+        // Visit from OOP's perspective (player=0).
+        let cfreach_ip: Vec<f32> = vec![1.0; num_ip];
+        let mut result_oop: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result_oop, &node, 0, &cfreach_ip);
+
+        // Visit from IP's perspective (player=1).
+        let cfreach_oop: Vec<f32> = vec![1.0; num_oop];
+        let mut result_ip: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_ip];
+        game.evaluate_internal(&mut result_ip, &node, 1, &cfreach_oop);
+
+        let single = mock.single_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let both = mock.both_calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        // After the refactor: compute_cfvs_both should be called once (on first visit),
+        // and compute_cfvs (single-side) should never be called.
+        assert_eq!(
+            both, 1,
+            "compute_cfvs_both should be called exactly once, got {both}"
+        );
+        assert_eq!(
+            single, 0,
+            "compute_cfvs (single-side) should never be called, got {single}"
+        );
     }
 }
