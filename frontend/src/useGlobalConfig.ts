@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import type { GlobalConfig } from './types';
 
 const STORAGE_KEY = 'global_config';
-const DEFAULT_CONFIG: GlobalConfig = { blueprint_dir: '', target_exploitability: 3.0, solve_iterations: 200, backend_url: '', rollout_bias_factor: 10.0, rollout_num_samples: 3, rollout_opponent_samples: 8, rollout_enumerate_depth: 2, matrix_snapshot_interval: 10, range_clamp_threshold: 0.05, subgame_depth_limit: 1, hybrid_refresh_interval: 10, hybrid_samples_per_refresh: 100 };
+const DEFAULT_CONFIG: GlobalConfig = { blueprint_dir: '', target_exploitability: 3.0, solve_iterations: 200, backend_url: '', matrix_snapshot_interval: 10, range_clamp_threshold: 0.05, flop_boundary_mode: 'exact', turn_boundary_mode: 'exact', river_boundary_mode: 'exact', flop_model_path: '', turn_model_path: '', river_model_path: '' };
 
 // Custom event name for same-window config sync
 const CONFIG_CHANGED = 'global_config_changed';

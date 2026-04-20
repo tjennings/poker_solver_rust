@@ -144,21 +144,32 @@ export interface SimulationResult {
   elapsed_ms: number;
 }
 
+export type StreetBoundaryMode =
+  | { mode: 'exact' }
+  | { mode: 'cfvnet'; model_path: string };
+
+export interface StreetBoundaryConfig {
+  flop: StreetBoundaryMode;
+  turn: StreetBoundaryMode;
+  river: StreetBoundaryMode;
+}
+
 export interface GlobalConfig {
   blueprint_dir: string;
   target_exploitability: number;
   stub_range_solver?: boolean;
   solve_iterations: number;
   backend_url: string;
-  rollout_bias_factor: number;
-  rollout_num_samples: number;
-  rollout_opponent_samples: number;
-  rollout_enumerate_depth: number;
   matrix_snapshot_interval: number;
   range_clamp_threshold: number;
-  subgame_depth_limit: number;
-  hybrid_refresh_interval: number;
-  hybrid_samples_per_refresh: number;
+  // Per-street boundary config + remembered model paths per street
+  // (paths persist across "exact" toggles so users don't lose them).
+  flop_boundary_mode: 'exact' | 'cfvnet';
+  turn_boundary_mode: 'exact' | 'cfvnet';
+  river_boundary_mode: 'exact' | 'cfvnet';
+  flop_model_path: string;
+  turn_model_path: string;
+  river_model_path: string;
 }
 
 export interface BlueprintListEntry {

@@ -7,6 +7,7 @@ import type {
   GameMatrix,
   GameState,
 } from './game-types';
+// RefreshProgress removed — no longer exists in the backend contract.
 
 describe('GameState types', () => {
   it('constructs a valid GameState with all fields', () => {
