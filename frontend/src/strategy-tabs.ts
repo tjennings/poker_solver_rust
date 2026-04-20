@@ -1,3 +1,5 @@
+import type { StreetBoundaryConfig, StreetBoundaryMode } from './types';
+
 /** Strategy source type for tab selection */
 export type StrategySource = 'blueprint' | 'subgame' | 'exact';
 
@@ -15,14 +17,19 @@ export interface SolveParams {
   maxIterations: number;
   targetExploitability: number;
   matrixSnapshotInterval: number;
-  rolloutBiasFactor: number;
-  rolloutNumSamples: number;
-  rolloutOpponentSamples: number;
-  rolloutEnumerateDepth: number;
   rangeClampThreshold: number;
-  subgameDepthLimit: number;
-  hybridRefreshInterval: number;
-  hybridSamplesPerRefresh: number;
+  streetBoundaryConfig: StreetBoundaryConfig;
+}
+
+function modeFromConfig(
+  mode: 'exact' | 'cfvnet' | undefined,
+  modelPath: string | undefined,
+): StreetBoundaryMode {
+  if (mode === 'cfvnet') {
+    if (!modelPath) throw new Error('Street boundary set to cfvnet but no model_path');
+    return { mode: 'cfvnet', model_path: modelPath };
+  }
+  return { mode: 'exact' };
 }
 
 /**
@@ -32,20 +39,16 @@ export function buildSolveParams(
   mode: SolveMode,
   config: Record<string, unknown>,
 ): SolveParams {
-  const matrixSnapshotInterval = (config.matrix_snapshot_interval as number | undefined) ?? 10;
-
   return {
     mode,
     maxIterations: (config.solve_iterations as number | undefined) ?? 200,
     targetExploitability: (config.target_exploitability as number | undefined) ?? 3.0,
-    matrixSnapshotInterval,
-    rolloutBiasFactor: (config.rollout_bias_factor as number | undefined) ?? 10.0,
-    rolloutNumSamples: (config.rollout_num_samples as number | undefined) ?? 3,
-    rolloutOpponentSamples: (config.rollout_opponent_samples as number | undefined) ?? 8,
-    rolloutEnumerateDepth: (config.rollout_enumerate_depth as number | undefined) ?? 2,
+    matrixSnapshotInterval: (config.matrix_snapshot_interval as number | undefined) ?? 10,
     rangeClampThreshold: (config.range_clamp_threshold as number | undefined) ?? 0.05,
-    subgameDepthLimit: (config.subgame_depth_limit as number | undefined) ?? 1,
-    hybridRefreshInterval: (config.hybrid_refresh_interval as number | undefined) ?? 10,
-    hybridSamplesPerRefresh: (config.hybrid_samples_per_refresh as number | undefined) ?? 100,
+    streetBoundaryConfig: {
+      flop: modeFromConfig(config.flop_boundary_mode as 'exact' | 'cfvnet' | undefined, config.flop_model_path as string | undefined),
+      turn: modeFromConfig(config.turn_boundary_mode as 'exact' | 'cfvnet' | undefined, config.turn_model_path as string | undefined),
+      river: modeFromConfig(config.river_boundary_mode as 'exact' | 'cfvnet' | undefined, config.river_model_path as string | undefined),
+    },
   };
 }

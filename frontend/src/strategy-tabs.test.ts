@@ -32,11 +32,13 @@ describe('buildSolveParams', () => {
     solve_iterations: 200,
     target_exploitability: 3.0,
     matrix_snapshot_interval: 10,
-    rollout_bias_factor: 10.0,
-    rollout_num_samples: 3,
-    rollout_opponent_samples: 8,
-    rollout_enumerate_depth: 2,
     range_clamp_threshold: 0.05,
+    flop_boundary_mode: 'exact' as const,
+    turn_boundary_mode: 'exact' as const,
+    river_boundary_mode: 'exact' as const,
+    flop_model_path: '',
+    turn_model_path: '',
+    river_model_path: '',
   };
 
   it('returns mode in params', () => {
@@ -44,13 +46,8 @@ describe('buildSolveParams', () => {
     expect(params.mode).toBe('subgame');
   });
 
-  it('sets matrixSnapshotInterval from config for subgame mode', () => {
+  it('sets matrixSnapshotInterval from config', () => {
     const params = buildSolveParams('subgame', defaultConfig);
-    expect(params.matrixSnapshotInterval).toBe(10);
-  });
-
-  it('uses config matrixSnapshotInterval for exact mode (same as subgame)', () => {
-    const params = buildSolveParams('exact', defaultConfig);
     expect(params.matrixSnapshotInterval).toBe(10);
   });
 
@@ -59,10 +56,6 @@ describe('buildSolveParams', () => {
     expect(params.maxIterations).toBe(200);
     expect(params.targetExploitability).toBe(3.0);
     expect(params.matrixSnapshotInterval).toBe(10);
-    expect(params.rolloutBiasFactor).toBe(10.0);
-    expect(params.rolloutNumSamples).toBe(3);
-    expect(params.rolloutOpponentSamples).toBe(8);
-    expect(params.rolloutEnumerateDepth).toBe(2);
     expect(params.rangeClampThreshold).toBe(0.05);
   });
 
@@ -71,37 +64,96 @@ describe('buildSolveParams', () => {
       solve_iterations: 500,
       target_exploitability: 1.0,
       matrix_snapshot_interval: 20,
-      rollout_bias_factor: 5.0,
-      rollout_num_samples: 5,
-      rollout_opponent_samples: 12,
-      rollout_enumerate_depth: 4,
       range_clamp_threshold: 0.1,
+      flop_boundary_mode: 'exact' as const,
+      turn_boundary_mode: 'exact' as const,
+      river_boundary_mode: 'exact' as const,
+      flop_model_path: '',
+      turn_model_path: '',
+      river_model_path: '',
     };
     const params = buildSolveParams('subgame', config);
     expect(params.maxIterations).toBe(500);
     expect(params.targetExploitability).toBe(1.0);
     expect(params.matrixSnapshotInterval).toBe(20);
-    expect(params.rolloutBiasFactor).toBe(5.0);
-    expect(params.rolloutNumSamples).toBe(5);
-    expect(params.rolloutOpponentSamples).toBe(12);
-    expect(params.rolloutEnumerateDepth).toBe(4);
     expect(params.rangeClampThreshold).toBe(0.1);
   });
 
+  // streetBoundaryConfig tests
+
+  it('builds all-exact streetBoundaryConfig when all modes are exact', () => {
+    const params = buildSolveParams('subgame', defaultConfig);
+    expect(params.streetBoundaryConfig).toEqual({
+      flop: { mode: 'exact' },
+      turn: { mode: 'exact' },
+      river: { mode: 'exact' },
+    });
+  });
+
+  it('builds cfvnet streetBoundaryConfig for river with model path', () => {
+    const config = {
+      ...defaultConfig,
+      river_boundary_mode: 'cfvnet' as const,
+      river_model_path: '/models/river_v2.onnx',
+    };
+    const params = buildSolveParams('subgame', config);
+    expect(params.streetBoundaryConfig).toEqual({
+      flop: { mode: 'exact' },
+      turn: { mode: 'exact' },
+      river: { mode: 'cfvnet', model_path: '/models/river_v2.onnx' },
+    });
+  });
+
+  it('builds cfvnet streetBoundaryConfig for turn with model path', () => {
+    const config = {
+      ...defaultConfig,
+      turn_boundary_mode: 'cfvnet' as const,
+      turn_model_path: '/models/turn_v1.onnx',
+    };
+    const params = buildSolveParams('subgame', config);
+    expect(params.streetBoundaryConfig).toEqual({
+      flop: { mode: 'exact' },
+      turn: { mode: 'cfvnet', model_path: '/models/turn_v1.onnx' },
+      river: { mode: 'exact' },
+    });
+  });
+
+  it('throws if cfvnet mode has empty model_path', () => {
+    const config = {
+      ...defaultConfig,
+      river_boundary_mode: 'cfvnet' as const,
+      river_model_path: '',
+    };
+    expect(() => buildSolveParams('subgame', config)).toThrow(
+      'Street boundary set to cfvnet but no model_path',
+    );
+  });
+
+  it('throws if cfvnet mode has empty model_path for flop', () => {
+    const config = {
+      ...defaultConfig,
+      flop_boundary_mode: 'cfvnet' as const,
+      flop_model_path: '',
+    };
+    expect(() => buildSolveParams('subgame', config)).toThrow(
+      'Street boundary set to cfvnet but no model_path',
+    );
+  });
+
+  it('does not include legacy fields in output', () => {
+    const params = buildSolveParams('subgame', defaultConfig) as unknown as Record<string, unknown>;
+    expect(params).not.toHaveProperty('subgameDepthLimit');
+    expect(params).not.toHaveProperty('hybridRefreshInterval');
+    expect(params).not.toHaveProperty('hybridSamplesPerRefresh');
+    expect(params).not.toHaveProperty('rolloutBiasFactor');
+    expect(params).not.toHaveProperty('rolloutNumSamples');
+    expect(params).not.toHaveProperty('rolloutOpponentSamples');
+    expect(params).not.toHaveProperty('rolloutEnumerateDepth');
+  });
+
   it('uses matrix_snapshot_interval from config for exact mode', () => {
-    const config = { matrix_snapshot_interval: 20 };
+    const config = { ...defaultConfig, matrix_snapshot_interval: 20 };
     const params = buildSolveParams('exact', config);
     expect(params.matrixSnapshotInterval).toBe(20);
-  });
-
-  it('includes subgameDepthLimit with default value 0', () => {
-    const params = buildSolveParams('subgame', {});
-    expect(params.subgameDepthLimit).toBe(0);
-  });
-
-  it('uses subgame_depth_limit from config when provided', () => {
-    const config = { subgame_depth_limit: 2 };
-    const params = buildSolveParams('subgame', config);
-    expect(params.subgameDepthLimit).toBe(2);
   });
 });
