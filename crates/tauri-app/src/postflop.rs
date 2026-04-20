@@ -3478,11 +3478,19 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires ONNX model file on disk
     fn test_build_subgame_solver_with_neural_boundary_evaluator() {
-        use burn::backend::NdArray;
-        use cfvnet::model::boundary_net::BoundaryNet;
-        use cfvnet::eval::boundary_evaluator::NeuralBoundaryEvaluator;
+        use cfvnet::eval::boundary_evaluator::{load_shared_onnx_session, neural_boundary_evaluator_from_shared};
         use range_solver::interface::Game;
+        use std::path::PathBuf;
+
+        let model_path = PathBuf::from(
+            "local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx",
+        );
+        if !model_path.exists() {
+            eprintln!("skipping: ONNX model not found");
+            return;
+        }
 
         // Turn board (4 cards) -> creates depth boundaries for river.
         let board_cards = vec![
@@ -3501,17 +3509,14 @@ mod tests {
             &oop_w, &ip_w, 0, None, None, None, None, None, None, None, None,
         ).unwrap();
 
-        // Construct a fresh (untrained) BoundaryNet as a stand-in.
-        let device = Default::default();
-        let model = BoundaryNet::<NdArray>::new(&device, 2, 64);
-
+        let session = load_shared_onnx_session(&model_path).unwrap();
         let board_ids: Vec<u8> = board_cards.iter().map(|c|
             poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id(*c)
         ).collect();
 
         let neural_eval: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(
-            NeuralBoundaryEvaluator::new(
-                model,
+            neural_boundary_evaluator_from_shared(
+                session,
                 board_ids,
                 [
                     game_for_cards.private_cards(0).to_vec(),

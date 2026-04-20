@@ -688,6 +688,7 @@ fn run_dcfr_solve(
     refresh_interval: u32,
 ) -> (f64, f64) {
     let start = Instant::now();
+    let has_per_boundary = !game.per_boundary_evaluators.is_empty();
     for t in 0..iters {
         // Hybrid mode: notify the evaluator of the current iteration
         // and clear boundary CFV cache at refresh boundaries so the
@@ -697,6 +698,11 @@ fn run_dcfr_solve(
             if t == 0 || t % refresh_interval == 0 {
                 game.clear_boundary_cfvs();
             }
+        } else if has_per_boundary {
+            // Neural cfvnet path: per-boundary evaluators are set but no
+            // HybridBoundaryEvaluator. Clear CFV cache every iteration so
+            // boundary values are recomputed with updated opponent reaches.
+            game.clear_boundary_cfvs();
         }
 
         // DCFR discount params for boundary continuation regrets
@@ -1071,24 +1077,73 @@ pub fn run(
         &board_cards, seed_street, current_node,
     );
 
-    // 7. Set up hybrid boundary evaluator (lazy, sampled during DCFR)
+    // 7. Set up boundary evaluator — prefer ONNX neural cfvnet, fall back to rollout
     let opp_samples = opponent_samples.unwrap_or(8);
     let hybrid_eval = if n_boundaries > 0 {
-        eprintln!(
-            "[compare] hybrid mode: {} boundaries, refresh_interval={}, samples_per_refresh={}",
-            n_boundaries, hybrid_refresh_interval, hybrid_samples_per_refresh,
+        // Check if neural cfvnet path is applicable:
+        //   (a) ONNX model file exists, AND
+        //   (b) all boundary boards are 4-card (turn boards for river cfvnet)
+        let model_path = std::path::PathBuf::from(
+            "local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx",
         );
-        Some(setup_hybrid_boundaries(
-            &mut subgame_game,
-            &ctx,
-            &board_cards,
-            abstract_node_idx,
-            hybrid_refresh_interval,
-            hybrid_samples_per_refresh,
-            opp_samples,
-            eff_stack,
-            pot,
-        ))
+        let boundary_boards = subgame_game.boundary_boards();
+        let neural_applicable = model_path.exists()
+            && !boundary_boards.is_empty()
+            && boundary_boards.iter().all(|b| b.len() == 4);
+
+        let neural_session = if neural_applicable {
+            match cfvnet::eval::boundary_evaluator::load_shared_onnx_session(&model_path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("[compare] ONNX session load failed, falling back to rollout: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(session) = neural_session {
+            // -- Neural cfvnet mode: ONNX-based boundary evaluation --
+            let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
+                Vec::with_capacity(n_boundaries);
+            for board_4 in boundary_boards {
+                let private_cards_pair = [
+                    subgame_game.private_cards(0).to_vec(),
+                    subgame_game.private_cards(1).to_vec(),
+                ];
+                let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+                    Arc::clone(&session),
+                    board_4,
+                    private_cards_pair,
+                );
+                per_boundary.push(Arc::new(eval));
+            }
+            subgame_game.per_boundary_evaluators = per_boundary;
+            subgame_game.boundary_evaluator = None;
+            eprintln!(
+                "[solve] neural-cfvnet mode: {} boundaries (ONNX), 0 samples",
+                n_boundaries,
+            );
+            None // No HybridBoundaryEvaluator needed for neural path
+        } else {
+            // -- Fallback: rollout-based hybrid path --
+            eprintln!(
+                "[compare] hybrid mode: {} boundaries, refresh_interval={}, samples_per_refresh={}",
+                n_boundaries, hybrid_refresh_interval, hybrid_samples_per_refresh,
+            );
+            Some(setup_hybrid_boundaries(
+                &mut subgame_game,
+                &ctx,
+                &board_cards,
+                abstract_node_idx,
+                hybrid_refresh_interval,
+                hybrid_samples_per_refresh,
+                opp_samples,
+                eff_stack,
+                pot,
+            ))
+        }
     } else {
         None
     };

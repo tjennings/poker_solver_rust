@@ -1913,6 +1913,53 @@ pub fn game_solve_core(
             let map1 = build_map(1, &combos);
 
             if is_hybrid && cbv_ctx.is_some() {
+                // Prefer ONNX neural evaluator when:
+                //   (a) a model file exists at the expected path, AND
+                //   (b) all boundaries have 4-card boards (turn board for river cfvnet)
+                let model_path = std::path::PathBuf::from(
+                    "local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx",
+                );
+                let boundary_boards = game.boundary_boards();
+                let neural_applicable = model_path.exists()
+                    && !boundary_boards.is_empty()
+                    && boundary_boards.iter().all(|b| b.len() == 4);
+
+                let neural_session = if neural_applicable {
+                    match cfvnet::eval::boundary_evaluator::load_shared_onnx_session(&model_path) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            eprintln!("[solve] ONNX session load failed, falling back to rollout: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(session) = neural_session {
+                    // -- Neural cfvnet mode: ONNX-based boundary evaluation --
+                    let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
+                        Vec::with_capacity(n_boundaries);
+                    for board_4 in boundary_boards {
+                        let private_cards_pair = [
+                            game.private_cards(0).to_vec(),
+                            game.private_cards(1).to_vec(),
+                        ];
+                        let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+                            Arc::clone(&session),
+                            board_4,
+                            private_cards_pair,
+                        );
+                        per_boundary.push(Arc::new(eval));
+                    }
+                    game.per_boundary_evaluators = per_boundary;
+                    game.boundary_evaluator = None;
+
+                    eprintln!(
+                        "[solve] neural-cfvnet mode: {} boundaries (ONNX), 0 samples",
+                        n_boundaries,
+                    );
+                } else {
                 // -- Hybrid mode: lazy HybridBoundaryEvaluator with per-boundary adapters --
                 let ctx = cbv_ctx.as_ref().unwrap();
                 let samples = hybrid_samples_per_refresh.unwrap_or(100);
@@ -1980,6 +2027,7 @@ pub fn game_solve_core(
                     "[solve] hybrid mode: {} boundaries, refresh_interval={}, samples_per_refresh={}",
                     n_boundaries, interval, samples,
                 );
+                }
             } else {
                 // -- Legacy subgame mode: SolveBoundaryEvaluator + K=4 precompute --
                 let rollout = cbv_ctx.as_ref().map(|ctx| {
@@ -2167,6 +2215,11 @@ pub fn game_solve_core(
                 if t == 0 || t % refresh_interval == 0 {
                     game.clear_boundary_cfvs();
                 }
+            } else if !game.per_boundary_evaluators.is_empty() {
+                // Neural cfvnet path: per-boundary evaluators are set but no
+                // HybridBoundaryEvaluator. Clear CFV cache every iteration so
+                // boundary values are recomputed with updated opponent reaches.
+                game.clear_boundary_cfvs();
             }
 
             // Update DCFR discount params for boundary continuation regrets.

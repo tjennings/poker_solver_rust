@@ -408,6 +408,36 @@ impl PostFlopGame {
         None
     }
 
+    /// Returns the board cards at each depth boundary, indexed by ordinal.
+    ///
+    /// Each entry is the known community cards at that boundary:
+    /// - Flop-root depth=1: 4 cards (flop + turn card at that node)
+    /// - Turn-root depth=0: 4 cards (flop + turn from card_config)
+    /// - Flop-root depth=0: 3 cards (just the flop)
+    ///
+    /// The cards are in range-solver `Card` (u8, 0..52) ordering.
+    pub fn boundary_boards(&self) -> Vec<Vec<u8>> {
+        let n = self.num_boundary_nodes();
+        if n == 0 {
+            return Vec::new();
+        }
+        let indices = self.boundary_node_indices();
+        let flop = self.card_config.flop;
+        let mut boards = Vec::with_capacity(n);
+        for &idx in &indices {
+            let node = self.node_arena[idx].lock();
+            let mut board = vec![flop[0], flop[1], flop[2]];
+            if node.turn != NOT_DEALT {
+                board.push(node.turn);
+            }
+            if node.river != NOT_DEALT {
+                board.push(node.river);
+            }
+            boards.push(board);
+        }
+        boards
+    }
+
     /// Initialise multi-continuation boundary storage with K continuation
     /// strategies per boundary node.
     ///
@@ -1472,5 +1502,129 @@ mod tests {
             let pot = game.boundary_pot(ordinal);
             assert!(pot >= 100, "boundary pot should be >= starting pot, got {pot}");
         }
+    }
+
+    #[test]
+    fn test_boundary_boards_turn_root_depth0() {
+        // Turn-root tree with depth_limit=0: boundaries at river chance.
+        // Each boundary board should be [flop0, flop1, flop2, turn] (4 cards).
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let flop = flop_from_str("Qs Jh 2c").unwrap();
+        let turn = card_from_str("8d").unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn,
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        let n = game.num_boundary_nodes();
+        assert!(n > 0);
+        let boards = game.boundary_boards();
+        assert_eq!(boards.len(), n);
+
+        // Each board should be the 4-card turn board [flop0, flop1, flop2, turn]
+        for board in &boards {
+            assert_eq!(board.len(), 4, "turn-root depth=0 boundary = 4-card board");
+            assert_eq!(board[0], flop[0]);
+            assert_eq!(board[1], flop[1]);
+            assert_eq!(board[2], flop[2]);
+            assert_eq!(board[3], turn);
+        }
+    }
+
+    #[test]
+    fn test_boundary_boards_flop_root_depth1() {
+        // Flop-root tree with depth_limit=1: flop+turn action tree, boundaries
+        // at river chance. Each boundary board = [flop0, flop1, flop2, turn_card].
+        // Different boundaries may have different turn cards.
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let flop = flop_from_str("Qs Jh 2c").unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn: NOT_DEALT,
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 100,
+            effective_stack: 200,
+            flop_bet_sizes: simple_bet_sizes(),
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(1),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        let n = game.num_boundary_nodes();
+        assert!(n > 0, "should have boundary nodes");
+        let boards = game.boundary_boards();
+        assert_eq!(boards.len(), n);
+
+        for board in &boards {
+            assert_eq!(board.len(), 4, "flop+depth=1 boundary = 4-card board");
+            // First three cards must be the flop
+            assert_eq!(board[0], flop[0]);
+            assert_eq!(board[1], flop[1]);
+            assert_eq!(board[2], flop[2]);
+            // Turn card must be valid (0..52) and not a flop card
+            assert!(board[3] < 52, "turn card should be valid");
+            assert!(
+                board[3] != flop[0] && board[3] != flop[1] && board[3] != flop[2],
+                "turn card should not be a flop card"
+            );
+        }
+
+        // Verify multiple distinct turn cards exist across boundaries
+        let mut turn_cards: Vec<u8> = boards.iter().map(|b| b[3]).collect();
+        turn_cards.sort_unstable();
+        turn_cards.dedup();
+        assert!(
+            turn_cards.len() > 1,
+            "flop-root depth=1 should have boundaries with different turn cards"
+        );
+    }
+
+    #[test]
+    fn test_boundary_boards_empty_when_no_boundaries() {
+        // Exact solve (no depth_limit) = no boundaries = empty boards vec.
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: None,
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        assert_eq!(game.num_boundary_nodes(), 0);
+        assert!(game.boundary_boards().is_empty());
     }
 }
