@@ -167,6 +167,73 @@ impl HybridBoundaryEvaluator {
 }
 
 // ---------------------------------------------------------------------------
+// HybridBoundaryAdapter — per-boundary adapter for BoundaryEvaluator trait
+// ---------------------------------------------------------------------------
+
+/// Per-boundary adapter that lets `HybridBoundaryEvaluator` satisfy the
+/// `range_solver::game::BoundaryEvaluator` trait by pre-binding the
+/// boundary-specific context (combos, board, pot, invested) that isn't
+/// carried by the trait signature.
+///
+/// Constructed fresh for each boundary visit during solve; keeps a
+/// reference to the long-lived `HybridBoundaryEvaluator` for the cache.
+pub struct HybridBoundaryAdapter<'a> {
+    pub evaluator: &'a HybridBoundaryEvaluator,
+    pub boundary_id: u64,
+    pub combos: Vec<[RsPokerCard; 2]>,
+    pub board: Vec<RsPokerCard>,
+    pub boundary_pot: f64,
+    pub boundary_invested: [f64; 2],
+    pub num_oop: usize,
+    pub num_ip: usize,
+}
+
+impl<'a> range_solver::game::BoundaryEvaluator for HybridBoundaryAdapter<'a> {
+    fn num_continuations(&self) -> usize { 1 }
+
+    fn compute_cfvs(
+        &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        panic!(
+            "HybridBoundaryAdapter: use compute_cfvs_both \
+             (single-side compute_cfvs not supported)"
+        );
+    }
+
+    fn compute_cfvs_both(
+        &self,
+        _pot: i32,
+        _remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let oop_range: Vec<f64> = oop_reach.iter().map(|&v| f64::from(v)).collect();
+        let ip_range: Vec<f64> = ip_reach.iter().map(|&v| f64::from(v)).collect();
+        let cfvs = self.evaluator.compute_cfvs(
+            self.boundary_id,
+            &self.combos,
+            &self.board,
+            &oop_range,
+            &ip_range,
+            self.boundary_pot,
+            self.boundary_invested,
+        );
+        let oop = cfvs.oop_cfvs.into_iter().map(|v| v as f32).collect();
+        let ip = cfvs.ip_cfvs.into_iter().map(|v| v as f32).collect();
+        (oop, ip)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BoundaryEvaluator trait placeholder
 // ---------------------------------------------------------------------------
 
@@ -408,5 +475,135 @@ mod tests {
         // because the real entry point is HybridBoundaryEvaluator::compute_cfvs
         // with different arguments.
         let _ = BoundaryEvaluator::compute_cfvs(&eval, 0, 100, 50.0, &[], 0, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4A.2: HybridBoundaryAdapter
+    // -----------------------------------------------------------------------
+
+    /// Sized-return sampler for adapter tests: returns vectors matching
+    /// the combo count with deterministic values.
+    struct SizedSampler;
+
+    impl BoundarySampler for SizedSampler {
+        fn sample_boundary_cfvs(
+            &self,
+            combos: &[[RsPokerCard; 2]],
+            _board: &[RsPokerCard],
+            _oop_range: &[f64],
+            _ip_range: &[f64],
+            _boundary_pot: f64,
+            _boundary_invested: [f64; 2],
+            _num_samples: u32,
+        ) -> BoundaryCfvs {
+            let n = combos.len();
+            BoundaryCfvs {
+                oop_cfvs: vec![0.5; n],
+                ip_cfvs: vec![-0.5; n],
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_compute_cfvs_both_returns_correct_lengths() {
+        use poker_solver_core::poker::{Suit as RsPokerSuit, Value as RsPokerValue};
+        use range_solver::game::BoundaryEvaluator;
+
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(SizedSampler),
+            10,
+            1,
+        );
+        let combos = vec![
+            [
+                RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+                RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Spade),
+            ],
+            [
+                RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Heart),
+                RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Heart),
+            ],
+            [
+                RsPokerCard::new(RsPokerValue::Ten, RsPokerSuit::Club),
+                RsPokerCard::new(RsPokerValue::Nine, RsPokerSuit::Club),
+            ],
+        ];
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+        ];
+
+        let adapter = HybridBoundaryAdapter {
+            evaluator: &eval,
+            boundary_id: 99,
+            combos: combos.clone(),
+            board: board.clone(),
+            boundary_pot: 100.0,
+            boundary_invested: [50.0, 50.0],
+            num_oop: 3,
+            num_ip: 3,
+        };
+
+        let oop_reach = vec![1.0f32; 3];
+        let ip_reach = vec![1.0f32; 3];
+        let (oop, ip) = adapter.compute_cfvs_both(100, 50.0, &oop_reach, &ip_reach, 3, 3, 0);
+        assert_eq!(oop.len(), 3);
+        assert_eq!(ip.len(), 3);
+        // Values should be f32 versions of the SizedSampler's f64 output.
+        assert!((oop[0] - 0.5f32).abs() < 1e-6);
+        assert!((ip[0] - (-0.5f32)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adapter_implements_boundary_evaluator_trait() {
+        // Compile-time check.
+        fn assert_impl<'a, T: range_solver::game::BoundaryEvaluator>() {}
+        assert_impl::<HybridBoundaryAdapter<'_>>();
+    }
+
+    #[test]
+    fn adapter_num_continuations_is_one() {
+        use range_solver::game::BoundaryEvaluator;
+
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(NoOpSampler),
+            10,
+            1,
+        );
+        let adapter = HybridBoundaryAdapter {
+            evaluator: &eval,
+            boundary_id: 0,
+            combos: vec![],
+            board: vec![],
+            boundary_pot: 0.0,
+            boundary_invested: [0.0, 0.0],
+            num_oop: 0,
+            num_ip: 0,
+        };
+        assert_eq!(adapter.num_continuations(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "single-side compute_cfvs not supported")]
+    fn adapter_single_side_compute_cfvs_panics() {
+        use range_solver::game::BoundaryEvaluator;
+
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(NoOpSampler),
+            10,
+            1,
+        );
+        let adapter = HybridBoundaryAdapter {
+            evaluator: &eval,
+            boundary_id: 0,
+            combos: vec![],
+            board: vec![],
+            boundary_pot: 0.0,
+            boundary_invested: [0.0, 0.0],
+            num_oop: 0,
+            num_ip: 0,
+        };
+        let _ = BoundaryEvaluator::compute_cfvs(&adapter, 0, 100, 50.0, &[], 0, 0);
     }
 }
