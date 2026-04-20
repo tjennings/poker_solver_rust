@@ -82,9 +82,13 @@ pub fn resolve_street_boundary(
         Street::Preflop => return None, // preflop solve not supported
     };
 
-    for (depth, (_street, mode)) in streets.iter().enumerate() {
+    // Street mode `X = Cfvnet` means "cut at the card deal BEFORE street X".
+    // Near tree = streets[0..index], so depth = index - 1.
+    // If the root street itself is Cfvnet, no cut possible — fall through.
+    for (i, (_street, mode)) in streets.iter().enumerate() {
         if let StreetBoundaryMode::Cfvnet { model_path } = mode {
-            return Some((depth as u8, model_path.clone()));
+            if i == 0 { continue; }
+            return Some(((i - 1) as u8, model_path.clone()));
         }
     }
     None // all exact
@@ -4018,6 +4022,8 @@ mod tests {
 
     #[test]
     fn sbc_cfvnet_at_river_from_flop_root() {
+        // river=Cfvnet from flop root → cut before river card → depth=1
+        // (near tree = flop + turn, 1 street transition before the river cut).
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Exact,
@@ -4026,11 +4032,13 @@ mod tests {
             },
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((2, "/models/river.onnx".to_string())));
+        assert_eq!(result, Some((1, "/models/river.onnx".to_string())));
     }
 
     #[test]
     fn sbc_cfvnet_at_turn_from_flop_root() {
+        // turn=Cfvnet from flop root → cut before turn card → depth=0
+        // (near tree = flop only, 0 transitions).
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Cfvnet {
@@ -4039,11 +4047,13 @@ mod tests {
             river: StreetBoundaryMode::Exact,
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((1, "/models/turn.onnx".to_string())));
+        assert_eq!(result, Some((0, "/models/turn.onnx".to_string())));
     }
 
     #[test]
-    fn sbc_cfvnet_at_flop_from_flop_root() {
+    fn sbc_cfvnet_at_flop_from_flop_root_is_ignored() {
+        // flop=Cfvnet on flop root is degenerate — can't cut before our
+        // current position. Falls through to all-exact (None).
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Cfvnet {
                 model_path: "/models/flop.onnx".to_string(),
@@ -4052,7 +4062,7 @@ mod tests {
             river: StreetBoundaryMode::Exact,
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((0, "/models/flop.onnx".to_string())));
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -4066,9 +4076,9 @@ mod tests {
                 model_path: "/models/river.onnx".to_string(),
             },
         };
-        // First non-exact wins: turn at depth 1
+        // First non-exact wins: turn cut at depth 0 from flop root.
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((1, "/models/turn.onnx".to_string())));
+        assert_eq!(result, Some((0, "/models/turn.onnx".to_string())));
     }
 
     #[test]
@@ -4080,13 +4090,14 @@ mod tests {
                 model_path: "/models/river.onnx".to_string(),
             },
         };
-        // From turn root, river is at depth 1 (turn=0, river=1)
+        // From turn root: near tree = turn, cut before river = depth=0.
         let result = resolve_street_boundary(&config, Street::Turn);
-        assert_eq!(result, Some((1, "/models/river.onnx".to_string())));
+        assert_eq!(result, Some((0, "/models/river.onnx".to_string())));
     }
 
     #[test]
-    fn sbc_cfvnet_at_turn_from_turn_root() {
+    fn sbc_cfvnet_at_turn_from_turn_root_is_ignored() {
+        // turn=Cfvnet on turn root is degenerate — same as flop case above.
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Cfvnet {
@@ -4094,9 +4105,8 @@ mod tests {
             },
             river: StreetBoundaryMode::Exact,
         };
-        // From turn root, turn itself is at depth 0
         let result = resolve_street_boundary(&config, Street::Turn);
-        assert_eq!(result, Some((0, "/models/turn.onnx".to_string())));
+        assert_eq!(result, None);
     }
 
     #[test]
