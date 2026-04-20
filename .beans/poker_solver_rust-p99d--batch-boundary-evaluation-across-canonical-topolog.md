@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-p99d
 title: Batch boundary evaluation across canonical-topology batch (turn datagen)
-status: todo
+status: completed
 type: task
 priority: normal
 created_at: 2026-04-20T06:51:09Z
-updated_at: 2026-04-20T17:56:05Z
+updated_at: 2026-04-20T22:47:52Z
 blocked_by:
     - poker_solver_rust-oox2
 ---
@@ -42,3 +42,30 @@ With `solver_iterations: 300, leaf_eval_interval: 50` (~6 eval rounds × 256 gam
 ## Priority
 
 High — blocks production turn datagen at intended batch size. Without this, we can't hit the 50M-sample target at batch=256, and at batch=32 we may still be bottlenecked on boundary eval rather than the DCFR kernel (validates after `vb8r` soak test at batch=32 finishes).
+
+
+
+## Summary of Changes (Layer A only)
+
+Hoisted evaluate_boundaries_batched out of the per-sit loop in batch_boundary_leaf_cfvs at \`crates/cfvnet/src/datagen/domain/pipeline.rs:746-826\`. The ORT call now runs once per DCFR eval round with all sits' requests concatenated, instead of once per sit.
+
+**Plan:** \`docs/plans/2026-04-20-boundary-eval-batching.md\`
+**Design:** \`docs/plans/2026-04-20-boundary-eval-batching-design.md\`
+
+**Commits on main:**
+- \`7287ff6\` test(cfvnet): regression test for batched boundary eval
+- \`1939ef0\` feat(cfvnet): batch boundary eval across canonical topology
+
+**Validation:**
+
+1. Regression test \`layer_a_batched_matches_per_sit_within_tolerance\` passes: batched path matches per-sit path within 1e-5 abs / 1e-4 rel tolerance. No TensorRT kernel-selection drift observed.
+2. Full workspace tests: same 8 pre-existing failures as oox2, no new regressions.
+3. Manual validation: production datagen (\`gpu_batch_size=4, solver_iterations=300\`) went from ~15 min/file (oox2 baseline) to ~11 min/file (~30% improvement) for 2 of 4 files before killed.
+
+**Reality check:** the 30% improvement at batch=4 is far short of the hoped-for speedup. Observed: main thread 100%, 7 ORT threads at ~30%, GPU 0% util for most wall time. Root cause: the CPU-side f64 reduction in \`evaluate_boundaries_batched:207-269\` is serial per request and dominates main-thread time. Layer A only amortized the ORT call; the reduction was untouched.
+
+**Filed as follow-up:** bean \`6c5k\` — Rayon-parallelize the f64 reduction (Layer C). Expected to be the actual throughput unlock.
+
+**Unblocks:**
+- Oox2's end-to-end full validation: the numerically-equivalent batched path is in place.
+- \`6c5k\` (Layer C): the batched request layout makes per-request rayon parallelism straightforward.
