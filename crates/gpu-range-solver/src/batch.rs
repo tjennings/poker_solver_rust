@@ -329,24 +329,57 @@ impl GpuBatchSolver {
         }
         let d_initial_weights = self.stream.clone_htod(&weights_flat)?;
 
-        // Build batched showdown outcomes: [B * num_showdowns * H * H] for each player
-        let hh = h * h;
-        let sd_per_batch = self.num_showdowns * hh;
-        let mut batched_sd_p0 = vec![0.0f32; batch_size * sd_per_batch];
-        let mut batched_sd_p1 = vec![0.0f32; batch_size * sd_per_batch];
-        for (b, spec) in specs.iter().enumerate() {
-            let base = b * sd_per_batch;
-            if let Some(sd) = spec.showdown_outcomes_p0.as_deref() {
-                let src_len = sd.len().min(sd_per_batch);
-                batched_sd_p0[base..base + src_len].copy_from_slice(&sd[..src_len]);
+        // Build batched showdown outcomes: [B * num_showdowns * H * H] for each player.
+        // If all specs have `None` outcomes (turn datagen with leaf injection), skip the
+        // allocation + upload entirely and set active_num_showdowns=0 so the kernel's
+        // showdown loop is a no-op. Mixed Some/None in one batch is a bug.
+        let any_some_p0 = specs.iter().any(|s| s.showdown_outcomes_p0.is_some());
+        let any_some_p1 = specs.iter().any(|s| s.showdown_outcomes_p1.is_some());
+        let all_some_p0 = specs.iter().all(|s| s.showdown_outcomes_p0.is_some());
+        let all_some_p1 = specs.iter().all(|s| s.showdown_outcomes_p1.is_some());
+        debug_assert_eq!(
+            any_some_p0, all_some_p0,
+            "SubgameSpec.showdown_outcomes_p0 must be uniformly Some or None across a batch"
+        );
+        debug_assert_eq!(
+            any_some_p1, all_some_p1,
+            "SubgameSpec.showdown_outcomes_p1 must be uniformly Some or None across a batch"
+        );
+        debug_assert_eq!(
+            any_some_p0, any_some_p1,
+            "SubgameSpec showdown_outcomes_p0 and _p1 must have the same Some/None state"
+        );
+
+        let (d_showdown_p0, d_showdown_p1, active_num_showdowns) = if all_some_p0 {
+            let hh = h * h;
+            let sd_per_batch = self.num_showdowns * hh;
+            let mut batched_sd_p0 = vec![0.0f32; batch_size * sd_per_batch];
+            let mut batched_sd_p1 = vec![0.0f32; batch_size * sd_per_batch];
+            for (b, spec) in specs.iter().enumerate() {
+                let base = b * sd_per_batch;
+                if let Some(sd) = spec.showdown_outcomes_p0.as_deref() {
+                    let src_len = sd.len().min(sd_per_batch);
+                    batched_sd_p0[base..base + src_len].copy_from_slice(&sd[..src_len]);
+                }
+                if let Some(sd) = spec.showdown_outcomes_p1.as_deref() {
+                    let src_len = sd.len().min(sd_per_batch);
+                    batched_sd_p1[base..base + src_len].copy_from_slice(&sd[..src_len]);
+                }
             }
-            if let Some(sd) = spec.showdown_outcomes_p1.as_deref() {
-                let src_len = sd.len().min(sd_per_batch);
-                batched_sd_p1[base..base + src_len].copy_from_slice(&sd[..src_len]);
-            }
-        }
-        let d_showdown_p0 = upload_or_dummy_f32(&self.stream, &batched_sd_p0)?;
-        let d_showdown_p1 = upload_or_dummy_f32(&self.stream, &batched_sd_p1)?;
+            (
+                upload_or_dummy_f32(&self.stream, &batched_sd_p0)?,
+                upload_or_dummy_f32(&self.stream, &batched_sd_p1)?,
+                self.num_showdowns,
+            )
+        } else {
+            // No showdowns to compute. Dummy device buffers keep the kernel-arg plumbing
+            // happy; active_num_showdowns=0 makes the kernel's showdown loop zero-iteration.
+            (
+                upload_or_dummy_f32(&self.stream, &[])?,
+                upload_or_dummy_f32(&self.stream, &[])?,
+                0,
+            )
+        };
 
         // Build batched fold payoffs: [B * num_folds] for each player
         let num_folds = self.num_folds;
@@ -371,6 +404,7 @@ impl GpuBatchSolver {
         self.active_d_fold_payoffs_p0 = Some(d_fold_p0);
         self.active_d_fold_payoffs_p1 = Some(d_fold_p1);
         self.active_batch_size = batch_size;
+        self.active_num_showdowns = active_num_showdowns;
         Ok(())
     }
 
@@ -419,7 +453,7 @@ impl GpuBatchSolver {
         let start_iter_i32 = start as i32;
         let end_iter_i32 = end as i32;
         let num_folds_i32 = self.num_folds as i32;
-        let num_showdowns_i32 = self.num_showdowns as i32;
+        let num_showdowns_i32 = self.active_num_showdowns as i32;
         let num_leaves_i32 = self.num_leaves as i32;
         let num_hands_p0_i32 = self.num_hands_p0 as i32;
         let num_hands_p1_i32 = self.num_hands_p1 as i32;
