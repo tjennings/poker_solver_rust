@@ -304,9 +304,19 @@ impl HandParallelKernel {
             crate::kernels::hand_parallel_compile_opts(),
         )?;
         let module = ctx.load_module(ptx)?;
-        Ok(Self {
-            cfr_solve: module.load_function("cfr_solve")?,
-        })
+        let cfr_solve = module.load_function("cfr_solve")?;
+
+        // Opt into Ada's extended per-block dynamic smem (99 KB) as a
+        // defense-in-depth measure. Current smem budget is ~26 KB — well
+        // under the 48 KB default — so this only matters if the topology
+        // grows. Failure is not fatal (pre-Ampere GPUs may not support it).
+        // See bean poker_solver_rust-oox2.
+        let _ = cfr_solve.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            99 * 1024,
+        );
+
+        Ok(Self { cfr_solve })
     }
 }
 
