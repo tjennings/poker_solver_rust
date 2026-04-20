@@ -200,73 +200,92 @@ pub fn evaluate_boundaries_batched(
         Vec::new()
     };
 
-    // Reduce: average over rivers, weighted by opponent reach. One result per request.
-    let mut results: Vec<BoundaryEvalResult> = Vec::with_capacity(requests.len());
-    let mut row_cursor = 0usize;
+    // Pre-compute per-request row offsets. Each request consumes
+    // `num_boundaries * num_rivers * 2` rows from `all_outputs`
+    // (two players per boundary). Offsets replace the sequential
+    // `row_cursor` state so the reduction can run in parallel.
+    let row_offsets: Vec<usize> = request_meta
+        .iter()
+        .zip(requests.iter())
+        .scan(0usize, |acc, (meta, req)| {
+            let off = *acc;
+            *acc += req.num_boundaries * meta.valid_rivers.len() * 2;
+            Some(off)
+        })
+        .collect();
 
-    for (req_idx, req) in requests.iter().enumerate() {
-        let meta = &request_meta[req_idx];
-        let num_rivers = meta.valid_rivers.len();
+    // Reduce: average over rivers, weighted by opponent reach. One result
+    // per request. Parallelized across requests — per-element arithmetic
+    // is unchanged, so output is byte-identical to the serial version.
+    use rayon::prelude::*;
+    let results: Vec<BoundaryEvalResult> = (0..requests.len())
+        .into_par_iter()
+        .map(|req_idx| {
+            let req = &requests[req_idx];
+            let meta = &request_meta[req_idx];
+            let num_rivers = meta.valid_rivers.len();
+            let row_base = row_offsets[req_idx];
 
-        let mut leaf_cfv_p0: Vec<f32> = Vec::with_capacity(req.num_boundaries * num_hands);
-        let mut leaf_cfv_p1: Vec<f32> = Vec::with_capacity(req.num_boundaries * num_hands);
+            let mut leaf_cfv_p0: Vec<f32> =
+                Vec::with_capacity(req.num_boundaries * num_hands);
+            let mut leaf_cfv_p1: Vec<f32> =
+                Vec::with_capacity(req.num_boundaries * num_hands);
 
-        for bi in 0..req.num_boundaries {
-            let p0_row_start = row_cursor;
-            row_cursor += num_rivers;
-            let p1_row_start = row_cursor;
-            row_cursor += num_rivers;
+            for bi in 0..req.num_boundaries {
+                let p0_row_start = row_base + bi * num_rivers * 2;
+                let p1_row_start = p0_row_start + num_rivers;
 
-            let denorm = f64::from(req.pot + req.effective_stack);
+                let denorm = f64::from(req.pot + req.effective_stack);
 
-            for (hi, &combo_idx) in hand_combo_indices.iter().enumerate() {
-                let (c0, c1) = hand_cards[hi];
+                for (hi, &combo_idx) in hand_combo_indices.iter().enumerate() {
+                    let (c0, c1) = hand_cards[hi];
 
-                // Player 0: opponent is IP.
-                let mut cfv_sum_p0 = 0.0_f64;
-                let mut weight_sum_p0 = 0.0_f64;
-                for (ri, &river) in meta.valid_rivers.iter().enumerate() {
-                    if c0 == river || c1 == river {
-                        continue;
+                    // Player 0: opponent is IP.
+                    let mut cfv_sum_p0 = 0.0_f64;
+                    let mut weight_sum_p0 = 0.0_f64;
+                    for (ri, &river) in meta.valid_rivers.iter().enumerate() {
+                        if c0 == river || c1 == river {
+                            continue;
+                        }
+                        let row = p0_row_start + ri;
+                        let net_val = f64::from(all_outputs[row * NUM_COMBOS + combo_idx]);
+                        cfv_sum_p0 += meta.ip_weights[bi][ri] * net_val;
+                        weight_sum_p0 += meta.ip_weights[bi][ri];
                     }
-                    let row = p0_row_start + ri;
-                    let net_val = f64::from(all_outputs[row * NUM_COMBOS + combo_idx]);
-                    cfv_sum_p0 += meta.ip_weights[bi][ri] * net_val;
-                    weight_sum_p0 += meta.ip_weights[bi][ri];
-                }
-                let cfv_p0 = if weight_sum_p0 > 0.0 {
-                    (cfv_sum_p0 / weight_sum_p0) * denorm
-                } else {
-                    0.0
-                };
-                leaf_cfv_p0.push(cfv_p0 as f32);
+                    let cfv_p0 = if weight_sum_p0 > 0.0 {
+                        (cfv_sum_p0 / weight_sum_p0) * denorm
+                    } else {
+                        0.0
+                    };
+                    leaf_cfv_p0.push(cfv_p0 as f32);
 
-                // Player 1: opponent is OOP.
-                let mut cfv_sum_p1 = 0.0_f64;
-                let mut weight_sum_p1 = 0.0_f64;
-                for (ri, &river) in meta.valid_rivers.iter().enumerate() {
-                    if c0 == river || c1 == river {
-                        continue;
+                    // Player 1: opponent is OOP.
+                    let mut cfv_sum_p1 = 0.0_f64;
+                    let mut weight_sum_p1 = 0.0_f64;
+                    for (ri, &river) in meta.valid_rivers.iter().enumerate() {
+                        if c0 == river || c1 == river {
+                            continue;
+                        }
+                        let row = p1_row_start + ri;
+                        let net_val = f64::from(all_outputs[row * NUM_COMBOS + combo_idx]);
+                        cfv_sum_p1 += meta.oop_weights[bi][ri] * net_val;
+                        weight_sum_p1 += meta.oop_weights[bi][ri];
                     }
-                    let row = p1_row_start + ri;
-                    let net_val = f64::from(all_outputs[row * NUM_COMBOS + combo_idx]);
-                    cfv_sum_p1 += meta.oop_weights[bi][ri] * net_val;
-                    weight_sum_p1 += meta.oop_weights[bi][ri];
+                    let cfv_p1 = if weight_sum_p1 > 0.0 {
+                        (cfv_sum_p1 / weight_sum_p1) * denorm
+                    } else {
+                        0.0
+                    };
+                    leaf_cfv_p1.push(cfv_p1 as f32);
                 }
-                let cfv_p1 = if weight_sum_p1 > 0.0 {
-                    (cfv_sum_p1 / weight_sum_p1) * denorm
-                } else {
-                    0.0
-                };
-                leaf_cfv_p1.push(cfv_p1 as f32);
             }
-        }
 
-        results.push(BoundaryEvalResult {
-            leaf_cfv_p0,
-            leaf_cfv_p1,
-        });
-    }
+            BoundaryEvalResult {
+                leaf_cfv_p0,
+                leaf_cfv_p1,
+            }
+        })
+        .collect();
 
     Ok(results)
 }
