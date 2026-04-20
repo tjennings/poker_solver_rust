@@ -460,9 +460,14 @@ impl RolloutLeafEvaluator {
 
     /// Sample boundary CFVs for both players via Monte Carlo rollouts.
     ///
-    /// Calls `rollout_chip_values_with_state` once per traverser (0=OOP,
-    /// 1=IP) with `n_samples` rollouts, returning per-combo chip-value
-    /// CFVs in a `BoundaryCfvs`.
+    /// Returns per-combo counterfactual values. Each rollout call uses
+    /// **uniform hero reach** so CFVs are computed for *every* combo
+    /// (not just those currently in range) — matches CFR semantics where
+    /// CFV(h) = Σ_{h'} opp_reach(h') × u(h, h', σ), independent of hero
+    /// reach. The passed `oop_range`/`ip_range` are used only as opponent
+    /// sampling weights (i.e. when computing OOP's CFV, `ip_range` weights
+    /// the IP opponent; when computing IP's CFV, `oop_range` weights the
+    /// OOP opponent).
     #[allow(clippy::too_many_arguments)]
     pub fn sample_boundary_cfvs(
         &self,
@@ -475,12 +480,17 @@ impl RolloutLeafEvaluator {
         n_samples: u32,
     ) -> BoundaryCfvs {
         let eval = self.clone_with_num_rollouts(n_samples);
+        let uniform = vec![1.0_f64; combos.len()];
+        // Traverser 0 = OOP hero. Hero range uniform so all OOP combos compute;
+        // IP opponent weights come from `ip_range`.
         let oop_cfvs = eval.rollout_chip_values_with_state(
-            combos, board, oop_range, ip_range, 0,
+            combos, board, &uniform, ip_range, 0,
             boundary_pot, boundary_invested,
         );
+        // Traverser 1 = IP hero. Hero range uniform so all IP combos compute;
+        // OOP opponent weights come from `oop_range`.
         let ip_cfvs = eval.rollout_chip_values_with_state(
-            combos, board, oop_range, ip_range, 1,
+            combos, board, oop_range, &uniform, 1,
             boundary_pot, boundary_invested,
         );
         BoundaryCfvs { oop_cfvs, ip_cfvs }

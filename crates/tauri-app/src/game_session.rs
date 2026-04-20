@@ -1943,6 +1943,7 @@ pub fn game_solve_core(
                         boundary_invested: [boundary_pot / 2.0, boundary_pot / 2.0],
                         num_oop,
                         num_ip,
+                        game_to_combo: [map0.clone(), map1.clone()],
                     };
                     per_boundary.push(Arc::new(adapter));
                 }

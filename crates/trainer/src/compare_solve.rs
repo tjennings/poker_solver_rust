@@ -630,6 +630,19 @@ fn setup_hybrid_boundaries(
         }
     }
 
+    // Game-space hand index → combo-space index (per player).
+    let build_map = |player: usize| -> Vec<usize> {
+        game.private_cards(player).iter().map(|&(c1, c2)| {
+            let rs_c1 = range_solver_to_rs_card(c1);
+            let rs_c2 = range_solver_to_rs_card(c2);
+            combos.iter().position(|c|
+                (c[0] == rs_c1 && c[1] == rs_c2) || (c[0] == rs_c2 && c[1] == rs_c1)
+            ).unwrap_or(usize::MAX)
+        }).collect()
+    };
+    let map0 = build_map(0);
+    let map1 = build_map(1);
+
     // Build per-boundary owned adapters
     let n_boundaries = game.num_boundary_nodes();
     let num_oop = game.num_private_hands(0);
@@ -647,6 +660,7 @@ fn setup_hybrid_boundaries(
             boundary_invested: [boundary_pot / 2.0, boundary_pot / 2.0],
             num_oop,
             num_ip,
+            game_to_combo: [map0.clone(), map1.clone()],
         };
         per_boundary.push(Arc::new(adapter));
     }

@@ -249,6 +249,9 @@ pub struct OwnedHybridBoundaryAdapter {
     pub boundary_invested: [f64; 2],
     pub num_oop: usize,
     pub num_ip: usize,
+    /// Per-player map from game-space hand index → combo-space index.
+    /// `game_to_combo[player][game_idx] = combo_idx` (or `usize::MAX`).
+    pub game_to_combo: [Vec<usize>; 2],
 }
 
 impl range_solver::game::BoundaryEvaluator for OwnedHybridBoundaryAdapter {
@@ -279,19 +282,46 @@ impl range_solver::game::BoundaryEvaluator for OwnedHybridBoundaryAdapter {
         _num_ip: usize,
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        let oop_range: Vec<f64> = oop_reach.iter().map(|&v| f64::from(v)).collect();
-        let ip_range: Vec<f64> = ip_reach.iter().map(|&v| f64::from(v)).collect();
+        // Game-space reach → combo-space reach. Combos are board-filtered
+        // (card1, card2) pairs (~1026 on a flop); game-space is the solver's
+        // private-cards list per player (smaller). Direct indexing would OOB.
+        let num_combos = self.combos.len();
+        let mut oop_combo_reach = vec![0.0_f64; num_combos];
+        let mut ip_combo_reach = vec![0.0_f64; num_combos];
+        for (game_idx, &combo_idx) in self.game_to_combo[0].iter().enumerate() {
+            if combo_idx < num_combos && game_idx < oop_reach.len() {
+                oop_combo_reach[combo_idx] = f64::from(oop_reach[game_idx]);
+            }
+        }
+        for (game_idx, &combo_idx) in self.game_to_combo[1].iter().enumerate() {
+            if combo_idx < num_combos && game_idx < ip_reach.len() {
+                ip_combo_reach[combo_idx] = f64::from(ip_reach[game_idx]);
+            }
+        }
+
         let cfvs = self.evaluator.compute_cfvs(
             self.boundary_id,
             &self.combos,
             &self.board,
-            &oop_range,
-            &ip_range,
+            &oop_combo_reach,
+            &ip_combo_reach,
             self.boundary_pot,
             self.boundary_invested,
         );
-        let oop = cfvs.oop_cfvs.into_iter().map(|v| v as f32).collect();
-        let ip = cfvs.ip_cfvs.into_iter().map(|v| v as f32).collect();
+
+        // Combo-space CFVs → game-space CFVs.
+        let mut oop = vec![0.0_f32; self.num_oop];
+        let mut ip = vec![0.0_f32; self.num_ip];
+        for (game_idx, &combo_idx) in self.game_to_combo[0].iter().enumerate() {
+            if combo_idx < cfvs.oop_cfvs.len() && game_idx < oop.len() {
+                oop[game_idx] = cfvs.oop_cfvs[combo_idx] as f32;
+            }
+        }
+        for (game_idx, &combo_idx) in self.game_to_combo[1].iter().enumerate() {
+            if combo_idx < cfvs.ip_cfvs.len() && game_idx < ip.len() {
+                ip[game_idx] = cfvs.ip_cfvs[combo_idx] as f32;
+            }
+        }
         (oop, ip)
     }
 }
