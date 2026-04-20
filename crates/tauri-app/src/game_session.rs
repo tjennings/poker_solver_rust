@@ -1710,7 +1710,10 @@ pub fn game_solve_core(
     hybrid_samples_per_refresh: Option<u32>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
-    let is_hybrid = mode.as_deref() == Some("hybrid");
+    // Anything non-exact routes to hybrid. Phase 4B replaced the K=4
+    // "subgame" path with live MCCFR; mode strings "hybrid", "subgame",
+    // and None all dispatch to HybridBoundaryEvaluator.
+    let is_hybrid = !is_exact;
     let ss_ref = session_state.solve_for(&mode);
 
     // Guard: reject if this mode is already solving
