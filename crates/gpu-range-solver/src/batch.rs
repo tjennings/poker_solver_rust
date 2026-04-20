@@ -1745,4 +1745,34 @@ mod tests {
         }
     }
 
+    /// Enforces that a batch must be uniformly Some or None across all specs.
+    /// In debug mode `prepare_batch` asserts this invariant. In the canonical-
+    /// topology batched-datagen model all specs in a batch share the same
+    /// terminal structure, so mixed states are a bug.
+    #[test]
+    #[should_panic(expected = "uniformly Some or None")]
+    fn prepare_batch_panics_on_mixed_showdown_presence() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        let mut solver =
+            GpuBatchSolver::new(&topo, &term, 2, num_hands, 10).unwrap();
+
+        let base_spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        let spec_none = SubgameSpec {
+            initial_weights: base_spec.initial_weights.clone(),
+            showdown_outcomes_p0: None,
+            showdown_outcomes_p1: None,
+            fold_payoffs_p0: base_spec.fold_payoffs_p0.clone(),
+            fold_payoffs_p1: base_spec.fold_payoffs_p1.clone(),
+        };
+        let spec_some = base_spec; // already Some(...) from SubgameSpec::from_game
+
+        // Mixed batch must panic in debug.
+        solver.prepare_batch(&[spec_none, spec_some]).unwrap();
+    }
+
 }
