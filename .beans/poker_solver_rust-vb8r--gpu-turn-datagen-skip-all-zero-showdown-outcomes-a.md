@@ -5,7 +5,9 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-19T20:51:42Z
-updated_at: 2026-04-19T20:51:42Z
+updated_at: 2026-04-20T17:56:05Z
+blocked_by:
+    - poker_solver_rust-oox2
 ---
 
 ## Problem
