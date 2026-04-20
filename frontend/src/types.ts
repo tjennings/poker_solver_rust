@@ -157,6 +157,8 @@ export interface GlobalConfig {
   matrix_snapshot_interval: number;
   range_clamp_threshold: number;
   subgame_depth_limit: number;
+  hybrid_refresh_interval: number;
+  hybrid_samples_per_refresh: number;
 }
 
 export interface BlueprintListEntry {

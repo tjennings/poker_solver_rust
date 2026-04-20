@@ -313,33 +313,90 @@ export default function Settings() {
         </p>
       </div>
 
-      {/* Subgame Depth */}
+      {/* Hybrid Solver (replaces broken K=4 Subgame) */}
       <div style={{ marginBottom: '1.5rem' }}>
-        <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
-          Subgame Depth
-        </label>
-        <input
-          type="number"
-          min={0}
-          max={3}
-          value={config.subgame_depth_limit ?? 0}
-          onChange={e => {
-            const v = parseInt(e.target.value);
-            if (!isNaN(v) && v >= 0 && v <= 3) setConfig({ subgame_depth_limit: v });
-          }}
-          style={{
-            width: 60,
-            padding: '0.45rem 0.6rem',
-            background: 'rgba(255,255,255,0.06)',
-            border: '1px solid rgba(255,255,255,0.12)',
-            borderRadius: 6,
-            color: '#eee',
-            fontSize: '0.85rem',
-            fontFamily: 'inherit',
-          }}
-        />
-        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
-          Number of street transitions in the subgame tree. 0 = current street only (fastest), 1 = current + next, 2 = full solve from flop. Higher values improve accuracy but use more memory and time.
+        <div style={{ fontSize: '0.85rem', color: '#ccc', marginBottom: '0.6rem', fontWeight: 500 }}>
+          Hybrid Solver
+        </div>
+        <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
+              Depth Limit
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={3}
+              value={config.subgame_depth_limit ?? 1}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v >= 0 && v <= 3) setConfig({ subgame_depth_limit: v });
+              }}
+              style={{
+                width: 60,
+                padding: '0.4rem 0.55rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
+              Refresh Interval (iters)
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={1000}
+              value={config.hybrid_refresh_interval ?? 10}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v >= 1 && v <= 1000) setConfig({ hybrid_refresh_interval: v });
+              }}
+              style={{
+                width: 70,
+                padding: '0.4rem 0.55rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
+              Samples / Refresh
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={100000}
+              value={config.hybrid_samples_per_refresh ?? 100}
+              onChange={e => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v) && v >= 1 && v <= 100000) setConfig({ hybrid_samples_per_refresh: v });
+              }}
+              style={{
+                width: 80,
+                padding: '0.4rem 0.55rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+        </div>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.5rem' }}>
+          Depth Limit: street transitions in the near tree (0 = current street, 1 = + next, 2 = full). Refresh Interval: DCFR iterations between boundary CFV resamples (lower = more adaptive, slower). Samples / Refresh: Monte Carlo rollouts per boundary refresh (higher = lower variance, slower).
         </p>
       </div>
 
