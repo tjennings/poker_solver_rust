@@ -59,6 +59,57 @@ pub fn encode_boundary_inference_input(
     input
 }
 
+/// Build per-river input rows for batched inference over all valid rivers.
+///
+/// Returns the valid river cards and a flat `Vec<f32>` of shape
+/// `[n_rivers, INPUT_SIZE]` ready for batched forward pass.
+fn build_river_batch_inputs(
+    board: &[u8],
+    oop_1326: &[f32],
+    ip_1326: &[f32],
+    pot: f32,
+    eff_stack: f32,
+    player: u8,
+) -> (Vec<u8>, Vec<f32>) {
+    let valid_rivers: Vec<u8> = (0u8..52)
+        .filter(|r| !board.contains(r))
+        .collect();
+    let n_rivers = valid_rivers.len();
+    let mut flat_input = Vec::with_capacity(n_rivers * INPUT_SIZE);
+    for &river in &valid_rivers {
+        let mut board_5 = board.to_vec();
+        board_5.push(river);
+        let (oop_r, ip_r) = blocker_adjust_ranges(oop_1326, ip_1326, river);
+        let row = encode_boundary_inference_input(
+            &oop_r, &ip_r, &board_5, pot, eff_stack, player,
+        );
+        flat_input.extend_from_slice(&row);
+    }
+    (valid_rivers, flat_input)
+}
+
+/// Accumulate batched outputs into averaged per-combo CFVs, skipping
+/// combos blocked by each river card.
+fn accumulate_river_cfvs(valid_rivers: &[u8], all_outputs: &[f32]) -> Vec<f32> {
+    let mut cfv_sum = vec![0.0_f32; NUM_COMBOS];
+    let mut cfv_cnt = vec![0_u32; NUM_COMBOS];
+    for (row_idx, &river) in valid_rivers.iter().enumerate() {
+        let offset = row_idx * NUM_COMBOS;
+        for combo_idx in 0..NUM_COMBOS {
+            let (c1, c2) = index_to_card_pair(combo_idx);
+            if c1 == river || c2 == river { continue; }
+            cfv_sum[combo_idx] += all_outputs[offset + combo_idx];
+            cfv_cnt[combo_idx] += 1;
+        }
+    }
+    for i in 0..NUM_COMBOS {
+        if cfv_cnt[i] > 0 {
+            cfv_sum[i] /= cfv_cnt[i] as f32;
+        }
+    }
+    cfv_sum
+}
+
 /// Return (oop_range, ip_range) with combos containing `river_card` zeroed.
 fn blocker_adjust_ranges(oop_1326: &[f32], ip_1326: &[f32], river: u8) -> (Vec<f32>, Vec<f32>) {
     let mut oop = oop_1326.to_vec();
@@ -211,37 +262,25 @@ impl NeuralBoundaryEvaluator {
     }
 
     /// Enumerate all valid river cards given a 4-card (turn) board, blocker-
-    /// adjust ranges per river, run per-river forward passes, and average the
-    /// 1326-combo CFVs (per-combo, counting only rivers that don't block the
-    /// combo).
+    /// adjust ranges per river, run a single batched forward pass for all
+    /// rivers, and average the 1326-combo CFVs (per-combo, counting only
+    /// rivers that don't block the combo).
     fn burn_river_enumerated(&self, oop_1326: &[f32], ip_1326: &[f32], pot: f32, eff_stack: f32, player: u8) -> Vec<f32> {
-        let mut cfv_sum = vec![0.0_f32; NUM_COMBOS];
-        let mut cfv_cnt = vec![0_u32; NUM_COMBOS];
+        let (valid_rivers, flat_input) =
+            build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, player);
+        let n_rivers = valid_rivers.len();
 
-        for river in 0u8..52 {
-            if self.board.contains(&river) { continue; }
-            let mut board_5 = self.board.clone();
-            board_5.push(river);
+        let device = Default::default();
+        let tensor = Tensor::<NdArray, 2>::from_data(
+            TensorData::new(flat_input, [n_rivers, INPUT_SIZE]),
+            &device,
+        );
+        let model = self.model.lock().unwrap();
+        let output = model.forward(tensor);
+        drop(model);
+        let all_outputs: Vec<f32> = output.into_data().to_vec::<f32>().unwrap();
 
-            // Blocker-adjust both ranges: zero out combos containing the river.
-            let (oop_r, ip_r) = blocker_adjust_ranges(oop_1326, ip_1326, river);
-
-            let out = self.burn_forward(&oop_r, &ip_r, &board_5, pot, eff_stack, player);
-
-            for (combo_idx, &v) in out.iter().enumerate() {
-                let (c1, c2) = index_to_card_pair(combo_idx);
-                if c1 == river || c2 == river { continue; }
-                cfv_sum[combo_idx] += v;
-                cfv_cnt[combo_idx] += 1;
-            }
-        }
-
-        for i in 0..NUM_COMBOS {
-            if cfv_cnt[i] > 0 {
-                cfv_sum[i] /= cfv_cnt[i] as f32;
-            }
-        }
-        cfv_sum
+        accumulate_river_cfvs(&valid_rivers, &all_outputs)
     }
 }
 
@@ -399,31 +438,30 @@ impl NeuralBoundaryEvaluator {
         output_view.iter().copied().collect()
     }
 
+    /// Enumerate all valid river cards given a 4-card (turn) board, blocker-
+    /// adjust ranges per river, run a single batched session.run for all
+    /// rivers, and average the 1326-combo CFVs (per-combo, counting only
+    /// rivers that don't block the combo).
     fn onnx_river_enumerated(&self, oop_1326: &[f32], ip_1326: &[f32], pot: f32, eff_stack: f32, player: u8) -> Vec<f32> {
-        let mut cfv_sum = vec![0.0_f32; NUM_COMBOS];
-        let mut cfv_cnt = vec![0_u32; NUM_COMBOS];
+        let (valid_rivers, flat_input) =
+            build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, player);
+        let n_rivers = valid_rivers.len();
 
-        for river in 0u8..52 {
-            if self.board.contains(&river) { continue; }
-            let mut board_5 = self.board.clone();
-            board_5.push(river);
-            let (oop_r, ip_r) = blocker_adjust_ranges(oop_1326, ip_1326, river);
-            let out = self.onnx_forward(&oop_r, &ip_r, &board_5, pot, eff_stack, player);
+        let input_tensor = ort::value::Tensor::from_array((
+            [n_rivers as i64, INPUT_SIZE as i64],
+            flat_input,
+        ))
+        .expect("ort tensor creation");
+        let outputs = self
+            .session
+            .run(ort::inputs![input_tensor].expect("ort inputs"))
+            .expect("ort session run");
+        let output_view = outputs[0]
+            .try_extract_tensor::<f32>()
+            .expect("ort output extract f32");
+        let all_outputs: Vec<f32> = output_view.iter().copied().collect();
 
-            for (combo_idx, &v) in out.iter().enumerate() {
-                let (c1, c2) = index_to_card_pair(combo_idx);
-                if c1 == river || c2 == river { continue; }
-                cfv_sum[combo_idx] += v;
-                cfv_cnt[combo_idx] += 1;
-            }
-        }
-
-        for i in 0..NUM_COMBOS {
-            if cfv_cnt[i] > 0 {
-                cfv_sum[i] /= cfv_cnt[i] as f32;
-            }
-        }
-        cfv_sum
+        accumulate_river_cfvs(&valid_rivers, &all_outputs)
     }
 }
 
@@ -676,6 +714,93 @@ mod tests {
         );
         assert_eq!(oop_cfvs.len(), private_cards_p0.len(), "OOP CFV count should match p0 hand count");
         assert_eq!(ip_cfvs.len(),  private_cards_p1.len(), "IP CFV count should match p1 hand count");
+    }
+
+    #[cfg(not(feature = "onnx"))]
+    #[test]
+    fn burn_river_enumerated_produces_finite_averaged_cfvs() {
+        use burn::backend::NdArray;
+        use crate::model::boundary_net::BoundaryNet;
+        use range_solver::game::BoundaryEvaluator;
+
+        let device = Default::default();
+        let model = BoundaryNet::<NdArray>::new(&device, 2, 64);
+
+        // 4-card board triggers river enumeration
+        let board = vec![0u8, 4, 8, 12];
+
+        let private_cards_p0 = vec![(1u8, 2u8), (1, 3), (2, 3), (5, 6)];
+        let private_cards_p1 = vec![(5u8, 7u8), (6, 7), (1, 5)];
+
+        let evaluator = NeuralBoundaryEvaluator::new(
+            model,
+            board,
+            [private_cards_p0.clone(), private_cards_p1.clone()],
+        );
+
+        let oop_reach = vec![0.5_f32; private_cards_p0.len()];
+        let ip_reach  = vec![0.5_f32; private_cards_p1.len()];
+        let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach,
+            private_cards_p0.len(), private_cards_p1.len(), 0,
+        );
+        assert_eq!(oop_cfvs.len(), private_cards_p0.len());
+        assert_eq!(ip_cfvs.len(), private_cards_p1.len());
+        for &v in oop_cfvs.iter().chain(ip_cfvs.iter()) {
+            assert!(v.is_finite(), "CFV must be finite, got {v}");
+        }
+    }
+
+    #[cfg(not(feature = "onnx"))]
+    #[test]
+    fn burn_river_enumerated_matches_sequential_baseline() {
+        use burn::backend::NdArray;
+        use crate::model::boundary_net::BoundaryNet;
+
+        let device = Default::default();
+        let model = BoundaryNet::<NdArray>::new(&device, 2, 64);
+
+        let board = vec![0u8, 4, 8, 12];
+
+        let evaluator = NeuralBoundaryEvaluator::new(
+            model,
+            board.clone(),
+            [vec![(1u8, 2u8)], vec![(5u8, 6u8)]],
+        );
+
+        // Compute via the batched path (the method under test)
+        let oop_1326 = vec![0.3_f32; NUM_COMBOS];
+        let ip_1326 = vec![0.7_f32; NUM_COMBOS];
+        let result = evaluator.burn_river_enumerated(&oop_1326, &ip_1326, 100.0, 150.0, 0);
+
+        // Compute the expected result via explicit sequential forward passes
+        let mut cfv_sum = vec![0.0_f32; NUM_COMBOS];
+        let mut cfv_cnt = vec![0_u32; NUM_COMBOS];
+        for river in 0u8..52 {
+            if board.contains(&river) { continue; }
+            let mut board_5 = board.clone();
+            board_5.push(river);
+            let (oop_r, ip_r) = blocker_adjust_ranges(&oop_1326, &ip_1326, river);
+            let out = evaluator.burn_forward(&oop_r, &ip_r, &board_5, 100.0, 150.0, 0);
+            for (combo_idx, &v) in out.iter().enumerate() {
+                let (c1, c2) = index_to_card_pair(combo_idx);
+                if c1 == river || c2 == river { continue; }
+                cfv_sum[combo_idx] += v;
+                cfv_cnt[combo_idx] += 1;
+            }
+        }
+        for i in 0..NUM_COMBOS {
+            if cfv_cnt[i] > 0 { cfv_sum[i] /= cfv_cnt[i] as f32; }
+        }
+
+        // Compare: batched must match sequential exactly (same math, same model)
+        for i in 0..NUM_COMBOS {
+            assert!(
+                (result[i] - cfv_sum[i]).abs() < 1e-5,
+                "Mismatch at combo {i}: batched={} sequential={}",
+                result[i], cfv_sum[i]
+            );
+        }
     }
 
     #[cfg(not(feature = "onnx"))]
