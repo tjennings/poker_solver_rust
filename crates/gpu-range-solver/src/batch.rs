@@ -350,7 +350,7 @@ impl GpuBatchSolver {
             "SubgameSpec showdown_outcomes_p0 and _p1 must have the same Some/None state"
         );
 
-        let (d_showdown_p0, d_showdown_p1, active_num_showdowns) = if all_some_p0 {
+        let (d_showdown_p0, d_showdown_p1, active_num_showdowns) = if all_some_p0 && all_some_p1 {
             let hh = h * h;
             let sd_per_batch = self.num_showdowns * hh;
             let mut batched_sd_p0 = vec![0.0f32; batch_size * sd_per_batch];
