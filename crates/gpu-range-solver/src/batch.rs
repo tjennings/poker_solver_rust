@@ -16,9 +16,14 @@ pub struct SubgameSpec {
     /// Per-player initial weights, length `num_hands` each.
     pub initial_weights: [Vec<f32>; 2],
     /// Pre-scaled showdown outcomes for player 0 traversal: `[num_showdowns * H * H]`.
-    pub showdown_outcomes_p0: Vec<f32>,
+    /// `None` means this spec has no showdowns — used by turn datagen where leaf
+    /// injection from BoundaryNet supplies all CFVs at boundary nodes. When `None`,
+    /// `prepare_batch` skips host concat and H2D upload, and the kernel sees
+    /// `num_showdowns=0` so its showdown loop is a no-op.
+    pub showdown_outcomes_p0: Option<Vec<f32>>,
     /// Pre-scaled showdown outcomes for player 1 traversal: `[num_showdowns * H * H]`.
-    pub showdown_outcomes_p1: Vec<f32>,
+    /// See `showdown_outcomes_p0` for `None` semantics.
+    pub showdown_outcomes_p1: Option<Vec<f32>>,
     /// Per-game fold payoffs for P0 traversal: `[num_folds]`.
     pub fold_payoffs_p0: Vec<f32>,
     /// Per-game fold payoffs for P1 traversal: `[num_folds]`.
@@ -56,8 +61,8 @@ impl SubgameSpec {
         let mtd = build_mega_terminal_data(topo, term, &raw_weights, num_hands);
         SubgameSpec {
             initial_weights,
-            showdown_outcomes_p0: mtd.showdown_outcomes_p0,
-            showdown_outcomes_p1: mtd.showdown_outcomes_p1,
+            showdown_outcomes_p0: Some(mtd.showdown_outcomes_p0),
+            showdown_outcomes_p1: Some(mtd.showdown_outcomes_p1),
             fold_payoffs_p0: mtd.fold_payoffs_p0,
             fold_payoffs_p1: mtd.fold_payoffs_p1,
         }
@@ -325,12 +330,14 @@ impl GpuBatchSolver {
         let mut batched_sd_p1 = vec![0.0f32; batch_size * sd_per_batch];
         for (b, spec) in specs.iter().enumerate() {
             let base = b * sd_per_batch;
-            let src_len = spec.showdown_outcomes_p0.len().min(sd_per_batch);
-            batched_sd_p0[base..base + src_len]
-                .copy_from_slice(&spec.showdown_outcomes_p0[..src_len]);
-            let src_len = spec.showdown_outcomes_p1.len().min(sd_per_batch);
-            batched_sd_p1[base..base + src_len]
-                .copy_from_slice(&spec.showdown_outcomes_p1[..src_len]);
+            if let Some(sd) = spec.showdown_outcomes_p0.as_deref() {
+                let src_len = sd.len().min(sd_per_batch);
+                batched_sd_p0[base..base + src_len].copy_from_slice(&sd[..src_len]);
+            }
+            if let Some(sd) = spec.showdown_outcomes_p1.as_deref() {
+                let src_len = sd.len().min(sd_per_batch);
+                batched_sd_p1[base..base + src_len].copy_from_slice(&sd[..src_len]);
+            }
         }
         let d_showdown_p0 = upload_or_dummy_f32(&self.stream, &batched_sd_p0)?;
         let d_showdown_p1 = upload_or_dummy_f32(&self.stream, &batched_sd_p1)?;
@@ -1047,8 +1054,14 @@ mod tests {
         assert_eq!(spec.initial_weights[0].len(), num_hands);
         assert_eq!(spec.initial_weights[1].len(), num_hands);
         let num_showdowns = topo.showdown_nodes.len();
-        assert_eq!(spec.showdown_outcomes_p0.len(), num_showdowns * num_hands * num_hands);
-        assert_eq!(spec.showdown_outcomes_p1.len(), num_showdowns * num_hands * num_hands);
+        assert_eq!(
+            spec.showdown_outcomes_p0.as_ref().map(Vec::len),
+            Some(num_showdowns * num_hands * num_hands)
+        );
+        assert_eq!(
+            spec.showdown_outcomes_p1.as_ref().map(Vec::len),
+            Some(num_showdowns * num_hands * num_hands)
+        );
         let num_folds = topo.fold_nodes.len();
         assert_eq!(spec.fold_payoffs_p0.len(), num_folds);
         assert_eq!(spec.fold_payoffs_p1.len(), num_folds);

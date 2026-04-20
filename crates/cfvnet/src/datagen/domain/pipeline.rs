@@ -1017,8 +1017,8 @@ impl DomainPipeline {
 
         gpu_range_solver::SubgameSpec {
             initial_weights: [w_oop, w_ip],
-            showdown_outcomes_p0: zero_outcomes.clone(),
-            showdown_outcomes_p1: zero_outcomes,
+            showdown_outcomes_p0: Some(zero_outcomes.clone()),
+            showdown_outcomes_p1: Some(zero_outcomes),
             fold_payoffs_p0,
             fold_payoffs_p1,
         }
