@@ -518,4 +518,26 @@ mod tests {
         let expected = 3 * 10 * 4 + 2 * 4 * 4 + 5 * 4;
         assert_eq!(size, expected);
     }
+
+    #[test]
+    fn canonical_turn_tree_smem_fits_under_cuda_default_limit() {
+        // Regression test for bean oox2: the canonical turn tree
+        // (SPR=100, bet sizes [25%, 50%, 100%, a] × [25%, 75%, a]) has
+        // num_edges=6590, num_nodes=6591, max_depth=16. With edges stored
+        // in dynamic shared memory, the required smem was ~103 KB which
+        // exceeds CUDA's 48 KB default per-block limit, causing
+        // CUDA_ERROR_INVALID_VALUE at kernel launch.
+        //
+        // After moving edge_parent/child/player out of smem and reading
+        // them directly from global memory, the kernel's dynamic smem
+        // must fit under the 48 KB default on any CUDA-capable GPU.
+        const CUDA_DEFAULT_SMEM_PER_BLOCK: usize = 48 * 1024;
+        let size = compute_hand_parallel_shared_mem(6590, 16, 6591);
+        assert!(
+            size <= CUDA_DEFAULT_SMEM_PER_BLOCK,
+            "canonical turn tree smem {} bytes must fit under CUDA default {} bytes",
+            size,
+            CUDA_DEFAULT_SMEM_PER_BLOCK
+        );
+    }
 }
