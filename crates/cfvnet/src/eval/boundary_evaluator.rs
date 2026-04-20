@@ -5,6 +5,7 @@
 //! - `onnx` feature: uses `ort::Session` loaded from a `.onnx` file exported by PyTorch.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_COMBOS, NUM_RANKS};
 use range_solver::card::card_pair_to_index;
@@ -207,9 +208,11 @@ pub fn load_neural_boundary_evaluator(
 ///
 /// Loads a `.onnx` model exported from PyTorch. `ort::Session` is natively
 /// `Send + Sync` and `run` takes `&self`, so no `Mutex` is needed.
+/// The session is wrapped in `Arc` so multiple evaluators (one per boundary)
+/// can share a single loaded model.
 #[cfg(feature = "onnx")]
 pub struct NeuralBoundaryEvaluator {
-    session: ort::session::Session,
+    session: Arc<ort::session::Session>,
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
 }
@@ -274,14 +277,24 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
             .expect("ort output extract f32");
         let normalized: Vec<f32> = output_view.iter().copied().collect();
 
-        // Denormalize: multiply by (pot + effective_stack) to get chip EVs.
-        let total = pot_f32 + eff_stack_f32;
-        let chip_evs: Vec<f32> = normalized.iter().map(|&v| v * total).collect();
+        // Convert network output to pot-normalised units (1.0 = one half-pot).
+        //
+        // The training pipeline normalises targets as:
+        //   target = cfv_halfpot * pot / (pot + eff_stack)
+        // where cfv_halfpot = (ev_chips - half_pot) / half_pot.
+        //
+        // To recover range-solver CFV units (1.0 = one half-pot gain):
+        //   cfv_halfpot = output * (pot + eff_stack) / pot
+        let scale = if pot_f32 > 0.0 {
+            (pot_f32 + eff_stack_f32) / pot_f32
+        } else {
+            0.0
+        };
 
         // Map 1326-combo ordering back to game private_cards ordering.
         let mut cfvs = Vec::with_capacity(num_hands);
         for &(c1, c2) in &self.private_cards[player] {
-            cfvs.push(chip_evs[card_pair_to_index(c1, c2)]);
+            cfvs.push(normalized[card_pair_to_index(c1, c2)] * scale);
         }
         cfvs
     }
@@ -295,6 +308,18 @@ pub fn load_neural_boundary_evaluator(
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
 ) -> Result<NeuralBoundaryEvaluator, String> {
+    let session = load_shared_onnx_session(model_path)?;
+    Ok(NeuralBoundaryEvaluator { session, board, private_cards })
+}
+
+/// Load an ONNX session from a model file, returning it wrapped in `Arc`.
+///
+/// Use this when multiple `NeuralBoundaryEvaluator` instances (one per boundary)
+/// need to share a single model load. Loading is expensive (~100ms for a 26MB
+/// model), so loading once and sharing via Arc is critical for depth-limited
+/// solves with 100+ boundaries.
+#[cfg(feature = "onnx")]
+pub fn load_shared_onnx_session(model_path: &Path) -> Result<Arc<ort::session::Session>, String> {
     use ort::session::{Session, builder::GraphOptimizationLevel};
 
     let session = Session::builder()
@@ -303,7 +328,21 @@ pub fn load_neural_boundary_evaluator(
         .map_err(|e| format!("ort optimization: {e}"))?
         .commit_from_file(model_path)
         .map_err(|e| format!("ort load {}: {e}", model_path.display()))?;
-    Ok(NeuralBoundaryEvaluator { session, board, private_cards })
+    Ok(Arc::new(session))
+}
+
+/// Create a `NeuralBoundaryEvaluator` from a pre-loaded shared session.
+///
+/// Each boundary in a depth-limited solve has a different board (e.g., flop +
+/// different turn card). This constructor avoids reloading the ONNX model for
+/// each boundary.
+#[cfg(feature = "onnx")]
+pub fn neural_boundary_evaluator_from_shared(
+    session: Arc<ort::session::Session>,
+    board: Vec<u8>,
+    private_cards: [Vec<(u8, u8)>; 2],
+) -> NeuralBoundaryEvaluator {
+    NeuralBoundaryEvaluator { session, board, private_cards }
 }
 
 #[cfg(test)]
@@ -315,6 +354,7 @@ mod tests {
     mod onnx_tests {
         use super::*;
         use std::path::PathBuf;
+        use std::sync::Arc;
 
         #[test]
         fn load_onnx_evaluator_rejects_missing_file() {
@@ -345,6 +385,103 @@ mod tests {
             // Verify NeuralBoundaryEvaluator implements BoundaryEvaluator at compile time.
             fn _assert_trait<T: range_solver::game::BoundaryEvaluator>() {}
             _assert_trait::<NeuralBoundaryEvaluator>();
+        }
+
+        #[test]
+        fn load_shared_session_rejects_missing_file() {
+            let result = load_shared_onnx_session(&PathBuf::from("/nonexistent/model.onnx"));
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("ort"), "error should mention ort, got: {err}");
+        }
+
+        #[test]
+        fn from_shared_constructor_produces_valid_evaluator() {
+            // This test validates the from_shared constructor compiles and
+            // produces a NeuralBoundaryEvaluator that implements BoundaryEvaluator.
+            // Uses an ignored gate since it requires a real ONNX model file.
+            fn _assert_from_shared_compiles(session: Arc<ort::session::Session>) {
+                let board = vec![0u8, 4, 8, 12];
+                let private_cards = [
+                    vec![(1u8, 2u8), (1, 3)],
+                    vec![(5u8, 6u8), (5, 7)],
+                ];
+                let eval = neural_boundary_evaluator_from_shared(
+                    session, board, private_cards,
+                );
+                // Verify it implements BoundaryEvaluator
+                fn _check<T: range_solver::game::BoundaryEvaluator>(_: &T) {}
+                _check(&eval);
+            }
+        }
+
+        #[test]
+        #[ignore] // Requires ONNX model file on disk
+        fn shared_session_smoke_test_compute_cfvs() {
+            use range_solver::game::BoundaryEvaluator;
+
+            let model_path = PathBuf::from(
+                "../../local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx"
+            );
+            if !model_path.exists() {
+                eprintln!("skipping: ONNX model not found at {}", model_path.display());
+                return;
+            }
+
+            let session = load_shared_onnx_session(&model_path)
+                .expect("load shared session");
+            assert_eq!(Arc::strong_count(&session), 1);
+
+            // Create two evaluators sharing the same session (different boards)
+            let board_a = vec![0u8, 4, 8, 12]; // 4-card turn board
+            let board_b = vec![0u8, 4, 8, 16]; // different turn card
+
+            // Generate non-conflicting private cards for board_a
+            let private_cards_a: [Vec<(u8, u8)>; 2] = [
+                (1..=20).step_by(2).map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| ![0, 4, 8, 12].contains(&c1) && ![0, 4, 8, 12].contains(&c2))
+                    .take(5)
+                    .collect(),
+                (21..=40).step_by(2).map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| ![0, 4, 8, 12].contains(&c1) && ![0, 4, 8, 12].contains(&c2))
+                    .take(5)
+                    .collect(),
+            ];
+            let private_cards_b: [Vec<(u8, u8)>; 2] = [
+                (1..=20).step_by(2).map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| ![0, 4, 8, 16].contains(&c1) && ![0, 4, 8, 16].contains(&c2))
+                    .take(5)
+                    .collect(),
+                (21..=40).step_by(2).map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| ![0, 4, 8, 16].contains(&c1) && ![0, 4, 8, 16].contains(&c2))
+                    .take(5)
+                    .collect(),
+            ];
+
+            let eval_a = neural_boundary_evaluator_from_shared(
+                Arc::clone(&session), board_a, private_cards_a.clone(),
+            );
+            let eval_b = neural_boundary_evaluator_from_shared(
+                Arc::clone(&session), board_b, private_cards_b.clone(),
+            );
+            assert_eq!(Arc::strong_count(&session), 3);
+
+            // compute_cfvs should return correct-length output
+            let num_hands_p0 = private_cards_a[0].len();
+            let opponent_reach = vec![1.0_f32; private_cards_a[1].len()];
+            let cfvs = eval_a.compute_cfvs(0, 200, 100.0, &opponent_reach, num_hands_p0, 0);
+            assert_eq!(cfvs.len(), num_hands_p0, "CFV count must match player 0 hands");
+
+            // All CFVs should be finite
+            for &v in &cfvs {
+                assert!(v.is_finite(), "CFV must be finite, got {v}");
+            }
+
+            // eval_b should also work
+            let num_hands_p0_b = private_cards_b[0].len();
+            let opponent_reach_b = vec![1.0_f32; private_cards_b[1].len()];
+            let cfvs_b = eval_b.compute_cfvs(0, 200, 100.0, &opponent_reach_b, num_hands_p0_b, 0);
+            assert_eq!(cfvs_b.len(), num_hands_p0_b);
         }
     }
 
