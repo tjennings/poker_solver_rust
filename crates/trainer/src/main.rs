@@ -377,10 +377,18 @@ enum Commands {
         #[arg(long)]
         dump_boundary_cfvs: bool,
 
-        /// Subgame depth limit: number of street transitions allowed.
+        /// Depth limit for hybrid subgame: number of street transitions allowed.
         /// 0 = current street only (default), 1 = current + next, 2 = flop through river.
-        #[arg(long)]
-        subgame_depth_limit: Option<u8>,
+        #[arg(long, alias = "subgame-depth-limit")]
+        hybrid_depth_limit: Option<u8>,
+
+        /// Hybrid evaluator refresh interval: re-sample boundary CFVs every N iters.
+        #[arg(long, default_value_t = 10)]
+        hybrid_refresh_interval: u32,
+
+        /// Hybrid evaluator samples per refresh: number of rollout samples per boundary.
+        #[arg(long, default_value_t = 100)]
+        hybrid_samples_per_refresh: u32,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1298,7 +1306,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             opponent_samples,
             verbose,
             dump_boundary_cfvs,
-            subgame_depth_limit,
+            hybrid_depth_limit,
+            hybrid_refresh_interval,
+            hybrid_samples_per_refresh,
         } => {
             compare_solve::run(
                 &bundle,
@@ -1309,7 +1319,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(opponent_samples),
                 verbose,
                 dump_boundary_cfvs,
-                subgame_depth_limit,
+                hybrid_depth_limit,
+                hybrid_refresh_interval,
+                hybrid_samples_per_refresh,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -2699,5 +2711,61 @@ snapshots:
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "UTG open");
         assert_eq!(resolved[1].name, "HJ vs UTG");
+    }
+
+    /// compare-solve should accept --hybrid-depth-limit, --hybrid-refresh-interval,
+    /// --hybrid-samples-per-refresh, and the --subgame-depth-limit alias.
+    #[test]
+    fn compare_solve_hybrid_cli_flags_parse() {
+        use clap::Parser;
+
+        // New hybrid flags
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/test",
+            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--hybrid-depth-limit", "1",
+            "--hybrid-refresh-interval", "20",
+            "--hybrid-samples-per-refresh", "200",
+        ]);
+        assert!(cli.is_ok(), "hybrid flags must parse: {:?}", cli.err());
+
+        if let super::Commands::CompareSolve {
+            hybrid_depth_limit,
+            hybrid_refresh_interval,
+            hybrid_samples_per_refresh,
+            ..
+        } = cli.unwrap().command {
+            assert_eq!(hybrid_depth_limit, Some(1));
+            assert_eq!(hybrid_refresh_interval, 20);
+            assert_eq!(hybrid_samples_per_refresh, 200);
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+
+        // Legacy alias: --subgame-depth-limit should map to hybrid_depth_limit
+        let cli2 = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/test",
+            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--subgame-depth-limit", "2",
+        ]);
+        assert!(cli2.is_ok(), "--subgame-depth-limit alias must parse: {:?}", cli2.err());
+
+        if let super::Commands::CompareSolve {
+            hybrid_depth_limit,
+            hybrid_refresh_interval,
+            hybrid_samples_per_refresh,
+            ..
+        } = cli2.unwrap().command {
+            assert_eq!(hybrid_depth_limit, Some(2));
+            // Defaults
+            assert_eq!(hybrid_refresh_interval, 10);
+            assert_eq!(hybrid_samples_per_refresh, 100);
+        } else {
+            panic!("expected CompareSolve variant");
+        }
     }
 }
