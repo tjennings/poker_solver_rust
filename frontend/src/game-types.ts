@@ -8,6 +8,15 @@ export interface ActionRecord {
   actions: GameAction[];  // all available actions at this decision point
 }
 
+export interface RefreshProgress {
+  iter: number;
+  done: number;
+  total: number;
+  elapsed_ms: number;
+  eta_ms: number;
+  active: boolean;
+}
+
 export interface SolveStatus {
   iteration: number;
   max_iterations: number;
@@ -16,6 +25,7 @@ export interface SolveStatus {
   rollout_hands_per_sec: number;
   solver_name: string;
   is_complete: boolean;
+  refresh_progress?: RefreshProgress;
 }
 
 export interface GameAction {

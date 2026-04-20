@@ -1377,6 +1377,9 @@ button:disabled {
   border-radius: 4px;
   transition: width 0.3s;
 }
+.progress-bar-track .progress-bar-fill--refresh {
+  background: linear-gradient(90deg, #f59e0b33, #f59e0b66);
+}
 .progress-bar-track .progress-text {
   position: relative;
   z-index: 1;
