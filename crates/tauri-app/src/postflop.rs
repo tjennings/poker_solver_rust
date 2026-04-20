@@ -482,18 +482,22 @@ impl RolloutLeafEvaluator {
         // Note: `_n_samples` is intentionally ignored. `num_opponent_samples`
         // and `num_rollouts` are set at evaluator construction and control
         // the MC budget; callers should configure them via the constructor.
-        // The hybrid path sets num_rollouts=1 and num_opponent_samples=budget.
-        let uniform = vec![1.0_f64; combos.len()];
-        // Traverser 0 = OOP hero. Hero range uniform so all OOP combos compute;
-        // IP opponent weights come from `ip_range`.
+        //
+        // Hero range is passed AS-IS (no uniform clamp). The inner sampler's
+        // `if hero_range[i] <= 0.0 return 0.0` is a correctness-preserving
+        // optimization: hands with zero counterfactual reach contribute 0 to
+        // CFR regret updates (Σ_h π_{-i}(h) × u(h, a) skips h where σ_i = 0
+        // reached h), so their CFVs are never read. Skipping zero-range combos
+        // trims per-boundary work from |combos| (≈1176 on a flop) down to the
+        // player's preflop-range size (≈150-200 combos) — a 6-8x speedup.
+        // Traverser 0 = OOP hero; IP opponent weights come from `ip_range`.
         let oop_cfvs = self.rollout_chip_values_with_state(
-            combos, board, &uniform, ip_range, 0,
+            combos, board, oop_range, ip_range, 0,
             boundary_pot, boundary_invested,
         );
-        // Traverser 1 = IP hero. Hero range uniform so all IP combos compute;
-        // OOP opponent weights come from `oop_range`.
+        // Traverser 1 = IP hero; OOP opponent weights come from `oop_range`.
         let ip_cfvs = self.rollout_chip_values_with_state(
-            combos, board, oop_range, &uniform, 1,
+            combos, board, oop_range, ip_range, 1,
             boundary_pot, boundary_invested,
         );
         BoundaryCfvs { oop_cfvs, ip_cfvs }
