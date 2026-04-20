@@ -12,7 +12,7 @@ poker-solver-tauri = { path = "../tauri-app" }
 range-solver = { path = "../range-solver" }
 gpu-range-solver = { path = "../gpu-range-solver" }
 rebel = { path = "../rebel" }
-cfvnet = { path = "../cfvnet" }
+cfvnet = { path = "../cfvnet", features = ["onnx"] }
 burn = { version = "0.16", features = ["wgpu"] }
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
