@@ -752,7 +752,142 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     println!("  mBB:       {:.2}", total_mbb / n);
 }
 
+/// Infer the number of board cards from a binary data file by reading
+/// the first byte, which stores `board_size` (3=flop, 4=turn, 5=river).
+/// This avoids requiring a `--street` CLI flag or a `config.yaml` for ONNX models.
+#[cfg(any(feature = "onnx", test))]
+fn infer_board_cards_from_data(data_path: &std::path::Path) -> usize {
+    let mut f = std::fs::File::open(data_path).unwrap_or_else(|e| {
+        eprintln!("failed to open data file {}: {e}", data_path.display());
+        std::process::exit(1);
+    });
+    let mut buf = [0u8; 1];
+    std::io::Read::read_exact(&mut f, &mut buf).unwrap_or_else(|e| {
+        eprintln!("failed to read board_size from {}: {e}", data_path.display());
+        std::process::exit(1);
+    });
+    let board_cards = buf[0] as usize;
+    assert!(
+        (3..=5).contains(&board_cards),
+        "unexpected board_size {board_cards} in data file (expected 3-5)"
+    );
+    board_cards
+}
+
+/// Evaluate a `.onnx` model against binary boundary data using ONNX Runtime.
+///
+/// Board card count is inferred from the data file's first record (option b),
+/// avoiding the need for a `config.yaml` or extra CLI flags.
+#[cfg(feature = "onnx")]
+fn cmd_eval_boundary_onnx(model_path: PathBuf, data_path: PathBuf) {
+    use cfvnet::datagen::storage::{read_record, record_size};
+    use cfvnet::eval::metrics::compute_normalized_mae;
+    use cfvnet::model::boundary_dataset::encode_boundary_record;
+    use cfvnet::model::network::INPUT_SIZE;
+    use ort::session::{Session, builder::GraphOptimizationLevel};
+
+    let session = Session::builder()
+        .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
+        .and_then(|b| b.commit_from_file(&model_path))
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load ONNX model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    let board_cards = infer_board_cards_from_data(&data_path);
+    let rec_size = record_size(board_cards) as u64;
+    let file_size = std::fs::metadata(&data_path)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to read data file {}: {e}", data_path.display());
+            std::process::exit(1);
+        })
+        .len();
+    let num_records = file_size / rec_size;
+    let street_name = match board_cards {
+        3 => "flop",
+        4 => "turn",
+        _ => "river",
+    };
+    println!("Evaluating {num_records} records (ONNX, {street_name}) ...");
+
+    let file = std::fs::File::open(&data_path).unwrap_or_else(|e| {
+        eprintln!("failed to open data file {}: {e}", data_path.display());
+        std::process::exit(1);
+    });
+    let mut reader = std::io::BufReader::new(file);
+
+    let mut all_maes: Vec<f64> = Vec::with_capacity(num_records as usize);
+    let mut spr_maes: [Vec<f64>; 4] = [vec![], vec![], vec![], vec![]];
+
+    while let Ok(rec) = read_record(&mut reader) {
+        let item = encode_boundary_record(&rec);
+        let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
+
+        let input_tensor = ort::value::Tensor::from_array(
+            ([1_i64, INPUT_SIZE as i64], item.input.clone()),
+        )
+        .expect("ort tensor creation");
+        let outputs = session
+            .run(ort::inputs![input_tensor].expect("ort inputs"))
+            .expect("ort session run");
+        let output_view = outputs[0]
+            .try_extract_tensor::<f32>()
+            .expect("ort output extract f32");
+        let pred_vec: Vec<f32> = output_view.iter().copied().collect();
+
+        let mae = compute_normalized_mae(&pred_vec, &item.target, &mask);
+        all_maes.push(mae);
+
+        let spr = if rec.pot > 0.0 {
+            rec.effective_stack as f64 / rec.pot as f64
+        } else {
+            0.0
+        };
+        let bucket = if spr < 1.0 {
+            0
+        } else if spr < 3.0 {
+            1
+        } else if spr < 10.0 {
+            2
+        } else {
+            3
+        };
+        spr_maes[bucket].push(mae);
+    }
+
+    if all_maes.is_empty() {
+        println!("No records to evaluate.");
+        return;
+    }
+
+    println!("Results ({} records):", all_maes.len());
+    print_error_stats("  Overall", &mut all_maes);
+
+    let bucket_labels = ["<1", "1-3", "3-10", "10+"];
+    println!("\nMAE by SPR bucket:");
+    for (i, label) in bucket_labels.iter().enumerate() {
+        if spr_maes[i].is_empty() {
+            println!("  SPR {:<5}: N/A     (0 records)", label);
+        } else {
+            print_error_stats(&format!("  SPR {:<5}", label), &mut spr_maes[i]);
+        }
+    }
+}
+
 fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
+    // Dispatch: .onnx files use ONNX Runtime; everything else uses the Burn path.
+    if is_onnx_model(&model_dir) {
+        #[cfg(feature = "onnx")]
+        {
+            return cmd_eval_boundary_onnx(model_dir, data_path);
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            eprintln!("ONNX models require building with --features onnx");
+            std::process::exit(1);
+        }
+    }
+
     use burn::backend::NdArray;
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
@@ -1665,3 +1800,81 @@ fn format_board(board: &[u8; 5], board_size: usize) -> String {
     format!("Board: {}", cards.join(" "))
 }
 
+/// Returns `true` if the model path has an `.onnx` extension, indicating
+/// that the ONNX inference path should be used instead of the Burn path.
+fn is_onnx_model(path: &std::path::Path) -> bool {
+    path.extension().map_or(false, |ext| ext == "onnx")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn is_onnx_model_detects_onnx_extension() {
+        assert!(is_onnx_model(Path::new("model.onnx")));
+        assert!(is_onnx_model(Path::new("/some/path/checkpoint_epoch675.onnx")));
+    }
+
+    #[test]
+    fn is_onnx_model_rejects_non_onnx() {
+        assert!(!is_onnx_model(Path::new("model.mpk.gz")));
+        assert!(!is_onnx_model(Path::new("/some/dir/model")));
+        assert!(!is_onnx_model(Path::new("model_dir/")));
+        assert!(!is_onnx_model(Path::new("model.onnx.bak")));
+    }
+
+    #[test]
+    fn is_onnx_model_handles_edge_cases() {
+        assert!(!is_onnx_model(Path::new("")));
+        assert!(!is_onnx_model(Path::new(".")));
+        // ".onnx" is a hidden file with no extension on Unix, not an ONNX model
+        assert!(!is_onnx_model(Path::new(".onnx")));
+    }
+
+    #[test]
+    fn infer_board_cards_river() {
+        let dir = std::env::temp_dir().join("cfvnet_test_infer_river");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_river.bin");
+        // First byte = 5 (river)
+        std::fs::write(&path, &[5u8]).unwrap();
+        assert_eq!(infer_board_cards_from_data(&path), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn infer_board_cards_flop() {
+        let dir = std::env::temp_dir().join("cfvnet_test_infer_flop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_flop.bin");
+        // First byte = 3 (flop)
+        std::fs::write(&path, &[3u8]).unwrap();
+        assert_eq!(infer_board_cards_from_data(&path), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn infer_board_cards_turn() {
+        let dir = std::env::temp_dir().join("cfvnet_test_infer_turn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_turn.bin");
+        // First byte = 4 (turn)
+        std::fs::write(&path, &[4u8]).unwrap();
+        assert_eq!(infer_board_cards_from_data(&path), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected board_size")]
+    fn infer_board_cards_rejects_invalid() {
+        let dir = std::env::temp_dir().join("cfvnet_test_infer_invalid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_bad.bin");
+        // First byte = 0 (invalid)
+        std::fs::write(&path, &[0u8]).unwrap();
+        infer_board_cards_from_data(&path);
+        // cleanup won't run due to panic, but temp dir is fine
+    }
+}
