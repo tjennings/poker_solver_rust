@@ -24,6 +24,73 @@ use poker_solver_core::blueprint_v2::Street;
 use range_solver::card::{card_to_string, NOT_DEALT};
 use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
 use range_solver::interface::Game;
+use serde::Deserialize;
+
+// ---------------------------------------------------------------------------
+// Per-street boundary configuration
+// ---------------------------------------------------------------------------
+
+/// How to evaluate boundaries at a given street transition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum StreetBoundaryMode {
+    Exact,
+    Cfvnet { model_path: String },
+}
+
+impl Default for StreetBoundaryMode {
+    fn default() -> Self {
+        StreetBoundaryMode::Exact
+    }
+}
+
+/// Per-street boundary evaluator configuration.
+///
+/// The solver walks streets in order from the session's root street. The first
+/// non-Exact street becomes the cut point: the tree is built with a depth limit
+/// that stops at that street transition, and the named cfvnet model evaluates
+/// the boundary.
+///
+/// All-Exact (the default) means a full exact solve with no boundaries.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StreetBoundaryConfig {
+    pub flop: StreetBoundaryMode,
+    pub turn: StreetBoundaryMode,
+    pub river: StreetBoundaryMode,
+}
+
+/// Result of resolving a `StreetBoundaryConfig` against a root street.
+///
+/// `None` means all-exact (no cut). `Some((depth, model_path))` means cut
+/// after `depth` street transitions using the given ONNX model.
+pub fn resolve_street_boundary(
+    config: &StreetBoundaryConfig,
+    root_street: Street,
+) -> Option<(u8, String)> {
+    // Streets to walk from root, in order.
+    let streets: &[(Street, &StreetBoundaryMode)] = match root_street {
+        Street::Flop => &[
+            (Street::Flop, &config.flop),
+            (Street::Turn, &config.turn),
+            (Street::River, &config.river),
+        ],
+        Street::Turn => &[
+            (Street::Turn, &config.turn),
+            (Street::River, &config.river),
+        ],
+        Street::River => &[
+            (Street::River, &config.river),
+        ],
+        Street::Preflop => return None, // preflop solve not supported
+    };
+
+    for (depth, (_street, mode)) in streets.iter().enumerate() {
+        if let StreetBoundaryMode::Cfvnet { model_path } = mode {
+            return Some((depth as u8, model_path.clone()));
+        }
+    }
+    None // all exact
+}
 
 use crate::exploration::{
     board_for_street_slice, blueprint_sizes_to_range_solver, build_canonical_to_combo_map,
@@ -4354,5 +4421,163 @@ mod tests {
         }
         ss.reset();
         assert!(ss.refresh_progress.read().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // StreetBoundaryConfig + resolve_street_boundary tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sbc_all_exact_returns_none() {
+        let config = StreetBoundaryConfig::default();
+        assert!(resolve_street_boundary(&config, Street::Flop).is_none());
+        assert!(resolve_street_boundary(&config, Street::Turn).is_none());
+        assert!(resolve_street_boundary(&config, Street::River).is_none());
+    }
+
+    #[test]
+    fn sbc_cfvnet_at_river_from_flop_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/river.onnx".to_string(),
+            },
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((2, "/models/river.onnx".to_string())));
+    }
+
+    #[test]
+    fn sbc_cfvnet_at_turn_from_flop_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/turn.onnx".to_string(),
+            },
+            river: StreetBoundaryMode::Exact,
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((1, "/models/turn.onnx".to_string())));
+    }
+
+    #[test]
+    fn sbc_cfvnet_at_flop_from_flop_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/flop.onnx".to_string(),
+            },
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Exact,
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((0, "/models/flop.onnx".to_string())));
+    }
+
+    #[test]
+    fn sbc_first_cfvnet_wins_when_multiple() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/turn.onnx".to_string(),
+            },
+            river: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/river.onnx".to_string(),
+            },
+        };
+        // First non-exact wins: turn at depth 1
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((1, "/models/turn.onnx".to_string())));
+    }
+
+    #[test]
+    fn sbc_cfvnet_at_river_from_turn_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/river.onnx".to_string(),
+            },
+        };
+        // From turn root, river is at depth 1 (turn=0, river=1)
+        let result = resolve_street_boundary(&config, Street::Turn);
+        assert_eq!(result, Some((1, "/models/river.onnx".to_string())));
+    }
+
+    #[test]
+    fn sbc_cfvnet_at_turn_from_turn_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/turn.onnx".to_string(),
+            },
+            river: StreetBoundaryMode::Exact,
+        };
+        // From turn root, turn itself is at depth 0
+        let result = resolve_street_boundary(&config, Street::Turn);
+        assert_eq!(result, Some((0, "/models/turn.onnx".to_string())));
+    }
+
+    #[test]
+    fn sbc_preflop_root_returns_none() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/flop.onnx".to_string(),
+            },
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Exact,
+        };
+        assert!(resolve_street_boundary(&config, Street::Preflop).is_none());
+    }
+
+    #[test]
+    fn sbc_default_is_all_exact() {
+        let config = StreetBoundaryConfig::default();
+        assert!(matches!(config.flop, StreetBoundaryMode::Exact));
+        assert!(matches!(config.turn, StreetBoundaryMode::Exact));
+        assert!(matches!(config.river, StreetBoundaryMode::Exact));
+    }
+
+    #[test]
+    fn sbc_serde_roundtrip_exact() {
+        let config = StreetBoundaryConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: StreetBoundaryConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed.flop, StreetBoundaryMode::Exact));
+    }
+
+    #[test]
+    fn sbc_serde_roundtrip_cfvnet() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/river.onnx".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: StreetBoundaryConfig = serde_json::from_str(&json).unwrap();
+        if let StreetBoundaryMode::Cfvnet { model_path } = &parsed.river {
+            assert_eq!(model_path, "/models/river.onnx");
+        } else {
+            panic!("expected Cfvnet for river");
+        }
+    }
+
+    #[test]
+    fn sbc_serde_from_json_tagged() {
+        let json = r#"{
+            "flop": {"mode": "exact"},
+            "turn": {"mode": "exact"},
+            "river": {"mode": "cfvnet", "model_path": "/path/to/model.onnx"}
+        }"#;
+        let config: StreetBoundaryConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(config.flop, StreetBoundaryMode::Exact));
+        assert!(matches!(config.turn, StreetBoundaryMode::Exact));
+        if let StreetBoundaryMode::Cfvnet { model_path } = &config.river {
+            assert_eq!(model_path, "/path/to/model.onnx");
+        } else {
+            panic!("expected Cfvnet");
+        }
     }
 }
