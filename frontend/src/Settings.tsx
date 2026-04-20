@@ -1,6 +1,120 @@
 import { useState, useEffect } from 'react';
 import { isTauri } from './invoke';
 import { useGlobalConfig } from './useGlobalConfig';
+import type { GlobalConfig } from './types';
+
+const STREETS = ['flop', 'turn', 'river'] as const;
+type Street = typeof STREETS[number];
+
+function BoundaryEvaluationSettings({
+  config,
+  setConfig,
+}: {
+  config: GlobalConfig;
+  setConfig: (update: Partial<GlobalConfig>) => void;
+}) {
+  // Determine the first cfvnet street (if any) — later streets are disabled.
+  const firstCfvnetIdx = STREETS.findIndex(
+    s => config[`${s}_boundary_mode`] === 'cfvnet',
+  );
+
+  const handlePickModel = async (street: Street) => {
+    if (isTauri()) {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({
+        filters: [{ name: 'ONNX', extensions: ['onnx'] }],
+      });
+      if (typeof selected === 'string') {
+        setConfig({ [`${street}_model_path`]: selected } as Partial<GlobalConfig>);
+      }
+    } else {
+      const path = window.prompt('Absolute path to .onnx model file');
+      if (path) {
+        setConfig({ [`${street}_model_path`]: path } as Partial<GlobalConfig>);
+      }
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: '1.5rem' }}>
+      <div style={{ fontSize: '0.85rem', color: '#ccc', marginBottom: '0.6rem', fontWeight: 500 }}>
+        Boundary Evaluation
+      </div>
+      {STREETS.map((street, idx) => {
+        const modeKey = `${street}_boundary_mode` as keyof GlobalConfig;
+        const pathKey = `${street}_model_path` as keyof GlobalConfig;
+        const mode = config[modeKey] as 'exact' | 'cfvnet';
+        const modelPath = config[pathKey] as string;
+        const disabled = firstCfvnetIdx !== -1 && idx > firstCfvnetIdx;
+
+        return (
+          <div key={street} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem' }}>
+            <span style={{ width: 40, fontSize: '0.8rem', color: '#aaa', textTransform: 'capitalize' }}>
+              {street}
+            </span>
+            <select
+              value={mode}
+              disabled={disabled}
+              onChange={e => setConfig({ [modeKey]: e.target.value } as Partial<GlobalConfig>)}
+              style={{
+                width: 100,
+                padding: '0.35rem 0.5rem',
+                background: disabled ? 'rgba(255,255,255,0.02)' : 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: disabled ? '#555' : '#eee',
+                fontSize: '0.8rem',
+                fontFamily: 'inherit',
+                cursor: disabled ? 'not-allowed' : 'pointer',
+              }}
+              title={disabled ? 'Earlier boundary cut takes precedence' : undefined}
+            >
+              <option value="exact">Exact</option>
+              <option value="cfvnet">CFVNet</option>
+            </select>
+            {mode === 'cfvnet' && !disabled && (
+              <>
+                <input
+                  type="text"
+                  value={modelPath}
+                  readOnly
+                  style={{
+                    flex: 1,
+                    padding: '0.35rem 0.5rem',
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: 6,
+                    color: '#ccc',
+                    fontSize: '0.75rem',
+                    fontFamily: 'inherit',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    minWidth: 0,
+                  }}
+                  placeholder="No model selected"
+                />
+                <button
+                  onClick={() => handlePickModel(street)}
+                  style={{
+                    padding: '0.35rem 0.7rem',
+                    fontSize: '0.75rem',
+                    flexShrink: 0,
+                  }}
+                >
+                  Pick...
+                </button>
+              </>
+            )}
+          </div>
+        );
+      })}
+      <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.5rem' }}>
+        Selecting CFVNet on a street cuts the solve at that street boundary and uses the chosen ONNX model for counterfactual values. Earlier streets must be Exact.
+      </p>
+    </div>
+  );
+}
 
 export default function Settings() {
   const { config, setConfig } = useGlobalConfig();
@@ -199,209 +313,36 @@ export default function Settings() {
         </p>
       </div>
 
-      {/* Rollout Settings (depth-limited solver) */}
+      {/* Solve Parameters */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
-          Rollout Settings (depth-limited solver)
+          Snapshot Interval
         </label>
-        <div style={{ display: 'flex', gap: '0.8rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          <div>
-            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Bias Factor</span>
-            <input
-              type="text"
-              value={config.rollout_bias_factor ?? 10}
-              onChange={e => {
-                const v = parseFloat(e.target.value);
-                if (!isNaN(v) && v > 0) setConfig({ rollout_bias_factor: v });
-              }}
-              style={{
-                width: 55,
-                padding: '0.45rem 0.6rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Rollouts</span>
-            <input
-              type="text"
-              value={config.rollout_num_samples ?? 3}
-              onChange={e => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v) && v > 0) setConfig({ rollout_num_samples: v });
-              }}
-              style={{
-                width: 45,
-                padding: '0.45rem 0.6rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Snapshot Interval</span>
-            <input
-              type="text"
-              value={config.matrix_snapshot_interval ?? 10}
-              onChange={e => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v) && v > 0) setConfig({ matrix_snapshot_interval: v });
-              }}
-              style={{
-                width: 45,
-                padding: '0.45rem 0.6rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Opp. Samples</span>
-            <input
-              type="text"
-              value={config.rollout_opponent_samples ?? 8}
-              onChange={e => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v) && v > 0) setConfig({ rollout_opponent_samples: v });
-              }}
-              style={{
-                width: 45,
-                padding: '0.45rem 0.6rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <span style={{ fontSize: '0.7rem', color: '#666', marginRight: '0.3rem' }}>Enum. Depth</span>
-            <input
-              type="text"
-              value={config.rollout_enumerate_depth ?? 2}
-              onChange={e => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v) && v >= 1 && v <= 10) setConfig({ rollout_enumerate_depth: v });
-              }}
-              style={{
-                width: 45,
-                padding: '0.45rem 0.6rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-        </div>
+        <input
+          type="text"
+          value={config.matrix_snapshot_interval ?? 10}
+          onChange={e => {
+            const v = parseInt(e.target.value);
+            if (!isNaN(v) && v > 0) setConfig({ matrix_snapshot_interval: v });
+          }}
+          style={{
+            width: 60,
+            padding: '0.45rem 0.6rem',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 6,
+            color: '#eee',
+            fontSize: '0.85rem',
+            fontFamily: 'inherit',
+          }}
+        />
         <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
-          Bias factor multiplies fold/call/raise probabilities in continuation strategies. Rollouts = Monte Carlo samples per street transition. Snapshot Interval = re-evaluate leaf boundaries every N iterations. Opp. Samples = opponent hands sampled per combo at boundaries. Enum. Depth = decision levels to fully enumerate before sampling (higher = more accurate, slower).
+          Re-snapshot the strategy matrix every N iterations for live UI updates.
         </p>
       </div>
 
-      {/* Hybrid Solver (replaces broken K=4 Subgame) */}
-      <div style={{ marginBottom: '1.5rem' }}>
-        <div style={{ fontSize: '0.85rem', color: '#ccc', marginBottom: '0.6rem', fontWeight: 500 }}>
-          Hybrid Solver
-        </div>
-        <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
-          <div>
-            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
-              Depth Limit
-            </label>
-            <input
-              type="text"
-              inputMode="numeric"
-              defaultValue={config.subgame_depth_limit ?? 1}
-              onBlur={e => {
-                const v = parseInt(e.target.value, 10);
-                if (!isNaN(v) && v >= 0 && v <= 3) setConfig({ subgame_depth_limit: v });
-                else e.target.value = String(config.subgame_depth_limit ?? 1);
-              }}
-              style={{
-                width: 70,
-                padding: '0.4rem 0.55rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
-              Refresh Interval (iters)
-            </label>
-            <input
-              type="text"
-              inputMode="numeric"
-              defaultValue={config.hybrid_refresh_interval ?? 10}
-              onBlur={e => {
-                const v = parseInt(e.target.value, 10);
-                if (!isNaN(v) && v >= 1) setConfig({ hybrid_refresh_interval: v });
-                else e.target.value = String(config.hybrid_refresh_interval ?? 10);
-              }}
-              style={{
-                width: 80,
-                padding: '0.4rem 0.55rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
-              Samples / Refresh
-            </label>
-            <input
-              type="text"
-              inputMode="numeric"
-              defaultValue={config.hybrid_samples_per_refresh ?? 100}
-              onBlur={e => {
-                const v = parseInt(e.target.value, 10);
-                if (!isNaN(v) && v >= 1) setConfig({ hybrid_samples_per_refresh: v });
-                else e.target.value = String(config.hybrid_samples_per_refresh ?? 100);
-              }}
-              style={{
-                width: 90,
-                padding: '0.4rem 0.55rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-        </div>
-        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.5rem' }}>
-          Depth Limit: street transitions in the near tree (0 = current street, 1 = + next, 2 = full). Refresh Interval: DCFR iterations between boundary CFV resamples (lower = more adaptive, slower). Samples / Refresh: Monte Carlo rollouts per boundary refresh (higher = lower variance, slower).
-        </p>
-      </div>
+      {/* Boundary Evaluation */}
+      <BoundaryEvaluationSettings config={config} setConfig={setConfig} />
 
       {/* Range Clamp Threshold */}
       <div style={{ marginBottom: '1.5rem' }}>
