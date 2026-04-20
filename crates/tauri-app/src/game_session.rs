@@ -1860,11 +1860,14 @@ pub fn game_solve_core(
     let ss_clone = Arc::clone(ss_ref);
     let board_clone = board.clone();
     std::thread::spawn(move || {
-        // Build game with depth_limit from boundary config
+        // Build game with depth_limit from boundary config.
+        // When no boundary cut is active (all-exact SBC or explicit exact mode),
+        // build as exact (no boundaries).
         let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
+        let build_exact = is_exact || boundary_cut.is_none();
         let mut game = match build_solve_game(
             &board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes,
-            is_exact, depth_limit_override,
+            build_exact, depth_limit_override,
         ) {
             Ok(g) => g,
             Err(e) => {

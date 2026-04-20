@@ -784,8 +784,10 @@ pub fn run(
     }
 
     // 5. Build subgame game (with depth limit from SBC)
+    // When all-exact (no boundary cut), build as exact too (no boundaries).
+    let subgame_is_exact = boundary_cut.is_none();
     eprintln!("[compare] building subgame game...");
-    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, false, depth_limit)?;
+    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, subgame_is_exact, depth_limit)?;
 
     let n_boundaries = subgame_game.num_boundary_nodes();
     let (mem_subgame, _) = subgame_game.memory_usage();
