@@ -1010,15 +1010,14 @@ impl DomainPipeline {
             fold_payoffs_p1[i] = if folded_player == 0 { win } else { lose };
         }
 
-        // Showdown outcomes: zeros. Turn boundary nodes get real CFVs from
-        // leaf injection in the kernel.
-        let num_showdowns = topo.showdown_nodes.len();
-        let zero_outcomes = vec![0.0_f32; num_showdowns * num_hands * num_hands];
-
+        // Showdown outcomes: None. Turn boundary nodes get real CFVs from leaf
+        // injection (GpuBoundaryEvaluator → update_leaf_cfvs), so the kernel's
+        // showdown loop runs zero iterations and the all-zero outcomes buffer
+        // that used to be allocated here is unnecessary.
         gpu_range_solver::SubgameSpec {
             initial_weights: [w_oop, w_ip],
-            showdown_outcomes_p0: Some(zero_outcomes.clone()),
-            showdown_outcomes_p1: Some(zero_outcomes),
+            showdown_outcomes_p0: None,
+            showdown_outcomes_p1: None,
             fold_payoffs_p0,
             fold_payoffs_p1,
         }
