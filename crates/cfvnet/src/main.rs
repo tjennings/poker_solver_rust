@@ -148,6 +148,25 @@ enum Commands {
         #[arg(short, long, default_value = "100")]
         num_positions: usize,
     },
+    /// Inspect a preflop_ranges.bin file: prints per-path label, frequency,
+    /// and range-shape stats (density, entropy, top-10 mass).
+    #[command(name = "inspect-preflop-ranges")]
+    InspectPreflopRanges {
+        /// Path to the preflop_ranges.bin file
+        #[arg(short, long)]
+        path: PathBuf,
+    },
+    /// Filter a preflop_ranges.bin to a single path by label.
+    #[command(name = "filter-preflop-ranges")]
+    FilterPreflopRanges {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Exact path label to keep (e.g. "2bb/10bb/22bb/call")
+        #[arg(short, long)]
+        label: String,
+    },
     /// Precompute average turn entry ranges from a blueprint strategy, bucketed by SPR.
     #[command(name = "precompute-ranges")]
     PrecomputeRanges {
@@ -271,6 +290,10 @@ fn main() {
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
+        }
+        Commands::InspectPreflopRanges { path } => cmd_inspect_preflop_ranges(path),
+        Commands::FilterPreflopRanges { input, output, label } => {
+            cmd_filter_preflop_ranges(input, output, label);
         }
         Commands::PrecomputeRanges {
             blueprint,
@@ -643,6 +666,78 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
         "Solved {} situations in {:.2?} ({:.1} solves/sec, {:.2?}/solve)",
         num_samples, elapsed, solves_per_sec, per_solve,
     );
+}
+
+fn cmd_inspect_preflop_ranges(path: PathBuf) {
+    use cfvnet::datagen::precompute_ranges::PrecomputedRanges;
+
+    let ranges = PrecomputedRanges::load(&path).unwrap_or_else(|e| {
+        eprintln!("failed to load {}: {e}", path.display());
+        std::process::exit(1);
+    });
+
+    let total_freq: f64 = ranges.paths.iter().map(|p| p.frequency).sum();
+    println!("Loaded {} preflop paths from {}", ranges.paths.len(), path.display());
+    println!("Total frequency (sum): {total_freq:.6}\n");
+
+    // Column headers
+    println!(
+        "{:<28} {:>10} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10}",
+        "label", "freq", "oop_nz", "ip_nz",
+        "oop_ent", "ip_ent", "oop_top10", "ip_top10",
+    );
+    println!("{}", "-".repeat(100));
+
+    for p in &ranges.paths {
+        let (oop_ent, oop_top10) = range_shape(&p.oop_range);
+        let (ip_ent, ip_top10) = range_shape(&p.ip_range);
+        let pct = if total_freq > 0.0 { p.frequency / total_freq * 100.0 } else { 0.0 };
+        println!(
+            "{:<28} {:>10.4} {:>8} {:>8} {:>10.3} {:>10.3} {:>10.4} {:>10.4}",
+            p.label,
+            pct,
+            p.oop_nonzero,
+            p.ip_nonzero,
+            oop_ent,
+            ip_ent,
+            oop_top10,
+            ip_top10,
+        );
+    }
+    println!("\nfreq column is % of total. oop_nz / ip_nz = non-zero combos (>0.01).");
+    println!("Entropy in bits over L1-normalized range. top-10 = sum of top 10 weights / total.");
+}
+
+fn cmd_filter_preflop_ranges(input: PathBuf, output: PathBuf, label: String) {
+    use cfvnet::datagen::precompute_ranges::PrecomputedRanges;
+    let ranges = PrecomputedRanges::load(&input).unwrap_or_else(|e| {
+        eprintln!("failed to load {}: {e}", input.display());
+        std::process::exit(1);
+    });
+    let kept: Vec<_> = ranges.paths.into_iter().filter(|p| p.label == label).collect();
+    if kept.is_empty() {
+        eprintln!("no paths match label '{label}' in {}", input.display());
+        std::process::exit(1);
+    }
+    let out = PrecomputedRanges { paths: kept };
+    out.save(&output).unwrap_or_else(|e| {
+        eprintln!("failed to save {}: {e}", output.display());
+        std::process::exit(1);
+    });
+    println!("Wrote {} path(s) matching '{label}' to {}", out.paths.len(), output.display());
+}
+
+/// Returns (entropy_bits, top10_mass_frac) for a range vector.
+fn range_shape(range: &[f32]) -> (f64, f64) {
+    let total: f64 = range.iter().map(|&v| v as f64).sum();
+    if total <= 0.0 { return (0.0, 0.0); }
+    let entropy = range.iter().map(|&v| v as f64).filter(|&v| v > 0.0)
+        .map(|v| { let p = v / total; -p * p.log2() })
+        .sum::<f64>();
+    let mut sorted: Vec<f64> = range.iter().map(|&v| v as f64).collect();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let top10: f64 = sorted.iter().take(10).sum();
+    (entropy, top10 / total)
 }
 
 fn cmd_precompute_ranges(

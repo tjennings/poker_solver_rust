@@ -1,0 +1,42 @@
+# River datagen — 4-bet-called path ONLY (hypothesis test)
+#
+# Uses preflop_ranges_4bet_only.bin which contains only the
+# "2bb/10bb/22bb/call" path. Produces records with the narrow range
+# distributions seen in izod-style spots to test whether the model is
+# calibrated on this out-of-distribution shape.
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["25%", "75%", "a"]
+  board_size: 5
+
+datagen:
+  street: "river"
+  mode: "exact"
+  blueprint_path: "local_data/cfvnet/preflop_ranges_4bet_only.bin"
+  num_samples: 1250
+  per_file: 10000
+  bet_size_fuzz: 0.20
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
+  solver_iterations: 200
+  threads: 12
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 32000
+  epochs: 500
+  learning_rate: 0.006
+  lr_min: 0.00004
+  huber_delta: 1.0
+  aux_loss_weight: 0.1
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 10
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  encoder_threads: 14
+  gpu_prefetch: 3
+  grad_clip_norm: 1.0
