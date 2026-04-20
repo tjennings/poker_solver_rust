@@ -145,11 +145,14 @@ export default function Settings() {
         </label>
         <input
           type="text"
-          value={config.target_exploitability}
-          onChange={e => {
+          inputMode="decimal"
+          defaultValue={config.target_exploitability}
+          onBlur={e => {
             const v = parseFloat(e.target.value);
-            if (!isNaN(v) && v >= 0.1 && v <= 100) {
+            if (!isNaN(v) && v > 0) {
               setConfig({ target_exploitability: v });
+            } else {
+              e.target.value = String(config.target_exploitability);
             }
           }}
           style={{
