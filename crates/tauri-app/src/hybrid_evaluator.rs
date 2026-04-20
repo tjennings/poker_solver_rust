@@ -32,6 +32,29 @@ pub trait BoundarySampler: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// BoundarySampler impl for RolloutLeafEvaluator
+// ---------------------------------------------------------------------------
+
+impl BoundarySampler for crate::postflop::RolloutLeafEvaluator {
+    fn sample_boundary_cfvs(
+        &self,
+        combos: &[[RsPokerCard; 2]],
+        board: &[RsPokerCard],
+        oop_range: &[f64],
+        ip_range: &[f64],
+        boundary_pot: f64,
+        boundary_invested: [f64; 2],
+        num_samples: u32,
+    ) -> BoundaryCfvs {
+        // Delegate to RolloutLeafEvaluator's inherent method of the same name.
+        crate::postflop::RolloutLeafEvaluator::sample_boundary_cfvs(
+            self, combos, board, oop_range, ip_range,
+            boundary_pot, boundary_invested, num_samples,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CachedEntry
 // ---------------------------------------------------------------------------
 
@@ -324,6 +347,45 @@ mod tests {
         // Re-query first boundary → cached (still 1.0)
         let r1_again = eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
         assert_eq!(r1_again.oop_cfvs, vec![1.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4A.1: BoundarySampler impl on RolloutLeafEvaluator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rollout_evaluator_implements_boundary_sampler_via_trait_object() {
+        use crate::postflop::make_test_rollout_evaluator;
+        use poker_solver_core::poker::{Suit as RsPokerSuit, Value as RsPokerValue};
+
+        let eval = make_test_rollout_evaluator(3);
+        // Use it as a trait object to prove the impl exists.
+        let sampler: &dyn BoundarySampler = &eval;
+
+        let combos = vec![
+            [
+                RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+                RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Spade),
+            ],
+            [
+                RsPokerCard::new(RsPokerValue::Queen, RsPokerSuit::Heart),
+                RsPokerCard::new(RsPokerValue::Jack, RsPokerSuit::Heart),
+            ],
+        ];
+        let board = vec![
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Three, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Five, RsPokerSuit::Diamond),
+        ];
+        let oop_range = vec![0.0; combos.len()];
+        let ip_range = vec![0.0; combos.len()];
+
+        let result = sampler.sample_boundary_cfvs(
+            &combos, &board, &oop_range, &ip_range, 100.0, [50.0, 50.0], 2,
+        );
+        assert_eq!(result.oop_cfvs.len(), combos.len());
+        assert_eq!(result.ip_cfvs.len(), combos.len());
     }
 
     #[test]

@@ -2286,6 +2286,44 @@ pub fn postflop_load_cached(
 }
 
 // ---------------------------------------------------------------------------
+// Test helpers (pub(crate) for cross-module test use)
+// ---------------------------------------------------------------------------
+
+/// Build a minimal `RolloutLeafEvaluator` for testing.
+///
+/// Uses an empty blueprint strategy and trivial game tree so tests can
+/// exercise the evaluator's API without requiring real strategy data.
+#[cfg(test)]
+pub(crate) fn make_test_rollout_evaluator(num_rollouts: u32) -> RolloutLeafEvaluator {
+    let strategy = Arc::new(BlueprintV2Strategy::empty());
+    let tree = Arc::new(GameTree::build_subgame(
+        poker_solver_core::blueprint_v2::Street::Turn,
+        100.0,
+        [50.0; 2],
+        200.0,
+        &[vec![1.0]],
+        Some(1),
+        0,
+    ));
+    let all_buckets = Arc::new(AllBuckets::new(
+        [2, 2, 2, 2],
+        [None, None, None, None],
+    ));
+    RolloutLeafEvaluator::new(
+        strategy,
+        tree,
+        all_buckets,
+        0,
+        BiasType::Unbiased,
+        10.0,
+        num_rollouts,
+        8,
+        100.0,
+        10.0,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3910,34 +3948,9 @@ mod tests {
     // clone_with_num_rollouts tests
     // -----------------------------------------------------------------------
 
-    /// Helper: build a minimal RolloutLeafEvaluator for testing.
+    /// Helper: delegates to the `pub(crate)` version at module level.
     fn make_test_rollout_evaluator(num_rollouts: u32) -> RolloutLeafEvaluator {
-        let strategy = Arc::new(BlueprintV2Strategy::empty());
-        let tree = Arc::new(GameTree::build_subgame(
-            poker_solver_core::blueprint_v2::Street::Turn,
-            100.0,
-            [50.0; 2],
-            200.0,
-            &[vec![1.0]],
-            Some(1),
-            0,
-        ));
-        let all_buckets = Arc::new(AllBuckets::new(
-            [2, 2, 2, 2],
-            [None, None, None, None],
-        ));
-        RolloutLeafEvaluator::new(
-            strategy,
-            tree,
-            all_buckets,
-            0,
-            BiasType::Unbiased,
-            10.0,
-            num_rollouts,
-            8,
-            100.0,
-            10.0,
-        )
+        super::make_test_rollout_evaluator(num_rollouts)
     }
 
     #[test]
