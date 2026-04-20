@@ -104,31 +104,6 @@ function SolveProgress({ state }: { state: GameState }) {
   const solve = state.solve;
   if (!solve) return null;
 
-  const rp = solve.refresh_progress;
-
-  // Phase 1: Boundary-refresh sampling (hybrid mode)
-  if (rp?.active) {
-    const pct = rp.total > 0
-      ? Math.min((rp.done / rp.total) * 100, 100)
-      : 0;
-    const etaSecs = (rp.eta_ms / 1000).toFixed(1);
-    return (
-      <div className="progress-bar-container">
-        <div className="progress-bar-track">
-          <div
-            className="progress-bar-fill progress-bar-fill--refresh"
-            style={{ width: `${pct}%` }}
-          />
-          <div className="progress-text">
-            Sampling boundaries: {rp.done}/{rp.total} ({Math.round(pct)}%)
-            {' '} | ETA {etaSecs}s
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Phase 2: Normal DCFR iteration progress
   const pct = solve.max_iterations > 0
     ? Math.min((solve.iteration / solve.max_iterations) * 100, 100)
     : 0;
