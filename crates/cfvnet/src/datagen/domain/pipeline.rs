@@ -1498,5 +1498,93 @@ mod tests {
             // Records come in OOP+IP pairs, so we expect 2 per sample.
             assert_eq!(count, 12, "expected 12 records (6 samples x 2), got {count}");
         }
+
+        /// Regression test for bean oox2: the canonical turn tree previously
+        /// failed with CUDA_ERROR_INVALID_VALUE at the first run_iterations
+        /// call because its dynamic shared-memory request (~103 KB) exceeded
+        /// CUDA's 48 KB default per-block limit. After moving the edge arrays
+        /// out of smem, the kernel launch must succeed.
+        ///
+        /// Smoke test: one iteration, batch=1, zero leaf CFVs. We assert the
+        /// kernel launches and produces finite results — not checking CFR
+        /// correctness. This is the test that catches the class of bug oox2
+        /// represents: unit tests pass on the river topology because it's
+        /// tiny; only the real canonical turn topology exposes the overflow.
+        #[cfg(feature = "gpu-turn-datagen")]
+        #[test]
+        fn canonical_turn_tree_runs_one_iteration_without_smem_overflow() {
+            use crate::datagen::range_gen::NUM_COMBOS;
+            use gpu_range_solver::extract::extract_topology;
+            use gpu_range_solver::{GpuBatchSolver, SubgameSpec};
+
+            // Canonical turn bet sizes matching `turn_gpu_datagen.yaml`:
+            // [25%, 50%, 100%, allin] x [25%, 75%, allin]. `allin` becomes
+            // BetSize::AllIn at SPR=100; parse_bet_sizes_depth drops the 'a'
+            // token so we pass the numeric-only list here as production does.
+            let bet_sizes: Vec<Vec<f64>> = vec![
+                vec![0.25, 0.50, 1.00],
+                vec![0.25, 0.75],
+            ];
+
+            let canonical_game =
+                crate::datagen::domain::game_tree::build_canonical_turn_tree(&bet_sizes)
+                    .expect("canonical turn tree builds");
+            let topo = extract_topology(&canonical_game);
+            assert!(
+                !topo.showdown_nodes.is_empty(),
+                "canonical turn topology must have boundary (showdown) nodes"
+            );
+
+            let num_hands = NUM_COMBOS;
+            let term = DomainPipeline::build_canonical_turn_terminal_data(&topo, num_hands);
+
+            let mut solver = GpuBatchSolver::new(&topo, &term, 1, num_hands, 1)
+                .expect("GpuBatchSolver::new on canonical turn topology");
+
+            // Use every boundary node as a leaf injection point (as production does).
+            let leaf_node_ids: Vec<i32> =
+                topo.showdown_nodes.iter().map(|&n| n as i32).collect();
+            let leaf_depths: Vec<i32> = topo
+                .showdown_nodes
+                .iter()
+                .map(|&n| topo.node_depth[n] as i32)
+                .collect();
+            let num_leaves = leaf_node_ids.len();
+            solver
+                .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+                .expect("set_leaf_injection");
+
+            // Minimal spec: uniform-ish weights, None showdown outcomes
+            // (matches build_turn_subgame_spec post-vb8r), zero fold payoffs.
+            let num_folds = topo.fold_nodes.len();
+            let spec = SubgameSpec {
+                initial_weights: [
+                    vec![1.0f32 / num_hands as f32; num_hands],
+                    vec![1.0f32 / num_hands as f32; num_hands],
+                ],
+                showdown_outcomes_p0: None,
+                showdown_outcomes_p1: None,
+                fold_payoffs_p0: vec![0.0; num_folds],
+                fold_payoffs_p1: vec![0.0; num_folds],
+            };
+            solver.prepare_batch(&[spec]).expect("prepare_batch");
+
+            // Zero leaf CFVs: smoke test, we just want the kernel to launch.
+            let zeros = vec![0.0f32; num_leaves * num_hands];
+            solver
+                .update_leaf_cfvs(&zeros, &zeros)
+                .expect("update_leaf_cfvs");
+
+            // This is the call that used to fail with CUDA_ERROR_INVALID_VALUE.
+            solver
+                .run_iterations(0, 1)
+                .expect("run_iterations must not fail on canonical turn tree");
+
+            let results = solver.extract_results().expect("extract_results");
+            assert_eq!(results.len(), 1);
+            for &v in &results[0].strategy_sum {
+                assert!(v.is_finite(), "strategy_sum must be finite, got {v}");
+            }
+        }
     }
 }
