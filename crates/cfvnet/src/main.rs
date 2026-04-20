@@ -1241,6 +1241,18 @@ fn cmd_datagen_eval(data: PathBuf) {
     let mut num_extreme_records = 0u64;
     let mut extreme_examples: Vec<String> = Vec::new();
 
+    // Range shape statistics
+    let mut oop_densities = Vec::new();
+    let mut oop_entropies = Vec::new();
+    let mut oop_top10_concs = Vec::new();
+    let mut oop_max_mean_ratios = Vec::new();
+    let mut oop_totals = Vec::new();
+    let mut ip_densities = Vec::new();
+    let mut ip_entropies = Vec::new();
+    let mut ip_top10_concs = Vec::new();
+    let mut ip_max_mean_ratios = Vec::new();
+    let mut ip_totals = Vec::new();
+
     for path in &paths {
         let file = std::fs::File::open(path).unwrap_or_else(|e| {
             eprintln!("failed to open {}: {e}", path.display());
@@ -1304,6 +1316,21 @@ fn cmd_datagen_eval(data: PathBuf) {
                             }
                         }
                     }
+                    // Range shape statistics
+                    let (d, e, t10, mm, tot) = range_stats(&rec.oop_range);
+                    oop_densities.push(d);
+                    oop_entropies.push(e);
+                    oop_top10_concs.push(t10);
+                    oop_max_mean_ratios.push(mm);
+                    oop_totals.push(tot);
+
+                    let (d, e, t10, mm, tot) = range_stats(&rec.ip_range);
+                    ip_densities.push(d);
+                    ip_entropies.push(e);
+                    ip_top10_concs.push(t10);
+                    ip_max_mean_ratios.push(mm);
+                    ip_totals.push(tot);
+
                     rec_idx += 1;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -1359,6 +1386,66 @@ fn cmd_datagen_eval(data: PathBuf) {
         .map(|(p, s)| *s / *p)
         .collect();
     print_spr_frequency_histogram("Frequency by SPR", &sprs);
+
+    // Range Statistics
+    let oop_nonzero_mass = oop_totals.iter().filter(|&&t| t > 0.0).count();
+    let ip_nonzero_mass = ip_totals.iter().filter(|&&t| t > 0.0).count();
+    println!("\n=== Range Statistics ===\n");
+    println!("Records with nonzero OOP mass: {}/{}", oop_nonzero_mass, num_records);
+    println!("Records with nonzero IP mass:  {}/{}", ip_nonzero_mass, num_records);
+
+    println!("\nOOP ranges (across {} records):", num_records);
+    print_stats("  Density       ", &oop_densities);
+    print_stats("  Entropy (bits)", &oop_entropies);
+    print_stats("  Top-10 mass   ", &oop_top10_concs);
+    print_stats("  Max/mean      ", &oop_max_mean_ratios);
+    print_stats("  Total mass    ", &oop_totals);
+
+    println!("\nIP ranges (across {} records):", num_records);
+    print_stats("  Density       ", &ip_densities);
+    print_stats("  Entropy (bits)", &ip_entropies);
+    print_stats("  Top-10 mass   ", &ip_top10_concs);
+    print_stats("  Max/mean      ", &ip_max_mean_ratios);
+    print_stats("  Total mass    ", &ip_totals);
+}
+
+/// Compute range-shape statistics for a single range vector.
+/// Returns (density, entropy_bits, top10_concentration, max_mean_ratio, total_mass).
+fn range_stats(range: &[f32]) -> (f64, f64, f64, f64, f64) {
+    let total: f64 = range.iter().map(|&v| v as f64).sum();
+    let nonzero_count = range.iter().filter(|&&v| v > 0.0).count();
+    let density = nonzero_count as f64 / range.len() as f64;
+
+    let entropy = if total > 0.0 {
+        range.iter()
+            .filter(|&&v| v > 0.0)
+            .map(|&v| {
+                let p = v as f64 / total;
+                -p * p.log2()
+            })
+            .sum::<f64>()
+    } else {
+        0.0
+    };
+
+    let top10_mass = if total > 0.0 {
+        let mut sorted: Vec<f64> = range.iter().map(|&v| v as f64).collect();
+        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top: f64 = sorted.iter().take(10).sum();
+        top / total
+    } else {
+        0.0
+    };
+
+    let max_mean_ratio = if nonzero_count > 0 && total > 0.0 {
+        let mean = total / nonzero_count as f64;
+        let max = range.iter().map(|&v| v as f64).fold(0.0_f64, f64::max);
+        max / mean
+    } else {
+        0.0
+    };
+
+    (density, entropy, top10_mass, max_mean_ratio, total)
 }
 
 fn print_stats(label: &str, values: &[f64]) {
@@ -1876,5 +1963,82 @@ mod tests {
         std::fs::write(&path, &[0u8]).unwrap();
         infer_board_cards_from_data(&path);
         // cleanup won't run due to panic, but temp dir is fine
+    }
+
+    #[test]
+    fn range_stats_uniform_nonzero() {
+        let range = [1.0_f32; 1326];
+        let (density, entropy, top10, max_mean, total) = range_stats(&range);
+        assert!((density - 1.0).abs() < 1e-9, "density={density}");
+        let expected_entropy = (1326.0_f64).log2();
+        assert!((entropy - expected_entropy).abs() < 0.01, "entropy={entropy}");
+        let expected_top10 = 10.0 / 1326.0;
+        assert!((top10 - expected_top10).abs() < 1e-6, "top10={top10}");
+        assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
+        assert!((total - 1326.0).abs() < 1e-6, "total={total}");
+    }
+
+    #[test]
+    fn range_stats_all_zeros() {
+        let range = [0.0_f32; 1326];
+        let (density, entropy, top10, max_mean, total) = range_stats(&range);
+        assert!((density).abs() < 1e-9);
+        assert!((entropy).abs() < 1e-9);
+        assert!((top10).abs() < 1e-9);
+        assert!((max_mean).abs() < 1e-9);
+        assert!((total).abs() < 1e-9);
+    }
+
+    #[test]
+    fn range_stats_single_spike() {
+        let mut range = [0.0_f32; 1326];
+        range[500] = 100.0;
+        let (density, entropy, top10, max_mean, total) = range_stats(&range);
+        let expected_density = 1.0 / 1326.0;
+        assert!((density - expected_density).abs() < 1e-9, "density={density}");
+        assert!((entropy).abs() < 1e-9, "entropy={entropy}");
+        assert!((top10 - 1.0).abs() < 1e-9, "top10={top10}");
+        assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
+        assert!((total - 100.0).abs() < 1e-6, "total={total}");
+    }
+
+    #[test]
+    fn range_stats_partial_range() {
+        // 100 entries at 2.0, rest zero
+        let mut range = [0.0_f32; 1326];
+        for i in 0..100 {
+            range[i] = 2.0;
+        }
+        let (density, entropy, top10, max_mean, total) = range_stats(&range);
+        let expected_density = 100.0 / 1326.0;
+        assert!((density - expected_density).abs() < 1e-6, "density={density}");
+        // Uniform over 100 entries: entropy = log2(100)
+        let expected_entropy = (100.0_f64).log2();
+        assert!((entropy - expected_entropy).abs() < 0.01, "entropy={entropy}");
+        // Top 10 of 100 uniform entries = 10/100 = 0.1
+        let expected_top10 = 10.0 / 100.0;
+        assert!((top10 - expected_top10).abs() < 1e-6, "top10={top10}");
+        assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
+        assert!((total - 200.0).abs() < 1e-6, "total={total}");
+    }
+
+    #[test]
+    fn range_stats_spiky_distribution() {
+        // One entry at 90, nine entries at 1 => top10 mass = 99/99 = 1.0
+        // max/mean: nonzero count=10, total=99, mean=9.9, max=90 => ratio=90/9.9
+        let mut range = [0.0_f32; 1326];
+        range[0] = 90.0;
+        for i in 1..10 {
+            range[i] = 1.0;
+        }
+        let (density, _entropy, top10, max_mean, total) = range_stats(&range);
+        let expected_density = 10.0 / 1326.0;
+        assert!((density - expected_density).abs() < 1e-6, "density={density}");
+        // All 10 entries are in top 10, so top10 concentration = 1.0
+        assert!((top10 - 1.0).abs() < 1e-6, "top10={top10}");
+        // max/mean = 90 / (99/10) = 90/9.9 ~= 9.0909
+        let expected_ratio = 90.0 / 9.9;
+        assert!((max_mean - expected_ratio).abs() < 0.001, "max_mean={max_mean}");
+        assert!((total - 99.0).abs() < 1e-6, "total={total}");
     }
 }
