@@ -58,6 +58,10 @@ pub struct SolveStatus {
     pub elapsed_secs: f64,
     pub solver_name: String,
     pub is_complete: bool,
+    /// Boundary-refresh progress (hybrid mode only). `None` when not in
+    /// hybrid mode or when no refresh cycle has started yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_progress: Option<crate::hybrid_evaluator::RefreshProgress>,
 }
 
 /// One action available at the current decision point.
@@ -152,6 +156,9 @@ pub struct SolveState {
     pub solve_cache: RwLock<HashMap<Vec<usize>, CachedSolveNode>>,
     /// Current position within the solved tree (action path from solve root).
     pub solve_path: RwLock<Vec<usize>>,
+    /// Hybrid boundary-refresh progress. Written by `HybridBoundaryEvaluator`
+    /// via its progress sink, read by `game_get_state`.
+    pub refresh_progress: Arc<RwLock<Option<crate::hybrid_evaluator::RefreshProgress>>>,
 }
 
 impl Default for SolveState {
@@ -168,6 +175,7 @@ impl Default for SolveState {
             solve_position: RwLock::new(String::new()),
             solve_cache: RwLock::new(HashMap::new()),
             solve_path: RwLock::new(vec![]),
+            refresh_progress: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -186,6 +194,7 @@ impl SolveState {
         *self.solve_position.write() = String::new();
         *self.solve_cache.write() = HashMap::new();
         *self.solve_path.write() = vec![];
+        *self.refresh_progress.write() = None;
     }
 }
 
@@ -1541,6 +1550,7 @@ pub fn game_get_state_core(session_state: &GameSessionState, source: Option<Stri
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0);
 
+        let rp = ss.refresh_progress.read().clone();
         state.solve = Some(SolveStatus {
             iteration,
             max_iterations: max_iters,
@@ -1548,6 +1558,7 @@ pub fn game_get_state_core(session_state: &GameSessionState, source: Option<Stri
             elapsed_secs: elapsed,
             solver_name: "range".to_string(),
             is_complete: !is_solving && iteration > 0,
+            refresh_progress: rp,
         });
 
         // Prefer solve cache (navigated position) over root snapshot
@@ -1935,6 +1946,7 @@ pub fn game_solve_core(
                 // players' CFV slots. Second-traverser visits hit the cache.
                 // So per refresh cycle: n_boundaries samples, not × 2.
                 hybrid_eval.set_total_boundaries(n_boundaries as u32);
+                hybrid_eval.set_progress_sink(Arc::clone(&ss_clone.refresh_progress));
                 hybrid_eval_arc = Some(Arc::clone(&hybrid_eval));
 
                 // Build per-boundary owned adapters.
@@ -2626,6 +2638,7 @@ mod tests {
             elapsed_secs: 2.3,
             solver_name: "CfvSubgame".to_string(),
             is_complete: false,
+            refresh_progress: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("CfvSubgame"));
@@ -4174,5 +4187,105 @@ mod tests {
             assert_eq!(matrix.cells.len(), 13);
             assert!(!matrix.actions.is_empty());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RefreshProgress in game_get_state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_state_core_returns_none_refresh_progress_by_default() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(10, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
+
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
+        let solve = state.solve.expect("solve should be Some");
+        assert!(solve.refresh_progress.is_none(), "no refresh_progress by default");
+    }
+
+    #[test]
+    fn get_state_core_returns_active_refresh_progress() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(5, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
+
+        // Write active refresh progress
+        {
+            let mut rp = gss.subgame_solve.refresh_progress.write();
+            *rp = Some(crate::hybrid_evaluator::RefreshProgress {
+                iter: 5,
+                done: 3,
+                total: 10,
+                elapsed_ms: 500,
+                eta_ms: 1200,
+                active: true,
+            });
+        }
+
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
+        let solve = state.solve.expect("solve should be Some");
+        let rp = solve.refresh_progress.expect("refresh_progress should be Some");
+        assert!(rp.active);
+        assert_eq!(rp.done, 3);
+        assert_eq!(rp.total, 10);
+        assert_eq!(rp.iter, 5);
+        assert_eq!(rp.elapsed_ms, 500);
+        assert_eq!(rp.eta_ms, 1200);
+    }
+
+    #[test]
+    fn get_state_core_returns_inactive_refresh_progress() {
+        let gss = GameSessionState::default();
+        let session = make_decision_session();
+        *gss.session.write() = Some(session);
+
+        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.iteration.store(5, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
+        *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
+
+        // Write completed refresh progress
+        {
+            let mut rp = gss.subgame_solve.refresh_progress.write();
+            *rp = Some(crate::hybrid_evaluator::RefreshProgress {
+                iter: 5,
+                done: 10,
+                total: 10,
+                elapsed_ms: 2000,
+                eta_ms: 0,
+                active: false,
+            });
+        }
+
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
+        let solve = state.solve.expect("solve should be Some");
+        let rp = solve.refresh_progress.expect("refresh_progress should be Some");
+        assert!(!rp.active);
+        assert_eq!(rp.done, 10);
+    }
+
+    #[test]
+    fn solve_state_reset_clears_refresh_progress() {
+        let ss = SolveState::default();
+        {
+            let mut rp = ss.refresh_progress.write();
+            *rp = Some(crate::hybrid_evaluator::RefreshProgress {
+                iter: 1, done: 5, total: 10,
+                elapsed_ms: 100, eta_ms: 200, active: true,
+            });
+        }
+        ss.reset();
+        assert!(ss.refresh_progress.read().is_none());
     }
 }

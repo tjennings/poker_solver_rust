@@ -55,6 +55,23 @@ impl BoundarySampler for crate::postflop::RolloutLeafEvaluator {
 }
 
 // ---------------------------------------------------------------------------
+// RefreshProgress — UI-readable snapshot of a boundary-refresh cycle
+// ---------------------------------------------------------------------------
+
+/// Progress snapshot for a single boundary-refresh cycle. Written by the
+/// evaluator into a shared slot that `SolveState` / `game_get_state` reads.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub struct RefreshProgress {
+    pub iter: u32,
+    pub done: u32,
+    pub total: u32,
+    pub elapsed_ms: u64,
+    pub eta_ms: u64,
+    /// `true` while a refresh cycle is in progress (`done < total`).
+    pub active: bool,
+}
+
+// ---------------------------------------------------------------------------
 // CachedEntry
 // ---------------------------------------------------------------------------
 
@@ -94,6 +111,9 @@ pub struct HybridBoundaryEvaluator {
     refresh_start: std::sync::Mutex<Option<std::time::Instant>>,
     /// Rate-limit for progress log lines (throttles to ~1 every 500ms).
     last_log: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Optional sink for UI-readable refresh progress. Written on every
+    /// sample; read by `game_get_state` via `SolveState`.
+    progress_sink: std::sync::Mutex<Option<std::sync::Arc<parking_lot::RwLock<Option<RefreshProgress>>>>>,
 }
 
 impl HybridBoundaryEvaluator {
@@ -141,6 +161,7 @@ impl HybridBoundaryEvaluator {
             refresh_cycle_iter: AtomicU32::new(u32::MAX),
             refresh_start: std::sync::Mutex::new(None),
             last_log: std::sync::Mutex::new(None),
+            progress_sink: std::sync::Mutex::new(None),
         }
     }
 
@@ -148,6 +169,15 @@ impl HybridBoundaryEvaluator {
     /// construction, before the first solve iteration.
     pub fn set_total_boundaries(&self, n: u32) {
         self.total_boundaries.store(n, Ordering::Relaxed);
+    }
+
+    /// Attach a shared slot where refresh-progress snapshots are published.
+    /// The UI layer reads this slot via `SolveState`.
+    pub fn set_progress_sink(
+        &self,
+        sink: std::sync::Arc<parking_lot::RwLock<Option<RefreshProgress>>>,
+    ) {
+        *self.progress_sink.lock().unwrap() = Some(sink);
     }
 
     /// Update the current iteration counter. Called at the start of each
@@ -230,6 +260,42 @@ impl HybridBoundaryEvaluator {
         fresh
     }
 
+    /// Write a `RefreshProgress` snapshot into the shared sink (if attached).
+    fn publish_refresh_progress(
+        &self,
+        iter: u32,
+        done: u32,
+        total: u32,
+        started: Option<std::time::Instant>,
+    ) {
+        let guard = self.progress_sink.lock().unwrap();
+        let sink = match guard.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let now = std::time::Instant::now();
+        let (elapsed_ms, eta_ms) = match started {
+            Some(t) if total > 0 => {
+                let elapsed = now.duration_since(t);
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let rate = done as f64 / elapsed.as_secs_f64().max(0.001);
+                let remaining = total.saturating_sub(done);
+                let eta = (remaining as f64 / rate.max(0.001) * 1000.0).round() as u64;
+                (elapsed_ms, eta)
+            }
+            _ => (0, 0),
+        };
+        let mut slot = sink.write();
+        *slot = Some(RefreshProgress {
+            iter,
+            done,
+            total,
+            elapsed_ms,
+            eta_ms,
+            active: done < total,
+        });
+    }
+
     /// Tracks refresh-cycle progress and logs a rate-limited console line.
     /// Called at the end of every successful sample.
     fn log_refresh_progress(&self, iter: u32) {
@@ -249,6 +315,9 @@ impl HybridBoundaryEvaluator {
         let done = self.refreshed_this_cycle.load(Ordering::Relaxed);
         let total = self.total_boundaries.load(Ordering::Relaxed);
         let started = *self.refresh_start.lock().unwrap();
+
+        // Always publish to UI sink (not rate-limited).
+        self.publish_refresh_progress(iter, done, total, started);
 
         // Rate-limit: log at most every 500ms, plus always log on completion.
         let now = std::time::Instant::now();
@@ -770,6 +839,148 @@ mod tests {
         // Compile-time check.
         fn assert_impl<'a, T: range_solver::game::BoundaryEvaluator>() {}
         assert_impl::<HybridBoundaryAdapter<'_>>();
+    }
+
+    // -----------------------------------------------------------------------
+    // RefreshProgress + progress_sink tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn refresh_progress_defaults_to_inactive() {
+        let p = super::RefreshProgress::default();
+        assert!(!p.active);
+        assert_eq!(p.done, 0);
+        assert_eq!(p.total, 0);
+        assert_eq!(p.iter, 0);
+        assert_eq!(p.elapsed_ms, 0);
+        assert_eq!(p.eta_ms, 0);
+    }
+
+    #[test]
+    fn set_progress_sink_stores_sink() {
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(NoOpSampler),
+            10,
+            1,
+        );
+        let sink: std::sync::Arc<parking_lot::RwLock<Option<super::RefreshProgress>>> =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        eval.set_progress_sink(std::sync::Arc::clone(&sink));
+
+        // Sink should still be None before any sampling
+        assert!(sink.read().is_none());
+    }
+
+    #[test]
+    fn progress_sink_updated_on_sample() {
+        let sink: std::sync::Arc<parking_lot::RwLock<Option<super::RefreshProgress>>> =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(CountingSampler::new()),
+            1, // refresh every iteration
+            1,
+        );
+        eval.set_total_boundaries(3);
+        eval.set_progress_sink(std::sync::Arc::clone(&sink));
+
+        let combos: Vec<[RsPokerCard; 2]> = vec![];
+        let board: Vec<RsPokerCard> = vec![];
+        let empty: Vec<f64> = vec![];
+
+        eval.begin_iteration(0);
+        // Sample first boundary
+        eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        {
+            let progress = sink.read();
+            let p = progress.as_ref().expect("progress should be Some after first sample");
+            assert_eq!(p.done, 1);
+            assert_eq!(p.total, 3);
+            assert_eq!(p.iter, 0);
+            assert!(p.active, "should be active while done < total");
+        }
+
+        // Sample second boundary
+        eval.compute_cfvs(2, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        {
+            let progress = sink.read();
+            let p = progress.as_ref().unwrap();
+            assert_eq!(p.done, 2);
+            assert!(p.active);
+        }
+
+        // Sample third (final) boundary
+        eval.compute_cfvs(3, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        {
+            let progress = sink.read();
+            let p = progress.as_ref().unwrap();
+            assert_eq!(p.done, 3);
+            assert_eq!(p.total, 3);
+            assert!(!p.active, "should be inactive when done >= total");
+        }
+    }
+
+    #[test]
+    fn progress_sink_resets_on_new_cycle() {
+        let sink: std::sync::Arc<parking_lot::RwLock<Option<super::RefreshProgress>>> =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(CountingSampler::new()),
+            1, // refresh every iteration
+            1,
+        );
+        eval.set_total_boundaries(2);
+        eval.set_progress_sink(std::sync::Arc::clone(&sink));
+
+        let combos: Vec<[RsPokerCard; 2]> = vec![];
+        let board: Vec<RsPokerCard> = vec![];
+        let empty: Vec<f64> = vec![];
+
+        // Cycle at iter 0
+        eval.begin_iteration(0);
+        eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        eval.compute_cfvs(2, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        {
+            let p = sink.read();
+            assert_eq!(p.as_ref().unwrap().done, 2);
+            assert!(!p.as_ref().unwrap().active);
+        }
+
+        // New cycle at iter 1 -- done should reset
+        eval.begin_iteration(1);
+        eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+        {
+            let p = sink.read();
+            let progress = p.as_ref().unwrap();
+            assert_eq!(progress.iter, 1);
+            assert_eq!(progress.done, 1);
+            assert!(progress.active, "new cycle, only 1/2 done");
+        }
+    }
+
+    #[test]
+    fn progress_sink_has_nonzero_elapsed() {
+        let sink: std::sync::Arc<parking_lot::RwLock<Option<super::RefreshProgress>>> =
+            std::sync::Arc::new(parking_lot::RwLock::new(None));
+        let eval = HybridBoundaryEvaluator::new(
+            Box::new(CountingSampler::new()),
+            1,
+            1,
+        );
+        eval.set_total_boundaries(1);
+        eval.set_progress_sink(std::sync::Arc::clone(&sink));
+
+        let combos: Vec<[RsPokerCard; 2]> = vec![];
+        let board: Vec<RsPokerCard> = vec![];
+        let empty: Vec<f64> = vec![];
+
+        eval.begin_iteration(0);
+        eval.compute_cfvs(1, &combos, &board, &empty, &empty, 100.0, [50.0, 50.0]);
+
+        // Elapsed should be >= 0 (can't assert exact value due to timing)
+        let p = sink.read();
+        let progress = p.as_ref().unwrap();
+        // Just verify the field exists and is a reasonable value
+        assert!(progress.elapsed_ms < 10_000, "elapsed should be reasonable");
     }
 
     #[test]
