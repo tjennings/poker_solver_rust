@@ -26,6 +26,7 @@ use poker_solver_tauri::{
     compute_boundary_reach,
 };
 use poker_solver_tauri::postflop::{CbvContext, RolloutLeafEvaluator};
+use poker_solver_tauri::hybrid_evaluator::{HybridBoundaryEvaluator, OwnedHybridBoundaryAdapter};
 
 use range_solver::card::card_to_string;
 use range_solver::interface::Game;
@@ -407,7 +408,9 @@ fn find_boundary_node(tree: &V2GameTree, node_idx: u32) -> u32 {
 }
 
 /// Set up boundary evaluator and precompute multi-continuation CFVs for a subgame game.
-#[allow(clippy::too_many_arguments)]
+///
+/// Legacy path: retained for Phase 5 cleanup. Replaced by `setup_hybrid_boundaries`.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn setup_subgame_boundaries(
     game: &mut PostFlopGame,
     ctx: &CbvContext,
@@ -576,15 +579,108 @@ fn setup_subgame_boundaries(
     }
 }
 
+/// Set up hybrid boundary evaluator with lazy per-boundary adapters.
+///
+/// Replaces the legacy K=4 precompute approach: instead of precomputing all
+/// boundary CFVs upfront, this creates a `HybridBoundaryEvaluator` that
+/// lazily samples and caches boundary CFVs during the DCFR iteration loop.
+///
+/// Returns the hybrid evaluator Arc (caller must hook `begin_iteration` per iter).
+#[allow(clippy::too_many_arguments)]
+fn setup_hybrid_boundaries(
+    game: &mut PostFlopGame,
+    ctx: &CbvContext,
+    board_cards: &[poker_solver_core::poker::Card],
+    abstract_node_idx: u32,
+    refresh_interval: u32,
+    samples_per_refresh: u32,
+    opponent_samples: u32,
+    eff_stack: i32,
+    pot: i32,
+) -> Arc<HybridBoundaryEvaluator> {
+    let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
+
+    let rollout_eval = RolloutLeafEvaluator::new(
+        Arc::clone(&ctx.strategy),
+        Arc::new(ctx.abstract_tree.clone()),
+        Arc::clone(&ctx.all_buckets),
+        abstract_node_idx,
+        BiasType::Unbiased,
+        1.0, // bias_factor irrelevant for unbiased
+        samples_per_refresh,
+        opponent_samples,
+        starting_stack,
+        f64::from(pot),
+    );
+
+    let hybrid_eval = Arc::new(HybridBoundaryEvaluator::new(
+        Box::new(rollout_eval),
+        refresh_interval,
+        samples_per_refresh,
+    ));
+
+    // Build combos in rollout ordering
+    let mut combos: Vec<[poker_solver_core::poker::Card; 2]> = Vec::new();
+    for hand in all_hands() {
+        for (c0, c1) in hand.combos() {
+            if board_cards.iter().any(|b| *b == c0 || *b == c1) {
+                continue;
+            }
+            combos.push([c0, c1]);
+        }
+    }
+
+    // Build per-boundary owned adapters
+    let n_boundaries = game.num_boundary_nodes();
+    let num_oop = game.num_private_hands(0);
+    let num_ip = game.num_private_hands(1);
+    let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
+        Vec::with_capacity(n_boundaries);
+    for ordinal in 0..n_boundaries {
+        let boundary_pot = game.boundary_pot(ordinal) as f64;
+        let adapter = OwnedHybridBoundaryAdapter {
+            evaluator: Arc::clone(&hybrid_eval),
+            boundary_id: ordinal as u64,
+            combos: combos.clone(),
+            board: board_cards.to_vec(),
+            boundary_pot,
+            boundary_invested: [boundary_pot / 2.0, boundary_pot / 2.0],
+            num_oop,
+            num_ip,
+        };
+        per_boundary.push(Arc::new(adapter));
+    }
+    game.per_boundary_evaluators = per_boundary;
+    // Hybrid path is dispatched via per_boundary_evaluators; disable legacy evaluator.
+    game.boundary_evaluator = None;
+
+    hybrid_eval
+}
+
 /// Run a DCFR solve loop, returning (wall_time, final_exploitability).
+///
+/// If `hybrid_eval` is provided, calls `begin_iteration` at the top of each
+/// iteration and clears cached boundary CFVs at refresh boundaries.
 fn run_dcfr_solve(
     game: &mut PostFlopGame,
     iters: u32,
     label: &str,
     verbose: bool,
+    hybrid_eval: Option<&HybridBoundaryEvaluator>,
+    refresh_interval: u32,
 ) -> (f64, f64) {
     let start = Instant::now();
     for t in 0..iters {
+        // Hybrid mode: notify the evaluator of the current iteration
+        // and clear boundary CFV cache at refresh boundaries so the
+        // evaluator re-samples with current strategy-derived reaches.
+        if let Some(eval) = hybrid_eval {
+            eval.begin_iteration(t);
+            if t == 0 || t % refresh_interval == 0 {
+                game.clear_boundary_cfvs();
+            }
+        }
+
         // DCFR discount params for boundary continuation regrets
         let nearest_pow4 = if t == 0 { 0 } else { 1u32 << ((t.leading_zeros() ^ 31) & !1) };
         let t_alpha = (t as i32 - 1).max(0) as f64;
@@ -607,10 +703,13 @@ fn run_dcfr_solve(
     game.back_to_root();
     game.cache_normalized_weights();
 
-    // Compute exploitability with cached boundary CFVs (disable lazy evaluator).
+    // Compute exploitability with cached boundary CFVs.
+    // Disable lazy evaluators so exploitability uses the cached values.
     let saved_evaluator = game.boundary_evaluator.take();
+    let saved_per_boundary = std::mem::take(&mut game.per_boundary_evaluators);
     let exp = compute_exploitability(game);
     game.boundary_evaluator = saved_evaluator;
+    game.per_boundary_evaluators = saved_per_boundary;
 
     let wall = start.elapsed().as_secs_f64();
     (wall, exp as f64)
@@ -620,6 +719,9 @@ fn run_dcfr_solve(
 ///
 /// Returns (hand_label, game_index) for each match found. Looks for
 /// AA, AKs, JJ, 54s, 72o as strong/medium/weak representatives.
+///
+/// Legacy path: retained for Phase 5 cleanup.
+#[allow(dead_code)]
 fn find_sample_hand_indices(private_cards: &[(u8, u8)]) -> Vec<(String, usize)> {
     // Card IDs: rank = card >> 2, suit = card & 3
     // 2=0..A=12, club=0 diamond=1 heart=2 spade=3
@@ -647,6 +749,9 @@ fn find_sample_hand_indices(private_cards: &[(u8, u8)]) -> Vec<(String, usize)> 
 ///
 /// For each boundary ordinal, prints per-player, per-bias summary stats
 /// and flags sanity check violations.
+///
+/// Legacy path: retained for Phase 5 cleanup.
+#[allow(dead_code)]
 fn dump_boundary_cfv_stats(
     game: &PostFlopGame,
     pot: i32,
@@ -826,17 +931,19 @@ fn format_hand(c1: u8, c2: u8) -> String {
 }
 
 /// Run the compare-solve harness.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn run(
     bundle_dir: &Path,
     snapshot: Option<&str>,
     spot: &str,
     iters: u32,
-    enumerate_depth: Option<u8>,
+    _enumerate_depth: Option<u8>,
     opponent_samples: Option<u32>,
     verbose: bool,
     dump_boundary_cfvs: bool,
     subgame_depth_limit: Option<u8>,
+    hybrid_refresh_interval: u32,
+    hybrid_samples_per_refresh: u32,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -898,10 +1005,10 @@ pub fn run(
     println!("board: {board_str}  pot: {pot_bb:.0}  eff_stack: {eff_bb:.0}");
     println!("position: {position}");
     println!(
-        "iters: {iters}  subgame enumerate_depth: {}  opp_samples: {}  depth_limit: {}",
-        enumerate_depth.unwrap_or(2),
-        opponent_samples.unwrap_or(8),
+        "iters: {iters}  depth_limit: {}  hybrid refresh_interval: {}  samples_per_refresh: {}",
         subgame_depth_limit.map_or("default(0)".to_string(), |d| d.to_string()),
+        hybrid_refresh_interval,
+        hybrid_samples_per_refresh,
     );
     println!();
 
@@ -946,29 +1053,44 @@ pub fn run(
         &board_cards, seed_street, current_node,
     );
 
-    // 7. Precompute subgame boundaries
-    eprintln!("[compare] precomputing subgame boundaries...");
-    let precomp_start = Instant::now();
-    setup_subgame_boundaries(
-        &mut subgame_game, &ctx, &board_cards,
-        abstract_node_idx, current_node, street,
-        eff_stack, pot,
-        enumerate_depth, opponent_samples, verbose,
-    );
-    let precomp_wall = precomp_start.elapsed().as_secs_f64();
+    // 7. Set up hybrid boundary evaluator (lazy, sampled during DCFR)
+    let opp_samples = opponent_samples.unwrap_or(8);
+    let hybrid_eval = if n_boundaries > 0 {
+        eprintln!(
+            "[compare] hybrid mode: {} boundaries, refresh_interval={}, samples_per_refresh={}",
+            n_boundaries, hybrid_refresh_interval, hybrid_samples_per_refresh,
+        );
+        Some(setup_hybrid_boundaries(
+            &mut subgame_game,
+            &ctx,
+            &board_cards,
+            abstract_node_idx,
+            hybrid_refresh_interval,
+            hybrid_samples_per_refresh,
+            opp_samples,
+            eff_stack,
+            pot,
+        ))
+    } else {
+        None
+    };
 
-    // 7b. Dump boundary CFVs if requested
-    if dump_boundary_cfvs {
-        dump_boundary_cfv_stats(&subgame_game, pot, eff_stack);
-    }
+    // 7b. Dump boundary CFVs if requested (only meaningful after at least
+    //     one iteration in hybrid mode; skip pre-solve dump for hybrid).
+    let _ = dump_boundary_cfvs;
 
     // 8. Solve exact
     eprintln!("[compare] solving exact ({iters} iters)...");
-    let (exact_wall, exact_exp) = run_dcfr_solve(&mut exact_game, iters, "exact", verbose);
+    let (exact_wall, exact_exp) = run_dcfr_solve(
+        &mut exact_game, iters, "exact", verbose, None, hybrid_refresh_interval,
+    );
 
-    // 9. Solve subgame
-    eprintln!("[compare] solving subgame ({iters} iters)...");
-    let (subgame_wall, subgame_exp) = run_dcfr_solve(&mut subgame_game, iters, "subgame", verbose);
+    // 9. Solve subgame (hybrid)
+    eprintln!("[compare] solving subgame/hybrid ({iters} iters)...");
+    let (subgame_wall, subgame_exp) = run_dcfr_solve(
+        &mut subgame_game, iters, "subgame", verbose,
+        hybrid_eval.as_deref(), hybrid_refresh_interval,
+    );
 
     // 10. Extract strategies at root
     exact_game.back_to_root();
@@ -1022,15 +1144,14 @@ pub fn run(
     );
     println!();
 
-    println!("=== Subgame solve ===");
+    println!("=== Hybrid solve ===");
     println!(
-        "precompute: {precomp_wall:.1}s  solve: {subgame_wall:.1}s  wall: {:.1}s  final_exp: {subgame_exp_mbb:.2} mbb/hand  memory: {:.1} MB  boundaries: {n_boundaries}",
-        precomp_wall + subgame_wall,
+        "solve: {subgame_wall:.1}s  final_exp: {subgame_exp_mbb:.2} mbb/hand  memory: {:.1} MB  boundaries: {n_boundaries}  refresh: {hybrid_refresh_interval}  samples: {hybrid_samples_per_refresh}",
         mem_subgame as f64 / 1_048_576.0,
     );
     println!();
 
-    println!("=== Diff (exact vs subgame, at root) ===");
+    println!("=== Diff (exact vs hybrid, at root) ===");
     println!("mean mass moved per hand: {mean_mass:.3}");
     println!("max mass moved: {max_mass:.3} at hand #{max_idx} ({max_hand_label})");
     println!();
@@ -1050,7 +1171,7 @@ pub fn run(
 
     let exp_delta_mbb = subgame_exp_mbb - exact_exp_mbb;
     println!(
-        "exploitability delta: subgame {:+.2} mbb/hand ({})",
+        "exploitability delta: hybrid {:+.2} mbb/hand ({})",
         exp_delta_mbb,
         if exp_delta_mbb > 0.0 { "worse" } else { "better" }
     );
