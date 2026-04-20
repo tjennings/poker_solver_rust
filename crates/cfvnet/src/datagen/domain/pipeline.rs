@@ -769,6 +769,11 @@ impl DomainPipeline {
         let mut batched_p0 = vec![0.0_f32; batch_len * slot_len];
         let mut batched_p1 = vec![0.0_f32; batch_len * slot_len];
 
+        // Build all requests first — no ORT call inside this loop. This
+        // hoists `evaluate_boundaries_batched` out of the per-sit loop so
+        // a single batched ORT dispatch handles every sit in the batch,
+        // instead of `sits.len()` batch-of-1 dispatches per DCFR eval round.
+        let mut requests: Vec<BoundaryEvalRequest> = Vec::with_capacity(sits.len());
         for (b, sit) in sits.iter().enumerate() {
             let spec = &specs[b];
             let strategy_sum = &strategy_sums[b];
@@ -803,23 +808,28 @@ impl DomainPipeline {
                 sit.board[2],
                 sit.board[3],
             ];
-            let request = BoundaryEvalRequest {
+            requests.push(BoundaryEvalRequest {
                 board: board_4,
                 pot: sit.pot as f32,
                 effective_stack: sit.effective_stack as f32,
                 oop_reach: oop_reach_1326,
                 ip_reach: ip_reach_1326,
                 num_boundaries,
-            };
+            });
+        }
 
-            let results =
-                evaluate_boundaries_batched(evaluator, &[request], canonical_hand_cards)
-                    .map_err(|e| format!("boundary eval failed: {e}"))?;
+        // Single batched ORT call across all sits.
+        let results = evaluate_boundaries_batched(evaluator, &requests, canonical_hand_cards)
+            .map_err(|e| format!("boundary eval failed: {e}"))?;
+        debug_assert_eq!(results.len(), sits.len());
+
+        // Copy per-sit results into the batched output buffers.
+        for (b, result) in results.into_iter().enumerate() {
             let slot_start = b * slot_len;
             batched_p0[slot_start..slot_start + slot_len]
-                .copy_from_slice(&results[0].leaf_cfv_p0);
+                .copy_from_slice(&result.leaf_cfv_p0);
             batched_p1[slot_start..slot_start + slot_len]
-                .copy_from_slice(&results[0].leaf_cfv_p1);
+                .copy_from_slice(&result.leaf_cfv_p1);
         }
 
         Ok((batched_p0, batched_p1))
