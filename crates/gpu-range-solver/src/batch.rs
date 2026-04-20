@@ -439,6 +439,24 @@ impl GpuBatchSolver {
         let e = self.num_edges;
 
         let block_threads = (h as u32).min(1024);
+
+        #[cfg(debug_assertions)]
+        {
+            // CUDA's default per-block dynamic shared-memory limit is 48 KB.
+            // Exceeding it produces CUDA_ERROR_INVALID_VALUE at launch with
+            // no useful diagnostic. Assert here so the panic names the
+            // topology dimensions. See bean poker_solver_rust-oox2.
+            const CUDA_DEFAULT_SMEM_PER_BLOCK: u32 = 48 * 1024;
+            assert!(
+                self.shared_mem_bytes <= CUDA_DEFAULT_SMEM_PER_BLOCK,
+                "cfr_solve dynamic smem {} bytes exceeds CUDA 48 KB default. \
+                 Tree: num_edges={}, num_nodes={}, max_depth={}. \
+                 Either shrink the dynamic smem layout or call \
+                 set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES).",
+                self.shared_mem_bytes, self.num_edges, self.num_nodes, self.max_depth
+            );
+        }
+
         let cfg = LaunchConfig {
             grid_dim: (batch_size as u32, 1, 1),
             block_dim: (block_threads, 1, 1),
