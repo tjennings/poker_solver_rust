@@ -600,6 +600,9 @@ fn setup_hybrid_boundaries(
 ) -> Arc<HybridBoundaryEvaluator> {
     let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
 
+    // num_rollouts=1 (inner trajectory loop); num_opponent_samples =
+    // samples_per_refresh so the MC budget knob is proportional to actual work.
+    let _ = opponent_samples;
     let rollout_eval = RolloutLeafEvaluator::new(
         Arc::clone(&ctx.strategy),
         Arc::new(ctx.abstract_tree.clone()),
@@ -607,8 +610,8 @@ fn setup_hybrid_boundaries(
         abstract_node_idx,
         BiasType::Unbiased,
         1.0, // bias_factor irrelevant for unbiased
-        samples_per_refresh,
-        opponent_samples,
+        1,                     // num_rollouts
+        samples_per_refresh,   // num_opponent_samples
         starting_stack,
         f64::from(pot),
     );

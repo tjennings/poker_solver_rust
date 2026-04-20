@@ -1917,9 +1917,14 @@ pub fn game_solve_core(
                 let ctx = cbv_ctx.as_ref().unwrap();
                 let samples = hybrid_samples_per_refresh.unwrap_or(100);
                 let interval = hybrid_refresh_interval.unwrap_or(10);
-                let opp_samples = rollout_opponent_samples.unwrap_or(8);
                 let starting_stack = f64::from(eff_stack) + f64::from(pot) / 2.0;
 
+                // Semantics: `samples_per_refresh` controls MC budget per combo
+                // (= num_opponent_samples). `num_rollouts` is held at 1 because
+                // it multiplies the inner trajectory loop — values > 1 make
+                // each compute_cfvs call num_rollouts× more expensive for no
+                // correctness win (opp hand sampling already provides the MC
+                // spread).
                 let rollout_eval = RolloutLeafEvaluator::new(
                     Arc::clone(&ctx.strategy),
                     Arc::new(ctx.abstract_tree.clone()),
@@ -1927,8 +1932,8 @@ pub fn game_solve_core(
                     abstract_node_idx.unwrap_or(0),
                     BiasType::Unbiased,
                     1.0, // bias_factor irrelevant for unbiased
-                    samples,
-                    opp_samples,
+                    1,        // num_rollouts = 1 (one trajectory per opp hand sample)
+                    samples,  // num_opponent_samples = samples_per_refresh
                     starting_stack,
                     f64::from(pot),
                 );

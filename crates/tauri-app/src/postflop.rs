@@ -477,19 +477,22 @@ impl RolloutLeafEvaluator {
         ip_range: &[f64],
         boundary_pot: f64,
         boundary_invested: [f64; 2],
-        n_samples: u32,
+        _n_samples: u32,
     ) -> BoundaryCfvs {
-        let eval = self.clone_with_num_rollouts(n_samples);
+        // Note: `_n_samples` is intentionally ignored. `num_opponent_samples`
+        // and `num_rollouts` are set at evaluator construction and control
+        // the MC budget; callers should configure them via the constructor.
+        // The hybrid path sets num_rollouts=1 and num_opponent_samples=budget.
         let uniform = vec![1.0_f64; combos.len()];
         // Traverser 0 = OOP hero. Hero range uniform so all OOP combos compute;
         // IP opponent weights come from `ip_range`.
-        let oop_cfvs = eval.rollout_chip_values_with_state(
+        let oop_cfvs = self.rollout_chip_values_with_state(
             combos, board, &uniform, ip_range, 0,
             boundary_pot, boundary_invested,
         );
         // Traverser 1 = IP hero. Hero range uniform so all IP combos compute;
         // OOP opponent weights come from `oop_range`.
-        let ip_cfvs = eval.rollout_chip_values_with_state(
+        let ip_cfvs = self.rollout_chip_values_with_state(
             combos, board, oop_range, &uniform, 1,
             boundary_pot, boundary_invested,
         );
