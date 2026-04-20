@@ -130,6 +130,11 @@ pub struct GpuBatchSolver {
     active_d_fold_payoffs_p0: Option<CudaSlice<f32>>,
     active_d_fold_payoffs_p1: Option<CudaSlice<f32>>,
     active_batch_size: usize,
+    /// Number of showdowns active in the current batch. Equal to `self.num_showdowns`
+    /// when the batch has real outcomes, or `0` when all specs set `showdown_outcomes_*`
+    /// to `None` (turn datagen with leaf injection). Set by `prepare_batch`, consumed
+    /// by `run_iterations`.
+    active_num_showdowns: usize,
     /// Number of leaf nodes for leaf injection (0 for river).
     pub num_leaves: usize,
 }
@@ -242,6 +247,7 @@ impl GpuBatchSolver {
             active_d_fold_payoffs_p0: None,
             active_d_fold_payoffs_p1: None,
             active_batch_size: 0,
+            active_num_showdowns: 0,
             num_leaves: 0,
         })
     }
