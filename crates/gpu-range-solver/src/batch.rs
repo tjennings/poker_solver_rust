@@ -1636,4 +1636,113 @@ mod tests {
         }
     }
 
+    /// A batch with `None` showdown outcomes + leaf-injected CFVs must produce
+    /// non-trivial, different strategy_sums per batch. This protects the
+    /// turn-datagen OOM fix: when `showdown_outcomes_{p0,p1}` are `None`,
+    /// `prepare_batch` skips the host alloc / H2D upload, `active_num_showdowns`
+    /// is set to 0, and the kernel's showdown loop runs zero iterations — all
+    /// terminal CFVs must come from leaf injection.
+    ///
+    /// Uses the river topology (same as `batched_leaf_cfvs_matches_single`) with
+    /// `showdown_nodes` as leaf-injection points. The specs' `showdown_outcomes_*`
+    /// are set to `None` instead of `Some(mtd.showdown_outcomes_*)`, so no
+    /// showdown-pass contributes to CFVs — only the injected leaf CFVs do.
+    #[test]
+    fn batch_with_none_showdowns_returns_leaf_injection_values() {
+        use super::*;
+        let game = make_river_game();
+        let topo = extract_topology(&game);
+        let term = extract_terminal_data(&game, &topo);
+        let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
+
+        assert!(
+            !topo.showdown_nodes.is_empty(),
+            "river topology must have showdown nodes to use as leaf injection points"
+        );
+        // Use every showdown node as a leaf injection point so all terminal
+        // values come from injection.
+        let leaf_node_ids: Vec<i32> =
+            topo.showdown_nodes.iter().map(|&n| n as i32).collect();
+        let leaf_depths: Vec<i32> = topo
+            .showdown_nodes
+            .iter()
+            .map(|&n| topo.node_depth[n] as i32)
+            .collect();
+        let num_leaves = leaf_node_ids.len();
+
+        // Build a spec with None showdown outcomes. Reuse fold payoffs and initial
+        // weights from the standard river spec so the non-showdown paths still work.
+        let base_spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
+        let spec_none = SubgameSpec {
+            initial_weights: base_spec.initial_weights.clone(),
+            showdown_outcomes_p0: None,
+            showdown_outcomes_p1: None,
+            fold_payoffs_p0: base_spec.fold_payoffs_p0.clone(),
+            fold_payoffs_p1: base_spec.fold_payoffs_p1.clone(),
+        };
+
+        // Two specs in the batch, each with distinct leaf CFV values so we can
+        // prove per-batch slot indexing is correct.
+        let batch_size = 2;
+        let specs: Vec<SubgameSpec> =
+            (0..batch_size).map(|_| spec_none.clone()).collect();
+
+        // Distinct per-batch leaf CFVs to force different strategies.
+        let per_game = num_leaves * num_hands;
+        let mut p0_batched = vec![0.0f32; batch_size * per_game];
+        let mut p1_batched = vec![0.0f32; batch_size * per_game];
+        for b in 0..batch_size {
+            let favored_leaf = b % num_leaves;
+            for li in 0..num_leaves {
+                let v_p0 = if li == favored_leaf { 100.0 } else { -100.0 };
+                let v_p1 = if li == favored_leaf { -80.0 } else { 80.0 };
+                for h in 0..num_hands {
+                    p0_batched[b * per_game + li * num_hands + h] = v_p0;
+                    p1_batched[b * per_game + li * num_hands + h] = v_p1;
+                }
+            }
+        }
+
+        let mut solver =
+            GpuBatchSolver::new(&topo, &term, batch_size, num_hands, 100).unwrap();
+        solver
+            .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+            .unwrap();
+        solver.prepare_batch(&specs).unwrap();
+        solver.update_leaf_cfvs(&p0_batched, &p1_batched).unwrap();
+        solver.run_iterations(0, 100).unwrap();
+        let results = solver.extract_results().unwrap();
+
+        assert_eq!(results.len(), batch_size);
+
+        // All strategy_sums must be finite.
+        for (bi, r) in results.iter().enumerate() {
+            for (i, &v) in r.strategy_sum.iter().enumerate() {
+                assert!(
+                    v.is_finite(),
+                    "strategy_sum[batch={bi}][{i}] not finite: {v}"
+                );
+            }
+        }
+
+        // At least one strategy_sum must be non-zero — proves the leaf-injected
+        // CFVs propagated through the tree despite num_showdowns=0.
+        for (bi, r) in results.iter().enumerate() {
+            assert!(
+                r.strategy_sum.iter().any(|&v| v != 0.0),
+                "batch {bi} strategy_sum should be non-trivial (leaf injection must propagate)"
+            );
+        }
+
+        // Pairwise different: distinct leaf CFVs must yield distinct strategies.
+        for i in 0..batch_size {
+            for j in (i + 1)..batch_size {
+                assert_ne!(
+                    results[i].strategy_sum, results[j].strategy_sum,
+                    "batch {i} and {j} should differ (different leaf CFVs with None showdowns)"
+                );
+            }
+        }
+    }
+
 }
