@@ -89,9 +89,9 @@ impl PostFlopGame {
             let ordinal = self.node_to_boundary[node_index] as usize;
             let k = self.num_continuations.max(1);
 
-            // Update both players' reaches at this boundary every visit.
-            // Opponent reach comes from cfreach (the opponent's counterfactual reach).
-            // Player's own reach is also stashed so compute_cfvs_both can use it.
+            // Store the opponent's counterfactual reach at this boundary.
+            // cfreach holds the reach for player `opp` (the opponent of the
+            // current traverser). This is read back by compute_cfvs_both.
             let opp = player ^ 1;
             let reach_index = ordinal * 2 + opp;
             if reach_index < self.boundary_reach.len() {
@@ -107,43 +107,49 @@ impl PostFlopGame {
                     let guard = self.boundary_cfvs[bcfv_index].lock().unwrap();
                     if guard.is_empty() {
                         drop(guard);
-                        if let Some(ref evaluator) = self.boundary_evaluator {
-                            let pot = self.tree_config.starting_pot + 2 * node.amount;
-                            let remaining = (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
-                            let opp_reach = self.boundary_reach[reach_index].lock().unwrap().clone();
-                            let opp_reach_ref = if opp_reach.is_empty() {
-                                &self.initial_weights[opp]
+                        // Prefer per-boundary evaluator (hybrid mode) over global.
+                        let evaluator: &dyn crate::game::BoundaryEvaluator =
+                            if let Some(per) = self.per_boundary_evaluators.get(ordinal) {
+                                per.as_ref()
+                            } else if let Some(ref e) = self.boundary_evaluator {
+                                e.as_ref()
                             } else {
-                                &opp_reach
+                                panic!(
+                                    "boundary_cfvs empty at ordinal {ordinal}, player {player} \
+                                     with no evaluator set (neither per_boundary_evaluators \
+                                     nor boundary_evaluator). Ensure hybrid setup populated \
+                                     per_boundary_evaluators or set_boundary_cfvs() is called."
+                                );
                             };
-                            // Get the visiting player's own reach for compute_cfvs_both.
-                            let player_reach_index = ordinal * 2 + player;
-                            let player_reach = self.boundary_reach[player_reach_index].lock().unwrap().clone();
-                            let player_reach_ref = if player_reach.is_empty() {
-                                &self.initial_weights[player]
-                            } else {
-                                &player_reach
-                            };
-                            let num_oop = self.private_cards[0].len();
-                            let num_ip = self.private_cards[1].len();
-                            let (oop_reach, ip_reach) = if player == 0 {
-                                (player_reach_ref.as_slice(), opp_reach_ref.as_slice())
-                            } else {
-                                (opp_reach_ref.as_slice(), player_reach_ref.as_slice())
-                            };
-                            let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
-                                pot, remaining, oop_reach, ip_reach,
-                                num_oop, num_ip, 0,
-                            );
-                            *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_cfvs;
-                            *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_cfvs;
+                        let pot = self.tree_config.starting_pot + 2 * node.amount;
+                        let remaining = (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
+                        let opp_reach = self.boundary_reach[reach_index].lock().unwrap().clone();
+                        let opp_reach_ref = if opp_reach.is_empty() {
+                            &self.initial_weights[opp]
                         } else {
-                            panic!(
-                                "boundary_cfvs empty at ordinal {ordinal}, player {player} \
-                                 with no boundary_evaluator set — cannot compute CFVs. \
-                                 Ensure set_boundary_cfvs() is called before solve/exploitability."
-                            );
-                        }
+                            &opp_reach
+                        };
+                        // Get the visiting player's own reach for compute_cfvs_both.
+                        let player_reach_index = ordinal * 2 + player;
+                        let player_reach = self.boundary_reach[player_reach_index].lock().unwrap().clone();
+                        let player_reach_ref = if player_reach.is_empty() {
+                            &self.initial_weights[player]
+                        } else {
+                            &player_reach
+                        };
+                        let num_oop = self.private_cards[0].len();
+                        let num_ip = self.private_cards[1].len();
+                        let (oop_reach, ip_reach) = if player == 0 {
+                            (player_reach_ref.as_slice(), opp_reach_ref.as_slice())
+                        } else {
+                            (opp_reach_ref.as_slice(), player_reach_ref.as_slice())
+                        };
+                        let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+                            pot, remaining, oop_reach, ip_reach,
+                            num_oop, num_ip, 0,
+                        );
+                        *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_cfvs;
+                        *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_cfvs;
                     }
                 }
 
