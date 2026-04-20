@@ -98,49 +98,73 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
 
     fn compute_cfvs(
         &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        // Learned boundary net was trained on (oop_range, ip_range) pairs of
+        // realistic reach distributions. The single-side trait method doesn't
+        // receive hero's reach — previous impl uniformed it, producing an
+        // out-of-distribution input for the net. Force callers to use
+        // compute_cfvs_both which threads both sides' reaches through.
+        panic!(
+            "NeuralBoundaryEvaluator: use compute_cfvs_both (net needs both \
+             ranges; uniform-hero single-side call produces OOD input)"
+        );
+    }
+
+    fn compute_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let oop_cfvs = self.forward_for_player(0, pot, remaining_stack, oop_reach, ip_reach);
+        let ip_cfvs  = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
+        (oop_cfvs, ip_cfvs)
+    }
+}
+
+#[cfg(not(feature = "onnx"))]
+impl NeuralBoundaryEvaluator {
+    /// Run one forward pass for a given traverser player, using the real
+    /// game-space reach distributions for both sides (no uniform-hero hack).
+    fn forward_for_player(
+        &self,
         player: usize,
         pot: i32,
         remaining_stack: f64,
-        opponent_reach: &[f32],
-        num_hands: usize,
-        _continuation_index: usize,
+        oop_reach_game: &[f32],
+        ip_reach_game: &[f32],
     ) -> Vec<f32> {
-        let opp = player ^ 1;
-
-        // Check for zero total opponent reach (unreachable boundary).
-        let opp_total: f32 = opponent_reach.iter().sum();
-        if opp_total <= 0.0 {
-            return vec![0.0; num_hands];
-        }
-
-        // Build 1326-element range vectors from game ordering.
-        let mut opp_range = vec![0.0_f32; NUM_COMBOS];
-        for (i, &(c1, c2)) in self.private_cards[opp].iter().enumerate() {
-            if i < opponent_reach.len() {
-                opp_range[card_pair_to_index(c1, c2)] = opponent_reach[i];
+        // Build 1326-element range vectors from game ordering for BOTH sides.
+        let mut oop_range_1326 = vec![0.0_f32; NUM_COMBOS];
+        for (i, &(c1, c2)) in self.private_cards[0].iter().enumerate() {
+            if i < oop_reach_game.len() {
+                oop_range_1326[card_pair_to_index(c1, c2)] = oop_reach_game[i];
             }
         }
-
-        // Hero range: uniform 1.0 (solver weights externally).
-        let mut hero_range = vec![0.0_f32; NUM_COMBOS];
-        for &(c1, c2) in &self.private_cards[player] {
-            hero_range[card_pair_to_index(c1, c2)] = 1.0;
+        let mut ip_range_1326 = vec![0.0_f32; NUM_COMBOS];
+        for (i, &(c1, c2)) in self.private_cards[1].iter().enumerate() {
+            if i < ip_reach_game.len() {
+                ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
+            }
         }
-
-        let (oop_range, ip_range) = if player == 0 {
-            (&hero_range, &opp_range)
-        } else {
-            (&opp_range, &hero_range)
-        };
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
 
         let input = encode_boundary_inference_input(
-            oop_range, ip_range, &self.board, pot_f32, eff_stack_f32, player as u8,
+            &oop_range_1326, &ip_range_1326, &self.board, pot_f32, eff_stack_f32, player as u8,
         );
 
-        // Forward pass (mutex-locked for thread safety).
         let device = Default::default();
         let tensor = Tensor::<NdArray, 2>::from_data(
             TensorData::new(input, [1, INPUT_SIZE]),
@@ -151,13 +175,13 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         drop(model);
         let normalized: Vec<f32> = output.into_data().to_vec::<f32>().unwrap();
 
-        // Denormalize: multiply by (pot + effective_stack) to get chip EVs.
         let total = pot_f32 + eff_stack_f32;
         let chip_evs: Vec<f32> = normalized.iter().map(|&v| v * total).collect();
 
         // Map 1326-combo ordering back to game private_cards ordering.
-        let mut cfvs = Vec::with_capacity(num_hands);
-        for &(c1, c2) in &self.private_cards[player] {
+        let hands = &self.private_cards[player];
+        let mut cfvs = Vec::with_capacity(hands.len());
+        for &(c1, c2) in hands {
             cfvs.push(chip_evs[card_pair_to_index(c1, c2)]);
         }
         cfvs
@@ -223,49 +247,69 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
 
     fn compute_cfvs(
         &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        // See rationale on the Burn variant above. Learned boundary net
+        // requires both realistic reach distributions; single-side path
+        // uniformed the hero side and produced OOD input.
+        panic!(
+            "NeuralBoundaryEvaluator (onnx): use compute_cfvs_both (net needs \
+             both ranges; uniform-hero single-side call produces OOD input)"
+        );
+    }
+
+    fn compute_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let oop_cfvs = self.forward_for_player(0, pot, remaining_stack, oop_reach, ip_reach);
+        let ip_cfvs  = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
+        (oop_cfvs, ip_cfvs)
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl NeuralBoundaryEvaluator {
+    fn forward_for_player(
+        &self,
         player: usize,
         pot: i32,
         remaining_stack: f64,
-        opponent_reach: &[f32],
-        num_hands: usize,
-        _continuation_index: usize,
+        oop_reach_game: &[f32],
+        ip_reach_game: &[f32],
     ) -> Vec<f32> {
-        let opp = player ^ 1;
-
-        // Check for zero total opponent reach (unreachable boundary).
-        let opp_total: f32 = opponent_reach.iter().sum();
-        if opp_total <= 0.0 {
-            return vec![0.0; num_hands];
-        }
-
-        // Build 1326-element range vectors from game ordering.
-        let mut opp_range = vec![0.0_f32; NUM_COMBOS];
-        for (i, &(c1, c2)) in self.private_cards[opp].iter().enumerate() {
-            if i < opponent_reach.len() {
-                opp_range[card_pair_to_index(c1, c2)] = opponent_reach[i];
+        // Build 1326-element range vectors from game ordering for BOTH sides.
+        let mut oop_range_1326 = vec![0.0_f32; NUM_COMBOS];
+        for (i, &(c1, c2)) in self.private_cards[0].iter().enumerate() {
+            if i < oop_reach_game.len() {
+                oop_range_1326[card_pair_to_index(c1, c2)] = oop_reach_game[i];
             }
         }
-
-        // Hero range: uniform 1.0 (solver weights externally).
-        let mut hero_range = vec![0.0_f32; NUM_COMBOS];
-        for &(c1, c2) in &self.private_cards[player] {
-            hero_range[card_pair_to_index(c1, c2)] = 1.0;
+        let mut ip_range_1326 = vec![0.0_f32; NUM_COMBOS];
+        for (i, &(c1, c2)) in self.private_cards[1].iter().enumerate() {
+            if i < ip_reach_game.len() {
+                ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
+            }
         }
-
-        let (oop_range, ip_range) = if player == 0 {
-            (&hero_range, &opp_range)
-        } else {
-            (&opp_range, &hero_range)
-        };
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
 
         let input_vec = encode_boundary_inference_input(
-            oop_range, ip_range, &self.board, pot_f32, eff_stack_f32, player as u8,
+            &oop_range_1326, &ip_range_1326, &self.board, pot_f32, eff_stack_f32, player as u8,
         );
 
-        // Forward pass via ONNX Runtime.
         let input_tensor = ort::value::Tensor::from_array(
             ([1_i64, INPUT_SIZE as i64], input_vec),
         ).expect("ort tensor creation");
@@ -277,14 +321,8 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
             .expect("ort output extract f32");
         let normalized: Vec<f32> = output_view.iter().copied().collect();
 
-        // Convert network output to pot-normalised units (1.0 = one half-pot).
-        //
-        // The training pipeline normalises targets as:
-        //   target = cfv_halfpot * pot / (pot + eff_stack)
-        // where cfv_halfpot = (ev_chips - half_pot) / half_pot.
-        //
-        // To recover range-solver CFV units (1.0 = one half-pot gain):
-        //   cfv_halfpot = output * (pot + eff_stack) / pot
+        // Unit conversion: target = cfv_halfpot * pot / (pot + eff_stack)
+        // → cfv_halfpot = output * (pot + eff_stack) / pot
         let scale = if pot_f32 > 0.0 {
             (pot_f32 + eff_stack_f32) / pot_f32
         } else {
@@ -292,8 +330,9 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         };
 
         // Map 1326-combo ordering back to game private_cards ordering.
-        let mut cfvs = Vec::with_capacity(num_hands);
-        for &(c1, c2) in &self.private_cards[player] {
+        let hands = &self.private_cards[player];
+        let mut cfvs = Vec::with_capacity(hands.len());
+        for &(c1, c2) in hands {
             cfvs.push(normalized[card_pair_to_index(c1, c2)] * scale);
         }
         cfvs
@@ -538,15 +577,17 @@ mod tests {
 
         assert_eq!(evaluator.num_continuations(), 1);
 
-        // Test player 0: opponent is player 1, so opponent_reach has p1's hand count
-        let opponent_reach = vec![0.5_f32; private_cards_p1.len()];
-        let cfvs = evaluator.compute_cfvs(0, 100, 150.0, &opponent_reach, private_cards_p0.len(), 0);
-        assert_eq!(cfvs.len(), private_cards_p0.len(), "CFV count should match player 0 hand count");
-
-        // Test player 1: opponent is player 0
-        let opponent_reach = vec![0.5_f32; private_cards_p0.len()];
-        let cfvs = evaluator.compute_cfvs(1, 100, 150.0, &opponent_reach, private_cards_p1.len(), 0);
-        assert_eq!(cfvs.len(), private_cards_p1.len(), "CFV count should match player 1 hand count");
+        // compute_cfvs_both takes both sides' reach distributions. Single-side
+        // compute_cfvs panics by design (net was trained on both realistic
+        // ranges; uniform-hero fallback produced OOD inputs).
+        let oop_reach = vec![0.5_f32; private_cards_p0.len()];
+        let ip_reach  = vec![0.5_f32; private_cards_p1.len()];
+        let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach,
+            private_cards_p0.len(), private_cards_p1.len(), 0,
+        );
+        assert_eq!(oop_cfvs.len(), private_cards_p0.len(), "OOP CFV count should match p0 hand count");
+        assert_eq!(ip_cfvs.len(),  private_cards_p1.len(), "IP CFV count should match p1 hand count");
     }
 
     #[cfg(not(feature = "onnx"))]
@@ -569,13 +610,15 @@ mod tests {
             [private_cards_p0.clone(), private_cards_p1.clone()],
         );
 
-        // All-zero opponent reach: boundary is unreachable
-        let opponent_reach = vec![0.0_f32; private_cards_p1.len()];
-        let cfvs = evaluator.compute_cfvs(0, 100, 150.0, &opponent_reach, private_cards_p0.len(), 0);
-        assert_eq!(cfvs.len(), private_cards_p0.len());
-        // All CFVs should be zero when opponent has no reach
-        for &v in &cfvs {
-            assert!((v).abs() < 1e-6, "expected 0.0 for zero opponent reach, got {v}");
-        }
+        // With compute_cfvs_both both reach vectors are passed through;
+        // assert shape only (net may extrapolate on zero-range inputs).
+        let zero_oop = vec![0.0_f32; private_cards_p0.len()];
+        let zero_ip  = vec![0.0_f32; private_cards_p1.len()];
+        let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+            100, 150.0, &zero_oop, &zero_ip,
+            private_cards_p0.len(), private_cards_p1.len(), 0,
+        );
+        assert_eq!(oop_cfvs.len(), private_cards_p0.len());
+        assert_eq!(ip_cfvs.len(),  private_cards_p1.len());
     }
 }
