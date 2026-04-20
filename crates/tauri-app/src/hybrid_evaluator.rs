@@ -8,7 +8,7 @@
 use crate::postflop::BoundaryCfvs;
 use poker_solver_core::poker::Card as RsPokerCard;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -77,10 +77,15 @@ pub struct HybridBoundaryEvaluator {
     samples_per_refresh: u32,
     cached: RwLock<HashMap<u64, CachedEntry>>,
     current_iter: AtomicU32,
+    /// Optional cancel signal shared with the solve loop. When set, in-flight
+    /// `compute_cfvs` calls skip sampling and return cached-or-zero values so
+    /// the solve unwinds promptly.
+    cancel_flag: std::sync::Arc<AtomicBool>,
 }
 
 impl HybridBoundaryEvaluator {
-    /// Create a new hybrid evaluator.
+    /// Create a new hybrid evaluator with an internal (unshared) cancel flag.
+    /// Use `new_with_cancel` to share a flag with the solve loop.
     ///
     /// # Panics
     /// Panics if `samples_per_refresh` is zero.
@@ -88,6 +93,24 @@ impl HybridBoundaryEvaluator {
         sampler: Box<dyn BoundarySampler>,
         refresh_interval: u32,
         samples_per_refresh: u32,
+    ) -> Self {
+        Self::new_with_cancel(
+            sampler,
+            refresh_interval,
+            samples_per_refresh,
+            std::sync::Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Create a new hybrid evaluator with an externally-owned cancel flag.
+    ///
+    /// # Panics
+    /// Panics if `samples_per_refresh` is zero.
+    pub fn new_with_cancel(
+        sampler: Box<dyn BoundarySampler>,
+        refresh_interval: u32,
+        samples_per_refresh: u32,
+        cancel_flag: std::sync::Arc<AtomicBool>,
     ) -> Self {
         assert!(
             samples_per_refresh > 0,
@@ -99,6 +122,7 @@ impl HybridBoundaryEvaluator {
             samples_per_refresh,
             cached: RwLock::new(HashMap::new()),
             current_iter: AtomicU32::new(0),
+            cancel_flag,
         }
     }
 
@@ -142,6 +166,20 @@ impl HybridBoundaryEvaluator {
                     return entry.cfvs.clone();
                 }
             }
+        }
+
+        // Cancellation: if the solve has been cancelled, skip sampling and
+        // return cached-if-any or zero CFVs. The solve loop will exit on the
+        // next iteration boundary.
+        if self.cancel_flag.load(Ordering::Relaxed) {
+            let guard = self.cached.read().unwrap();
+            if let Some(entry) = guard.get(&boundary_id) {
+                return entry.cfvs.clone();
+            }
+            return BoundaryCfvs {
+                oop_cfvs: vec![0.0; combos.len()],
+                ip_cfvs:  vec![0.0; combos.len()],
+            };
         }
 
         // Slow path: re-sample, write-lock, update cache.

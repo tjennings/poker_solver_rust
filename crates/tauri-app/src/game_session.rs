@@ -133,7 +133,9 @@ pub struct GameState {
 /// a `RwLock`.
 pub struct SolveState {
     pub solving: AtomicBool,
-    pub cancel: AtomicBool,
+    /// Arc so it can be shared with long-running boundary evaluators that
+    /// need to poll cancellation mid-refresh (e.g., HybridBoundaryEvaluator).
+    pub cancel: Arc<AtomicBool>,
     pub iteration: AtomicU32,
     pub max_iterations: AtomicU32,
     /// Exploitability stored as f32 bits (use `f32::to_bits` / `f32::from_bits`).
@@ -156,7 +158,7 @@ impl Default for SolveState {
     fn default() -> Self {
         Self {
             solving: AtomicBool::new(false),
-            cancel: AtomicBool::new(false),
+            cancel: Arc::new(AtomicBool::new(false)),
             iteration: AtomicU32::new(0),
             max_iterations: AtomicU32::new(0),
             exploitability_bits: AtomicU32::new(0),
@@ -1919,10 +1921,11 @@ pub fn game_solve_core(
                 );
 
                 let hybrid_eval = Arc::new(
-                    crate::hybrid_evaluator::HybridBoundaryEvaluator::new(
+                    crate::hybrid_evaluator::HybridBoundaryEvaluator::new_with_cancel(
                         Box::new(rollout_eval),
                         interval,
                         samples,
+                        Arc::clone(&ss_clone.cancel),
                     ),
                 );
                 hybrid_eval_arc = Some(Arc::clone(&hybrid_eval));
