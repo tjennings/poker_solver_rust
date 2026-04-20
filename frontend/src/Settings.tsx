@@ -324,38 +324,13 @@ export default function Settings() {
               Depth Limit
             </label>
             <input
-              type="number"
-              min={0}
-              max={3}
-              value={config.subgame_depth_limit ?? 1}
-              onChange={e => {
-                const v = parseInt(e.target.value);
+              type="text"
+              inputMode="numeric"
+              defaultValue={config.subgame_depth_limit ?? 1}
+              onBlur={e => {
+                const v = parseInt(e.target.value, 10);
                 if (!isNaN(v) && v >= 0 && v <= 3) setConfig({ subgame_depth_limit: v });
-              }}
-              style={{
-                width: 60,
-                padding: '0.4rem 0.55rem',
-                background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                borderRadius: 6,
-                color: '#eee',
-                fontSize: '0.85rem',
-                fontFamily: 'inherit',
-              }}
-            />
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
-              Refresh Interval (iters)
-            </label>
-            <input
-              type="number"
-              min={1}
-              max={1000}
-              value={config.hybrid_refresh_interval ?? 10}
-              onChange={e => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v) && v >= 1 && v <= 1000) setConfig({ hybrid_refresh_interval: v });
+                else e.target.value = String(config.subgame_depth_limit ?? 1);
               }}
               style={{
                 width: 70,
@@ -371,19 +346,44 @@ export default function Settings() {
           </div>
           <div>
             <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
-              Samples / Refresh
+              Refresh Interval (iters)
             </label>
             <input
-              type="number"
-              min={1}
-              max={100000}
-              value={config.hybrid_samples_per_refresh ?? 100}
-              onChange={e => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v) && v >= 1 && v <= 100000) setConfig({ hybrid_samples_per_refresh: v });
+              type="text"
+              inputMode="numeric"
+              defaultValue={config.hybrid_refresh_interval ?? 10}
+              onBlur={e => {
+                const v = parseInt(e.target.value, 10);
+                if (!isNaN(v) && v >= 1) setConfig({ hybrid_refresh_interval: v });
+                else e.target.value = String(config.hybrid_refresh_interval ?? 10);
               }}
               style={{
                 width: 80,
+                padding: '0.4rem 0.55rem',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 6,
+                color: '#eee',
+                fontSize: '0.85rem',
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: '0.75rem', color: '#888', marginBottom: '0.3rem' }}>
+              Samples / Refresh
+            </label>
+            <input
+              type="text"
+              inputMode="numeric"
+              defaultValue={config.hybrid_samples_per_refresh ?? 100}
+              onBlur={e => {
+                const v = parseInt(e.target.value, 10);
+                if (!isNaN(v) && v >= 1) setConfig({ hybrid_samples_per_refresh: v });
+                else e.target.value = String(config.hybrid_samples_per_refresh ?? 100);
+              }}
+              style={{
+                width: 90,
                 padding: '0.4rem 0.55rem',
                 background: 'rgba(255,255,255,0.06)',
                 border: '1px solid rgba(255,255,255,0.12)',
