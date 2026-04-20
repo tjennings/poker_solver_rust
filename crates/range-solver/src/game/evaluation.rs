@@ -1264,6 +1264,55 @@ mod tests {
     }
 
     #[test]
+    fn per_boundary_evaluator_preferred_over_global() {
+        let game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "need boundary nodes");
+
+        let num_oop = game.num_private_hands(0);
+        let num_ip = game.num_private_hands(1);
+
+        // Build per-boundary evaluators: one mock per boundary ordinal.
+        let mocks: Vec<Arc<MockBothSidesEvaluator>> = (0..n_boundary)
+            .map(|_| Arc::new(MockBothSidesEvaluator::new(num_oop, num_ip)))
+            .collect();
+
+        let game = {
+            let mut g = game;
+            // Hybrid mode: per_boundary_evaluators populated, boundary_evaluator = None.
+            g.boundary_evaluator = None;
+            g.per_boundary_evaluators = mocks
+                .iter()
+                .map(|m| m.clone() as Arc<dyn crate::game::BoundaryEvaluator>)
+                .collect();
+            g
+        };
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let ordinal = game.node_to_boundary[bd_idx] as usize;
+        let node = game.node_arena[bd_idx].lock();
+
+        // Evaluate from OOP's perspective -- should NOT panic.
+        let cfreach_ip: Vec<f32> = vec![1.0; num_ip];
+        let mut result: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_ip);
+
+        // The per-boundary evaluator at this ordinal should have been called.
+        let both = mocks[ordinal]
+            .both_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            both, 1,
+            "per_boundary_evaluators[{ordinal}].compute_cfvs_both should be called once, got {both}"
+        );
+
+        // Values should be populated (non-panic, non-empty).
+        let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
+        let nonzero = values.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero > 0, "should produce nonzero values from per-boundary evaluator");
+    }
+
+    #[test]
     fn boundary_eval_uses_compute_cfvs_both_not_single() {
         let game = make_turn_game_depth_limited();
         let n_boundary = game.num_boundary_nodes();
