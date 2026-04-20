@@ -769,54 +769,60 @@ impl DomainPipeline {
         let mut batched_p0 = vec![0.0_f32; batch_len * slot_len];
         let mut batched_p1 = vec![0.0_f32; batch_len * slot_len];
 
-        // Build all requests first — no ORT call inside this loop. This
-        // hoists `evaluate_boundaries_batched` out of the per-sit loop so
-        // a single batched ORT dispatch handles every sit in the batch,
-        // instead of `sits.len()` batch-of-1 dispatches per DCFR eval round.
-        let mut requests: Vec<BoundaryEvalRequest> = Vec::with_capacity(sits.len());
-        for (b, sit) in sits.iter().enumerate() {
-            let spec = &specs[b];
-            let strategy_sum = &strategy_sums[b];
+        use rayon::prelude::*;
 
-            let reach = compute_reach_at_nodes(
-                topo,
-                strategy_sum,
-                &spec.initial_weights,
-                num_hands,
-                boundary_node_ids,
-            );
+        // Build one BoundaryEvalRequest per sit in parallel. Each sit's work
+        // (reach computation, 1326-reshape, request struct) is independent.
+        // Per-element arithmetic is unchanged vs the serial loop. A single
+        // batched ORT dispatch (called after this block) still handles every
+        // sit in one shot — unchanged from the Layer A behavior.
+        let requests: Vec<BoundaryEvalRequest> = (0..sits.len())
+            .into_par_iter()
+            .map(|b| {
+                let sit = &sits[b];
+                let spec = &specs[b];
+                let strategy_sum = &strategy_sums[b];
 
-            // Canonical hand layout: hand index == card_pair_to_index, so we
-            // can copy reach directly without remapping.
-            debug_assert_eq!(num_hands, NUM_COMBOS);
-            let mut oop_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
-            let mut ip_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
-            for bi in 0..num_boundaries {
-                let src_base = bi * num_hands;
-                let dst_base = bi * NUM_COMBOS;
-                // reach[0] = opponent (P1/IP) reach from P0 traversal
-                // reach[1] = opponent (P0/OOP) reach from P1 traversal
-                ip_reach_1326[dst_base..dst_base + NUM_COMBOS]
-                    .copy_from_slice(&reach[0][src_base..src_base + num_hands]);
-                oop_reach_1326[dst_base..dst_base + NUM_COMBOS]
-                    .copy_from_slice(&reach[1][src_base..src_base + num_hands]);
-            }
+                let reach = compute_reach_at_nodes(
+                    topo,
+                    strategy_sum,
+                    &spec.initial_weights,
+                    num_hands,
+                    boundary_node_ids,
+                );
 
-            let board_4: [u8; 4] = [
-                sit.board[0],
-                sit.board[1],
-                sit.board[2],
-                sit.board[3],
-            ];
-            requests.push(BoundaryEvalRequest {
-                board: board_4,
-                pot: sit.pot as f32,
-                effective_stack: sit.effective_stack as f32,
-                oop_reach: oop_reach_1326,
-                ip_reach: ip_reach_1326,
-                num_boundaries,
-            });
-        }
+                // Canonical hand layout: hand index == card_pair_to_index, so we
+                // can copy reach directly without remapping.
+                debug_assert_eq!(num_hands, NUM_COMBOS);
+                let mut oop_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
+                let mut ip_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
+                for bi in 0..num_boundaries {
+                    let src_base = bi * num_hands;
+                    let dst_base = bi * NUM_COMBOS;
+                    // reach[0] = opponent (P1/IP) reach from P0 traversal
+                    // reach[1] = opponent (P0/OOP) reach from P1 traversal
+                    ip_reach_1326[dst_base..dst_base + NUM_COMBOS]
+                        .copy_from_slice(&reach[0][src_base..src_base + num_hands]);
+                    oop_reach_1326[dst_base..dst_base + NUM_COMBOS]
+                        .copy_from_slice(&reach[1][src_base..src_base + num_hands]);
+                }
+
+                let board_4: [u8; 4] = [
+                    sit.board[0],
+                    sit.board[1],
+                    sit.board[2],
+                    sit.board[3],
+                ];
+                BoundaryEvalRequest {
+                    board: board_4,
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    oop_reach: oop_reach_1326,
+                    ip_reach: ip_reach_1326,
+                    num_boundaries,
+                }
+            })
+            .collect();
 
         // Single batched ORT call across all sits.
         let results = evaluate_boundaries_batched(evaluator, &requests, canonical_hand_cards)
