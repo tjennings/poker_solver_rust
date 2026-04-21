@@ -167,6 +167,22 @@ enum Commands {
         #[arg(short, long)]
         label: String,
     },
+    /// Diagnose per-combo CFV deltas between ONNX model and ground truth
+    #[command(name = "diagnose-boundary")]
+    DiagnoseBoundary {
+        /// Path to ONNX model file
+        #[arg(short, long)]
+        model: PathBuf,
+        /// Path to binary training/validation data file
+        #[arg(short, long)]
+        data: PathBuf,
+        /// Max records to process (default: all)
+        #[arg(long)]
+        num_records: Option<usize>,
+        /// Optional CSV dump path (record_idx, combo_idx, category, net_cfv, truth_cfv, delta)
+        #[arg(long)]
+        csv_out: Option<PathBuf>,
+    },
     /// Precompute average turn entry ranges from a blueprint strategy, bucketed by SPR.
     #[command(name = "precompute-ranges")]
     PrecomputeRanges {
@@ -290,6 +306,9 @@ fn main() {
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
         Commands::BenchSolve { config, num_samples, threads } => {
             cmd_bench_solve(config, num_samples, threads);
+        }
+        Commands::DiagnoseBoundary { model, data, num_records, csv_out } => {
+            cmd_diagnose_boundary(model, data, num_records, csv_out);
         }
         Commands::InspectPreflopRanges { path } => cmd_inspect_preflop_ranges(path),
         Commands::FilterPreflopRanges { input, output, label } => {
@@ -967,6 +986,208 @@ fn cmd_eval_boundary_onnx(model_path: PathBuf, data_path: PathBuf) {
             print_error_stats(&format!("  SPR {:<5}", label), &mut spr_maes[i]);
         }
     }
+}
+
+fn cmd_diagnose_boundary(
+    model_path: PathBuf,
+    data_path: PathBuf,
+    num_records: Option<usize>,
+    csv_out: Option<PathBuf>,
+) {
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = (&model_path, &data_path, &num_records, &csv_out);
+        eprintln!("diagnose-boundary requires building with --features onnx");
+        std::process::exit(1);
+    }
+    #[cfg(feature = "onnx")]
+    {
+        cmd_diagnose_boundary_onnx(model_path, data_path, num_records, csv_out);
+    }
+}
+
+#[cfg(feature = "onnx")]
+fn cmd_diagnose_boundary_onnx(
+    model_path: PathBuf,
+    data_path: PathBuf,
+    num_records: Option<usize>,
+    csv_out: Option<PathBuf>,
+) {
+    use cfvnet::datagen::storage::{read_record, record_size};
+    use cfvnet::model::boundary_dataset::encode_boundary_record;
+    use cfvnet::model::network::INPUT_SIZE;
+    use ort::session::{Session, builder::GraphOptimizationLevel};
+    use range_solver::card::index_to_card_pair;
+    use std::collections::HashMap;
+
+    let session = Session::builder()
+        .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
+        .and_then(|b| b.commit_from_file(&model_path))
+        .unwrap_or_else(|e| {
+            eprintln!("failed to load ONNX model from {}: {e}", model_path.display());
+            std::process::exit(1);
+        });
+
+    let board_cards = infer_board_cards_from_data(&data_path);
+    if board_cards != 5 {
+        eprintln!("diagnose-boundary requires river data (5-card board), got {board_cards}-card");
+        std::process::exit(1);
+    }
+
+    let rec_size = record_size(board_cards) as u64;
+    let file_size = std::fs::metadata(&data_path)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to read data file {}: {e}", data_path.display());
+            std::process::exit(1);
+        })
+        .len();
+    let total_records = file_size / rec_size;
+    let limit = num_records.map_or(total_records as usize, |n| n.min(total_records as usize));
+
+    println!(
+        "=== CFV Delta Analysis: {} vs {} ===",
+        model_path.display(),
+        data_path.display()
+    );
+    println!("Records: {limit}");
+
+    let file = std::fs::File::open(&data_path).unwrap_or_else(|e| {
+        eprintln!("failed to open data file {}: {e}", data_path.display());
+        std::process::exit(1);
+    });
+    let mut reader = std::io::BufReader::new(file);
+
+    // Collect deltas into bins
+    const NUM_BINS: usize = 13;
+    const COMBOS: usize = 1326;
+    let bin_size = COMBOS / NUM_BINS; // 102
+    let mut bin_deltas: Vec<Vec<f64>> = (0..NUM_BINS).map(|_| Vec::new()).collect();
+    let mut cat_deltas: HashMap<HandCategory, Vec<f64>> = HashMap::new();
+
+    let mut csv_writer = csv_out.map(|path| {
+        let f = std::fs::File::create(&path).unwrap_or_else(|e| {
+            eprintln!("failed to create CSV file {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        let mut w = std::io::BufWriter::new(f);
+        use std::io::Write;
+        writeln!(w, "record_idx,combo_idx,category,net_cfv,truth_cfv,delta").unwrap();
+        w
+    });
+
+    for rec_idx in 0..limit {
+        let rec = match read_record(&mut reader) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error reading record {rec_idx}: {e}");
+                break;
+            }
+        };
+        let item = encode_boundary_record(&rec);
+        let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
+
+        let input_tensor = ort::value::Tensor::from_array(
+            ([1_i64, INPUT_SIZE as i64], item.input.clone()),
+        )
+        .expect("ort tensor creation");
+        let outputs = session
+            .run(ort::inputs![input_tensor].expect("ort inputs"))
+            .expect("ort session run");
+        let pred_vec: Vec<f32> = outputs[0]
+            .try_extract_tensor::<f32>()
+            .expect("ort output extract f32")
+            .iter()
+            .copied()
+            .collect();
+
+        let board = &rec.board;
+        for combo_idx in 0..COMBOS {
+            if !mask[combo_idx] {
+                continue;
+            }
+            let delta = (pred_vec[combo_idx] - item.target[combo_idx]) as f64;
+
+            // Index bin
+            let bin = (combo_idx / bin_size).min(NUM_BINS - 1);
+            bin_deltas[bin].push(delta);
+
+            // Hand category
+            let (c1, c2) = index_to_card_pair(combo_idx);
+            let category = classify_made_hand(c1, c2, board);
+            cat_deltas.entry(category).or_default().push(delta);
+
+            // CSV output
+            if let Some(ref mut w) = csv_writer {
+                use std::io::Write;
+                writeln!(
+                    w,
+                    "{rec_idx},{combo_idx},{},{:.6},{:.6},{:.6}",
+                    category.label(),
+                    pred_vec[combo_idx],
+                    item.target[combo_idx],
+                    delta as f32
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    // Print per-index-bin stats
+    println!("\n--- Per combo-index bin ({NUM_BINS} x ~{bin_size} combos) ---");
+    for (i, deltas) in bin_deltas.iter_mut().enumerate() {
+        let lo = i * bin_size;
+        let hi = if i == NUM_BINS - 1 { COMBOS } else { lo + bin_size };
+        if deltas.is_empty() {
+            println!("bin [{lo:04}..{hi:04}]: n=0");
+            continue;
+        }
+        print_delta_stats(&format!("bin [{lo:04}..{hi:04}]"), deltas);
+    }
+
+    // Print per-category stats sorted by count descending
+    println!("\n--- Per made-hand category ---");
+    let mut cat_order: Vec<HandCategory> = HandCategory::ALL
+        .iter()
+        .copied()
+        .filter(|cat| cat_deltas.contains_key(cat))
+        .collect();
+    cat_order.sort_by(|a, b| {
+        cat_deltas[b].len().cmp(&cat_deltas[a].len())
+    });
+    for cat in &cat_order {
+        let deltas = cat_deltas.get_mut(cat).unwrap();
+        print_delta_stats(&format!("{:<14}", cat), deltas);
+    }
+
+    if let Some(ref mut w) = csv_writer {
+        use std::io::Write;
+        w.flush().unwrap();
+    }
+}
+
+/// Print delta statistics: count, mean, std, |mean|, p5, p95, min, max.
+#[allow(dead_code)]
+fn print_delta_stats(label: &str, values: &mut [f64]) {
+    let n = values.len();
+    if n == 0 {
+        println!("{label}: n=0");
+        return;
+    }
+    let mean: f64 = values.iter().sum::<f64>() / n as f64;
+    let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let std_dev = variance.sqrt();
+    let abs_mean: f64 = values.iter().map(|v| v.abs()).sum::<f64>() / n as f64;
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p = |frac: f64| values[((frac * (n - 1) as f64) as usize).min(n - 1)];
+
+    println!(
+        "{label}: n={n} mean={mean:+.4} std={std_dev:.4} |mean|={abs_mean:.4} p5={:.4} p95={:.4} min={:.4} max={:.4}",
+        p(0.05),
+        p(0.95),
+        values[0],
+        values[n - 1]
+    );
 }
 
 fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
@@ -1982,6 +2203,79 @@ fn format_board(board: &[u8; 5], board_size: usize) -> String {
     format!("Board: {}", cards.join(" "))
 }
 
+// ---------------------------------------------------------------------------
+// Hand category classification for diagnose-boundary
+// ---------------------------------------------------------------------------
+
+/// Poker made-hand categories for diagnostic grouping.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+enum HandCategory {
+    HighCard,
+    Pair,
+    TwoPair,
+    Trips,
+    Straight,
+    Flush,
+    FullHouse,
+    Quads,
+    StraightFlush,
+}
+
+impl HandCategory {
+    #[allow(dead_code)]
+    const ALL: [HandCategory; 9] = [
+        Self::HighCard,
+        Self::Pair,
+        Self::TwoPair,
+        Self::Trips,
+        Self::Straight,
+        Self::Flush,
+        Self::FullHouse,
+        Self::Quads,
+        Self::StraightFlush,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::HighCard => "HighCard",
+            Self::Pair => "Pair",
+            Self::TwoPair => "TwoPair",
+            Self::Trips => "Trips",
+            Self::Straight => "Straight",
+            Self::Flush => "Flush",
+            Self::FullHouse => "FullHouse",
+            Self::Quads => "Quads",
+            Self::StraightFlush => "StraightFlush",
+        }
+    }
+}
+
+impl std::fmt::Display for HandCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.label())
+    }
+}
+
+/// Classify a 7-card hand (2 hole cards + 5 board cards) into a `HandCategory`.
+///
+/// Reuses the inline evaluator from `datagen::range_gen` which encodes the
+/// category in bits 26..28 of the returned score.
+fn classify_made_hand(c1: u8, c2: u8, board: &[u8]) -> HandCategory {
+    let score = cfvnet::datagen::range_gen::evaluate_7_slice(c1, c2, board);
+    match score >> 26 {
+        0 => HandCategory::HighCard,
+        1 => HandCategory::Pair,
+        2 => HandCategory::TwoPair,
+        3 => HandCategory::Trips,
+        4 => HandCategory::Straight,
+        5 => HandCategory::Flush,
+        6 => HandCategory::FullHouse,
+        7 => HandCategory::Quads,
+        8 => HandCategory::StraightFlush,
+        other => panic!("unexpected hand category {other} from evaluator"),
+    }
+}
+
 /// Returns `true` if the model path has an `.onnx` extension, indicating
 /// that the ONNX inference path should be used instead of the Burn path.
 fn is_onnx_model(path: &std::path::Path) -> bool {
@@ -2115,6 +2409,39 @@ mod tests {
         assert!((top10 - expected_top10).abs() < 1e-6, "top10={top10}");
         assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
         assert!((total - 200.0).abs() < 1e-6, "total={total}");
+    }
+
+    #[test]
+    fn classify_made_hand_known_hands() {
+        // Card encoding: card_id = 4 * rank + suit
+        // rank: 2→0, 3→1, ..., A→12; suit: c→0, d→1, h→2, s→3
+
+        // TwoPair: As Ks on board [Ah Kh 7c 2d 3s] → AA KK
+        assert_eq!(classify_made_hand(51, 47, &[50, 46, 20, 1, 7]), HandCategory::TwoPair);
+
+        // HighCard: Ah Ks on board [9c 7d 5h 3c 2d]
+        assert_eq!(classify_made_hand(50, 47, &[28, 21, 14, 4, 1]), HandCategory::HighCard);
+
+        // Pair: As Kh on board [Ac 7h 5d 3c 2d] → pair of aces
+        assert_eq!(classify_made_hand(51, 46, &[48, 22, 13, 4, 1]), HandCategory::Pair);
+
+        // Trips: Ah Ad on board [As 7h 5c 2d 3s] → AAA
+        assert_eq!(classify_made_hand(50, 49, &[51, 22, 12, 1, 7]), HandCategory::Trips);
+
+        // Straight: 9h 8h on board [7c 6d 5s 2c 3d] → 9-high straight
+        assert_eq!(classify_made_hand(30, 26, &[20, 17, 15, 0, 5]), HandCategory::Straight);
+
+        // Flush: Ah Kh on board [Qh 9h 2h 3c 4d] → heart flush
+        assert_eq!(classify_made_hand(50, 46, &[42, 30, 2, 4, 9]), HandCategory::Flush);
+
+        // FullHouse: Ah Ad on board [As 7h 7c 2d 3s] → AAA 77
+        assert_eq!(classify_made_hand(50, 49, &[51, 22, 20, 1, 7]), HandCategory::FullHouse);
+
+        // Quads: Ah Ad on board [As Ac 7h 2d 3s] → AAAA
+        assert_eq!(classify_made_hand(50, 49, &[51, 48, 22, 1, 7]), HandCategory::Quads);
+
+        // StraightFlush: 9h 8h on board [7h 6h 5h 2c 3d] → 9-high straight flush
+        assert_eq!(classify_made_hand(30, 26, &[22, 18, 14, 0, 5]), HandCategory::StraightFlush);
     }
 
     #[test]

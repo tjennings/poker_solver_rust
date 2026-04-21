@@ -181,7 +181,11 @@ fn rsp_recursive<R: Rng>(hands: &[usize], p: f64, range: &mut [f32; NUM_COMBOS],
 
 /// Evaluate a 7-card hand (2 hole cards + 5 board cards).
 /// Returns an i32 where higher = stronger. Zero is never returned for valid input.
-fn evaluate_7_slice(c1: u8, c2: u8, board: &[u8]) -> i32 {
+///
+/// The hand category is encoded in bits 26..28:
+///   0=HighCard, 1=Pair, 2=TwoPair, 3=Trips, 4=Straight,
+///   5=Flush, 6=FullHouse, 7=Quads, 8=StraightFlush
+pub fn evaluate_7_slice(c1: u8, c2: u8, board: &[u8]) -> i32 {
     let cards = [
         c1 as usize,
         c2 as usize,
