@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-6c5k
 title: Rayon-parallelize f64 reduction in evaluate_boundaries_batched (turn datagen Layer C)
-status: todo
+status: completed
 type: task
 priority: high
 created_at: 2026-04-20T22:47:35Z
-updated_at: 2026-04-20T22:47:52Z
+updated_at: 2026-04-21T01:01:18Z
 ---
 
 Follow-up to bean \`p99d\` Layer A. The Layer A fix (hoist ORT call out of the per-sit loop) shipped but turn-datagen throughput remains CPU-bound at any batch size.
@@ -52,3 +52,35 @@ The outer \`for req in requests\` loop is embarrassingly parallel — each reque
 ## Priority
 
 High — turn datagen is still throughput-blocked. Without Layer C/B, the 50M-in-1h target is unreachable no matter how big \`gpu_batch_size\` is.
+
+
+
+## Summary of Changes
+
+Shipped Layers B and C from the design: rayon-parallelized (B) the per-sit prep in \`batch_boundary_leaf_cfvs\` and (C) the per-request f64 reduction in \`evaluate_boundaries_batched\`. Both parallelize only across sits/requests — per-element arithmetic unchanged — so output is byte-identical to the serial reference.
+
+**Plan:** \`docs/plans/2026-04-20-boundary-eval-rayon.md\`
+**Design:** \`docs/plans/2026-04-20-boundary-eval-rayon-design.md\`
+
+**Commits on main:**
+- \`187d047\` feat(cfvnet): rayon-parallelize per-request reduction (Layer C)
+- \`153c510\` feat(cfvnet): rayon-parallelize per-sit prep (Layer B)
+- \`bc444f9\` test(cfvnet): byte-identical regression test for Layer B+C
+
+**Correctness validation:**
+- Layer A's tolerance regression test (\`layer_a_batched_matches_per_sit_within_tolerance\`): PASS post-refactor.
+- New byte-identical regression test (\`layer_bc_parallel_matches_serial_exact\`) using \`f32::to_bits()\` equality: PASS.
+- Full workspace test suite: same 2 pre-existing \`poker-solver-core::blueprint_mp\` timer-sensitive failures, unchanged.
+
+**Throughput validation at gpu_batch_size=4** (matches p99d Task 5 baseline):
+- Wall clock: 45m35s (32 samples, 4 files × 8 samples).
+- Files written: 4/4, 276 KB each.
+- CPU %: peaked at 404% (pre-6c5k baseline 313%) — rayon confirmed parallelizing.
+- GPU util: peak 100% (pre-6c5k baseline ~0% persistent) — GPU now actually exercising DCFR.
+- Peak RSS: 52.75 GB.
+
+**Interpretation:** wall clock unchanged vs Layer A alone. At batch=4 the DCFR GPU kernel iterations dominate the per-batch time, so parallelizing CPU prep/reduction moves the bottleneck but doesn't shrink the critical path. Layer B+C is expected to scale better at larger batch, where CPU work becomes a larger share per batch. Filed \`krhd\` to measure at batch=32 and 256.
+
+**Unblocks:**
+- \`vb8r\` end-to-end validation — now numerically and functionally correct with rayon in the hot path.
+- \`krhd\` — throughput scaling measurement.
