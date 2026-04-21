@@ -7,6 +7,7 @@ mod blueprint_tui_resolve;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
 mod bench_rollout;
+mod boundary_trace;
 mod compare_solve;
 mod inspect_spot;
 mod validate_rollout;
@@ -392,6 +393,19 @@ enum Commands {
         /// ONNX model path for river boundary (required when --river-boundary=cfvnet)
         #[arg(long)]
         river_model: Option<String>,
+
+        /// Boundary ordinals to trace (comma-separated, or "all").
+        /// Produces one JSONL file per ordinal in --trace-dir.
+        #[arg(long)]
+        trace_boundaries: Option<String>,
+
+        /// Iterations to trace (comma-separated, "all", or "last"; default "last").
+        #[arg(long, default_value = "last")]
+        trace_iters: String,
+
+        /// Directory to write trace files (default: ./traces/).
+        #[arg(long, default_value = "./traces")]
+        trace_dir: PathBuf,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1313,6 +1327,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             turn_model,
             river_boundary,
             river_model,
+            trace_boundaries,
+            trace_iters,
+            trace_dir,
         } => {
             let parse_mode = |mode: &str, model: Option<String>, street: &str|
                 -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
@@ -1334,6 +1351,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 turn: parse_mode(&turn_boundary, turn_model, "turn")?,
                 river: parse_mode(&river_boundary, river_model, "river")?,
             };
+            let trace_config = boundary_trace::TraceConfig {
+                boundaries: trace_boundaries,
+                iters_str: trace_iters,
+                dir: trace_dir,
+            };
             compare_solve::run(
                 &bundle,
                 snapshot.as_deref(),
@@ -1342,6 +1364,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 verbose,
                 dump_boundary_cfvs,
                 sbc,
+                trace_config,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -2780,6 +2803,59 @@ snapshots:
         } = cli2.unwrap().command {
             assert_eq!(river_boundary, "cfvnet");
             assert_eq!(river_model.as_deref(), Some("/path/to/model.onnx"));
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+    }
+
+    /// compare-solve should accept --trace-boundaries, --trace-iters, --trace-dir flags.
+    #[test]
+    fn compare_solve_trace_flags_parse() {
+        use clap::Parser;
+
+        // With trace flags
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/test",
+            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--trace-boundaries", "0,42,100",
+            "--trace-iters", "0,9",
+            "--trace-dir", "/tmp/traces",
+        ]);
+        assert!(cli.is_ok(), "trace flags must parse: {:?}", cli.err());
+
+        if let super::Commands::CompareSolve {
+            trace_boundaries,
+            trace_iters,
+            trace_dir,
+            ..
+        } = cli.unwrap().command {
+            assert_eq!(trace_boundaries.as_deref(), Some("0,42,100"));
+            assert_eq!(trace_iters, "0,9");
+            assert_eq!(trace_dir, std::path::PathBuf::from("/tmp/traces"));
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+
+        // Default trace values (no --trace-boundaries means None)
+        let cli2 = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/test",
+            "--spot", "sb:2bb,bb:call|Jd9d7d",
+        ]);
+        assert!(cli2.is_ok());
+
+        if let super::Commands::CompareSolve {
+            trace_boundaries,
+            trace_iters,
+            trace_dir,
+            ..
+        } = cli2.unwrap().command {
+            assert!(trace_boundaries.is_none());
+            assert_eq!(trace_iters, "last");
+            assert_eq!(trace_dir, std::path::PathBuf::from("./traces"));
         } else {
             panic!("expected CompareSolve variant");
         }

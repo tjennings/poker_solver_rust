@@ -5333,6 +5333,7 @@ dependencies = [
  "rayon",
  "rebel",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "test-macros",
