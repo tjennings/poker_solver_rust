@@ -428,6 +428,7 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
 fn capture_boundary_traces(
     game: &PostFlopGame,
     tracer: &crate::boundary_trace::BoundaryTracer,
+    spot_paths: Option<&[String]>,
     iter: u32,
 ) {
     let n_boundaries = game.num_boundary_nodes();
@@ -474,10 +475,13 @@ fn capture_boundary_traces(
         let oop_cfvs = expand_to_1326(game, 0, &oop_cfvs_raw);
         let ip_cfvs = expand_to_1326(game, 1, &ip_cfvs_raw);
 
+        let spot = spot_paths.and_then(|paths| paths.get(ordinal).cloned());
+
         let event = crate::boundary_trace::BoundaryTraceEvent {
             board: board_str,
             pot,
             stack,
+            spot,
             oop_range_1326: oop_range,
             ip_range_1326: ip_range,
             oop_cfvs_1326: oop_cfvs,
@@ -515,6 +519,7 @@ fn run_dcfr_solve(
     label: &str,
     verbose: bool,
     tracer: Option<&crate::boundary_trace::BoundaryTracer>,
+    spot_paths: Option<&[String]>,
 ) -> (f64, f64) {
     let start = Instant::now();
     let has_per_boundary = !game.per_boundary_evaluators.is_empty();
@@ -539,7 +544,7 @@ fn run_dcfr_solve(
 
         // Capture boundary traces after this iteration's CFVs are cached.
         if let Some(tr) = tracer {
-            capture_boundary_traces(game, tr, t);
+            capture_boundary_traces(game, tr, spot_paths, t);
         }
 
         if verbose && (t + 1) % 20 == 0 {
@@ -920,16 +925,30 @@ pub fn run(
         );
     }
 
+    // 7c. Build spot strings for each boundary ordinal
+    let spot_paths: Option<Vec<String>> = if tracer.is_some() && n_boundaries > 0 {
+        let postflop_paths = crate::boundary_trace::build_boundary_spot_paths(&subgame_game);
+        Some(
+            postflop_paths
+                .iter()
+                .map(|suffix| crate::boundary_trace::assemble_full_spot(spot, suffix))
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     // 8. Solve exact
     eprintln!("[compare] solving exact ({iters} iters)...");
     let (exact_wall, exact_exp) = run_dcfr_solve(
-        &mut exact_game, iters, "exact", verbose, None,
+        &mut exact_game, iters, "exact", verbose, None, None,
     );
 
     // 9. Solve subgame (with optional tracer)
     eprintln!("[compare] solving subgame ({iters} iters)...");
     let (subgame_wall, subgame_exp) = run_dcfr_solve(
         &mut subgame_game, iters, "subgame", verbose, tracer.as_ref(),
+        spot_paths.as_deref(),
     );
 
     // 10. Extract strategies at root

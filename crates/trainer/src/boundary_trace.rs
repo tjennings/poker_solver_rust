@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use range_solver::Action;
 use range_solver::card::index_to_card_pair;
 use serde::Serialize;
 
@@ -137,6 +138,126 @@ pub fn format_cfvs_as_hands(cfvs_1326: &[f32]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Spot-string helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a range-solver `Action` into the lowercased label that Tauri's
+/// `GameSession::encode_spot` / `load_spot` expects.
+///
+/// Labels: `check`, `call`, `fold`, `{bb}bb`, `all-in`.
+/// Chip amounts are halved (1 chip = 0.5 BB) and rounded.
+fn format_postflop_action(action: &Action) -> String {
+    match action {
+        Action::Check => "check".to_string(),
+        Action::Call => "call".to_string(),
+        Action::Fold => "fold".to_string(),
+        Action::Bet(chips) | Action::Raise(chips) => {
+            let bb = (*chips as f64 / 2.0).round() as i64;
+            format!("{bb}bb")
+        }
+        Action::AllIn(_) => "all-in".to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Format a sequence of `Action`s (root-to-boundary) as the postflop portion
+/// of a Tauri spot string.
+///
+/// `Action::Chance(card)` inserts a `|{card}|` separator between streets.
+/// Player actions alternate starting with OOP (BB) at the beginning of each
+/// street.
+fn format_action_path_as_spot_suffix(actions: &[Action]) -> String {
+    use range_solver::card::card_to_string;
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut current_street: Vec<String> = Vec::new();
+    // OOP (BB) = 0, IP (SB) = 1; OOP acts first on each street.
+    let mut player_to_act: usize = 0;
+
+    for action in actions {
+        match action {
+            Action::Chance(card) => {
+                // Flush current street's actions
+                if !current_street.is_empty() {
+                    parts.push(current_street.join(","));
+                    current_street.clear();
+                }
+                // Emit the dealt card
+                let card_str = card_to_string(*card).unwrap_or_else(|_| "??".to_string());
+                parts.push(card_str);
+                // Reset to OOP acting first on new street
+                player_to_act = 0;
+            }
+            Action::None => {}
+            action => {
+                let pos = if player_to_act == 0 { "bb" } else { "sb" };
+                let label = format_postflop_action(action);
+                current_street.push(format!("{pos}:{label}"));
+                // Alternate player after each action
+                player_to_act ^= 1;
+            }
+        }
+    }
+
+    // Flush remaining street actions
+    if !current_street.is_empty() {
+        parts.push(current_street.join(","));
+    }
+
+    parts.join("|")
+}
+
+/// Build the postflop spot-string suffix for every depth boundary in ordinal
+/// order. Uses a DFS from the root to discover the `Action` path leading to
+/// each boundary node.
+///
+/// Returns one `String` per boundary ordinal. If the walk fails to reach a
+/// boundary (should not happen), the entry is `"<error: unreachable>"`.
+pub fn build_boundary_spot_paths(game: &range_solver::PostFlopGame) -> Vec<String> {
+    let boundary_indices = game.boundary_node_indices();
+    let n = boundary_indices.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Map boundary arena index → ordinal for O(1) lookup.
+    let mut index_to_ord = std::collections::HashMap::with_capacity(n);
+    for (ord, &idx) in boundary_indices.iter().enumerate() {
+        index_to_ord.insert(idx, ord);
+    }
+
+    let mut paths = vec!["<error: unreachable>".to_string(); n];
+
+    // DFS walk: (node_arena_index, action_history_so_far)
+    let mut stack: Vec<(usize, Vec<Action>)> = vec![(0, Vec::new())];
+    while let Some((node_idx, history)) = stack.pop() {
+        if let Some(&ord) = index_to_ord.get(&node_idx) {
+            paths[ord] = format_action_path_as_spot_suffix(&history);
+        }
+        let children = game.child_indices(node_idx);
+        for child_idx in children {
+            let child_node = game.node_at(child_idx);
+            let mut child_history = history.clone();
+            child_history.push(child_node.prev_action());
+            drop(child_node);
+            stack.push((child_idx, child_history));
+        }
+    }
+
+    paths
+}
+
+/// Combine the user-supplied preflop spot prefix with a postflop path suffix.
+///
+/// If the postflop suffix is empty, returns the prefix unchanged.
+pub fn assemble_full_spot(preflop_prefix: &str, postflop_suffix: &str) -> String {
+    if postflop_suffix.is_empty() {
+        return preflop_prefix.to_string();
+    }
+    format!("{preflop_prefix}|{postflop_suffix}")
+}
+
+// ---------------------------------------------------------------------------
 // TraceConfig (CLI-level configuration, parsed in main.rs)
 // ---------------------------------------------------------------------------
 
@@ -244,6 +365,9 @@ pub struct BoundaryTraceEvent {
     pub board: String,
     pub pot: i32,
     pub stack: f64,
+    /// Full spot string for navigating to this boundary in the Tauri UI.
+    /// `None` if spot generation failed or was not configured.
+    pub spot: Option<String>,
     pub oop_range_1326: Vec<f32>,
     pub ip_range_1326: Vec<f32>,
     pub oop_cfvs_1326: Vec<f32>,
@@ -270,6 +394,8 @@ struct TraceRecord {
     traverser: String,
     pot_chips: i32,
     stack_chips: f64,
+    /// Full spot string for copy-paste into the Tauri UI. `null` if unavailable.
+    spot: Option<String>,
     cfv_units: &'static str,
     weight_units: &'static str,
     oop_range: String,
@@ -334,6 +460,7 @@ impl BoundaryTracer {
             traverser: "both".to_string(),
             pot_chips: event.pot,
             stack_chips: event.stack,
+            spot: event.spot.clone(),
             cfv_units: "chips",
             weight_units: "reach_weight",
             oop_range: format_range_as_hands(&event.oop_range_1326),
@@ -366,6 +493,214 @@ impl BoundaryTracer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use range_solver::Action;
+
+    // ---------------------------------------------------------------
+    // build_boundary_spot_paths integration tests
+    // ---------------------------------------------------------------
+
+    /// Build a turn-start game with depth_limit=1, so flop→turn chance
+    /// creates depth boundary nodes (one per non-isomorphic turn card).
+    fn make_depth_limited_turn_game() -> range_solver::PostFlopGame {
+        use range_solver::card::{card_from_str, flop_from_str, NOT_DEALT};
+        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::{CardConfig, ActionTree, TreeConfig, BoardState, PostFlopGame};
+
+        let oop_range: range_solver::range::Range = "AA,KK".parse().unwrap();
+        let ip_range: range_solver::range::Range = "QQ,JJ".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: NOT_DEALT,
+            river: NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 100,
+            effective_stack: 200,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(1), // boundary at turn deal
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+        game
+    }
+
+    #[test]
+    fn boundary_spot_paths_has_correct_count() {
+        let game = make_depth_limited_turn_game();
+        let n = game.num_boundary_nodes();
+        assert!(n > 0, "should have boundary nodes with depth_limit=1");
+        let paths = build_boundary_spot_paths(&game);
+        assert_eq!(paths.len(), n);
+    }
+
+    #[test]
+    fn boundary_spot_paths_differ_for_different_turns() {
+        let game = make_depth_limited_turn_game();
+        let paths = build_boundary_spot_paths(&game);
+        assert!(paths.len() >= 2, "need at least 2 boundary nodes");
+        // Not all paths should be identical — different turn cards
+        // create different chance actions in the history.
+        let unique: std::collections::HashSet<&String> = paths.iter().collect();
+        assert!(
+            unique.len() > 1,
+            "boundary paths should differ across turn cards, got all identical: {:?}",
+            &paths[..2.min(paths.len())]
+        );
+    }
+
+    #[test]
+    fn boundary_spot_paths_contain_card_separator() {
+        let game = make_depth_limited_turn_game();
+        let paths = build_boundary_spot_paths(&game);
+        // With depth_limit=1 from flop, boundaries are at turn deal.
+        // The path from root to boundary crosses through flop actions
+        // then a Chance(card). The formatted path should contain a '|'
+        // separating the flop actions from the turn card.
+        let has_separator = paths.iter().any(|p| p.contains('|'));
+        assert!(
+            has_separator,
+            "at least some boundary paths should contain '|' card separator, got: {:?}",
+            &paths[..2.min(paths.len())]
+        );
+    }
+
+    #[test]
+    fn assemble_spot_prepends_preflop() {
+        let preflop = "sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d";
+        let postflop = "bb:check,sb:22bb,bb:call|3c";
+        let result = assemble_full_spot(preflop, postflop);
+        assert_eq!(
+            result,
+            "sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d|bb:check,sb:22bb,bb:call|3c"
+        );
+    }
+
+    #[test]
+    fn assemble_spot_with_empty_postflop() {
+        let preflop = "sb:2bb,bb:call|Jd9d7d";
+        let result = assemble_full_spot(preflop, "");
+        assert_eq!(result, "sb:2bb,bb:call|Jd9d7d");
+    }
+
+    // ---------------------------------------------------------------
+    // format_action_path_as_spot_suffix tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn spot_suffix_single_check() {
+        // OOP (BB) checks at flop root
+        let actions = vec![Action::Check];
+        let result = format_action_path_as_spot_suffix(&actions);
+        assert_eq!(result, "bb:check");
+    }
+
+    #[test]
+    fn spot_suffix_check_bet_call() {
+        let actions = vec![Action::Check, Action::Bet(44), Action::Call];
+        let result = format_action_path_as_spot_suffix(&actions);
+        assert_eq!(result, "bb:check,sb:22bb,bb:call");
+    }
+
+    #[test]
+    fn spot_suffix_with_chance_card() {
+        // OOP check, IP check, then deal turn card 12 (5c), then OOP check
+        // card 12: rank=12/4=3 -> '5', suit=12%4=0 -> 'c'
+        let actions = vec![
+            Action::Check,
+            Action::Check,
+            Action::Chance(12),
+            Action::Check,
+        ];
+        let result = format_action_path_as_spot_suffix(&actions);
+        assert_eq!(result, "bb:check,sb:check|5c|bb:check");
+    }
+
+    #[test]
+    fn spot_suffix_allin() {
+        let actions = vec![Action::Bet(50), Action::AllIn(200)];
+        let result = format_action_path_as_spot_suffix(&actions);
+        assert_eq!(result, "bb:25bb,sb:all-in");
+    }
+
+    #[test]
+    fn spot_suffix_empty_actions() {
+        let actions: Vec<Action> = vec![];
+        let result = format_action_path_as_spot_suffix(&actions);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn spot_suffix_two_streets_with_chance() {
+        // flop: bb check, sb bet, bb call
+        // turn deal: card 20 (7c)
+        // card 20: rank=20/4=5 -> '7', suit=20%4=0 -> 'c'
+        // turn: bb check, sb all-in, bb fold
+        let actions = vec![
+            Action::Check,
+            Action::Bet(44),
+            Action::Call,
+            Action::Chance(20),
+            Action::Check,
+            Action::AllIn(200),
+            Action::Fold,
+        ];
+        let result = format_action_path_as_spot_suffix(&actions);
+        assert_eq!(result, "bb:check,sb:22bb,bb:call|7c|bb:check,sb:all-in,bb:fold");
+    }
+
+    // ---------------------------------------------------------------
+    // format_postflop_action tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn format_action_check() {
+        assert_eq!(format_postflop_action(&Action::Check), "check");
+    }
+
+    #[test]
+    fn format_action_call() {
+        assert_eq!(format_postflop_action(&Action::Call), "call");
+    }
+
+    #[test]
+    fn format_action_fold() {
+        assert_eq!(format_postflop_action(&Action::Fold), "fold");
+    }
+
+    #[test]
+    fn format_action_bet_even_chips() {
+        // 44 chips = 22 BB
+        assert_eq!(format_postflop_action(&Action::Bet(44)), "22bb");
+    }
+
+    #[test]
+    fn format_action_bet_odd_chips() {
+        // 33 chips = 16.5 BB — should show decimal
+        assert_eq!(format_postflop_action(&Action::Bet(33)), "17bb");
+    }
+
+    #[test]
+    fn format_action_raise() {
+        // 100 chips = 50 BB
+        assert_eq!(format_postflop_action(&Action::Raise(100)), "50bb");
+    }
+
+    #[test]
+    fn format_action_allin() {
+        assert_eq!(format_postflop_action(&Action::AllIn(200)), "all-in");
+    }
+
+    #[test]
+    fn format_action_none_returns_unknown() {
+        assert_eq!(format_postflop_action(&Action::None), "?");
+    }
 
     // ---------------------------------------------------------------
     // canonical_hand_name tests
@@ -646,6 +981,71 @@ mod tests {
     }
 
     #[test]
+    fn tracer_writes_jsonl_with_spot_field() {
+        let dir = std::env::temp_dir().join("boundary_trace_test_spot");
+        let _ = std::fs::remove_dir_all(&dir);
+        let tracer = BoundaryTracer::new(
+            TraceFilter::All,
+            TraceFilter::All,
+            dir.clone(),
+        );
+        let event = BoundaryTraceEvent {
+            board: "Jd9d7d3c".to_string(),
+            pot: 88,
+            stack: 78.0,
+            spot: Some("sb:2bb,bb:call|Jd9d7d|bb:check,sb:22bb,bb:call|3c".to_string()),
+            oop_range_1326: vec![1.0; 1326],
+            ip_range_1326: vec![0.5; 1326],
+            oop_cfvs_1326: vec![5.0; 1326],
+            ip_cfvs_1326: vec![-3.0; 1326],
+            strategy_at_prev: None,
+        };
+        tracer.trace(0, 0, &event);
+
+        let path = dir.join("boundary_0.jsonl");
+        assert!(path.exists(), "trace file should exist");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(
+            v["spot"],
+            "sb:2bb,bb:call|Jd9d7d|bb:check,sb:22bb,bb:call|3c",
+            "spot field should be the full spot string"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracer_writes_null_spot_when_none() {
+        let dir = std::env::temp_dir().join("boundary_trace_test_null_spot");
+        let _ = std::fs::remove_dir_all(&dir);
+        let tracer = BoundaryTracer::new(
+            TraceFilter::All,
+            TraceFilter::All,
+            dir.clone(),
+        );
+        let event = BoundaryTraceEvent {
+            board: "Jd9d7d3c".to_string(),
+            pot: 88,
+            stack: 78.0,
+            spot: None,
+            oop_range_1326: vec![1.0; 1326],
+            ip_range_1326: vec![0.5; 1326],
+            oop_cfvs_1326: vec![5.0; 1326],
+            ip_cfvs_1326: vec![-3.0; 1326],
+            strategy_at_prev: None,
+        };
+        tracer.trace(0, 0, &event);
+
+        let path = dir.join("boundary_0.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert!(v["spot"].is_null(), "spot should be null when None");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tracer_writes_jsonl_file() {
         let dir = std::env::temp_dir().join("boundary_trace_test_jsonl");
         let _ = std::fs::remove_dir_all(&dir);
@@ -658,6 +1058,7 @@ mod tests {
             board: "Jd9d7dQc".to_string(),
             pot: 88,
             stack: 78.0,
+            spot: None,
             oop_range_1326: vec![1.0; 1326],
             ip_range_1326: vec![0.5; 1326],
             oop_cfvs_1326: vec![5.0; 1326],
@@ -703,6 +1104,7 @@ mod tests {
             board: "Ah2c3d".to_string(),
             pot: 100,
             stack: 50.0,
+            spot: None,
             oop_range_1326: vec![1.0; 1326],
             ip_range_1326: vec![1.0; 1326],
             oop_cfvs_1326: vec![0.0; 1326],
