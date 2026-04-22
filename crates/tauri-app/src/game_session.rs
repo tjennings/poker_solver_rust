@@ -1077,6 +1077,31 @@ impl GameSession {
 // ---------------------------------------------------------------------------
 
 /// Convert a `TreeAction` to a `GameAction`.
+/// Resolve a relative path against the Cargo workspace root so outputs
+/// land in the project's real directory regardless of the launcher's CWD
+/// (Tauri desktop apps and `cargo run` from crate subdirs both differ from
+/// the workspace root). Walks parent dirs looking for a `Cargo.toml` that
+/// declares `[workspace]`; falls back to joining against the current CWD.
+fn resolve_against_workspace_root(relative: &std::path::Path) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut cursor: &std::path::Path = &cwd;
+    loop {
+        let candidate = cursor.join("Cargo.toml");
+        if candidate.exists() {
+            if let Ok(content) = std::fs::read_to_string(&candidate) {
+                if content.contains("[workspace]") {
+                    return cursor.join(relative);
+                }
+            }
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    cwd.join(relative)
+}
+
 fn build_game_actions(tree_actions: &[TreeAction]) -> Vec<GameAction> {
     tree_actions
         .iter()
@@ -1851,25 +1876,30 @@ pub fn game_solve_core(
     let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
     let target_exp = target_exploitability.unwrap_or(3.0);
 
-    // Build trace config (empty trace_boundaries = no tracing = zero cost)
-    eprintln!(
-        "[solve] trace params: boundaries={:?} iters={:?} dir={:?}",
-        trace_boundaries, trace_iters, trace_dir,
-    );
+    // Build trace config (empty trace_boundaries = no tracing = zero cost).
+    // Relative trace_dir is resolved against the workspace root (walk up
+    // from CWD looking for a `Cargo.toml` with `[workspace]`) so files
+    // land in the project's local_data/logs regardless of whether the
+    // solver is launched from the workspace root or a crate subdir.
     let trace_config = {
         let boundaries = trace_boundaries.filter(|s| !s.trim().is_empty());
+        let raw_dir = std::path::PathBuf::from(
+            trace_dir.unwrap_or_else(|| "./local_data/logs".to_string()),
+        );
+        let dir = if raw_dir.is_absolute() {
+            raw_dir
+        } else {
+            resolve_against_workspace_root(&raw_dir)
+        };
+        if boundaries.is_some() {
+            eprintln!("[solve] trace output dir: {}", dir.display());
+        }
         crate::boundary_trace::TraceConfig {
             boundaries,
             iters_str: trace_iters.unwrap_or_else(|| "last".to_string()),
-            dir: std::path::PathBuf::from(
-                trace_dir.unwrap_or_else(|| "./local_data/logs".to_string()),
-            ),
+            dir,
         }
     };
-    eprintln!(
-        "[solve] trace_config: boundaries={:?} iters_str={} dir={:?}",
-        trace_config.boundaries, trace_config.iters_str, trace_config.dir,
-    );
 
     // Reset solve state atomics
     let ss = ss_ref;
@@ -1958,12 +1988,8 @@ pub fn game_solve_core(
             );
         }
 
-        // Set up boundary tracer (no-op when disabled)
+        // Set up boundary tracer (no-op when disabled).
         let tracer = trace_config.into_tracer(max_iters);
-        eprintln!(
-            "[solve] tracer enabled: {} (max_iters={})",
-            tracer.is_some(), max_iters,
-        );
         let spot_paths: Option<Vec<String>> = tracer.as_ref().and_then(|_| {
             let n = game.num_boundary_nodes();
             if n > 0 {
@@ -2041,15 +2067,20 @@ pub fn game_solve_core(
 
         // Flush "last iter" traces even when early termination fired before
         // reaching max_iters (TraceFilter::Last was precomputed as max_iters-1).
-        // Uses the actual exit iter (t-1) and bypasses the iter filter.
+        // Only fire if the natural loop didn't already capture this iter — the
+        // normal in-loop path captures iter=t-1 AFTER incrementing t, so when
+        // t == max_iters and Last(max_iters-1) matched naturally, we skip.
         if let Some(ref tr) = tracer {
-            crate::boundary_trace::capture_boundary_traces_forced(
-                &game,
-                tr,
-                spot_paths.as_deref(),
-                preceding_map.as_ref(),
-                t.saturating_sub(1),
-            );
+            let final_iter = t.saturating_sub(1);
+            if t < max_iters {
+                crate::boundary_trace::capture_boundary_traces_forced(
+                    &game,
+                    tr,
+                    spot_paths.as_deref(),
+                    preceding_map.as_ref(),
+                    final_iter,
+                );
+            }
         }
 
         // Finalize: normalize strategy, compute EVs
