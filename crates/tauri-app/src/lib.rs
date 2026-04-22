@@ -1,3 +1,4 @@
+pub mod boundary_trace;
 mod exploration;
 pub mod game_session;
 pub mod postflop;
