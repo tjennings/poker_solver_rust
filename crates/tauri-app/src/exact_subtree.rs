@@ -125,13 +125,9 @@ fn reach_is_all_zero(reach: &[f32]) -> bool {
 /// Build the subtree game, run DCFR, finalize, and extract boundary CFVs.
 ///
 /// The subtree is built with the PARENT's initial weights (so that
-/// `num_combinations` matches the parent exactly). The equilibrium
-/// strategies do not depend on initial weights (two-player zero-sum).
-///
-/// After solving, per-hand cfvalues are computed using the ACTUAL boundary
-/// reach via `root_cfvalues_with_reach`, then converted to the boundary
-/// evaluator format (bcfv) by dividing out the `half_pot / N * cfreach_adj`
-/// factor that `evaluate_boundary_single` will multiply back in.
+/// `num_combinations` matches the parent exactly). After solving, per-hand
+/// cfvalues are computed using the ACTUAL boundary reach and converted to
+/// bcfv format by dividing out the `half_pot / N * cfreach_adj` factor.
 fn solve_subtree(
     board: &[u8],
     private_cards: &[Vec<(u8, u8)>; 2],
@@ -152,11 +148,6 @@ fn solve_subtree(
     let effective_stack =
         (pot / 2).saturating_add(remaining_stack.round() as i32);
 
-    // The subtree represents the DOWNSTREAM game starting from the boundary.
-    // For a turn→river boundary the initial_state is Turn (required by
-    // PostFlopGame when river is NOT_DEALT), but the turn action layer must
-    // be empty (forced check-check) because the parent already handled turn
-    // decisions.  Only river_bet_sizes matter for the actual subtree play.
     let tree_config = TreeConfig {
         initial_state,
         starting_pot: pot,
@@ -175,10 +166,7 @@ fn solve_subtree(
     run_dcfr(&mut game, solve_iters);
     finalize(&mut game);
 
-    // Compute cfvalues at the root using the ACTUAL boundary reach rather
-    // than the game's initial_weights. This is critical: `evaluate_boundary_single`
-    // in the parent solver will multiply bcfv by `half_pot / N * cfreach_adj`,
-    // and the cfreach_adj comes from the actual boundary reach.
+    // Remap parent reach to subtree hand ordering
     let sub_oop_reach = remap_reach_to_subtree(
         oop_reach, private_cards, game.private_cards(0), 0,
     );
@@ -189,53 +177,24 @@ fn solve_subtree(
     let half_pot = pot as f64 / 2.0;
     let num_combos = game.num_combinations();
 
-    // OOP cfvalue uses IP reach as opponent cfreach.
+    // Compute cfvalues using actual boundary reach
     let oop_cfv = root_cfvalues_with_reach(&game, 0, &sub_ip_reach);
-    // IP cfvalue uses OOP reach as opponent cfreach.
     let ip_cfv = root_cfvalues_with_reach(&game, 1, &sub_oop_reach);
 
-    // Convert cfvalues to bcfv format.
-    // evaluate_boundary_single does: result = bcfv * (half_pot / N) * cfreach_adj
-    // We want result = cfv, so: bcfv = cfv / (half_pot / N * cfreach_adj)
-    //                              = cfv * N / (half_pot * cfreach_adj)
+    // Convert cfvalues to bcfv format:
+    // bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])
     let oop_bcfv = cfv_to_bcfv(
-        &oop_cfv,
-        game.private_cards(0),
-        game.private_cards(1),
-        &sub_ip_reach,
-        half_pot,
-        num_combos,
+        &oop_cfv, game.private_cards(0),
+        game.private_cards(1), &sub_ip_reach,
+        half_pot, num_combos,
     );
     let ip_bcfv = cfv_to_bcfv(
-        &ip_cfv,
-        game.private_cards(1),
-        game.private_cards(0),
-        &sub_oop_reach,
-        half_pot,
-        num_combos,
+        &ip_cfv, game.private_cards(1),
+        game.private_cards(0), &sub_oop_reach,
+        half_pot, num_combos,
     );
 
-    // Diagnostic: print sample bcfv values (first 5 non-zero for each player)
-    {
-        let oop_nonzero: Vec<_> = oop_bcfv.iter().enumerate()
-            .filter(|(_, &v)| v.abs() > 1e-6)
-            .take(5)
-            .collect();
-        let ip_nonzero: Vec<_> = ip_bcfv.iter().enumerate()
-            .filter(|(_, &v)| v.abs() > 1e-6)
-            .take(5)
-            .collect();
-        let oop_cfv_sample: Vec<_> = oop_cfv.iter().enumerate()
-            .filter(|(_, &v)| v.abs() > 1e-9)
-            .take(5)
-            .collect();
-        eprintln!(
-            "[subtree-diag] pot={pot} half_pot={half_pot:.1} N={num_combos:.1} \
-             oop_cfv_sample={oop_cfv_sample:?} oop_bcfv={oop_nonzero:?} ip_bcfv={ip_nonzero:?}"
-        );
-    }
-
-    // Remap from subtree ordering to parent ordering.
+    // Remap from subtree ordering to parent ordering
     let oop_out = remap_cfvs_to_parent(
         &oop_bcfv, game.private_cards(0), &private_cards[0],
     );
@@ -245,18 +204,8 @@ fn solve_subtree(
     (oop_out, ip_out)
 }
 
-/// Convert raw cfvalues to bcfv format by dividing out the scaling factor
-/// that `evaluate_boundary_single` will multiply back in.
-///
-/// For hand h: `bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])`
-/// where cfreach_adj is the blocker-adjusted opponent reach sum.
-///
-/// Numerically, when `cfreach_adj` is very small the division can produce
-/// extreme values. We clamp to `[-MAX_BCFV, MAX_BCFV]` to prevent such
-/// outliers from poisoning the parent solver. Hands with near-zero
-/// cfreach_adj are effectively unreachable and their bcfv will be
-/// multiplied by the same near-zero cfreach_adj in the parent, so the
-/// clamping has negligible impact on the final cfvalue.
+/// Convert raw cfvalues to bcfv format.
+/// `bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])`
 fn cfv_to_bcfv(
     cfv: &[f32],
     hero_cards: &[(u8, u8)],
@@ -265,13 +214,7 @@ fn cfv_to_bcfv(
     half_pot: f64,
     num_combos: f64,
 ) -> Vec<f32> {
-    // Maximum absolute bcfv: a hand can win at most 2 * effective_stack
-    // (all-in pot), which in pot-normalised units is at most ~10x half_pot.
-    const MAX_BCFV: f32 = 10.0;
-    // Minimum cfreach_adj to avoid division by near-zero.
-    const MIN_ADJ: f64 = 1e-6;
-
-    let denom_base = half_pot / num_combos;
+    let scale = num_combos / half_pot;
     cfv.iter()
         .enumerate()
         .map(|(h, &c)| {
@@ -280,19 +223,15 @@ fn cfv_to_bcfv(
             }
             let (h1, h2) = hero_cards[h];
             let adj = cfreach_adj(h1, h2, opp_cards, opp_reach);
-            if adj < MIN_ADJ {
+            if adj <= 1e-9 {
                 return 0.0;
             }
-            let raw = (c as f64 / (denom_base * adj)) as f32;
-            raw.clamp(-MAX_BCFV, MAX_BCFV)
+            (c as f64 * scale / adj) as f32
         })
         .collect()
 }
 
-/// Compute the blocker-adjusted opponent reach sum for a hero hand.
-/// This mirrors the cfreach accumulation in `evaluate_boundary_single`:
-/// sum of opponent reach for hands that don't share any card with the
-/// hero hand.
+/// Blocker-adjusted opponent reach sum for a hero hand.
 fn cfreach_adj(h1: u8, h2: u8, opp_cards: &[(u8, u8)], opp_reach: &[f32]) -> f64 {
     let mut sum = 0.0f64;
     for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
@@ -307,9 +246,7 @@ fn cfreach_adj(h1: u8, h2: u8, opp_cards: &[(u8, u8)], opp_reach: &[f32]) -> f64
     sum
 }
 
-/// Remap a parent-ordering reach vector to the subtree's private_cards
-/// ordering. Hands in the subtree that don't appear in the parent get
-/// reach 0.
+/// Remap a parent-ordering reach vector to subtree ordering.
 fn remap_reach_to_subtree(
     parent_reach: &[f32],
     parent_private_cards: &[Vec<(u8, u8)>; 2],
@@ -317,7 +254,6 @@ fn remap_reach_to_subtree(
     player: usize,
 ) -> Vec<f32> {
     let parent_cards = &parent_private_cards[player];
-    // Build map: canonical card pair → reach
     let mut map: HashMap<(u8, u8), f32> =
         HashMap::with_capacity(parent_cards.len());
     for (i, &(c1, c2)) in parent_cards.iter().enumerate() {
@@ -334,6 +270,18 @@ fn remap_reach_to_subtree(
         .collect()
 }
 
+/// Convert raw cfvalues to bcfv format by dividing out the scaling factor
+/// that `evaluate_boundary_single` will multiply back in.
+///
+/// For hand h: `bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])`
+/// where cfreach_adj is the blocker-adjusted opponent reach sum.
+///
+/// Numerically, when `cfreach_adj` is very small the division can produce
+/// extreme values. We clamp to `[-MAX_BCFV, MAX_BCFV]` to prevent such
+/// outliers from poisoning the parent solver. Hands with near-zero
+/// cfreach_adj are effectively unreachable and their bcfv will be
+/// multiplied by the same near-zero cfreach_adj in the parent, so the
+/// clamping has negligible impact on the final cfvalue.
 /// Remap CFVs from subtree hand ordering to parent hand ordering.
 fn remap_cfvs_to_parent(
     subtree_cfvs: &[f32],
