@@ -156,4 +156,23 @@ describe('buildSolveParams', () => {
     const params = buildSolveParams('exact', config);
     expect(params.matrixSnapshotInterval).toBe(20);
   });
+
+  // Boundary tracing params
+
+  it('defaults traceBoundaries to empty and traceIters to last', () => {
+    const params = buildSolveParams('subgame', {});
+    expect(params.traceBoundaries).toBe('');
+    expect(params.traceIters).toBe('last');
+  });
+
+  it('passes trace config from global config', () => {
+    const config = {
+      ...defaultConfig,
+      trace_boundaries: '0,42',
+      trace_iters: 'all',
+    };
+    const params = buildSolveParams('subgame', config);
+    expect(params.traceBoundaries).toBe('0,42');
+    expect(params.traceIters).toBe('all');
+  });
 });

@@ -170,6 +170,9 @@ export interface GlobalConfig {
   flop_model_path: string;
   turn_model_path: string;
   river_model_path: string;
+  // Boundary tracing (debug)
+  trace_boundaries: string;
+  trace_iters: string;
 }
 
 export interface BlueprintListEntry {

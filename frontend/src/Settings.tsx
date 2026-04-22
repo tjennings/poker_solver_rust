@@ -344,6 +344,58 @@ export default function Settings() {
       {/* Boundary Evaluation */}
       <BoundaryEvaluationSettings config={config} setConfig={setConfig} />
 
+      {/* Boundary Tracing (debug) */}
+      <div style={{ marginBottom: '1.5rem' }}>
+        <div style={{ fontSize: '0.85rem', color: '#ccc', marginBottom: '0.6rem', fontWeight: 500 }}>
+          Boundary Tracing (debug)
+        </div>
+        <div style={{ marginBottom: '0.5rem' }}>
+          <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+            Boundaries to trace
+          </label>
+          <input
+            type="text"
+            defaultValue={config.trace_boundaries ?? ''}
+            placeholder='e.g. 42  or  0,42,100  or  all'
+            onBlur={e => setConfig({ trace_boundaries: e.target.value })}
+            style={{
+              width: 200,
+              padding: '0.45rem 0.6rem',
+              background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 6,
+              color: '#eee',
+              fontSize: '0.85rem',
+              fontFamily: 'inherit',
+            }}
+          />
+        </div>
+        <div style={{ marginBottom: '0.5rem' }}>
+          <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>
+            Iterations to trace
+          </label>
+          <input
+            type="text"
+            defaultValue={config.trace_iters ?? 'last'}
+            placeholder='last  or  all  or  0,49,99'
+            onBlur={e => setConfig({ trace_iters: e.target.value })}
+            style={{
+              width: 200,
+              padding: '0.45rem 0.6rem',
+              background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 6,
+              color: '#eee',
+              fontSize: '0.85rem',
+              fontFamily: 'inherit',
+            }}
+          />
+        </div>
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem' }}>
+          Output: ./local_data/logs/boundary_&lt;ord&gt;.txt. Empty disables tracing.
+        </p>
+      </div>
+
       {/* Range Clamp Threshold */}
       <div style={{ marginBottom: '1.5rem' }}>
         <label style={{ display: 'block', fontSize: '0.8rem', color: '#888', marginBottom: '0.4rem' }}>

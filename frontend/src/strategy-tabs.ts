@@ -19,6 +19,8 @@ export interface SolveParams {
   matrixSnapshotInterval: number;
   rangeClampThreshold: number;
   streetBoundaryConfig: StreetBoundaryConfig;
+  traceBoundaries: string;
+  traceIters: string;
 }
 
 function modeFromConfig(
@@ -50,5 +52,7 @@ export function buildSolveParams(
       turn: modeFromConfig(config.turn_boundary_mode as 'exact' | 'cfvnet' | undefined, config.turn_model_path as string | undefined),
       river: modeFromConfig(config.river_boundary_mode as 'exact' | 'cfvnet' | undefined, config.river_model_path as string | undefined),
     },
+    traceBoundaries: (config.trace_boundaries as string | undefined) ?? '',
+    traceIters: (config.trace_iters as string | undefined) ?? 'last',
   };
 }
