@@ -26,6 +26,11 @@ use range_solver::card::card_to_string;
 use range_solver::interface::Game;
 use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
 
+use crate::boundary_trace::{
+    BoundaryTracer, assemble_full_spot, build_boundary_spot_paths,
+    build_preceding_decision_map, capture_boundary_traces,
+};
+
 // ---------------------------------------------------------------------------
 // Boundary CFV diagnostic types
 // ---------------------------------------------------------------------------
@@ -424,93 +429,8 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
     );
 }
 
-/// Capture boundary trace data for all enabled boundaries at this iteration.
-fn capture_boundary_traces(
-    game: &PostFlopGame,
-    tracer: &crate::boundary_trace::BoundaryTracer,
-    spot_paths: Option<&[String]>,
-    iter: u32,
-) {
-    let n_boundaries = game.num_boundary_nodes();
-    if n_boundaries == 0 {
-        return;
-    }
-
-    let boards = game.boundary_boards();
-
-    for ordinal in 0..n_boundaries {
-        if !tracer.enabled(ordinal, iter) {
-            continue;
-        }
-
-        let board_cards = &boards[ordinal];
-        let board_str: String = board_cards
-            .iter()
-            .map(|&c| card_to_string(c).unwrap_or_else(|_| "??".to_string()))
-            .collect();
-
-        let pot = game.boundary_pot(ordinal);
-        let stack = (game.tree_config().effective_stack as f64 - pot as f64 / 2.0).max(0.0);
-
-        // Read reach probabilities (opponent's reach stored per player)
-        let oop_reach = game.boundary_reach(ordinal, 0);
-        let ip_reach = game.boundary_reach(ordinal, 1);
-
-        // Use initial weights as fallback if reach not yet populated
-        let oop_range = if oop_reach.is_empty() {
-            build_1326_range(game, 0)
-        } else {
-            expand_to_1326(game, 0, &oop_reach)
-        };
-        let ip_range = if ip_reach.is_empty() {
-            build_1326_range(game, 1)
-        } else {
-            expand_to_1326(game, 1, &ip_reach)
-        };
-
-        // Read cached CFVs
-        let oop_cfvs_raw = game.get_boundary_cfvs_multi(ordinal, 0, 0);
-        let ip_cfvs_raw = game.get_boundary_cfvs_multi(ordinal, 1, 0);
-
-        let oop_cfvs = expand_to_1326(game, 0, &oop_cfvs_raw);
-        let ip_cfvs = expand_to_1326(game, 1, &ip_cfvs_raw);
-
-        let spot = spot_paths.and_then(|paths| paths.get(ordinal).cloned());
-
-        let event = crate::boundary_trace::BoundaryTraceEvent {
-            board: board_str,
-            pot,
-            stack,
-            spot,
-            oop_range_1326: oop_range,
-            ip_range_1326: ip_range,
-            oop_cfvs_1326: oop_cfvs,
-            ip_cfvs_1326: ip_cfvs,
-            strategy_at_prev: None, // TODO: strategy extraction
-        };
-
-        tracer.trace(ordinal, iter, &event);
-    }
-}
-
-/// Build a 1326-element range vector from a player's initial weights.
-fn build_1326_range(game: &PostFlopGame, player: usize) -> Vec<f32> {
-    let weights = game.initial_weights(player);
-    expand_to_1326(game, player, weights)
-}
-
-/// Expand a per-private-hand vector to 1326-element form, mapping by card pair.
-fn expand_to_1326(game: &PostFlopGame, player: usize, values: &[f32]) -> Vec<f32> {
-    let private_cards = game.private_cards(player);
-    let mut out = vec![0.0f32; 1326];
-    for (i, &(c1, c2)) in private_cards.iter().enumerate() {
-        if i < values.len() {
-            let idx = range_solver::card::card_pair_to_index(c1, c2);
-            out[idx] = values[i];
-        }
-    }
-    out
-}
+// capture_boundary_traces, build_1326_range, expand_to_1326 live in
+// boundary_trace module (shared with tauri game_solve).
 
 /// Run a DCFR solve loop, returning (wall_time, final_exploitability).
 fn run_dcfr_solve(
@@ -518,11 +438,15 @@ fn run_dcfr_solve(
     iters: u32,
     label: &str,
     verbose: bool,
-    tracer: Option<&crate::boundary_trace::BoundaryTracer>,
+    tracer: Option<&BoundaryTracer>,
     spot_paths: Option<&[String]>,
 ) -> (f64, f64) {
     let start = Instant::now();
     let has_per_boundary = !game.per_boundary_evaluators.is_empty();
+
+    // Build preceding decision map once for strategy extraction
+    let preceding_map = tracer.as_ref().map(|_| build_preceding_decision_map(game));
+
     for t in 0..iters {
         // Neural cfvnet path: clear CFV cache every iteration so boundary
         // values are recomputed with updated opponent reaches.
@@ -544,7 +468,7 @@ fn run_dcfr_solve(
 
         // Capture boundary traces after this iteration's CFVs are cached.
         if let Some(tr) = tracer {
-            capture_boundary_traces(game, tr, spot_paths, t);
+            capture_boundary_traces(game, tr, spot_paths, preceding_map.as_ref(), t);
         }
 
         if verbose && (t + 1) % 20 == 0 {
@@ -927,11 +851,11 @@ pub fn run(
 
     // 7c. Build spot strings for each boundary ordinal
     let spot_paths: Option<Vec<String>> = if tracer.is_some() && n_boundaries > 0 {
-        let postflop_paths = crate::boundary_trace::build_boundary_spot_paths(&subgame_game);
+        let postflop_paths = build_boundary_spot_paths(&subgame_game);
         Some(
             postflop_paths
                 .iter()
-                .map(|suffix| crate::boundary_trace::assemble_full_spot(spot, suffix))
+                .map(|suffix| assemble_full_spot(spot, suffix))
                 .collect(),
         )
     } else {

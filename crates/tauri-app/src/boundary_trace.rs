@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 use range_solver::Action;
 use range_solver::card::index_to_card_pair;
-use range_solver::interface::GameNode;
+use range_solver::interface::{Game, GameNode};
 
 // ---------------------------------------------------------------------------
 // Hand name formatting
@@ -321,6 +321,180 @@ pub fn build_preceding_decision_map(
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Capture helpers (shared between tauri game_solve and trainer compare_solve)
+// ---------------------------------------------------------------------------
+
+/// Expand a per-private-hand vector to 1326-element form, mapping by card pair.
+pub fn expand_to_1326(
+    game: &range_solver::PostFlopGame,
+    player: usize,
+    values: &[f32],
+) -> Vec<f32> {
+    let private_cards = game.private_cards(player);
+    let mut out = vec![0.0f32; 1326];
+    for (i, &(c1, c2)) in private_cards.iter().enumerate() {
+        if i < values.len() {
+            let idx = range_solver::card::card_pair_to_index(c1, c2);
+            out[idx] = values[i];
+        }
+    }
+    out
+}
+
+/// Build a 1326-element range vector from a player's initial weights.
+pub fn build_1326_range(
+    game: &range_solver::PostFlopGame,
+    player: usize,
+) -> Vec<f32> {
+    expand_to_1326(game, player, game.initial_weights(player))
+}
+
+/// Extract the strategy at a preceding decision node for a boundary, formatted
+/// as a `StrategyAtPrevDecision` with per-hand-class probabilities.
+pub fn extract_strategy_at_prev(
+    game: &range_solver::PostFlopGame,
+    preceding_map: &HashMap<usize, (usize, Vec<String>)>,
+    ordinal: usize,
+) -> Option<StrategyAtPrevDecision> {
+    let (node_idx, actions) = preceding_map.get(&ordinal)?;
+    let node = game.node_at(*node_idx);
+    let player = node.player();
+    let num_actions = node.num_actions();
+    drop(node);
+
+    if num_actions == 0 {
+        return None;
+    }
+
+    let strategy = game.strategy_at_index(*node_idx);
+    let num_hands = strategy.len() / num_actions;
+
+    // Build per-hand-class aggregation: for each hand class, average the
+    // per-action probabilities across combos.
+    let private_cards = game.private_cards(player);
+    let initial_weights = game.initial_weights(player);
+
+    let mut class_data: std::collections::BTreeMap<String, (f64, Vec<f64>)> =
+        std::collections::BTreeMap::new();
+
+    for h in 0..num_hands {
+        let weight = if h < initial_weights.len() {
+            initial_weights[h] as f64
+        } else {
+            0.0
+        };
+        if weight < 0.001 {
+            continue;
+        }
+        let (c1, c2) = private_cards[h];
+        let name = canonical_hand_name(c1, c2);
+        let entry = class_data
+            .entry(name)
+            .or_insert_with(|| (0.0, vec![0.0; num_actions]));
+        entry.0 += weight;
+        for a in 0..num_actions {
+            entry.1[a] += strategy[a * num_hands + h] as f64 * weight;
+        }
+    }
+
+    // Normalize per-class probabilities and sort by descending reach.
+    let mut by_hand: Vec<(String, f64, Vec<f32>)> = class_data
+        .into_iter()
+        .map(|(name, (total_w, weighted_probs))| {
+            let probs: Vec<f32> = weighted_probs
+                .iter()
+                .map(|&wp| if total_w > 0.0 { (wp / total_w) as f32 } else { 0.0 })
+                .collect();
+            (name, total_w, probs)
+        })
+        .collect();
+    by_hand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    Some(StrategyAtPrevDecision {
+        node_idx: *node_idx,
+        player,
+        actions: actions.clone(),
+        by_hand: by_hand.into_iter().map(|(n, _, p)| (n, p)).collect(),
+    })
+}
+
+/// Capture boundary trace data for all enabled boundaries at this iteration.
+///
+/// This is the shared logic used by both `game_solve_core` (Tauri) and
+/// `compare_solve::run` (CLI trainer).
+pub fn capture_boundary_traces(
+    game: &range_solver::PostFlopGame,
+    tracer: &BoundaryTracer,
+    spot_paths: Option<&[String]>,
+    preceding_map: Option<&HashMap<usize, (usize, Vec<String>)>>,
+    iter: u32,
+) {
+    let n_boundaries = game.num_boundary_nodes();
+    if n_boundaries == 0 {
+        return;
+    }
+
+    let boards = game.boundary_boards();
+
+    for ordinal in 0..n_boundaries {
+        if !tracer.enabled(ordinal, iter) {
+            continue;
+        }
+
+        let board_cards = &boards[ordinal];
+        let board_str: String = board_cards
+            .iter()
+            .map(|&c| {
+                range_solver::card::card_to_string(c).unwrap_or_else(|_| "??".to_string())
+            })
+            .collect();
+
+        let pot = game.boundary_pot(ordinal);
+        let stack =
+            (game.tree_config().effective_stack as f64 - pot as f64 / 2.0).max(0.0);
+
+        let oop_reach = game.boundary_reach(ordinal, 0);
+        let ip_reach = game.boundary_reach(ordinal, 1);
+
+        let oop_range = if oop_reach.is_empty() {
+            build_1326_range(game, 0)
+        } else {
+            expand_to_1326(game, 0, &oop_reach)
+        };
+        let ip_range = if ip_reach.is_empty() {
+            build_1326_range(game, 1)
+        } else {
+            expand_to_1326(game, 1, &ip_reach)
+        };
+
+        let oop_cfvs_raw = game.get_boundary_cfvs_multi(ordinal, 0, 0);
+        let ip_cfvs_raw = game.get_boundary_cfvs_multi(ordinal, 1, 0);
+
+        let oop_cfvs = expand_to_1326(game, 0, &oop_cfvs_raw);
+        let ip_cfvs = expand_to_1326(game, 1, &ip_cfvs_raw);
+
+        let spot = spot_paths.and_then(|paths| paths.get(ordinal).cloned());
+
+        let strategy_at_prev = preceding_map
+            .and_then(|map| extract_strategy_at_prev(game, map, ordinal));
+
+        let event = BoundaryTraceEvent {
+            board: board_str,
+            pot,
+            stack,
+            spot,
+            oop_range_1326: oop_range,
+            ip_range_1326: ip_range,
+            oop_cfvs_1326: oop_cfvs,
+            ip_cfvs_1326: ip_cfvs,
+            strategy_at_prev,
+        };
+
+        tracer.trace(ordinal, iter, &event);
+    }
 }
 
 // ---------------------------------------------------------------------------

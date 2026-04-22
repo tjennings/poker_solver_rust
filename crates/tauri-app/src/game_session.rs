@@ -1773,6 +1773,9 @@ pub fn game_solve_core(
     matrix_snapshot_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
     street_boundary_config: Option<StreetBoundaryConfig>,
+    trace_boundaries: Option<String>,
+    trace_iters: Option<String>,
+    trace_dir: Option<String>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
@@ -1847,6 +1850,18 @@ pub fn game_solve_core(
     let max_iters = max_iterations.unwrap_or(200);
     let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
     let target_exp = target_exploitability.unwrap_or(3.0);
+
+    // Build trace config (empty trace_boundaries = no tracing = zero cost)
+    let trace_config = {
+        let boundaries = trace_boundaries.filter(|s| !s.trim().is_empty());
+        crate::boundary_trace::TraceConfig {
+            boundaries,
+            iters_str: trace_iters.unwrap_or_else(|| "last".to_string()),
+            dir: std::path::PathBuf::from(
+                trace_dir.unwrap_or_else(|| "./local_data/logs".to_string()),
+            ),
+        }
+    };
 
     // Reset solve state atomics
     let ss = ss_ref;
@@ -1935,6 +1950,20 @@ pub fn game_solve_core(
             );
         }
 
+        // Set up boundary tracer (no-op when disabled)
+        let tracer = trace_config.into_tracer(max_iters);
+        let spot_paths: Option<Vec<String>> = tracer.as_ref().and_then(|_| {
+            let n = game.num_boundary_nodes();
+            if n > 0 {
+                Some(crate::boundary_trace::build_boundary_spot_paths(&game))
+            } else {
+                None
+            }
+        });
+        let preceding_map = tracer.as_ref().map(|_| {
+            crate::boundary_trace::build_preceding_decision_map(&game)
+        });
+
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
@@ -1968,6 +1997,17 @@ pub fn game_solve_core(
             solve_step(&game, t);
             t += 1;
             ss_clone.iteration.store(t, Ordering::Relaxed);
+
+            // Capture boundary traces after this iteration's CFVs are cached.
+            if let Some(ref tr) = tracer {
+                crate::boundary_trace::capture_boundary_traces(
+                    &game,
+                    tr,
+                    spot_paths.as_deref(),
+                    preceding_map.as_ref(),
+                    t - 1,
+                );
+            }
 
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
@@ -2129,6 +2169,9 @@ pub fn game_solve(
     matrix_snapshot_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
     street_boundary_config: Option<StreetBoundaryConfig>,
+    trace_boundaries: Option<String>,
+    trace_iters: Option<String>,
+    trace_dir: Option<String>,
 ) -> Result<(), String> {
     game_solve_core(
         &session_state,
@@ -2138,6 +2181,9 @@ pub fn game_solve(
         matrix_snapshot_interval,
         range_clamp_threshold,
         street_boundary_config,
+        trace_boundaries,
+        trace_iters,
+        trace_dir,
     )
 }
 
@@ -2766,7 +2812,7 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -2779,7 +2825,7 @@ mod tests {
         gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Default mode (subgame) should reject when subgame is already solving
-        let result = game_solve_core(&gss, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2792,7 +2838,7 @@ mod tests {
         gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should reject when exact is already solving
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2808,7 +2854,7 @@ mod tests {
         // Exact mode should NOT be rejected (different mode)
         // It will still fail because it's a preflop node, but the error
         // should NOT be "already in progress"
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("already in progress"));
     }

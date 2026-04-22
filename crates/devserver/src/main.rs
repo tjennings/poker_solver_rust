@@ -170,6 +170,9 @@ struct GameSolveParams {
     matrix_snapshot_interval: Option<u32>,
     range_clamp_threshold: Option<f64>,
     street_boundary_config: Option<poker_solver_tauri::StreetBoundaryConfig>,
+    trace_boundaries: Option<String>,
+    trace_iters: Option<String>,
+    trace_dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -656,6 +659,9 @@ async fn handle_game_solve(
         params.matrix_snapshot_interval,
         params.range_clamp_threshold,
         params.street_boundary_config,
+        params.trace_boundaries,
+        params.trace_iters,
+        params.trace_dir,
     ))
 }
 
