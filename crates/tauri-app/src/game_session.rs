@@ -1852,6 +1852,10 @@ pub fn game_solve_core(
     let target_exp = target_exploitability.unwrap_or(3.0);
 
     // Build trace config (empty trace_boundaries = no tracing = zero cost)
+    eprintln!(
+        "[solve] trace params: boundaries={:?} iters={:?} dir={:?}",
+        trace_boundaries, trace_iters, trace_dir,
+    );
     let trace_config = {
         let boundaries = trace_boundaries.filter(|s| !s.trim().is_empty());
         crate::boundary_trace::TraceConfig {
@@ -1862,6 +1866,10 @@ pub fn game_solve_core(
             ),
         }
     };
+    eprintln!(
+        "[solve] trace_config: boundaries={:?} iters_str={} dir={:?}",
+        trace_config.boundaries, trace_config.iters_str, trace_config.dir,
+    );
 
     // Reset solve state atomics
     let ss = ss_ref;
@@ -1952,6 +1960,10 @@ pub fn game_solve_core(
 
         // Set up boundary tracer (no-op when disabled)
         let tracer = trace_config.into_tracer(max_iters);
+        eprintln!(
+            "[solve] tracer enabled: {} (max_iters={})",
+            tracer.is_some(), max_iters,
+        );
         let spot_paths: Option<Vec<String>> = tracer.as_ref().and_then(|_| {
             let n = game.num_boundary_nodes();
             if n > 0 {

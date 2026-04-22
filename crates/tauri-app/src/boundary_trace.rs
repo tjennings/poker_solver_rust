@@ -583,9 +583,15 @@ impl TraceFilter {
     pub fn parse(input: Option<&str>) -> Self {
         match input {
             Option::None => TraceFilter::None,
-            Some("all") => TraceFilter::All,
-            Some(csv) => {
-                let set: HashSet<usize> = csv
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return TraceFilter::None;
+                }
+                if trimmed.eq_ignore_ascii_case("all") {
+                    return TraceFilter::All;
+                }
+                let set: HashSet<usize> = trimmed
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
@@ -598,24 +604,28 @@ impl TraceFilter {
         }
     }
 
-    /// Parse iteration filter, with "last" support.
+    /// Parse iteration filter, with "last" support. Case-insensitive.
     ///
     /// `"last"` -> `Last(total_iters - 1)`, `"all"` -> `All`, `"0,9"` -> `Set`.
     pub fn parse_iters(input: &str, total_iters: u32) -> Self {
-        match input {
-            "last" => TraceFilter::Last(total_iters.saturating_sub(1) as usize),
-            "all" => TraceFilter::All,
-            csv => {
-                let set: HashSet<usize> = csv
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-                if set.is_empty() {
-                    TraceFilter::None
-                } else {
-                    TraceFilter::Set(set)
-                }
-            }
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return TraceFilter::None;
+        }
+        if trimmed.eq_ignore_ascii_case("last") {
+            return TraceFilter::Last(total_iters.saturating_sub(1) as usize);
+        }
+        if trimmed.eq_ignore_ascii_case("all") {
+            return TraceFilter::All;
+        }
+        let set: HashSet<usize> = trimmed
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if set.is_empty() {
+            TraceFilter::None
+        } else {
+            TraceFilter::Set(set)
         }
     }
 
