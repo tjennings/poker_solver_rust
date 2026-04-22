@@ -17,6 +17,14 @@ use range_solver::{solve_step, finalize, BoardState, PostFlopGame};
 const DEFAULT_SOLVE_ITERS: u32 = 500;
 
 /// Boundary evaluator that solves the downstream subtree exactly via DCFR.
+/// A solved river subtree game, ready for cfvalue queries with any reach.
+struct SolvedRiverGame {
+    /// The solved PostFlopGame (strategies frozen after finalize).
+    game: PostFlopGame,
+    /// The 5-card board for this river runout.
+    board_5: [u8; 5],
+}
+
 pub struct SubtreeExactEvaluator {
     /// Board cards at this boundary (3, 4, or 5 cards).
     board: Vec<u8>,
@@ -30,8 +38,11 @@ pub struct SubtreeExactEvaluator {
     parent_tree_config: TreeConfig,
     /// Number of DCFR iterations to run.
     solve_iters: u32,
-    /// Cache keyed by rounded reach digest.
+    /// Cache keyed by rounded reach digest (legacy bcfv path).
     cache: Mutex<HashMap<u64, (Vec<f32>, Vec<f32>)>>,
+    /// Lazily-built solved subtree games for the raw CFV path.
+    /// For 5-card boards: one game. For 4-card boards: up to 48 games.
+    solved_games: Mutex<Vec<SolvedRiverGame>>,
 }
 
 impl SubtreeExactEvaluator {
@@ -49,6 +60,7 @@ impl SubtreeExactEvaluator {
             parent_tree_config,
             solve_iters: DEFAULT_SOLVE_ITERS,
             cache: Mutex::new(HashMap::new()),
+            solved_games: Mutex::new(Vec::new()),
         }
     }
 
@@ -57,6 +69,173 @@ impl SubtreeExactEvaluator {
         self.solve_iters = iters;
         self
     }
+
+    /// Lazily build and cache the solved subtree games.
+    fn ensure_solved_games(&self, pot: i32, remaining_stack: f64) {
+        let mut games = self.solved_games.lock().expect("solved_games lock");
+        if !games.is_empty() {
+            return;
+        }
+        match self.board.len() {
+            5 => {
+                let board_5 = [
+                    self.board[0], self.board[1], self.board[2],
+                    self.board[3], self.board[4],
+                ];
+                let sg = build_solved_river_game(
+                    &board_5, &self.private_cards,
+                    &self.parent_initial_weights,
+                    &self.parent_tree_config,
+                    pot, remaining_stack, self.solve_iters,
+                );
+                games.push(sg);
+            }
+            4 => {
+                for river in 0..52u8 {
+                    if card_on_board(river, &self.board) { continue; }
+                    let board_5 = [
+                        self.board[0], self.board[1], self.board[2],
+                        self.board[3], river,
+                    ];
+                    // Zero out blocked hands in weights.
+                    let mut weights = self.parent_initial_weights.clone();
+                    for player in 0..2 {
+                        for (i, &(c1, c2)) in
+                            self.private_cards[player].iter().enumerate()
+                        {
+                            if card_blocks_hand(river, c1, c2) {
+                                weights[player][i] = 0.0;
+                            }
+                        }
+                    }
+                    let oop_live: f32 = weights[0].iter().sum();
+                    let ip_live: f32 = weights[1].iter().sum();
+                    if oop_live <= 0.0 || ip_live <= 0.0 { continue; }
+
+                    let sg = build_solved_river_game(
+                        &board_5, &self.private_cards, &weights,
+                        &self.parent_tree_config,
+                        pot, remaining_stack, self.solve_iters,
+                    );
+                    games.push(sg);
+                }
+                eprintln!(
+                    "[exact_subtree] built {} solved river games for turn boundary",
+                    games.len()
+                );
+            }
+            _ => panic!("raw CFV path not supported for board len {}", self.board.len()),
+        }
+    }
+
+    /// Compute raw per-hand chip CFVs using solved subtree games.
+    ///
+    /// For each solved river game, calls `root_cfvalues_with_reach` with the
+    /// given opponent reach (adjusted for blockers), then aggregates across
+    /// river runouts. Returns values in the same per-combo units that
+    /// `evaluate_internal` writes to its result array.
+    fn compute_raw_from_solved_games(
+        &self,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let num_oop = self.private_cards[0].len();
+        let num_ip = self.private_cards[1].len();
+        let mut oop_sum = vec![0.0f64; num_oop];
+        let mut ip_sum = vec![0.0f64; num_ip];
+        let mut oop_cnt = vec![0u32; num_oop];
+        let mut ip_cnt = vec![0u32; num_ip];
+
+        let games = self.solved_games.lock().expect("solved_games lock");
+        for sg in games.iter() {
+            let river_card = sg.board_5[4];
+            let sub_oop_cards = sg.game.private_cards(0);
+            let sub_ip_cards = sg.game.private_cards(1);
+
+            // Build reach for this river: zero out blocked hands, remap
+            // from parent ordering to subtree ordering.
+            let ip_reach_sub = remap_reach_to_subtree(
+                ip_reach, &self.private_cards[1], sub_ip_cards, river_card,
+            );
+            let oop_reach_sub = remap_reach_to_subtree(
+                oop_reach, &self.private_cards[0], sub_oop_cards, river_card,
+            );
+
+            // Get per-hand cfvalues with the given opponent reach.
+            let oop_cfv = range_solver::root_cfvalues_with_reach(
+                &sg.game, 0, &ip_reach_sub,
+            );
+            let ip_cfv = range_solver::root_cfvalues_with_reach(
+                &sg.game, 1, &oop_reach_sub,
+            );
+
+            // Remap back to parent ordering and accumulate.
+            let oop_parent = remap_cfvs_to_parent(
+                &oop_cfv, sub_oop_cards, &self.private_cards[0],
+            );
+            let ip_parent = remap_cfvs_to_parent(
+                &ip_cfv, sub_ip_cards, &self.private_cards[1],
+            );
+
+            for (h, &(c1, c2)) in self.private_cards[0].iter().enumerate() {
+                if !card_blocks_hand(river_card, c1, c2) {
+                    oop_sum[h] += oop_parent[h] as f64;
+                    oop_cnt[h] += 1;
+                }
+            }
+            for (h, &(c1, c2)) in self.private_cards[1].iter().enumerate() {
+                if !card_blocks_hand(river_card, c1, c2) {
+                    ip_sum[h] += ip_parent[h] as f64;
+                    ip_cnt[h] += 1;
+                }
+            }
+        }
+
+        let oop_raw: Vec<f32> = oop_sum.iter().zip(oop_cnt.iter())
+            .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { 0.0 })
+            .collect();
+        let ip_raw: Vec<f32> = ip_sum.iter().zip(ip_cnt.iter())
+            .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { 0.0 })
+            .collect();
+
+        (oop_raw, ip_raw)
+    }
+}
+
+/// Build and solve a single 5-card River game, returning the solved game
+/// object (strategies frozen). Used by the raw CFV path.
+fn build_solved_river_game(
+    board_5: &[u8; 5],
+    private_cards: &[Vec<(u8, u8)>; 2],
+    weights: &[Vec<f32>; 2],
+    parent_tree_config: &TreeConfig,
+    pot: i32,
+    remaining_stack: f64,
+    solve_iters: u32,
+) -> SolvedRiverGame {
+    let card_config = build_card_config(board_5, private_cards, weights);
+    let effective_stack =
+        (pot / 2).saturating_add(remaining_stack.round() as i32);
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::River,
+        starting_pot: pot,
+        effective_stack,
+        river_bet_sizes: parent_tree_config.river_bet_sizes.clone(),
+        depth_limit: None,
+        ..Default::default()
+    };
+
+    let tree = ActionTree::new(tree_config)
+        .unwrap_or_else(|e| panic!("subtree ActionTree failed: {e}"));
+    let mut game = PostFlopGame::with_config(card_config, tree)
+        .unwrap_or_else(|e| panic!("subtree PostFlopGame failed: {e}"));
+    game.allocate_memory(false);
+
+    run_dcfr(&mut game, solve_iters);
+    finalize(&mut game);
+
+    SolvedRiverGame { game, board_5: *board_5 }
 }
 
 /// Compute a cache key from two reach vectors by rounding to 3 decimals
@@ -400,6 +579,33 @@ fn solve_subtree(
     }
 }
 
+/// Remap reach from parent hand ordering to subtree hand ordering,
+/// zeroing out hands blocked by a river card.
+fn remap_reach_to_subtree(
+    parent_reach: &[f32],
+    parent_cards: &[(u8, u8)],
+    subtree_cards: &[(u8, u8)],
+    river_card: u8,
+) -> Vec<f32> {
+    let mut map: HashMap<(u8, u8), f32> = HashMap::with_capacity(parent_cards.len());
+    for (i, &(c1, c2)) in parent_cards.iter().enumerate() {
+        let key = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+        let r = parent_reach.get(i).copied().unwrap_or(0.0);
+        if card_blocks_hand(river_card, c1, c2) {
+            map.insert(key, 0.0);
+        } else {
+            map.insert(key, r);
+        }
+    }
+    subtree_cards
+        .iter()
+        .map(|&(c1, c2)| {
+            let key = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+            map.get(&key).copied().unwrap_or(0.0)
+        })
+        .collect()
+}
+
 /// Remap CFVs from subtree hand ordering to parent hand ordering.
 fn remap_cfvs_to_parent(
     subtree_cfvs: &[f32],
@@ -492,6 +698,24 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
         let mut cache = self.cache.lock().expect("cache lock poisoned");
         cache.insert(key, result.clone());
         result
+    }
+
+    fn compute_raw_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        // Only support river and turn boundaries.
+        if self.board.len() < 4 {
+            return None;
+        }
+        self.ensure_solved_games(pot, remaining_stack);
+        Some(self.compute_raw_from_solved_games(oop_reach, ip_reach))
     }
 }
 
@@ -838,6 +1062,96 @@ mod tests {
         for &bcfv in &oop_bcfv {
             assert!(bcfv.is_finite(), "bcfv must be finite, got {bcfv}");
         }
+    }
+
+    #[test]
+    fn compute_raw_cfvs_both_returns_some() {
+        let eval = make_river_evaluator(50);
+        let num_oop = eval.private_cards[0].len();
+        let num_ip = eval.private_cards[1].len();
+        let oop_reach = vec![1.0f32; num_oop];
+        let ip_reach = vec![1.0f32; num_ip];
+        let result = eval.compute_raw_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
+        );
+        assert!(result.is_some(), "SubtreeExactEvaluator should support raw CFV path");
+        let (oop_raw, ip_raw) = result.unwrap();
+        assert_eq!(oop_raw.len(), num_oop);
+        assert_eq!(ip_raw.len(), num_ip);
+        for &v in &oop_raw {
+            assert!(v.is_finite(), "raw OOP CFV should be finite, got {v}");
+        }
+        for &v in &ip_raw {
+            assert!(v.is_finite(), "raw IP CFV should be finite, got {v}");
+        }
+    }
+
+    #[test]
+    fn raw_cfvs_match_reference_full_tree_river() {
+        // Build a reference full-tree River game and compare raw CFVs.
+        let flop = flop_from_str("7h 5d 2c").unwrap();
+        let turn_card: u8 = 7; // 3s
+        let river_card: u8 = 30; // 9h
+        let board = vec![flop[0], flop[1], flop[2], turn_card, river_card];
+
+        let oop_range: Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: Range = "TT,99,88".parse().unwrap();
+        let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1 << c));
+        let (oop_hands, oop_weights) = oop_range.get_hands_weights(board_mask);
+        let (ip_hands, ip_weights) = ip_range.get_hands_weights(board_mask);
+
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 200,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+
+        // Build the reference game directly
+        let card_config = build_card_config(
+            &board,
+            &[oop_hands.clone(), ip_hands.clone()],
+            &[oop_weights.clone(), ip_weights.clone()],
+        );
+        let ref_tree = ActionTree::new(tree_config.clone()).unwrap();
+        let mut ref_game = PostFlopGame::with_config(card_config, ref_tree).unwrap();
+        ref_game.allocate_memory(false);
+        run_dcfr(&mut ref_game, 500);
+        finalize(&mut ref_game);
+        // root_cfvalues returns per-combo cfvalues (the same units as evaluate_internal result)
+        let ref_oop = range_solver::root_cfvalues(&ref_game, 0);
+
+        // Build the evaluator
+        let eval = SubtreeExactEvaluator::new(
+            board,
+            [oop_hands.clone(), ip_hands.clone()],
+            [oop_weights.clone(), ip_weights.clone()],
+            tree_config,
+        ).with_solve_iters(500);
+
+        let num_oop = oop_hands.len();
+        let num_ip = ip_hands.len();
+        let oop_reach = vec![1.0f32; num_oop];
+        let ip_reach = vec![1.0f32; num_ip];
+        let (oop_raw, _) = eval.compute_raw_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
+        ).expect("should return Some");
+
+        // Raw CFVs should match reference root_cfvalues within DCFR
+        // convergence tolerance. root_cfvalues are in per-combo chip units.
+        let mut max_err = 0.0f64;
+        for (h, (&raw, &reference)) in oop_raw.iter().zip(ref_oop.iter()).enumerate() {
+            let err = (raw as f64 - reference as f64).abs();
+            if err > max_err { max_err = err; }
+            let tol = 0.1 * reference.abs().max(0.01) as f64; // 10% relative tolerance
+            assert!(
+                err <= tol,
+                "hand {h}: raw={raw:.6} ref={reference:.6} err={err:.6} tol={tol:.6}"
+            );
+        }
+        eprintln!("[raw_cfvs_match_reference] max_err={max_err:.6}");
     }
 
     #[test]
