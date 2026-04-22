@@ -2065,26 +2065,26 @@ pub fn game_solve_core(
             }
         }
 
-        // Flush "last iter" traces even when early termination fired before
-        // reaching max_iters (TraceFilter::Last was precomputed as max_iters-1).
-        // Only fire if the natural loop didn't already capture this iter — the
-        // normal in-loop path captures iter=t-1 AFTER incrementing t, so when
-        // t == max_iters and Last(max_iters-1) matched naturally, we skip.
+        // Finalize: normalize strategy, compute EVs.
+        // (This replaces the per-node strategy buffer with the CFR
+        // time-averaged equilibrium — the same values the UI reads.)
+        finalize(&mut game);
+
+        // Flush the "last iter" trace AFTER finalize so the strategy recorded
+        // matches the UI's displayed (time-averaged) strategy. Runs whether or
+        // not the natural in-loop path caught iter=last — this record reflects
+        // the *finalized* equilibrium strategy, which is distinct from any
+        // per-iter raw strategy captured inside the loop.
         if let Some(ref tr) = tracer {
             let final_iter = t.saturating_sub(1);
-            if t < max_iters {
-                crate::boundary_trace::capture_boundary_traces_forced(
-                    &game,
-                    tr,
-                    spot_paths.as_deref(),
-                    preceding_map.as_ref(),
-                    final_iter,
-                );
-            }
+            crate::boundary_trace::capture_boundary_traces_forced(
+                &game,
+                tr,
+                spot_paths.as_deref(),
+                preceding_map.as_ref(),
+                final_iter,
+            );
         }
-
-        // Finalize: normalize strategy, compute EVs
-        finalize(&mut game);
         game.back_to_root();
         game.cache_normalized_weights();
         let player = game.current_player();

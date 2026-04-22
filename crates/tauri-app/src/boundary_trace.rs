@@ -681,6 +681,19 @@ pub fn count_nonzero_combos(range: &[f32]) -> usize {
 
 /// Format a single boundary trace event as a human-readable TXT record.
 pub fn format_trace_txt(iter: u32, boundary_ord: usize, event: &BoundaryTraceEvent) -> String {
+    format_trace_txt_impl(iter, boundary_ord, event, false)
+}
+
+/// Same as `format_trace_txt` but marks the header with `FINAL` to indicate
+/// the record reflects the post-`finalize()` time-averaged strategy (matches
+/// what the UI displays). Used for the one-shot capture after the solve loop
+/// exits. Per-iter captures inside the loop use `format_trace_txt` which
+/// shows the raw current-iter strategy (useful for convergence diagnostics).
+pub fn format_trace_txt_final(iter: u32, boundary_ord: usize, event: &BoundaryTraceEvent) -> String {
+    format_trace_txt_impl(iter, boundary_ord, event, true)
+}
+
+fn format_trace_txt_impl(iter: u32, boundary_ord: usize, event: &BoundaryTraceEvent, is_final: bool) -> String {
     let mut out = String::with_capacity(4096);
 
     // Header line
@@ -689,9 +702,10 @@ pub fn format_trace_txt(iter: u32, boundary_ord: usize, event: &BoundaryTraceEve
     } else {
         0.0
     };
+    let final_tag = if is_final { " FINAL" } else { "" };
     let _ = writeln!(
         out,
-        "[iter={iter} boundary={boundary_ord} board={} pot={} stack={} spr={spr:.2}]",
+        "[iter={iter}{final_tag} boundary={boundary_ord} board={} pot={} stack={} spr={spr:.2}]",
         event.board,
         event.pot,
         event.stack as i64,
@@ -810,7 +824,14 @@ impl BoundaryTracer {
             return;
         }
 
-        let txt = format_trace_txt(iter, ord, event);
+        // Force-flagged captures reflect the post-finalize time-averaged
+        // strategy and are marked FINAL in the header so consumers can tell
+        // them apart from per-iter raw captures.
+        let txt = if force_iter {
+            format_trace_txt_final(iter, ord, event)
+        } else {
+            format_trace_txt(iter, ord, event)
+        };
 
         let mut handles = self.handles.lock().expect("tracer lock poisoned");
         let writer = handles.entry(ord).or_insert_with(|| {
