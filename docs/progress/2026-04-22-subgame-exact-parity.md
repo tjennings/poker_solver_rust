@@ -77,3 +77,23 @@ Status: FAIL (131 mbb gap at best, 27K mbb at worst)
 Status: FAIL (root cause identified: cfv_to_bcfv architecture is broken)
 
 **Commits:** `ebb32128` docs(progress): iteration 2 — cfv_to_bcfv clamping ineffective
+
+## Iteration 5 — 2026-04-22 (Per-river enumeration approach #3)
+
+**Baseline before:** exact_exp=77.67 mbb (turn spot JhTh9h7d, 150 iters), subgame_exp=8497 mbb (previous approach), delta=1.000
+
+**Diagnosis:** Implemented approach #3 from the followup doc: per-river-card enumeration. Instead of solving a single Turn+River game, enumerate each of the 48 valid river cards and solve each as a separate 5-card River game. This eliminates the chance_factor issue that broke the previous Turn game approach.
+
+Three sub-approaches were tried:
+1. **expected_values with uniform weights**: Converts chip EV to bcfv via `(ev - half_pot) / half_pot`. Failed with subgame_exp=6919 mbb because expected_values includes opponent range weighting that double-counts with evaluate_boundary_single's cfreach_adj.
+2. **root_cfvalues + cfv_to_bcfv with uniform weights**: Uses cfv_to_bcfv formula `bcfv[h] = cfv[h] * N_sub / (half_pot * cfreach_adj[h])`. N_sub cancels out correctly. Failed with subgame_exp=52281 mbb because uniform weights produce bcfv values that don't match the parent's actual reach distribution.
+3. **root_cfvalues + cfv_to_bcfv with boundary reach**: Uses actual boundary reach from DCFR as initial weights. Produces reasonable bcfv values (range [-1, 2], mean near 0). Still produces all-in strategy (subgame_exp=8417 mbb).
+
+Key diagnostic finding: zeroing ALL bcfv values produces subgame_exp=0.0 mbb with reasonable strategy (0.616 mean mass). Confirms tree structure is correct; issue is purely in bcfv-to-strategy interaction.
+
+**Fix applied:** Per-river enumeration with boundary reach + cfv_to_bcfv.
+
+**Result after:** exact_exp=77.67 mbb, subgame_exp=8417 mbb, worst_delta=1.000
+Status: FAIL (delta=1.000, per-river bcfv values look numerically correct but integration with evaluate_boundary_single's lazy caching produces all-in strategy)
+
+**Commits:** `cc82d6de` per-river enumeration, `735c6fcf` CLI fix, `fdd1cdd5` boundary reach, `1c251e35` root_cfvalues + cfv_to_bcfv, `07438ba3` uniform weights, `30028f79` boundary reach + root_cfvalues

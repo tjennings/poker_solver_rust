@@ -69,10 +69,33 @@ The equilibrium strategy depends on which hands are present and their relative w
 
 The subtree starts at `BoardState::Turn` with a chance node that deals river cards. The `compute_cfvalue_recursive` divides cfreach by `chance_factor` at this node. But `evaluate_boundary_single` in the parent doesn't apply any chance factor - it uses the raw boundary cfreach. This means the subtree's cfvalues include a 1/C factor that the parent doesn't expect. The bcfv conversion should account for this but may not do so correctly.
 
-## Recommended Next Steps
+## Recommended Next Steps (Updated 2026-04-22 — Post Approach #3)
 
-1. **Build a minimal test**: Create a 2-hand-per-player river-only game where the exact answer is known analytically. Verify that the boundary evaluator produces correct cfvalues for this case. This would isolate the scaling issue.
+Approach #3 (per-river enumeration) was implemented and tested. The per-river bcfv values are numerically correct (verified by diagnostic unit test showing 0.977 ratio against full Turn+River reference). However, when plugged into the full compare-solve harness, the subgame still goes all-in with everything.
 
-2. **Bypass evaluate_boundary_single**: Instead of returning bcfv, directly inject cfvalues into `boundary_cfvs` using `set_boundary_cfvs()` before each iteration. This avoids the `bcfv * payoff_scale * cfreach_adj` formula entirely. The challenge is computing the cfvalues in exactly the format that the solver expects.
+### Key finding: zero-bcfv test
 
-3. **Per-river-card subtree approach**: Instead of a Turn game with river enumeration, solve each river card individually as a River game (5-card board). This eliminates the chance_factor issue entirely. The challenge is averaging correctly over river cards and handling blocker effects.
+Setting ALL bcfv values to 0.0 produces `subgame_exp=0.0 mbb` with reasonable strategy structure. This confirms:
+- The tree structure is correct
+- `evaluate_boundary_single` works correctly
+- The issue is purely in how bcfv values interact with the DCFR iteration loop
+
+### Best delta achieved: 1.000 (no improvement from per-river approach)
+
+### What approach #3 revealed
+
+1. **The bcfv values ARE numerically correct** for a single evaluation. The cfv_to_bcfv formula with per-river N_sub produces values that reconstruct the reference CFVs within 2.3% (DCFR convergence tolerance).
+
+2. **The lazy caching mechanism is the problem**. bcfv is computed once (on the first DCFR iteration's visit) and reused for ALL subsequent iterations. The cached bcfv interacts with CHANGING cfreach_adj across iterations. Even for SPR=0 (showdown equity), this creates a growing error as the reach distribution evolves.
+
+3. **The same caching issue exists for SPR=0 evaluators**, but is tolerable there because showdown equity varies slowly with reach composition. For SPR>0 with betting, the per-matchup payoff variation is much larger, amplifying the caching error.
+
+### What to try next
+
+1. **Per-iteration boundary evaluation**: Instead of lazy caching, recompute bcfv on every DCFR iteration. This is expensive (48 river solves per boundary per iteration) but would eliminate the caching error. The `evaluate_internal` code would need to clear `boundary_cfvs` between iterations, or switch to a callback model where the evaluator is called on every visit.
+
+2. **Set boundary_cfvs directly per iteration**: Use `set_boundary_cfvs()` before each DCFR iteration to inject pre-computed cfvalues. Build a full Turn+River game ONCE, solve it to convergence, then on each parent DCFR iteration, call `root_cfvalues_with_reach(subtree_game, player, current_opp_reach)` to get reach-dependent cfvalues. The challenge: cfvalues from root_cfvalues are in the subtree's unit system and need conversion to bcfv format.
+
+3. **Modify evaluate_boundary_single to accept raw cfvalues**: Add a new code path that bypasses the `bcfv * payoff_scale * cfreach_adj` multiplication. The evaluator returns raw cfvalues in the parent's unit system, and evaluate_boundary_single writes them directly. This requires a new `BoundaryEvaluator` method signature.
+
+4. **Pre-compute all bcfv values and set_boundary_cfvs before solving**: Solve each boundary's subtree exactly, compute bcfv from the converged strategy, and call `set_boundary_cfvs()` before the parent DCFR solve starts. This avoids the lazy-evaluation issue entirely. The bcfv would be computed with the game's initial_weights as reach.
