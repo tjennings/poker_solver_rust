@@ -129,3 +129,42 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `canonicalize_board` | Canonicalize board cards via suit isomorphism |
 | `list_agents` | List available agent TOML configs |
 | `get_combo_classes` | Get combo-level hand class breakdown for a cell |
+
+## Boundary Tracing
+
+When solving hybrid (cfvnet) spots, you can enable per-boundary trace logging to capture what the boundary evaluator sees and produces at each depth boundary.
+
+### Enabling from Settings
+
+1. Open **Settings** in the explorer UI
+2. Under **Boundary Tracing (debug)**, set:
+   - **Boundaries to trace**: ordinal indices (e.g. `42`, `0,42,100`, or `all`)
+   - **Iterations to trace**: `last` (default), `all`, or specific indices (e.g. `0,49,99`)
+3. Leave "Boundaries to trace" empty to disable tracing (zero performance cost)
+
+### Output
+
+Trace files are written to `./local_data/logs/boundary_<ord>.txt` (created automatically).
+
+Each record has this format:
+
+```
+[iter=50 boundary=42 board=JdTh9dQc pot=88 stack=78 spr=0.89]
+Spot: sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c
+OOP range (168 combos): AA:6/6:1.00 KK:6/6:0.98 AKs:4/4:0.90 ...
+IP range (197 combos):  QQ:6/6:1.00 AKs:4/4:0.80 ...
+OOP CFVs (chips): AA:+3.45 KK:+2.10 AKs:+1.80 ...
+IP CFVs  (chips): ...
+Strategy at preceding decision (node #1234, OOP to act):
+  Actions: [check, bet33%, allin]
+  AA:  [0.00, 0.30, 0.70]
+  KK:  [0.20, 0.80, 0.00]
+  AKo: [0.80, 0.20, 0.00]
+  ...
+---
+```
+
+- **combos** = distinct card pairs with nonzero weight (not 169 hand classes)
+- **spr** = stack / pot, rounded to 2 decimals
+- **Strategy section** = per-hand-class probability over actions at the nearest ancestor decision node, sorted by descending reach weight
+- `---` separates records within a file
