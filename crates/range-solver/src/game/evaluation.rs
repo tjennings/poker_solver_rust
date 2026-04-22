@@ -144,17 +144,37 @@ impl PostFlopGame {
                         } else {
                             (opp_reach_ref.as_slice(), player_reach_ref.as_slice())
                         };
-                        let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+                        // Try raw CFV path first — values already integrated
+                        // over opponent reach, bypass bcfv * payoff_scale * cfreach_adj.
+                        if let Some((oop_raw, ip_raw)) = evaluator.compute_raw_cfvs_both(
                             pot, remaining, oop_reach, ip_reach,
                             num_oop, num_ip, 0,
-                        );
-                        *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_cfvs;
-                        *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_cfvs;
+                        ) {
+                            *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_raw;
+                            *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_raw;
+                            if let Some(flag) = self.boundary_is_raw.get(ordinal) {
+                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else {
+                            let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
+                                pot, remaining, oop_reach, ip_reach,
+                                num_oop, num_ip, 0,
+                            );
+                            *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_cfvs;
+                            *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_cfvs;
+                        }
                     }
                 }
 
                 let bcfvs = self.boundary_cfvs[bcfv_index].lock().unwrap();
-                self.evaluate_boundary_single(result, node, player, player_cards, opponent_cards, cfreach, &bcfvs, half_pot);
+                let is_raw = self.boundary_is_raw
+                    .get(ordinal)
+                    .map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                if is_raw {
+                    self.evaluate_boundary_raw(result, node, player, &bcfvs);
+                } else {
+                    self.evaluate_boundary_single(result, node, player, player_cards, opponent_cards, cfreach, &bcfvs, half_pot);
+                }
                 return;
             }
 
@@ -580,6 +600,35 @@ impl PostFlopGame {
                 let bcfv = *bcfvs.get_unchecked(i as usize) as f64;
                 *result.get_unchecked_mut(i as usize) =
                     (bcfv * payoff_scale * cfreach_adj) as f32;
+            }
+        }
+    }
+
+    /// Evaluates a raw-CFV boundary terminal.
+    ///
+    /// The cached values are already reach-integrated chip CFVs — write them
+    /// directly to result without the `bcfv * payoff_scale * cfreach_adj`
+    /// formula used by [`evaluate_boundary_single`].
+    fn evaluate_boundary_raw(
+        &self,
+        result: &mut [f32],
+        node: &PostFlopNode,
+        player: usize,
+        raw_cfvs: &[f32],
+    ) {
+        let valid_indices = if node.river != NOT_DEALT {
+            &self.valid_indices_river[card_pair_to_index(node.turn, node.river)]
+        } else if node.turn != NOT_DEALT {
+            &self.valid_indices_turn[node.turn as usize]
+        } else {
+            &self.valid_indices_flop
+        };
+
+        let player_indices = &valid_indices[player];
+        for &i in player_indices {
+            unsafe {
+                let v = *raw_cfvs.get_unchecked(i as usize);
+                *result.get_unchecked_mut(i as usize) = v;
             }
         }
     }
@@ -1363,5 +1412,177 @@ mod tests {
             single, 0,
             "compute_cfvs (single-side) should never be called, got {single}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Raw CFV boundary evaluation (bypasses bcfv * payoff_scale * cfreach_adj)
+    // -----------------------------------------------------------------
+
+    /// Mock evaluator that returns raw per-hand chip CFVs via compute_raw_cfvs_both.
+    /// Returns known constant values so we can verify the solver writes them directly.
+    struct MockRawCfvEvaluator {
+        num_oop: usize,
+        num_ip: usize,
+        raw_called: std::sync::atomic::AtomicU32,
+        legacy_called: std::sync::atomic::AtomicU32,
+    }
+
+    impl MockRawCfvEvaluator {
+        fn new(num_oop: usize, num_ip: usize) -> Self {
+            Self {
+                num_oop,
+                num_ip,
+                raw_called: std::sync::atomic::AtomicU32::new(0),
+                legacy_called: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl crate::game::BoundaryEvaluator for MockRawCfvEvaluator {
+        fn compute_cfvs(
+            &self,
+            player: usize,
+            _pot: i32,
+            _remaining_stack: f64,
+            _opponent_reach: &[f32],
+            _num_hands: usize,
+            _continuation_index: usize,
+        ) -> Vec<f32> {
+            self.legacy_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = if player == 0 { self.num_oop } else { self.num_ip };
+            vec![0.0; n]
+        }
+
+        fn compute_cfvs_both(
+            &self,
+            _pot: i32,
+            _remaining_stack: f64,
+            _oop_reach: &[f32],
+            _ip_reach: &[f32],
+            _num_oop: usize,
+            _num_ip: usize,
+            _continuation_index: usize,
+        ) -> (Vec<f32>, Vec<f32>) {
+            self.legacy_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (vec![0.0; self.num_oop], vec![0.0; self.num_ip])
+        }
+
+        fn compute_raw_cfvs_both(
+            &self,
+            _pot: i32,
+            _remaining_stack: f64,
+            _oop_reach: &[f32],
+            _ip_reach: &[f32],
+            _num_oop: usize,
+            _num_ip: usize,
+            _continuation_index: usize,
+        ) -> Option<(Vec<f32>, Vec<f32>)> {
+            self.raw_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Return known values: 5.0 for every OOP hand, -3.0 for every IP hand.
+            Some((vec![5.0; self.num_oop], vec![-3.0; self.num_ip]))
+        }
+    }
+
+    #[test]
+    fn raw_cfv_evaluator_bypasses_bcfv_formula() {
+        let game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "need boundary nodes");
+
+        let num_oop = game.num_private_hands(0);
+        let num_ip = game.num_private_hands(1);
+
+        let mocks: Vec<Arc<MockRawCfvEvaluator>> = (0..n_boundary)
+            .map(|_| Arc::new(MockRawCfvEvaluator::new(num_oop, num_ip)))
+            .collect();
+
+        let game = {
+            let mut g = game;
+            g.boundary_evaluator = None;
+            g.per_boundary_evaluators = mocks
+                .iter()
+                .map(|m| m.clone() as Arc<dyn crate::game::BoundaryEvaluator>)
+                .collect();
+            g
+        };
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let ordinal = game.node_to_boundary[bd_idx] as usize;
+        let node = game.node_arena[bd_idx].lock();
+
+        // Evaluate from OOP's perspective.
+        let cfreach_ip: Vec<f32> = vec![1.0; num_ip];
+        let mut result: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_ip);
+
+        let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
+
+        // Raw CFV path should be used (not the legacy bcfv path).
+        let raw_calls = mocks[ordinal].raw_called.load(std::sync::atomic::Ordering::SeqCst);
+        let legacy_calls = mocks[ordinal].legacy_called.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(raw_calls, 1, "compute_raw_cfvs_both should be called once");
+        assert_eq!(legacy_calls, 0, "legacy compute_cfvs_both should NOT be called");
+
+        // The raw values (5.0 per OOP hand) should be written directly.
+        // In the raw path, result[h] = raw_cfv[h] — no payoff_scale * cfreach_adj.
+        let nonzero: Vec<f32> = values.iter().copied().filter(|&v| v != 0.0).collect();
+        assert!(!nonzero.is_empty(), "should have nonzero values");
+        for &v in &nonzero {
+            assert!(
+                (v - 5.0).abs() < 1e-4,
+                "raw CFV should be written directly (expected 5.0), got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_cfv_evaluator_called_every_iteration_after_clear() {
+        let game = make_turn_game_depth_limited();
+        let n_boundary = game.num_boundary_nodes();
+        assert!(n_boundary > 0, "need boundary nodes");
+
+        let num_oop = game.num_private_hands(0);
+        let num_ip = game.num_private_hands(1);
+
+        let mocks: Vec<Arc<MockRawCfvEvaluator>> = (0..n_boundary)
+            .map(|_| Arc::new(MockRawCfvEvaluator::new(num_oop, num_ip)))
+            .collect();
+
+        let game = {
+            let mut g = game;
+            g.boundary_evaluator = None;
+            g.per_boundary_evaluators = mocks
+                .iter()
+                .map(|m| m.clone() as Arc<dyn crate::game::BoundaryEvaluator>)
+                .collect();
+            g
+        };
+
+        let bd_idx = find_boundary_node(&game).expect("should have a boundary node");
+        let ordinal = game.node_to_boundary[bd_idx] as usize;
+        let node = game.node_arena[bd_idx].lock();
+
+        // First evaluation
+        let cfreach_ip: Vec<f32> = vec![1.0; num_ip];
+        let mut result: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result, &node, 0, &cfreach_ip);
+
+        // Clear boundary cfvs (simulating start of next DCFR iteration)
+        game.clear_boundary_cfvs();
+
+        // Second evaluation — should call the evaluator again (not use stale cache)
+        let mut result2: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
+        game.evaluate_internal(&mut result2, &node, 0, &cfreach_ip);
+
+        let raw_calls = mocks[ordinal].raw_called.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(raw_calls, 2, "compute_raw_cfvs_both should be called twice after clear");
+    }
+
+    #[test]
+    fn default_compute_raw_cfvs_both_returns_none() {
+        // Verify that the default implementation of the trait method returns None.
+        let mock = MockBothSidesEvaluator::new(10, 10);
+        let result = mock.compute_raw_cfvs_both(100, 50.0, &[], &[], 10, 10, 0);
+        assert!(result.is_none(), "default impl should return None");
     }
 }
