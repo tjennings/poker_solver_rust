@@ -336,9 +336,15 @@ fn solve_subtree(
     ip_reach: &[f32],
     solve_iters: u32,
 ) -> (Vec<f32>, Vec<f32>) {
-    // Use boundary reach as initial weights so that expected_values computes
-    // reach-weighted EVs (analogous to SPR=0's reach-weighted equity).
-    let weights = [oop_reach.to_vec(), ip_reach.to_vec()];
+    // Use UNIFORM initial weights. The Nash equilibrium strategies are
+    // independent of initial weights (two-player zero-sum saddle point).
+    // The bcfv from root_cfvalues with uniform weights gives the average
+    // per-hand payoff against uniform opponents. evaluate_boundary_single
+    // then applies cfreach_adj to weight by actual opponent reach.
+    let weights = [
+        vec![1.0f32; private_cards[0].len()],
+        vec![1.0f32; private_cards[1].len()],
+    ];
 
     match board.len() {
         5 => {
@@ -636,10 +642,9 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_different_reaches_give_different_cfvs() {
-        // With boundary reach as initial weights, different opponent reach
-        // distributions produce different bcfv values (analogous to SPR=0's
-        // reach-weighted equity).
+    fn evaluator_bcfv_is_reach_independent() {
+        // With uniform initial weights, bcfv is independent of boundary
+        // reach. The reach-dependence is handled by evaluate_boundary_single.
         let eval = make_river_evaluator(50);
         let num_oop = eval.private_cards[0].len();
         let num_ip = eval.private_cards[1].len();
@@ -658,7 +663,7 @@ mod tests {
         let (oop2, _) = eval.compute_cfvs_both(
             100, 150.0, &oop_reach_full, &ip_reach_half, num_oop, num_ip, 0,
         );
-        assert_ne!(oop1, oop2, "different reaches should produce different CFVs");
+        assert_eq!(oop1, oop2, "bcfv should be reach-independent with uniform weights");
     }
 
     /// Helper: build a SubtreeExactEvaluator for a TURN-boundary spot.
