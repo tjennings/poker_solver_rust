@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::card::{CardConfig, NOT_DEALT};
+use range_solver::interface::Game;
 use range_solver::range::Range;
 use range_solver::{solve_step, finalize, BoardState, PostFlopGame};
 
@@ -106,11 +107,29 @@ fn build_card_config(
     }
 }
 
+/// Blocker-adjusted opponent reach sum for a hero hand.
+fn cfreach_adj(
+    h1: u8, h2: u8, opp_cards: &[(u8, u8)], opp_reach: &[f32],
+) -> f64 {
+    let mut sum = 0.0f64;
+    for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
+        if o1 == h1 || o1 == h2 || o2 == h1 || o2 == h2 {
+            continue;
+        }
+        let r = opp_reach.get(j).copied().unwrap_or(0.0);
+        if r > 0.0 {
+            sum += r as f64;
+        }
+    }
+    sum
+}
+
 /// Solve a single 5-card River game and return per-hand pot-normalised bcfv,
 /// remapped to parent hand ordering.
 ///
-/// bcfv = `(chip_ev - half_pot) / half_pot`, which is the same equity-like
-/// format that the SPR=0 path in `SolveBoundaryEvaluator` produces.
+/// Uses `root_cfvalues` to extract counterfactual values, then converts to
+/// bcfv via: `bcfv[h] = cfv[h] * N_sub / (half_pot * cfreach_adj[h])`.
+/// This mirrors the SPR=0 formula: `bcfv = (weighted_eq - 0.5) * 2`.
 fn solve_river_game(
     board_5: &[u8; 5],
     private_cards: &[Vec<(u8, u8)>; 2],
@@ -143,27 +162,50 @@ fn solve_river_game(
 
     run_dcfr(&mut game, solve_iters);
     finalize(&mut game);
-    game.cache_normalized_weights();
 
     let half_pot = pot as f64 / 2.0;
-    let oop_ev = game.expected_values(0);
-    let ip_ev = game.expected_values(1);
+    let n_sub = game.num_combinations();
+    let scale = n_sub / half_pot;
 
-    let oop_sub: Vec<f32> = oop_ev
+    // Compute per-hand bcfv using root_cfvalues and cfv_to_bcfv formula.
+    let oop_cfv = range_solver::root_cfvalues(&game, 0);
+    let ip_cfv = range_solver::root_cfvalues(&game, 1);
+
+    let sub_oop_cards = game.private_cards(0);
+    let sub_ip_cards = game.private_cards(1);
+    let sub_oop_weights = game.initial_weights(0);
+    let sub_ip_weights = game.initial_weights(1);
+
+    let oop_sub: Vec<f32> = oop_cfv
         .iter()
-        .map(|&ev| ((ev as f64 - half_pot) / half_pot) as f32)
+        .enumerate()
+        .map(|(h, &c)| {
+            if c == 0.0 { return 0.0; }
+            let (h1, h2) = sub_oop_cards[h];
+            let adj = cfreach_adj(h1, h2, sub_ip_cards, sub_ip_weights);
+            if adj <= 1e-9 { return 0.0; }
+            (c as f64 * scale / adj) as f32
+        })
         .collect();
-    let ip_sub: Vec<f32> = ip_ev
+
+    let ip_sub: Vec<f32> = ip_cfv
         .iter()
-        .map(|&ev| ((ev as f64 - half_pot) / half_pot) as f32)
+        .enumerate()
+        .map(|(h, &c)| {
+            if c == 0.0 { return 0.0; }
+            let (h1, h2) = sub_ip_cards[h];
+            let adj = cfreach_adj(h1, h2, sub_oop_cards, sub_oop_weights);
+            if adj <= 1e-9 { return 0.0; }
+            (c as f64 * scale / adj) as f32
+        })
         .collect();
 
     // Remap from subtree ordering to parent ordering.
     let oop_bcfv = remap_cfvs_to_parent(
-        &oop_sub, game.private_cards(0), &private_cards[0],
+        &oop_sub, sub_oop_cards, &private_cards[0],
     );
     let ip_bcfv = remap_cfvs_to_parent(
-        &ip_sub, game.private_cards(1), &private_cards[1],
+        &ip_sub, sub_ip_cards, &private_cards[1],
     );
 
     (oop_bcfv, ip_bcfv)
