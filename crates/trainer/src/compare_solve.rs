@@ -456,7 +456,7 @@ fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
             private_cards.clone(),
             initial_weights.clone(),
             tree_cfg.clone(),
-        ).with_solve_iters(100);
+        );
         per_boundary.push(Arc::new(eval));
     }
     game.per_boundary_evaluators = per_boundary;
