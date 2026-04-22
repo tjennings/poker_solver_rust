@@ -215,6 +215,26 @@ fn solve_subtree(
         num_combos,
     );
 
+    // Diagnostic: print sample bcfv values (first 5 non-zero for each player)
+    {
+        let oop_nonzero: Vec<_> = oop_bcfv.iter().enumerate()
+            .filter(|(_, &v)| v.abs() > 1e-6)
+            .take(5)
+            .collect();
+        let ip_nonzero: Vec<_> = ip_bcfv.iter().enumerate()
+            .filter(|(_, &v)| v.abs() > 1e-6)
+            .take(5)
+            .collect();
+        let oop_cfv_sample: Vec<_> = oop_cfv.iter().enumerate()
+            .filter(|(_, &v)| v.abs() > 1e-9)
+            .take(5)
+            .collect();
+        eprintln!(
+            "[subtree-diag] pot={pot} half_pot={half_pot:.1} N={num_combos:.1} \
+             oop_cfv_sample={oop_cfv_sample:?} oop_bcfv={oop_nonzero:?} ip_bcfv={ip_nonzero:?}"
+        );
+    }
+
     // Remap from subtree ordering to parent ordering.
     let oop_out = remap_cfvs_to_parent(
         &oop_bcfv, game.private_cards(0), &private_cards[0],
@@ -230,6 +250,13 @@ fn solve_subtree(
 ///
 /// For hand h: `bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])`
 /// where cfreach_adj is the blocker-adjusted opponent reach sum.
+///
+/// Numerically, when `cfreach_adj` is very small the division can produce
+/// extreme values. We clamp to `[-MAX_BCFV, MAX_BCFV]` to prevent such
+/// outliers from poisoning the parent solver. Hands with near-zero
+/// cfreach_adj are effectively unreachable and their bcfv will be
+/// multiplied by the same near-zero cfreach_adj in the parent, so the
+/// clamping has negligible impact on the final cfvalue.
 fn cfv_to_bcfv(
     cfv: &[f32],
     hero_cards: &[(u8, u8)],
@@ -238,6 +265,12 @@ fn cfv_to_bcfv(
     half_pot: f64,
     num_combos: f64,
 ) -> Vec<f32> {
+    // Maximum absolute bcfv: a hand can win at most 2 * effective_stack
+    // (all-in pot), which in pot-normalised units is at most ~10x half_pot.
+    const MAX_BCFV: f32 = 10.0;
+    // Minimum cfreach_adj to avoid division by near-zero.
+    const MIN_ADJ: f64 = 1e-6;
+
     let denom_base = half_pot / num_combos;
     cfv.iter()
         .enumerate()
@@ -247,10 +280,11 @@ fn cfv_to_bcfv(
             }
             let (h1, h2) = hero_cards[h];
             let adj = cfreach_adj(h1, h2, opp_cards, opp_reach);
-            if adj <= 0.0 {
+            if adj < MIN_ADJ {
                 return 0.0;
             }
-            (c as f64 / (denom_base * adj)) as f32
+            let raw = (c as f64 / (denom_base * adj)) as f32;
+            raw.clamp(-MAX_BCFV, MAX_BCFV)
         })
         .collect()
 }

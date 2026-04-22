@@ -30,3 +30,16 @@ Status: PASS (baseline, no boundary cut applied)
 Status: FAIL (delta=0.9832, +131.84 mbb exploitability gap)
 
 **Commits:** (no code change yet, diagnostic only)
+
+## Iteration 2 — 2026-04-22 12:10
+
+**Baseline before:** exact_exp=109.13 mbb, subgame_exp=240.97 mbb (from iter 1, no clamping)
+
+**Diagnosis:** Added MIN_ADJ=1e-6 and MAX_BCFV=10 clamping to `cfv_to_bcfv` to prevent numerical instability when cfreach_adj approaches zero. The clamping had negligible effect: subgame_exp dropped from 240.97 to 232.43 mbb, worst_cell unchanged (96s @ Check delta=0.9832). The problem is NOT numerical instability in the cfv_to_bcfv inversion. Root cause appears to be a more fundamental issue with the cfv_to_bcfv approach itself: the subtree game uses parent initial_weights for game construction but evaluates with boundary reach. The subtree's `num_combinations` (computed from parent initial_weights with a 4-card board) differs from what the parent solver expects, and the boundary reach remapping between subtree and parent ordering may introduce systematic errors. Next step: add diagnostic logging to compare cfreach_adj values between subtree and parent.
+
+**Fix applied:** `exact_subtree.rs:cfv_to_bcfv` — added MIN_ADJ threshold and MAX_BCFV clamp.
+
+**Result after:** exact_exp=109.13 mbb, subgame_exp=232.43 mbb, mean_mass=0.496, worst_cell="96s @ Check exact=0.0168 subgame=1.0000 delta=0.9832"
+Status: FAIL (delta=0.9832, +123.30 mbb gap, marginal improvement from 240.97)
+
+**Commits:** (clamping change, uncommitted)
