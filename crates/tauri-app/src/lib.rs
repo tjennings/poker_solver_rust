@@ -1,4 +1,5 @@
 pub mod boundary_trace;
+pub mod exact_subtree;
 mod exploration;
 pub mod game_session;
 pub mod postflop;
@@ -67,5 +68,5 @@ pub use game_session::{
     // Types
     GameSession, GameSessionState, GameState, GameMatrix, GameMatrixCell, GameAction,
     SolveBoundaryEvaluator, build_solve_game,
-    StreetBoundaryConfig, StreetBoundaryMode, resolve_street_boundary,
+    StreetBoundaryConfig, StreetBoundaryMode, BoundaryKind, resolve_street_boundary,
 };

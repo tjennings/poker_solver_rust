@@ -406,6 +406,13 @@ enum Commands {
         /// Directory to write trace files (default: ./traces/).
         #[arg(long, default_value = "./traces")]
         trace_dir: PathBuf,
+
+        /// Maximum acceptable per-cell strategy delta (fraction, e.g. 0.001
+        /// = 0.1%). If any aggregated 13x13 cell probability differs by more
+        /// than this between exact and subgame, the harness exits with a
+        /// non-zero status. `0.0` disables the check (default).
+        #[arg(long, default_value_t = 0.0)]
+        tolerance: f32,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1330,6 +1337,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             trace_boundaries,
             trace_iters,
             trace_dir,
+            tolerance,
         } => {
             let parse_mode = |mode: &str, model: Option<String>, street: &str|
                 -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
@@ -1365,6 +1373,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 dump_boundary_cfvs,
                 sbc,
                 trace_config,
+                tolerance,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
