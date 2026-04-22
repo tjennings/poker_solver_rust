@@ -2027,6 +2027,19 @@ pub fn game_solve_core(
             }
         }
 
+        // Flush "last iter" traces even when early termination fired before
+        // reaching max_iters (TraceFilter::Last was precomputed as max_iters-1).
+        // Uses the actual exit iter (t-1) and bypasses the iter filter.
+        if let Some(ref tr) = tracer {
+            crate::boundary_trace::capture_boundary_traces_forced(
+                &game,
+                tr,
+                spot_paths.as_deref(),
+                preceding_map.as_ref(),
+                t.saturating_sub(1),
+            );
+        }
+
         // Finalize: normalize strategy, compute EVs
         finalize(&mut game);
         game.back_to_root();

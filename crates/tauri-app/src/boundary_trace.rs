@@ -432,6 +432,31 @@ pub fn capture_boundary_traces(
     preceding_map: Option<&HashMap<usize, (usize, Vec<String>)>>,
     iter: u32,
 ) {
+    capture_boundary_traces_impl(game, tracer, spot_paths, preceding_map, iter, false);
+}
+
+/// Variant that bypasses the iter filter — used at solve-loop exit so
+/// `TraceFilter::Last` (precomputed as `max_iters - 1`) still fires when
+/// early termination exits before reaching that iter. Still respects the
+/// ordinal filter.
+pub fn capture_boundary_traces_forced(
+    game: &range_solver::PostFlopGame,
+    tracer: &BoundaryTracer,
+    spot_paths: Option<&[String]>,
+    preceding_map: Option<&HashMap<usize, (usize, Vec<String>)>>,
+    iter: u32,
+) {
+    capture_boundary_traces_impl(game, tracer, spot_paths, preceding_map, iter, true);
+}
+
+fn capture_boundary_traces_impl(
+    game: &range_solver::PostFlopGame,
+    tracer: &BoundaryTracer,
+    spot_paths: Option<&[String]>,
+    preceding_map: Option<&HashMap<usize, (usize, Vec<String>)>>,
+    iter: u32,
+    force_iter: bool,
+) {
     let n_boundaries = game.num_boundary_nodes();
     if n_boundaries == 0 {
         return;
@@ -440,7 +465,12 @@ pub fn capture_boundary_traces(
     let boards = game.boundary_boards();
 
     for ordinal in 0..n_boundaries {
-        if !tracer.enabled(ordinal, iter) {
+        let enabled = if force_iter {
+            tracer.ordinal_enabled(ordinal)
+        } else {
+            tracer.enabled(ordinal, iter)
+        };
+        if !enabled {
             continue;
         }
 
@@ -493,7 +523,11 @@ pub fn capture_boundary_traces(
             strategy_at_prev,
         };
 
-        tracer.trace(ordinal, iter, &event);
+        if force_iter {
+            tracer.trace_forced(ordinal, iter, &event);
+        } else {
+            tracer.trace(ordinal, iter, &event);
+        }
     }
 }
 
@@ -739,9 +773,30 @@ impl BoundaryTracer {
         self.enabled_ordinals.matches(ord) && self.enabled_iters.matches(iter as usize)
     }
 
+    /// Returns true if this ordinal is enabled, ignoring the iter filter.
+    /// Used for the forced "capture-at-loop-exit" path.
+    pub fn ordinal_enabled(&self, ord: usize) -> bool {
+        self.enabled_ordinals.matches(ord)
+    }
+
     /// Write a trace event for one boundary at one iteration.
     pub fn trace(&self, ord: usize, iter: u32, event: &BoundaryTraceEvent) {
-        if !self.enabled(ord, iter) {
+        self.trace_inner(ord, iter, event, false);
+    }
+
+    /// Write a trace event, bypassing the iter filter. Still respects the
+    /// ordinal filter.
+    pub fn trace_forced(&self, ord: usize, iter: u32, event: &BoundaryTraceEvent) {
+        self.trace_inner(ord, iter, event, true);
+    }
+
+    fn trace_inner(&self, ord: usize, iter: u32, event: &BoundaryTraceEvent, force_iter: bool) {
+        let ok = if force_iter {
+            self.ordinal_enabled(ord)
+        } else {
+            self.enabled(ord, iter)
+        };
+        if !ok {
             return;
         }
 
