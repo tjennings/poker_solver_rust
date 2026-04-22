@@ -30,10 +30,12 @@ use serde::Deserialize;
 
 /// How to evaluate boundaries at a given street transition.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub enum StreetBoundaryMode {
     Exact,
     Cfvnet { model_path: String },
+    /// Cut here and solve the downstream subtree exactly (full CFR).
+    ExactSubtree,
 }
 
 impl Default for StreetBoundaryMode {
@@ -57,14 +59,23 @@ pub struct StreetBoundaryConfig {
     pub river: StreetBoundaryMode,
 }
 
+/// What kind of boundary evaluator to use at a depth cut.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoundaryKind {
+    /// Use an ONNX cfvnet model for boundary CFVs.
+    Cfvnet(String),
+    /// Solve the downstream subtree exactly (full CFR).
+    ExactSubtree,
+}
+
 /// Result of resolving a `StreetBoundaryConfig` against a root street.
 ///
-/// `None` means all-exact (no cut). `Some((depth, model_path))` means cut
-/// after `depth` street transitions using the given ONNX model.
+/// `None` means all-exact (no cut). `Some((depth, kind))` means cut
+/// after `depth` street transitions using the given boundary evaluator.
 pub fn resolve_street_boundary(
     config: &StreetBoundaryConfig,
     root_street: Street,
-) -> Option<(u8, String)> {
+) -> Option<(u8, BoundaryKind)> {
     // Streets to walk from root, in order.
     let streets: &[(Street, &StreetBoundaryMode)] = match root_street {
         Street::Flop => &[
@@ -82,13 +93,20 @@ pub fn resolve_street_boundary(
         Street::Preflop => return None, // preflop solve not supported
     };
 
-    // Street mode `X = Cfvnet` means "cut at the card deal BEFORE street X".
-    // Near tree = streets[0..index], so depth = index - 1.
-    // If the root street itself is Cfvnet, no cut possible — fall through.
+    // First non-Exact street defines the cut point.
+    // If the root street itself is non-Exact, no cut possible — skip it.
     for (i, (_street, mode)) in streets.iter().enumerate() {
-        if let StreetBoundaryMode::Cfvnet { model_path } = mode {
-            if i == 0 { continue; }
-            return Some(((i - 1) as u8, model_path.clone()));
+        if i == 0 && !matches!(mode, StreetBoundaryMode::Exact) {
+            continue;
+        }
+        match mode {
+            StreetBoundaryMode::Exact => {}
+            StreetBoundaryMode::Cfvnet { model_path } => {
+                return Some(((i - 1) as u8, BoundaryKind::Cfvnet(model_path.clone())));
+            }
+            StreetBoundaryMode::ExactSubtree => {
+                return Some(((i - 1) as u8, BoundaryKind::ExactSubtree));
+            }
         }
     }
     None // all exact
@@ -1335,18 +1353,19 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
 
     for (hand_idx, &(c1_raw, c2_raw)) in private_cards.iter().enumerate() {
         let (row, col, _) = card_pair_to_matrix(c1_raw, c2_raw);
+        let w = initial_weights[hand_idx] as f64;
         combo_counts[row][col] += 1;
-        weight_sums[row][col] += initial_weights[hand_idx] as f64;
+        weight_sums[row][col] += w;
         if let Some(evs) = hand_evs {
             if hand_idx < evs.len() {
-                ev_sums[row][col] += evs[hand_idx] as f64;
+                ev_sums[row][col] += evs[hand_idx] as f64 * w;
             }
         }
 
         let mut probs = Vec::with_capacity(num_actions);
         for (action_idx, prob_sum) in prob_sums[row][col].iter_mut().enumerate() {
             let prob = strategy[action_idx * num_hands + hand_idx];
-            *prob_sum += prob as f64;
+            *prob_sum += prob as f64 * w;
             probs.push(prob);
         }
 
@@ -1367,22 +1386,27 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
                 .map(|col| {
                     let (label, suited, pair) = matrix_cell_label(row, col);
                     let count = combo_counts[row][col];
-                    let probabilities = if count > 0 {
+                    let total_w = weight_sums[row][col];
+                    // Reach-weighted mean: P(action | class) = Σ P(action|combo) * w(combo) / Σ w(combo).
+                    // Using simple /count here would treat blocker-adjusted combos as
+                    // equally likely as full-weight ones, producing a misleading
+                    // aggregate for hand classes whose combos have uneven reach.
+                    let probabilities = if total_w > 0.0 {
                         prob_sums[row][col]
                             .iter()
-                            .map(|&s| (s / count as f64) as f32)
+                            .map(|&s| (s / total_w) as f32)
                             .collect()
                     } else {
                         vec![0.0; num_actions]
                     };
-                    let ev = if count > 0 && hand_evs.is_some() {
-                        Some((ev_sums[row][col] / count as f64) as f32)
+                    let ev = if total_w > 0.0 && hand_evs.is_some() {
+                        Some((ev_sums[row][col] / total_w) as f32)
                     } else {
                         None
                     };
                     let combos = std::mem::take(&mut combo_details[row][col]);
                     let weight = if count > 0 {
-                        (weight_sums[row][col] / count as f64) as f32
+                        (total_w / count as f64) as f32
                     } else {
                         0.0
                     };
@@ -1881,15 +1905,29 @@ pub fn game_solve_core(
     // from CWD looking for a `Cargo.toml` with `[workspace]`) so files
     // land in the project's local_data/logs regardless of whether the
     // solver is launched from the workspace root or a crate subdir.
+    //
+    // The resolved dir is further suffixed with `exact/` or `subgame/` so
+    // both modes can coexist without the user having to move files before
+    // running the other mode.
     let trace_config = {
         let boundaries = trace_boundaries.filter(|s| !s.trim().is_empty());
         let raw_dir = std::path::PathBuf::from(
             trace_dir.unwrap_or_else(|| "./local_data/logs".to_string()),
         );
-        let dir = if raw_dir.is_absolute() {
+        let base = if raw_dir.is_absolute() {
             raw_dir
         } else {
             resolve_against_workspace_root(&raw_dir)
+        };
+        let dir = if is_exact {
+            base.join("exact")
+        } else {
+            let subgame = base.join("subgame");
+            match &boundary_cut {
+                Some((_, BoundaryKind::Cfvnet(_))) => subgame.join("cfvnet"),
+                Some((_, BoundaryKind::ExactSubtree)) => subgame.join("exact_subtree"),
+                None => subgame,
+            }
         };
         if boundaries.is_some() {
             eprintln!("[solve] trace output dir: {}", dir.display());
@@ -1946,11 +1984,18 @@ pub fn game_solve_core(
             *ss_clone.solve_actions.write() = actions;
         }
 
-        // Set up neural boundary evaluators if a cut is active
+        // Set up boundary evaluators if a cut is active
         let n_boundaries = game.num_boundary_nodes();
-        if let Some((_, ref model_path)) = boundary_cut {
+        if let Some((_, ref kind)) = boundary_cut {
             if n_boundaries > 0 {
-                setup_neural_boundaries(&mut game, model_path);
+                match kind {
+                    BoundaryKind::Cfvnet(model_path) => {
+                        setup_neural_boundaries(&mut game, model_path);
+                    }
+                    BoundaryKind::ExactSubtree => {
+                        setup_exact_subtree_boundaries(&mut game);
+                    }
+                }
             }
         }
 
@@ -2039,7 +2084,7 @@ pub fn game_solve_core(
             // Capture boundary traces after this iteration's CFVs are cached.
             if let Some(ref tr) = tracer {
                 crate::boundary_trace::capture_boundary_traces(
-                    &game,
+                    &mut game,
                     tr,
                     spot_paths.as_deref(),
                     preceding_map.as_ref(),
@@ -2078,7 +2123,7 @@ pub fn game_solve_core(
         if let Some(ref tr) = tracer {
             let final_iter = t.saturating_sub(1);
             crate::boundary_trace::capture_boundary_traces_forced(
-                &game,
+                &mut game,
                 tr,
                 spot_paths.as_deref(),
                 preceding_map.as_ref(),
@@ -2159,6 +2204,43 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &str) {
     eprintln!(
         "[solve] neural-cfvnet mode: {} boundaries (ONNX)",
         n_boundaries,
+    );
+}
+
+/// Wire per-boundary `SubtreeExactEvaluator`s into the game's
+/// `per_boundary_evaluators` vector. Each boundary gets its own
+/// evaluator that solves the downstream subtree exactly via DCFR.
+fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
+    let boundary_boards = game.boundary_boards();
+    let n_boundaries = game.num_boundary_nodes();
+    if boundary_boards.is_empty() {
+        eprintln!("[solve] no boundary boards found; skipping exact subtree setup");
+        return;
+    }
+    let bet_sizes = game.tree_config().clone();
+    let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
+        Vec::with_capacity(n_boundaries);
+    let private_cards = [
+        game.private_cards(0).to_vec(),
+        game.private_cards(1).to_vec(),
+    ];
+    let initial_weights = [
+        game.initial_weights(0).to_vec(),
+        game.initial_weights(1).to_vec(),
+    ];
+    for board in boundary_boards {
+        let eval = crate::exact_subtree::SubtreeExactEvaluator::new(
+            board,
+            private_cards.clone(),
+            initial_weights.clone(),
+            bet_sizes.clone(),
+        );
+        per_boundary.push(Arc::new(eval));
+    }
+    game.per_boundary_evaluators = per_boundary;
+    game.boundary_evaluator = None;
+    eprintln!(
+        "[solve] exact-subtree mode: {n_boundaries} boundaries (full CFR)"
     );
 }
 
@@ -4134,7 +4216,7 @@ mod tests {
             },
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((1, "/models/river.onnx".to_string())));
+        assert_eq!(result, Some((1, BoundaryKind::Cfvnet("/models/river.onnx".to_string()))));
     }
 
     #[test]
@@ -4149,7 +4231,7 @@ mod tests {
             river: StreetBoundaryMode::Exact,
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((0, "/models/turn.onnx".to_string())));
+        assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string()))));
     }
 
     #[test]
@@ -4180,7 +4262,7 @@ mod tests {
         };
         // First non-exact wins: turn cut at depth 0 from flop root.
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((0, "/models/turn.onnx".to_string())));
+        assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string()))));
     }
 
     #[test]
@@ -4194,7 +4276,7 @@ mod tests {
         };
         // From turn root: near tree = turn, cut before river = depth=0.
         let result = resolve_street_boundary(&config, Street::Turn);
-        assert_eq!(result, Some((0, "/models/river.onnx".to_string())));
+        assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/river.onnx".to_string()))));
     }
 
     #[test]
@@ -4272,5 +4354,104 @@ mod tests {
         } else {
             panic!("expected Cfvnet");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // BoundaryKind + ExactSubtree tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sbc_exact_subtree_at_river_from_flop_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::ExactSubtree,
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((1, BoundaryKind::ExactSubtree)));
+    }
+
+    #[test]
+    fn sbc_exact_subtree_at_turn_from_flop_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::ExactSubtree,
+            river: StreetBoundaryMode::Exact,
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((0, BoundaryKind::ExactSubtree)));
+    }
+
+    #[test]
+    fn sbc_exact_subtree_at_river_from_turn_root() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::ExactSubtree,
+        };
+        let result = resolve_street_boundary(&config, Street::Turn);
+        assert_eq!(result, Some((0, BoundaryKind::ExactSubtree)));
+    }
+
+    #[test]
+    fn sbc_exact_subtree_at_root_street_is_ignored() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::ExactSubtree,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Exact,
+        };
+        assert_eq!(resolve_street_boundary(&config, Street::Flop), None);
+    }
+
+    #[test]
+    fn sbc_cfvnet_returns_boundary_kind_cfvnet() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/river.onnx".to_string(),
+            },
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(
+            result,
+            Some((1, BoundaryKind::Cfvnet("/models/river.onnx".to_string())))
+        );
+    }
+
+    #[test]
+    fn sbc_exact_subtree_wins_over_later_cfvnet() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::ExactSubtree,
+            river: StreetBoundaryMode::Cfvnet {
+                model_path: "/models/river.onnx".to_string(),
+            },
+        };
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(result, Some((0, BoundaryKind::ExactSubtree)));
+    }
+
+    #[test]
+    fn sbc_serde_roundtrip_exact_subtree() {
+        let config = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::ExactSubtree,
+            river: StreetBoundaryMode::Exact,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: StreetBoundaryConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed.turn, StreetBoundaryMode::ExactSubtree));
+    }
+
+    #[test]
+    fn sbc_serde_from_json_exact_subtree_tag() {
+        let json = r#"{
+            "flop": {"mode": "exact"},
+            "turn": {"mode": "exact_subtree"},
+            "river": {"mode": "exact"}
+        }"#;
+        let config: StreetBoundaryConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(config.turn, StreetBoundaryMode::ExactSubtree));
     }
 }
