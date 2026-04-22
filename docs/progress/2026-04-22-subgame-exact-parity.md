@@ -97,3 +97,27 @@ Key diagnostic finding: zeroing ALL bcfv values produces subgame_exp=0.0 mbb wit
 Status: FAIL (delta=1.000, per-river bcfv values look numerically correct but integration with evaluate_boundary_single's lazy caching produces all-in strategy)
 
 **Commits:** `cc82d6de` per-river enumeration, `735c6fcf` CLI fix, `fdd1cdd5` boundary reach, `1c251e35` root_cfvalues + cfv_to_bcfv, `07438ba3` uniform weights, `30028f79` boundary reach + root_cfvalues
+
+## Iteration 6 — 2026-04-22 (Round 3: Raw CFV path via compute_raw_cfvs_both)
+
+**Baseline before:** exact_exp=77.67 mbb (turn spot JhTh9h7d, 150 iters), subgame_exp=8417 mbb (bcfv path), delta=1.000
+
+**Diagnosis:** Implemented approach #3 from the followup plan: new `compute_raw_cfvs_both` trait method that returns per-hand chip CFVs already integrated over opponent reach, bypassing the `bcfv × payoff_scale × cfreach_adj` formula in `evaluate_boundary_single`.
+
+Three-part implementation:
+1. **BoundaryEvaluator trait** (`game/mod.rs`): Added `compute_raw_cfvs_both` with default `None` return. Added `boundary_is_raw` per-ordinal flag to switch between `evaluate_boundary_single` (legacy) and new `evaluate_boundary_raw` (direct write).
+2. **evaluate_internal** (`evaluation.rs`): K<=1 path tries `compute_raw_cfvs_both` first; if `Some(...)`, stores raw values and sets `boundary_is_raw` flag; new `evaluate_boundary_raw` writes values directly without cfreach_adj multiplication.
+3. **SubtreeExactEvaluator** (`exact_subtree.rs`): Builds Turn+River game once (check-check turn → chance → river decisions), caches the solved game, then calls `root_cfvalues_with_reach(game, player, boundary_opp_reach)` each iteration.
+
+**Key findings:**
+- **Zero-value sanity check PASSES:** Setting all raw CFVs to 0.0 produces subgame_exp=0.0 mbb, confirming the raw path plumbing works correctly.
+- **Integration test PASSES with zero error:** Small ranges (AA,KK,QQ vs TT,99,88) with turn bet sizes — bounded game root cfvalues match full game exactly.
+- **0.01x scaling test:** Reducing raw values by 100x drops subgame_exp from 2346 to 22.7 mbb, suggesting the raw values are correct in direction but the magnitude interacts badly with the seeded Turn strategy.
+- **Root cause:** The subtree evaluator solves a fresh game from scratch (un-seeded), while the parent solver's Turn strategy is seeded from the blueprint. The subtree's Nash equilibrium river strategy differs from the exact game's blueprint-seeded strategy, producing different boundary CFVs that push the Turn strategy in the wrong direction.
+
+**Fix applied:** `compute_raw_cfvs_both` trait method + `evaluate_boundary_raw` + Turn+River game approach.
+
+**Result after:** exact_exp=77.67 mbb, subgame_exp=2346 mbb, worst_delta=0.975
+Status: FAIL (delta=0.975, +2269 mbb gap — similar to previous bcfv-path result, confirming the issue is subtree strategy divergence, not the cfv formula)
+
+**Commits:** `6ccb55ca` trait method + wiring, `d626e19d` SubtreeExactEvaluator impl, `c8e56ee3` Turn+River game + integration test, `ed0d4a07` cleanup
