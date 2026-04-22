@@ -42,4 +42,17 @@ Status: FAIL (delta=0.9832, +131.84 mbb exploitability gap)
 **Result after:** exact_exp=109.13 mbb, subgame_exp=232.43 mbb, mean_mass=0.496, worst_cell="96s @ Check exact=0.0168 subgame=1.0000 delta=0.9832"
 Status: FAIL (delta=0.9832, +123.30 mbb gap, marginal improvement from 240.97)
 
-**Commits:** (clamping change, uncommitted)
+**Commits:** `ebb32128` docs(progress): iteration 2 — cfv_to_bcfv clamping ineffective
+
+## Iteration 3 — 2026-04-22 12:12 (Root cause identified)
+
+**Baseline before:** exact_exp=109.13 mbb, subgame_exp=232.43 mbb (turn spot with clamping)
+
+**Diagnosis:** Added diagnostic logging to `solve_subtree` revealing that ALL bcfv values are NEGATIVE for BOTH players at every boundary. In a zero-sum game, one player must have positive value when the other has negative, so both-negative indicates the cfv_to_bcfv scaling is fundamentally broken. The `root_cfvalues_with_reach` function returns per-combo cfvalues using boundary reach as opponent cfreach, then `cfv_to_bcfv` divides out `(half_pot / N) * cfreach_adj`. The cancellation requires the subtree's `num_combinations` and `cfreach_adj` to exactly match the parent's, but the subtree has different board cards (4-card boundary board for turn→river subtrees with 48 river cards in the subtree expansion), producing different `num_combinations`. Additionally, the `effective_stack` calculation in the subtree may be inconsistent with the parent's expectations, causing systematic cfvalue bias. The cfv_to_bcfv inversion approach is architecturally unsound -- it requires dividing by quantities that differ between subtree and parent, producing systematically wrong boundary values.
+
+**Fix applied:** N/A (diagnostic only). Next step: abandon cfv_to_bcfv inversion. Instead, compute per-hand chip EVs via `expected_values_detail` and pot-normalise directly, bypassing the cfreach_adj dependency entirely. This requires investigating how `evaluate_boundary_single` handles the cfreach weighting and potentially modifying the interface.
+
+**Result after:** exact_exp=109.13 mbb, subgame_exp=232.43 mbb (unchanged, diagnostic only)
+Status: FAIL (root cause identified: cfv_to_bcfv architecture is broken)
+
+**Commits:** `ebb32128` docs(progress): iteration 2 — cfv_to_bcfv clamping ineffective
