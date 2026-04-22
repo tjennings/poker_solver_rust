@@ -377,6 +377,30 @@ impl PostFlopGame {
         ret
     }
 
+    /// Returns the normalized strategy at the given node arena index.
+    ///
+    /// The return vec has length `num_actions * num_private_hands(player)`.
+    /// Action `i`, hand `j` is at index `i * num_hands + j`.
+    ///
+    /// Panics if the node is terminal, chance, or memory is not allocated.
+    pub fn strategy_at_index(&self, node_index: usize) -> Vec<f32> {
+        if self.state < State::MemoryAllocated {
+            panic!("Memory is not allocated");
+        }
+        let node = self.node_arena[node_index].lock();
+        assert!(
+            !node.is_terminal() && !node.is_chance(),
+            "strategy_at_index requires a decision node"
+        );
+        let num_actions = node.num_actions();
+        let ret = if self.is_compression_enabled {
+            normalized_strategy_compressed(node.strategy_compressed(), num_actions)
+        } else {
+            normalized_strategy(node.strategy(), num_actions)
+        };
+        ret
+    }
+
     /// Returns the total bet amount for each player `[OOP, IP]`.
     #[inline]
     pub fn total_bet_amount(&self) -> [i32; 2] {
@@ -1377,6 +1401,62 @@ mod tests {
                 terminal_children.is_empty(),
                 "terminal node should have no children"
             );
+        }
+    }
+
+    #[test]
+    fn strategy_at_index_matches_navigated_strategy() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+
+        // Solve a few iterations so strategy sums are non-trivial
+        for t in 0..10 {
+            crate::solve_step(&game, t);
+        }
+        crate::finalize(&mut game);
+
+        // Navigate to root and get strategy via the standard method
+        game.back_to_root();
+        let navigated = game.strategy();
+
+        // Get strategy at index 0 (root) via the new method
+        let at_index = game.strategy_at_index(0);
+
+        assert_eq!(navigated.len(), at_index.len());
+        for (i, (a, b)) in navigated.iter().zip(at_index.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "mismatch at {i}: navigated={a} at_index={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn strategy_at_index_non_root_decision() {
+        let mut game = build_river_game();
+        game.allocate_memory(false);
+
+        // Solve so strategy sums are populated
+        for t in 0..10 {
+            crate::solve_step(&game, t);
+        }
+        crate::finalize(&mut game);
+        game.back_to_root();
+
+        // Navigate to the first non-terminal child
+        let actions = game.available_actions();
+        game.play(0);
+        if !game.is_terminal_node() && !game.is_chance_node() {
+            let navigated = game.strategy();
+            let children = game.child_indices(0);
+            let at_index = game.strategy_at_index(children[0]);
+            assert_eq!(navigated.len(), at_index.len());
+            for (i, (a, b)) in navigated.iter().zip(at_index.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "mismatch at {i}: navigated={a} at_index={b}"
+                );
+            }
         }
     }
 }

@@ -1,17 +1,18 @@
 //! Per-boundary trace logging for the hybrid solver.
 //!
-//! Emits JSONL files capturing what the cfvnet boundary evaluator sees and
+//! Emits TXT files capturing what the cfvnet boundary evaluator sees and
 //! produces at specific boundaries, enabling post-hoc debugging of
 //! distribution-shift on 4bet-pot ranges.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use range_solver::Action;
 use range_solver::card::index_to_card_pair;
-use serde::Serialize;
+use range_solver::interface::GameNode;
 
 // ---------------------------------------------------------------------------
 // Hand name formatting
@@ -258,6 +259,71 @@ pub fn assemble_full_spot(preflop_prefix: &str, postflop_suffix: &str) -> String
 }
 
 // ---------------------------------------------------------------------------
+// Preceding-decision map
+// ---------------------------------------------------------------------------
+
+/// For each depth boundary, find the nearest ancestor decision node and its
+/// action labels.
+///
+/// Returns a map from `boundary_ordinal -> (decision_node_index, action_labels)`.
+/// Built via a single DFS from root, tracking the most recent decision node
+/// on each path.
+pub fn build_preceding_decision_map(
+    game: &range_solver::PostFlopGame,
+) -> HashMap<usize, (usize, Vec<String>)> {
+    let boundary_indices = game.boundary_node_indices();
+    let n = boundary_indices.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    let mut index_to_ord = HashMap::with_capacity(n);
+    for (ord, &idx) in boundary_indices.iter().enumerate() {
+        index_to_ord.insert(idx, ord);
+    }
+
+    let mut result = HashMap::with_capacity(n);
+
+    // DFS: (node_index, most_recent_decision_idx_or_None)
+    let mut stack: Vec<(usize, Option<usize>)> = vec![(0, None)];
+    while let Some((node_idx, last_decision)) = stack.pop() {
+        let node = game.node_at(node_idx);
+        let is_decision = !node.is_terminal() && !node.is_chance();
+
+        let current_decision = if is_decision {
+            Some(node_idx)
+        } else {
+            last_decision
+        };
+
+        // If this is a boundary node, record the preceding decision.
+        if let Some(&ord) = index_to_ord.get(&node_idx) {
+            if let Some(dec_idx) = last_decision {
+                let dec_node = game.node_at(dec_idx);
+                let actions: Vec<String> = game
+                    .child_indices(dec_idx)
+                    .iter()
+                    .map(|&ci| {
+                        let child = game.node_at(ci);
+                        format_postflop_action(&child.prev_action())
+                    })
+                    .collect();
+                drop(dec_node);
+                result.insert(ord, (dec_idx, actions));
+            }
+        }
+
+        let children = game.child_indices(node_idx);
+        drop(node);
+        for child_idx in children {
+            stack.push((child_idx, current_decision));
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // TraceConfig (CLI-level configuration, parsed in main.rs)
 // ---------------------------------------------------------------------------
 
@@ -378,43 +444,110 @@ pub struct BoundaryTraceEvent {
 /// Strategy at the preceding decision node.
 pub struct StrategyAtPrevDecision {
     pub node_idx: usize,
+    /// Player to act: 0 = OOP, 1 = IP.
+    pub player: usize,
     pub actions: Vec<String>,
+    /// Per-hand-class strategy: `(hand_name, [prob_per_action])`, sorted by
+    /// descending reach weight.
     pub by_hand: Vec<(String, Vec<f32>)>,
 }
 
 // ---------------------------------------------------------------------------
-// Serialisable trace record
+// TXT formatting
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct TraceRecord {
-    iter: u32,
-    boundary_ord: usize,
-    board: String,
-    traverser: String,
-    pot_chips: i32,
-    stack_chips: f64,
-    /// Full spot string for copy-paste into the Tauri UI. `null` if unavailable.
-    spot: Option<String>,
-    cfv_units: &'static str,
-    weight_units: &'static str,
-    oop_range: String,
-    ip_range: String,
-    oop_cfvs: String,
-    ip_cfvs: String,
-    strategy_at_preceding_decision: Option<serde_json::Value>,
+/// Count the number of combos with weight >= 0.001 in a 1326-element vector.
+pub fn count_nonzero_combos(range: &[f32]) -> usize {
+    range.iter().filter(|&&w| w.abs() >= 0.001).count()
+}
+
+/// Format a single boundary trace event as a human-readable TXT record.
+pub fn format_trace_txt(iter: u32, boundary_ord: usize, event: &BoundaryTraceEvent) -> String {
+    let mut out = String::with_capacity(4096);
+
+    // Header line
+    let spr = if event.pot > 0 {
+        event.stack / event.pot as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        out,
+        "[iter={iter} boundary={boundary_ord} board={} pot={} stack={} spr={spr:.2}]",
+        event.board,
+        event.pot,
+        event.stack as i64,
+    );
+
+    // Spot line (only if present)
+    if let Some(ref spot) = event.spot {
+        let _ = writeln!(out, "Spot: {spot}");
+    }
+
+    // Ranges
+    let oop_combos = count_nonzero_combos(&event.oop_range_1326);
+    let ip_combos = count_nonzero_combos(&event.ip_range_1326);
+    let _ = writeln!(
+        out,
+        "OOP range ({oop_combos} combos): {}",
+        format_range_as_hands(&event.oop_range_1326)
+    );
+    let _ = writeln!(
+        out,
+        "IP range ({ip_combos} combos):  {}",
+        format_range_as_hands(&event.ip_range_1326)
+    );
+
+    // CFVs
+    let _ = writeln!(
+        out,
+        "OOP CFVs (chips): {}",
+        format_cfvs_as_hands(&event.oop_cfvs_1326)
+    );
+    let _ = writeln!(
+        out,
+        "IP CFVs  (chips): {}",
+        format_cfvs_as_hands(&event.ip_cfvs_1326)
+    );
+
+    // Strategy at preceding decision
+    if let Some(ref s) = event.strategy_at_prev {
+        let player_label = if s.player == 0 { "OOP" } else { "IP" };
+        let _ = writeln!(
+            out,
+            "Strategy at preceding decision (node #{}, {player_label} to act):",
+            s.node_idx,
+        );
+        let _ = writeln!(out, "  Actions: [{}]", s.actions.join(", "));
+        // Find max hand-name length for alignment
+        let max_name = s.by_hand.iter().map(|(n, _)| n.len()).max().unwrap_or(2);
+        for (name, probs) in &s.by_hand {
+            let probs_str: Vec<String> = probs.iter().map(|p| format!("{p:.2}")).collect();
+            let padded_name = format!("{name}:");
+            let _ = writeln!(
+                out,
+                "  {padded_name:width$} [{probs}]",
+                width = max_name + 2,
+                probs = probs_str.join(", "),
+            );
+        }
+    }
+
+    // Separator
+    let _ = writeln!(out, "---");
+    out
 }
 
 // ---------------------------------------------------------------------------
 // BoundaryTracer
 // ---------------------------------------------------------------------------
 
-/// Thread-safe tracer that writes per-boundary JSONL files.
+/// Thread-safe tracer that writes per-boundary TXT files.
 pub struct BoundaryTracer {
     enabled_ordinals: TraceFilter,
     enabled_iters: TraceFilter,
     trace_dir: PathBuf,
-    handles: Mutex<std::collections::HashMap<usize, std::io::BufWriter<std::fs::File>>>,
+    handles: Mutex<HashMap<usize, std::io::BufWriter<std::fs::File>>>,
 }
 
 impl BoundaryTracer {
@@ -423,7 +556,7 @@ impl BoundaryTracer {
             enabled_ordinals: ords,
             enabled_iters: iters,
             trace_dir: dir,
-            handles: Mutex::new(std::collections::HashMap::new()),
+            handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -438,46 +571,13 @@ impl BoundaryTracer {
             return;
         }
 
-        let strategy_json = event.strategy_at_prev.as_ref().map(|s| {
-            let by_hand: serde_json::Map<String, serde_json::Value> = s
-                .by_hand
-                .iter()
-                .map(|(name, probs)| {
-                    (name.clone(), serde_json::json!(probs))
-                })
-                .collect();
-            serde_json::json!({
-                "node_idx": s.node_idx,
-                "actions": s.actions,
-                "by_hand": by_hand,
-            })
-        });
-
-        let record = TraceRecord {
-            iter,
-            boundary_ord: ord,
-            board: event.board.clone(),
-            traverser: "both".to_string(),
-            pot_chips: event.pot,
-            stack_chips: event.stack,
-            spot: event.spot.clone(),
-            cfv_units: "chips",
-            weight_units: "reach_weight",
-            oop_range: format_range_as_hands(&event.oop_range_1326),
-            ip_range: format_range_as_hands(&event.ip_range_1326),
-            oop_cfvs: format_cfvs_as_hands(&event.oop_cfvs_1326),
-            ip_cfvs: format_cfvs_as_hands(&event.ip_cfvs_1326),
-            strategy_at_preceding_decision: strategy_json,
-        };
-
-        let line = serde_json::to_string(&record)
-            .expect("trace record serialization should not fail");
+        let txt = format_trace_txt(iter, ord, event);
 
         let mut handles = self.handles.lock().expect("tracer lock poisoned");
         let writer = handles.entry(ord).or_insert_with(|| {
             std::fs::create_dir_all(&self.trace_dir)
                 .expect("failed to create trace directory");
-            let path = self.trace_dir.join(format!("boundary_{ord}.jsonl"));
+            let path = self.trace_dir.join(format!("boundary_{ord}.txt"));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -485,8 +585,8 @@ impl BoundaryTracer {
                 .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
             std::io::BufWriter::new(file)
         });
-        writeln!(writer, "{line}").expect("failed to write trace line");
-        writer.flush().expect("failed to flush trace line");
+        write!(writer, "{txt}").expect("failed to write trace record");
+        writer.flush().expect("failed to flush trace record");
     }
 }
 
@@ -980,74 +1080,187 @@ mod tests {
         assert!(!tracer.enabled(0, 0));
     }
 
+    // ---------------------------------------------------------------
+    // format_trace_txt tests
+    // ---------------------------------------------------------------
+
     #[test]
-    fn tracer_writes_jsonl_with_spot_field() {
-        let dir = std::env::temp_dir().join("boundary_trace_test_spot");
-        let _ = std::fs::remove_dir_all(&dir);
-        let tracer = BoundaryTracer::new(
-            TraceFilter::All,
-            TraceFilter::All,
-            dir.clone(),
-        );
+    fn format_trace_txt_header_line() {
         let event = BoundaryTraceEvent {
-            board: "Jd9d7d3c".to_string(),
+            board: "JdTh9dQc".to_string(),
             pot: 88,
             stack: 78.0,
-            spot: Some("sb:2bb,bb:call|Jd9d7d|bb:check,sb:22bb,bb:call|3c".to_string()),
+            spot: Some("sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c".to_string()),
             oop_range_1326: vec![1.0; 1326],
             ip_range_1326: vec![0.5; 1326],
             oop_cfvs_1326: vec![5.0; 1326],
             ip_cfvs_1326: vec![-3.0; 1326],
             strategy_at_prev: None,
         };
-        tracer.trace(0, 0, &event);
-
-        let path = dir.join("boundary_0.jsonl");
-        assert!(path.exists(), "trace file should exist");
-        let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-        assert_eq!(
-            v["spot"],
-            "sb:2bb,bb:call|Jd9d7d|bb:check,sb:22bb,bb:call|3c",
-            "spot field should be the full spot string"
+        let txt = format_trace_txt(50, 42, &event);
+        let first_line = txt.lines().next().unwrap();
+        assert!(
+            first_line.starts_with("[iter=50 boundary=42 board=JdTh9dQc pot=88 stack=78 spr=0.89]"),
+            "header mismatch: {first_line}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn tracer_writes_null_spot_when_none() {
-        let dir = std::env::temp_dir().join("boundary_trace_test_null_spot");
-        let _ = std::fs::remove_dir_all(&dir);
-        let tracer = BoundaryTracer::new(
-            TraceFilter::All,
-            TraceFilter::All,
-            dir.clone(),
-        );
+    fn format_trace_txt_spot_line() {
         let event = BoundaryTraceEvent {
-            board: "Jd9d7d3c".to_string(),
+            board: "JdTh9dQc".to_string(),
             pot: 88,
             stack: 78.0,
+            spot: Some("sb:2bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c".to_string()),
+            oop_range_1326: vec![1.0; 1326],
+            ip_range_1326: vec![0.5; 1326],
+            oop_cfvs_1326: vec![5.0; 1326],
+            ip_cfvs_1326: vec![-3.0; 1326],
+            strategy_at_prev: None,
+        };
+        let txt = format_trace_txt(0, 0, &event);
+        let lines: Vec<&str> = txt.lines().collect();
+        assert!(
+            lines[1].starts_with("Spot: sb:2bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c"),
+            "spot line mismatch: {}", lines[1]
+        );
+    }
+
+    #[test]
+    fn format_trace_txt_range_combo_count() {
+        let mut oop_range = vec![0.0f32; 1326];
+        // Set exactly 10 combos to nonzero
+        for i in 0..10 {
+            oop_range[i] = 1.0;
+        }
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: oop_range,
+            ip_range_1326: vec![0.5; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: None,
+        };
+        let txt = format_trace_txt(0, 0, &event);
+        assert!(
+            txt.contains("OOP range (10 combos)"),
+            "should show 10 combos, got:\n{txt}"
+        );
+    }
+
+    #[test]
+    fn format_trace_txt_spr_calculation() {
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 200.0,
             spot: None,
             oop_range_1326: vec![1.0; 1326],
-            ip_range_1326: vec![0.5; 1326],
-            oop_cfvs_1326: vec![5.0; 1326],
-            ip_cfvs_1326: vec![-3.0; 1326],
+            ip_range_1326: vec![1.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
             strategy_at_prev: None,
         };
-        tracer.trace(0, 0, &event);
-
-        let path = dir.join("boundary_0.jsonl");
-        let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-        assert!(v["spot"].is_null(), "spot should be null when None");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let txt = format_trace_txt(0, 0, &event);
+        // spr = stack / pot = 200 / 100 = 2.00
+        assert!(txt.contains("spr=2.00"), "spr should be 2.00, got:\n{txt}");
     }
 
     #[test]
-    fn tracer_writes_jsonl_file() {
-        let dir = std::env::temp_dir().join("boundary_trace_test_jsonl");
+    fn format_trace_txt_with_strategy() {
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: vec![1.0; 1326],
+            ip_range_1326: vec![1.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: Some(StrategyAtPrevDecision {
+                node_idx: 1234,
+                player: 0,
+                actions: vec!["check".to_string(), "bet33%".to_string(), "allin".to_string()],
+                by_hand: vec![
+                    ("AA".to_string(), vec![0.0, 0.30, 0.70]),
+                    ("KK".to_string(), vec![0.20, 0.80, 0.00]),
+                ],
+            }),
+        };
+        let txt = format_trace_txt(0, 0, &event);
+        assert!(
+            txt.contains("Strategy at preceding decision (node #1234, OOP to act):"),
+            "strategy header missing, got:\n{txt}"
+        );
+        assert!(
+            txt.contains("Actions: [check, bet33%, allin]"),
+            "actions line missing, got:\n{txt}"
+        );
+        assert!(
+            txt.contains("AA:  [0.00, 0.30, 0.70]"),
+            "AA strategy line missing, got:\n{txt}"
+        );
+    }
+
+    #[test]
+    fn format_trace_txt_ends_with_separator() {
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: vec![0.0; 1326],
+            ip_range_1326: vec![0.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: None,
+        };
+        let txt = format_trace_txt(0, 0, &event);
+        assert!(txt.ends_with("---\n"), "should end with --- separator");
+    }
+
+    #[test]
+    fn format_trace_txt_no_spot_line_when_none() {
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: vec![0.0; 1326],
+            ip_range_1326: vec![0.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: None,
+        };
+        let txt = format_trace_txt(0, 0, &event);
+        assert!(!txt.contains("Spot:"), "should not have Spot line when None");
+    }
+
+    // ---------------------------------------------------------------
+    // count_nonzero_combos test
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn count_nonzero_combos_counts_correctly() {
+        let mut range = vec![0.0f32; 1326];
+        range[0] = 1.0;
+        range[5] = 0.5;
+        range[100] = 0.001;
+        // 0.0009 is below threshold, should not count
+        range[200] = 0.0009;
+        assert_eq!(count_nonzero_combos(&range), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // tracer writes .txt files
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tracer_writes_txt_file() {
+        let dir = std::env::temp_dir().join("boundary_trace_test_txt");
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::All,
@@ -1068,32 +1281,23 @@ mod tests {
         tracer.trace(42, 0, &event);
         tracer.trace(42, 1, &event);
 
-        let path = dir.join("boundary_42.jsonl");
-        assert!(path.exists(), "trace file should exist");
+        let path = dir.join("boundary_42.txt");
+        assert!(path.exists(), "trace file should exist as .txt");
         let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 lines, got {}", lines.len());
+        // Two records, each ending with "---\n"
+        let separators: Vec<_> = content.match_indices("---").collect();
+        assert_eq!(separators.len(), 2, "expected 2 records, got {}", separators.len());
 
-        for line in &lines {
-            let v: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("invalid JSON: {e}\nline: {line}"));
-            assert_eq!(v["boundary_ord"], 42);
-            assert_eq!(v["board"], "Jd9d7dQc");
-            assert_eq!(v["cfv_units"], "chips");
-            assert_eq!(v["weight_units"], "reach_weight");
-        }
-
-        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(v0["iter"], 0);
-        assert_eq!(v1["iter"], 1);
+        // First record should have iter=0, second iter=1
+        assert!(content.contains("[iter=0 boundary=42"), "first record header");
+        assert!(content.contains("[iter=1 boundary=42"), "second record header");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn tracer_skips_disabled_ordinals() {
-        let dir = std::env::temp_dir().join("boundary_trace_test_skip");
+        let dir = std::env::temp_dir().join("boundary_trace_test_skip_txt");
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::Set(HashSet::from([10])),
@@ -1111,12 +1315,37 @@ mod tests {
             ip_cfvs_1326: vec![0.0; 1326],
             strategy_at_prev: None,
         };
-        // Ordinal 5 is NOT in the filter set
         tracer.trace(5, 0, &event);
-        // No file should be created for ordinal 5
-        let path = dir.join("boundary_5.jsonl");
+        let path = dir.join("boundary_5.txt");
         assert!(!path.exists(), "file should not exist for disabled ordinal");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // build_preceding_decision_map tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn preceding_decision_map_has_entry_per_boundary() {
+        let game = make_depth_limited_turn_game();
+        let n = game.num_boundary_nodes();
+        assert!(n > 0);
+        let map = build_preceding_decision_map(&game);
+        assert_eq!(map.len(), n);
+    }
+
+    #[test]
+    fn preceding_decision_map_node_is_decision() {
+        let game = make_depth_limited_turn_game();
+        let map = build_preceding_decision_map(&game);
+        for &(node_idx, ref actions) in map.values() {
+            let node = game.node_at(node_idx);
+            assert!(
+                !node.is_terminal() && !node.is_chance(),
+                "preceding node must be a decision node"
+            );
+            assert!(!actions.is_empty(), "should have at least one action label");
+        }
     }
 }
