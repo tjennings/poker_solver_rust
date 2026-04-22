@@ -1259,6 +1259,7 @@ mod tests {
             initial_state: BoardState::Turn,
             starting_pot: 100,
             effective_stack: 200,
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
             river_bet_sizes: [sizes.clone(), sizes.clone()],
             ..Default::default()
         };
