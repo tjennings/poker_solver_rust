@@ -1349,8 +1349,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         })?;
                         Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet { model_path: path })
                     }
+                    "exact_subtree" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
                     other => Err(format!(
-                        "invalid --{street}-boundary value '{other}': expected 'exact' or 'cfvnet'"
+                        "invalid --{street}-boundary value '{other}': \
+                         expected 'exact', 'cfvnet', or 'exact_subtree'"
                     ).into()),
                 }
             };
