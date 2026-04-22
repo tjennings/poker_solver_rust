@@ -44,6 +44,27 @@ Status: FAIL (delta=0.9832, +123.30 mbb gap, marginal improvement from 240.97)
 
 **Commits:** `ebb32128` docs(progress): iteration 2 — cfv_to_bcfv clamping ineffective
 
+## Iteration 3-4 — 2026-04-22 12:34 (Deep diagnosis)
+
+**Baseline before:** exact_exp=109.13 mbb, subgame_exp varies (232-27024 mbb depending on approach)
+
+**Diagnosis:** Tried four approaches for bcfv computation. All fail:
+1. `cfv_to_bcfv` with boundary reach + parent weights: all-negative bcfv (232 mbb exp)
+2. `pot_normalise` from `root_cfvalues` without cfv_to_bcfv: huge bcfv (27024 mbb, all-in)
+3. Uniform weights + `root_cfvalues` + `cfv_to_bcfv`: identical to (2), confirming cfv_to_bcfv correctly cancels reach
+4. Uniform weights + `root_cfvalues` directly: identical to (3)
+
+The fact that (2)=(3)=(4) confirms cfv_to_bcfv correctly inverts the reach weighting. The problem with (1) is that boundary reach from cfreach has different magnitude than initial_weights, causing the cfreach_adj ratio (subtree vs parent) to diverge. The problem with (2-4) is that `chip_ev_centered = cfv * num_combos * (w_raw/w_norm)` produces values much larger than half_pot because num_combos (~3925) amplifies the per-combo cfv. The bcfv interface expects equity-like values in [-1, 1], but the formula produces multi-pot values.
+
+The root cause is a semantic mismatch: `evaluate_boundary_single` treats bcfv as a "how many half-pots this hand wins" scalar, but the subtree's cfvalues are in a fundamentally different unit system where the per-combo normalization doesn't directly map to equity.
+
+**Fix applied:** Multiple approaches tried, none successful. The SubtreeExactEvaluator architecture needs a deeper redesign to either (a) produce values compatible with evaluate_boundary_single's expectations, or (b) use a different integration point that doesn't require bcfv format.
+
+**Result after:** Best result: exact_exp=109.13 mbb, subgame_exp=232.43 mbb (approach 1 with clamping)
+Status: FAIL (131 mbb gap at best, 27K mbb at worst)
+
+**Commits:** `0b5b88ab` docs(progress): iteration 3 — root cause identified
+
 ## Iteration 3 — 2026-04-22 12:12 (Root cause identified)
 
 **Baseline before:** exact_exp=109.13 mbb, subgame_exp=232.43 mbb (turn spot with clamping)

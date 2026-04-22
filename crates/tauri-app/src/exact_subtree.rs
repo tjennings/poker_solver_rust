@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::card::{CardConfig, NOT_DEALT};
 use range_solver::range::Range;
-use range_solver::{solve_step, finalize, root_cfvalues_with_reach, BoardState, PostFlopGame};
+use range_solver::{solve_step, finalize, BoardState, PostFlopGame};
 use range_solver::interface::Game;
 
 /// Default number of DCFR iterations for the exact subtree solve.
@@ -131,19 +131,24 @@ fn reach_is_all_zero(reach: &[f32]) -> bool {
 fn solve_subtree(
     board: &[u8],
     private_cards: &[Vec<(u8, u8)>; 2],
-    parent_weights: &[Vec<f32>; 2],
+    _parent_weights: &[Vec<f32>; 2],
     parent_tree_config: &TreeConfig,
     pot: i32,
     remaining_stack: f64,
-    oop_reach: &[f32],
-    ip_reach: &[f32],
+    _oop_reach: &[f32],
+    _ip_reach: &[f32],
     solve_iters: u32,
 ) -> (Vec<f32>, Vec<f32>) {
-    if reach_is_all_zero(oop_reach) || reach_is_all_zero(ip_reach) {
-        return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
-    }
-
-    let card_config = build_card_config(board, private_cards, parent_weights);
+    // Build subtree with UNIFORM initial weights. The equilibrium strategies
+    // are independent of initial weights (two-player zero-sum). Using uniform
+    // weights ensures root_cfvalues computes per-hand values with uniform
+    // opponent weighting, which is what evaluate_boundary_single expects
+    // (it applies its own cfreach_adj from boundary reach).
+    let uniform_weights = [
+        vec![1.0f32; private_cards[0].len()],
+        vec![1.0f32; private_cards[1].len()],
+    ];
+    let card_config = build_card_config(board, private_cards, &uniform_weights);
     let initial_state = board_state_from_len(board.len());
     let effective_stack =
         (pot / 2).saturating_add(remaining_stack.round() as i32);
@@ -166,31 +171,26 @@ fn solve_subtree(
     run_dcfr(&mut game, solve_iters);
     finalize(&mut game);
 
-    // Remap parent reach to subtree hand ordering
-    let sub_oop_reach = remap_reach_to_subtree(
-        oop_reach, private_cards, game.private_cards(0), 0,
-    );
-    let sub_ip_reach = remap_reach_to_subtree(
-        ip_reach, private_cards, game.private_cards(1), 1,
-    );
-
+    // Use root_cfvalues with the game's own uniform initial_weights.
+    // Then apply cfv_to_bcfv with uniform opponent reach to get per-hand
+    // average payoff in pot-normalised units.
     let half_pot = pot as f64 / 2.0;
     let num_combos = game.num_combinations();
 
-    // Compute cfvalues using actual boundary reach
-    let oop_cfv = root_cfvalues_with_reach(&game, 0, &sub_ip_reach);
-    let ip_cfv = root_cfvalues_with_reach(&game, 1, &sub_oop_reach);
+    let uniform_ip = game.initial_weights(1).to_vec();
+    let uniform_oop = game.initial_weights(0).to_vec();
 
-    // Convert cfvalues to bcfv format:
-    // bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])
+    let oop_cfv = range_solver::root_cfvalues(&game, 0);
+    let ip_cfv = range_solver::root_cfvalues(&game, 1);
+
     let oop_bcfv = cfv_to_bcfv(
         &oop_cfv, game.private_cards(0),
-        game.private_cards(1), &sub_ip_reach,
+        game.private_cards(1), &uniform_ip,
         half_pot, num_combos,
     );
     let ip_bcfv = cfv_to_bcfv(
         &ip_cfv, game.private_cards(1),
-        game.private_cards(0), &sub_oop_reach,
+        game.private_cards(0), &uniform_oop,
         half_pot, num_combos,
     );
 
