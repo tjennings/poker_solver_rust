@@ -21,6 +21,7 @@ export interface SolveParams {
   streetBoundaryConfig: StreetBoundaryConfig;
   traceBoundaries: string;
   traceIters: string;
+  enableGadget: boolean;
 }
 
 function modeFromConfig(
@@ -54,5 +55,6 @@ export function buildSolveParams(
     },
     traceBoundaries: (config.trace_boundaries as string | undefined) ?? '',
     traceIters: (config.trace_iters as string | undefined) ?? 'last',
+    enableGadget: (config.enable_safe_resolving as boolean | undefined) ?? false,
   };
 }
