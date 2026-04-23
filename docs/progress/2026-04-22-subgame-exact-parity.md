@@ -167,3 +167,32 @@ Top 3 hands by mass moved:
 **Root cause confirmed:** The gadget architecture is correct (unit tests verify clamping behavior). The blocker is the underlying SubtreeExactEvaluator's cfv_to_bcfv formula producing incorrectly-scaled boundary values. The gadget cannot fix wrong inputs — it needs correct bcfv values to clamp meaningfully.
 
 **Commits:** `6057ff3f` feat(gadget): DeepStack range gadget for safe subgame boundary evaluation
+
+## Iteration 9 — 2026-04-23 (500-iter convergence probe)
+
+**Baseline before:** exact_exp=77.67 mbb (150 iters), subgame_exp=3140.12 mbb (iter 7, cfv_to_bcfv + clamping), worst_delta=0.988
+
+**Hypothesis:** More iterations (500 vs 150) might close the gap if the subgame strategy just needs longer to converge.
+
+**Result after:** exact_exp=5.02 mbb, subgame_exp=82.62 mbb, mean_mass=0.593, worst_cell="J8s @ Check exact=1.0000 subgame=0.0000 delta=1.0000"
+Status: FAIL (delta=1.000, +77.61 mbb exploitability gap)
+
+Wall times: exact=0.8s, subgame=1406.3s (2.81s/iter avg)
+Cache-hit ratio at end: 11% (641 hits / 5500 calls, avg solve 2751ms)
+
+**Comparison to iter 7 (150 iters):**
+- exact_exp: 77.67 -> 5.02 mbb (exact solver converged better at 500 iters, as expected)
+- subgame_exp: 3140.12 -> 82.62 mbb (massive improvement with more iters)
+- exploitability gap: +3062 -> +77.61 mbb (gap narrowed ~40x)
+- worst_delta: 0.988 -> 1.000 (unchanged — individual worst cell is still max-delta)
+- Hands still fully inverted: 7 of top-10 flip from bet/shove to pure check
+
+**Convergence verdict: PARTIAL.** The exploitability *numbers* improved dramatically (82.62 vs 3140 mbb), but this is largely because the exact solver also converged much tighter (5.02 vs 77.67 mbb). The *relative* gap (subgame/exact ratio) went from 40x to 16x. The worst-cell delta remains 1.000, and the same structural pathology persists: hands that should bet/shove instead check (and vice versa). More iters narrow the exploitability gap in absolute terms but do NOT fix the strategy divergence. The bcfv formula is still the root cause.
+
+Per-action-class bias: Bet/Raise -0.233, Check +0.054, AllIn +0.179
+Top 3 hands by mass moved:
+1. 2d7h mass=1.000 — exact=[B55:0.50 A:0.50] subgame=[X:1.00] (should bet/shove, checks)
+2. 2h7s mass=1.000 — exact=[B55:0.33 A:0.67] subgame=[X:1.00] (should shove, checks)
+3. 2hJc mass=1.000 — exact=[B55:0.50 A:0.50] subgame=[X:1.00] (should bet/shove, checks)
+
+**Commits:** measurement only, no code changes
