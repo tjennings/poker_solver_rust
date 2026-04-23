@@ -1,132 +1,100 @@
-# DeepStack Range Gadget for Safe Subgame Solving
+# Libratus-style Safe Re-solving Gadget — Validated Design
+
+> **Terminology note.** The original draft called this a "DeepStack gadget." After
+> brainstorming the two lineages apart, this design is **Libratus-style** (static
+> opt-out values from a pre-computed blueprint CBV table). DeepStack-proper uses
+> opt-out bounds as a runtime parameter that the CFV network is trained to
+> consume, which we cannot do without retraining. That retrain is tracked as
+> bean [`poker_solver_rust-akg3`](../../.beans/poker_solver_rust-akg3--retrain-cfvnet-with-opt-out-input-channel-for-deep.md).
+>
+> The module name in code remains `gadget` (generic) rather than renaming to
+> `libratus_safe_resolve`. The design doc is the place we state which flavour.
+
+Parent bean: [`poker_solver_rust-lay5`](../../.beans/poker_solver_rust-lay5--libratus-style-safe-re-solving-gadget-mvp.md).
 
 ## Goal
 
-Implement a DeepStack-style range gadget (Moravcik et al. 2017; Brown et al. 2020 ReBeL)
-to constrain opponent strategy at subgame boundaries. The gadget gives the opponent a
-per-hand choice between entering the subtree or taking an opt-out value equal to their
-counterfactual best-response value from the blueprint. This produces subgame solutions
-that are **safe** -- the opponent's subgame CFV is guaranteed to be at least as good as
-the blueprint's, preventing the strategy inversions observed in iterations 1-7 of the
-subgame-exact-parity investigation.
+Make cfvnet-based and other boundary-evaluator-based subgame solves **safe** — the
+opponent's reported per-hand CFV at a boundary is no worse than the blueprint's
+counterfactual best-response value for that hand. This prevents the strategy
+inversions observed across 8 iterations of subgame-exact-parity investigation
+(`docs/progress/2026-04-22-subgame-exact-parity.md`).
+
+**Primary consumer:** cfvnet (`NeuralBoundaryEvaluator`) in both the
+compare-solve harness and the Tauri game_solve command.
+
+**Secondary consumer:** `SubtreeExactEvaluator` (diagnostic oracle). Already wired
+by the skeleton agent.
+
+**Not in scope:** DeepStack-proper continual re-solving with trained opt-out
+input channel (bean `akg3`).
 
 ## Architecture
 
-```
-Parent DCFR solver
-  |
-  v  (reaches boundary node)
-  |
-  +--[GadgetEvaluator]--+
-  |                      |
-  |  For each opponent   |
-  |  hand h:             |
-  |                      |
-  |  subtree_cfv[h]      |     opt_out_cfv[h]
-  |  (from inner eval)   |     (from OptOutProvider)
-  |                      |
-  |  gadget_cfv[h] =     |
-  |    max(subtree_cfv,  |
-  |        opt_out_cfv)  |
-  |                      |
-  +----------------------+
-  |
-  v  (returns adjusted CFVs to parent)
-```
-
-The gadget node conceptually sits between the parent's boundary and the subtree:
+The gadget is a `BoundaryEvaluator` **wrapper** — it lives outside range-solver
+entirely, consumes any inner `BoundaryEvaluator`, and clamps the opponent's
+per-hand CFV upward to a pre-computed opt-out floor.
 
 ```
-Parent game tree:
-  ... -> [boundary] -> (subtree evaluator returns CFVs)
-
-With gadget:
-  ... -> [boundary] -> [gadget: opt-out vs enter] -> (subtree)
-
-  At the gadget, opponent chooses per-hand:
-    ENTER:   play subtree, get subtree_cfv[h]
-    OPT-OUT: take opt_out_cfv[h] (from blueprint CBV)
-
-  Regret matching at gadget ensures opponent never does worse
-  than opt-out. This constrains the subtree solution to be safe.
+┌────────────────────────────────────────────────────────────┐
+│ parent solver                                               │
+│  │                                                          │
+│  ▼  (reaches boundary)                                      │
+│ ┌────────────────────────────────────────┐                  │
+│ │ GadgetEvaluator                        │                  │
+│ │                                        │                  │
+│ │   inner.compute_cfvs_both(...)         │                  │
+│ │   │                                    │                  │
+│ │   ▼                                    │                  │
+│ │   (oop_cfv, ip_cfv)                    │                  │
+│ │   │                                    │                  │
+│ │   ▼ clamp opp side up to opt_out       │                  │
+│ │   opp_cfv[h] ← max(inner[h], opt[h])   │                  │
+│ └────────────────────────────────────────┘                  │
+│  │                                                          │
+│  ▼ adjusted CFVs                                            │
+└────────────────────────────────────────────────────────────┘
 ```
 
-## Implementation Path Comparison
+### Per-hand clamp
 
-### Option A: Tree-extension (add explicit gadget node to ActionTree)
+For the opponent's hand `h` at boundary ordinal `b`:
 
-**Description:** Insert a new decision node into the range-solver's `ActionTree` at each
-boundary. The node has K+1 children: one ENTER action leading to the subtree, and one
-OPT-OUT action per hand (or a single OPT-OUT action with per-hand payoffs). The DCFR
-solver's standard regret matching naturally handles the gadget choice.
+```
+opt_out[h] = blueprint_cbv[h] / half_pot      // chip CBV → bcfv units
+gadget_cfv[h] = max(inner_cfv[h], opt_out[h])
+```
 
-**Advantages:**
-- Theoretically cleanest: the gadget is a real game node, DCFR discounting and strategy
-  averaging apply naturally
-- Per-iteration reach evolution is handled automatically by the solver
-- No special-case code in the evaluation path
+The traversing player's CFVs pass through unchanged. Both `compute_cfvs` and
+`compute_cfvs_both` apply the clamp on the opponent side of the call.
 
-**Disadvantages:**
-- Requires modifying `ActionTree` construction and `PostFlopGame`'s node layout -- these
-  are the most performance-critical and delicate structures in range-solver
-- The gadget node is NOT a standard poker action (check/bet/fold/call), so the node type
-  system needs extension
-- The OPT-OUT payoff is per-hand (not per-pot), requiring a new terminal evaluation mode
-- Tight coupling between gadget logic and range-solver internals makes it fragile to
-  refactor
-- Substantial code surface: new node type, new action type, new terminal evaluator,
-  modified tree-build, modified traversal
+### Safety property (honest)
 
-### Option B: Per-call CFV adjustment (wrapper evaluator) -- CHOSEN
+- **Reported-CFV safety:** the opponent's CFV as returned is ≥ opt-out. The
+  parent solver therefore gets a boundary value that is at least as good for
+  the opponent as the blueprint.
+- **Not full strategy-level safety:** in DeepStack's paper, the in-subtree
+  *strategy* adapts because the opt-out is part of the subgame tree — the
+  player responds to the opponent's ability to opt out. Option B (our wrapper)
+  applies the clamp *after* the inner evaluator runs, so any inner strategy is
+  frozen and gadget-unaware. This is intentional for cfvnet (where there is
+  no "inner strategy" — cfvnet is a function) and a known approximation for
+  the exact subtree evaluator.
 
-**Description:** Wrapper `BoundaryEvaluator` that adjusts CFVs after the inner evaluator
-computes them. The gadget logic lives entirely outside range-solver.
+## Implementation — Option B (per-call CFV adjustment)
 
-**Justification:** This avoids modifying range-solver's ActionTree or evaluation engine
-entirely. The gadget logic lives in a thin wrapper that:
-1. Delegates to the inner evaluator (e.g. `SubtreeExactEvaluator`)
-2. For the opponent's CFVs, clamps each hand's value upward to the opt-out
-3. Returns the clamped values through the standard `BoundaryEvaluator` interface
+See the commit history on `feat/subgame-exact-parity` for Option A (tree-extension)
+tradeoff analysis. Option B chosen for: zero changes to range-solver, trivial
+composition with any inner evaluator, ~150 lines of code, already partially shipped.
 
-This is the least invasive approach -- no changes to range-solver at all. It also
-composes cleanly: any `BoundaryEvaluator` can be wrapped (cfvnet, rollout, exact subtree).
+## Interface surface
 
-**Advantages:**
-- Zero changes to range-solver
-- Composable: wraps any inner evaluator
-- Small code surface (~100 lines)
-- Easy to test with stub evaluators
-
-**Disadvantages:**
-- The clamp is applied once per boundary visit, not iterated within the subtree solve.
-  This means the gadget doesn't benefit from DCFR's convergence properties at the
-  gadget node itself. In practice, the upward clamp is a sufficient approximation
-  because the inner evaluator already produces converged CFVs.
-- The traversing player's CFV adjustment (zero-sum accounting) requires care -- currently
-  we leave player CFVs unchanged since the bcfv interface treats per-hand values
-  independently.
-
-**Per-hand gadget math:**
-For each opponent hand h at boundary ordinal b:
-- `inner_cfv[h]` = CFV from subtree evaluator
-- `opt_out[h]` = CFV from OptOutProvider (blueprint CBV)
-- `gadget_cfv[h]` = max(inner_cfv[h], opt_out[h])
-
-For the traversing player, the adjustment is the negative of the opponent's gain:
-- `player_adjustment[h]` = -(gadget_cfv_opp[h] - inner_cfv_opp[h]) weighted by card overlap
-
-Since the bcfv interface already handles reach weighting, we apply the clamp directly
-to the bcfv values before they are stored in the boundary cache.
-
-## Interface Surface
-
-### `OptOutProvider` trait (`gadget.rs`)
+### `OptOutProvider` trait (already shipped in `crates/tauri-app/src/gadget.rs`)
 
 ```rust
 pub trait OptOutProvider: Send + Sync {
-    /// Returns per-hand opt-out CFVs for the OPPONENT at this boundary.
-    /// Values are in pot-normalised bcfv units (1.0 = one half-pot).
-    /// Vec length must equal `opponent_private_cards.len()`.
+    /// Per-hand opt-out CFVs for the OPPONENT at this boundary, in
+    /// pot-normalised bcfv units (1.0 = one half-pot won).
     fn opt_out_cfvs(
         &self,
         boundary_ordinal: usize,
@@ -139,66 +107,116 @@ pub trait OptOutProvider: Send + Sync {
 }
 ```
 
-### `ConstantOptOut` (testing)
+### `ConstantOptOut(f32)` (already shipped)
 
-Returns the same value for every hand at every boundary. Used to verify gadget behavior
-in unit tests without needing a real blueprint.
+For testing / A-B diagnostic via `--gadget-provider=constant --gadget-constant=V`.
 
-```rust
-pub struct ConstantOptOut(pub f32);
-```
-
-### `BlueprintCbvOptOut` (production)
-
-Queries the loaded blueprint strategy to compute per-hand counterfactual best-response
-values at the boundary. This is the production implementation that makes re-solving safe.
+### `BlueprintCbvOptOut` (to build)
 
 ```rust
 pub struct BlueprintCbvOptOut {
-    /// Reference to the loaded blueprint strategy bundle.
-    blueprint: Arc<BlueprintV2Strategy>,
-    /// Board cards for the current subgame.
-    board: Vec<u8>,
-    /// Pre-computed per-boundary CBVs, indexed by boundary_ordinal.
-    /// Each entry is a Vec<f32> with one value per opponent hand.
-    cached_cbvs: Vec<Vec<f32>>,
+    cbv_table: Arc<CbvTable>,
+    all_buckets: Arc<AllBuckets>,
+    abstract_node_idx: usize,
+    per_hand_cbv: [Vec<f32>; 2],  // pre-computed at construction, per player
+    half_pot_chips: f32,
+}
+
+impl BlueprintCbvOptOut {
+    pub fn new(
+        cbv_ctx: &CbvContext,
+        board: &[u8],
+        abstract_node_idx: usize,
+        private_cards: &[Vec<(u8, u8)>; 2],
+        half_pot_chips: f32,
+    ) -> Self { /* ... */ }
 }
 ```
 
-**How CBVs are computed:** For each boundary, walk the blueprint game tree to the
-boundary node, then compute the opponent's counterfactual best-response value by
-maximising over available actions weighted by the blueprint's reach probabilities. This
-is the value the opponent *could* achieve by deviating from the blueprint at this node.
+**Construction panics if:**
+- `cbv_table` is missing from the bundle.
+- `abstract_node_idx` doesn't resolve to a valid blueprint node.
 
-### `GadgetEvaluator` (boundary evaluator wrapper)
+**Runtime panics if:**
+- `all_buckets.lookup(board, c1, c2)` returns `None` for a hand in `private_cards`
+  (should be impossible — the parent `PostFlopGame::assign_zero_weights` filters
+  blocker-conflicting hands out of `private_cards` before we see them).
 
-Wraps an inner `BoundaryEvaluator` + `OptOutProvider`. Implements `BoundaryEvaluator`.
+### `GadgetEvaluator` (already shipped, may need generalisation)
 
-```rust
-pub struct GadgetEvaluator {
-    inner: Arc<dyn BoundaryEvaluator>,
-    opt_out: Arc<dyn OptOutProvider>,
-    board: Vec<u8>,
-    private_cards: [Vec<(u8, u8)>; 2],
-}
-```
+Verify the shipped wrapper correctly clamps both `compute_cfvs` and
+`compute_cfvs_both` on the opponent side.
 
-## Tests
+## Wiring
 
-### Test 1: Huge positive opt-out forces all opt-out
+### `compare-solve` CLI
 
-`ConstantOptOut(1000.0)` -- every hand's opt-out value far exceeds any realistic subtree
-CFV. The opponent should always opt out. The returned opponent CFVs should all equal
-the opt-out value (1000.0 in bcfv units).
+Current: `--gadget` (bool), only wraps exact_subtree.
 
-### Test 2: Very negative opt-out is dominated
+New:
+- `--gadget` stays.
+- `--gadget-provider <blueprint-cbv|constant>` (default `blueprint-cbv` when `--gadget` is set).
+- `--gadget-constant <f32>` (required when `--gadget-provider=constant`).
+- `setup_neural_boundaries` accepts `Option<Arc<dyn OptOutProvider>>` and wraps each `NeuralBoundaryEvaluator` when present. Mirror `setup_exact_subtree_boundaries`.
+- Provider is constructed once in `run()` before either `setup_*` fn, fed to both.
 
-`ConstantOptOut(-1000.0)` -- opt-out is so bad that the opponent always enters the
-subtree. The gadget-wrapped CFVs should match the non-gadget inner evaluator exactly.
+### Tauri `game_solve_core`
 
-### Test 3: Integration -- opponent CFV >= opt-out per hand
+- Add `enable_gadget: bool` to `game_solve` Tauri command params, thread through `game_solve_core`.
+- When true + a boundary-cut mode is active, construct `BlueprintCbvOptOut` from `PostflopState::cbv_context`, wrap neural evaluators in `GadgetEvaluator`.
+- When true + top-level "exact" mode (no cut), log that gadget is unused and continue.
 
-On the small test game (AA,KK,QQ vs TT,99,88), verify that with a moderate opt-out
-value (0.0 = break-even), every opponent hand's CFV from the gadget evaluator is >= the
-opt-out value. Also verify that at least one hand was actually clamped (i.e., the gadget
-had an effect, not a vacuous pass-through).
+### Settings UI
+
+- `frontend/src/Settings.tsx` — add checkbox "Safe re-solving (Libratus gadget)".
+- `frontend/src/types.ts` — `GlobalConfig.enable_safe_resolving: boolean`.
+- `frontend/src/useGlobalConfig.ts` — default false.
+- `frontend/src/strategy-tabs.ts::buildSolveParams` — pass `enableGadget: bool`.
+- Greyed out when no per-street cut mode is `cfvnet` or `exact_subtree`.
+
+## Validation
+
+1. **Iter 9 — cfvnet baseline (no gadget):** record subgame_exp + worst_delta vs exact.
+2. **Iter 10 — cfvnet + BlueprintCbvOptOut:** compare to iter 9.
+3. **Iter 11 — cfvnet + ConstantOptOut(-999.0):** dominated opt-out. Must match iter 9 exactly (sanity).
+
+Hypothesis: iter 10's strategy delta is smaller than iter 9's. If not, the
+Libratus-style static CBV is not strong enough and we fall back to the bean-`akg3`
+retrain path.
+
+## Testing
+
+### Rust unit tests (in `gadget.rs`)
+
+- `blueprint_cbv_construct_panics_on_missing_table`
+- `blueprint_cbv_lookup_panics_on_missing_bucket`
+- `blueprint_cbv_returns_nonzero_for_known_spot` — integration with a real bundle fixture
+- `unit_conversion_chip_to_bcfv` — standalone numeric test
+- `gadget_wraps_neural_evaluator_and_clamps` — mocked `NeuralBoundaryEvaluator`
+
+### Harness tests (runtime, not CI)
+
+- Non-gadget cfvnet baseline
+- Gadget + BlueprintCbvOptOut cfvnet
+- Gadget + ConstantOptOut(-999.0) — should be no-op
+
+## Out of scope
+
+- Tree-extension implementation of the gadget (Option A) — deferred indefinitely.
+- DeepStack-proper retrain of cfvnet with opt-out input channel — bean `akg3`.
+- Unabstracted CBV via exact BR — easy to add later as a second `OptOutProvider` impl; deferred.
+- Automated UI click-through test.
+- Performance optimisation beyond pre-computing per-hand CBVs at construction.
+
+## Files
+
+To create or modify:
+- `crates/tauri-app/src/gadget.rs` — add `BlueprintCbvOptOut` impl + panics.
+- `crates/tauri-app/src/game_session.rs` — thread `enable_gadget` through `game_solve_core` + `setup_neural_boundaries`.
+- `crates/trainer/src/main.rs` — add `--gadget-provider`, `--gadget-constant` flags.
+- `crates/trainer/src/compare_solve.rs` — construct provider, pass to both setup_* fns, wire into neural path.
+- `frontend/src/Settings.tsx` — checkbox.
+- `frontend/src/types.ts` — config type field.
+- `frontend/src/useGlobalConfig.ts` — default.
+- `frontend/src/strategy-tabs.ts` — build params.
+- `docs/progress/2026-04-22-subgame-exact-parity.md` — iterations 9–11.
