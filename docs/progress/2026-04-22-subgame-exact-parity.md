@@ -220,3 +220,44 @@ Top 3 hands by mass moved:
 **Key observation:** cfvnet boundary produces much larger exploitability (20932 mbb) than exact_subtree at same iters (3140 mbb iter 7). The cfvnet model's boundary values are far worse than even the broken cfv_to_bcfv formula. The subgame universally shoves with hands that should check.
 
 **Commits:** measurement only, no code changes
+
+## Iteration 11 — 2026-04-23 (cfvnet + BlueprintCbvOptOut gadget -- PANIC)
+
+**Approach:** river-boundary=cfvnet + --gadget --gadget-provider=blueprint-cbv. Intended to test whether the Libratus-style gadget closes the cfvnet exploitability gap.
+
+**Result:** PANIC at `crates/core/src/blueprint_v2/cbv.rs:48` -- index out of bounds: the len is 243 but the index is 7916.
+
+**Root cause:** `BlueprintCbvOptOut::from_cbv_context` receives `current_node` (the abstract tree node index of the current spot, e.g. 7916) as the `boundary_node_idx` parameter. But the CbvTable is indexed by boundary ordinal (0..N where N = number of chance nodes in the abstract tree, e.g. 27 for a 3-street tree), not by the full tree node ID. The unit tests only exercise a 1-node CbvTable where ordinal 0 always works, so this never crashed in testing.
+
+**Design flaw:** `BlueprintCbvOptOut` pre-computes CBV values for a single boundary node at construction, but there are 11 boundary nodes (one per river card) and each needs its own CBV lookup. The `opt_out_cfvs` method ignores the `boundary_ordinal` parameter.
+
+**Fix needed:**
+1. Map each range-solver boundary ordinal to the corresponding CBV table boundary node index (requires traversing the abstract tree from `current_node` to find its chance children and their CBV ordinals).
+2. Either (a) make the provider compute lazily per-boundary using the ordinal, or (b) pre-compute all 11 boundaries at construction with the correct CBV indices.
+
+Status: BLOCKED (code bug in Phase 1-3 -- `BlueprintCbvOptOut::from_cbv_context` index mapping is wrong)
+
+**Commits:** no code changes (measurement-only run revealed the bug)
+
+## Iteration 12 — 2026-04-23 (sanity check, dominated opt-out -999.0)
+
+**Approach:** river-boundary=cfvnet + --gadget --gadget-provider=constant --gadget-constant=-999.0. Sanity check: a dominated opt-out should be a no-op, producing results identical to the baseline (iter 10).
+
+**Result:** exact_exp=77.67 mbb, subgame_exp=20932.49 mbb, worst_delta=1.0000, worst_cell="77 @ All-in exact=0.0000 subgame=1.0000"
+mean_mass=0.543, max_mass=1.000 at hand 2s7c.
+Status: PASS (sanity)
+
+**Comparison to iter 10 (no gadget):**
+
+| Metric | Iter 10 (no gadget) | Iter 12 (constant -999) | Delta |
+|--------|-------------------|------------------------|-------|
+| exact_exp | 77.67 mbb | 77.67 mbb | 0.00 |
+| subgame_exp | 20932.49 mbb | 20932.49 mbb | 0.00 |
+| worst_delta | 1.0000 | 1.0000 | 0.00 |
+| mean_mass | 0.543 | 0.543 | 0.00 |
+
+All values match exactly. The dominated opt-out (-999.0) is a perfect no-op. The GadgetEvaluator wrapper correctly passes through inner evaluator values when the opt-out is dominated. This confirms the gadget wrapping infrastructure works correctly; the blocker is only in BlueprintCbvOptOut's CBV index mapping.
+
+**Wall time:** exact=0.3s, subgame=1.6s.
+
+**Commits:** measurement only, no code changes
