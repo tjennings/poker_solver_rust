@@ -7,6 +7,7 @@
 //! for the full design and the distinction from DeepStack-proper
 //! (which requires a cfvnet retrain; bean poker_solver_rust-akg3).
 
+use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use std::sync::Arc;
 
 /// Per-hand opt-out value provider at a boundary.
@@ -54,6 +55,41 @@ impl OptOutProvider for ConstantOptOut {
         opponent_private_cards: &[(u8, u8)],
     ) -> Vec<f32> {
         vec![self.0; opponent_private_cards.len()]
+    }
+}
+
+/// Opt-out provider that pulls per-hand CFVs from a blueprint's `CbvTable`.
+///
+/// CBVs are read at construction (once per boundary) and cached as a
+/// per-player `Vec<f32>` in bcfv units. At runtime, `opt_out_cfvs` is a
+/// pure vec clone.
+pub struct BlueprintCbvOptOut {
+    /// Per-player, per-hand pre-computed bcfv opt-out values.
+    /// Index: `per_hand_cbv_bcfv[player][hand_idx]`.
+    per_hand_cbv_bcfv: [Vec<f32>; 2],
+}
+
+impl BlueprintCbvOptOut {
+    /// Test-only constructor that accepts a raw `CbvTable` and hand lists.
+    /// Production callers use `BlueprintCbvOptOut::from_cbv_context`.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        cbv_table: Arc<CbvTable>,
+        _abstract_node_idx: u32,
+        oop_private_cards: Vec<(u8, u8)>,
+        ip_private_cards: Vec<(u8, u8)>,
+        _half_pot_chips: f32,
+    ) -> Self {
+        assert!(
+            !cbv_table.values.is_empty(),
+            "CbvTable has no values; cannot construct BlueprintCbvOptOut"
+        );
+        Self {
+            per_hand_cbv_bcfv: [
+                vec![0.0; oop_private_cards.len()],
+                vec![0.0; ip_private_cards.len()],
+            ],
+        }
     }
 }
 
@@ -195,6 +231,28 @@ mod tests {
     #[should_panic(expected = "half_pot must be positive")]
     fn chip_cfv_to_bcfv_negative_half_pot_panics() {
         chip_cfv_to_bcfv(10.0, -5.0);
+    }
+
+    // ---------------------------------------------------------------
+    // BlueprintCbvOptOut tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "CbvTable has no values")]
+    fn blueprint_cbv_construct_panics_on_empty_table() {
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        let empty_table = CbvTable {
+            values: vec![],
+            node_offsets: vec![],
+            buckets_per_node: vec![],
+        };
+        let _ = BlueprintCbvOptOut::new_for_test(
+            Arc::new(empty_table),
+            0,
+            vec![(0u8, 1u8)],
+            vec![(2u8, 3u8)],
+            73.0,
+        );
     }
 
     // ---------------------------------------------------------------
