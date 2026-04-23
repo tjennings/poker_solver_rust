@@ -140,3 +140,30 @@ Top 3 hands by mass moved:
 3. 7hQd mass=1.000 — exact=[B55:0.78 A:0.21] subgame=[X:1.00] (should bet, checks instead)
 
 **Commits:** `484939a4` revert(exact_subtree): cfv_to_bcfv approach + MIN_ADJ/MAX_BCFV clamping
+
+## Iteration 8 — 2026-04-23 (DeepStack range gadget with ConstantOptOut(0.0))
+
+**Baseline before:** exact_exp=77.67 mbb (river spot JhTh9h7d, 150 iters), subgame_exp=3140.12 mbb (iter 7 cfv_to_bcfv), worst_delta=0.988
+
+**Diagnosis:** Implemented DeepStack-style range gadget (GadgetEvaluator) as a BoundaryEvaluator wrapper. The gadget clamps each opponent hand's bcfv upward to an opt-out value (ConstantOptOut(0.0) for this iteration). Architecture:
+- OptOutProvider trait returns per-hand opt-out CFVs
+- GadgetEvaluator wraps inner SubtreeExactEvaluator + OptOutProvider
+- compute_cfvs_both delegates to inner, then clamps opponent values upward
+- 9 unit tests + 2 integration tests all pass
+
+The gadget correctly applies per-hand clamping (verified by unit tests with StubEvaluator). However, the underlying cfv_to_bcfv formula in SubtreeExactEvaluator still produces values with incorrect magnitude/scale (the root cause from iterations 1-7). Clamping already-wrong values to 0.0 adds error rather than correcting it.
+
+**Fix applied:** `6057ff3f` feat(gadget): GadgetEvaluator + OptOutProvider + ConstantOptOut + --gadget CLI flag.
+
+**Result after:** exact_exp=77.67 mbb, subgame_exp=34079.20 mbb, mean_mass=0.460, worst_cell="77 @ All-in exact=0.0000 subgame=1.0000 delta=1.0000"
+Status: FAIL (delta=1.000, +34002 mbb — gadget with ConstantOptOut(0.0) WORSENS the result because clamping already-incorrect bcfv values to 0 amplifies the error)
+
+Wall times: exact=1.6s, subgame=337.6s
+Top 3 hands by mass moved:
+1. 7hKs mass=1.000 — exact=[B55:0.57 A:0.42] subgame=[X:1.00] (should bet, checks)
+2. 3hAh mass=1.000 — exact=[X:0.98] subgame=[A:1.00] (should check, shoves)
+3. QhAd mass=1.000 — exact=[B55:0.62 A:0.38] subgame=[X:1.00] (should bet, checks)
+
+**Root cause confirmed:** The gadget architecture is correct (unit tests verify clamping behavior). The blocker is the underlying SubtreeExactEvaluator's cfv_to_bcfv formula producing incorrectly-scaled boundary values. The gadget cannot fix wrong inputs — it needs correct bcfv values to clamp meaningfully.
+
+**Commits:** `6057ff3f` feat(gadget): DeepStack range gadget for safe subgame boundary evaluation
