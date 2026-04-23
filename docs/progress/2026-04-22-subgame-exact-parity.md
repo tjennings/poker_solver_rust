@@ -121,3 +121,22 @@ Three-part implementation:
 Status: FAIL (delta=0.975, +2269 mbb gap — similar to previous bcfv-path result, confirming the issue is subtree strategy divergence, not the cfv formula)
 
 **Commits:** `6ccb55ca` trait method + wiring, `d626e19d` SubtreeExactEvaluator impl, `c8e56ee3` Turn+River game + integration test, `ed0d4a07` cleanup
+
+## Iteration 7 — 2026-04-22 (cfv_to_bcfv + clamping restore, JhTh9h spot)
+
+**Baseline before:** exact_exp=77.67 mbb (river spot JhTh9h7d, 150 iters), subgame_exp=2346 mbb (raw CFV path from iter 6), worst_delta=0.975
+
+**Diagnosis:** Reverted to the `cfv_to_bcfv` approach with `MIN_ADJ=1e-6` + `MAX_BCFV=10.0` clamping (commit `484939a4`). Testing whether the original bcfv path on the JhTh9h spot performs differently than the raw CFV path. The bcfv path re-introduces the `cfv_to_bcfv` inversion formula that divides raw cfvalues by `(half_pot/N)*cfreach_adj` and clamps extreme outputs. This was previously measured on the Jd9d7d turn spot (iter 2) where it produced 232 mbb exploitability. Now measuring on the JhTh9h7d river spot to compare against the raw CFV path (iter 6: 2346 mbb).
+
+**Fix applied:** `484939a4` revert to cfv_to_bcfv + MIN_ADJ/MAX_BCFV clamping (revert of raw CFV path).
+
+**Result after:** exact_exp=77.67 mbb, subgame_exp=3140.12 mbb, mean_mass=0.556, worst_cell="TT @ Check exact=0.9921 subgame=0.0041 delta=0.9880"
+Status: FAIL (delta=0.9880, +3062.45 mbb exploitability gap — worse than raw CFV path's 2346 mbb)
+
+Wall times: exact=0.3s, subgame=458.8s
+Top 3 hands by mass moved:
+1. AcAd mass=1.000 — exact=[X:1.00] subgame=[B55:0.60 A:0.40] (should check, goes aggro)
+2. 7hKs mass=1.000 — exact=[B55:0.57 A:0.42] subgame=[X:1.00] (should bet/shove, checks instead)
+3. 7hQd mass=1.000 — exact=[B55:0.78 A:0.21] subgame=[X:1.00] (should bet, checks instead)
+
+**Commits:** `484939a4` revert(exact_subtree): cfv_to_bcfv approach + MIN_ADJ/MAX_BCFV clamping
