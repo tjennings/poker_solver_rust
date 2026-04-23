@@ -389,7 +389,14 @@ fn load_bundle_with_snapshot(
 
 /// Load ONNX session and wire per-boundary `NeuralBoundaryEvaluator`s
 /// into the game's `per_boundary_evaluators` vector.
-fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
+///
+/// When `opt_out` is `Some`, each evaluator is wrapped in a `GadgetEvaluator`
+/// that clamps the opponent's CFVs upward to the opt-out values.
+fn setup_neural_boundaries(
+    game: &mut PostFlopGame,
+    model_path: &Path,
+    opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>>,
+) {
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
 
@@ -406,6 +413,7 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
         }
     };
 
+    let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
     for board_4 in boundary_boards {
@@ -413,19 +421,30 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
             game.private_cards(0).to_vec(),
             game.private_cards(1).to_vec(),
         ];
-        let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+        let neural_eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
             Arc::clone(&session),
-            board_4,
-            private_cards_pair,
+            board_4.clone(),
+            private_cards_pair.clone(),
         );
-        per_boundary.push(Arc::new(eval));
+        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
+        let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
+            Some(provider) => Arc::new(
+                poker_solver_tauri::gadget::GadgetEvaluator::new(
+                    inner,
+                    Arc::clone(provider),
+                    board_4,
+                    private_cards_pair,
+                ),
+            ),
+            None => inner,
+        };
+        per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
     eprintln!(
-        "[compare] neural-cfvnet mode: {} boundaries (ONNX)",
-        n_boundaries,
+        "[compare] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",
     );
 }
 
@@ -956,7 +975,7 @@ pub fn run(
         if n_boundaries > 0 {
             match kind {
                 BoundaryKind::Cfvnet(model_path) => {
-                    setup_neural_boundaries(&mut subgame_game, Path::new(model_path));
+                    setup_neural_boundaries(&mut subgame_game, Path::new(model_path), opt_out);
                 }
                 BoundaryKind::ExactSubtree => {
                     setup_exact_subtree_boundaries(&mut subgame_game, opt_out);
