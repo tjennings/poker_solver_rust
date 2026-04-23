@@ -173,6 +173,8 @@ export interface GlobalConfig {
   // Boundary tracing (debug)
   trace_boundaries: string;
   trace_iters: string;
+  // Safe re-solving (Libratus gadget)
+  enable_safe_resolving: boolean;
 }
 
 export interface BlueprintListEntry {

@@ -41,6 +41,25 @@ pub trait BoundaryEvaluator: Send + Sync {
         continuation_index: usize,
     ) -> Vec<f32>;
 
+    /// Returns per-hand chip CFVs at the boundary, already integrated over
+    /// the opponent's reach. The parent solver should use these directly
+    /// (no `bcfv * payoff_scale * cfreach_adj` multiplication).
+    ///
+    /// Returns `None` if this evaluator doesn't support the raw path (caller
+    /// falls back to `compute_cfvs_both` + the legacy bcfv contract).
+    fn compute_raw_cfvs_both(
+        &self,
+        _pot: i32,
+        _remaining_stack: f64,
+        _oop_reach: &[f32],
+        _ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
+
     /// Amortized: returns CFVs for both players in one pass.
     /// Default impl calls compute_cfvs twice (backwards compat).
     /// Implementations with internal amortization should override.
@@ -224,6 +243,11 @@ pub struct PostFlopGame {
     /// When set, takes priority over `boundary_evaluator` for the matching
     /// ordinal. Used by hybrid mode where each boundary has different context.
     pub per_boundary_evaluators: Vec<Arc<dyn BoundaryEvaluator>>,
+    /// Per-boundary flag: when true, cached `boundary_cfvs` values are raw
+    /// chip CFVs (already reach-integrated) and should be written directly to
+    /// the result — bypassing the `bcfv * payoff_scale * cfreach_adj` formula.
+    /// Indexed by boundary ordinal. Cleared alongside `boundary_cfvs`.
+    pub(crate) boundary_is_raw: Vec<std::sync::atomic::AtomicBool>,
 
     // -- multi-continuation boundary data --
     /// Number of continuation strategies per boundary. 1 = legacy, 4 = multi-valued.

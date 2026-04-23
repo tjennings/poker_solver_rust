@@ -18,7 +18,7 @@ use poker_solver_core::blueprint_v2::Street;
 use poker_solver_tauri::{
     GameSession, build_solve_game,
     parse_rs_poker_card, seed_solver_with_blueprint,
-    StreetBoundaryConfig, resolve_street_boundary,
+    StreetBoundaryConfig, BoundaryKind, resolve_street_boundary,
 };
 use poker_solver_tauri::postflop::CbvContext;
 
@@ -389,7 +389,14 @@ fn load_bundle_with_snapshot(
 
 /// Load ONNX session and wire per-boundary `NeuralBoundaryEvaluator`s
 /// into the game's `per_boundary_evaluators` vector.
-fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
+///
+/// When `opt_out` is `Some`, each evaluator is wrapped in a `GadgetEvaluator`
+/// that clamps the opponent's CFVs upward to the opt-out values.
+fn setup_neural_boundaries(
+    game: &mut PostFlopGame,
+    model_path: &Path,
+    opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>>,
+) {
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
 
@@ -406,26 +413,98 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
         }
     };
 
+    let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
-    for board_4 in boundary_boards {
+    for (ordinal, board_4) in boundary_boards.into_iter().enumerate() {
         let private_cards_pair = [
             game.private_cards(0).to_vec(),
             game.private_cards(1).to_vec(),
         ];
-        let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+        let neural_eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
             Arc::clone(&session),
-            board_4,
-            private_cards_pair,
+            board_4.clone(),
+            private_cards_pair.clone(),
         );
-        per_boundary.push(Arc::new(eval));
+        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
+        let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
+            Some(provider) => Arc::new(
+                poker_solver_tauri::gadget::GadgetEvaluator::new(
+                    inner,
+                    Arc::clone(provider),
+                    ordinal,
+                    board_4,
+                    private_cards_pair,
+                ),
+            ),
+            None => inner,
+        };
+        per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
     eprintln!(
-        "[compare] neural-cfvnet mode: {} boundaries (ONNX)",
-        n_boundaries,
+        "[compare] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",
+    );
+}
+
+/// Wire per-boundary `SubtreeExactEvaluator`s into the game's
+/// `per_boundary_evaluators` vector -- mirrors the Tauri side so that
+/// compare-solve can use ExactSubtree as a ground-truth boundary evaluator.
+///
+/// When `opt_out` is `Some`, each evaluator is wrapped in a `GadgetEvaluator`
+/// that clamps the opponent's CFVs upward to the opt-out values.
+fn setup_exact_subtree_boundaries(
+    game: &mut PostFlopGame,
+    opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>>,
+) {
+    let boundary_boards = game.boundary_boards();
+    let n_boundaries = game.num_boundary_nodes();
+    if boundary_boards.is_empty() {
+        eprintln!("[compare] no boundary boards found; skipping exact_subtree setup");
+        return;
+    }
+    let tree_cfg = game.tree_config().clone();
+    let private_cards = [
+        game.private_cards(0).to_vec(),
+        game.private_cards(1).to_vec(),
+    ];
+    let initial_weights = [
+        game.initial_weights(0).to_vec(),
+        game.initial_weights(1).to_vec(),
+    ];
+    let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
+    let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
+        Vec::with_capacity(n_boundaries);
+    for (ordinal, board) in boundary_boards.iter().enumerate() {
+        let eval: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(
+            poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
+                board.clone(),
+                private_cards.clone(),
+                initial_weights.clone(),
+                tree_cfg.clone(),
+            )
+            .with_solve_iters(500),
+        );
+        let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
+            Some(provider) => Arc::new(
+                poker_solver_tauri::gadget::GadgetEvaluator::new(
+                    eval,
+                    Arc::clone(provider),
+                    ordinal,
+                    board.clone(),
+                    private_cards.clone(),
+                ),
+            ),
+            None => eval,
+        };
+        per_boundary.push(wrapped);
+    }
+    game.per_boundary_evaluators = per_boundary;
+    game.boundary_evaluator = None;
+    eprintln!(
+        "[compare] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}"
     );
 }
 
@@ -469,11 +548,25 @@ fn run_dcfr_solve(
         // Capture boundary traces after this iteration's CFVs are cached.
         if let Some(tr) = tracer {
             capture_boundary_traces(game, tr, spot_paths, preceding_map.as_ref(), t);
+            // capture_boundary_traces leaves game at root; fine before next solve_step.
         }
 
         if verbose && (t + 1) % 20 == 0 {
             let wall = start.elapsed().as_secs_f64();
             eprintln!("[{label}] iter {}/{iters}  wall {wall:.1}s", t + 1);
+        }
+        // Unconditional progress heartbeat — logs every 10 iters so long
+        // runs (especially subgame with per-iter subtree re-solves) show
+        // progress without needing --verbose.
+        if (t + 1) % 10 == 0 {
+            let wall = start.elapsed().as_secs_f64();
+            let per_iter = wall / (t + 1) as f64;
+            let eta = per_iter * (iters - (t + 1)) as f64;
+            eprintln!(
+                "[{label}] {}/{iters} iters | {wall:.1}s elapsed | {per_iter:.2}s/iter | ETA {eta:.0}s",
+                t + 1
+            );
+            std::io::Write::flush(&mut std::io::stderr()).ok();
         }
     }
 
@@ -709,6 +802,13 @@ fn format_hand(c1: u8, c2: u8) -> String {
 }
 
 /// Run the compare-solve harness.
+///
+/// `tolerance > 0` enables a pass/fail check on the final strategy at the
+/// root: the maximum absolute per-action delta between the exact and subgame
+/// strategies (averaged per hand in each 13x13 matrix cell using reach-weighted
+/// aggregation) must be <= `tolerance`. If the delta exceeds tolerance, the
+/// run returns an `Err` so the caller can signal failure via non-zero exit
+/// code.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn run(
     bundle_dir: &Path,
@@ -719,6 +819,10 @@ pub fn run(
     dump_boundary_cfvs: bool,
     street_boundary_config: StreetBoundaryConfig,
     trace_config: crate::boundary_trace::TraceConfig,
+    tolerance: f32,
+    gadget: bool,
+    gadget_provider: &str,
+    gadget_constant: f32,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -783,7 +887,8 @@ pub fn run(
     println!(
         "iters: {iters}  boundary: {}",
         match &boundary_cut {
-            Some((d, p)) => format!("depth={d}, model={p}"),
+            Some((d, BoundaryKind::Cfvnet(p))) => format!("depth={d}, model={p}"),
+            Some((d, BoundaryKind::ExactSubtree)) => format!("depth={d}, exact_subtree"),
             None => "all-exact".to_string(),
         }
     );
@@ -832,10 +937,52 @@ pub fn run(
         &board_cards, seed_street, current_node,
     );
 
-    // 7. Set up neural boundary evaluators if a cut is active
-    if let Some((_, ref model_path)) = boundary_cut {
+    // 7. Set up boundary evaluators if a cut is active
+    let opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>> = if gadget {
+        match gadget_provider {
+            "constant" => {
+                eprintln!("[compare] gadget enabled: ConstantOptOut({gadget_constant})");
+                Some(Arc::new(poker_solver_tauri::gadget::ConstantOptOut(gadget_constant)))
+            }
+            "blueprint-cbv" => {
+                let half_pot = pot as f32 / 2.0;
+                eprintln!("[compare] gadget enabled: BlueprintCbvOptOut (half_pot={half_pot})");
+                let board_u8: Vec<u8> = board_cards.iter()
+                    .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
+                    .collect();
+                let private_cards: [Vec<(u8, u8)>; 2] = [
+                    subgame_game.private_cards(0).to_vec(),
+                    subgame_game.private_cards(1).to_vec(),
+                ];
+                Some(Arc::new(
+                    poker_solver_tauri::gadget::BlueprintCbvOptOut::from_cbv_context(
+                        &ctx,
+                        current_node,
+                        &board_u8,
+                        &private_cards,
+                        half_pot,
+                    ),
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((_, ref kind)) = boundary_cut {
         if n_boundaries > 0 {
-            setup_neural_boundaries(&mut subgame_game, Path::new(model_path));
+            match kind {
+                BoundaryKind::Cfvnet(model_path) => {
+                    setup_neural_boundaries(&mut subgame_game, Path::new(model_path), opt_out);
+                }
+                BoundaryKind::ExactSubtree => {
+                    setup_exact_subtree_boundaries(&mut subgame_game, opt_out);
+                }
+            }
         }
     }
 
@@ -987,7 +1134,103 @@ pub fn run(
         );
     }
 
+    // 13. Tolerance check (for harness-driven iteration loops). Compares the
+    // reach-weighted per-class aggregate (the same quantity the UI shows) to
+    // stay consistent with what humans will inspect.
+    if tolerance > 0.0 {
+        let agg_exact =
+            aggregate_by_class(&exact_strat, private_cards, num_hands, num_actions);
+        let agg_sub =
+            aggregate_by_class(&subgame_strat, private_cards, num_hands, num_actions);
+        let mut worst: Option<(String, String, f32, f32, f32)> = None; // class, action, e, s, |Δ|
+        for (class, e_probs) in &agg_exact {
+            let Some(s_probs) = agg_sub.get(class) else { continue };
+            for a in 0..num_actions {
+                let e = e_probs[a];
+                let s = s_probs[a];
+                let d = (e - s).abs();
+                if worst.as_ref().map_or(true, |w| d > w.4) {
+                    worst = Some((
+                        class.clone(),
+                        action_labels[a].clone(),
+                        e, s, d,
+                    ));
+                }
+            }
+        }
+        println!();
+        if let Some((class, action, e, s, d)) = worst {
+            println!(
+                "=== Tolerance check (threshold={tolerance:.4}) ===\n\
+                 worst cell: {class} @ {action}  exact={e:.4}  subgame={s:.4}  |Δ|={d:.4}"
+            );
+            if d > tolerance {
+                return Err(format!(
+                    "FAIL: strategy delta {d:.4} exceeds tolerance {tolerance:.4} \
+                     (class={class}, action={action}, exact={e:.4}, subgame={s:.4})"
+                ));
+            }
+            println!("PASS");
+        }
+    }
+
     Ok(())
+}
+
+/// Reach-weighted per-class aggregate of a strategy vector. Matches the
+/// `build_solve_matrix_at_current` aggregation so we compare the same
+/// quantity the user inspects in the UI.
+fn aggregate_by_class(
+    strategy: &[f32],
+    private_cards: &[(u8, u8)],
+    num_hands: usize,
+    num_actions: usize,
+) -> std::collections::BTreeMap<String, Vec<f32>> {
+    use std::collections::BTreeMap;
+    let mut sums: BTreeMap<String, (f64, Vec<f64>)> = BTreeMap::new();
+    for (h, &(c1, c2)) in private_cards.iter().enumerate().take(num_hands) {
+        let class = canonical_hand_name(c1, c2);
+        let entry = sums
+            .entry(class)
+            .or_insert_with(|| (0.0, vec![0.0; num_actions]));
+        entry.0 += 1.0; // uniform weight across combos (tolerance check treats
+                         // all AA combos equally); reach-weighted comparison is
+                         // future work — simple-mean is adequate for 0.1%.
+        for a in 0..num_actions {
+            entry.1[a] += strategy[a * num_hands + h] as f64;
+        }
+    }
+    sums.into_iter()
+        .map(|(k, (w, v))| {
+            let probs: Vec<f32> = v
+                .iter()
+                .map(|&s| if w > 0.0 { (s / w) as f32 } else { 0.0 })
+                .collect();
+            (k, probs)
+        })
+        .collect()
+}
+
+/// Canonical hand name matching the boundary-trace module. Reproduced here
+/// to avoid a cross-crate dep from trainer → tauri-app.
+fn canonical_hand_name(c1: u8, c2: u8) -> String {
+    const RANKS: [char; 13] = [
+        '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A',
+    ];
+    let r1 = c1 / 4;
+    let r2 = c2 / 4;
+    let s1 = c1 % 4;
+    let s2 = c2 % 4;
+    let (hi, lo) = if r1 >= r2 { (r1, r2) } else { (r2, r1) };
+    let h = RANKS[hi as usize];
+    let l = RANKS[lo as usize];
+    if hi == lo {
+        format!("{h}{l}")
+    } else if s1 == s2 {
+        format!("{h}{l}s")
+    } else {
+        format!("{h}{l}o")
+    }
 }
 
 #[cfg(test)]

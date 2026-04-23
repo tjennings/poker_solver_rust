@@ -2621,7 +2621,7 @@ pub struct PreflopRanges {
 ///
 /// `rs_poker` encoding: `Value::Two = 0 .. Ace = 12`,
 /// `Suit::Spade = 0, Club = 1, Heart = 2, Diamond = 3`.
-pub(crate) fn rs_card_to_range_solver(card: Card) -> u8 {
+pub fn rs_card_to_range_solver(card: Card) -> u8 {
     let rank = card.value as u8; // Two=0 .. Ace=12, matches range-solver
     let suit = match card.suit {
         Suit::Club => 0,

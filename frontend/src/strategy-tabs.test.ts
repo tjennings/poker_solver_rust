@@ -175,4 +175,23 @@ describe('buildSolveParams', () => {
     expect(params.traceBoundaries).toBe('0,42');
     expect(params.traceIters).toBe('all');
   });
+
+  // enableGadget tests
+
+  it('defaults enableGadget to false when config has no enable_safe_resolving', () => {
+    const params = buildSolveParams('subgame', {});
+    expect(params.enableGadget).toBe(false);
+  });
+
+  it('sets enableGadget to true when enable_safe_resolving is true', () => {
+    const config = { ...defaultConfig, enable_safe_resolving: true };
+    const params = buildSolveParams('subgame', config);
+    expect(params.enableGadget).toBe(true);
+  });
+
+  it('sets enableGadget to false when enable_safe_resolving is false', () => {
+    const config = { ...defaultConfig, enable_safe_resolving: false };
+    const params = buildSolveParams('subgame', config);
+    expect(params.enableGadget).toBe(false);
+  });
 });

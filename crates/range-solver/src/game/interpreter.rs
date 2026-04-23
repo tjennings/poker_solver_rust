@@ -372,6 +372,9 @@ impl PostFlopGame {
         for m in &self.boundary_cfvs {
             m.lock().unwrap().clear();
         }
+        for flag in &self.boundary_is_raw {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Clear only boundary CFVs, keeping reach probabilities intact.
@@ -382,6 +385,9 @@ impl PostFlopGame {
     pub fn clear_boundary_cfvs(&self) {
         for m in &self.boundary_cfvs {
             m.lock().unwrap().clear();
+        }
+        for flag in &self.boundary_is_raw {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -459,6 +465,10 @@ impl PostFlopGame {
         // Reallocate boundary_cfvs: boundary_count * 2 * K slots
         self.boundary_cfvs = (0..boundary_count * 2 * k)
             .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
+        // Multi-continuation always uses legacy bcfv path (not raw).
+        self.boundary_is_raw = (0..boundary_count)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
             .collect();
 
         // Allocate per-boundary continuation regrets and strategy sums
@@ -791,6 +801,9 @@ impl PostFlopGame {
             .collect();
         self.boundary_reach = (0..boundary_count as usize * 2)
             .map(|_| std::sync::Mutex::new(Vec::new()))
+            .collect();
+        self.boundary_is_raw = (0..boundary_count as usize)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
             .collect();
 
         self.misc_memory_usage = self.memory_usage_internal();

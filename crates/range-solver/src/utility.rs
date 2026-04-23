@@ -391,6 +391,57 @@ pub fn compute_exploitability<T: Game>(game: &T) -> f32 {
     }
 }
 
+/// Returns per-hand counterfactual values at the ROOT for the given player,
+/// using the game's current (solved) strategies and the initial reach of
+/// the opposing player.
+///
+/// Values are in "per-combination" units: dimensionally `payoff / combo`,
+/// the same internal representation stored by `compute_cfvalue_recursive`.
+/// To convert to pot-normalised CFV:
+/// `bcfv[h] = per_combo_cfv[h] * num_combinations / half_pot`.
+///
+/// Works regardless of whether the player is the root's current player —
+/// bypasses `expected_values` which depends on `cfvalues_cache` (only
+/// populated after navigation).
+#[inline]
+pub fn root_cfvalues<T: Game>(game: &T, player: usize) -> Vec<f32> {
+    if !game.is_ready() && !game.is_solved() {
+        panic!("Game is not ready");
+    }
+    let opp = player ^ 1;
+    root_cfvalues_with_reach(game, player, game.initial_weights(opp))
+}
+
+/// Like [`root_cfvalues`] but with a caller-supplied opponent reach vector
+/// instead of the game's `initial_weights(opp)`.
+///
+/// This lets boundary evaluators compute cfvalues using the parent solver's
+/// actual cfreach at the boundary rather than the subtree game's initial
+/// weights.
+#[inline]
+pub fn root_cfvalues_with_reach<T: Game>(
+    game: &T,
+    player: usize,
+    opp_reach: &[f32],
+) -> Vec<f32> {
+    if !game.is_ready() && !game.is_solved() {
+        panic!("Game is not ready");
+    }
+    let nh = game.num_private_hands(player);
+    let mut out = Vec::with_capacity(nh);
+    compute_cfvalue_recursive(
+        &mut out.spare_capacity_mut()[..nh],
+        game,
+        &mut game.root(),
+        player,
+        opp_reach,
+        false,
+    );
+    // SAFETY: compute_cfvalue_recursive writes all nh elements.
+    unsafe { out.set_len(nh) };
+    out
+}
+
 /// Computes the expected values of each player's current strategy.
 ///
 /// The bias (starting_pot / 2) is already subtracted to increase significant

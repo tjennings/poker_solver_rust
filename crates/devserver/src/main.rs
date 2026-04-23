@@ -173,6 +173,7 @@ struct GameSolveParams {
     trace_boundaries: Option<String>,
     trace_iters: Option<String>,
     trace_dir: Option<String>,
+    enable_gadget: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -662,6 +663,7 @@ async fn handle_game_solve(
         params.trace_boundaries,
         params.trace_iters,
         params.trace_dir,
+        params.enable_gadget,
     ))
 }
 

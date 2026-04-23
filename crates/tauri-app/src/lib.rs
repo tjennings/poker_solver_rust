@@ -1,4 +1,6 @@
 pub mod boundary_trace;
+pub mod exact_subtree;
+pub mod gadget;
 mod exploration;
 pub mod game_session;
 pub mod postflop;
@@ -22,7 +24,7 @@ pub use exploration::{
     start_bucket_computation_core,
     // Helpers
     blueprint_sizes_to_range_solver, load_hand_ev_bin, populate_cbv_context,
-    range_solver_to_rs_card,
+    range_solver_to_rs_card, rs_card_to_range_solver,
     // Types
     BlueprintListEntry, ExplorationState, SnapshotEntry, SubgameProgressEvent,
     // Additional types needed by consumers of core functions
@@ -67,5 +69,5 @@ pub use game_session::{
     // Types
     GameSession, GameSessionState, GameState, GameMatrix, GameMatrixCell, GameAction,
     SolveBoundaryEvaluator, build_solve_game,
-    StreetBoundaryConfig, StreetBoundaryMode, resolve_street_boundary,
+    StreetBoundaryConfig, StreetBoundaryMode, BoundaryKind, resolve_street_boundary,
 };
