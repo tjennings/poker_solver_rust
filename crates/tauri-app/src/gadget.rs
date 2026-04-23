@@ -1,11 +1,11 @@
-//! DeepStack-style range gadget for safe subgame solving.
+//! Libratus-style safe re-solving gadget.
 //!
-//! The gadget gives the opponent a per-hand choice at each boundary:
-//! - **ENTER**: play the subtree (get subtree CFV)
-//! - **OPT-OUT**: take a pre-specified CFV (from blueprint or other source)
-//!
-//! This constrains the subgame solution so the opponent never does worse
-//! than the opt-out value, producing a **safe** re-solve.
+//! Clamps opponent per-hand CFV upward to a pre-computed opt-out floor
+//! (typically blueprint CBVs). Makes subgame boundary evaluators "safe"
+//! in the sense that the reported opponent CFV is never worse than the
+//! blueprint would guarantee. See `docs/plans/2026-04-23-deepstack-gadget.md`
+//! for the full design and the distinction from DeepStack-proper
+//! (which requires a cfvnet retrain; bean poker_solver_rust-akg3).
 
 use std::sync::Arc;
 
@@ -47,7 +47,7 @@ impl OptOutProvider for ConstantOptOut {
     }
 }
 
-/// Boundary evaluator wrapper that applies the DeepStack range gadget.
+/// Boundary evaluator wrapper that applies the Libratus range gadget.
 ///
 /// Delegates to an inner `BoundaryEvaluator`, then clamps each opponent
 /// hand's CFV upward to the opt-out value. This ensures the opponent
