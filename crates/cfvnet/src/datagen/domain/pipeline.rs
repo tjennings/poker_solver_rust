@@ -769,6 +769,113 @@ impl DomainPipeline {
         let mut batched_p0 = vec![0.0_f32; batch_len * slot_len];
         let mut batched_p1 = vec![0.0_f32; batch_len * slot_len];
 
+        use rayon::prelude::*;
+
+        // Build one BoundaryEvalRequest per sit in parallel. Each sit's work
+        // (reach computation, 1326-reshape, request struct) is independent.
+        // Per-element arithmetic is unchanged vs the serial loop. A single
+        // batched ORT dispatch (called after this block) still handles every
+        // sit in one shot — unchanged from the Layer A behavior.
+        let requests: Vec<BoundaryEvalRequest> = (0..sits.len())
+            .into_par_iter()
+            .map(|b| {
+                let sit = &sits[b];
+                let spec = &specs[b];
+                let strategy_sum = &strategy_sums[b];
+
+                let reach = compute_reach_at_nodes(
+                    topo,
+                    strategy_sum,
+                    &spec.initial_weights,
+                    num_hands,
+                    boundary_node_ids,
+                );
+
+                // Canonical hand layout: hand index == card_pair_to_index, so we
+                // can copy reach directly without remapping.
+                debug_assert_eq!(num_hands, NUM_COMBOS);
+                let mut oop_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
+                let mut ip_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
+                for bi in 0..num_boundaries {
+                    let src_base = bi * num_hands;
+                    let dst_base = bi * NUM_COMBOS;
+                    // reach[0] = opponent (P1/IP) reach from P0 traversal
+                    // reach[1] = opponent (P0/OOP) reach from P1 traversal
+                    ip_reach_1326[dst_base..dst_base + NUM_COMBOS]
+                        .copy_from_slice(&reach[0][src_base..src_base + num_hands]);
+                    oop_reach_1326[dst_base..dst_base + NUM_COMBOS]
+                        .copy_from_slice(&reach[1][src_base..src_base + num_hands]);
+                }
+
+                let board_4: [u8; 4] = [
+                    sit.board[0],
+                    sit.board[1],
+                    sit.board[2],
+                    sit.board[3],
+                ];
+                BoundaryEvalRequest {
+                    board: board_4,
+                    pot: sit.pot as f32,
+                    effective_stack: sit.effective_stack as f32,
+                    oop_reach: oop_reach_1326,
+                    ip_reach: ip_reach_1326,
+                    num_boundaries,
+                }
+            })
+            .collect();
+
+        // Single batched ORT call across all sits.
+        let results = evaluate_boundaries_batched(evaluator, &requests, canonical_hand_cards)
+            .map_err(|e| format!("boundary eval failed: {e}"))?;
+        debug_assert_eq!(results.len(), sits.len());
+
+        // Copy per-sit results into the batched output buffers.
+        for (b, result) in results.into_iter().enumerate() {
+            let slot_start = b * slot_len;
+            batched_p0[slot_start..slot_start + slot_len]
+                .copy_from_slice(&result.leaf_cfv_p0);
+            batched_p1[slot_start..slot_start + slot_len]
+                .copy_from_slice(&result.leaf_cfv_p1);
+        }
+
+        Ok((batched_p0, batched_p1))
+    }
+
+    /// Test-only reference implementation that mirrors the pre-Layer-A
+    /// per-sit, batch-of-1 ORT call path. Retained so the regression test
+    /// for bean `p99d` can compare the refactored batched-once path
+    /// against this byte-for-byte reference of the original behavior.
+    ///
+    /// The body is a copy of the original `batch_boundary_leaf_cfvs`
+    /// implementation. Do not modify without also updating the production
+    /// function — the whole point is to serve as the numerical baseline.
+    #[cfg(all(test, feature = "gpu-turn-datagen"))]
+    #[allow(clippy::too_many_arguments)]
+    fn per_sit_batch_boundary_leaf_cfvs(
+        evaluator: &crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator,
+        topo: &gpu_range_solver::extract::TreeTopology,
+        boundary_node_ids: &[usize],
+        canonical_hand_cards: &[(u8, u8)],
+        num_hands: usize,
+        strategy_sums: &[Vec<f32>],
+        specs: &[gpu_range_solver::SubgameSpec],
+        sits: &[crate::datagen::sampler::Situation],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        use gpu_range_solver::compute_reach_at_nodes;
+        use crate::datagen::gpu_boundary_eval::{
+            evaluate_boundaries_batched, BoundaryEvalRequest,
+        };
+        use crate::datagen::range_gen::NUM_COMBOS;
+
+        debug_assert_eq!(strategy_sums.len(), specs.len());
+        debug_assert_eq!(strategy_sums.len(), sits.len());
+
+        let num_boundaries = boundary_node_ids.len();
+        let slot_len = num_boundaries * num_hands;
+        let batch_len = specs.len();
+        let mut batched_p0 = vec![0.0_f32; batch_len * slot_len];
+        let mut batched_p1 = vec![0.0_f32; batch_len * slot_len];
+
         for (b, sit) in sits.iter().enumerate() {
             let spec = &specs[b];
             let strategy_sum = &strategy_sums[b];
@@ -781,16 +888,12 @@ impl DomainPipeline {
                 boundary_node_ids,
             );
 
-            // Canonical hand layout: hand index == card_pair_to_index, so we
-            // can copy reach directly without remapping.
             debug_assert_eq!(num_hands, NUM_COMBOS);
             let mut oop_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
             let mut ip_reach_1326 = vec![0.0_f32; num_boundaries * NUM_COMBOS];
             for bi in 0..num_boundaries {
                 let src_base = bi * num_hands;
                 let dst_base = bi * NUM_COMBOS;
-                // reach[0] = opponent (P1/IP) reach from P0 traversal
-                // reach[1] = opponent (P0/OOP) reach from P1 traversal
                 ip_reach_1326[dst_base..dst_base + NUM_COMBOS]
                     .copy_from_slice(&reach[0][src_base..src_base + num_hands]);
                 oop_reach_1326[dst_base..dst_base + NUM_COMBOS]
@@ -1585,6 +1688,272 @@ mod tests {
             for &v in &results[0].strategy_sum {
                 assert!(v.is_finite(), "strategy_sum must be finite, got {v}");
             }
+        }
+
+        /// Regression test for bean p99d (Layer A boundary-eval batching):
+        /// the refactored `batch_boundary_leaf_cfvs` (single batched ORT
+        /// call across all sits) must produce leaf CFVs matching the
+        /// per-sit reference implementation (`per_sit_batch_boundary_leaf_cfvs`)
+        /// element-wise within tight FP tolerance.
+        ///
+        /// Pre-refactor, both functions share the same body so the test
+        /// passes trivially (zero diff). After the Layer A refactor it
+        /// becomes a meaningful cross-implementation regression check.
+        ///
+        /// Tolerance accounts for TensorRT potentially picking different
+        /// kernels at different batch sizes.
+        #[cfg(feature = "gpu-turn-datagen")]
+        #[test]
+        fn layer_a_batched_matches_per_sit_within_tolerance() {
+            use crate::datagen::range_gen::NUM_COMBOS;
+            use crate::datagen::sampler::Situation;
+            use gpu_range_solver::extract::extract_topology;
+            use gpu_range_solver::SubgameSpec;
+            use range_solver::card::index_to_card_pair;
+
+            let model_path =
+                std::path::Path::new("../../local_data/models/cfvnet_river_py_v2/model.onnx");
+            if !model_path.exists() {
+                eprintln!(
+                    "SKIPPING: BoundaryNet model missing at {} — run cfvnet train-boundary first",
+                    model_path.display()
+                );
+                return;
+            }
+            let evaluator =
+                crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator::load(model_path)
+                    .expect("load BoundaryNet");
+
+            // Canonical turn bet sizes matching the smoke test above.
+            let bet_sizes: Vec<Vec<f64>> = vec![
+                vec![0.25, 0.50, 1.00],
+                vec![0.25, 0.75],
+            ];
+            let canonical_game =
+                crate::datagen::domain::game_tree::build_canonical_turn_tree(&bet_sizes)
+                    .expect("canonical turn tree builds");
+            let topo = extract_topology(&canonical_game);
+            assert!(
+                !topo.showdown_nodes.is_empty(),
+                "canonical turn topology must have boundary nodes"
+            );
+
+            let num_hands = NUM_COMBOS;
+            let boundary_node_ids: Vec<usize> = topo.showdown_nodes.clone();
+            let num_folds = topo.fold_nodes.len();
+
+            // Build 4 deterministic sits with small perturbations so each
+            // produces distinct inputs (catches per-sit indexing bugs).
+            let batch_size = 4usize;
+            let sits: Vec<Situation> = (0..batch_size)
+                .map(|i| {
+                    let i_u8 = i as u8;
+                    Situation {
+                        board: [0, 4, 8, 12 + i_u8, 0],
+                        board_size: 4,
+                        pot: 100 + 10 * i as i32,
+                        effective_stack: 200 - 10 * i as i32,
+                        ranges: [[1.0f32 / num_hands as f32; NUM_COMBOS]; 2],
+                    }
+                })
+                .collect();
+
+            // Strategy sums sized to `topo.num_edges * num_hands` (what
+            // `compute_reach_at_nodes` expects). All zeros -> uniform avg
+            // strategy, deterministic reach computation.
+            let strategy_sums: Vec<Vec<f32>> = (0..batch_size)
+                .map(|_| vec![0.0f32; topo.num_edges * num_hands])
+                .collect();
+
+            // Uniform specs with no showdowns (matches turn datagen's
+            // SubgameSpec shape) and zero fold payoffs.
+            let specs: Vec<SubgameSpec> = (0..batch_size)
+                .map(|_| SubgameSpec {
+                    initial_weights: [
+                        vec![1.0f32 / num_hands as f32; num_hands],
+                        vec![1.0f32 / num_hands as f32; num_hands],
+                    ],
+                    showdown_outcomes_p0: None,
+                    showdown_outcomes_p1: None,
+                    fold_payoffs_p0: vec![0.0; num_folds],
+                    fold_payoffs_p1: vec![0.0; num_folds],
+                })
+                .collect();
+
+            let hand_cards: Vec<(u8, u8)> =
+                (0..num_hands).map(index_to_card_pair).collect();
+
+            let (batched_p0, batched_p1) = DomainPipeline::batch_boundary_leaf_cfvs(
+                &evaluator,
+                &topo,
+                &boundary_node_ids,
+                &hand_cards,
+                num_hands,
+                &strategy_sums,
+                &specs,
+                &sits,
+            )
+            .expect("batched path");
+
+            let (reference_p0, reference_p1) = DomainPipeline::per_sit_batch_boundary_leaf_cfvs(
+                &evaluator,
+                &topo,
+                &boundary_node_ids,
+                &hand_cards,
+                num_hands,
+                &strategy_sums,
+                &specs,
+                &sits,
+            )
+            .expect("per-sit reference path");
+
+            assert_eq!(batched_p0.len(), reference_p0.len());
+            assert_eq!(batched_p1.len(), reference_p1.len());
+
+            let check_close = |batched: &[f32], reference: &[f32], label: &str| {
+                for (i, (&b, &r)) in batched.iter().zip(reference).enumerate() {
+                    let abs_tol = 1e-5_f32;
+                    let rel_tol = 1e-4_f32;
+                    let diff = (b - r).abs();
+                    let limit = abs_tol + rel_tol * r.abs();
+                    assert!(
+                        diff <= limit,
+                        "{label}[{i}] batched={b} reference={r} diff={diff} limit={limit}"
+                    );
+                    assert!(b.is_finite(), "{label}[{i}] batched value not finite: {b}");
+                }
+            };
+
+            check_close(&batched_p0, &reference_p0, "p0");
+            check_close(&batched_p1, &reference_p1, "p1");
+        }
+
+        /// Regression test for bean 6c5k (Layer B+C). Unlike Layer A's
+        /// tolerance-based test, this asserts byte-identical output: we
+        /// only parallelize across independent sits/requests, so per-
+        /// element arithmetic is unchanged.
+        ///
+        /// Compares the production `batch_boundary_leaf_cfvs` (parallel
+        /// per-sit prep + parallel reduction) against the serial reference
+        /// `per_sit_batch_boundary_leaf_cfvs` using `f32::to_bits()`
+        /// equality. Strictly stronger than Layer A's tolerance because
+        /// rayon parallelism preserves per-element FP math exactly.
+        #[cfg(feature = "gpu-turn-datagen")]
+        #[test]
+        fn layer_bc_parallel_matches_serial_exact() {
+            use crate::datagen::range_gen::NUM_COMBOS;
+            use crate::datagen::sampler::Situation;
+            use gpu_range_solver::extract::extract_topology;
+            use gpu_range_solver::SubgameSpec;
+            use range_solver::card::index_to_card_pair;
+
+            let model_path =
+                std::path::Path::new("../../local_data/models/cfvnet_river_py_v2/model.onnx");
+            if !model_path.exists() {
+                eprintln!(
+                    "SKIPPING: BoundaryNet model missing at {} - run cfvnet train-boundary first",
+                    model_path.display()
+                );
+                return;
+            }
+            let evaluator =
+                crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator::load(model_path)
+                    .expect("load BoundaryNet");
+
+            // Identical setup to layer_a_batched_matches_per_sit_within_tolerance:
+            // canonical turn bet sizes, 4 deterministic sits with per-sit
+            // perturbations so each produces distinct inputs.
+            let bet_sizes: Vec<Vec<f64>> = vec![
+                vec![0.25, 0.50, 1.00],
+                vec![0.25, 0.75],
+            ];
+            let canonical_game =
+                crate::datagen::domain::game_tree::build_canonical_turn_tree(&bet_sizes)
+                    .expect("canonical turn tree builds");
+            let topo = extract_topology(&canonical_game);
+            assert!(
+                !topo.showdown_nodes.is_empty(),
+                "canonical turn topology must have boundary nodes"
+            );
+
+            let num_hands = NUM_COMBOS;
+            let boundary_node_ids: Vec<usize> = topo.showdown_nodes.clone();
+            let num_folds = topo.fold_nodes.len();
+
+            let batch_size = 4usize;
+            let sits: Vec<Situation> = (0..batch_size)
+                .map(|i| {
+                    let i_u8 = i as u8;
+                    Situation {
+                        board: [0, 4, 8, 12 + i_u8, 0],
+                        board_size: 4,
+                        pot: 100 + 10 * i as i32,
+                        effective_stack: 200 - 10 * i as i32,
+                        ranges: [[1.0f32 / num_hands as f32; NUM_COMBOS]; 2],
+                    }
+                })
+                .collect();
+
+            let strategy_sums: Vec<Vec<f32>> = (0..batch_size)
+                .map(|_| vec![0.0f32; topo.num_edges * num_hands])
+                .collect();
+
+            let specs: Vec<SubgameSpec> = (0..batch_size)
+                .map(|_| SubgameSpec {
+                    initial_weights: [
+                        vec![1.0f32 / num_hands as f32; num_hands],
+                        vec![1.0f32 / num_hands as f32; num_hands],
+                    ],
+                    showdown_outcomes_p0: None,
+                    showdown_outcomes_p1: None,
+                    fold_payoffs_p0: vec![0.0; num_folds],
+                    fold_payoffs_p1: vec![0.0; num_folds],
+                })
+                .collect();
+
+            let hand_cards: Vec<(u8, u8)> =
+                (0..num_hands).map(index_to_card_pair).collect();
+
+            let (batched_p0, batched_p1) = DomainPipeline::batch_boundary_leaf_cfvs(
+                &evaluator,
+                &topo,
+                &boundary_node_ids,
+                &hand_cards,
+                num_hands,
+                &strategy_sums,
+                &specs,
+                &sits,
+            )
+            .expect("parallel path");
+
+            let (reference_p0, reference_p1) = DomainPipeline::per_sit_batch_boundary_leaf_cfvs(
+                &evaluator,
+                &topo,
+                &boundary_node_ids,
+                &hand_cards,
+                num_hands,
+                &strategy_sums,
+                &specs,
+                &sits,
+            )
+            .expect("serial reference path");
+
+            assert_eq!(batched_p0.len(), reference_p0.len());
+            assert_eq!(batched_p1.len(), reference_p1.len());
+
+            let check_bitwise_eq = |parallel: &[f32], serial: &[f32], label: &str| {
+                for (i, (&pv, &sv)) in parallel.iter().zip(serial).enumerate() {
+                    assert!(
+                        pv.to_bits() == sv.to_bits(),
+                        "{label}[{i}] parallel={pv} (bits={:#010x}) serial={sv} (bits={:#010x})",
+                        pv.to_bits(),
+                        sv.to_bits()
+                    );
+                }
+            };
+
+            check_bitwise_eq(&batched_p0, &reference_p0, "p0");
+            check_bitwise_eq(&batched_p1, &reference_p1, "p1");
         }
     }
 }
