@@ -2006,7 +2006,7 @@ pub fn game_solve_core(
                         ctx,
                         current_node_idx,
                         &board_clone.iter()
-                            .filter_map(|s| parse_rs_poker_card(s).ok())
+                            .map(|s| parse_rs_poker_card(s).expect("board card must parse"))
                             .map(|c| crate::exploration::rs_card_to_range_solver(c))
                             .collect::<Vec<u8>>(),
                         &private_cards,
@@ -2049,7 +2049,7 @@ pub fn game_solve_core(
         if let Some(ref ctx) = cbv_ctx {
             let board_cards: Vec<rs_poker::core::Card> = board_clone
                 .iter()
-                .filter_map(|s| parse_rs_poker_card(s).ok())
+                .map(|s| parse_rs_poker_card(s).expect("board card must parse"))
                 .collect();
             let seed_street = match board_cards.len() {
                 3 => Street::Flop,
