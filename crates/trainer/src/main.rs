@@ -413,6 +413,12 @@ enum Commands {
         /// non-zero status. `0.0` disables the check (default).
         #[arg(long, default_value_t = 0.0)]
         tolerance: f32,
+
+        /// Enable DeepStack-style range gadget at subgame boundaries.
+        /// Constrains opponent CFVs to be at least as good as the blueprint
+        /// CBV opt-out, producing a safe re-solve.
+        #[arg(long, default_value_t = false)]
+        gadget: bool,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1338,6 +1344,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             trace_iters,
             trace_dir,
             tolerance,
+            gadget,
         } => {
             let parse_mode = |mode: &str, model: Option<String>, street: &str|
                 -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
@@ -1376,6 +1383,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 sbc,
                 trace_config,
                 tolerance,
+                gadget,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -2867,6 +2875,41 @@ snapshots:
             assert!(trace_boundaries.is_none());
             assert_eq!(trace_iters, "last");
             assert_eq!(trace_dir, std::path::PathBuf::from("./traces"));
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+    }
+
+    /// compare-solve should accept --gadget flag.
+    #[test]
+    fn compare_solve_gadget_flag_parse() {
+        use clap::Parser;
+
+        // Default: gadget off
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/test",
+            "--spot", "sb:2bb,bb:call|Jd9d7d",
+        ]);
+        assert!(cli.is_ok());
+        if let super::Commands::CompareSolve { gadget, .. } = cli.unwrap().command {
+            assert!(!gadget, "gadget should default to false");
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+
+        // Explicit --gadget
+        let cli2 = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/test",
+            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--gadget",
+        ]);
+        assert!(cli2.is_ok());
+        if let super::Commands::CompareSolve { gadget, .. } = cli2.unwrap().command {
+            assert!(gadget, "gadget should be true when --gadget is passed");
         } else {
             panic!("expected CompareSolve variant");
         }

@@ -1,5 +1,6 @@
 pub mod boundary_trace;
 pub mod exact_subtree;
+pub mod gadget;
 mod exploration;
 pub mod game_session;
 pub mod postflop;

@@ -430,9 +430,15 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &Path) {
 }
 
 /// Wire per-boundary `SubtreeExactEvaluator`s into the game's
-/// `per_boundary_evaluators` vector — mirrors the Tauri side so that
+/// `per_boundary_evaluators` vector -- mirrors the Tauri side so that
 /// compare-solve can use ExactSubtree as a ground-truth boundary evaluator.
-fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
+///
+/// When `opt_out` is `Some`, each evaluator is wrapped in a `GadgetEvaluator`
+/// that clamps the opponent's CFVs upward to the opt-out values.
+fn setup_exact_subtree_boundaries(
+    game: &mut PostFlopGame,
+    opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>>,
+) {
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
     if boundary_boards.is_empty() {
@@ -448,21 +454,36 @@ fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
         game.initial_weights(0).to_vec(),
         game.initial_weights(1).to_vec(),
     ];
+    let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
-    for board in boundary_boards {
-        let eval = poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
-            board,
-            private_cards.clone(),
-            initial_weights.clone(),
-            tree_cfg.clone(),
-        ).with_solve_iters(500);
-        per_boundary.push(Arc::new(eval));
+    for board in &boundary_boards {
+        let eval: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(
+            poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
+                board.clone(),
+                private_cards.clone(),
+                initial_weights.clone(),
+                tree_cfg.clone(),
+            )
+            .with_solve_iters(500),
+        );
+        let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
+            Some(provider) => Arc::new(
+                poker_solver_tauri::gadget::GadgetEvaluator::new(
+                    eval,
+                    Arc::clone(provider),
+                    board.clone(),
+                    private_cards.clone(),
+                ),
+            ),
+            None => eval,
+        };
+        per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
     eprintln!(
-        "[compare] exact-subtree mode: {n_boundaries} boundaries (full CFR)"
+        "[compare] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}"
     );
 }
 
@@ -778,6 +799,7 @@ pub fn run(
     street_boundary_config: StreetBoundaryConfig,
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
+    gadget: bool,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -893,6 +915,15 @@ pub fn run(
     );
 
     // 7. Set up boundary evaluators if a cut is active
+    let opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>> = if gadget {
+        // Use ConstantOptOut(0.0) as a baseline gadget -- clamps opponent
+        // hands below break-even to 0. A future iteration will use
+        // BlueprintCbvOptOut for per-hand blueprint values.
+        eprintln!("[compare] gadget enabled: ConstantOptOut(0.0)");
+        Some(Arc::new(poker_solver_tauri::gadget::ConstantOptOut(0.0)))
+    } else {
+        None
+    };
     if let Some((_, ref kind)) = boundary_cut {
         if n_boundaries > 0 {
             match kind {
@@ -900,7 +931,7 @@ pub fn run(
                     setup_neural_boundaries(&mut subgame_game, Path::new(model_path));
                 }
                 BoundaryKind::ExactSubtree => {
-                    setup_exact_subtree_boundaries(&mut subgame_game);
+                    setup_exact_subtree_boundaries(&mut subgame_game, opt_out);
                 }
             }
         }
