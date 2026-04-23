@@ -24,7 +24,7 @@ pub use exploration::{
     start_bucket_computation_core,
     // Helpers
     blueprint_sizes_to_range_solver, load_hand_ev_bin, populate_cbv_context,
-    range_solver_to_rs_card,
+    range_solver_to_rs_card, rs_card_to_range_solver,
     // Types
     BlueprintListEntry, ExplorationState, SnapshotEntry, SubgameProgressEvent,
     // Additional types needed by consumers of core functions

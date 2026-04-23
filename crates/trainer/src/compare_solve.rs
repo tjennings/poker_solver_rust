@@ -800,6 +800,8 @@ pub fn run(
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
+    gadget_provider: &str,
+    gadget_constant: f32,
 ) -> Result<(), String> {
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
@@ -916,11 +918,37 @@ pub fn run(
 
     // 7. Set up boundary evaluators if a cut is active
     let opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>> = if gadget {
-        // Use ConstantOptOut(0.0) as a baseline gadget -- clamps opponent
-        // hands below break-even to 0. A future iteration will use
-        // BlueprintCbvOptOut for per-hand blueprint values.
-        eprintln!("[compare] gadget enabled: ConstantOptOut(0.0)");
-        Some(Arc::new(poker_solver_tauri::gadget::ConstantOptOut(0.0)))
+        match gadget_provider {
+            "constant" => {
+                eprintln!("[compare] gadget enabled: ConstantOptOut({gadget_constant})");
+                Some(Arc::new(poker_solver_tauri::gadget::ConstantOptOut(gadget_constant)))
+            }
+            "blueprint-cbv" => {
+                let half_pot = pot as f32 / 2.0;
+                eprintln!("[compare] gadget enabled: BlueprintCbvOptOut (half_pot={half_pot})");
+                let board_u8: Vec<u8> = board_cards.iter()
+                    .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
+                    .collect();
+                let private_cards: [Vec<(u8, u8)>; 2] = [
+                    subgame_game.private_cards(0).to_vec(),
+                    subgame_game.private_cards(1).to_vec(),
+                ];
+                Some(Arc::new(
+                    poker_solver_tauri::gadget::BlueprintCbvOptOut::from_cbv_context(
+                        &ctx,
+                        current_node,
+                        &board_u8,
+                        &private_cards,
+                        half_pot,
+                    ),
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
+                ));
+            }
+        }
     } else {
         None
     };

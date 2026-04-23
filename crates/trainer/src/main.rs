@@ -414,11 +414,22 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         tolerance: f32,
 
-        /// Enable DeepStack-style range gadget at subgame boundaries.
+        /// Enable Libratus-style range gadget at subgame boundaries.
         /// Constrains opponent CFVs to be at least as good as the blueprint
         /// CBV opt-out, producing a safe re-solve.
         #[arg(long, default_value_t = false)]
         gadget: bool,
+
+        /// Opt-out provider when --gadget is set. "blueprint-cbv" reads from
+        /// the bundle's CbvTable (production). "constant" uses a fixed value
+        /// from --gadget-constant (diagnostic).
+        #[arg(long, default_value = "blueprint-cbv")]
+        gadget_provider: String,
+
+        /// Constant opt-out value (pot-normalised bcfv) when
+        /// --gadget-provider=constant. Ignored otherwise.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        gadget_constant: f32,
     },
     /// Generate a held-out validation set for ReBeL
     #[command(name = "rebel-validate")]
@@ -1345,6 +1356,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             trace_dir,
             tolerance,
             gadget,
+            gadget_provider,
+            gadget_constant,
         } => {
             let parse_mode = |mode: &str, model: Option<String>, street: &str|
                 -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
@@ -1384,6 +1397,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trace_config,
                 tolerance,
                 gadget,
+                &gadget_provider,
+                gadget_constant,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -2912,6 +2927,52 @@ snapshots:
             assert!(gadget, "gadget should be true when --gadget is passed");
         } else {
             panic!("expected CompareSolve variant");
+        }
+    }
+
+    /// --gadget-provider and --gadget-constant flags parse correctly.
+    #[test]
+    fn compare_solve_accepts_gadget_provider_flag() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/dummy",
+            "--spot", "any",
+            "--river-boundary", "cfvnet",
+            "--river-model", "/tmp/m",
+            "--gadget",
+            "--gadget-provider", "constant",
+            "--gadget-constant", "-0.5",
+        ]).expect("should parse");
+        if let super::Commands::CompareSolve { gadget, gadget_provider, gadget_constant, .. } = cli.command {
+            assert!(gadget);
+            assert_eq!(gadget_provider, "constant");
+            assert_eq!(gadget_constant, -0.5);
+        } else {
+            panic!("expected CompareSolve");
+        }
+    }
+
+    /// --gadget-provider defaults to "blueprint-cbv" and --gadget-constant defaults to 0.0.
+    #[test]
+    fn compare_solve_gadget_provider_defaults() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/dummy",
+            "--spot", "any",
+            "--gadget",
+        ]).expect("should parse");
+        if let super::Commands::CompareSolve { gadget, gadget_provider, gadget_constant, .. } = cli.command {
+            assert!(gadget);
+            assert_eq!(gadget_provider, "blueprint-cbv");
+            assert_eq!(gadget_constant, 0.0);
+        } else {
+            panic!("expected CompareSolve");
         }
     }
 }
