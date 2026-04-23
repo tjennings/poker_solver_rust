@@ -1825,6 +1825,7 @@ pub fn game_solve_core(
     trace_boundaries: Option<String>,
     trace_iters: Option<String>,
     trace_dir: Option<String>,
+    enable_gadget: Option<bool>,
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
@@ -1895,6 +1896,8 @@ pub fn game_solve_core(
             }
         }
     }
+
+    let gadget_enabled = enable_gadget.unwrap_or(false);
 
     let max_iters = max_iterations.unwrap_or(200);
     let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
@@ -1984,16 +1987,47 @@ pub fn game_solve_core(
             *ss_clone.solve_actions.write() = actions;
         }
 
+        // Build opt-out provider for the gadget (if enabled)
+        let opt_out: Option<Arc<dyn crate::gadget::OptOutProvider>> = if gadget_enabled {
+            if boundary_cut.is_none() {
+                eprintln!("[solve] enable_gadget=true but no boundary cut resolved; gadget has no effect");
+                None
+            } else {
+                let ctx = cbv_ctx.as_ref().unwrap_or_else(|| {
+                    panic!("enable_gadget=true but no CbvContext loaded (blueprint must include CBV tables)")
+                });
+                let private_cards: [Vec<(u8, u8)>; 2] = [
+                    game.private_cards(0).to_vec(),
+                    game.private_cards(1).to_vec(),
+                ];
+                let half_pot = pot as f32 / 2.0;
+                Some(Arc::new(
+                    crate::gadget::BlueprintCbvOptOut::from_cbv_context(
+                        ctx,
+                        current_node_idx,
+                        &board_clone.iter()
+                            .filter_map(|s| parse_rs_poker_card(s).ok())
+                            .map(|c| crate::exploration::rs_card_to_range_solver(c))
+                            .collect::<Vec<u8>>(),
+                        &private_cards,
+                        half_pot,
+                    ),
+                ))
+            }
+        } else {
+            None
+        };
+
         // Set up boundary evaluators if a cut is active
         let n_boundaries = game.num_boundary_nodes();
         if let Some((_, ref kind)) = boundary_cut {
             if n_boundaries > 0 {
                 match kind {
                     BoundaryKind::Cfvnet(model_path) => {
-                        setup_neural_boundaries(&mut game, model_path);
+                        setup_neural_boundaries(&mut game, model_path, opt_out);
                     }
                     BoundaryKind::ExactSubtree => {
-                        setup_exact_subtree_boundaries(&mut game);
+                        setup_exact_subtree_boundaries_with_gadget(&mut game, opt_out);
                     }
                 }
             }
@@ -2166,7 +2200,14 @@ pub fn game_solve_core(
 
 /// Load an ONNX session and wire per-boundary `NeuralBoundaryEvaluator`s
 /// into the game's `per_boundary_evaluators` vector.
-fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &str) {
+///
+/// When `opt_out` is `Some`, each evaluator is wrapped in a `GadgetEvaluator`
+/// that clamps the opponent's CFVs upward to the opt-out values.
+fn setup_neural_boundaries(
+    game: &mut PostFlopGame,
+    model_path: &str,
+    opt_out: Option<Arc<dyn crate::gadget::OptOutProvider>>,
+) {
     let path = std::path::PathBuf::from(model_path);
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
@@ -2184,6 +2225,7 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &str) {
         }
     };
 
+    let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
     for board_4 in boundary_boards {
@@ -2191,26 +2233,43 @@ fn setup_neural_boundaries(game: &mut PostFlopGame, model_path: &str) {
             game.private_cards(0).to_vec(),
             game.private_cards(1).to_vec(),
         ];
-        let eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+        let neural_eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
             Arc::clone(&session),
-            board_4,
-            private_cards_pair,
+            board_4.clone(),
+            private_cards_pair.clone(),
         );
-        per_boundary.push(Arc::new(eval));
+        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
+        let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
+            Some(provider) => Arc::new(
+                crate::gadget::GadgetEvaluator::new(
+                    inner,
+                    Arc::clone(provider),
+                    board_4,
+                    private_cards_pair,
+                ),
+            ),
+            None => inner,
+        };
+        per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
     eprintln!(
-        "[solve] neural-cfvnet mode: {} boundaries (ONNX)",
-        n_boundaries,
+        "[solve] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",
     );
 }
 
 /// Wire per-boundary `SubtreeExactEvaluator`s into the game's
 /// `per_boundary_evaluators` vector. Each boundary gets its own
 /// evaluator that solves the downstream subtree exactly via DCFR.
-fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
+///
+/// When `opt_out` is `Some`, each evaluator is wrapped in a `GadgetEvaluator`
+/// that clamps the opponent's CFVs upward to the opt-out values.
+fn setup_exact_subtree_boundaries_with_gadget(
+    game: &mut PostFlopGame,
+    opt_out: Option<Arc<dyn crate::gadget::OptOutProvider>>,
+) {
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
     if boundary_boards.is_empty() {
@@ -2218,6 +2277,7 @@ fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
         return;
     }
     let bet_sizes = game.tree_config().clone();
+    let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
     let private_cards = [
@@ -2228,19 +2288,32 @@ fn setup_exact_subtree_boundaries(game: &mut PostFlopGame) {
         game.initial_weights(0).to_vec(),
         game.initial_weights(1).to_vec(),
     ];
-    for board in boundary_boards {
-        let eval = crate::exact_subtree::SubtreeExactEvaluator::new(
-            board,
-            private_cards.clone(),
-            initial_weights.clone(),
-            bet_sizes.clone(),
+    for board in &boundary_boards {
+        let eval: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(
+            crate::exact_subtree::SubtreeExactEvaluator::new(
+                board.clone(),
+                private_cards.clone(),
+                initial_weights.clone(),
+                bet_sizes.clone(),
+            ),
         );
-        per_boundary.push(Arc::new(eval));
+        let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
+            Some(provider) => Arc::new(
+                crate::gadget::GadgetEvaluator::new(
+                    eval,
+                    Arc::clone(provider),
+                    board.clone(),
+                    private_cards.clone(),
+                ),
+            ),
+            None => eval,
+        };
+        per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
     eprintln!(
-        "[solve] exact-subtree mode: {n_boundaries} boundaries (full CFR)"
+        "[solve] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}"
     );
 }
 
@@ -2310,6 +2383,7 @@ pub fn game_solve(
     trace_boundaries: Option<String>,
     trace_iters: Option<String>,
     trace_dir: Option<String>,
+    enable_gadget: Option<bool>,
 ) -> Result<(), String> {
     game_solve_core(
         &session_state,
@@ -2322,6 +2396,7 @@ pub fn game_solve(
         trace_boundaries,
         trace_iters,
         trace_dir,
+        enable_gadget,
     )
 }
 
@@ -2950,7 +3025,7 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -2963,7 +3038,7 @@ mod tests {
         gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Default mode (subgame) should reject when subgame is already solving
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2976,7 +3051,7 @@ mod tests {
         gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should reject when exact is already solving
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -2992,9 +3067,20 @@ mod tests {
         // Exact mode should NOT be rejected (different mode)
         // It will still fail because it's a preflop node, but the error
         // should NOT be "already in progress"
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None);
+        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("already in progress"));
+    }
+
+    #[test]
+    fn game_solve_core_accepts_enable_gadget_param() {
+        let gss = GameSessionState::default();
+        // Should reject (no session) but must accept the enable_gadget parameter
+        let result = game_solve_core(
+            &gss, None, None, None, None, None, None, None, None, None, Some(true),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No game session"));
     }
 
     // -------------------------------------------------------------------
