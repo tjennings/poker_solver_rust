@@ -7,7 +7,7 @@
 //! for the full design and the distinction from DeepStack-proper
 //! (which requires a cfvnet retrain; bean poker_solver_rust-akg3).
 
-use poker_solver_core::blueprint_v2::cbv::CbvTable;
+use poker_solver_core::blueprint_v2::Street;
 use std::sync::Arc;
 
 /// Per-hand opt-out value provider at a boundary.
@@ -74,7 +74,7 @@ impl BlueprintCbvOptOut {
     /// Production callers use `BlueprintCbvOptOut::from_cbv_context`.
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        cbv_table: Arc<CbvTable>,
+        cbv_table: Arc<poker_solver_core::blueprint_v2::cbv::CbvTable>,
         _abstract_node_idx: u32,
         oop_private_cards: Vec<(u8, u8)>,
         ip_private_cards: Vec<(u8, u8)>,
@@ -90,6 +90,80 @@ impl BlueprintCbvOptOut {
                 vec![0.0; ip_private_cards.len()],
             ],
         }
+    }
+
+    /// Production constructor. Reads the blueprint's CBV values for
+    /// every combo in both players' ranges at the given boundary node,
+    /// converts to bcfv units, and caches.
+    ///
+    /// # Panics
+    ///
+    /// - If `cbv_context.cbv_table.values` is empty.
+    /// - If `half_pot_chips <= 0`.
+    pub fn from_cbv_context(
+        cbv_context: &crate::postflop::CbvContext,
+        boundary_node_idx: u32,
+        board: &[u8],
+        private_cards: &[Vec<(u8, u8)>; 2],
+        half_pot_chips: f32,
+    ) -> Self {
+        assert!(
+            !cbv_context.cbv_table.values.is_empty(),
+            "CbvTable has no values; cannot construct BlueprintCbvOptOut"
+        );
+        assert!(half_pot_chips > 0.0, "half_pot must be positive");
+
+        let street = match board.len() {
+            3 => Street::Flop,
+            4 => Street::Turn,
+            5 => Street::River,
+            n => panic!("unexpected board length {n}; expected 3, 4, or 5"),
+        };
+
+        let rs_board: Vec<poker_solver_core::poker::Card> = board
+            .iter()
+            .map(|&id| crate::exploration::range_solver_to_rs_card(id))
+            .collect();
+
+        let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        for player in 0..2 {
+            let hands = &private_cards[player];
+            per_hand[player].reserve(hands.len());
+            for &(c1, c2) in hands {
+                let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                let bucket = cbv_context.all_buckets.get_bucket(
+                    street, [rs_c1, rs_c2], &rs_board,
+                );
+                let chip_cbv = cbv_context.cbv_table.lookup(
+                    boundary_node_idx as usize, bucket as usize,
+                );
+                per_hand[player].push(chip_cfv_to_bcfv(chip_cbv, half_pot_chips));
+            }
+        }
+        Self { per_hand_cbv_bcfv: per_hand }
+    }
+}
+
+impl OptOutProvider for BlueprintCbvOptOut {
+    fn opt_out_cfvs(
+        &self,
+        _boundary_ordinal: usize,
+        opponent: usize,
+        _pot: i32,
+        _effective_stack: i32,
+        _board: &[u8],
+        opponent_private_cards: &[(u8, u8)],
+    ) -> Vec<f32> {
+        assert_eq!(
+            opponent_private_cards.len(),
+            self.per_hand_cbv_bcfv[opponent].len(),
+            "opt_out_cfvs called with hand list of length {} but \
+             constructor registered {} hands for player {opponent}",
+            opponent_private_cards.len(),
+            self.per_hand_cbv_bcfv[opponent].len(),
+        );
+        self.per_hand_cbv_bcfv[opponent].clone()
     }
 }
 
@@ -253,6 +327,122 @@ mod tests {
             vec![(2u8, 3u8)],
             73.0,
         );
+    }
+
+    #[test]
+    fn blueprint_cbv_opt_out_from_cbv_context_returns_correct_bcfv() {
+        use crate::postflop::CbvContext;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        use poker_solver_core::blueprint_v2::game_tree::GameTree;
+        use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::card::flop_from_str;
+
+        // Build a minimal CbvTable with 1 boundary node and 2 buckets.
+        // Values: bucket 0 -> 50.0 chips, bucket 1 -> -30.0 chips.
+        let cbv_table = CbvTable {
+            values: vec![50.0, -30.0],
+            node_offsets: vec![0],
+            buckets_per_node: vec![2],
+        };
+
+        // AllBuckets with 2 buckets per street and equity fallback enabled.
+        let mut ab = AllBuckets::new([2, 2, 2, 2], [None, None, None, None]);
+        ab.equity_fallback = true;
+        let all_buckets = Arc::new(ab);
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = GameTree::build_subgame(
+            Street::River, 100.0, [50.0; 2], 200.0,
+            &[vec![1.0]], Some(1), 0,
+        );
+
+        let ctx = CbvContext {
+            cbv_table,
+            abstract_tree: tree,
+            all_buckets,
+            strategy,
+        };
+
+        // Board: 5 cards for river. Use range-solver IDs.
+        let flop = flop_from_str("7h 5d 2c").unwrap();
+        let turn_card: u8 = 7;  // 3s
+        let river_card: u8 = 30; // 9h
+        let board = vec![flop[0], flop[1], flop[2], turn_card, river_card];
+
+        // Two hands per player. They'll get equity-bucketed into bucket 0 or 1.
+        let oop_hands = vec![(48u8, 49u8)]; // Ac, Ad
+        let ip_hands = vec![(4u8, 5u8)];    // 3c, 3d
+        let private_cards = [oop_hands, ip_hands];
+
+        let half_pot = 50.0_f32;
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards, half_pot,
+        );
+
+        // Verify opt_out_cfvs returns the correct number of hands
+        let oop_cfvs = provider.opt_out_cfvs(0, 0, 100, 200, &board, &private_cards[0]);
+        let ip_cfvs = provider.opt_out_cfvs(0, 1, 100, 200, &board, &private_cards[1]);
+        assert_eq!(oop_cfvs.len(), 1);
+        assert_eq!(ip_cfvs.len(), 1);
+
+        // Verify the values are chip_cbv / half_pot.
+        // With equity fallback and 2 buckets, the exact bucket depends on
+        // equity calculation, but the value must be either 50.0/50.0 = 1.0
+        // or -30.0/50.0 = -0.6.
+        for &v in oop_cfvs.iter().chain(ip_cfvs.iter()) {
+            assert!(
+                (v - 1.0).abs() < 1e-6 || (v - (-0.6)).abs() < 1e-6,
+                "bcfv value {v} should be 1.0 or -0.6"
+            );
+        }
+    }
+
+    #[test]
+    fn blueprint_cbv_opt_out_provider_length_mismatch_panics() {
+        use crate::postflop::CbvContext;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        use poker_solver_core::blueprint_v2::game_tree::GameTree;
+        use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::card::flop_from_str;
+
+        let cbv_table = CbvTable {
+            values: vec![50.0, -30.0],
+            node_offsets: vec![0],
+            buckets_per_node: vec![2],
+        };
+        let mut ab = AllBuckets::new([2, 2, 2, 2], [None, None, None, None]);
+        ab.equity_fallback = true;
+        let all_buckets = Arc::new(ab);
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = GameTree::build_subgame(
+            Street::River, 100.0, [50.0; 2], 200.0,
+            &[vec![1.0]], Some(1), 0,
+        );
+        let ctx = CbvContext {
+            cbv_table,
+            abstract_tree: tree,
+            all_buckets,
+            strategy,
+        };
+
+        let flop = flop_from_str("7h 5d 2c").unwrap();
+        let board = vec![flop[0], flop[1], flop[2], 7, 30];
+        let oop_hands = vec![(48u8, 49u8)];
+        let ip_hands = vec![(4u8, 5u8)];
+        let private_cards = [oop_hands, ip_hands];
+
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards, 50.0,
+        );
+
+        // Call with wrong hand count -- should panic
+        let result = std::panic::catch_unwind(|| {
+            provider.opt_out_cfvs(0, 0, 100, 200, &board, &[(0u8, 1u8), (2, 3)])
+        });
+        assert!(result.is_err(), "should panic on hand count mismatch");
     }
 
     // ---------------------------------------------------------------
