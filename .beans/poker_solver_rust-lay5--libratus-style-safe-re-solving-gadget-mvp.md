@@ -5,7 +5,7 @@ status: completed
 type: feature
 priority: normal
 created_at: 2026-04-23T19:33:39Z
-updated_at: 2026-04-23T20:36:02Z
+updated_at: 2026-04-23T21:12:29Z
 ---
 
 Parent bean for the MVP implementation of the Libratus-style safe re-solving gadget. See docs/plans/2026-04-23-deepstack-gadget.md for the validated design. See docs/progress/2026-04-22-subgame-exact-parity.md for iteration history.
@@ -33,3 +33,11 @@ Gadget could NOT be tested with production BlueprintCbvOptOut due to the index b
 1. Fix BlueprintCbvOptOut::from_cbv_context boundary ordinal mapping (bug fix, not new feature)
 2. Re-run iter 11 with fixed code
 3. If gap doesn't close: bean akg3 (DeepStack-proper cfvnet retrain)
+
+
+
+## Final Validation Outcome
+
+The gadget infrastructure was implemented and tested end-to-end (iter 11-fixed). Verdict: the Libratus-style static-CBV approach with *bucketed* blueprint CBVs does NOT close the cfvnet parity gap. In fact it makes exploitability 15x WORSE on the 4-bet turn test spot (20932 → 318119 mbb). Root cause: blueprint CBVs are per-bucket (~2-1000 buckets/street) while cfvnet output is per-combo (1326 combos). Clamping high-resolution values up to low-resolution floors pulls strategies toward blueprint's coarse equilibrium.
+
+This conclusively motivates bean poker_solver_rust-akg3 (DeepStack-proper cfvnet retrain with per-combo opt-out input channel) as the remaining architectural path. The gadget code stays in place as infrastructure for that future work.
