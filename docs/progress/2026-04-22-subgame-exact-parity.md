@@ -196,3 +196,27 @@ Top 3 hands by mass moved:
 3. 2hJc mass=1.000 — exact=[B55:0.50 A:0.50] subgame=[X:1.00] (should bet/shove, checks)
 
 **Commits:** measurement only, no code changes
+
+## Iteration 10 — 2026-04-23 (cfvnet baseline, no gadget)
+
+**Approach:** river-boundary=cfvnet (ONNX model `checkpoint_epoch675.onnx`), no gadget. This is the baseline for the Libratus gadget A/B comparison (iterations 10-12).
+
+**Result:** exact_exp=77.67 mbb, subgame_exp=20932.49 mbb, worst_delta=1.0000, worst_cell="77 @ All-in exact=0.0000 subgame=1.0000"
+mean_mass=0.543, max_mass=1.000 at hand 2s7c.
+Status: FAIL (established cfvnet baseline for gadget comparison)
+
+**Wall time:** exact=0.3s, subgame=1.5s.
+
+Per-action-class bias (subgame - exact):
+- AllIn: +0.217
+- Bet/Raise: -0.015
+- Check: -0.202
+
+Top 3 hands by mass moved:
+1. 2s7c mass=1.000 -- exact=[X:0.89 B24:0.11] subgame=[A:1.00] (should check, goes all-in)
+2. 7cAd mass=1.000 -- exact=[X:0.99] subgame=[A:1.00] (should check, goes all-in)
+3. 4h5h mass=1.000 -- exact=[X:0.98] subgame=[A:1.00] (should check, goes all-in)
+
+**Key observation:** cfvnet boundary produces much larger exploitability (20932 mbb) than exact_subtree at same iters (3140 mbb iter 7). The cfvnet model's boundary values are far worse than even the broken cfv_to_bcfv formula. The subgame universally shoves with hands that should check.
+
+**Commits:** measurement only, no code changes
