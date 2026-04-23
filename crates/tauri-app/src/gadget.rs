@@ -70,15 +70,13 @@ pub struct BlueprintCbvOptOut {
 }
 
 impl BlueprintCbvOptOut {
-    /// Test-only constructor that accepts a raw `CbvTable` and hand lists.
+    /// Test-only constructor that builds zero-valued opt-out vectors.
     /// Production callers use `BlueprintCbvOptOut::from_cbv_context`.
     #[cfg(test)]
     pub(crate) fn new_for_test(
         cbv_table: Arc<poker_solver_core::blueprint_v2::cbv::CbvTable>,
-        _abstract_node_idx: u32,
-        oop_private_cards: Vec<(u8, u8)>,
-        ip_private_cards: Vec<(u8, u8)>,
-        _half_pot_chips: f32,
+        num_oop: usize,
+        num_ip: usize,
     ) -> Self {
         assert!(
             !cbv_table.values.is_empty(),
@@ -86,8 +84,8 @@ impl BlueprintCbvOptOut {
         );
         Self {
             per_hand_cbv_bcfv: [
-                vec![0.0; oop_private_cards.len()],
-                vec![0.0; ip_private_cards.len()],
+                vec![0.0; num_oop],
+                vec![0.0; num_ip],
             ],
         }
     }
@@ -323,10 +321,8 @@ mod tests {
         };
         let _ = BlueprintCbvOptOut::new_for_test(
             Arc::new(empty_table),
-            0,
-            vec![(0u8, 1u8)],
-            vec![(2u8, 3u8)],
-            73.0,
+            1,
+            1,
         );
     }
 
