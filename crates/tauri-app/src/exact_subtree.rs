@@ -9,22 +9,13 @@ use std::sync::Mutex;
 
 use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::card::{CardConfig, NOT_DEALT};
-use range_solver::interface::Game;
 use range_solver::range::Range;
-use range_solver::{solve_step, finalize, BoardState, PostFlopGame};
+use range_solver::{solve_step, finalize, root_cfvalues_with_reach, BoardState, PostFlopGame};
 
 /// Default number of DCFR iterations for the exact subtree solve.
 const DEFAULT_SOLVE_ITERS: u32 = 500;
 
 /// Boundary evaluator that solves the downstream subtree exactly via DCFR.
-/// A solved river subtree game, ready for cfvalue queries with any reach.
-struct SolvedRiverGame {
-    /// The solved PostFlopGame (strategies frozen after finalize).
-    game: PostFlopGame,
-    /// The 5-card board for this river runout.
-    board_5: [u8; 5],
-}
-
 pub struct SubtreeExactEvaluator {
     /// Board cards at this boundary (3, 4, or 5 cards).
     board: Vec<u8>,
@@ -38,11 +29,8 @@ pub struct SubtreeExactEvaluator {
     parent_tree_config: TreeConfig,
     /// Number of DCFR iterations to run.
     solve_iters: u32,
-    /// Cache keyed by rounded reach digest (legacy bcfv path).
+    /// Cache keyed by rounded reach digest.
     cache: Mutex<HashMap<u64, (Vec<f32>, Vec<f32>)>>,
-    /// Lazily-built solved subtree games for the raw CFV path.
-    /// For 5-card boards: one game. For 4-card boards: up to 48 games.
-    solved_games: Mutex<Vec<SolvedRiverGame>>,
 }
 
 impl SubtreeExactEvaluator {
@@ -60,7 +48,6 @@ impl SubtreeExactEvaluator {
             parent_tree_config,
             solve_iters: DEFAULT_SOLVE_ITERS,
             cache: Mutex::new(HashMap::new()),
-            solved_games: Mutex::new(Vec::new()),
         }
     }
 
@@ -69,206 +56,6 @@ impl SubtreeExactEvaluator {
         self.solve_iters = iters;
         self
     }
-
-    /// Lazily build and cache the solved subtree games.
-    fn ensure_solved_games(&self, pot: i32, remaining_stack: f64) {
-        let mut games = self.solved_games.lock().expect("solved_games lock");
-        if !games.is_empty() {
-            return;
-        }
-        match self.board.len() {
-            5 => {
-                let board_5 = [
-                    self.board[0], self.board[1], self.board[2],
-                    self.board[3], self.board[4],
-                ];
-                let sg = build_solved_river_game(
-                    &board_5, &self.private_cards,
-                    &self.parent_initial_weights,
-                    &self.parent_tree_config,
-                    pot, remaining_stack, self.solve_iters,
-                );
-                games.push(sg);
-            }
-            4 => {
-                // Build a single Turn→River game with NO turn bet sizes
-                // (check-check → chance → river). This produces cfvalues in
-                // the correct parent units with proper chance averaging.
-                let sg = build_solved_turn_game(
-                    &self.board,
-                    &self.private_cards,
-                    &self.parent_initial_weights,
-                    &self.parent_tree_config,
-                    pot, remaining_stack, self.solve_iters,
-                );
-                eprintln!(
-                    "[exact_subtree] built Turn+River game (N={})",
-                    sg.game.num_combinations(),
-                );
-                games.push(sg);
-            }
-            _ => panic!("raw CFV path not supported for board len {}", self.board.len()),
-        }
-    }
-
-    /// Compute `num_combinations` from parent weights — the same formula
-    /// used by `PostFlopGame::check_card_config` to set `self.num_combinations`.
-    fn parent_num_combinations(&self) -> f64 {
-        let mut n = 0.0f64;
-        for (&(c1, c2), &w1) in self.private_cards[0].iter()
-            .zip(self.parent_initial_weights[0].iter())
-        {
-            if w1 <= 0.0 { continue; }
-            let mask: u64 = (1 << c1) | (1 << c2);
-            for (&(c3, c4), &w2) in self.private_cards[1].iter()
-                .zip(self.parent_initial_weights[1].iter())
-            {
-                if w2 <= 0.0 { continue; }
-                if mask & ((1u64 << c3) | (1u64 << c4)) == 0 {
-                    n += w1 as f64 * w2 as f64;
-                }
-            }
-        }
-        n
-    }
-
-    /// Compute raw per-hand chip CFVs using solved subtree games.
-    ///
-    /// For a single game (river boundary or Turn+River game): calls
-    /// `root_cfvalues_with_reach` directly with the given opponent reach.
-    /// Returns values in the same per-combo units that the parent game's
-    /// `evaluate_internal` writes to its result array.
-    fn compute_raw_from_solved_games(
-        &self,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
-    ) -> (Vec<f32>, Vec<f32>) {
-        let games = self.solved_games.lock().expect("solved_games lock");
-        assert!(!games.is_empty(), "solved_games should be populated");
-
-        let sg = &games[0];
-        let sub_oop_cards = sg.game.private_cards(0);
-        let sub_ip_cards = sg.game.private_cards(1);
-
-        // Remap reach from parent ordering to subtree ordering.
-        // For Turn games, river_card is 0xFF (sentinel) — no blocking.
-        let river_card = sg.board_5[4];
-        let ip_reach_sub = remap_reach_to_subtree(
-            ip_reach, &self.private_cards[1], sub_ip_cards, river_card,
-        );
-        let oop_reach_sub = remap_reach_to_subtree(
-            oop_reach, &self.private_cards[0], sub_oop_cards, river_card,
-        );
-
-        // Get per-hand cfvalues with the given opponent reach.
-        let oop_cfv = range_solver::root_cfvalues_with_reach(
-            &sg.game, 0, &ip_reach_sub,
-        );
-        let ip_cfv = range_solver::root_cfvalues_with_reach(
-            &sg.game, 1, &oop_reach_sub,
-        );
-
-        // Scale: subtree N may differ from parent N.
-        let n_sub = sg.game.num_combinations();
-        let n_parent = self.parent_num_combinations();
-        let scale = if (n_sub - n_parent).abs() > 1e-6 {
-            n_sub / n_parent
-        } else {
-            1.0
-        };
-
-        // Remap back to parent ordering and apply scale.
-        let oop_parent = remap_cfvs_to_parent(
-            &oop_cfv, sub_oop_cards, &self.private_cards[0],
-        );
-        let ip_parent = remap_cfvs_to_parent(
-            &ip_cfv, sub_ip_cards, &self.private_cards[1],
-        );
-
-        if (scale - 1.0).abs() < 1e-9 {
-            return (oop_parent, ip_parent);
-        }
-
-        let scale_f32 = scale as f32;
-        let oop_raw: Vec<f32> = oop_parent.iter().map(|&v| v * scale_f32).collect();
-        let ip_raw: Vec<f32> = ip_parent.iter().map(|&v| v * scale_f32).collect();
-        (oop_raw, ip_raw)
-    }
-}
-
-/// Build and solve a single 5-card River game, returning the solved game
-/// object (strategies frozen). Used by the raw CFV path.
-fn build_solved_river_game(
-    board_5: &[u8; 5],
-    private_cards: &[Vec<(u8, u8)>; 2],
-    weights: &[Vec<f32>; 2],
-    parent_tree_config: &TreeConfig,
-    pot: i32,
-    remaining_stack: f64,
-    solve_iters: u32,
-) -> SolvedRiverGame {
-    let card_config = build_card_config(board_5, private_cards, weights);
-    let effective_stack =
-        (pot / 2).saturating_add(remaining_stack.round() as i32);
-
-    let tree_config = TreeConfig {
-        initial_state: BoardState::River,
-        starting_pot: pot,
-        effective_stack,
-        river_bet_sizes: parent_tree_config.river_bet_sizes.clone(),
-        depth_limit: None,
-        ..Default::default()
-    };
-
-    let tree = ActionTree::new(tree_config)
-        .unwrap_or_else(|e| panic!("subtree ActionTree failed: {e}"));
-    let mut game = PostFlopGame::with_config(card_config, tree)
-        .unwrap_or_else(|e| panic!("subtree PostFlopGame failed: {e}"));
-    game.allocate_memory(false);
-
-    run_dcfr(&mut game, solve_iters);
-    finalize(&mut game);
-
-    SolvedRiverGame { game, board_5: *board_5 }
-}
-
-/// Build and solve a Turn→River game with NO turn bet sizes (check-check
-/// to river). The resulting game's `root_cfvalues_with_reach` produces
-/// values in the correct parent units with proper chance-node averaging.
-fn build_solved_turn_game(
-    board_4: &[u8],
-    private_cards: &[Vec<(u8, u8)>; 2],
-    weights: &[Vec<f32>; 2],
-    parent_tree_config: &TreeConfig,
-    pot: i32,
-    remaining_stack: f64,
-    solve_iters: u32,
-) -> SolvedRiverGame {
-    let card_config = build_card_config(board_4, private_cards, weights);
-    let effective_stack =
-        (pot / 2).saturating_add(remaining_stack.round() as i32);
-
-    let tree_config = TreeConfig {
-        initial_state: BoardState::Turn,
-        starting_pot: pot,
-        effective_stack,
-        // No turn bet sizes — check-check goes straight to the river.
-        river_bet_sizes: parent_tree_config.river_bet_sizes.clone(),
-        depth_limit: None,
-        ..Default::default()
-    };
-
-    let tree = ActionTree::new(tree_config)
-        .unwrap_or_else(|e| panic!("turn subtree ActionTree failed: {e}"));
-    let mut game = PostFlopGame::with_config(card_config, tree)
-        .unwrap_or_else(|e| panic!("turn subtree PostFlopGame failed: {e}"));
-    game.allocate_memory(false);
-
-    run_dcfr(&mut game, solve_iters);
-    finalize(&mut game);
-
-    let board_5 = [board_4[0], board_4[1], board_4[2], board_4[3], 0xFF];
-    SolvedRiverGame { game, board_5 }
 }
 
 /// Compute a cache key from two reach vectors by rounding to 3 decimals
@@ -285,6 +72,16 @@ fn reach_cache_key(oop_reach: &[f32], ip_reach: &[f32]) -> u64 {
         rounded.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Determine the `BoardState` (initial_state) from board length.
+fn board_state_from_len(n: usize) -> BoardState {
+    match n {
+        3 => BoardState::Flop,
+        4 => BoardState::Turn,
+        5 => BoardState::River,
+        _ => panic!("invalid board length for subtree: {n}"),
+    }
 }
 
 /// Build a CardConfig using the parent game's initial weights (not
@@ -319,46 +116,39 @@ fn build_card_config(
     }
 }
 
-/// Blocker-adjusted opponent reach sum for a hero hand.
-fn cfreach_adj(
-    h1: u8, h2: u8, opp_cards: &[(u8, u8)], opp_reach: &[f32],
-) -> f64 {
-    let mut sum = 0.0f64;
-    for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
-        if o1 == h1 || o1 == h2 || o2 == h1 || o2 == h2 {
-            continue;
-        }
-        let r = opp_reach.get(j).copied().unwrap_or(0.0);
-        if r > 0.0 {
-            sum += r as f64;
-        }
-    }
-    sum
+/// True when every element is (near-)zero.
+fn reach_is_all_zero(reach: &[f32]) -> bool {
+    reach.iter().all(|&v| v.abs() < 1e-9)
 }
 
-/// Solve a single 5-card River game and return per-hand pot-normalised bcfv,
-/// remapped to parent hand ordering.
+/// Build the subtree game, run DCFR, finalize, and extract boundary CFVs.
 ///
-/// Uses `root_cfvalues` to extract counterfactual values, then converts to
-/// bcfv via: `bcfv[h] = cfv[h] * N_sub / (half_pot * cfreach_adj[h])`.
-/// This mirrors the SPR=0 formula: `bcfv = (weighted_eq - 0.5) * 2`.
-fn solve_river_game(
-    board_5: &[u8; 5],
+/// The subtree is built with the PARENT's initial weights (so that
+/// `num_combinations` matches the parent exactly). After solving, per-hand
+/// cfvalues are computed using the ACTUAL boundary reach and converted to
+/// bcfv format by dividing out the `half_pot / N * cfreach_adj` factor.
+fn solve_subtree(
+    board: &[u8],
     private_cards: &[Vec<(u8, u8)>; 2],
-    weights: &[Vec<f32>; 2],
+    parent_weights: &[Vec<f32>; 2],
     parent_tree_config: &TreeConfig,
     pot: i32,
     remaining_stack: f64,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
     solve_iters: u32,
 ) -> (Vec<f32>, Vec<f32>) {
-    let card_config = build_card_config(
-        board_5, private_cards, weights,
-    );
+    if reach_is_all_zero(oop_reach) || reach_is_all_zero(ip_reach) {
+        return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
+    }
+
+    let card_config = build_card_config(board, private_cards, parent_weights);
+    let initial_state = board_state_from_len(board.len());
     let effective_stack =
         (pot / 2).saturating_add(remaining_stack.round() as i32);
 
     let tree_config = TreeConfig {
-        initial_state: BoardState::River,
+        initial_state,
         starting_pot: pot,
         effective_stack,
         river_bet_sizes: parent_tree_config.river_bet_sizes.clone(),
@@ -375,260 +165,110 @@ fn solve_river_game(
     run_dcfr(&mut game, solve_iters);
     finalize(&mut game);
 
+    // Remap parent reach to subtree hand ordering
+    let sub_oop_reach = remap_reach_to_subtree(
+        oop_reach, private_cards, game.private_cards(0), 0,
+    );
+    let sub_ip_reach = remap_reach_to_subtree(
+        ip_reach, private_cards, game.private_cards(1), 1,
+    );
+
     let half_pot = pot as f64 / 2.0;
-    let n_sub = game.num_combinations();
-    let scale = n_sub / half_pot;
+    let num_combos = game.num_combinations();
 
-    // Compute per-hand bcfv using root_cfvalues and cfv_to_bcfv formula.
-    let oop_cfv = range_solver::root_cfvalues(&game, 0);
-    let ip_cfv = range_solver::root_cfvalues(&game, 1);
+    // Compute cfvalues using actual boundary reach
+    let oop_cfv = root_cfvalues_with_reach(&game, 0, &sub_ip_reach);
+    let ip_cfv = root_cfvalues_with_reach(&game, 1, &sub_oop_reach);
 
-    let sub_oop_cards = game.private_cards(0);
-    let sub_ip_cards = game.private_cards(1);
-    let sub_oop_weights = game.initial_weights(0);
-    let sub_ip_weights = game.initial_weights(1);
+    // Convert cfvalues to bcfv format:
+    // bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])
+    let oop_bcfv = cfv_to_bcfv(
+        &oop_cfv, game.private_cards(0),
+        game.private_cards(1), &sub_ip_reach,
+        half_pot, num_combos,
+    );
+    let ip_bcfv = cfv_to_bcfv(
+        &ip_cfv, game.private_cards(1),
+        game.private_cards(0), &sub_oop_reach,
+        half_pot, num_combos,
+    );
 
-    let oop_sub: Vec<f32> = oop_cfv
-        .iter()
+    // Remap from subtree ordering to parent ordering
+    let oop_out = remap_cfvs_to_parent(
+        &oop_bcfv, game.private_cards(0), &private_cards[0],
+    );
+    let ip_out = remap_cfvs_to_parent(
+        &ip_bcfv, game.private_cards(1), &private_cards[1],
+    );
+    (oop_out, ip_out)
+}
+
+/// Floor for `cfreach_adj` before division. Below this we treat the hand as
+/// effectively unreachable (returns 0 bcfv); avoids divide-by-zero blowups
+/// for blocker-heavy hands.
+const MIN_ADJ: f64 = 1e-6;
+/// Clamp bound for the returned bcfv magnitude. Pot-normalised bcfv should
+/// live in `[-1, 1]`; anything larger is a numerical outlier from small
+/// `cfreach_adj`. Clamping prevents outliers from poisoning regret updates.
+const MAX_BCFV: f32 = 10.0;
+
+/// Convert raw cfvalues to bcfv format.
+/// `bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])`
+fn cfv_to_bcfv(
+    cfv: &[f32],
+    hero_cards: &[(u8, u8)],
+    opp_cards: &[(u8, u8)],
+    opp_reach: &[f32],
+    half_pot: f64,
+    num_combos: f64,
+) -> Vec<f32> {
+    let scale = num_combos / half_pot;
+    cfv.iter()
         .enumerate()
         .map(|(h, &c)| {
-            if c == 0.0 { return 0.0; }
-            let (h1, h2) = sub_oop_cards[h];
-            let adj = cfreach_adj(h1, h2, sub_ip_cards, sub_ip_weights);
-            if adj <= 1e-9 { return 0.0; }
-            (c as f64 * scale / adj) as f32
+            if c == 0.0 {
+                return 0.0;
+            }
+            let (h1, h2) = hero_cards[h];
+            let adj = cfreach_adj(h1, h2, opp_cards, opp_reach);
+            if adj <= MIN_ADJ {
+                return 0.0;
+            }
+            let raw = (c as f64 * scale / adj) as f32;
+            raw.clamp(-MAX_BCFV, MAX_BCFV)
         })
-        .collect();
-
-    let ip_sub: Vec<f32> = ip_cfv
-        .iter()
-        .enumerate()
-        .map(|(h, &c)| {
-            if c == 0.0 { return 0.0; }
-            let (h1, h2) = sub_ip_cards[h];
-            let adj = cfreach_adj(h1, h2, sub_oop_cards, sub_oop_weights);
-            if adj <= 1e-9 { return 0.0; }
-            (c as f64 * scale / adj) as f32
-        })
-        .collect();
-
-    // Remap from subtree ordering to parent ordering.
-    let oop_bcfv = remap_cfvs_to_parent(
-        &oop_sub, sub_oop_cards, &private_cards[0],
-    );
-    let ip_bcfv = remap_cfvs_to_parent(
-        &ip_sub, sub_ip_cards, &private_cards[1],
-    );
-
-    (oop_bcfv, ip_bcfv)
+        .collect()
 }
 
-/// Check whether card `c` conflicts with any card in `board`.
-fn card_on_board(c: u8, board: &[u8]) -> bool {
-    board.iter().any(|&b| b == c)
-}
-
-/// Check whether card `c` conflicts with hand `(h1, h2)`.
-fn card_blocks_hand(c: u8, h1: u8, h2: u8) -> bool {
-    c == h1 || c == h2
-}
-
-/// Enumerate valid river cards for a turn boundary and aggregate per-hand
-/// bcfv across all river runouts.
-///
-/// For each valid river card, builds a separate 5-card River game, solves it,
-/// and extracts per-hand pot-normalised bcfv. The final bcfv for each hand is
-/// the mean across all rivers that do not block that hand.
-fn solve_turn_via_river_enum(
-    board_4: &[u8],
-    private_cards: &[Vec<(u8, u8)>; 2],
-    parent_weights: &[Vec<f32>; 2],
-    parent_tree_config: &TreeConfig,
-    pot: i32,
-    remaining_stack: f64,
-    solve_iters: u32,
-) -> (Vec<f32>, Vec<f32>) {
-    let num_oop = private_cards[0].len();
-    let num_ip = private_cards[1].len();
-    let mut oop_sum = vec![0.0f64; num_oop];
-    let mut ip_sum = vec![0.0f64; num_ip];
-    let mut oop_cnt = vec![0u32; num_oop];
-    let mut ip_cnt = vec![0u32; num_ip];
-
-    let mut rivers_solved = 0u32;
-    for river in 0..52u8 {
-        if card_on_board(river, board_4) {
+/// Blocker-adjusted opponent reach sum for a hero hand.
+fn cfreach_adj(h1: u8, h2: u8, opp_cards: &[(u8, u8)], opp_reach: &[f32]) -> f64 {
+    let mut sum = 0.0f64;
+    for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
+        if o1 == h1 || o1 == h2 || o2 == h1 || o2 == h2 {
             continue;
         }
-        let board_5: [u8; 5] = [
-            board_4[0], board_4[1], board_4[2], board_4[3], river,
-        ];
-
-        // Build weights that zero out hands blocked by the river card.
-        let mut river_weights = parent_weights.clone();
-        for player in 0..2 {
-            for (i, &(c1, c2)) in private_cards[player].iter().enumerate() {
-                if card_blocks_hand(river, c1, c2) {
-                    river_weights[player][i] = 0.0;
-                }
-            }
+        let r = opp_reach.get(j).copied().unwrap_or(0.0);
+        if r > 0.0 {
+            sum += r as f64;
         }
-
-        // Skip if either player has no remaining hands.
-        let oop_live: f32 = river_weights[0].iter().sum();
-        let ip_live: f32 = river_weights[1].iter().sum();
-        if oop_live <= 0.0 || ip_live <= 0.0 {
-            continue;
-        }
-
-        let (oop_bcfv, ip_bcfv) = solve_river_game(
-            &board_5,
-            private_cards,
-            &river_weights,
-            parent_tree_config,
-            pot,
-            remaining_stack,
-            solve_iters,
-        );
-
-        // Accumulate — only for hands not blocked by this river card.
-        // solve_river_game already remapped to parent ordering.
-        for (h, &(c1, c2)) in private_cards[0].iter().enumerate() {
-            if !card_blocks_hand(river, c1, c2) {
-                oop_sum[h] += oop_bcfv[h] as f64;
-                oop_cnt[h] += 1;
-            }
-        }
-        for (h, &(c1, c2)) in private_cards[1].iter().enumerate() {
-            if !card_blocks_hand(river, c1, c2) {
-                ip_sum[h] += ip_bcfv[h] as f64;
-                ip_cnt[h] += 1;
-            }
-        }
-        rivers_solved += 1;
     }
-
-    eprintln!(
-        "[exact_subtree] turn boundary: solved {rivers_solved} river subgames"
-    );
-
-    let oop_bcfv: Vec<f32> = oop_sum
-        .iter()
-        .zip(oop_cnt.iter())
-        .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { 0.0 })
-        .collect();
-    let ip_bcfv: Vec<f32> = ip_sum
-        .iter()
-        .zip(ip_cnt.iter())
-        .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { 0.0 })
-        .collect();
-
-    (oop_bcfv, ip_bcfv)
+    sum
 }
 
-/// Solve the downstream subtree and return per-hand pot-normalised bcfv.
-///
-/// For 5-card boards (river boundary): solves a single River game.
-/// For 4-card boards (turn boundary): enumerates each valid river card,
-/// solves each as a separate River game, and averages bcfv across runouts.
-/// For 3-card boards (flop boundary): enumerates turn+river combos (slow).
-///
-/// Uses `oop_reach` / `ip_reach` (the actual boundary reach from the parent
-/// solver) as initial weights for the per-river games. This ensures
-/// `expected_values` computes EVs against the actual opponent distribution,
-/// matching the SPR=0 evaluator's reach-weighted equity approach.
-fn solve_subtree(
-    board: &[u8],
-    private_cards: &[Vec<(u8, u8)>; 2],
-    _parent_weights: &[Vec<f32>; 2],
-    parent_tree_config: &TreeConfig,
-    pot: i32,
-    remaining_stack: f64,
-    oop_reach: &[f32],
-    ip_reach: &[f32],
-    solve_iters: u32,
-) -> (Vec<f32>, Vec<f32>) {
-    // Use boundary reach as initial weights so root_cfvalues computes
-    // cfvalues weighted by the actual opponent distribution at the boundary.
-    let weights = [oop_reach.to_vec(), ip_reach.to_vec()];
-
-    match board.len() {
-        5 => {
-            let board_5: [u8; 5] = [
-                board[0], board[1], board[2], board[3], board[4],
-            ];
-            solve_river_game(
-                &board_5, private_cards, &weights,
-                parent_tree_config, pot, remaining_stack, solve_iters,
-            )
-        }
-        4 => solve_turn_via_river_enum(
-            board, private_cards, &weights,
-            parent_tree_config, pot, remaining_stack, solve_iters,
-        ),
-        3 => {
-            eprintln!(
-                "[exact_subtree] WARNING: flop boundary requires ~2256 \
-                 subgames — this will be very slow"
-            );
-            let num_oop = private_cards[0].len();
-            let num_ip = private_cards[1].len();
-            let mut oop_sum = vec![0.0f64; num_oop];
-            let mut ip_sum = vec![0.0f64; num_ip];
-            let mut oop_cnt = vec![0u32; num_oop];
-            let mut ip_cnt = vec![0u32; num_ip];
-
-            for turn in 0..52u8 {
-                if card_on_board(turn, board) { continue; }
-                let board_4 = [board[0], board[1], board[2], turn];
-                let (oop_turn, ip_turn) = solve_turn_via_river_enum(
-                    &board_4, private_cards, &weights,
-                    parent_tree_config, pot, remaining_stack, solve_iters,
-                );
-                for (h, &(c1, c2)) in private_cards[0].iter().enumerate() {
-                    if !card_blocks_hand(turn, c1, c2) {
-                        oop_sum[h] += oop_turn[h] as f64;
-                        oop_cnt[h] += 1;
-                    }
-                }
-                for (h, &(c1, c2)) in private_cards[1].iter().enumerate() {
-                    if !card_blocks_hand(turn, c1, c2) {
-                        ip_sum[h] += ip_turn[h] as f64;
-                        ip_cnt[h] += 1;
-                    }
-                }
-            }
-
-            let oop_bcfv: Vec<f32> = oop_sum.iter().zip(oop_cnt.iter())
-                .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { 0.0 })
-                .collect();
-            let ip_bcfv: Vec<f32> = ip_sum.iter().zip(ip_cnt.iter())
-                .map(|(&s, &c)| if c > 0 { (s / c as f64) as f32 } else { 0.0 })
-                .collect();
-
-            (oop_bcfv, ip_bcfv)
-        }
-        _ => panic!("invalid board length for subtree: {}", board.len()),
-    }
-}
-
-/// Remap reach from parent hand ordering to subtree hand ordering,
-/// zeroing out hands blocked by a river card.
+/// Remap a parent-ordering reach vector to subtree ordering.
 fn remap_reach_to_subtree(
     parent_reach: &[f32],
-    parent_cards: &[(u8, u8)],
+    parent_private_cards: &[Vec<(u8, u8)>; 2],
     subtree_cards: &[(u8, u8)],
-    river_card: u8,
+    player: usize,
 ) -> Vec<f32> {
-    let mut map: HashMap<(u8, u8), f32> = HashMap::with_capacity(parent_cards.len());
+    let parent_cards = &parent_private_cards[player];
+    let mut map: HashMap<(u8, u8), f32> =
+        HashMap::with_capacity(parent_cards.len());
     for (i, &(c1, c2)) in parent_cards.iter().enumerate() {
         let key = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
         let r = parent_reach.get(i).copied().unwrap_or(0.0);
-        if card_blocks_hand(river_card, c1, c2) {
-            map.insert(key, 0.0);
-        } else {
-            map.insert(key, r);
-        }
+        map.insert(key, r);
     }
     subtree_cards
         .iter()
@@ -732,24 +372,6 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
         cache.insert(key, result.clone());
         result
     }
-
-    fn compute_raw_cfvs_both(
-        &self,
-        pot: i32,
-        remaining_stack: f64,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
-        _num_oop: usize,
-        _num_ip: usize,
-        _continuation_index: usize,
-    ) -> Option<(Vec<f32>, Vec<f32>)> {
-        // Only support river and turn boundaries.
-        if self.board.len() < 4 {
-            return None;
-        }
-        self.ensure_solved_games(pot, remaining_stack);
-        Some(self.compute_raw_from_solved_games(oop_reach, ip_reach))
-    }
 }
 
 #[cfg(test)]
@@ -758,32 +380,6 @@ mod tests {
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::flop_from_str;
     use range_solver::game::BoundaryEvaluator;
-    use range_solver::interface::Game;
-
-    /// Determine the `BoardState` from board length (test-only helper).
-    fn board_state_from_len(n: usize) -> BoardState {
-        match n {
-            3 => BoardState::Flop,
-            4 => BoardState::Turn,
-            5 => BoardState::River,
-            _ => panic!("invalid board length for subtree: {n}"),
-        }
-    }
-
-    /// Blocker-adjusted opponent reach sum for a hero hand (test-only helper).
-    fn cfreach_adj(h1: u8, h2: u8, opp_cards: &[(u8, u8)], opp_reach: &[f32]) -> f64 {
-        let mut sum = 0.0f64;
-        for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
-            if o1 == h1 || o1 == h2 || o2 == h1 || o2 == h2 {
-                continue;
-            }
-            let r = opp_reach.get(j).copied().unwrap_or(0.0);
-            if r > 0.0 {
-                sum += r as f64;
-            }
-        }
-        sum
-    }
 
     /// Helper: build a SubtreeExactEvaluator for a river-boundary spot.
     /// AA,KK,QQ vs TT,99,88 on 7h 5d 2c 3s 9h (balanced equities).
@@ -894,9 +490,6 @@ mod tests {
 
     #[test]
     fn evaluator_different_reaches_give_different_cfvs() {
-        // With boundary reach as initial weights, bcfv depends on the
-        // opponent reach distribution. This matches SPR=0's behavior
-        // where equity is weighted by opponent reach.
         let eval = make_river_evaluator(50);
         let num_oop = eval.private_cards[0].len();
         let num_ip = eval.private_cards[1].len();
@@ -916,275 +509,6 @@ mod tests {
             100, 150.0, &oop_reach_full, &ip_reach_half, num_oop, num_ip, 0,
         );
         assert_ne!(oop1, oop2, "different reaches should produce different CFVs");
-    }
-
-    /// Helper: build a SubtreeExactEvaluator for a TURN-boundary spot.
-    /// AA,KK,QQ vs TT,99,88 on 7h 5d 2c 3s (4-card board, no river yet).
-    fn make_turn_evaluator(solve_iters: u32) -> SubtreeExactEvaluator {
-        let flop = flop_from_str("7h 5d 2c").unwrap();
-        let turn_card: u8 = 7; // 3s
-        let board = vec![flop[0], flop[1], flop[2], turn_card];
-
-        let oop_range: Range = "AA,KK,QQ".parse().unwrap();
-        let ip_range: Range = "TT,99,88".parse().unwrap();
-        let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1 << c));
-        let (oop_hands, oop_weights) = oop_range.get_hands_weights(board_mask);
-        let (ip_hands, ip_weights) = ip_range.get_hands_weights(board_mask);
-
-        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
-        let tree_config = TreeConfig {
-            initial_state: BoardState::Turn,
-            starting_pot: 100,
-            effective_stack: 200,
-            river_bet_sizes: [sizes.clone(), sizes],
-            ..Default::default()
-        };
-
-        SubtreeExactEvaluator::new(
-            board,
-            [oop_hands, ip_hands],
-            [oop_weights.clone(), ip_weights.clone()],
-            tree_config,
-        ).with_solve_iters(solve_iters)
-    }
-
-    #[test]
-    fn turn_evaluator_returns_correct_length_cfvs() {
-        let eval = make_turn_evaluator(50);
-        let num_oop = eval.private_cards[0].len();
-        let num_ip = eval.private_cards[1].len();
-        assert!(num_oop > 0, "should have OOP hands");
-        assert!(num_ip > 0, "should have IP hands");
-
-        let oop_reach = vec![1.0f32; num_oop];
-        let ip_reach = vec![1.0f32; num_ip];
-        let (oop_cfvs, ip_cfvs) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
-        assert_eq!(oop_cfvs.len(), num_oop);
-        assert_eq!(ip_cfvs.len(), num_ip);
-    }
-
-    #[test]
-    fn turn_evaluator_cfvs_are_finite_and_bounded() {
-        let eval = make_turn_evaluator(100);
-        let num_oop = eval.private_cards[0].len();
-        let num_ip = eval.private_cards[1].len();
-        let oop_reach = vec![1.0f32; num_oop];
-        let ip_reach = vec![1.0f32; num_ip];
-        let (oop_cfvs, ip_cfvs) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
-        for &v in &oop_cfvs {
-            assert!(v.is_finite(), "OOP CFV should be finite, got {v}");
-            assert!(
-                v.abs() <= 5.0,
-                "OOP bcfv should be bounded (pot-normalised), got {v}"
-            );
-        }
-        for &v in &ip_cfvs {
-            assert!(v.is_finite(), "IP CFV should be finite, got {v}");
-            assert!(
-                v.abs() <= 5.0,
-                "IP bcfv should be bounded (pot-normalised), got {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn turn_evaluator_overpairs_have_positive_bcfv() {
-        // AA,KK,QQ are all overpairs on 7h5d2c3s. They should average
-        // positive bcfv against TT,99,88 across all river runouts.
-        let eval = make_turn_evaluator(200);
-        let num_oop = eval.private_cards[0].len();
-        let num_ip = eval.private_cards[1].len();
-        let oop_reach = vec![1.0f32; num_oop];
-        let ip_reach = vec![1.0f32; num_ip];
-        let (oop_cfvs, _ip_cfvs) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
-        let oop_positive = oop_cfvs.iter().filter(|&&v| v > 0.0).count();
-        assert!(
-            oop_positive > num_oop / 2,
-            "majority of OOP overpairs should have positive bcfv, \
-             got {oop_positive}/{num_oop}, values: {:?}",
-            &oop_cfvs[..5.min(oop_cfvs.len())]
-        );
-    }
-
-    /// Diagnostic: compare per-river bcfv reconstruction against full
-    /// Turn+River solve to understand scaling. Print ratios.
-    #[test]
-    fn turn_evaluator_bcfv_scaling_diagnostic() {
-        let flop = flop_from_str("7h 5d 2c").unwrap();
-        let turn_card: u8 = 7; // 3s
-        let board = vec![flop[0], flop[1], flop[2], turn_card];
-
-        let oop_range: Range = "AA,KK,QQ".parse().unwrap();
-        let ip_range: Range = "TT,99,88".parse().unwrap();
-        let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1 << c));
-        let (oop_hands, oop_weights) = oop_range.get_hands_weights(board_mask);
-        let (ip_hands, ip_weights) = ip_range.get_hands_weights(board_mask);
-
-        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
-        let tree_config = TreeConfig {
-            initial_state: BoardState::Turn,
-            starting_pot: 100,
-            effective_stack: 200,
-            river_bet_sizes: [sizes.clone(), sizes],
-            ..Default::default()
-        };
-
-        // Build a full Turn+River game as reference
-        let card_config = build_card_config(
-            &board,
-            &[oop_hands.clone(), ip_hands.clone()],
-            &[oop_weights.clone(), ip_weights.clone()],
-        );
-        let ref_tree = ActionTree::new(tree_config.clone()).unwrap();
-        let mut ref_game =
-            PostFlopGame::with_config(card_config, ref_tree).unwrap();
-        ref_game.allocate_memory(false);
-        run_dcfr(&mut ref_game, 500);
-        finalize(&mut ref_game);
-        let ref_oop_cfv = range_solver::root_cfvalues(&ref_game, 0);
-
-        // Build per-river evaluator
-        let eval = SubtreeExactEvaluator::new(
-            board,
-            [oop_hands.clone(), ip_hands.clone()],
-            [oop_weights.clone(), ip_weights.clone()],
-            tree_config,
-        ).with_solve_iters(500);
-
-        let num_oop = oop_hands.len();
-        let num_ip = ip_hands.len();
-        let oop_reach = vec![1.0f32; num_oop];
-        let ip_reach = vec![1.0f32; num_ip];
-        let (oop_bcfv, _) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
-
-        let half_pot = 50.0f64;
-        let num_combinations = ref_game.num_combinations();
-        let payoff_scale = half_pot / num_combinations;
-
-        eprintln!("--- Scaling diagnostic ---");
-        eprintln!("half_pot={half_pot}, N={num_combinations}, payoff_scale={payoff_scale:.8}");
-
-        let mut ratios = Vec::new();
-        for (h, &bcfv) in oop_bcfv.iter().enumerate().take(5) {
-            let (h1, h2) = oop_hands[h];
-            let adj = cfreach_adj(h1, h2, &ip_hands, &ip_reach);
-            let reconstructed = bcfv as f64 * payoff_scale * adj;
-            let reference = ref_oop_cfv[h] as f64;
-            let ratio = if reference.abs() > 1e-9 {
-                reconstructed / reference
-            } else {
-                f64::NAN
-            };
-            ratios.push(ratio);
-            eprintln!(
-                "  h={h} ({h1},{h2}): bcfv={bcfv:.6} adj={adj:.2} \
-                 recon={reconstructed:.6} ref={reference:.6} ratio={ratio:.4}"
-            );
-        }
-
-        // The test passes if bcfv values are finite; the diagnostic output
-        // shows us the scaling we need to correct.
-        for &bcfv in &oop_bcfv {
-            assert!(bcfv.is_finite(), "bcfv must be finite, got {bcfv}");
-        }
-    }
-
-    #[test]
-    fn compute_raw_cfvs_both_returns_some() {
-        let eval = make_river_evaluator(50);
-        let num_oop = eval.private_cards[0].len();
-        let num_ip = eval.private_cards[1].len();
-        let oop_reach = vec![1.0f32; num_oop];
-        let ip_reach = vec![1.0f32; num_ip];
-        let result = eval.compute_raw_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
-        assert!(result.is_some(), "SubtreeExactEvaluator should support raw CFV path");
-        let (oop_raw, ip_raw) = result.unwrap();
-        assert_eq!(oop_raw.len(), num_oop);
-        assert_eq!(ip_raw.len(), num_ip);
-        for &v in &oop_raw {
-            assert!(v.is_finite(), "raw OOP CFV should be finite, got {v}");
-        }
-        for &v in &ip_raw {
-            assert!(v.is_finite(), "raw IP CFV should be finite, got {v}");
-        }
-    }
-
-    #[test]
-    fn raw_cfvs_match_reference_full_tree_river() {
-        // Build a reference full-tree River game and compare raw CFVs.
-        let flop = flop_from_str("7h 5d 2c").unwrap();
-        let turn_card: u8 = 7; // 3s
-        let river_card: u8 = 30; // 9h
-        let board = vec![flop[0], flop[1], flop[2], turn_card, river_card];
-
-        let oop_range: Range = "AA,KK,QQ".parse().unwrap();
-        let ip_range: Range = "TT,99,88".parse().unwrap();
-        let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1 << c));
-        let (oop_hands, oop_weights) = oop_range.get_hands_weights(board_mask);
-        let (ip_hands, ip_weights) = ip_range.get_hands_weights(board_mask);
-
-        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
-        let tree_config = TreeConfig {
-            initial_state: BoardState::River,
-            starting_pot: 100,
-            effective_stack: 200,
-            river_bet_sizes: [sizes.clone(), sizes],
-            ..Default::default()
-        };
-
-        // Build the reference game directly
-        let card_config = build_card_config(
-            &board,
-            &[oop_hands.clone(), ip_hands.clone()],
-            &[oop_weights.clone(), ip_weights.clone()],
-        );
-        let ref_tree = ActionTree::new(tree_config.clone()).unwrap();
-        let mut ref_game = PostFlopGame::with_config(card_config, ref_tree).unwrap();
-        ref_game.allocate_memory(false);
-        run_dcfr(&mut ref_game, 500);
-        finalize(&mut ref_game);
-        // root_cfvalues returns per-combo cfvalues (the same units as evaluate_internal result)
-        let ref_oop = range_solver::root_cfvalues(&ref_game, 0);
-
-        // Build the evaluator
-        let eval = SubtreeExactEvaluator::new(
-            board,
-            [oop_hands.clone(), ip_hands.clone()],
-            [oop_weights.clone(), ip_weights.clone()],
-            tree_config,
-        ).with_solve_iters(500);
-
-        let num_oop = oop_hands.len();
-        let num_ip = ip_hands.len();
-        let oop_reach = vec![1.0f32; num_oop];
-        let ip_reach = vec![1.0f32; num_ip];
-        let (oop_raw, _) = eval.compute_raw_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        ).expect("should return Some");
-
-        // Raw CFVs should match reference root_cfvalues within DCFR
-        // convergence tolerance. root_cfvalues are in per-combo chip units.
-        let mut max_err = 0.0f64;
-        for (h, (&raw, &reference)) in oop_raw.iter().zip(ref_oop.iter()).enumerate() {
-            let err = (raw as f64 - reference as f64).abs();
-            if err > max_err { max_err = err; }
-            let tol = 0.1 * reference.abs().max(0.01) as f64; // 10% relative tolerance
-            assert!(
-                err <= tol,
-                "hand {h}: raw={raw:.6} ref={reference:.6} err={err:.6} tol={tol:.6}"
-            );
-        }
-        eprintln!("[raw_cfvs_match_reference] max_err={max_err:.6}");
     }
 
     #[test]
@@ -1234,113 +558,5 @@ mod tests {
             100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
         );
         assert_eq!(oop_single, oop_both, "single-player should match both");
-    }
-
-    /// Integration test: build a Turn game with depth_limit=0, wire a
-    /// SubtreeExactEvaluator, and verify that the bounded game's root
-    /// cfvalues closely match the full game's root cfvalues.
-    #[test]
-    fn raw_cfv_turn_boundary_matches_full_game() {
-        use std::sync::Arc;
-        use range_solver::game::BoundaryEvaluator;
-
-        let flop = flop_from_str("7h 5d 2c").unwrap();
-        let turn_card: u8 = 7; // 3s
-        let board = vec![flop[0], flop[1], flop[2], turn_card];
-
-        let oop_range: Range = "AA,KK,QQ".parse().unwrap();
-        let ip_range: Range = "TT,99,88".parse().unwrap();
-        let board_mask: u64 = board.iter().fold(0u64, |m, &c| m | (1 << c));
-        let (oop_hands, oop_weights) = oop_range.get_hands_weights(board_mask);
-        let (ip_hands, ip_weights) = ip_range.get_hands_weights(board_mask);
-
-        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
-        let tree_config = TreeConfig {
-            initial_state: BoardState::Turn,
-            starting_pot: 100,
-            effective_stack: 200,
-            turn_bet_sizes: [sizes.clone(), sizes.clone()],
-            river_bet_sizes: [sizes.clone(), sizes.clone()],
-            ..Default::default()
-        };
-
-        // Build and solve the FULL Turn+River game (no boundaries).
-        let card_config = build_card_config(
-            &board, &[oop_hands.clone(), ip_hands.clone()],
-            &[oop_weights.clone(), ip_weights.clone()],
-        );
-        let full_tree = ActionTree::new(tree_config.clone()).unwrap();
-        let mut full_game = PostFlopGame::with_config(card_config.clone(), full_tree).unwrap();
-        full_game.allocate_memory(false);
-        run_dcfr(&mut full_game, 500);
-        finalize(&mut full_game);
-        let ref_oop = range_solver::root_cfvalues(&full_game, 0);
-        let ref_ip = range_solver::root_cfvalues(&full_game, 1);
-
-        // Build the BOUNDED game (depth_limit=0 → boundary at Turn→River).
-        let bounded_config = TreeConfig {
-            depth_limit: Some(0),
-            ..tree_config.clone()
-        };
-        let bounded_tree = ActionTree::new(bounded_config).unwrap();
-        let mut bounded_game = PostFlopGame::with_config(card_config, bounded_tree).unwrap();
-        bounded_game.allocate_memory(false);
-
-        let n_boundaries = bounded_game.num_boundary_nodes();
-        assert!(n_boundaries > 0, "should have boundary nodes");
-
-        // Create evaluators for each boundary.
-        let boundary_boards = bounded_game.boundary_boards();
-        let private_cards = [oop_hands.clone(), ip_hands.clone()];
-        let initial_weights = [oop_weights.clone(), ip_weights.clone()];
-        let per_boundary: Vec<Arc<dyn BoundaryEvaluator>> = boundary_boards.iter()
-            .map(|brd| {
-                Arc::new(SubtreeExactEvaluator::new(
-                    brd.clone(),
-                    private_cards.clone(),
-                    initial_weights.clone(),
-                    tree_config.clone(),
-                ).with_solve_iters(500)) as Arc<dyn BoundaryEvaluator>
-            })
-            .collect();
-        bounded_game.per_boundary_evaluators = per_boundary;
-
-        // Solve with per-iteration boundary recomputation.
-        for t in 0..500u32 {
-            bounded_game.clear_boundary_cfvs();
-            solve_step(&mut bounded_game, t);
-        }
-        finalize(&mut bounded_game);
-        let bounded_oop = range_solver::root_cfvalues(&bounded_game, 0);
-        let bounded_ip = range_solver::root_cfvalues(&bounded_game, 1);
-
-        // Compare root cfvalues.
-        let mut max_oop_err = 0.0f64;
-        for (h, (&bounded, &reference)) in bounded_oop.iter().zip(ref_oop.iter()).enumerate() {
-            let err = (bounded as f64 - reference as f64).abs();
-            if err > max_oop_err { max_oop_err = err; }
-            let tol = 0.3 * reference.abs().max(0.001) as f64; // 30% relative
-            if err > tol {
-                eprintln!(
-                    "OOP hand {h}: bounded={bounded:.6} ref={reference:.6} \
-                     err={err:.6} tol={tol:.6}"
-                );
-            }
-        }
-
-        let mut max_ip_err = 0.0f64;
-        for (h, (&bounded, &reference)) in bounded_ip.iter().zip(ref_ip.iter()).enumerate() {
-            let err = (bounded as f64 - reference as f64).abs();
-            if err > max_ip_err { max_ip_err = err; }
-        }
-
-        eprintln!(
-            "[raw_cfv_turn_boundary] max_oop_err={max_oop_err:.6} max_ip_err={max_ip_err:.6}"
-        );
-        // Generous tolerance for DCFR convergence differences.
-        assert!(
-            max_oop_err < 0.5,
-            "OOP root cfvalues should be close to reference, max_err={max_oop_err:.6}"
-        );
     }
 }
