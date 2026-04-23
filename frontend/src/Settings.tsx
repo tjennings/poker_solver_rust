@@ -6,6 +6,15 @@ import type { GlobalConfig } from './types';
 const STREETS = ['flop', 'turn', 'river'] as const;
 type Street = typeof STREETS[number];
 
+/** Returns true if any per-street boundary mode is not 'exact' (i.e. a cut is active). */
+export function hasAnyCut(cfg: GlobalConfig): boolean {
+  return (
+    cfg.flop_boundary_mode !== 'exact' ||
+    cfg.turn_boundary_mode !== 'exact' ||
+    cfg.river_boundary_mode !== 'exact'
+  );
+}
+
 function BoundaryEvaluationSettings({
   config,
   setConfig,
@@ -112,6 +121,21 @@ function BoundaryEvaluationSettings({
       <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.5rem' }}>
         Selecting CFVNet on a street cuts the solve at that street boundary and uses the chosen ONNX model for counterfactual values. Earlier streets must be Exact.
       </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: hasAnyCut(config) ? 'pointer' : 'not-allowed' }}>
+        <input
+          type="checkbox"
+          checked={config.enable_safe_resolving}
+          disabled={!hasAnyCut(config)}
+          onChange={(e) => setConfig({ enable_safe_resolving: e.target.checked })}
+          style={{ accentColor: '#00d9ff' }}
+        />
+        Safe re-solving (Libratus gadget)
+      </label>
+      {!hasAnyCut(config) && (
+        <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem', marginLeft: '1.8rem' }}>
+          Enable a per-street cut mode (CFVNet) to use the gadget.
+        </p>
+      )}
     </div>
   );
 }
