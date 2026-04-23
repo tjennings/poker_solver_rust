@@ -1004,6 +1004,35 @@ impl GameTree {
         }
         map
     }
+
+    /// Collect all `Chance` node arena indices reachable from `start`
+    /// via DFS, in arena-encounter order.
+    ///
+    /// Useful for mapping range-solver boundary ordinals to abstract
+    /// tree chance nodes: the i-th entry corresponds to the i-th
+    /// boundary the solver will encounter.
+    #[must_use]
+    pub fn chance_descendants(&self, start: u32) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut stack = vec![start];
+        while let Some(idx) = stack.pop() {
+            match &self.nodes[idx as usize] {
+                GameNode::Chance { child, .. } => {
+                    result.push(idx);
+                    stack.push(*child);
+                }
+                GameNode::Decision { children, .. } => {
+                    // Push in reverse so left children are visited first
+                    // (matching DFS order).
+                    for &c in children.iter().rev() {
+                        stack.push(c);
+                    }
+                }
+                GameNode::Terminal { .. } => {}
+            }
+        }
+        result
+    }
 }
 
 /// Check if two actions are the same type (ignoring size values).

@@ -416,7 +416,7 @@ fn setup_neural_boundaries(
     let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
-    for board_4 in boundary_boards {
+    for (ordinal, board_4) in boundary_boards.into_iter().enumerate() {
         let private_cards_pair = [
             game.private_cards(0).to_vec(),
             game.private_cards(1).to_vec(),
@@ -432,6 +432,7 @@ fn setup_neural_boundaries(
                 poker_solver_tauri::gadget::GadgetEvaluator::new(
                     inner,
                     Arc::clone(provider),
+                    ordinal,
                     board_4,
                     private_cards_pair,
                 ),
@@ -476,7 +477,7 @@ fn setup_exact_subtree_boundaries(
     let gadget_label = if opt_out.is_some() { " + gadget" } else { "" };
     let mut per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> =
         Vec::with_capacity(n_boundaries);
-    for board in &boundary_boards {
+    for (ordinal, board) in boundary_boards.iter().enumerate() {
         let eval: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(
             poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
                 board.clone(),
@@ -491,6 +492,7 @@ fn setup_exact_subtree_boundaries(
                 poker_solver_tauri::gadget::GadgetEvaluator::new(
                     eval,
                     Arc::clone(provider),
+                    ordinal,
                     board.clone(),
                     private_cards.clone(),
                 ),

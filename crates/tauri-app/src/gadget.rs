@@ -60,17 +60,18 @@ impl OptOutProvider for ConstantOptOut {
 
 /// Opt-out provider that pulls per-hand CFVs from a blueprint's `CbvTable`.
 ///
-/// CBVs are read at construction (once per boundary) and cached as a
-/// per-player `Vec<f32>` in bcfv units. At runtime, `opt_out_cfvs` is a
-/// pure vec clone.
+/// Stores pre-computed opt-out values for every boundary (chance node
+/// descendant) and both players. At runtime, `opt_out_cfvs` selects the
+/// correct boundary by ordinal and returns a pure vec clone.
 pub struct BlueprintCbvOptOut {
-    /// Per-player, per-hand pre-computed bcfv opt-out values.
-    /// Index: `per_hand_cbv_bcfv[player][hand_idx]`.
-    per_hand_cbv_bcfv: [Vec<f32>; 2],
+    /// Per-boundary, per-player, per-hand pre-computed bcfv opt-out values.
+    /// Index: `per_boundary_cbv[boundary_ordinal][player][hand_idx]`.
+    per_boundary_cbv: Vec<[Vec<f32>; 2]>,
 }
 
 impl BlueprintCbvOptOut {
-    /// Test-only constructor that builds zero-valued opt-out vectors.
+    /// Test-only constructor that builds zero-valued opt-out vectors
+    /// for a single boundary.
     /// Production callers use `BlueprintCbvOptOut::from_cbv_context`.
     #[cfg(test)]
     pub(crate) fn new_for_test(
@@ -83,34 +84,52 @@ impl BlueprintCbvOptOut {
             "CbvTable has no values; cannot construct BlueprintCbvOptOut"
         );
         Self {
-            per_hand_cbv_bcfv: [
+            per_boundary_cbv: vec![[
                 vec![0.0; num_oop],
                 vec![0.0; num_ip],
-            ],
+            ]],
         }
     }
 
-    /// Production constructor. Reads the blueprint's CBV values for
-    /// every combo in both players' ranges at the given boundary node,
-    /// converts to bcfv units, and caches.
+    /// Production constructor. Finds all chance node descendants of
+    /// `abstract_root` in the abstract tree (DFS order), maps each to
+    /// its dense CBV ordinal, and pre-computes per-hand opt-out values
+    /// in bcfv units for both players at every boundary.
+    ///
+    /// `abstract_root` is the abstract tree arena index of the decision
+    /// node where the subgame starts (e.g., the turn decision node).
     ///
     /// # Panics
     ///
     /// - If `cbv_context.cbv_table.values` is empty.
     /// - If `half_pot_chips <= 0`.
     /// - If `board.len()` is not 3, 4, or 5.
+    /// - If no chance nodes are found below `abstract_root`.
     pub fn from_cbv_context(
         cbv_context: &crate::postflop::CbvContext,
-        boundary_node_idx: u32,
+        abstract_root: u32,
         board: &[u8],
         private_cards: &[Vec<(u8, u8)>; 2],
         half_pot_chips: f32,
     ) -> Self {
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+
         assert!(
             !cbv_context.cbv_table.values.is_empty(),
             "CbvTable has no values; cannot construct BlueprintCbvOptOut"
         );
         assert!(half_pot_chips > 0.0, "half_pot must be positive");
+
+        let ordinal_map =
+            CbvTable::build_node_to_ordinal_map(&cbv_context.abstract_tree);
+        let chance_nodes =
+            cbv_context.abstract_tree.chance_descendants(abstract_root);
+
+        assert!(
+            !chance_nodes.is_empty(),
+            "no chance nodes found below abstract tree node {abstract_root}; \
+             cannot construct BlueprintCbvOptOut"
+        );
 
         let street = match board.len() {
             3 => Street::Flop,
@@ -124,45 +143,62 @@ impl BlueprintCbvOptOut {
             .map(|&id| crate::exploration::range_solver_to_rs_card(id))
             .collect();
 
-        let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
-        for player in 0..2 {
-            let hands = &private_cards[player];
-            per_hand[player].reserve(hands.len());
-            for &(c1, c2) in hands {
-                let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
-                let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
-                let bucket = cbv_context.all_buckets.get_bucket(
-                    street, [rs_c1, rs_c2], &rs_board,
-                );
-                let chip_cbv = cbv_context.cbv_table.lookup(
-                    boundary_node_idx as usize, bucket as usize,
-                );
-                per_hand[player].push(chip_cfv_to_bcfv(chip_cbv, half_pot_chips));
+        let mut per_boundary = Vec::with_capacity(chance_nodes.len());
+        for &chance_arena_idx in &chance_nodes {
+            let cbv_ordinal =
+                CbvTable::require_ordinal(&ordinal_map, chance_arena_idx);
+
+            let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+            for player in 0..2 {
+                let hands = &private_cards[player];
+                per_hand[player].reserve(hands.len());
+                for &(c1, c2) in hands {
+                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                    let bucket = cbv_context.all_buckets.get_bucket(
+                        street, [rs_c1, rs_c2], &rs_board,
+                    );
+                    let chip_cbv = cbv_context.cbv_table.lookup(
+                        cbv_ordinal, bucket as usize,
+                    );
+                    per_hand[player].push(
+                        chip_cfv_to_bcfv(chip_cbv, half_pot_chips),
+                    );
+                }
             }
+            per_boundary.push(per_hand);
         }
-        Self { per_hand_cbv_bcfv: per_hand }
+        Self { per_boundary_cbv: per_boundary }
+    }
+
+    /// Number of boundaries this provider was constructed with.
+    #[must_use]
+    pub fn num_boundaries(&self) -> usize {
+        self.per_boundary_cbv.len()
     }
 }
 
 impl OptOutProvider for BlueprintCbvOptOut {
     fn opt_out_cfvs(
         &self,
-        _boundary_ordinal: usize,
+        boundary_ordinal: usize,
         opponent: usize,
         _pot: i32,
         _effective_stack: i32,
         _board: &[u8],
         opponent_private_cards: &[(u8, u8)],
     ) -> Vec<f32> {
+        let entry = &self.per_boundary_cbv[boundary_ordinal
+            .min(self.per_boundary_cbv.len() - 1)];
         assert_eq!(
             opponent_private_cards.len(),
-            self.per_hand_cbv_bcfv[opponent].len(),
+            entry[opponent].len(),
             "opt_out_cfvs called with hand list of length {} but \
              constructor registered {} hands for player {opponent}",
             opponent_private_cards.len(),
-            self.per_hand_cbv_bcfv[opponent].len(),
+            entry[opponent].len(),
         );
-        self.per_hand_cbv_bcfv[opponent].clone()
+        entry[opponent].clone()
     }
 }
 
@@ -174,6 +210,8 @@ impl OptOutProvider for BlueprintCbvOptOut {
 pub struct GadgetEvaluator {
     inner: Arc<dyn range_solver::game::BoundaryEvaluator>,
     opt_out: Arc<dyn OptOutProvider>,
+    /// Which boundary this evaluator serves (passed to `opt_out_cfvs`).
+    boundary_ordinal: usize,
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
 }
@@ -182,10 +220,11 @@ impl GadgetEvaluator {
     pub fn new(
         inner: Arc<dyn range_solver::game::BoundaryEvaluator>,
         opt_out: Arc<dyn OptOutProvider>,
+        boundary_ordinal: usize,
         board: Vec<u8>,
         private_cards: [Vec<(u8, u8)>; 2],
     ) -> Self {
-        Self { inner, opt_out, board, private_cards }
+        Self { inner, opt_out, boundary_ordinal, board, private_cards }
     }
 }
 
@@ -254,10 +293,12 @@ impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
         let eff_stack = (pot / 2) + remaining_stack.round() as i32;
         // Get opt-out values for each player (as opponent)
         let oop_opt_out = self.opt_out.opt_out_cfvs(
-            0, 0, pot, eff_stack, &self.board, &self.private_cards[0],
+            self.boundary_ordinal, 0, pot, eff_stack,
+            &self.board, &self.private_cards[0],
         );
         let ip_opt_out = self.opt_out.opt_out_cfvs(
-            0, 1, pot, eff_stack, &self.board, &self.private_cards[1],
+            self.boundary_ordinal, 1, pot, eff_stack,
+            &self.board, &self.private_cards[1],
         );
         // When computing OOP cfvs, IP is opponent => clamp IP upward
         let (_oop_adj_for_oop, ip_clamped) = apply_gadget_clamp(
@@ -328,11 +369,16 @@ mod tests {
 
     /// Build a minimal `CbvContext` + board + private_cards fixture for gadget tests.
     /// Uses a 2-bucket CbvTable with known values and equity-fallback bucketing.
-    fn make_cbv_test_context() -> (crate::postflop::CbvContext, Vec<u8>, [Vec<(u8, u8)>; 2]) {
+    ///
+    /// Returns `(context, abstract_root, board, private_cards)`.
+    /// `abstract_root` is the decision node where the subgame starts.
+    fn make_cbv_test_context() -> (crate::postflop::CbvContext, u32, Vec<u8>, [Vec<(u8, u8)>; 2]) {
         use crate::postflop::CbvContext;
         use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
         use poker_solver_core::blueprint_v2::cbv::CbvTable;
-        use poker_solver_core::blueprint_v2::game_tree::GameTree;
+        use poker_solver_core::blueprint_v2::game_tree::{
+            GameNode, GameTree, TerminalKind, TreeAction,
+        };
         use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
         use poker_solver_core::blueprint_v2::Street;
         use range_solver::card::flop_from_str;
@@ -344,14 +390,51 @@ mod tests {
             buckets_per_node: vec![2],
         };
 
+        // Hand-built tree with a single chance node at arena index 2
+        // (not 0) so the ordinal mapping is exercised.
+        //   0: Decision(P0, Turn, [Check])
+        //   1: Decision(P1, Turn, [Check])
+        //   2: Chance(next=River, child=3) -- ordinal 0
+        //   3: Terminal(Showdown, pot=100)
+        let nodes = vec![
+            GameNode::Decision {
+                player: 0,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![1],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![2],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Chance {
+                next_street: Street::River,
+                child: 3,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 100.0,
+                stacks: [50.0, 50.0],
+            },
+        ];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
+        // Root decision node (arena 0) -- callers pass this to from_cbv_context.
+        // The chance node is at arena index 2 (ordinal 0).
+        let abstract_root: u32 = 0;
+
         let mut ab = AllBuckets::new([2, 2, 2, 2], [None, None, None, None]);
         ab.equity_fallback = true;
         let all_buckets = Arc::new(ab);
         let strategy = Arc::new(BlueprintV2Strategy::empty());
-        let tree = GameTree::build_subgame(
-            Street::River, 100.0, [50.0; 2], 200.0,
-            &[vec![1.0]], Some(1), 0,
-        );
 
         let ctx = CbvContext {
             cbv_table,
@@ -369,16 +452,16 @@ mod tests {
         let ip_hands = vec![(4u8, 5u8)];    // 3c, 3d
         let private_cards = [oop_hands, ip_hands];
 
-        (ctx, board, private_cards)
+        (ctx, abstract_root, board, private_cards)
     }
 
     #[test]
     fn blueprint_cbv_opt_out_from_cbv_context_returns_correct_bcfv() {
-        let (ctx, board, private_cards) = make_cbv_test_context();
+        let (ctx, root, board, private_cards) = make_cbv_test_context();
 
         let half_pot = 50.0_f32;
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, 0, &board, &private_cards, half_pot,
+            &ctx, root, &board, &private_cards, half_pot,
         );
 
         // Verify opt_out_cfvs returns the correct number of hands
@@ -399,13 +482,176 @@ mod tests {
         }
     }
 
+    /// Build a multi-node CbvContext with a connected tree rooted at node 0.
+    /// The tree has 3 action paths leading to 3 different chance nodes at
+    /// sparse arena indices, with distinct CBV values at each.
+    ///
+    /// Tree structure (root=0):
+    ///   0: Decision(P0, Turn, [Check, Bet, AllIn])
+    ///     1: Decision(P1, Turn, [Check])
+    ///       2: Chance(River, child=3) -- ordinal 0, CBV=[10, -5]
+    ///         3: Terminal(Showdown)
+    ///     4: Decision(P1, Turn, [Fold, Call])
+    ///       5: Terminal(Fold)
+    ///       6: Chance(River, child=7) -- ordinal 1, CBV=[30, -15]
+    ///         7: Terminal(Showdown)
+    ///     8: Decision(P1, Turn, [Fold, Call])
+    ///       9: Terminal(Fold)
+    ///       10: Chance(River, child=11) -- ordinal 2, CBV=[60, -30]
+    ///         11: Terminal(Showdown)
+    fn make_multi_node_cbv_context() -> (crate::postflop::CbvContext, Vec<u8>, [Vec<(u8, u8)>; 2]) {
+        use crate::postflop::CbvContext;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        use poker_solver_core::blueprint_v2::game_tree::{
+            GameNode, GameTree, TerminalKind, TreeAction,
+        };
+        use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::card::flop_from_str;
+
+        let nodes = vec![
+            // 0: Root decision (3 actions)
+            GameNode::Decision {
+                player: 0,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check, TreeAction::Bet(2.0), TreeAction::AllIn],
+                children: vec![1, 4, 8],
+                blueprint_decision_idx: None,
+            },
+            // 1: P1 after check
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![2],
+                blueprint_decision_idx: None,
+            },
+            // 2: Chance (check-check) -- ordinal 0
+            GameNode::Chance { next_street: Street::River, child: 3 },
+            // 3: Terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown, pot: 10.0, stacks: [50.0, 50.0],
+            },
+            // 4: P1 after bet
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![5, 6],
+                blueprint_decision_idx: None,
+            },
+            // 5: Fold terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 0 }, pot: 10.0, stacks: [50.0, 50.0],
+            },
+            // 6: Chance (bet-call) -- ordinal 1
+            GameNode::Chance { next_street: Street::River, child: 7 },
+            // 7: Terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown, pot: 30.0, stacks: [45.0, 45.0],
+            },
+            // 8: P1 after all-in
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![9, 10],
+                blueprint_decision_idx: None,
+            },
+            // 9: Fold terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 0 }, pot: 10.0, stacks: [50.0, 50.0],
+            },
+            // 10: Chance (allin-call) -- ordinal 2
+            GameNode::Chance { next_street: Street::River, child: 11 },
+            // 11: Terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown, pot: 60.0, stacks: [20.0, 20.0],
+            },
+        ];
+
+        // 3 boundary nodes with distinct CBV values.
+        // ordinal 0 (arena 2):  bucket 0 = 10.0, bucket 1 = -5.0
+        // ordinal 1 (arena 6):  bucket 0 = 30.0, bucket 1 = -15.0
+        // ordinal 2 (arena 10): bucket 0 = 60.0, bucket 1 = -30.0
+        let cbv_table = CbvTable {
+            values: vec![10.0, -5.0, 30.0, -15.0, 60.0, -30.0],
+            node_offsets: vec![0, 2, 4],
+            buckets_per_node: vec![2, 2, 2],
+        };
+
+        let mut ab = AllBuckets::new([2, 2, 2, 2], [None, None, None, None]);
+        ab.equity_fallback = true;
+        let all_buckets = Arc::new(ab);
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
+
+        let ctx = CbvContext {
+            cbv_table,
+            abstract_tree: tree,
+            all_buckets,
+            strategy,
+        };
+
+        let flop = flop_from_str("7h 5d 2c").unwrap();
+        let board = vec![flop[0], flop[1], flop[2], 7u8, 30u8];
+
+        let oop_hands = vec![(48u8, 49u8)]; // Ac, Ad
+        let ip_hands = vec![(4u8, 5u8)];    // 3c, 3d
+        let private_cards = [oop_hands, ip_hands];
+
+        (ctx, board, private_cards)
+    }
+
+    #[test]
+    fn from_cbv_context_multi_node_finds_all_boundaries() {
+        let (ctx, board, private_cards) = make_multi_node_cbv_context();
+
+        let half_pot = 50.0_f32;
+        // Root node 0 has 3 chance descendants
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards, half_pot,
+        );
+
+        assert_eq!(provider.num_boundaries(), 3);
+    }
+
+    #[test]
+    fn from_cbv_context_multi_node_different_ordinals_return_different_values() {
+        let (ctx, board, private_cards) = make_multi_node_cbv_context();
+
+        let half_pot = 50.0_f32;
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards, half_pot,
+        );
+
+        // boundary 0 (ordinal 0, arena 2): CBV bucket 0 = 10.0 -> bcfv = 0.2
+        // boundary 2 (ordinal 2, arena 10): CBV bucket 0 = 60.0 -> bcfv = 1.2
+        let oop_0 = provider.opt_out_cfvs(0, 0, 100, 200, &board, &private_cards[0]);
+        let oop_2 = provider.opt_out_cfvs(2, 0, 100, 200, &board, &private_cards[0]);
+
+        // They should be different values (ordinal 0 vs ordinal 2 have different CBVs)
+        assert!(
+            (oop_0[0] - oop_2[0]).abs() > 0.01,
+            "ordinal 0 and ordinal 2 should produce different opt-out values, \
+             got oop_0={}, oop_2={}",
+            oop_0[0], oop_2[0]
+        );
+    }
+
     #[test]
     #[should_panic(expected = "hand list of length")]
     fn blueprint_cbv_opt_out_provider_length_mismatch_panics() {
-        let (ctx, board, private_cards) = make_cbv_test_context();
+        let (ctx, root, board, private_cards) = make_cbv_test_context();
 
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, 0, &board, &private_cards, 50.0,
+            &ctx, root, &board, &private_cards, 50.0,
         );
 
         // Call with wrong hand count -- should panic
@@ -494,7 +740,7 @@ mod tests {
             vec![(6u8, 7), (8, 9), (11, 12)],
         ];
 
-        let gadget = GadgetEvaluator::new(inner, opt_out, board, private_cards);
+        let gadget = GadgetEvaluator::new(inner, opt_out, 0, board, private_cards);
 
         let (oop_cfvs, ip_cfvs) = gadget.compute_cfvs_both(
             100, 150.0, &[1.0; 3], &[1.0; 3], 3, 3, 0,
@@ -522,7 +768,7 @@ mod tests {
             vec![(6u8, 7), (8, 9), (11, 12)],
         ];
 
-        let gadget = GadgetEvaluator::new(inner, opt_out, board, private_cards);
+        let gadget = GadgetEvaluator::new(inner, opt_out, 0, board, private_cards);
 
         let (oop_cfvs, ip_cfvs) = gadget.compute_cfvs_both(
             100, 150.0, &[1.0; 3], &[1.0; 3], 3, 3, 0,
@@ -548,7 +794,7 @@ mod tests {
             vec![(4u8, 5), (6, 7)],
         ];
 
-        let gadget = GadgetEvaluator::new(inner, opt_out, board, private_cards);
+        let gadget = GadgetEvaluator::new(inner, opt_out, 0, board, private_cards);
 
         let (oop_cfvs, ip_cfvs) = gadget.compute_cfvs_both(
             100, 150.0, &[1.0; 2], &[1.0; 2], 2, 2, 0,
@@ -638,6 +884,7 @@ mod tests {
         let gadget = GadgetEvaluator::new(
             Arc::new(eval),
             opt_out,
+            0,
             board,
             private_cards.clone(),
         );
@@ -692,6 +939,7 @@ mod tests {
         let gadget = GadgetEvaluator::new(
             Arc::new(eval),
             opt_out,
+            0,
             board,
             private_cards.clone(),
         );
@@ -719,7 +967,7 @@ mod tests {
             vec![(6u8, 7), (8, 9), (11, 12)],
         ];
 
-        let gadget = GadgetEvaluator::new(inner, opt_out, board, private_cards);
+        let gadget = GadgetEvaluator::new(inner, opt_out, 0, board, private_cards);
 
         let (oop_cfvs, ip_cfvs) = gadget.compute_cfvs_both(
             100, 150.0, &[1.0; 3], &[1.0; 3], 3, 3, 0,

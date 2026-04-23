@@ -5,8 +5,11 @@
 //! save/load during real-time subgame solving.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+
+use super::game_tree::{GameNode, GameTree};
 
 /// Flat lookup table mapping `(boundary_node, bucket)` pairs to precomputed
 /// continuation values.
@@ -53,6 +56,42 @@ impl CbvTable {
     #[must_use]
     pub fn num_boundary_nodes(&self) -> usize {
         self.node_offsets.len()
+    }
+
+    /// Build a mapping from abstract tree arena index to dense CBV ordinal.
+    ///
+    /// The ordinal is the position of a `Chance` node in the tree's node
+    /// list when filtering for `GameNode::Chance` variants and iterating
+    /// in arena-index order. This is the same ordering used by
+    /// `cbv_compute::compute_cbvs` when populating the table.
+    ///
+    /// Only `Chance` nodes appear in the returned map.
+    #[must_use]
+    pub fn build_node_to_ordinal_map(tree: &GameTree) -> HashMap<u32, usize> {
+        tree.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, GameNode::Chance { .. }))
+            .enumerate()
+            .map(|(ordinal, (arena_idx, _))| (arena_idx as u32, ordinal))
+            .collect()
+    }
+
+    /// Look up the dense CBV ordinal for an abstract tree arena index,
+    /// panicking if the node is not a CBV boundary (chance node).
+    ///
+    /// # Panics
+    ///
+    /// Panics with a descriptive message if `arena_idx` is not a chance
+    /// node in the map.
+    #[must_use]
+    pub fn require_ordinal(map: &HashMap<u32, usize>, arena_idx: u32) -> usize {
+        *map.get(&arena_idx).unwrap_or_else(|| {
+            panic!(
+                "abstract tree node {arena_idx} is not a CBV boundary \
+                 (chance node); cannot look up CBV ordinal"
+            )
+        })
     }
 
     /// Save to file using bincode.
@@ -164,5 +203,158 @@ mod tests {
         assert_eq!(table.lookup(0, 2), 30.0);
         assert_eq!(table.lookup(1, 0), 40.0);
         assert_eq!(table.lookup(1, 1), 50.0);
+    }
+
+    #[test]
+    fn cbv_ordinal_of_node_maps_sparse_arena_to_dense() {
+        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+        use crate::blueprint_v2::Street;
+
+        // Tree with chance nodes at arena indices 2 and 6 (NOT 0 and 1).
+        // Ordinals should be 0 and 1 respectively.
+        let nodes = vec![
+            // 0: Root decision
+            GameNode::Decision {
+                player: 0,
+                street: Street::Flop,
+                actions: vec![TreeAction::Check, TreeAction::Bet(2.0)],
+                children: vec![1, 4],
+                blueprint_decision_idx: None,
+            },
+            // 1: Player 1 decision
+            GameNode::Decision {
+                player: 1,
+                street: Street::Flop,
+                actions: vec![TreeAction::Check],
+                children: vec![2],
+                blueprint_decision_idx: None,
+            },
+            // 2: Chance node (ordinal 0)
+            GameNode::Chance {
+                next_street: Street::Turn,
+                child: 3,
+            },
+            // 3: Terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 2.0,
+                stacks: [49.0, 49.0],
+            },
+            // 4: Player 1 decision
+            GameNode::Decision {
+                player: 1,
+                street: Street::Flop,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![5, 6],
+                blueprint_decision_idx: None,
+            },
+            // 5: Fold terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 0 },
+                pot: 2.0,
+                stacks: [49.0, 49.0],
+            },
+            // 6: Chance node (ordinal 1)
+            GameNode::Chance {
+                next_street: Street::Turn,
+                child: 7,
+            },
+            // 7: Terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 4.0,
+                stacks: [48.0, 48.0],
+            },
+        ];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        };
+
+        let map = CbvTable::build_node_to_ordinal_map(&tree);
+
+        // Chance nodes at arena index 2 -> ordinal 0, arena index 6 -> ordinal 1
+        assert_eq!(map.get(&2), Some(&0));
+        assert_eq!(map.get(&6), Some(&1));
+
+        // Non-chance nodes should not be in the map
+        assert_eq!(map.get(&0), None);
+        assert_eq!(map.get(&1), None);
+        assert_eq!(map.get(&3), None);
+        assert_eq!(map.get(&5), None);
+        assert_eq!(map.get(&7), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a CBV boundary")]
+    fn cbv_ordinal_of_node_panics_for_non_chance_node() {
+        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+        use crate::blueprint_v2::Street;
+
+        let nodes = vec![
+            GameNode::Decision {
+                player: 0,
+                street: Street::Flop,
+                actions: vec![TreeAction::Check],
+                children: vec![1],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Chance {
+                next_street: Street::Turn,
+                child: 2,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 2.0,
+                stacks: [49.0, 49.0],
+            },
+        ];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        };
+
+        let map = CbvTable::build_node_to_ordinal_map(&tree);
+
+        // Should panic: node 0 is a Decision, not a Chance node
+        CbvTable::require_ordinal(&map, 0);
+    }
+
+    #[test]
+    fn cbv_require_ordinal_returns_correct_value() {
+        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
+        use crate::blueprint_v2::Street;
+
+        let nodes = vec![
+            GameNode::Decision {
+                player: 0,
+                street: Street::Flop,
+                actions: vec![TreeAction::Check],
+                children: vec![1],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Chance {
+                next_street: Street::Turn,
+                child: 2,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 2.0,
+                stacks: [49.0, 49.0],
+            },
+        ];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        };
+
+        let map = CbvTable::build_node_to_ordinal_map(&tree);
+        assert_eq!(CbvTable::require_ordinal(&map, 1), 0);
     }
 }

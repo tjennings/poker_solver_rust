@@ -261,3 +261,36 @@ All values match exactly. The dominated opt-out (-999.0) is a perfect no-op. The
 **Wall time:** exact=0.3s, subgame=1.6s.
 
 **Commits:** measurement only, no code changes
+
+## Iteration 11 (fixed) -- 2026-04-22 (cfvnet + BlueprintCbvOptOut gadget, bug fix applied)
+
+**Bug fix:** `BlueprintCbvOptOut::from_cbv_context` had two bugs:
+1. It was passed the abstract tree's decision node ID (e.g. 7916) but `CbvTable::lookup` expected a dense boundary ordinal (0..N). Added `CbvTable::build_node_to_ordinal_map()` and `CbvTable::require_ordinal()` to convert sparse arena indices to dense ordinals.
+2. The provider only stored CBV values for a single boundary but the subgame has multiple boundaries (one per action path reaching a street transition). Redesigned `BlueprintCbvOptOut` to store per-boundary values (`Vec<[Vec<f32>; 2]>`) and accept `abstract_root` (decision node) instead of a single chance node. The constructor now finds all chance node descendants via DFS and computes CBVs for each.
+3. `GadgetEvaluator` now carries its `boundary_ordinal` and passes it to `opt_out_cfvs`, so each boundary gets the correct opt-out values.
+
+**Approach:** river-boundary=cfvnet + --gadget --gadget-provider=blueprint-cbv (same as iter 11 but with the CBV index bug fixed).
+
+**Result:** exact_exp=77.67 mbb, subgame_exp=318119.14 mbb, worst_delta=1.0000, worst_cell="32o @ All-in exact=0.0000 subgame=1.0000"
+mean_mass=0.818, max_mass=1.000 at hand 4h5c.
+Status: FAIL (gadget made things WORSE)
+
+**Comparison to iter 10 (cfvnet baseline, no gadget):**
+
+| Metric | Iter 10 (no gadget) | Iter 11-fixed (CBV gadget) | Delta |
+|--------|-------------------|---------------------------|-------|
+| exact_exp | 77.67 mbb | 77.67 mbb | 0.00 |
+| subgame_exp | 20932.49 mbb | 318119.14 mbb | +297186.65 |
+| worst_delta | 1.0000 | 1.0000 | 0.00 |
+| mean_mass | 0.543 | 0.818 | +0.275 |
+
+Per-action-class bias (subgame - exact):
+- AllIn: +0.818 (vs +0.217 in iter 10)
+- Bet/Raise: -0.262 (vs -0.015 in iter 10)
+- Check: -0.556 (vs -0.202 in iter 10)
+
+**Wall time:** exact=0.3s, subgame=1.7s.
+
+**Verdict:** The Libratus-style BlueprintCbvOptOut gadget with abstract-tree CBVs does NOT close the gap -- it makes it ~15x worse. The abstract tree's coarse bucketed CBVs produce inaccurate opt-out floors that distort the strategy, causing near-universal all-in. The CBV values from 2-bucket equity-fallback abstraction are too noisy to serve as meaningful lower bounds.
+
+This confirms that the Libratus static-CBV approach is insufficient with the current abstraction quality. The DeepStack-proper approach (bean poker_solver_rust-akg3: retrain cfvnet to produce per-hand CBV values directly) is the correct next step.
