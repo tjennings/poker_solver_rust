@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::card::{CardConfig, NOT_DEALT};
@@ -348,14 +350,19 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
         _num_ip: usize,
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
+        let n_calls = GLOBAL_CALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
         let key = reach_cache_key(oop_reach, ip_reach);
         {
             let cache = self.cache.lock().expect("cache lock poisoned");
             if let Some(cached) = cache.get(&key) {
+                GLOBAL_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                log_progress(n_calls, false);
                 return cached.clone();
             }
         }
 
+        let t0 = Instant::now();
         let result = solve_subtree(
             &self.board,
             &self.private_cards,
@@ -367,11 +374,40 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
             ip_reach,
             self.solve_iters,
         );
+        GLOBAL_SOLVE_SECS.fetch_add(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
 
         let mut cache = self.cache.lock().expect("cache lock poisoned");
         cache.insert(key, result.clone());
+        log_progress(n_calls, true);
         result
     }
+}
+
+// ---------------------------------------------------------------------------
+// Progress diagnostics
+// ---------------------------------------------------------------------------
+
+/// Global call counter across all SubtreeExactEvaluator instances in the
+/// process. Incremented atomically on each `compute_cfvs_both` entry.
+static GLOBAL_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Cache hits (cumulative).
+static GLOBAL_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+/// Total wall time spent inside `solve_subtree` for cache misses, in ms.
+static GLOBAL_SOLVE_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Log every 50 evaluator calls with cache-hit ratio and avg solve time.
+fn log_progress(n_calls: u64, _was_miss: bool) {
+    if n_calls % 50 != 0 {
+        return;
+    }
+    let hits = GLOBAL_CACHE_HITS.load(Ordering::Relaxed);
+    let solve_ms = GLOBAL_SOLVE_SECS.load(Ordering::Relaxed);
+    let misses = n_calls.saturating_sub(hits);
+    let hit_pct = if n_calls > 0 { (hits * 100) / n_calls } else { 0 };
+    let avg_solve_ms = if misses > 0 { solve_ms / misses } else { 0 };
+    eprintln!(
+        "[exact_subtree] {n_calls} calls | hits={hits} ({hit_pct}%) | misses={misses} | avg solve {avg_solve_ms}ms"
+    );
 }
 
 #[cfg(test)]

@@ -513,6 +513,19 @@ fn run_dcfr_solve(
             let wall = start.elapsed().as_secs_f64();
             eprintln!("[{label}] iter {}/{iters}  wall {wall:.1}s", t + 1);
         }
+        // Unconditional progress heartbeat — logs every 10 iters so long
+        // runs (especially subgame with per-iter subtree re-solves) show
+        // progress without needing --verbose.
+        if (t + 1) % 10 == 0 {
+            let wall = start.elapsed().as_secs_f64();
+            let per_iter = wall / (t + 1) as f64;
+            let eta = per_iter * (iters - (t + 1)) as f64;
+            eprintln!(
+                "[{label}] {}/{iters} iters | {wall:.1}s elapsed | {per_iter:.2}s/iter | ETA {eta:.0}s",
+                t + 1
+            );
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+        }
     }
 
     finalize(game);
