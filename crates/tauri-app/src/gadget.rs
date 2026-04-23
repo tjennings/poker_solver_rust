@@ -29,14 +29,16 @@ pub trait OptOutProvider: Send + Sync {
     ) -> Vec<f32>;
 }
 
-/// Convert a per-hand chip CFV into pot-normalised bcfv units.
+/// Convert a per-hand CBV in raw chip-pot units to pot-normalised bcfv.
 ///
-/// Blueprint `CbvTable` stores per-bucket CBVs in chips; the gadget's
-/// `OptOutProvider` contract returns bcfv (1.0 = one half-pot won). This
-/// helper does the conversion.
+/// `CbvTable` stores values where `pot` chips = "won the full pot"
+/// (see `cbv_compute.rs` `Fold`/`Showdown` terminal math). bcfv convention:
+/// `+1.0` = "won one half-pot beyond start", `-1.0` = "lost one half-pot".
+/// The conversion subtracts the break-even baseline before normalising,
+/// matching the cfvnet training target in `cfvnet/datagen/domain/pipeline.rs:371`.
 pub fn chip_cfv_to_bcfv(chip_cfv: f32, half_pot_chips: f32) -> f32 {
     assert!(half_pot_chips > 0.0, "half_pot must be positive");
-    chip_cfv / half_pot_chips
+    (chip_cfv - half_pot_chips) / half_pot_chips
 }
 
 /// Constant opt-out provider for testing.
@@ -324,15 +326,28 @@ mod tests {
 
     #[test]
     fn chip_cfv_to_bcfv_converts_correctly() {
-        // half_pot = 73 chips
-        // chip_cfv of +73 means "won one half-pot" -> bcfv = 1.0
-        assert!((chip_cfv_to_bcfv(73.0, 73.0) - 1.0).abs() < 1e-6);
-        // chip_cfv of 0 -> bcfv = 0
-        assert_eq!(chip_cfv_to_bcfv(0.0, 73.0), 0.0);
-        // chip_cfv of -73 -> bcfv = -1.0 (lost one half-pot)
-        assert!((chip_cfv_to_bcfv(-73.0, 73.0) - (-1.0)).abs() < 1e-6);
-        // chip_cfv of +36.5 -> bcfv = 0.5
-        assert!((chip_cfv_to_bcfv(36.5, 73.0) - 0.5).abs() < 1e-6);
+        // CbvTable stores raw chip-pot values where `pot` = "won the full pot".
+        // half_pot = 73 chips (i.e. full pot = 146 chips).
+        // Break-even = half_pot = 73 chips.
+        //
+        // chip_cfv of 146 = won full pot => bcfv = (146-73)/73 = +1.0
+        assert!((chip_cfv_to_bcfv(146.0, 73.0) - 1.0).abs() < 1e-6);
+        // chip_cfv of 73 = break-even => bcfv = (73-73)/73 = 0.0
+        assert!((chip_cfv_to_bcfv(73.0, 73.0) - 0.0).abs() < 1e-6);
+        // chip_cfv of 0 = lost everything => bcfv = (0-73)/73 = -1.0
+        assert!((chip_cfv_to_bcfv(0.0, 73.0) - (-1.0)).abs() < 1e-6);
+        // chip_cfv of 109.5 = won half-pot above break-even => bcfv = (109.5-73)/73 = +0.5
+        assert!((chip_cfv_to_bcfv(109.5, 73.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chip_cfv_to_bcfv_matches_cfvnet_training_target() {
+        // cfvnet target: (ev_chips - half_pot) / half_pot (pipeline.rs:371)
+        let half_pot = 73.0_f32;
+        for ev_chips in [0.0, 36.5, 73.0, 109.5, 146.0] {
+            let target = (ev_chips - half_pot) / half_pot;
+            assert_eq!(chip_cfv_to_bcfv(ev_chips, half_pot), target);
+        }
     }
 
     #[test]
@@ -470,14 +485,14 @@ mod tests {
         assert_eq!(oop_cfvs.len(), 1);
         assert_eq!(ip_cfvs.len(), 1);
 
-        // Verify the values are chip_cbv / half_pot.
+        // Verify the values are (chip_cbv - half_pot) / half_pot.
         // With equity fallback and 2 buckets, the exact bucket depends on
-        // equity calculation, but the value must be either 50.0/50.0 = 1.0
-        // or -30.0/50.0 = -0.6.
+        // equity calculation, but the value must be either
+        // (50.0-50.0)/50.0 = 0.0  or  (-30.0-50.0)/50.0 = -1.6.
         for &v in oop_cfvs.iter().chain(ip_cfvs.iter()) {
             assert!(
-                (v - 1.0).abs() < 1e-6 || (v - (-0.6)).abs() < 1e-6,
-                "bcfv value {v} should be 1.0 or -0.6"
+                (v - 0.0).abs() < 1e-6 || (v - (-1.6)).abs() < 1e-6,
+                "bcfv value {v} should be 0.0 or -1.6"
             );
         }
     }
@@ -631,8 +646,8 @@ mod tests {
             &ctx, 0, &board, &private_cards, half_pot,
         );
 
-        // boundary 0 (ordinal 0, arena 2): CBV bucket 0 = 10.0 -> bcfv = 0.2
-        // boundary 2 (ordinal 2, arena 10): CBV bucket 0 = 60.0 -> bcfv = 1.2
+        // boundary 0 (ordinal 0, arena 2): CBV bucket 0 = 10.0 -> bcfv = (10-50)/50 = -0.8
+        // boundary 2 (ordinal 2, arena 10): CBV bucket 0 = 60.0 -> bcfv = (60-50)/50 = 0.2
         let oop_0 = provider.opt_out_cfvs(0, 0, 100, 200, &board, &private_cards[0]);
         let oop_2 = provider.opt_out_cfvs(2, 0, 100, 200, &board, &private_cards[0]);
 

@@ -36,8 +36,12 @@ Gadget could NOT be tested with production BlueprintCbvOptOut due to the index b
 
 
 
+## Iter 13 — unit-conversion bug fix (2026-04-22)
+
+`chip_cfv_to_bcfv` was computing `chip_cfv / half_pot` but CbvTable stores raw chip-pot values where break-even = half_pot, not zero. Fixed to `(chip_cfv - half_pot) / half_pot` matching the cfvnet training target formula. This reduced exploitability from 318k to 219k mbb (31% improvement), but the gadget is still 10x worse than no gadget (219k vs 21k mbb baseline).
+
 ## Final Validation Outcome
 
-The gadget infrastructure was implemented and tested end-to-end (iter 11-fixed). Verdict: the Libratus-style static-CBV approach with *bucketed* blueprint CBVs does NOT close the cfvnet parity gap. In fact it makes exploitability 15x WORSE on the 4-bet turn test spot (20932 → 318119 mbb). Root cause: blueprint CBVs are per-bucket (~2-1000 buckets/street) while cfvnet output is per-combo (1326 combos). Clamping high-resolution values up to low-resolution floors pulls strategies toward blueprint's coarse equilibrium.
+The gadget infrastructure was implemented, tested end-to-end, and the unit-conversion bug fixed (iters 11-fixed through 13). Verdict: the Libratus-style static-CBV approach with *bucketed* blueprint CBVs does NOT close the cfvnet parity gap. Even with the correct conversion formula, it makes exploitability 10x WORSE on the 4-bet turn test spot (20932 -> 218619 mbb). Root cause: blueprint CBVs are per-bucket (~2-1000 buckets/street) while cfvnet output is per-combo (1326 combos). Clamping high-resolution values up to low-resolution floors pulls strategies toward blueprint's coarse equilibrium.
 
 This conclusively motivates bean poker_solver_rust-akg3 (DeepStack-proper cfvnet retrain with per-combo opt-out input channel) as the remaining architectural path. The gadget code stays in place as infrastructure for that future work.

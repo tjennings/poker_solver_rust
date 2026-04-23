@@ -294,3 +294,33 @@ Per-action-class bias (subgame - exact):
 **Verdict:** The Libratus-style BlueprintCbvOptOut gadget with abstract-tree CBVs does NOT close the gap -- it makes it ~15x worse. The abstract tree's coarse bucketed CBVs produce inaccurate opt-out floors that distort the strategy, causing near-universal all-in. The CBV values from 2-bucket equity-fallback abstraction are too noisy to serve as meaningful lower bounds.
 
 This confirms that the Libratus static-CBV approach is insufficient with the current abstraction quality. The DeepStack-proper approach (bean poker_solver_rust-akg3: retrain cfvnet to produce per-hand CBV values directly) is the correct next step.
+
+## Iteration 13 — 2026-04-22 (cfvnet + BlueprintCbvOptOut gadget, unit-conversion fix)
+
+**Bug fix:** `chip_cfv_to_bcfv(chip_cfv, half_pot_chips)` was computing `chip_cfv / half_pot_chips` but the CbvTable stores values in raw chip-pot units where `pot` chips = "won the full pot" (see `cbv_compute.rs` Fold/Showdown terminal math). The break-even baseline is `half_pot` chips, not zero. The correct formula matching the cfvnet training target (`pipeline.rs:371`) is `(chip_cfv - half_pot_chips) / half_pot_chips`. Without the subtraction, all opt-out values were shifted up by +1.0 (one full half-pot), causing the gadget to clamp nearly everything to the inflated floor -- producing the degenerate all-in strategy seen in iter 11-fixed.
+
+**Approach:** river-boundary=cfvnet + --gadget --gadget-provider=blueprint-cbv (same as iter 11-fixed but with the unit-conversion bug corrected).
+
+**Result:** exact_exp=77.67 mbb, subgame_exp=218619.14 mbb, worst_delta=0.9970, worst_cell="JJ @ Check exact=0.9970 subgame=0.0000"
+mean_mass=0.810, max_mass=1.000 at hand 4h5h.
+Status: FAIL (gadget still makes things worse)
+
+**Comparison across iterations:**
+
+| Metric | Iter 10 (no gadget) | Iter 11-fixed (broken scale) | Iter 13 (fixed scale) |
+|--------|-------------------|---------------------------|----------------------|
+| exact_exp | 77.67 mbb | 77.67 mbb | 77.67 mbb |
+| subgame_exp | 20932.49 mbb | 318119.14 mbb | 218619.14 mbb |
+| worst_delta | 1.0000 | 1.0000 | 0.9970 |
+| mean_mass | 0.543 | 0.818 | 0.810 |
+
+Per-action-class bias (subgame - exact):
+- Check: -0.556
+- Bet/Raise: +0.728
+- AllIn: -0.173
+
+**Wall time:** exact=0.3s, subgame=1.6s.
+
+**Diagnosis:** The unit-conversion fix reduced exploitability by ~31% (318k -> 219k mbb), confirming the formula was wrong. However, the gadget with correctly-scaled opt-out values is STILL 10x worse than no gadget at all (219k vs 21k mbb). The strategy shifted from universal all-in (iter 11-fixed) to universal 55% pot bet, but both are degenerate. Root cause unchanged from iter 11-fixed: the CbvTable's 2-bucket equity-fallback abstraction produces opt-out floors that are far too coarse. When a single bucket maps to hundreds of distinct hands, the gadget clamps high-resolution cfvnet values to a uniform low-resolution floor, erasing the information the cfvnet provides and pushing the strategy toward the blueprint's coarse equilibrium.
+
+**Verdict:** The unit-conversion fix was real and necessary (the old formula was mathematically wrong), but it does not change the architectural conclusion: Libratus-style static CBVs from a bucketed blueprint are insufficient to close the cfvnet parity gap. Bean akg3 (DeepStack-proper cfvnet retrain with per-combo opt-out) remains the correct path.
