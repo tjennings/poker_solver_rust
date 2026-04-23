@@ -28,6 +28,16 @@ pub trait OptOutProvider: Send + Sync {
     ) -> Vec<f32>;
 }
 
+/// Convert a per-hand chip CFV into pot-normalised bcfv units.
+///
+/// Blueprint `CbvTable` stores per-bucket CBVs in chips; the gadget's
+/// `OptOutProvider` contract returns bcfv (1.0 = one half-pot won). This
+/// helper does the conversion.
+pub fn chip_cfv_to_bcfv(chip_cfv: f32, half_pot_chips: f32) -> f32 {
+    assert!(half_pot_chips > 0.0, "half_pot must be positive");
+    chip_cfv / half_pot_chips
+}
+
 /// Constant opt-out provider for testing.
 ///
 /// Returns the same CFV for every hand at every boundary.
@@ -157,6 +167,35 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use range_solver::game::BoundaryEvaluator;
+
+    // ---------------------------------------------------------------
+    // chip_cfv_to_bcfv tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn chip_cfv_to_bcfv_converts_correctly() {
+        // half_pot = 73 chips
+        // chip_cfv of +73 means "won one half-pot" -> bcfv = 1.0
+        assert!((chip_cfv_to_bcfv(73.0, 73.0) - 1.0).abs() < 1e-6);
+        // chip_cfv of 0 -> bcfv = 0
+        assert_eq!(chip_cfv_to_bcfv(0.0, 73.0), 0.0);
+        // chip_cfv of -73 -> bcfv = -1.0 (lost one half-pot)
+        assert!((chip_cfv_to_bcfv(-73.0, 73.0) - (-1.0)).abs() < 1e-6);
+        // chip_cfv of +36.5 -> bcfv = 0.5
+        assert!((chip_cfv_to_bcfv(36.5, 73.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "half_pot must be positive")]
+    fn chip_cfv_to_bcfv_zero_half_pot_panics() {
+        chip_cfv_to_bcfv(10.0, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "half_pot must be positive")]
+    fn chip_cfv_to_bcfv_negative_half_pot_panics() {
+        chip_cfv_to_bcfv(10.0, -5.0);
+    }
 
     // ---------------------------------------------------------------
     // OptOutProvider tests
