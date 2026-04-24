@@ -5,7 +5,7 @@ status: todo
 type: task
 priority: normal
 created_at: 2026-04-23T19:17:15Z
-updated_at: 2026-04-23T19:33:45Z
+updated_at: 2026-04-24T02:17:19Z
 blocked_by:
     - poker_solver_rust-lay5
 ---
@@ -43,3 +43,40 @@ Extend cfvnet architecture + training pipeline to accept opt-out bounds as input
 ## Related beans
 
 - Blocked-by: The Libratus-style MVP (whichever bean tracks that work).
+
+
+
+## Empirical Motivation (Post lay5)
+
+Bean `lay5` (Libratus-style MVP) shipped and was exhaustively tested across 14 harness iterations on a 4-bet turn spot (docs/progress/2026-04-22-subgame-exact-parity.md). Final result: gadget reduces exploitability gap but does NOT close it — still 2× worse than no-gadget baseline (40k vs 21k mbb) after all correctness bugs were fixed.
+
+## Why post-clamp fails for cfvnet on this spot
+
+Per-boundary diagnostic (from the logging added in `diag/gadget-boundary-logging`) revealed the structural pattern:
+
+- **Boundary 0 (pot=146, turn check-check → river chance):** 98% of hands clamped. Blueprint CBVs legitimately higher than cfvnet output for this narrow range.
+- **Boundary 1-10 (higher pots, post-turn-betting):** 54-62% selective clamping.
+
+**Root cause of persistent gap:** blueprint CBVs are computed via backward induction over blueprint's **range-reach distribution at each bucket**. cfvnet output reflects the **actual narrowed range at a specific boundary**. These diverge especially on filtered paths (like check-check, which selects weak hands out of the pot).
+
+Static post-clamp can't know which opt-out to apply for which narrowed range — it just uses the blueprint-over-blueprint-range value, which overstates opt-out and drags cfvnet output up. DCFR over-commits chips defending the inflated opponent CFV → degenerate strategies.
+
+## What akg3 needs to do
+
+Train cfvnet to consume opt-out bounds as an **input channel** (per-hand or per-bucket), so its output is self-consistent with the given opt-out constraint. Continual re-solving (DeepStack-proper) then propagates constraint-consistent values through boundary-evaluator chains.
+
+**Existing infrastructure that akg3 can reuse:**
+- `OptOutProvider` trait (tauri-app/src/gadget.rs)
+- `BlueprintCbvOptOut` with per-boundary pot normalisation (correct, tested)
+- `GadgetEvaluator` wrapper (correct, tested — issue is cfvnet unaware of constraint, not wrapper)
+- Full wiring: CLI flags, Tauri command, Settings UI
+- Diagnostic logging + compare-solve harness + `scripts/trace_diff.py`
+
+The retrain is the only remaining piece. Once cfvnet learns to respect opt-out bounds, the existing gadget stack will produce correct safe-subgame-solving output without further code changes.
+
+## References
+
+- Progress log: docs/progress/2026-04-22-subgame-exact-parity.md (iterations 1-14)
+- Design doc: docs/plans/2026-04-23-deepstack-gadget.md
+- Impl plan: docs/plans/2026-04-23-libratus-gadget-impl-plan.md
+- Parent bean: poker_solver_rust-lay5 (completed)
