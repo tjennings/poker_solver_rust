@@ -2201,6 +2201,7 @@ pub fn game_solve_core(
                 4 => Street::Turn,
                 _ => Street::River,
             };
+            let seed_start = if gadget_tree_active { 4 } else { 0 };
             crate::postflop::seed_solver_with_blueprint(
                 &game,
                 &ctx.strategy,
@@ -2209,6 +2210,7 @@ pub fn game_solve_core(
                 &board_cards,
                 seed_street,
                 current_node_idx,
+                seed_start,
             );
         }
 

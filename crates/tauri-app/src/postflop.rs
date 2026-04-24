@@ -975,6 +975,12 @@ pub fn build_rollout_evaluator(
 /// Walks the range-solver tree and blueprint tree in parallel via DFS.
 /// At each decision node, looks up each hand's bucket in the blueprint
 /// and writes `blueprint_prob * SCALE` into the strategy sums.
+///
+/// `start_arena_index` is the range-solver arena index where the parallel
+/// DFS begins. For a normal (non-gadget) game this is 0. When the gadget
+/// layer is active, pass 4 to skip the 4 synthetic gadget nodes.
+///
+/// Returns the number of decision nodes seeded.
 pub fn seed_solver_with_blueprint(
     game: &PostFlopGame,
     strategy: &BlueprintV2Strategy,
@@ -983,7 +989,8 @@ pub fn seed_solver_with_blueprint(
     board: &[RsPokerCard],
     street: Street,
     blueprint_root: u32,
-) {
+    start_arena_index: usize,
+) -> u32 {
     /// Scale factor for blueprint probabilities written into cumulative
     /// strategy sums. Gives the initial blueprint sufficient weight so
     /// early solver iterations don't immediately wash it out.
@@ -994,7 +1001,7 @@ pub fn seed_solver_with_blueprint(
     let mut arena_to_decision: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
     // DFS stack: (range_solver_arena_index, blueprint_tree_arena_index).
-    let mut dfs_stack: Vec<(usize, u32)> = vec![(0, blueprint_root)];
+    let mut dfs_stack: Vec<(usize, u32)> = vec![(start_arena_index, blueprint_root)];
 
     while let Some((rs_idx, bp_idx)) = dfs_stack.pop() {
         let bp_node = &tree.nodes[bp_idx as usize];
@@ -1034,7 +1041,7 @@ pub fn seed_solver_with_blueprint(
 
     if arena_to_decision.is_empty() {
         eprintln!("[seed] no blueprint decision nodes mapped -- skipping seeding");
-        return;
+        return 0;
     }
 
     let board_rs: Vec<RsPokerCard> = board.to_vec();
@@ -1070,6 +1077,7 @@ pub fn seed_solver_with_blueprint(
 
     let count = num_seeded.load(Ordering::Relaxed);
     eprintln!("[seed] seeded {count} decision nodes with blueprint strategy");
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1094,10 @@ pub fn seed_solver_with_blueprint(
 ///
 /// This replaces the naive `game.initial_weights(player)` which ignores
 /// the action path leading to each boundary.
+///
+/// `start_arena_index` is the range-solver arena index where the parallel
+/// DFS begins. For a normal (non-gadget) game this is 0. When the gadget
+/// layer is active, pass 4 to skip the 4 synthetic gadget nodes.
 pub fn compute_boundary_reach(
     game: &PostFlopGame,
     strategy: &BlueprintV2Strategy,
@@ -1094,6 +1106,7 @@ pub fn compute_boundary_reach(
     board: &[RsPokerCard],
     street: Street,
     blueprint_root: u32,
+    start_arena_index: usize,
 ) -> Vec<[Vec<f32>; 2]> {
     use range_solver::interface::{Game, GameNode};
 
@@ -1116,7 +1129,7 @@ pub fn compute_boundary_reach(
         std::collections::HashMap::new();
 
     // DFS stack: (range_solver_arena_index, blueprint_tree_arena_index).
-    let mut dfs_stack: Vec<(usize, u32)> = vec![(0, blueprint_root)];
+    let mut dfs_stack: Vec<(usize, u32)> = vec![(start_arena_index, blueprint_root)];
 
     while let Some((rs_idx, bp_idx)) = dfs_stack.pop() {
         let bp_node = &tree.nodes[bp_idx as usize];
@@ -1153,7 +1166,7 @@ pub fn compute_boundary_reach(
     let initial_p0 = game.initial_weights(0).to_vec();
     let initial_p1 = game.initial_weights(1).to_vec();
     let mut reach_stack: Vec<(usize, Vec<f32>, Vec<f32>)> =
-        vec![(0, initial_p0, initial_p1)];
+        vec![(start_arena_index, initial_p0, initial_p1)];
 
     while let Some((rs_idx, reach_0, reach_1)) = reach_stack.pop() {
         // Check if this node is a depth boundary.
@@ -1809,6 +1822,7 @@ fn solve_depth_limited(
                         &board_cards,
                         seed_street,
                         abs_node,
+                        0,
                     );
                 }
 
@@ -3425,6 +3439,7 @@ mod tests {
             &board_cards,
             Street::River,
             blueprint_tree.root,
+            0,
         );
 
         // 6. Verify strategy changed: action 0 should dominate.
@@ -3473,7 +3488,7 @@ mod tests {
         seed_solver_with_blueprint(
             &game, &strategy, &all_buckets,
             &empty_tree, &board_cards,
-            Street::River, empty_tree.root,
+            Street::River, empty_tree.root, 0,
         );
     }
 
@@ -3643,6 +3658,7 @@ mod tests {
             &board_cards,
             Street::Turn,
             blueprint_tree.root,
+            0,
         );
 
         assert_eq!(reach.len(), n_boundaries, "one reach entry per boundary");
@@ -3745,6 +3761,7 @@ mod tests {
             &board_cards,
             Street::Turn,
             blueprint_tree.root,
+            0,
         );
 
         // With uniform strategy, each boundary should have reach that sums
@@ -3846,6 +3863,7 @@ mod tests {
             &board_cards,
             Street::Turn,
             blueprint_tree.root,
+            0,
         );
 
         let initial_oop = game.initial_weights(0);
@@ -4210,5 +4228,165 @@ mod tests {
         );
         // Should have called rollout_chip_values_with_state twice (once per traverser)
         assert_eq!(eval.call_counter_for_test(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // seed_solver_with_blueprint + gadget arena offset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn seed_with_gadget_game_seeds_decision_nodes() {
+        // Build a gadget game (IP outer) and verify seeding from
+        // start_arena_index=4 (skipping the 4 gadget nodes) maps
+        // blueprint strategy to at least 1 decision node.
+        //
+        // Uses 50%+allin bet sizes (3 actions: check, bet50%, allin)
+        // so the blueprint root has 3 actions vs the gadget's 2,
+        // preventing an accidental action-count match at arena 0.
+        use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::interface::Game;
+
+        let board_cards = vec![
+            RsPokerCard::new(RsPokerValue::Ace, RsPokerSuit::Spade),
+            RsPokerCard::new(RsPokerValue::King, RsPokerSuit::Heart),
+            RsPokerCard::new(RsPokerValue::Seven, RsPokerSuit::Diamond),
+            RsPokerCard::new(RsPokerValue::Four, RsPokerSuit::Club),
+            RsPokerCard::new(RsPokerValue::Two, RsPokerSuit::Club),
+        ];
+
+        let oop_w = weights_from_range("AA,KK,QQ");
+        let ip_w = weights_from_range("JJ,TT,99");
+
+        // Build a non-gadget game first to discover hand counts.
+        let bet_sizes = vec![vec![0.5f32, 10.0]]; // 50% + allin => 3 actions
+        let (tmp_game, _, _, _, _) = build_subgame_solver(
+            &board_cards,
+            &bet_sizes,
+            100,
+            [200, 200],
+            &oop_w,
+            &ip_w,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let n_oop = tmp_game.num_private_hands(0);
+        let n_ip = tmp_game.num_private_hands(1);
+        drop(tmp_game);
+
+        // Build the gadget game with matching bet sizes.
+        let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: range_solver::range::Range = "JJ,TT,99".parse().unwrap();
+        let cc = range_solver::card::CardConfig {
+            range: [oop_range, ip_range],
+            flop: range_solver::card::flop_from_str("As Kh 7d").unwrap(),
+            turn: range_solver::card::card_from_str("4c").unwrap(),
+            river: range_solver::card::card_from_str("2c").unwrap(),
+        };
+        let sizes = range_solver::bet_size::BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tc = range_solver::action_tree::TreeConfig {
+            initial_state: range_solver::BoardState::River,
+            starting_pot: 100,
+            effective_stack: 200,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let at = range_solver::action_tree::ActionTree::new(tc).unwrap();
+        let cfg = range_solver::game::gadget::GadgetConfig {
+            opt_out_oop: vec![0.0; n_oop],
+            opt_out_ip: vec![0.0; n_ip],
+            outer_player: 1,
+        };
+        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> =
+            Arc::new(crate::gadget::StaticGadgetEvaluator::new(
+                vec![0.0; n_oop],
+                vec![0.0; n_ip],
+            ));
+        let game = crate::gadget::make_gadget_game(cc, at, cfg, inner).unwrap();
+
+        // Build blueprint tree + strategy with matching 50%+allin sizes.
+        let blueprint_tree = V2GameTree::build_subgame(
+            Street::River,
+            100.0,
+            [100.0; 2],
+            200.0,
+            &[vec![0.5, 10.0]], // 3 actions: check, bet50%, allin
+            None,
+            0,
+        );
+        let bucket_counts: [u16; 4] = [169, 1, 1, 1];
+        let mut action_probs = Vec::new();
+        let mut node_action_counts = Vec::new();
+        let mut node_street_indices = Vec::new();
+        for node in &blueprint_tree.nodes {
+            if let poker_solver_core::blueprint_v2::game_tree::GameNode::Decision {
+                actions,
+                street,
+                ..
+            } = node
+            {
+                let n_actions = actions.len() as u16;
+                node_action_counts.push(n_actions);
+                node_street_indices.push(*street as u8);
+                let mut probs = vec![0.1 / (n_actions as f32 - 1.0); n_actions as usize];
+                probs[0] = 0.9;
+                action_probs.extend_from_slice(&probs);
+            }
+        }
+        let mut strategy = BlueprintV2Strategy {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations: 100,
+            elapsed_minutes: 1,
+            node_offsets: Vec::new(),
+        };
+        strategy.post_deserialize();
+
+        let mut all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        // Seeding from arena 0 should seed 0 nodes (gadget root has 2
+        // actions but blueprint root has 3, so action count mismatch
+        // causes visitor to skip all nodes).
+        let count_from_0 = seed_solver_with_blueprint(
+            &game,
+            &strategy,
+            &all_buckets,
+            &blueprint_tree,
+            &board_cards,
+            Street::River,
+            blueprint_tree.root,
+            0,
+        );
+        assert_eq!(
+            count_from_0, 0,
+            "seeding from arena 0 (gadget root) should seed 0 nodes due to action mismatch"
+        );
+
+        // Seeding from arena 4 (skip gadget layer) should seed at least 1.
+        let count_from_4 = seed_solver_with_blueprint(
+            &game,
+            &strategy,
+            &all_buckets,
+            &blueprint_tree,
+            &board_cards,
+            Street::River,
+            blueprint_tree.root,
+            4,
+        );
+        assert!(
+            count_from_4 > 0,
+            "seeding from arena 4 should seed at least 1 node, got 0"
+        );
     }
 }

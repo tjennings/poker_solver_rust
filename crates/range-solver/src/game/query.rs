@@ -711,14 +711,6 @@ impl PostFlopGame {
             } else {
                 node.cfvalues_chance().to_vec()
             }
-        } else if node.has_cfvalues_ip() && player == PLAYER_IP as usize {
-            if self.is_compression_enabled {
-                let slice = node.cfvalues_ip_compressed();
-                let scale = node.cfvalue_ip_scale();
-                decode_signed_slice(slice, scale)
-            } else {
-                node.cfvalues_ip().to_vec()
-            }
         } else if player == self.current_player() {
             have_actions = true;
             if self.is_compression_enabled {
@@ -727,6 +719,14 @@ impl PostFlopGame {
                 decode_signed_slice(slice, scale)
             } else {
                 node.cfvalues().to_vec()
+            }
+        } else if node.has_cfvalues_ip() && player == PLAYER_IP as usize {
+            if self.is_compression_enabled {
+                let slice = node.cfvalues_ip_compressed();
+                let scale = node.cfvalue_ip_scale();
+                decode_signed_slice(slice, scale)
+            } else {
+                node.cfvalues_ip().to_vec()
             }
         } else {
             self.cfvalues_cache[player].to_vec()
@@ -1458,5 +1458,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Gadget root (IP-acting) expected_values_detail tests
+    // -----------------------------------------------------------------------
+
+    fn build_gadget_game_ip_outer() -> PostFlopGame {
+        let oop: crate::range::Range = "AA,KK".parse().unwrap();
+        let ip: crate::range::Range = "QQ,JJ".parse().unwrap();
+        let cc = CardConfig {
+            range: [oop.clone(), ip.clone()],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tc = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 200,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        // Build a throwaway game to discover hand counts.
+        let tmp = PostFlopGame::with_config(
+            cc.clone(),
+            ActionTree::new(tc.clone()).unwrap(),
+        )
+        .unwrap();
+        let n_oop = tmp.num_private_hands(0);
+        let n_ip = tmp.num_private_hands(1);
+        drop(tmp);
+
+        let at = ActionTree::new(tc).unwrap();
+        let cfg = crate::game::gadget::GadgetConfig {
+            opt_out_oop: vec![0.0; n_oop],
+            opt_out_ip: vec![0.0; n_ip],
+            outer_player: 1, // IP outer
+        };
+        PostFlopGame::with_config_and_gadget(cc, at, cfg).unwrap()
+    }
+
+    #[test]
+    fn expected_values_detail_ip_acting_gadget_root_returns_per_action() {
+        // Bug 1: at the gadget root (IP-acting), expected_values_detail(IP)
+        // must return num_actions * num_hands_ip values (per-action detail),
+        // not just num_hands_ip (the IP-storage branch).
+        let mut game = build_gadget_game_ip_outer();
+        game.allocate_memory(false);
+
+        for t in 0..10 {
+            crate::solve_step(&game, t);
+        }
+        crate::finalize(&mut game);
+        game.back_to_root();
+        game.cache_normalized_weights();
+
+        let num_actions = game.available_actions().len(); // 2: Terminate, Follow
+        let num_hands_ip = game.num_private_hands(1);
+        assert_eq!(num_actions, 2, "gadget root should have 2 actions");
+
+        // IP is the acting player at root => per-action detail
+        let detail_ip = game.expected_values_detail(1);
+        assert_eq!(
+            detail_ip.len(),
+            num_actions * num_hands_ip,
+            "IP (acting) detail should be num_actions * num_hands_ip, got {}",
+            detail_ip.len(),
+        );
+    }
+
+    #[test]
+    fn expected_values_detail_oop_non_acting_at_gadget_root() {
+        // OOP is NOT the acting player at the gadget root (IP outer).
+        // expected_values_detail(OOP) should return num_hands_oop values.
+        let mut game = build_gadget_game_ip_outer();
+        game.allocate_memory(false);
+
+        for t in 0..10 {
+            crate::solve_step(&game, t);
+        }
+        crate::finalize(&mut game);
+        game.back_to_root();
+        game.cache_normalized_weights();
+
+        let num_hands_oop = game.num_private_hands(0);
+
+        let detail_oop = game.expected_values_detail(0);
+        assert_eq!(
+            detail_oop.len(),
+            num_hands_oop,
+            "OOP (non-acting) detail should be num_hands_oop, got {}",
+            detail_oop.len(),
+        );
+    }
+
+    #[test]
+    fn expected_values_ip_acting_gadget_root_does_not_panic() {
+        // The original bug: expected_values(1) panicked with
+        // "index out of bounds: the len is N but the index is N"
+        // because expected_values_detail returned N values instead of 2*N.
+        let mut game = build_gadget_game_ip_outer();
+        game.allocate_memory(false);
+
+        for t in 0..10 {
+            crate::solve_step(&game, t);
+        }
+        crate::finalize(&mut game);
+        game.back_to_root();
+        game.cache_normalized_weights();
+
+        let num_hands_ip = game.num_private_hands(1);
+
+        // This must not panic.
+        let ev = game.expected_values(1);
+        assert_eq!(ev.len(), num_hands_ip);
     }
 }

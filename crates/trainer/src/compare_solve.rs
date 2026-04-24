@@ -1164,13 +1164,14 @@ pub fn run(
 
     // 6. Seed both solvers with blueprint strategy
     let seed_street = street;
+    let subgame_seed_start = if gadget_tree_active { 4 } else { 0 };
     seed_solver_with_blueprint(
         &exact_game, &ctx.strategy, &ctx.all_buckets, &ctx.abstract_tree,
-        &board_cards, seed_street, current_node,
+        &board_cards, seed_street, current_node, 0,
     );
     seed_solver_with_blueprint(
         &subgame_game, &ctx.strategy, &ctx.all_buckets, &ctx.abstract_tree,
-        &board_cards, seed_street, current_node,
+        &board_cards, seed_street, current_node, subgame_seed_start,
     );
 
     let _ = dump_boundary_cfvs;
