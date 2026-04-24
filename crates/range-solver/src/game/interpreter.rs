@@ -558,20 +558,7 @@ impl PostFlopGame {
         let num_oop = self.num_private_hands(0);
         let num_ip = self.num_private_hands(1);
 
-        assert_eq!(
-            config.opt_out_oop.len(),
-            num_oop,
-            "opt_out_oop length must match OOP hand count"
-        );
-        assert_eq!(
-            config.opt_out_ip.len(),
-            num_ip,
-            "opt_out_ip length must match IP hand count"
-        );
-        assert!(
-            config.outer_player == 0 || config.outer_player == 1,
-            "outer_player must be 0 or 1"
-        );
+        self.validate_gadget_config(config, num_oop, num_ip);
 
         // Determine which player is outer vs inner.
         let (outer, inner) = if config.outer_player == 1 {
@@ -612,6 +599,46 @@ impl PostFlopGame {
         self.num_storage_ip += num_ip as u64;
 
         // 6. Reallocate storage buffers and re-assign pointers.
+        self.reallocate_storage_for_gadget();
+    }
+
+    /// Validates gadget config lengths and values against the game state.
+    fn validate_gadget_config(
+        &self,
+        config: &super::gadget::GadgetConfig,
+        num_oop: usize,
+        num_ip: usize,
+    ) {
+        assert_eq!(
+            config.opt_out_oop.len(),
+            num_oop,
+            "opt_out_oop length must match OOP hand count"
+        );
+        assert_eq!(
+            config.opt_out_ip.len(),
+            num_ip,
+            "opt_out_ip length must match IP hand count"
+        );
+        assert!(
+            config.outer_player == 0 || config.outer_player == 1,
+            "outer_player must be 0 or 1"
+        );
+        assert!(
+            self.num_continuations <= 1,
+            "gadget injection with multi-continuation (K > 1) is not yet supported: \
+             boundary_cont_regrets / boundary_cont_strategy are not resized. K={}",
+            self.num_continuations,
+        );
+        assert!(
+            self.state < State::Solved,
+            "inject_gadget_layer must not be called after solve completes; state = {:?}",
+            self.state,
+        );
+    }
+
+    /// Reallocates storage buffers and re-assigns node pointers after gadget
+    /// injection, if memory has already been allocated.
+    fn reallocate_storage_for_gadget(&mut self) {
         if self.state >= State::MemoryAllocated {
             let num_bytes: usize = if self.is_compression_enabled { 2 } else { 4 };
             let storage_bytes = (num_bytes as u64 * self.num_storage) as usize;
@@ -731,23 +758,7 @@ impl PostFlopGame {
             .collect();
 
         // Pre-populate gadget boundary CFVs (ordinals 0 and 1).
-        // Ordinal 0 = outer.Terminate: outer player takes opt-out,
-        //             opponent is neutralized (zeros).
-        // Ordinal 1 = inner.Terminate: inner player takes opt-out,
-        //             opponent is neutralized (zeros).
-        if config.outer_player == 1 {
-            // IP outer: ordinal 0 = G_IP.T, ordinal 1 = G_OOP.T
-            *new_cfvs[0].lock().unwrap() = vec![0.0; num_oop]; // OOP neutralized
-            *new_cfvs[1].lock().unwrap() = config.opt_out_ip.clone(); // IP opt-out
-            *new_cfvs[2].lock().unwrap() = config.opt_out_oop.clone(); // OOP opt-out
-            *new_cfvs[3].lock().unwrap() = vec![0.0; num_ip]; // IP neutralized
-        } else {
-            // OOP outer: ordinal 0 = G_OOP.T, ordinal 1 = G_IP.T
-            *new_cfvs[0].lock().unwrap() = config.opt_out_oop.clone(); // OOP opt-out
-            *new_cfvs[1].lock().unwrap() = vec![0.0; num_ip]; // IP neutralized
-            *new_cfvs[2].lock().unwrap() = vec![0.0; num_oop]; // OOP neutralized
-            *new_cfvs[3].lock().unwrap() = config.opt_out_ip.clone(); // IP opt-out
-        }
+        Self::populate_gadget_boundary_cfvs(&new_cfvs, config, num_oop, num_ip);
 
         // Move existing boundary data to new positions (ordinals shifted +2).
         for old_ord in 0..old_boundary_count {
@@ -771,6 +782,33 @@ impl PostFlopGame {
         self.boundary_cfvs = new_cfvs;
         self.boundary_reach = new_reach;
         self.boundary_is_raw = new_is_raw;
+    }
+
+    /// Writes opt-out CFVs into gadget boundary slots (ordinals 0 and 1).
+    ///
+    /// Ordinal 0 = outer.Terminate: outer player takes opt-out,
+    ///             opponent is neutralized (zeros).
+    /// Ordinal 1 = inner.Terminate: inner player takes opt-out,
+    ///             opponent is neutralized (zeros).
+    fn populate_gadget_boundary_cfvs(
+        cfvs: &[std::sync::Mutex<Vec<f32>>],
+        config: &super::gadget::GadgetConfig,
+        num_oop: usize,
+        num_ip: usize,
+    ) {
+        if config.outer_player == 1 {
+            // IP outer: ordinal 0 = G_IP.T, ordinal 1 = G_OOP.T
+            *cfvs[0].lock().unwrap() = vec![0.0; num_oop]; // OOP neutralized
+            *cfvs[1].lock().unwrap() = config.opt_out_ip.clone(); // IP opt-out
+            *cfvs[2].lock().unwrap() = config.opt_out_oop.clone(); // OOP opt-out
+            *cfvs[3].lock().unwrap() = vec![0.0; num_ip]; // IP neutralized
+        } else {
+            // OOP outer: ordinal 0 = G_OOP.T, ordinal 1 = G_IP.T
+            *cfvs[0].lock().unwrap() = config.opt_out_oop.clone(); // OOP opt-out
+            *cfvs[1].lock().unwrap() = vec![0.0; num_ip]; // IP neutralized
+            *cfvs[2].lock().unwrap() = vec![0.0; num_oop]; // OOP neutralized
+            *cfvs[3].lock().unwrap() = config.opt_out_ip.clone(); // IP opt-out
+        }
     }
 }
 
