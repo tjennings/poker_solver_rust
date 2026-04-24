@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-02wj
 title: Implement Option A gadget (tree-structural CFR-D)
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-04-24T04:48:05Z
-updated_at: 2026-04-24T13:24:05Z
+updated_at: 2026-04-24T20:15:59Z
 blocked_by:
     - poker_solver_rust-u3rf
 ---
@@ -95,3 +95,18 @@ Bean status: still in-progress pending the iter-15 E2E empirical run (Task 14). 
 1. User runs the harness against real blueprint data from main
 2. Results recorded in `docs/progress/2026-04-24-option-a-iter-15.md`
 3. akg3 triage decision made based on iter-15 numbers
+
+
+
+## Completed 2026-04-24
+
+Option A shipped and then superseded in the same session by Option A2 (per-boundary gadget). Option A code fully removed from main in merge `8af0d107`; A2 replaces it on all code paths (CLI, Tauri, explorer).
+
+Retention of Option A's design/plan docs (`2026-04-24-option-a-deepstack-gadget-{design,plan}.md`) for architectural history; they describe the now-obsolete root-gadget design. Option A2's pivot documented in a new addendum (`2026-04-24-option-a2-per-boundary-gadget-addendum.md`).
+
+Key follow-ons:
+- akg3: rescoped to opt-out tightness (un-abstracted / per-combo CBVs); still relevant under A2.
+- bgkr: legacy `GadgetEvaluator` post-clamp retirement — still needed (A2 kept the clamp path behind --gadget-clamp for diagnostic A/B).
+- wcc4: pre-existing blueprint_mp flake, unrelated.
+
+Ship gate met: per-boundary safety invariant test passes at 0.01 tol after 1000 iters.

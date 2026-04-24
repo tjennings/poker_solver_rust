@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-04-24T17:02:45Z
-updated_at: 2026-04-24T17:03:10Z
+updated_at: 2026-04-24T20:16:07Z
 blocked_by:
     - poker_solver_rust-02wj
 ---
@@ -37,3 +37,22 @@ Supersedes bgkr (GadgetEvaluator retirement) — A2 removes the post-clamp path 
 Branch: feat/option-a2-per-boundary-gadget
 
 Design basis: ml-researcher comparison preserved in session transcript; design doc addendum pending.
+
+
+
+## Phase progress 2026-04-24
+
+### Completed phases (all committed to feat/option-a2-per-boundary-gadget, merged to main at 8af0d107)
+
+- **Phase A** — per-boundary gadget tree injection. Commit `bbda235b`. PLAYER_GADGET_FLAG added; inject_per_boundary_gadgets + 17 new tests.
+- **Phase B** (initial, wrong condition) — Commit `ac19a5b1`. 5 new tests.
+- **Phase B fix** — flipped to Option Y semantics (owner's pass active, non-owner's pass disabled). Commit `e2252a3d`. Per-boundary safety invariant test PASSES at 0.01 tolerance after 1000 iters.
+- **Phase C** — SKIPPED. Option Y's disable-non-owner-pass semantics means the non-gadget player never traverses through the gadget Terminate, so zero-sum complement at that terminal is unreachable. No code needed.
+- **Phase D** — retire Option A + wire A2 through CLI / Tauri / explorer. Commit `d55d427b`. Net -571 lines. 970/971 tests pass on main post-merge.
+- **Merge to main** — `8af0d107`. All Option A code removed.
+
+### Still outstanding
+
+- **Phase F** — docs (dispatched; see commit TBD).
+- **E2E harness on JhTh9h|…|7d** — user to run directly from main post-docs merge.
+- **Close akg3** — triage decision based on iter-15/16 E2E results.
