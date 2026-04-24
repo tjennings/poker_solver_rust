@@ -7,7 +7,7 @@ use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::bet_size::BetSizeOptions;
 use range_solver::card::{card_from_str, flop_from_str, CardConfig};
 use range_solver::game::BoundaryEvaluator;
-use range_solver::interface::Game;
+use range_solver::interface::{Game, GameNode};
 use range_solver::range::Range;
 use range_solver::BoardState;
 
@@ -231,4 +231,117 @@ fn gadget_static_cfvs_correct_oop_outer() {
     let (oop_at_1, ip_at_1) = eval_1.compute_cfvs_both(100, 50.0, &[], &[], n_oop, n_ip, 0);
     assert_eq!(oop_at_1, vec![0.0f32; n_oop], "OOP at G_IP.Terminate should be zero");
     assert_eq!(ip_at_1, opt_out_ip, "IP at G_IP.Terminate should be opt_out_ip");
+}
+
+/// With opt-out values so negative they are always dominated, the T-branch
+/// (Terminate) never accumulates positive regret, so regret matching always
+/// picks F (Follow). The gadget reduces to the identity: strategies at all
+/// non-gadget decision nodes must match a no-gadget solve on the same spot.
+///
+/// We use `-1e9` rather than `f32::NEG_INFINITY` because the solver's
+/// reach-scaling arithmetic produces NaN when infinity propagates through
+/// subtraction/multiplication. A finite-but-dominated value achieves the
+/// same behavioral result without corrupting float arithmetic.
+#[test]
+fn gadget_with_neg_inf_opt_out_matches_no_gadget() {
+    // A value so negative that T-branch regret can never go positive,
+    // making Follow the only rational choice at every gadget decision.
+    const DOMINATED_OPT_OUT: f32 = -1e9;
+
+    // -- Shared parameters --
+    let oop: Range = "AA,KK,QQ".parse().unwrap();
+    let ip: Range = "TT,99,88".parse().unwrap();
+    let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+    let mk_config = |oop_r: Range, ip_r: Range| {
+        let cc = CardConfig {
+            range: [oop_r, ip_r],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let tc = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 200,
+            river_bet_sizes: [sizes.clone(), sizes.clone()],
+            ..Default::default()
+        };
+        (cc, tc)
+    };
+
+    // Enough iterations for DCFR discounting to wash out the gadget's
+    // warmup period (first few iterations where T-branch has ~50% weight
+    // before regret drives it to zero).
+    let iters: u32 = 1000;
+    let target_expl: f32 = 1e-4;
+
+    // -- No-gadget game --
+    let (cc_nog, tc_nog) = mk_config(oop.clone(), ip.clone());
+    let at_nog = ActionTree::new(tc_nog).unwrap();
+    let mut g_nog = range_solver::PostFlopGame::with_config(cc_nog, at_nog).unwrap();
+    g_nog.allocate_memory(false);
+    range_solver::solve(&mut g_nog, iters, target_expl, false);
+
+    // -- Gadget game with dominated opt-out --
+    let (cc_gad, tc_gad) = mk_config(oop, ip);
+    let at_gad = ActionTree::new(tc_gad).unwrap();
+
+    let n_oop = g_nog.num_private_hands(0);
+    let n_ip = g_nog.num_private_hands(1);
+
+    let cfg = range_solver::game::gadget::GadgetConfig {
+        opt_out_oop: vec![DOMINATED_OPT_OUT; n_oop],
+        opt_out_ip: vec![DOMINATED_OPT_OUT; n_ip],
+        outer_player: 1,
+    };
+    let inner: Arc<dyn BoundaryEvaluator> = Arc::new(PanicEvaluator);
+    let mut g_gad = make_gadget_game(cc_gad, at_gad, cfg, inner).unwrap();
+    range_solver::solve(&mut g_gad, iters, target_expl, false);
+
+    // -- Compare normalized strategies at all shared decision nodes --
+    // The gadget prepends 4 arena nodes (2 gadget-decision + 2 gadget-terminal),
+    // so no-gadget arena index N maps to gadget arena index N + 4.
+    // Use strategy_at_index() which returns the normalized average strategy,
+    // not the raw cumulative sums from GameNode::strategy().
+    let n_nog = g_nog.num_nodes();
+    let tol: f32 = 1e-3;
+    let mut compared = 0usize;
+    let mut drift_count = 0usize;
+
+    for nog_idx in 0..n_nog {
+        let nog_node = g_nog.node_at(nog_idx);
+        if nog_node.is_terminal() || nog_node.is_chance() {
+            continue;
+        }
+        drop(nog_node);
+
+        let nog_strat = g_nog.strategy_at_index(nog_idx);
+        let gad_idx = nog_idx + 4;
+        let gad_strat = g_gad.strategy_at_index(gad_idx);
+
+        assert_eq!(
+            nog_strat.len(),
+            gad_strat.len(),
+            "strategy length mismatch at nog arena idx {nog_idx}",
+        );
+
+        for (i, (a, b)) in nog_strat.iter().zip(gad_strat.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > tol {
+                drift_count += 1;
+                if drift_count <= 10 {
+                    eprintln!(
+                        "[parity drift] nog_idx={nog_idx} slot={i}: nog={a:.6} gad={b:.6} d={d:.6}"
+                    );
+                }
+            }
+        }
+        compared += 1;
+    }
+
+    assert!(compared > 0, "should have compared at least one decision node");
+    assert_eq!(
+        drift_count, 0,
+        "strategies drifted at {drift_count} slots (tolerance {tol}); see stderr for details"
+    );
 }
