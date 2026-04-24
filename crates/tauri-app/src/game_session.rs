@@ -2000,7 +2000,6 @@ pub fn game_solve_core(
                     game.private_cards(0).to_vec(),
                     game.private_cards(1).to_vec(),
                 ];
-                let half_pot = pot as f32 / 2.0;
                 Some(Arc::new(
                     crate::gadget::BlueprintCbvOptOut::from_cbv_context(
                         ctx,
@@ -2010,7 +2009,6 @@ pub fn game_solve_core(
                             .map(|c| crate::exploration::rs_card_to_range_solver(c))
                             .collect::<Vec<u8>>(),
                         &private_cards,
-                        half_pot,
                     ),
                 ))
             }

@@ -98,21 +98,25 @@ impl BlueprintCbvOptOut {
     /// its dense CBV ordinal, and pre-computes per-hand opt-out values
     /// in bcfv units for both players at every boundary.
     ///
+    /// Each boundary's CBV chip values are normalised by that boundary's
+    /// own half-pot (derived from `GameTree::pot_at_node`), not a single
+    /// global half-pot. This is critical when boundaries sit at different
+    /// points in the action tree with different accumulated pots.
+    ///
     /// `abstract_root` is the abstract tree arena index of the decision
     /// node where the subgame starts (e.g., the turn decision node).
     ///
     /// # Panics
     ///
     /// - If `cbv_context.cbv_table.values` is empty.
-    /// - If `half_pot_chips <= 0`.
     /// - If `board.len()` is not 3, 4, or 5.
     /// - If no chance nodes are found below `abstract_root`.
+    /// - If any chance node has a non-positive pot.
     pub fn from_cbv_context(
         cbv_context: &crate::postflop::CbvContext,
         abstract_root: u32,
         board: &[u8],
         private_cards: &[Vec<(u8, u8)>; 2],
-        half_pot_chips: f32,
     ) -> Self {
         use poker_solver_core::blueprint_v2::cbv::CbvTable;
 
@@ -120,7 +124,6 @@ impl BlueprintCbvOptOut {
             !cbv_context.cbv_table.values.is_empty(),
             "CbvTable has no values; cannot construct BlueprintCbvOptOut"
         );
-        assert!(half_pot_chips > 0.0, "half_pot must be positive");
 
         let ordinal_map =
             CbvTable::build_node_to_ordinal_map(&cbv_context.abstract_tree);
@@ -149,6 +152,14 @@ impl BlueprintCbvOptOut {
         for &chance_arena_idx in &chance_nodes {
             let cbv_ordinal =
                 CbvTable::require_ordinal(&ordinal_map, chance_arena_idx);
+            let pot_at_chance =
+                cbv_context.abstract_tree.pot_at_node(chance_arena_idx);
+            let half_pot = (pot_at_chance / 2.0) as f32;
+            assert!(
+                half_pot > 0.0,
+                "chance node {chance_arena_idx} has non-positive pot \
+                 ({pot_at_chance})"
+            );
 
             let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
             for player in 0..2 {
@@ -164,7 +175,7 @@ impl BlueprintCbvOptOut {
                         cbv_ordinal, bucket as usize,
                     );
                     per_hand[player].push(
-                        chip_cfv_to_bcfv(chip_cbv, half_pot_chips),
+                        chip_cfv_to_bcfv(chip_cbv, half_pot),
                     );
                 }
             }
@@ -230,22 +241,100 @@ impl GadgetEvaluator {
     }
 }
 
+/// Stats from a single clamp pass: how many hands were pushed up by the
+/// opt-out floor, and by how much. Diagnostic-only.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClampStats {
+    pub hands_clamped: usize,
+    pub hands_total: usize,
+    pub max_delta: f32,
+    pub mean_delta: f32,
+}
+
 /// Apply opt-out clamping: for each opponent hand, clamp CFV upward
-/// to the opt-out value. Returns the adjusted (player_cfvs, opp_cfvs).
+/// to the opt-out value. Returns the adjusted (player_cfvs, opp_cfvs)
+/// plus stats on how many hands were actually clamped.
 fn apply_gadget_clamp(
     player_cfvs: &[f32],
     opp_cfvs: &[f32],
     opt_out_cfvs: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
-    // Clamp opponent CFVs upward to opt-out
-    let clamped_opp: Vec<f32> = opp_cfvs.iter()
+) -> (Vec<f32>, Vec<f32>, ClampStats) {
+    let mut hands_clamped = 0usize;
+    let mut max_delta = 0.0f32;
+    let mut total_delta = 0.0f64;
+
+    let clamped_opp: Vec<f32> = opp_cfvs
+        .iter()
         .zip(opt_out_cfvs.iter())
-        .map(|(&inner, &opt)| inner.max(opt))
+        .map(|(&inner, &opt)| {
+            if opt > inner {
+                hands_clamped += 1;
+                let d = opt - inner;
+                total_delta += d as f64;
+                if d > max_delta {
+                    max_delta = d;
+                }
+                opt
+            } else {
+                inner
+            }
+        })
         .collect();
-    // Player CFVs stay the same -- the gadget only constrains the opponent.
-    // In the bcfv interface, player and opponent values are independent
-    // per-hand scalars (not directly zero-sum per-combo).
-    (player_cfvs.to_vec(), clamped_opp)
+
+    let mean_delta = if hands_clamped > 0 {
+        (total_delta / hands_clamped as f64) as f32
+    } else {
+        0.0
+    };
+    let stats = ClampStats {
+        hands_clamped,
+        hands_total: opp_cfvs.len(),
+        max_delta,
+        mean_delta,
+    };
+
+    // Player CFVs stay the same -- gadget only constrains opponent.
+    (player_cfvs.to_vec(), clamped_opp, stats)
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic logging
+// ---------------------------------------------------------------------------
+
+/// Summary stats over a per-hand CFV vector (for diagnostic logging).
+fn summary(cfvs: &[f32]) -> (f32, f32, f32) {
+    if cfvs.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let (mut mn, mut mx, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+    for &v in cfvs {
+        if v < mn { mn = v; }
+        if v > mx { mx = v; }
+        sum += v as f64;
+    }
+    (mn, (sum / cfvs.len() as f64) as f32, mx)
+}
+
+/// Guards per-boundary log lines so we print once per boundary per process,
+/// not once per call. Flip to `false` to disable gadget diagnostics.
+static GADGET_DIAG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static GADGET_DIAG_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::OnceLock::new();
+
+fn diag_fire_once(boundary_ordinal: usize) -> bool {
+    if !GADGET_DIAG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let seen = GADGET_DIAG_SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = seen.lock().expect("diag set poisoned");
+    guard.insert(boundary_ordinal)
+}
+
+/// Disable gadget diagnostic prints (useful for tests).
+pub fn set_gadget_diag_enabled(enabled: bool) {
+    GADGET_DIAG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
@@ -303,13 +392,51 @@ impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
             &self.board, &self.private_cards[1],
         );
         // When computing OOP cfvs, IP is opponent => clamp IP upward
-        let (_oop_adj_for_oop, ip_clamped) = apply_gadget_clamp(
+        let (_oop_adj_for_oop, ip_clamped, ip_clamp_stats) = apply_gadget_clamp(
             &oop_inner, &ip_inner, &ip_opt_out,
         );
         // When computing IP cfvs, OOP is opponent => clamp OOP upward
-        let (_ip_adj_for_ip, oop_clamped) = apply_gadget_clamp(
+        let (_ip_adj_for_ip, oop_clamped, oop_clamp_stats) = apply_gadget_clamp(
             &ip_inner, &oop_inner, &oop_opt_out,
         );
+
+        // One-time diagnostic: print params, inner/opt-out summaries, clamp stats.
+        // Fires once per (boundary_ordinal, process) so per-iter calls don't spam.
+        if diag_fire_once(self.boundary_ordinal) {
+            let b = self.boundary_ordinal;
+            let board: String = self
+                .board
+                .iter()
+                .map(|&c| range_solver::card::card_to_string(c).unwrap_or_else(|_| "??".to_string()))
+                .collect();
+            let (oi_min, oi_mean, oi_max) = summary(&oop_inner);
+            let (ii_min, ii_mean, ii_max) = summary(&ip_inner);
+            let (oo_min, oo_mean, oo_max) = summary(&oop_opt_out);
+            let (io_min, io_mean, io_max) = summary(&ip_opt_out);
+            let (oc_min, oc_mean, oc_max) = summary(&oop_clamped);
+            let (ic_min, ic_mean, ic_max) = summary(&ip_clamped);
+            eprintln!(
+                "[gadget] boundary={b} board={board} pot={pot} stack={eff_stack} \
+                 hands=(oop={num_oop},ip={num_ip})\n  \
+                 inner_OOP  min/mean/max = {oi_min:+.3} / {oi_mean:+.3} / {oi_max:+.3}\n  \
+                 optout_OOP min/mean/max = {oo_min:+.3} / {oo_mean:+.3} / {oo_max:+.3}  \
+                 clamped {oop_clamped_n}/{oop_total} hands, max_Δ={oop_max_d:+.3}, mean_Δ={oop_mean_d:+.3}\n  \
+                 final_OOP  min/mean/max = {oc_min:+.3} / {oc_mean:+.3} / {oc_max:+.3}\n  \
+                 inner_IP   min/mean/max = {ii_min:+.3} / {ii_mean:+.3} / {ii_max:+.3}\n  \
+                 optout_IP  min/mean/max = {io_min:+.3} / {io_mean:+.3} / {io_max:+.3}  \
+                 clamped {ip_clamped_n}/{ip_total} hands, max_Δ={ip_max_d:+.3}, mean_Δ={ip_mean_d:+.3}\n  \
+                 final_IP   min/mean/max = {ic_min:+.3} / {ic_mean:+.3} / {ic_max:+.3}",
+                oop_clamped_n = oop_clamp_stats.hands_clamped,
+                oop_total = oop_clamp_stats.hands_total,
+                oop_max_d = oop_clamp_stats.max_delta,
+                oop_mean_d = oop_clamp_stats.mean_delta,
+                ip_clamped_n = ip_clamp_stats.hands_clamped,
+                ip_total = ip_clamp_stats.hands_total,
+                ip_max_d = ip_clamp_stats.max_delta,
+                ip_mean_d = ip_clamp_stats.mean_delta,
+            );
+        }
+
         (oop_clamped, ip_clamped)
     }
 }
@@ -474,9 +601,8 @@ mod tests {
     fn blueprint_cbv_opt_out_from_cbv_context_returns_correct_bcfv() {
         let (ctx, root, board, private_cards) = make_cbv_test_context();
 
-        let half_pot = 50.0_f32;
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, root, &board, &private_cards, half_pot,
+            &ctx, root, &board, &private_cards,
         );
 
         // Verify opt_out_cfvs returns the correct number of hands
@@ -486,6 +612,7 @@ mod tests {
         assert_eq!(ip_cfvs.len(), 1);
 
         // Verify the values are (chip_cbv - half_pot) / half_pot.
+        // The chance node's child terminal has pot=100, so half_pot=50.
         // With equity fallback and 2 buckets, the exact bucket depends on
         // equity calculation, but the value must be either
         // (50.0-50.0)/50.0 = 0.0  or  (-30.0-50.0)/50.0 = -1.6.
@@ -628,35 +755,71 @@ mod tests {
     fn from_cbv_context_multi_node_finds_all_boundaries() {
         let (ctx, board, private_cards) = make_multi_node_cbv_context();
 
-        let half_pot = 50.0_f32;
         // Root node 0 has 3 chance descendants
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, 0, &board, &private_cards, half_pot,
+            &ctx, 0, &board, &private_cards,
         );
 
         assert_eq!(provider.num_boundaries(), 3);
     }
 
     #[test]
-    fn from_cbv_context_multi_node_different_ordinals_return_different_values() {
+    fn from_cbv_context_multi_node_each_boundary_has_correct_count() {
         let (ctx, board, private_cards) = make_multi_node_cbv_context();
 
-        let half_pot = 50.0_f32;
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, 0, &board, &private_cards, half_pot,
+            &ctx, 0, &board, &private_cards,
         );
 
-        // boundary 0 (ordinal 0, arena 2): CBV bucket 0 = 10.0 -> bcfv = (10-50)/50 = -0.8
-        // boundary 2 (ordinal 2, arena 10): CBV bucket 0 = 60.0 -> bcfv = (60-50)/50 = 0.2
+        // Each boundary should have the correct number of hands per player.
+        for b in 0..3 {
+            let oop = provider.opt_out_cfvs(b, 0, 100, 200, &board, &private_cards[0]);
+            let ip = provider.opt_out_cfvs(b, 1, 100, 200, &board, &private_cards[1]);
+            assert_eq!(oop.len(), private_cards[0].len());
+            assert_eq!(ip.len(), private_cards[1].len());
+        }
+    }
+
+    #[test]
+    fn from_cbv_context_uses_per_boundary_pot_for_normalization() {
+        // The multi-node tree has 3 chance nodes with distinct pots:
+        //   ordinal 0 (arena 2):  pot=10,  half_pot=5
+        //   ordinal 1 (arena 6):  pot=30,  half_pot=15
+        //   ordinal 2 (arena 10): pot=60,  half_pot=30
+        //
+        // With per-boundary pot, CBV bucket 0 values normalize as:
+        //   ordinal 0: chip_cbv=10 => (10-5)/5 = +1.0
+        //   ordinal 1: chip_cbv=30 => (30-15)/15 = +1.0
+        //   ordinal 2: chip_cbv=60 => (60-30)/30 = +1.0
+        //
+        // With a WRONG single half_pot=50 (the old bug), we'd get:
+        //   ordinal 0: (10-50)/50 = -0.8
+        //   ordinal 2: (60-50)/50 = +0.2
+        //
+        // This test catches the bug: with the fix, all three boundaries
+        // should produce the SAME bcfv for bucket 0 hands.
+        let (ctx, board, private_cards) = make_multi_node_cbv_context();
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards,
+        );
+
         let oop_0 = provider.opt_out_cfvs(0, 0, 100, 200, &board, &private_cards[0]);
+        let oop_1 = provider.opt_out_cfvs(1, 0, 100, 200, &board, &private_cards[0]);
         let oop_2 = provider.opt_out_cfvs(2, 0, 100, 200, &board, &private_cards[0]);
 
-        // They should be different values (ordinal 0 vs ordinal 2 have different CBVs)
+        // All three should be equal (same bucket maps to proportionally
+        // equal CBVs when normalised by that boundary's own pot).
         assert!(
-            (oop_0[0] - oop_2[0]).abs() > 0.01,
-            "ordinal 0 and ordinal 2 should produce different opt-out values, \
-             got oop_0={}, oop_2={}",
-            oop_0[0], oop_2[0]
+            (oop_0[0] - oop_1[0]).abs() < 0.01,
+            "boundary 0 ({}) and boundary 1 ({}) should have same bcfv \
+             when each is normalised by its own half-pot",
+            oop_0[0], oop_1[0],
+        );
+        assert!(
+            (oop_1[0] - oop_2[0]).abs() < 0.01,
+            "boundary 1 ({}) and boundary 2 ({}) should have same bcfv \
+             when each is normalised by its own half-pot",
+            oop_1[0], oop_2[0],
         );
     }
 
@@ -666,7 +829,7 @@ mod tests {
         let (ctx, root, board, private_cards) = make_cbv_test_context();
 
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, root, &board, &private_cards, 50.0,
+            &ctx, root, &board, &private_cards,
         );
 
         // Call with wrong hand count -- should panic

@@ -323,4 +323,42 @@ Per-action-class bias (subgame - exact):
 
 **Diagnosis:** The unit-conversion fix reduced exploitability by ~31% (318k -> 219k mbb), confirming the formula was wrong. However, the gadget with correctly-scaled opt-out values is STILL 10x worse than no gadget at all (219k vs 21k mbb). The strategy shifted from universal all-in (iter 11-fixed) to universal 55% pot bet, but both are degenerate. Root cause unchanged from iter 11-fixed: the CbvTable's 2-bucket equity-fallback abstraction produces opt-out floors that are far too coarse. When a single bucket maps to hundreds of distinct hands, the gadget clamps high-resolution cfvnet values to a uniform low-resolution floor, erasing the information the cfvnet provides and pushing the strategy toward the blueprint's coarse equilibrium.
 
-**Verdict:** The unit-conversion fix was real and necessary (the old formula was mathematically wrong), but it does not change the architectural conclusion: Libratus-style static CBVs from a bucketed blueprint are insufficient to close the cfvnet parity gap. Bean akg3 (DeepStack-proper cfvnet retrain with per-combo opt-out) remains the correct path.
+**Verdict:** The unit-conversion fix was real and necessary (the old formula was mathematically wrong), but it does not change the architectural conclusion: Libratis-style static CBVs from a bucketed blueprint are insufficient to close the cfvnet parity gap. Bean akg3 (DeepStack-proper cfvnet retrain with per-combo opt-out) remains the correct path.
+
+## Iteration 14 -- 2026-04-22 (per-boundary pot normalization fix)
+
+**Bug fix:** `BlueprintCbvOptOut::from_cbv_context` used a SINGLE `half_pot_chips` (derived from the subgame's starting pot) for ALL boundaries. But each boundary sits at a different point in the turn action tree with a different accumulated pot. For example, with starting pot=146 (half_pot=73), boundary 2 at pot=398 (half_pot=199) had its CBVs divided by 73 instead of 199, inflating bcfv ~2.7x. This caused all opt-out values to exceed +1.0, clamping 100% of hands.
+
+**Fix:** Added `GameTree::pot_at_node(node_idx)` helper that finds the pot at any node by locating its nearest Fold terminal descendant. Changed `from_cbv_context` to compute per-boundary half-pot from each chance node's pot via `pot_at_node`, instead of taking a single `half_pot_chips` parameter. Updated both callers (`compare_solve.rs`, `game_session.rs`).
+
+**Result:** exact_exp=77.67 mbb, subgame_exp=40277.79 mbb, worst_delta=1.0000, worst_cell="98s @ Check exact=0.0000 subgame=1.0000"
+mean_mass=0.487, max_mass=1.000 at hand 7hKs.
+Status: FAIL (gadget still worse than no gadget, but significantly improved)
+
+**Comparison across iterations:**
+
+| Metric | Iter 10 (no gadget) | Iter 13 (single half_pot) | Iter 14 (per-boundary pot) |
+|--------|-------------------|--------------------------|---------------------------|
+| exact_exp | 77.67 mbb | 77.67 mbb | 77.67 mbb |
+| subgame_exp | 20932.49 mbb | 218619.14 mbb | 40277.79 mbb |
+| worst_delta | 1.0000 | 0.9970 | 1.0000 |
+| mean_mass | 0.543 | 0.810 | 0.487 |
+
+Per-action-class bias (subgame - exact):
+- Check: +0.311
+- AllIn: -0.066
+- Bet/Raise: -0.245
+
+Per-boundary diagnostic (sample):
+- boundary=0 (pot=146): optout +0.535/+0.992/+1.545, clamped 1109/1127 (high -- small pot, large relative CBVs)
+- boundary=1 (pot=242): optout -0.315/-0.062/+0.276, clamped 662/1127 (selective)
+- boundary=2 (pot=398): optout -0.331/-0.084/+0.215, clamped 605/1127 (selective)
+- boundary=4-10 (pot=366-398): optout -0.064/+0.194/+0.425, clamped 912-996/1127
+
+**Wall time:** exact=0.3s, subgame=1.5s.
+
+**Diagnosis:** The per-boundary pot fix reduced exploitability by ~5.4x (218k -> 40k mbb) and mean_mass by 40% (0.810 -> 0.487). Boundaries at higher pots (242-398) now show selective clamping (54-88% of hands) instead of near-total clamping (99.9%). Boundary 0 (pot=146) still clamps most hands because the blueprint CBVs at that node are genuinely large relative to its small pot.
+
+The gadget is now only 2x worse than no gadget (40k vs 21k mbb), down from 10x in iter 13. The strategy bias flipped from universal betting (iter 13: Check -0.556, Bet +0.728) to over-checking (Check +0.311, Bet -0.245), suggesting the opt-out floors are now in a reasonable range but the 2-bucket abstraction still introduces too much noise.
+
+**Verdict:** The per-boundary pot fix was necessary and substantially improved results. The remaining gap (40k vs 21k mbb) is attributable to the coarse 2-bucket equity-fallback abstraction producing noisy opt-out floors, consistent with the architectural conclusion from iter 13.
