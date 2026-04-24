@@ -31,7 +31,7 @@ theoretical description more closely.
 | Opt-out source | `opt_out_at_subgame_root` (single-point) | `from_cbv_context` (per-boundary, per-player, per-hand, normalised by per-boundary pot) |
 | Ordinal layout | Ordinals 0--1 reserved for gadget; cfvnet shifted to 2+ | Ordinals 0..N stable (cfvnet); gadget terminals at N..3N |
 | Root invariant | `game.root()` returned gadget G_IP node | `game.root()` returns the real subgame root |
-| Non-gadget player terminal | Zero (neutralized) | Zero (neutralized; zero-sum complement deferred) |
+| Non-gadget player terminal | Zero (neutralized) — querieable from other player's pass under Option A | Zero (neutralized) — **unreachable under Option Y** because the non-owner's traversal short-circuits at the gadget Decision above this terminal; the solver never queries the non-gadget player's CFV here, so no zero-sum complement is needed |
 
 The traverser-disable semantics (called "Option Y" during development)
 are the key behavioral change. Under Option A, both players' traverser
