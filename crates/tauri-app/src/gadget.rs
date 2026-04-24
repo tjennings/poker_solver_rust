@@ -184,6 +184,79 @@ impl BlueprintCbvOptOut {
         Self { per_boundary_cbv: per_boundary }
     }
 
+    /// Compute per-hand opt-out bcfv values at the subgame ROOT (not at
+    /// chance descendants). MVP approximation: uses the parent chance-ancestor
+    /// CBV (already stored in CbvTable) as the root's opt-out, normalised by
+    /// the subgame's starting half-pot.
+    ///
+    /// Returns `[opt_out_oop, opt_out_ip]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `subgame_pot_chips <= 0`, if the CbvTable is empty, or if
+    /// no chance parent is found for `abstract_root`.
+    pub fn opt_out_at_subgame_root(
+        cbv_context: &crate::postflop::CbvContext,
+        abstract_root: u32,
+        subgame_pot_chips: f32,
+        board: &[u8],
+        private_cards: &[Vec<(u8, u8)>; 2],
+    ) -> [Vec<f32>; 2] {
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+
+        assert!(
+            subgame_pot_chips > 0.0,
+            "subgame_pot_chips must be positive"
+        );
+        assert!(
+            !cbv_context.cbv_table.values.is_empty(),
+            "CbvTable has no values; cannot construct opt-out"
+        );
+
+        let ordinal_map =
+            CbvTable::build_node_to_ordinal_map(&cbv_context.abstract_tree);
+        let chance_ancestor = cbv_context
+            .abstract_tree
+            .nearest_chance_ancestor(abstract_root)
+            .expect(
+                "subgame root must have a chance ancestor in the abstract tree",
+            );
+        let cbv_ordinal =
+            CbvTable::require_ordinal(&ordinal_map, chance_ancestor);
+
+        let half_pot = subgame_pot_chips / 2.0;
+
+        let street = match board.len() {
+            3 => Street::Flop,
+            4 => Street::Turn,
+            5 => Street::River,
+            n => panic!("unexpected board length {n}; expected 3, 4, or 5"),
+        };
+
+        let rs_board: Vec<poker_solver_core::poker::Card> = board
+            .iter()
+            .map(|&id| crate::exploration::range_solver_to_rs_card(id))
+            .collect();
+
+        let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        for player in 0..2 {
+            let hands = &private_cards[player];
+            per_hand[player].reserve(hands.len());
+            for &(c1, c2) in hands {
+                let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+                let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+                let bucket = cbv_context.all_buckets.get_bucket(
+                    street, [rs_c1, rs_c2], &rs_board,
+                );
+                let chip_cbv = cbv_context
+                    .cbv_table
+                    .lookup(cbv_ordinal, bucket as usize);
+                per_hand[player].push(chip_cfv_to_bcfv(chip_cbv, half_pot));
+            }
+        }
+        per_hand
+    }
+
     /// Number of boundaries this provider was constructed with.
     #[must_use]
     pub fn num_boundaries(&self) -> usize {
@@ -886,6 +959,188 @@ mod tests {
 
         // Call with wrong hand count -- should panic
         provider.opt_out_cfvs(0, 0, 100, 200, &board, &[(0u8, 1u8), (2, 3)]);
+    }
+
+    // ---------------------------------------------------------------
+    // opt_out_at_subgame_root tests
+    // ---------------------------------------------------------------
+
+    /// Build a fixture where `abstract_root` is a descendant of a chance
+    /// node, modeling a turn subgame: Flop-Decision -> Chance(Turn) ->
+    /// Turn-Decision (abstract_root) -> Chance(River) -> Terminal.
+    ///
+    /// Tree:
+    ///   0: Decision(P0, Flop, [Check]) -> [1]
+    ///   1: Chance(Turn, child=2)          -- ordinal 0, CBV=[50, -30]
+    ///   2: Decision(P0, Turn, [Check]) -> [3]   <-- abstract_root
+    ///   3: Decision(P1, Turn, [Check]) -> [4]
+    ///   4: Chance(River, child=5)         -- ordinal 1, CBV=[80, -10]
+    ///   5: Terminal(Showdown, pot=100)
+    fn make_subgame_root_context() -> (crate::postflop::CbvContext, u32, Vec<u8>, [Vec<(u8, u8)>; 2]) {
+        use crate::postflop::CbvContext;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        use poker_solver_core::blueprint_v2::game_tree::{
+            GameNode, GameTree, TerminalKind, TreeAction,
+        };
+        use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::card::flop_from_str;
+
+        // 2 boundary nodes (ordinals 0 and 1), 2 buckets each.
+        let cbv_table = CbvTable {
+            values: vec![50.0, -30.0, 80.0, -10.0],
+            node_offsets: vec![0, 2],
+            buckets_per_node: vec![2, 2],
+        };
+
+        let nodes = vec![
+            // 0: Flop decision (root of abstract tree)
+            GameNode::Decision {
+                player: 0,
+                street: Street::Flop,
+                actions: vec![TreeAction::Check],
+                children: vec![1],
+                blueprint_decision_idx: None,
+            },
+            // 1: Chance (flop->turn) -- ordinal 0
+            GameNode::Chance {
+                next_street: Street::Turn,
+                child: 2,
+            },
+            // 2: Turn decision -- this is the subgame root
+            GameNode::Decision {
+                player: 0,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![3],
+                blueprint_decision_idx: None,
+            },
+            // 3: Turn decision P1
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![4],
+                blueprint_decision_idx: None,
+            },
+            // 4: Chance (turn->river) -- ordinal 1
+            GameNode::Chance {
+                next_street: Street::River,
+                child: 5,
+            },
+            // 5: Terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 100.0,
+                stacks: [50.0, 50.0],
+            },
+        ];
+
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
+        let abstract_root: u32 = 2; // Turn decision, descendant of chance node 1
+
+        let mut ab = AllBuckets::new([2, 2, 2, 2], [None, None, None, None]);
+        ab.equity_fallback = true;
+        let all_buckets = Arc::new(ab);
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+
+        let ctx = CbvContext {
+            cbv_table,
+            abstract_tree: tree,
+            all_buckets,
+            strategy,
+        };
+
+        let flop = flop_from_str("7h 5d 2c").unwrap();
+        let turn_card: u8 = 7;  // 3s
+        let river_card: u8 = 30; // 9h
+        let board = vec![flop[0], flop[1], flop[2], turn_card, river_card];
+
+        let oop_hands = vec![(48u8, 49u8)]; // Ac, Ad
+        let ip_hands = vec![(4u8, 5u8)];    // 3c, 3d
+        let private_cards = [oop_hands, ip_hands];
+
+        (ctx, abstract_root, board, private_cards)
+    }
+
+    #[test]
+    fn opt_out_at_subgame_root_returns_two_hand_vectors() {
+        let (ctx, abstract_root, board, private_cards) = make_subgame_root_context();
+        let subgame_pot_chips = 100.0f32;
+
+        let [opt_oop, opt_ip] = BlueprintCbvOptOut::opt_out_at_subgame_root(
+            &ctx,
+            abstract_root,
+            subgame_pot_chips,
+            &board,
+            &private_cards,
+        );
+
+        assert_eq!(opt_oop.len(), private_cards[0].len());
+        assert_eq!(opt_ip.len(), private_cards[1].len());
+        // Every value should be finite and in a reasonable bcfv range.
+        for v in opt_oop.iter().chain(opt_ip.iter()) {
+            assert!(v.is_finite(), "opt-out bcfv must be finite");
+            assert!(*v >= -10.0 && *v <= 10.0, "bcfv unreasonable: {v}");
+        }
+    }
+
+    #[test]
+    fn opt_out_at_subgame_root_uses_parent_chance_cbv() {
+        // The fixture has chance node 1 (ordinal 0) as the nearest chance
+        // ancestor of abstract_root=2. CbvTable ordinal 0 has values
+        // [50.0, -30.0]. With subgame_pot=100, half_pot=50.
+        // Bucket 0: (50.0 - 50.0) / 50.0 = 0.0
+        // Bucket 1: (-30.0 - 50.0) / 50.0 = -1.6
+        let (ctx, abstract_root, board, private_cards) = make_subgame_root_context();
+        let [opt_oop, opt_ip] = BlueprintCbvOptOut::opt_out_at_subgame_root(
+            &ctx, abstract_root, 100.0, &board, &private_cards,
+        );
+        // Verify finite values produced from the parent chance node's CBV.
+        assert!(opt_oop.iter().all(|&v| v.is_finite()));
+        assert!(opt_ip.iter().all(|&v| v.is_finite()));
+        // Values should be either 0.0 or -1.6 depending on bucket.
+        for &v in opt_oop.iter().chain(opt_ip.iter()) {
+            assert!(
+                (v - 0.0).abs() < 1e-6 || (v - (-1.6)).abs() < 1e-6,
+                "bcfv value {v} should be 0.0 or -1.6 (from parent chance CBV)"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "subgame_pot_chips must be positive")]
+    fn opt_out_at_subgame_root_panics_on_zero_pot() {
+        let (ctx, abstract_root, board, private_cards) = make_subgame_root_context();
+        BlueprintCbvOptOut::opt_out_at_subgame_root(
+            &ctx, abstract_root, 0.0, &board, &private_cards,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "subgame_pot_chips must be positive")]
+    fn opt_out_at_subgame_root_panics_on_negative_pot() {
+        let (ctx, abstract_root, board, private_cards) = make_subgame_root_context();
+        BlueprintCbvOptOut::opt_out_at_subgame_root(
+            &ctx, abstract_root, -5.0, &board, &private_cards,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must have a chance ancestor")]
+    fn opt_out_at_subgame_root_panics_when_no_chance_ancestor() {
+        // Use the original fixture where abstract_root=0 is the tree root
+        // with no chance ancestor.
+        let (ctx, abstract_root, board, private_cards) = make_cbv_test_context();
+        BlueprintCbvOptOut::opt_out_at_subgame_root(
+            &ctx, abstract_root, 100.0, &board, &private_cards,
+        );
     }
 
     // ---------------------------------------------------------------
