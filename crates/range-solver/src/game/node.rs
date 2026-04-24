@@ -157,6 +157,25 @@ impl GameNode for PostFlopNode {
     }
 
     #[inline]
+    fn acting_player(&self) -> usize {
+        (self.player & PLAYER_MASK) as usize
+    }
+
+    #[inline]
+    fn is_gadget(&self) -> bool {
+        self.player & PLAYER_GADGET_FLAG != 0
+    }
+
+    #[inline]
+    fn gadget_owner(&self) -> Option<usize> {
+        if self.player & PLAYER_GADGET_FLAG != 0 {
+            Some((self.player & PLAYER_MASK) as usize)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn num_actions(&self) -> usize {
         self.num_children as usize
     }

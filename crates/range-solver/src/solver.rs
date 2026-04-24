@@ -242,6 +242,16 @@ fn solve_recursive<T: Game>(
         return;
     }
 
+    // Gadget disabled: traverser's own gadget — go directly to Follow
+    // (action index 1). No regret update, no strategy-sum accumulation.
+    // The bit-AND with PLAYER_GADGET_FLAG (0x40) is the fast-path check;
+    // for non-gadget games `is_gadget()` is a single branch-not-taken.
+    if node.is_gadget() && node.gadget_owner() == Some(player) {
+        let child = &mut node.play(1);
+        solve_recursive(result, game, child, player, cfreach, params);
+        return;
+    }
+
     // Take scratch buffers from thread-local storage.
     let mut scratch = take_scratch();
 
@@ -330,7 +340,14 @@ fn solve_recursive<T: Game>(
         put_scratch(scratch);
     }
     // -- Current player's decision node --
-    else if node.player() == player {
+    // Use acting_player() to mask off flag bits (e.g. PLAYER_GADGET_FLAG).
+    // For non-gadget decision nodes, acting_player() == player() (0 or 1).
+    // For active gadgets (disabled case already returned above),
+    // acting_player() returns the gadget owner (the non-traverser), so
+    // they fall through to the opponent branch, which is correct: the
+    // gadget owner's strategy weights cfreach, and the traverser's CFVs
+    // are computed as sum of weighted child CFVs.
+    else if node.acting_player() == player {
         // Return scratch to TLS before child recursion.
         put_scratch(scratch);
 
