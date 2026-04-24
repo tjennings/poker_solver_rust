@@ -1451,11 +1451,32 @@ fn range_solver_action_to_game_action(
     }
 }
 
-/// Build a `GameMatrix` from the current `PostFlopGame` state at the root node.
+/// Navigate a gadget-tree game past the gadget layer to the real subgame root.
 ///
-/// Navigates to root first, then delegates to `build_solve_matrix_at_current`.
-fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+/// The gadget layer is a solver-internal construct: 4 arena nodes (G_IP,
+/// G_IP.Terminate, G_OOP, G_OOP.Terminate) prepended to the tree so the
+/// solver can model opt-out/follow decisions. Explorer UI starts
+/// post-gadget (arena 4) so users see the real subgame.
+///
+/// Resets to `game.root()` (arena 0), then plays Follow (action index 1)
+/// at G_IP and G_OOP, landing on arena 4.
+fn advance_past_gadget(game: &mut PostFlopGame) {
     game.back_to_root();
+    game.play(1); // G_IP -> Follow -> G_OOP
+    game.play(1); // G_OOP -> Follow -> real subgame root (arena 4)
+}
+
+/// Build a `GameMatrix` from the current `PostFlopGame` state at the
+/// explorer-visible root.
+///
+/// When `gadget` is true, navigates to the real subgame root (arena 4)
+/// instead of the gadget root (arena 0).
+fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>, gadget: bool) -> GameMatrix {
+    if gadget {
+        advance_past_gadget(game);
+    } else {
+        game.back_to_root();
+    }
     build_solve_matrix_at_current(game, hand_evs)
 }
 
@@ -1570,9 +1591,11 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
 /// Walk the solved game tree and cache a `CachedSolveNode` at every decision node.
 ///
 /// Returns a map from action path (e.g., `[0, 1]`) to cached node data.
-fn build_solve_cache(game: &mut PostFlopGame) -> HashMap<Vec<usize>, CachedSolveNode> {
+/// When `gadget` is true, navigation starts from the real subgame root
+/// (arena 4) instead of the gadget root (arena 0).
+fn build_solve_cache(game: &mut PostFlopGame, gadget: bool) -> HashMap<Vec<usize>, CachedSolveNode> {
     let mut cache = HashMap::new();
-    build_solve_cache_recursive(game, &mut vec![], &mut cache);
+    build_solve_cache_recursive(game, &mut vec![], &mut cache, gadget);
     cache
 }
 
@@ -1580,6 +1603,7 @@ fn build_solve_cache_recursive(
     game: &mut PostFlopGame,
     path: &mut Vec<usize>,
     cache: &mut HashMap<Vec<usize>, CachedSolveNode>,
+    gadget: bool,
 ) {
     if game.is_terminal_node() || game.is_chance_node() {
         return;
@@ -1608,10 +1632,18 @@ fn build_solve_cache_recursive(
     for i in 0..num_actions {
         game.play(i);
         path.push(i);
-        build_solve_cache_recursive(game, path, cache);
+        build_solve_cache_recursive(game, path, cache, gadget);
         path.pop();
-        // Navigate back: PostFlopGame has no undo, so replay from root
-        game.apply_history(path);
+        // Navigate back: PostFlopGame has no undo, so replay from root.
+        // In gadget mode, replay from the real subgame root (arena 4).
+        if gadget {
+            advance_past_gadget(game);
+        } else {
+            game.back_to_root();
+        }
+        for &action in path.iter() {
+            game.play(action);
+        }
     }
 }
 
@@ -2139,9 +2171,14 @@ pub fn game_solve_core(
             }
         };
 
-        // Store available actions at root
+        // Store available actions at the explorer-visible root.
+        // In gadget mode, skip past the gadget layer to the real subgame.
         {
-            game.back_to_root();
+            if gadget_tree_active {
+                advance_past_gadget(&mut game);
+            } else {
+                game.back_to_root();
+            }
             let actions: Vec<GameAction> = game
                 .available_actions()
                 .iter()
@@ -2231,7 +2268,7 @@ pub fn game_solve_core(
         });
 
         // Initial matrix snapshot
-        let matrix = build_solve_matrix(&mut game, None);
+        let matrix = build_solve_matrix(&mut game, None, gadget_tree_active);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
 
         // Solve loop
@@ -2277,7 +2314,7 @@ pub fn game_solve_core(
 
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
-                let matrix = build_solve_matrix(&mut game, None);
+                let matrix = build_solve_matrix(&mut game, None, gadget_tree_active);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
 
                 if is_exact {
@@ -2313,11 +2350,16 @@ pub fn game_solve_core(
                 final_iter,
             );
         }
-        game.back_to_root();
+        // Navigate to explorer-visible root for final matrix + EVs.
+        if gadget_tree_active {
+            advance_past_gadget(&mut game);
+        } else {
+            game.back_to_root();
+        }
         game.cache_normalized_weights();
         let player = game.current_player();
         let evs = game.expected_values(player);
-        let final_matrix = build_solve_matrix(&mut game, Some(&evs));
+        let final_matrix = build_solve_matrix(&mut game, Some(&evs), gadget_tree_active);
         *ss_clone.matrix_snapshot.write() = Some(final_matrix);
 
         // Compute exploitability using cached boundary CFVs
@@ -2331,7 +2373,13 @@ pub fn game_solve_core(
             .store(final_exp.to_bits(), Ordering::Relaxed);
 
         // Build solve cache for all decision nodes in the solved tree.
-        let solve_cache = build_solve_cache(&mut game);
+        // In gadget mode, start from the real subgame root (arena 4).
+        if gadget_tree_active {
+            advance_past_gadget(&mut game);
+        } else {
+            game.back_to_root();
+        }
+        let solve_cache = build_solve_cache(&mut game, gadget_tree_active);
         eprintln!("[solve] cached {} decision nodes for subgame navigation", solve_cache.len());
         *ss_clone.solve_cache.write() = solve_cache;
         *ss_clone.solve_path.write() = vec![];
@@ -3500,7 +3548,7 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
 
-        let matrix = build_solve_matrix(&mut game, None);
+        let matrix = build_solve_matrix(&mut game, None, false);
         // Should be a 13x13 grid
         assert_eq!(matrix.cells.len(), 13);
         assert_eq!(matrix.cells[0].len(), 13);
@@ -4384,7 +4432,7 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
 
-        let cache = build_solve_cache(&mut game);
+        let cache = build_solve_cache(&mut game, false);
         // Root should be present
         assert!(cache.contains_key(&vec![]), "cache should contain root entry");
         // Root should have actions
@@ -4825,6 +4873,93 @@ mod tests {
             game.num_boundary_nodes(),
             plain_boundaries + 2,
             "gadget game should have original boundaries + 2 gadget ordinals"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // advance_past_gadget tests
+    // -------------------------------------------------------------------
+
+    /// Helper: build a gadget-tree game for testing advance_past_gadget.
+    fn make_gadget_game_for_advance() -> PostFlopGame {
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let pot = 20;
+        let eff_stack = 90;
+
+        let tmp = build_solve_game(
+            &board, &weights, &weights, pot, eff_stack, &sizes, false, Some(0),
+        ).unwrap();
+        let n_oop = tmp.private_cards(0).len();
+        let n_ip = tmp.private_cards(1).len();
+        drop(tmp);
+
+        let opt_out_values: [Vec<f32>; 2] = [
+            vec![0.0; n_oop],
+            vec![0.0; n_ip],
+        ];
+
+        struct NoopEval;
+        impl range_solver::game::BoundaryEvaluator for NoopEval {
+            fn compute_cfvs(
+                &self, _: usize, _: i32, _: f64, _: &[f32], n: usize, _: usize,
+            ) -> Vec<f32> {
+                vec![0.0; n]
+            }
+        }
+        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(NoopEval);
+
+        build_gadget_tree_solve_game(
+            &board, &weights, &weights, pot, eff_stack, &sizes,
+            Some(0), &opt_out_values, inner,
+        ).unwrap()
+    }
+
+    #[test]
+    fn advance_past_gadget_moves_to_real_subgame_root() {
+        let mut game = make_gadget_game_for_advance();
+
+        // Before advance: at gadget root, player is IP (outer_player=1),
+        // only 2 actions (Terminate/Follow).
+        game.back_to_root();
+        assert_eq!(game.current_player(), 1, "gadget root player should be IP");
+        assert_eq!(game.available_actions().len(), 2, "gadget root has 2 actions");
+
+        // Advance past gadget layer
+        advance_past_gadget(&mut game);
+
+        // After advance: at real subgame root (arena 4), OOP acts first,
+        // more than 2 actions (real bet sizing).
+        assert_eq!(
+            game.current_player(), 0,
+            "real subgame root player should be OOP"
+        );
+        assert!(
+            game.available_actions().len() > 2,
+            "real subgame root should have >2 actions (bet sizes), got {}",
+            game.available_actions().len()
+        );
+    }
+
+    #[test]
+    fn advance_past_gadget_cache_excludes_gadget_nodes() {
+        let mut game = make_gadget_game_for_advance();
+        advance_past_gadget(&mut game);
+
+        let cache = build_solve_cache(&mut game, true);
+
+        // The root entry (path []) should be at the real subgame root,
+        // not the gadget root. OOP is the acting player.
+        let root_node = cache.get(&vec![]).expect("cache should have root entry");
+        assert_eq!(
+            root_node.position, "OOP",
+            "cache root should be OOP (real subgame), not IP (gadget)"
+        );
+        assert!(
+            root_node.actions.len() > 2,
+            "cache root should have >2 actions, got {}",
+            root_node.actions.len()
         );
     }
 }
