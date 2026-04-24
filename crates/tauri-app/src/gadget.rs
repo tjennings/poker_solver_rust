@@ -98,21 +98,25 @@ impl BlueprintCbvOptOut {
     /// its dense CBV ordinal, and pre-computes per-hand opt-out values
     /// in bcfv units for both players at every boundary.
     ///
+    /// Each boundary's CBV chip values are normalised by that boundary's
+    /// own half-pot (derived from `GameTree::pot_at_node`), not a single
+    /// global half-pot. This is critical when boundaries sit at different
+    /// points in the action tree with different accumulated pots.
+    ///
     /// `abstract_root` is the abstract tree arena index of the decision
     /// node where the subgame starts (e.g., the turn decision node).
     ///
     /// # Panics
     ///
     /// - If `cbv_context.cbv_table.values` is empty.
-    /// - If `half_pot_chips <= 0`.
     /// - If `board.len()` is not 3, 4, or 5.
     /// - If no chance nodes are found below `abstract_root`.
+    /// - If any chance node has a non-positive pot.
     pub fn from_cbv_context(
         cbv_context: &crate::postflop::CbvContext,
         abstract_root: u32,
         board: &[u8],
         private_cards: &[Vec<(u8, u8)>; 2],
-        half_pot_chips: f32,
     ) -> Self {
         use poker_solver_core::blueprint_v2::cbv::CbvTable;
 
@@ -120,7 +124,6 @@ impl BlueprintCbvOptOut {
             !cbv_context.cbv_table.values.is_empty(),
             "CbvTable has no values; cannot construct BlueprintCbvOptOut"
         );
-        assert!(half_pot_chips > 0.0, "half_pot must be positive");
 
         let ordinal_map =
             CbvTable::build_node_to_ordinal_map(&cbv_context.abstract_tree);
@@ -149,6 +152,14 @@ impl BlueprintCbvOptOut {
         for &chance_arena_idx in &chance_nodes {
             let cbv_ordinal =
                 CbvTable::require_ordinal(&ordinal_map, chance_arena_idx);
+            let pot_at_chance =
+                cbv_context.abstract_tree.pot_at_node(chance_arena_idx);
+            let half_pot = (pot_at_chance / 2.0) as f32;
+            assert!(
+                half_pot > 0.0,
+                "chance node {chance_arena_idx} has non-positive pot \
+                 ({pot_at_chance})"
+            );
 
             let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
             for player in 0..2 {
@@ -164,7 +175,7 @@ impl BlueprintCbvOptOut {
                         cbv_ordinal, bucket as usize,
                     );
                     per_hand[player].push(
-                        chip_cfv_to_bcfv(chip_cbv, half_pot_chips),
+                        chip_cfv_to_bcfv(chip_cbv, half_pot),
                     );
                 }
             }
@@ -590,9 +601,8 @@ mod tests {
     fn blueprint_cbv_opt_out_from_cbv_context_returns_correct_bcfv() {
         let (ctx, root, board, private_cards) = make_cbv_test_context();
 
-        let half_pot = 50.0_f32;
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, root, &board, &private_cards, half_pot,
+            &ctx, root, &board, &private_cards,
         );
 
         // Verify opt_out_cfvs returns the correct number of hands
@@ -602,6 +612,7 @@ mod tests {
         assert_eq!(ip_cfvs.len(), 1);
 
         // Verify the values are (chip_cbv - half_pot) / half_pot.
+        // The chance node's child terminal has pot=100, so half_pot=50.
         // With equity fallback and 2 buckets, the exact bucket depends on
         // equity calculation, but the value must be either
         // (50.0-50.0)/50.0 = 0.0  or  (-30.0-50.0)/50.0 = -1.6.
@@ -744,35 +755,71 @@ mod tests {
     fn from_cbv_context_multi_node_finds_all_boundaries() {
         let (ctx, board, private_cards) = make_multi_node_cbv_context();
 
-        let half_pot = 50.0_f32;
         // Root node 0 has 3 chance descendants
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, 0, &board, &private_cards, half_pot,
+            &ctx, 0, &board, &private_cards,
         );
 
         assert_eq!(provider.num_boundaries(), 3);
     }
 
     #[test]
-    fn from_cbv_context_multi_node_different_ordinals_return_different_values() {
+    fn from_cbv_context_multi_node_each_boundary_has_correct_count() {
         let (ctx, board, private_cards) = make_multi_node_cbv_context();
 
-        let half_pot = 50.0_f32;
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, 0, &board, &private_cards, half_pot,
+            &ctx, 0, &board, &private_cards,
         );
 
-        // boundary 0 (ordinal 0, arena 2): CBV bucket 0 = 10.0 -> bcfv = (10-50)/50 = -0.8
-        // boundary 2 (ordinal 2, arena 10): CBV bucket 0 = 60.0 -> bcfv = (60-50)/50 = 0.2
+        // Each boundary should have the correct number of hands per player.
+        for b in 0..3 {
+            let oop = provider.opt_out_cfvs(b, 0, 100, 200, &board, &private_cards[0]);
+            let ip = provider.opt_out_cfvs(b, 1, 100, 200, &board, &private_cards[1]);
+            assert_eq!(oop.len(), private_cards[0].len());
+            assert_eq!(ip.len(), private_cards[1].len());
+        }
+    }
+
+    #[test]
+    fn from_cbv_context_uses_per_boundary_pot_for_normalization() {
+        // The multi-node tree has 3 chance nodes with distinct pots:
+        //   ordinal 0 (arena 2):  pot=10,  half_pot=5
+        //   ordinal 1 (arena 6):  pot=30,  half_pot=15
+        //   ordinal 2 (arena 10): pot=60,  half_pot=30
+        //
+        // With per-boundary pot, CBV bucket 0 values normalize as:
+        //   ordinal 0: chip_cbv=10 => (10-5)/5 = +1.0
+        //   ordinal 1: chip_cbv=30 => (30-15)/15 = +1.0
+        //   ordinal 2: chip_cbv=60 => (60-30)/30 = +1.0
+        //
+        // With a WRONG single half_pot=50 (the old bug), we'd get:
+        //   ordinal 0: (10-50)/50 = -0.8
+        //   ordinal 2: (60-50)/50 = +0.2
+        //
+        // This test catches the bug: with the fix, all three boundaries
+        // should produce the SAME bcfv for bucket 0 hands.
+        let (ctx, board, private_cards) = make_multi_node_cbv_context();
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards,
+        );
+
         let oop_0 = provider.opt_out_cfvs(0, 0, 100, 200, &board, &private_cards[0]);
+        let oop_1 = provider.opt_out_cfvs(1, 0, 100, 200, &board, &private_cards[0]);
         let oop_2 = provider.opt_out_cfvs(2, 0, 100, 200, &board, &private_cards[0]);
 
-        // They should be different values (ordinal 0 vs ordinal 2 have different CBVs)
+        // All three should be equal (same bucket maps to proportionally
+        // equal CBVs when normalised by that boundary's own pot).
         assert!(
-            (oop_0[0] - oop_2[0]).abs() > 0.01,
-            "ordinal 0 and ordinal 2 should produce different opt-out values, \
-             got oop_0={}, oop_2={}",
-            oop_0[0], oop_2[0]
+            (oop_0[0] - oop_1[0]).abs() < 0.01,
+            "boundary 0 ({}) and boundary 1 ({}) should have same bcfv \
+             when each is normalised by its own half-pot",
+            oop_0[0], oop_1[0],
+        );
+        assert!(
+            (oop_1[0] - oop_2[0]).abs() < 0.01,
+            "boundary 1 ({}) and boundary 2 ({}) should have same bcfv \
+             when each is normalised by its own half-pot",
+            oop_1[0], oop_2[0],
         );
     }
 
@@ -782,7 +829,7 @@ mod tests {
         let (ctx, root, board, private_cards) = make_cbv_test_context();
 
         let provider = BlueprintCbvOptOut::from_cbv_context(
-            &ctx, root, &board, &private_cards, 50.0,
+            &ctx, root, &board, &private_cards,
         );
 
         // Call with wrong hand count -- should panic

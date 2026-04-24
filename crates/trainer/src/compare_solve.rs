@@ -945,8 +945,7 @@ pub fn run(
                 Some(Arc::new(poker_solver_tauri::gadget::ConstantOptOut(gadget_constant)))
             }
             "blueprint-cbv" => {
-                let half_pot = pot as f32 / 2.0;
-                eprintln!("[compare] gadget enabled: BlueprintCbvOptOut (half_pot={half_pot})");
+                eprintln!("[compare] gadget enabled: BlueprintCbvOptOut (per-boundary pot)");
                 let board_u8: Vec<u8> = board_cards.iter()
                     .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
                     .collect();
@@ -960,7 +959,6 @@ pub fn run(
                         current_node,
                         &board_u8,
                         &private_cards,
-                        half_pot,
                     ),
                 ))
             }
