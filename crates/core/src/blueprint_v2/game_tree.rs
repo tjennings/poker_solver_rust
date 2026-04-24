@@ -1005,6 +1005,43 @@ impl GameTree {
         map
     }
 
+    /// Returns the pot (in chips) at the given arena node.
+    ///
+    /// For Terminal nodes, returns the stored `pot` directly. For
+    /// Chance and Decision nodes, finds the nearest Fold terminal
+    /// descendant (whose pot equals the pot at the point of fold,
+    /// i.e. the accumulated pot with no further bets). Falls back to
+    /// the first terminal if no Fold is found (handles test fixtures
+    /// where Chance -> Terminal directly).
+    #[must_use]
+    pub fn pot_at_node(&self, node_idx: u32) -> f64 {
+        let mut stack = vec![node_idx];
+        let mut first_terminal_pot: Option<f64> = None;
+        while let Some(idx) = stack.pop() {
+            match &self.nodes[idx as usize] {
+                GameNode::Terminal { kind: TerminalKind::Fold { .. }, pot, .. } => {
+                    return *pot;
+                }
+                GameNode::Terminal { pot, .. } => {
+                    if first_terminal_pot.is_none() {
+                        first_terminal_pot = Some(*pot);
+                    }
+                }
+                GameNode::Chance { child, .. } => {
+                    stack.push(*child);
+                }
+                GameNode::Decision { children, .. } => {
+                    for &c in children.iter().rev() {
+                        stack.push(c);
+                    }
+                }
+            }
+        }
+        first_terminal_pot.unwrap_or_else(|| {
+            panic!("no terminal found below node {node_idx}")
+        })
+    }
+
     /// Collect all `Chance` node arena indices reachable from `start`
     /// via DFS, in arena-encounter order.
     ///
@@ -2074,6 +2111,121 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // pot_at_node tests
+    // ---------------------------------------------------------------
+
+    /// Hand-built tree matching the multi-boundary gadget fixture:
+    ///   0: Decision(P0, Turn, [Check, Bet, AllIn])
+    ///     1: Decision(P1, Turn, [Check])
+    ///       2: Chance(River, child=3) -- pot should be 10
+    ///         3: Terminal(Showdown, pot=10)
+    ///     4: Decision(P1, Turn, [Fold, Call])
+    ///       5: Terminal(Fold, pot=10)
+    ///       6: Chance(River, child=7) -- pot should be 30
+    ///         7: Terminal(Showdown, pot=30)
+    ///     8: Decision(P1, Turn, [Fold, Call])
+    ///       9: Terminal(Fold, pot=10)
+    ///       10: Chance(River, child=11) -- pot should be 60
+    ///         11: Terminal(Showdown, pot=60)
+    fn multi_pot_tree() -> GameTree {
+        let nodes = vec![
+            GameNode::Decision {
+                player: 0,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check, TreeAction::Bet(2.0), TreeAction::AllIn],
+                children: vec![1, 4, 8],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![2],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Chance { next_street: Street::River, child: 3 },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown, pot: 10.0, stacks: [50.0, 50.0],
+            },
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![5, 6],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 0 }, pot: 10.0, stacks: [50.0, 50.0],
+            },
+            GameNode::Chance { next_street: Street::River, child: 7 },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown, pot: 30.0, stacks: [45.0, 45.0],
+            },
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![9, 10],
+                blueprint_decision_idx: None,
+            },
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 0 }, pot: 10.0, stacks: [50.0, 50.0],
+            },
+            GameNode::Chance { next_street: Street::River, child: 11 },
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown, pot: 60.0, stacks: [20.0, 20.0],
+            },
+        ];
+        GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 }
+    }
+
+    #[test]
+    fn pot_at_node_returns_terminal_pot_for_terminal() {
+        let tree = multi_pot_tree();
+        // Terminal at index 3 has pot=10
+        assert!((tree.pot_at_node(3) - 10.0).abs() < 1e-6);
+        // Terminal at index 7 has pot=30
+        assert!((tree.pot_at_node(7) - 30.0).abs() < 1e-6);
+        // Terminal at index 11 has pot=60
+        assert!((tree.pot_at_node(11) - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pot_at_node_returns_pot_at_chance_nodes() {
+        let tree = multi_pot_tree();
+        // Chance at index 2: child terminal has pot=10
+        assert!((tree.pot_at_node(2) - 10.0).abs() < 1e-6);
+        // Chance at index 6: child terminal has pot=30
+        assert!((tree.pot_at_node(6) - 30.0).abs() < 1e-6);
+        // Chance at index 10: child terminal has pot=60
+        assert!((tree.pot_at_node(10) - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pot_at_node_returns_pot_at_decision_node() {
+        let tree = multi_pot_tree();
+        // Decision at index 4 has Fold terminal child at index 5
+        // with pot=10 (the pot at the decision point before fold).
+        assert!((tree.pot_at_node(4) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pot_at_node_chance_in_built_tree() {
+        // Build a real tree and verify pot_at_node on its chance nodes.
+        let tree = simple_tree(); // 20bb stacks, 1/2 blinds
+        let chances: Vec<u32> = tree.nodes.iter().enumerate()
+            .filter_map(|(i, n)| {
+                if matches!(n, GameNode::Chance { .. }) { Some(i as u32) } else { None }
+            })
+            .collect();
+        assert!(!chances.is_empty(), "built tree should have chance nodes");
+        for &c in &chances {
+            let pot = tree.pot_at_node(c);
+            assert!(pot > 0.0, "pot at chance node {c} should be positive, got {pot}");
         }
     }
 }
