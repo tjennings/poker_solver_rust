@@ -5,9 +5,10 @@ status: todo
 type: task
 priority: normal
 created_at: 2026-04-23T19:17:15Z
-updated_at: 2026-04-24T04:32:59Z
+updated_at: 2026-04-24T04:48:20Z
 blocked_by:
     - poker_solver_rust-lay5
+    - poker_solver_rust-02wj
 ---
 
 ## Context
