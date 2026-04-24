@@ -6,6 +6,7 @@ mod query;
 
 use crate::action_tree::*;
 use crate::card::*;
+use crate::interface::GameNode;
 use crate::mutex_like::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -319,6 +320,52 @@ impl PostFlopGame {
     /// Returns the number of valid card combinations.
     pub fn num_combinations_f64(&self) -> f64 {
         self.num_combinations
+    }
+
+    /// Returns per-hand `(V_T, V_F, sigma_T, sigma_F)` at a gadget decision node.
+    ///
+    /// `gadget_node_idx` must be the arena index of a 2-action decision node
+    /// (the gadget Terminate/Follow choice). The game must be solved and
+    /// compression must be disabled.
+    ///
+    /// Both strategy and cfvalues use action-major layout:
+    /// `[action_0 for all hands, action_1 for all hands]` where action 0 is
+    /// Terminate and action 1 is Follow.
+    pub fn gadget_decision_diagnostic(
+        &self,
+        gadget_node_idx: usize,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        assert!(
+            self.state >= State::Solved,
+            "gadget_decision_diagnostic requires a solved game"
+        );
+        assert!(
+            !self.is_compression_enabled,
+            "gadget_decision_diagnostic does not support compression"
+        );
+        let node = self.node_arena[gadget_node_idx].lock();
+        assert!(
+            !node.is_terminal() && !node.is_chance(),
+            "gadget_decision_diagnostic requires a decision node"
+        );
+        assert_eq!(
+            node.num_actions(),
+            2,
+            "gadget_decision_diagnostic requires exactly 2 actions (Terminate/Follow)"
+        );
+        let num_hands = node.num_elements as usize / 2;
+        let strategy = crate::utility::normalized_strategy(node.strategy(), 2);
+        let cfv = node.cfvalues();
+
+        (0..num_hands)
+            .map(|h| {
+                let v_t = cfv[h];             // action 0 (Terminate), hand h
+                let v_f = cfv[num_hands + h]; // action 1 (Follow), hand h
+                let s_t = strategy[h];
+                let s_f = strategy[num_hands + h];
+                (v_t, v_f, s_t, s_f)
+            })
+            .collect()
     }
 }
 
