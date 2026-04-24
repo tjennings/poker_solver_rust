@@ -90,6 +90,23 @@ impl PostFlopNode {
         self.player
     }
 
+    /// Returns true if this is a gadget Decision node (per-boundary CFR-D gadget).
+    #[inline]
+    pub fn is_gadget(&self) -> bool {
+        self.player & PLAYER_GADGET_FLAG != 0
+    }
+
+    /// Returns the gadget owner player (0=OOP, 1=IP) if this is a gadget
+    /// Decision node, or `None` for non-gadget nodes.
+    #[inline]
+    pub fn gadget_owner(&self) -> Option<usize> {
+        if self.is_gadget() {
+            Some((self.player & PLAYER_MASK) as usize)
+        } else {
+            None
+        }
+    }
+
     /// Returns the child nodes as a slice.
     ///
     /// # Safety

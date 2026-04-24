@@ -16,6 +16,7 @@ pub const PLAYER_CHANCE_FLAG: u8 = 4; // chance_player = PLAYER_CHANCE_FLAG | pr
 pub const PLAYER_TERMINAL_FLAG: u8 = 8;
 pub const PLAYER_FOLD_FLAG: u8 = 24; // TERMINAL_FLAG(8) | 16
 pub const PLAYER_DEPTH_BOUNDARY_FLAG: u8 = 40; // TERMINAL_FLAG(8) | 32
+pub const PLAYER_GADGET_FLAG: u8 = 64; // bit 6: marks gadget Decision nodes
 
 // ---------------------------------------------------------------------------
 // Action
