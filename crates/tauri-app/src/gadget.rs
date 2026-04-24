@@ -315,26 +315,46 @@ fn summary(cfvs: &[f32]) -> (f32, f32, f32) {
     (mn, (sum / cfvs.len() as f64) as f32, mx)
 }
 
-/// Guards per-boundary log lines so we print once per boundary per process,
-/// not once per call. Flip to `false` to disable gadget diagnostics.
-static GADGET_DIAG_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-static GADGET_DIAG_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
-    std::sync::OnceLock::new();
+/// Controls gadget diagnostic logging. `stride` = log every Nth call per
+/// boundary (stride=1 → every call; stride=0 → disabled). Per-boundary
+/// atomic counters produce the call index shown in the log.
+static GADGET_DIAG_STRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(20);
+static GADGET_DIAG_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, u64>>,
+> = std::sync::OnceLock::new();
 
-fn diag_fire_once(boundary_ordinal: usize) -> bool {
-    if !GADGET_DIAG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
+/// Returns `Some(call_idx)` if this call should be logged, else `None`.
+/// `call_idx` is the 1-based count of compute_cfvs_both calls for this
+/// boundary_ordinal.
+fn diag_fire(boundary_ordinal: usize) -> Option<u64> {
+    let stride = GADGET_DIAG_STRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if stride == 0 {
+        return None;
     }
-    let seen = GADGET_DIAG_SEEN
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mut guard = seen.lock().expect("diag set poisoned");
-    guard.insert(boundary_ordinal)
+    let counts = GADGET_DIAG_COUNTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = counts.lock().expect("diag counts poisoned");
+    let entry = guard.entry(boundary_ordinal).or_insert(0);
+    *entry += 1;
+    let idx = *entry;
+    // Always log the first call + every strideth thereafter.
+    if idx == 1 || idx % stride as u64 == 0 {
+        Some(idx)
+    } else {
+        None
+    }
 }
 
-/// Disable gadget diagnostic prints (useful for tests).
+/// Set the diagnostic log stride. `0` disables. `1` logs every call.
+/// Default is `20`.
+pub fn set_gadget_diag_stride(stride: usize) {
+    GADGET_DIAG_STRIDE.store(stride, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Disable gadget diagnostic prints entirely. Kept for test compatibility.
 pub fn set_gadget_diag_enabled(enabled: bool) {
-    GADGET_DIAG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    set_gadget_diag_stride(if enabled { 20 } else { 0 });
 }
 
 impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
@@ -400,40 +420,32 @@ impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
             &ip_inner, &oop_inner, &oop_opt_out,
         );
 
-        // One-time diagnostic: print params, inner/opt-out summaries, clamp stats.
-        // Fires once per (boundary_ordinal, process) so per-iter calls don't spam.
-        if diag_fire_once(self.boundary_ordinal) {
+        // Per-N-calls diagnostic: prove ranges and CFVs are evolving across
+        // iters. Logs first call + every `stride`-th thereafter per boundary.
+        if let Some(call_idx) = diag_fire(self.boundary_ordinal) {
             let b = self.boundary_ordinal;
-            let board: String = self
-                .board
-                .iter()
-                .map(|&c| range_solver::card::card_to_string(c).unwrap_or_else(|_| "??".to_string()))
-                .collect();
+            // Reach summaries — shows the parent DCFR's evolving ranges.
+            let (oor_min, oor_mean, oor_max) = summary(oop_reach);
+            let oor_nonzero = oop_reach.iter().filter(|&&w| w > 1e-6).count();
+            let (ipr_min, ipr_mean, ipr_max) = summary(ip_reach);
+            let ipr_nonzero = ip_reach.iter().filter(|&&w| w > 1e-6).count();
+            // CFV summaries.
             let (oi_min, oi_mean, oi_max) = summary(&oop_inner);
             let (ii_min, ii_mean, ii_max) = summary(&ip_inner);
-            let (oo_min, oo_mean, oo_max) = summary(&oop_opt_out);
-            let (io_min, io_mean, io_max) = summary(&ip_opt_out);
-            let (oc_min, oc_mean, oc_max) = summary(&oop_clamped);
-            let (ic_min, ic_mean, ic_max) = summary(&ip_clamped);
             eprintln!(
-                "[gadget] boundary={b} board={board} pot={pot} stack={eff_stack} \
-                 hands=(oop={num_oop},ip={num_ip})\n  \
-                 inner_OOP  min/mean/max = {oi_min:+.3} / {oi_mean:+.3} / {oi_max:+.3}\n  \
-                 optout_OOP min/mean/max = {oo_min:+.3} / {oo_mean:+.3} / {oo_max:+.3}  \
-                 clamped {oop_clamped_n}/{oop_total} hands, max_Δ={oop_max_d:+.3}, mean_Δ={oop_mean_d:+.3}\n  \
-                 final_OOP  min/mean/max = {oc_min:+.3} / {oc_mean:+.3} / {oc_max:+.3}\n  \
-                 inner_IP   min/mean/max = {ii_min:+.3} / {ii_mean:+.3} / {ii_max:+.3}\n  \
-                 optout_IP  min/mean/max = {io_min:+.3} / {io_mean:+.3} / {io_max:+.3}  \
-                 clamped {ip_clamped_n}/{ip_total} hands, max_Δ={ip_max_d:+.3}, mean_Δ={ip_mean_d:+.3}\n  \
-                 final_IP   min/mean/max = {ic_min:+.3} / {ic_mean:+.3} / {ic_max:+.3}",
-                oop_clamped_n = oop_clamp_stats.hands_clamped,
-                oop_total = oop_clamp_stats.hands_total,
-                oop_max_d = oop_clamp_stats.max_delta,
-                oop_mean_d = oop_clamp_stats.mean_delta,
-                ip_clamped_n = ip_clamp_stats.hands_clamped,
-                ip_total = ip_clamp_stats.hands_total,
-                ip_max_d = ip_clamp_stats.max_delta,
-                ip_mean_d = ip_clamp_stats.mean_delta,
+                "[gadget] b={b} call={call_idx} pot={pot} \
+                 reach_OOP(nz={oor_nonzero}, min/mean/max={oor_min:+.3}/{oor_mean:+.3}/{oor_max:+.3}) \
+                 reach_IP(nz={ipr_nonzero}, min/mean/max={ipr_min:+.3}/{ipr_mean:+.3}/{ipr_max:+.3})\n  \
+                 inner_OOP(min/mean/max={oi_min:+.3}/{oi_mean:+.3}/{oi_max:+.3})  \
+                 clamped_IP={ip_cn}/{ip_ct} max_Δ={ip_mx:+.3}\n  \
+                 inner_IP (min/mean/max={ii_min:+.3}/{ii_mean:+.3}/{ii_max:+.3})  \
+                 clamped_OOP={op_cn}/{op_ct} max_Δ={op_mx:+.3}",
+                ip_cn = ip_clamp_stats.hands_clamped,
+                ip_ct = ip_clamp_stats.hands_total,
+                ip_mx = ip_clamp_stats.max_delta,
+                op_cn = oop_clamp_stats.hands_clamped,
+                op_ct = oop_clamp_stats.hands_total,
+                op_mx = oop_clamp_stats.max_delta,
             );
         }
 
