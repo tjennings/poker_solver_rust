@@ -453,6 +453,46 @@ impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
     }
 }
 
+/// BoundaryEvaluator that returns pre-stored per-hand CFVs, ignoring reach.
+/// Used for the gadget Terminate terminals (boundary ordinals 0 and 1).
+pub struct StaticGadgetEvaluator {
+    oop_cfvs: Vec<f32>,
+    ip_cfvs: Vec<f32>,
+}
+
+impl StaticGadgetEvaluator {
+    pub fn new(oop_cfvs: Vec<f32>, ip_cfvs: Vec<f32>) -> Self {
+        Self { oop_cfvs, ip_cfvs }
+    }
+}
+
+impl range_solver::game::BoundaryEvaluator for StaticGadgetEvaluator {
+    fn compute_cfvs(
+        &self,
+        player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        if player == 0 { self.oop_cfvs.clone() } else { self.ip_cfvs.clone() }
+    }
+
+    fn compute_cfvs_both(
+        &self,
+        _pot: i32,
+        _remaining_stack: f64,
+        _oop_reach: &[f32],
+        _ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        (self.oop_cfvs.clone(), self.ip_cfvs.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,5 +1212,52 @@ mod tests {
         // inner = [0.8, -0.3, 0.1], opt_out = 0.0
         // => [0.8, 0.0, 0.1] (hand 1 clamped from -0.3 to 0.0)
         assert_eq!(oop_cfvs, vec![0.8, 0.0, 0.1]);
+    }
+
+    // ---------------------------------------------------------------
+    // StaticGadgetEvaluator tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn static_gadget_evaluator_returns_stored_cfvs_regardless_of_reach() {
+        let oop = vec![0.1, 0.2, 0.3];
+        let ip  = vec![-0.5, -0.6];
+        let eval = StaticGadgetEvaluator::new(oop.clone(), ip.clone());
+
+        // compute_cfvs_both returns stored CFVs independent of reach/pot/etc.
+        let (o, i) = eval.compute_cfvs_both(
+            /* pot */      100,
+            /* stack */    50.0,
+            /* oop_reach*/ &[1.0; 3],
+            /* ip_reach */ &[1.0; 2],
+            /* num_oop */  3,
+            /* num_ip  */  2,
+            /* cont_idx */ 0,
+        );
+        assert_eq!(o, oop);
+        assert_eq!(i, ip);
+
+        // Reach values are ignored.
+        let (o2, i2) = eval.compute_cfvs_both(
+            50, 10.0, &[0.01; 3], &[0.01; 2], 3, 2, 0,
+        );
+        assert_eq!(o2, oop);
+        assert_eq!(i2, ip);
+    }
+
+    #[test]
+    fn static_gadget_evaluator_compute_cfvs_single_side() {
+        let oop = vec![0.1, 0.2];
+        let ip  = vec![0.3, 0.4];
+        let eval = StaticGadgetEvaluator::new(oop.clone(), ip.clone());
+
+        assert_eq!(
+            eval.compute_cfvs(0, 100, 50.0, &[1.0; 2], 2, 0),
+            oop,
+        );
+        assert_eq!(
+            eval.compute_cfvs(1, 100, 50.0, &[1.0; 2], 2, 0),
+            ip,
+        );
     }
 }
