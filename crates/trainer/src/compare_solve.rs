@@ -1176,10 +1176,13 @@ pub fn run(
     let _ = dump_boundary_cfvs;
 
     // 7b. Build boundary tracer (no-op if --trace-boundaries not given)
-    let tracer = trace_config.into_tracer(iters);
+    // In gadget-tree mode ordinals 0 and 1 are static gadget terminals
+    // whose CFVs never change during solve -- skip tracing them.
+    let skip = if gadget_tree_active { 2 } else { 0 };
+    let tracer = trace_config.into_tracer_with_skip(iters, skip);
     if tracer.is_some() {
         eprintln!(
-            "[compare] boundary tracing enabled ({n_boundaries} boundaries)"
+            "[compare] boundary tracing enabled ({n_boundaries} boundaries, skip {skip} leading)"
         );
     }
 

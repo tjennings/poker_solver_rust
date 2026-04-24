@@ -550,12 +550,24 @@ impl TraceConfig {
     ///
     /// Returns `None` if tracing is disabled (no --trace-boundaries flag).
     pub fn into_tracer(self, total_iters: u32) -> Option<BoundaryTracer> {
+        self.into_tracer_with_skip(total_iters, 0)
+    }
+
+    /// Build a `BoundaryTracer`, skipping the first `skip_leading` ordinals.
+    ///
+    /// Pass `2` in gadget-tree mode to avoid tracing the static gadget
+    /// terminals at ordinals 0 and 1. Pass `0` otherwise.
+    pub fn into_tracer_with_skip(
+        self,
+        total_iters: u32,
+        skip_leading: usize,
+    ) -> Option<BoundaryTracer> {
         let ord_filter = TraceFilter::parse(self.boundaries.as_deref());
         if matches!(ord_filter, TraceFilter::None) {
             return None;
         }
         let iter_filter = TraceFilter::parse_iters(&self.iters_str, total_iters);
-        Some(BoundaryTracer::new(ord_filter, iter_filter, self.dir))
+        Some(BoundaryTracer::new(ord_filter, iter_filter, self.dir, skip_leading))
     }
 }
 
@@ -780,27 +792,39 @@ pub struct BoundaryTracer {
     enabled_iters: TraceFilter,
     trace_dir: PathBuf,
     handles: Mutex<HashMap<usize, std::io::BufWriter<std::fs::File>>>,
+    /// Ordinals below this threshold are unconditionally skipped.
+    /// Set to 2 in gadget-tree mode to avoid tracing the static gadget
+    /// terminals at ordinals 0 and 1.
+    skip_leading_ordinals: usize,
 }
 
 impl BoundaryTracer {
-    pub fn new(ords: TraceFilter, iters: TraceFilter, dir: PathBuf) -> Self {
+    pub fn new(
+        ords: TraceFilter,
+        iters: TraceFilter,
+        dir: PathBuf,
+        skip_leading_ordinals: usize,
+    ) -> Self {
         Self {
             enabled_ordinals: ords,
             enabled_iters: iters,
             trace_dir: dir,
             handles: Mutex::new(HashMap::new()),
+            skip_leading_ordinals,
         }
     }
 
     /// Returns true if this (ord, iter) pair should be traced.
     pub fn enabled(&self, ord: usize, iter: u32) -> bool {
-        self.enabled_ordinals.matches(ord) && self.enabled_iters.matches(iter as usize)
+        ord >= self.skip_leading_ordinals
+            && self.enabled_ordinals.matches(ord)
+            && self.enabled_iters.matches(iter as usize)
     }
 
     /// Returns true if this ordinal is enabled, ignoring the iter filter.
     /// Used for the forced "capture-at-loop-exit" path.
     pub fn ordinal_enabled(&self, ord: usize) -> bool {
-        self.enabled_ordinals.matches(ord)
+        ord >= self.skip_leading_ordinals && self.enabled_ordinals.matches(ord)
     }
 
     /// Write a trace event for one boundary at one iteration.
@@ -1322,6 +1346,7 @@ mod tests {
             TraceFilter::Set(HashSet::from([0, 42])),
             TraceFilter::Set(HashSet::from([5, 9])),
             PathBuf::from("/tmp/test_traces"),
+            0,
         );
         assert!(tracer.enabled(0, 5));
         assert!(tracer.enabled(42, 9));
@@ -1336,6 +1361,7 @@ mod tests {
             TraceFilter::None,
             TraceFilter::All,
             PathBuf::from("/tmp/test_traces"),
+            0,
         );
         assert!(!tracer.enabled(0, 0));
     }
@@ -1526,6 +1552,7 @@ mod tests {
             TraceFilter::All,
             TraceFilter::All,
             dir.clone(),
+            0,
         );
         let event = BoundaryTraceEvent {
             board: "Jd9d7dQc".to_string(),
@@ -1563,6 +1590,7 @@ mod tests {
             TraceFilter::Set(HashSet::from([10])),
             TraceFilter::All,
             dir.clone(),
+            0,
         );
         let event = BoundaryTraceEvent {
             board: "Ah2c3d".to_string(),
@@ -1580,6 +1608,137 @@ mod tests {
         assert!(!path.exists(), "file should not exist for disabled ordinal");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // build_preceding_decision_map tests
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // skip_leading_ordinals tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tracer_skips_leading_ordinals() {
+        let dir = std::env::temp_dir().join(format!(
+            "gadget_tracer_skip_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tracer = BoundaryTracer::new(
+            TraceFilter::All,
+            TraceFilter::All,
+            dir.clone(),
+            2, // skip first 2 ordinals
+        );
+
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: vec![1.0; 1326],
+            ip_range_1326: vec![1.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: None,
+        };
+
+        tracer.trace(0, 0, &event);
+        tracer.trace(1, 0, &event);
+        tracer.trace(2, 0, &event);
+
+        assert!(
+            !dir.join("boundary_0.txt").exists(),
+            "ordinal 0 should be skipped"
+        );
+        assert!(
+            !dir.join("boundary_1.txt").exists(),
+            "ordinal 1 should be skipped"
+        );
+        assert!(
+            dir.join("boundary_2.txt").exists(),
+            "ordinal 2 should be traced"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracer_skip_zero_traces_all() {
+        let dir = std::env::temp_dir().join(format!(
+            "gadget_tracer_skip0_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tracer = BoundaryTracer::new(
+            TraceFilter::All,
+            TraceFilter::All,
+            dir.clone(),
+            0, // skip nothing
+        );
+
+        let event = BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: vec![1.0; 1326],
+            ip_range_1326: vec![1.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: None,
+        };
+
+        tracer.trace(0, 0, &event);
+        tracer.trace(1, 0, &event);
+
+        assert!(
+            dir.join("boundary_0.txt").exists(),
+            "ordinal 0 should be traced when skip=0"
+        );
+        assert!(
+            dir.join("boundary_1.txt").exists(),
+            "ordinal 1 should be traced when skip=0"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracer_enabled_respects_skip_leading() {
+        let tracer = BoundaryTracer::new(
+            TraceFilter::All,
+            TraceFilter::All,
+            PathBuf::from("/tmp/test_traces"),
+            2,
+        );
+        assert!(!tracer.enabled(0, 0), "ord 0 should be disabled");
+        assert!(!tracer.enabled(1, 5), "ord 1 should be disabled");
+        assert!(tracer.enabled(2, 0), "ord 2 should be enabled");
+        assert!(tracer.enabled(100, 0), "ord 100 should be enabled");
+    }
+
+    #[test]
+    fn tracer_ordinal_enabled_respects_skip_leading() {
+        let tracer = BoundaryTracer::new(
+            TraceFilter::All,
+            TraceFilter::All,
+            PathBuf::from("/tmp/test_traces"),
+            2,
+        );
+        assert!(
+            !tracer.ordinal_enabled(0),
+            "ord 0 should be disabled via ordinal_enabled"
+        );
+        assert!(
+            !tracer.ordinal_enabled(1),
+            "ord 1 should be disabled via ordinal_enabled"
+        );
+        assert!(
+            tracer.ordinal_enabled(2),
+            "ord 2 should be enabled via ordinal_enabled"
+        );
     }
 
     // ---------------------------------------------------------------
