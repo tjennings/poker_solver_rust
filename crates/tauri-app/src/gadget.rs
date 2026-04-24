@@ -230,22 +230,100 @@ impl GadgetEvaluator {
     }
 }
 
+/// Stats from a single clamp pass: how many hands were pushed up by the
+/// opt-out floor, and by how much. Diagnostic-only.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClampStats {
+    pub hands_clamped: usize,
+    pub hands_total: usize,
+    pub max_delta: f32,
+    pub mean_delta: f32,
+}
+
 /// Apply opt-out clamping: for each opponent hand, clamp CFV upward
-/// to the opt-out value. Returns the adjusted (player_cfvs, opp_cfvs).
+/// to the opt-out value. Returns the adjusted (player_cfvs, opp_cfvs)
+/// plus stats on how many hands were actually clamped.
 fn apply_gadget_clamp(
     player_cfvs: &[f32],
     opp_cfvs: &[f32],
     opt_out_cfvs: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
-    // Clamp opponent CFVs upward to opt-out
-    let clamped_opp: Vec<f32> = opp_cfvs.iter()
+) -> (Vec<f32>, Vec<f32>, ClampStats) {
+    let mut hands_clamped = 0usize;
+    let mut max_delta = 0.0f32;
+    let mut total_delta = 0.0f64;
+
+    let clamped_opp: Vec<f32> = opp_cfvs
+        .iter()
         .zip(opt_out_cfvs.iter())
-        .map(|(&inner, &opt)| inner.max(opt))
+        .map(|(&inner, &opt)| {
+            if opt > inner {
+                hands_clamped += 1;
+                let d = opt - inner;
+                total_delta += d as f64;
+                if d > max_delta {
+                    max_delta = d;
+                }
+                opt
+            } else {
+                inner
+            }
+        })
         .collect();
-    // Player CFVs stay the same -- the gadget only constrains the opponent.
-    // In the bcfv interface, player and opponent values are independent
-    // per-hand scalars (not directly zero-sum per-combo).
-    (player_cfvs.to_vec(), clamped_opp)
+
+    let mean_delta = if hands_clamped > 0 {
+        (total_delta / hands_clamped as f64) as f32
+    } else {
+        0.0
+    };
+    let stats = ClampStats {
+        hands_clamped,
+        hands_total: opp_cfvs.len(),
+        max_delta,
+        mean_delta,
+    };
+
+    // Player CFVs stay the same -- gadget only constrains opponent.
+    (player_cfvs.to_vec(), clamped_opp, stats)
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic logging
+// ---------------------------------------------------------------------------
+
+/// Summary stats over a per-hand CFV vector (for diagnostic logging).
+fn summary(cfvs: &[f32]) -> (f32, f32, f32) {
+    if cfvs.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let (mut mn, mut mx, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+    for &v in cfvs {
+        if v < mn { mn = v; }
+        if v > mx { mx = v; }
+        sum += v as f64;
+    }
+    (mn, (sum / cfvs.len() as f64) as f32, mx)
+}
+
+/// Guards per-boundary log lines so we print once per boundary per process,
+/// not once per call. Flip to `false` to disable gadget diagnostics.
+static GADGET_DIAG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static GADGET_DIAG_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::OnceLock::new();
+
+fn diag_fire_once(boundary_ordinal: usize) -> bool {
+    if !GADGET_DIAG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let seen = GADGET_DIAG_SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = seen.lock().expect("diag set poisoned");
+    guard.insert(boundary_ordinal)
+}
+
+/// Disable gadget diagnostic prints (useful for tests).
+pub fn set_gadget_diag_enabled(enabled: bool) {
+    GADGET_DIAG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
@@ -303,13 +381,51 @@ impl range_solver::game::BoundaryEvaluator for GadgetEvaluator {
             &self.board, &self.private_cards[1],
         );
         // When computing OOP cfvs, IP is opponent => clamp IP upward
-        let (_oop_adj_for_oop, ip_clamped) = apply_gadget_clamp(
+        let (_oop_adj_for_oop, ip_clamped, ip_clamp_stats) = apply_gadget_clamp(
             &oop_inner, &ip_inner, &ip_opt_out,
         );
         // When computing IP cfvs, OOP is opponent => clamp OOP upward
-        let (_ip_adj_for_ip, oop_clamped) = apply_gadget_clamp(
+        let (_ip_adj_for_ip, oop_clamped, oop_clamp_stats) = apply_gadget_clamp(
             &ip_inner, &oop_inner, &oop_opt_out,
         );
+
+        // One-time diagnostic: print params, inner/opt-out summaries, clamp stats.
+        // Fires once per (boundary_ordinal, process) so per-iter calls don't spam.
+        if diag_fire_once(self.boundary_ordinal) {
+            let b = self.boundary_ordinal;
+            let board: String = self
+                .board
+                .iter()
+                .map(|&c| range_solver::card::card_to_string(c).unwrap_or_else(|_| "??".to_string()))
+                .collect();
+            let (oi_min, oi_mean, oi_max) = summary(&oop_inner);
+            let (ii_min, ii_mean, ii_max) = summary(&ip_inner);
+            let (oo_min, oo_mean, oo_max) = summary(&oop_opt_out);
+            let (io_min, io_mean, io_max) = summary(&ip_opt_out);
+            let (oc_min, oc_mean, oc_max) = summary(&oop_clamped);
+            let (ic_min, ic_mean, ic_max) = summary(&ip_clamped);
+            eprintln!(
+                "[gadget] boundary={b} board={board} pot={pot} stack={eff_stack} \
+                 hands=(oop={num_oop},ip={num_ip})\n  \
+                 inner_OOP  min/mean/max = {oi_min:+.3} / {oi_mean:+.3} / {oi_max:+.3}\n  \
+                 optout_OOP min/mean/max = {oo_min:+.3} / {oo_mean:+.3} / {oo_max:+.3}  \
+                 clamped {oop_clamped_n}/{oop_total} hands, max_Δ={oop_max_d:+.3}, mean_Δ={oop_mean_d:+.3}\n  \
+                 final_OOP  min/mean/max = {oc_min:+.3} / {oc_mean:+.3} / {oc_max:+.3}\n  \
+                 inner_IP   min/mean/max = {ii_min:+.3} / {ii_mean:+.3} / {ii_max:+.3}\n  \
+                 optout_IP  min/mean/max = {io_min:+.3} / {io_mean:+.3} / {io_max:+.3}  \
+                 clamped {ip_clamped_n}/{ip_total} hands, max_Δ={ip_max_d:+.3}, mean_Δ={ip_mean_d:+.3}\n  \
+                 final_IP   min/mean/max = {ic_min:+.3} / {ic_mean:+.3} / {ic_max:+.3}",
+                oop_clamped_n = oop_clamp_stats.hands_clamped,
+                oop_total = oop_clamp_stats.hands_total,
+                oop_max_d = oop_clamp_stats.max_delta,
+                oop_mean_d = oop_clamp_stats.mean_delta,
+                ip_clamped_n = ip_clamp_stats.hands_clamped,
+                ip_total = ip_clamp_stats.hands_total,
+                ip_max_d = ip_clamp_stats.max_delta,
+                ip_mean_d = ip_clamp_stats.mean_delta,
+            );
+        }
+
         (oop_clamped, ip_clamped)
     }
 }
