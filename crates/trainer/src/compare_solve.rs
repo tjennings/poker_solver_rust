@@ -815,10 +815,11 @@ fn format_hand(c1: u8, c2: u8) -> String {
     format!("{s1}{s2}")
 }
 
-/// Build the subgame game via Option A tree-structural gadget path.
+/// Build the subgame game via Option A2 per-boundary gadget path.
 ///
-/// Uses `make_gadget_game` to prepend gadget decision nodes, then wires
-/// boundary evaluators for ordinals 2+ (real depth boundaries).
+/// Injects a 4-node gadget subtree at each cfvnet depth-boundary terminal.
+/// Post-injection ordinals: 0..N = cfvnet boundaries (stable), N..3N = gadget
+/// terminals (pre-populated with opt-out values).
 #[allow(clippy::too_many_arguments)]
 fn build_gadget_tree_game(
     board: &[String],
@@ -835,12 +836,67 @@ fn build_gadget_tree_game(
     gadget_provider: &str,
     gadget_constant: f32,
 ) -> Result<PostFlopGame, String> {
-    // Build a temporary game to extract private_cards (needed for opt-out
-    // computation and inner evaluator). Then build the real gadget game.
     let board_u8: Vec<u8> = board_cards.iter()
         .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
         .collect();
 
+    // Build inner boundary evaluator (handles cfvnet ordinals 0..N).
+    let inner_evaluator = build_inner_evaluator(
+        board, oop_w, ip_w, pot, eff_stack, bet_sizes, depth_limit,
+        &board_u8, boundary_cut,
+    )?;
+
+    // Build the gadget game via the appropriate provider.
+    let (card_config, action_tree) = build_solve_game_parts(
+        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+    )?;
+
+    let game = match gadget_provider {
+        "constant" => {
+            eprintln!("[compare] gadget-tree (A2): ConstantOptOut({gadget_constant})");
+            gadget::make_per_boundary_gadget_game_constant(
+                card_config, action_tree, gadget_constant, inner_evaluator,
+            )?
+        }
+        "blueprint-cbv" => {
+            eprintln!("[compare] gadget-tree (A2): BlueprintCbvOptOut (per-boundary pot)");
+            gadget::make_per_boundary_gadget_game(
+                card_config, action_tree, ctx, current_node,
+                &board_u8, inner_evaluator,
+            )?
+        }
+        other => {
+            return Err(format!(
+                "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
+            ));
+        }
+    };
+
+    let n_total = game.num_boundary_nodes();
+    let n_original = n_total / 3;
+    eprintln!(
+        "[compare] gadget-tree (A2): {} original boundaries, {} total (incl. {} gadget terminals)",
+        n_original, n_total, n_total - n_original,
+    );
+
+    Ok(game)
+}
+
+/// Build the inner boundary evaluator for cfvnet ordinals 0..N.
+///
+/// Extracted from `build_gadget_tree_game` to keep it under the 60-line limit.
+#[allow(clippy::too_many_arguments)]
+fn build_inner_evaluator(
+    board: &[String],
+    oop_w: &[f32],
+    ip_w: &[f32],
+    pot: i32,
+    eff_stack: i32,
+    bet_sizes: &[Vec<f64>],
+    depth_limit: Option<u8>,
+    board_u8: &[u8],
+    boundary_cut: &Option<(u8, BoundaryKind)>,
+) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
     let (tmp_cc, tmp_at) = build_solve_game_parts(
         board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
     )?;
@@ -853,25 +909,17 @@ fn build_gadget_tree_game(
     let tree_cfg = tmp_game.tree_config().clone();
     drop(tmp_game);
 
-    let [opt_out_oop, opt_out_ip] = compute_opt_out_values(
-        gadget_provider, gadget_constant, ctx, current_node,
-        pot as f32, &board_u8, &private_cards,
-    )?;
-
-    let gadget_config = range_solver::game::gadget::GadgetConfig {
-        opt_out_oop,
-        opt_out_ip,
-        outer_player: 1, // IP outer (default)
-    };
-
-    // Build inner boundary evaluator for ordinals 2+.
-    let inner_evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
+    let initial_weights = [
+        vec![1.0f32; private_cards[0].len()],
+        vec![1.0f32; private_cards[1].len()],
+    ];
+    let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
         match boundary_cut {
             Some((_, BoundaryKind::ExactSubtree)) | None => {
                 Arc::new(poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
-                    board_u8.clone(),
-                    private_cards.clone(),
-                    [vec![1.0; private_cards[0].len()], vec![1.0; private_cards[1].len()]],
+                    board_u8.to_vec(),
+                    private_cards,
+                    initial_weights,
                     tree_cfg,
                 ).with_solve_iters(500))
             }
@@ -881,33 +929,12 @@ fn build_gadget_tree_game(
                 ).map_err(|e| format!("ONNX session load failed: {e}"))?;
                 Arc::new(cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
                     session,
-                    board_u8.clone(),
-                    private_cards.clone(),
+                    board_u8.to_vec(),
+                    private_cards,
                 ))
             }
         };
-
-    // Build the real gadget game (consuming fresh card_config + action_tree).
-    let (card_config, action_tree) = build_solve_game_parts(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
-    )?;
-    let game = gadget::make_gadget_game(
-        card_config, action_tree, gadget_config, inner_evaluator,
-    )?;
-
-    // Wire per-boundary evaluators for ordinals 2+ (real depth boundaries).
-    // make_gadget_game already set ordinals 0/1 to StaticGadgetEvaluator
-    // and set boundary_evaluator for ordinals 2+.
-    // Additional per-boundary evaluators beyond the generic boundary_evaluator
-    // are not needed here — the generic evaluator handles all real boundaries.
-
-    let n_real_boundaries = game.num_boundary_nodes().saturating_sub(2);
-    eprintln!(
-        "[compare] gadget-tree mode: {} real boundaries + 2 gadget ordinals",
-        n_real_boundaries,
-    );
-
-    Ok(game)
+    Ok(evaluator)
 }
 
 /// Set up legacy clamp-path boundary evaluators (--gadget-clamp mode).
@@ -956,38 +983,6 @@ fn setup_clamp_boundaries(
         }
     }
     Ok(())
-}
-
-/// Compute per-hand opt-out bcfv values for the gadget tree path.
-///
-/// Returns `[opt_out_oop, opt_out_ip]` vectors.
-fn compute_opt_out_values(
-    gadget_provider: &str,
-    gadget_constant: f32,
-    ctx: &Arc<CbvContext>,
-    current_node: u32,
-    subgame_pot_chips: f32,
-    board_u8: &[u8],
-    private_cards: &[Vec<(u8, u8)>; 2],
-) -> Result<[Vec<f32>; 2], String> {
-    match gadget_provider {
-        "constant" => {
-            eprintln!("[compare] gadget-tree: ConstantOptOut({gadget_constant})");
-            Ok([
-                vec![gadget_constant; private_cards[0].len()],
-                vec![gadget_constant; private_cards[1].len()],
-            ])
-        }
-        "blueprint-cbv" => {
-            eprintln!("[compare] gadget-tree: BlueprintCbvOptOut (per-boundary pot)");
-            Ok(gadget::BlueprintCbvOptOut::opt_out_at_subgame_root(
-                ctx, current_node, subgame_pot_chips, board_u8, private_cards,
-            ))
-        }
-        other => Err(format!(
-            "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
-        )),
-    }
 }
 
 /// Compute an OptOutProvider for the legacy clamp path.

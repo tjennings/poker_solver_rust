@@ -242,6 +242,18 @@ fn solve_recursive<T: Game>(
         return;
     }
 
+    // Gadget disabled for non-owner: when the traverser is NOT the gadget
+    // owner, force sigma=(0,1) — skip straight to Follow (action 1).
+    // The owner's own pass uses standard Decision logic (fall-through),
+    // so regret-matching fires and the gadget sigma actually learns.
+    // Burch 2014 / Brown-Sandholm 2017: each player owns their gadget,
+    // updates regrets on own pass; opponent sees it as a passthrough.
+    if node.is_gadget() && node.gadget_owner() != Some(player) {
+        let child = &mut node.play(1);
+        solve_recursive(result, game, child, player, cfreach, params);
+        return;
+    }
+
     // Take scratch buffers from thread-local storage.
     let mut scratch = take_scratch();
 
@@ -330,7 +342,12 @@ fn solve_recursive<T: Game>(
         put_scratch(scratch);
     }
     // -- Current player's decision node --
-    else if node.player() == player {
+    // Use acting_player() to mask off flag bits (e.g. PLAYER_GADGET_FLAG).
+    // For non-gadget decision nodes, acting_player() == player() (0 or 1).
+    // For gadgets where owner == traverser (non-owner already returned
+    // above), the gadget is the owner's own decision — standard CFR
+    // regret-matching applies (owner updates regrets on own pass).
+    else if node.acting_player() == player {
         // Return scratch to TLS before child recursion.
         put_scratch(scratch);
 

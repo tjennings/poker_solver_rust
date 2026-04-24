@@ -1217,8 +1217,8 @@ fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
 
 /// Build the `CardConfig` and `ActionTree` for a postflop solve without
 /// constructing the `PostFlopGame`. Useful when the caller needs to pass
-/// these to `make_gadget_game` (Option A tree-structural gadget) rather
-/// than the normal `PostFlopGame::with_config` path.
+/// these to `make_per_boundary_gadget_game` or other paths that consume
+/// configs directly rather than building via `PostFlopGame::with_config`.
 ///
 /// When `exact` is true, `depth_limit` is set to `None` so the game tree
 /// extends through all remaining streets to showdown (no boundary nodes).
@@ -1307,49 +1307,12 @@ pub fn build_solve_game(
     Ok(game)
 }
 
-/// Build a gadget-tree `PostFlopGame` (Option A) for the Tauri solve path.
+/// Full per-boundary gadget game construction for the Tauri solve path.
 ///
-/// Mirrors the trainer's `build_gadget_tree_game` in `compare_solve.rs`:
-/// constructs a temporary game to discover private-card counts, builds a
-/// `GadgetConfig` from the provided opt-out values, then calls
-/// `make_gadget_game` with a fresh `CardConfig` + `ActionTree` and the
-/// given inner evaluator.
-///
-/// The resulting game has:
-/// - A gadget decision root with 2 actions (play / opt-out)
-/// - `per_boundary_evaluators[0/1]` = `StaticGadgetEvaluator`
-/// - `boundary_evaluator` = the inner evaluator (for ordinals 2+)
-pub fn build_gadget_tree_solve_game(
-    board: &[String],
-    oop_weights: &[f32],
-    ip_weights: &[f32],
-    pot: i32,
-    effective_stack: i32,
-    bet_sizes: &[Vec<f64>],
-    depth_limit: Option<u8>,
-    opt_out_values: &[Vec<f32>; 2],
-    inner_evaluator: Arc<dyn range_solver::game::BoundaryEvaluator>,
-) -> Result<PostFlopGame, String> {
-    let gadget_config = range_solver::game::gadget::GadgetConfig {
-        opt_out_oop: opt_out_values[0].clone(),
-        opt_out_ip: opt_out_values[1].clone(),
-        outer_player: 1,
-    };
-
-    let (card_config, action_tree) = build_solve_game_parts(
-        board, oop_weights, ip_weights, pot, effective_stack,
-        bet_sizes, false, depth_limit,
-    )?;
-    crate::gadget::make_gadget_game(card_config, action_tree, gadget_config, inner_evaluator)
-}
-
-/// Full gadget-tree game construction for the Tauri solve path.
-///
-/// Computes opt-out values from the blueprint CBV table, constructs the
-/// appropriate inner evaluator (cfvnet or exact-subtree), and delegates
-/// to [`build_gadget_tree_solve_game`].
-///
-/// Mirrors `build_gadget_tree_game` in `compare_solve.rs`.
+/// Uses Option A2: injects a 4-node gadget subtree at each cfvnet depth-boundary
+/// terminal. Post-injection, `game.root()` is the real subgame root (no gadget
+/// layer at the top). Cfvnet boundaries remain at ordinals 0..N; gadget terminals
+/// occupy N..3N with pre-populated opt-out values.
 #[allow(clippy::too_many_arguments)]
 fn build_gadget_tree_game_for_solve(
     board: &[String],
@@ -1372,7 +1335,36 @@ fn build_gadget_tree_game_for_solve(
         .map(|c| crate::exploration::rs_card_to_range_solver(c))
         .collect();
 
-    // Build a temporary game to discover private_cards and tree_config.
+    // Build inner boundary evaluator for cfvnet ordinals 0..N.
+    let inner_evaluator = build_inner_evaluator_for_solve(
+        board, oop_w, ip_w, pot, eff_stack, bet_sizes, depth_limit,
+        &board_u8, boundary_cut,
+    )?;
+
+    // Build gadget game via A2 per-boundary injection.
+    let (card_config, action_tree) = build_solve_game_parts(
+        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+    )?;
+    eprintln!("[solve] gadget-tree (A2): BlueprintCbvOptOut (per-boundary pot)");
+    crate::gadget::make_per_boundary_gadget_game(
+        card_config, action_tree, ctx, current_node_idx,
+        &board_u8, inner_evaluator,
+    )
+}
+
+/// Build the inner boundary evaluator for cfvnet ordinals 0..N (Tauri solve path).
+#[allow(clippy::too_many_arguments)]
+fn build_inner_evaluator_for_solve(
+    board: &[String],
+    oop_w: &[f32],
+    ip_w: &[f32],
+    pot: i32,
+    eff_stack: i32,
+    bet_sizes: &[Vec<f64>],
+    depth_limit: Option<u8>,
+    board_u8: &[u8],
+    boundary_cut: &Option<(u8, BoundaryKind)>,
+) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
     let (tmp_cc, tmp_at) = build_solve_game_parts(
         board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
     )?;
@@ -1383,23 +1375,17 @@ fn build_gadget_tree_game_for_solve(
         tmp_game.private_cards(1).to_vec(),
     ];
     let tree_cfg = tmp_game.tree_config().clone();
-    drop(tmp_game);
-
-    // Compute opt-out values at the subgame root.
-    let opt_out_values = crate::gadget::BlueprintCbvOptOut::opt_out_at_subgame_root(
-        ctx, current_node_idx, pot as f32, &board_u8, &private_cards,
-    );
-
-    // Build inner boundary evaluator for ordinals 2+.
     let initial_weights = [
         vec![1.0f32; private_cards[0].len()],
         vec![1.0f32; private_cards[1].len()],
     ];
-    let inner_evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
+    drop(tmp_game);
+
+    let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
         match boundary_cut {
             Some((_, BoundaryKind::ExactSubtree)) | None => {
                 Arc::new(crate::exact_subtree::SubtreeExactEvaluator::new(
-                    board_u8,
+                    board_u8.to_vec(),
                     private_cards,
                     initial_weights,
                     tree_cfg,
@@ -1411,17 +1397,12 @@ fn build_gadget_tree_game_for_solve(
                 ).map_err(|e| format!("ONNX session load failed: {e}"))?;
                 Arc::new(cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
                     session,
-                    board_u8,
+                    board_u8.to_vec(),
                     private_cards,
                 ))
             }
         };
-
-    eprintln!("[solve] gadget-tree: BlueprintCbvOptOut (subgame-root pot)");
-    build_gadget_tree_solve_game(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes,
-        depth_limit, &opt_out_values, inner_evaluator,
-    )
+    Ok(evaluator)
 }
 
 /// Convert a range-solver `Action` to a `GameAction`.
@@ -1451,32 +1432,9 @@ fn range_solver_action_to_game_action(
     }
 }
 
-/// Navigate a gadget-tree game past the gadget layer to the real subgame root.
-///
-/// The gadget layer is a solver-internal construct: 4 arena nodes (G_IP,
-/// G_IP.Terminate, G_OOP, G_OOP.Terminate) prepended to the tree so the
-/// solver can model opt-out/follow decisions. Explorer UI starts
-/// post-gadget (arena 4) so users see the real subgame.
-///
-/// Resets to `game.root()` (arena 0), then plays Follow (action index 1)
-/// at G_IP and G_OOP, landing on arena 4.
-fn advance_past_gadget(game: &mut PostFlopGame) {
+/// Build a `GameMatrix` from the current `PostFlopGame` state at the root.
+fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
     game.back_to_root();
-    game.play(1); // G_IP -> Follow -> G_OOP
-    game.play(1); // G_OOP -> Follow -> real subgame root (arena 4)
-}
-
-/// Build a `GameMatrix` from the current `PostFlopGame` state at the
-/// explorer-visible root.
-///
-/// When `gadget` is true, navigates to the real subgame root (arena 4)
-/// instead of the gadget root (arena 0).
-fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>, gadget: bool) -> GameMatrix {
-    if gadget {
-        advance_past_gadget(game);
-    } else {
-        game.back_to_root();
-    }
     build_solve_matrix_at_current(game, hand_evs)
 }
 
@@ -1591,11 +1549,9 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
 /// Walk the solved game tree and cache a `CachedSolveNode` at every decision node.
 ///
 /// Returns a map from action path (e.g., `[0, 1]`) to cached node data.
-/// When `gadget` is true, navigation starts from the real subgame root
-/// (arena 4) instead of the gadget root (arena 0).
-fn build_solve_cache(game: &mut PostFlopGame, gadget: bool) -> HashMap<Vec<usize>, CachedSolveNode> {
+fn build_solve_cache(game: &mut PostFlopGame) -> HashMap<Vec<usize>, CachedSolveNode> {
     let mut cache = HashMap::new();
-    build_solve_cache_recursive(game, &mut vec![], &mut cache, gadget);
+    build_solve_cache_recursive(game, &mut vec![], &mut cache);
     cache
 }
 
@@ -1603,7 +1559,6 @@ fn build_solve_cache_recursive(
     game: &mut PostFlopGame,
     path: &mut Vec<usize>,
     cache: &mut HashMap<Vec<usize>, CachedSolveNode>,
-    gadget: bool,
 ) {
     if game.is_terminal_node() || game.is_chance_node() {
         return;
@@ -1632,15 +1587,10 @@ fn build_solve_cache_recursive(
     for i in 0..num_actions {
         game.play(i);
         path.push(i);
-        build_solve_cache_recursive(game, path, cache, gadget);
+        build_solve_cache_recursive(game, path, cache);
         path.pop();
         // Navigate back: PostFlopGame has no undo, so replay from root.
-        // In gadget mode, replay from the real subgame root (arena 4).
-        if gadget {
-            advance_past_gadget(game);
-        } else {
-            game.back_to_root();
-        }
+        game.back_to_root();
         for &action in path.iter() {
             game.play(action);
         }
@@ -2131,10 +2081,10 @@ pub fn game_solve_core(
         let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
         let build_exact = is_exact || boundary_cut.is_none();
 
-        // Gadget tree mode (Option A): when gadget is enabled AND a boundary
-        // cut is active, build the game via make_gadget_game which prepends
-        // gadget decision nodes to the tree. This replaces the legacy
-        // post-clamp GadgetEvaluator wrapping.
+        // Gadget tree mode (A2): when gadget is enabled AND a boundary
+        // cut is active, build via make_per_boundary_gadget_game which
+        // injects per-boundary gadget subtrees. game.root() remains the
+        // real subgame root.
         let gadget_tree_active = gadget_enabled
             && boundary_cut.is_some()
             && cbv_ctx.is_some();
@@ -2172,13 +2122,9 @@ pub fn game_solve_core(
         };
 
         // Store available actions at the explorer-visible root.
-        // In gadget mode, skip past the gadget layer to the real subgame.
+        // Under A2, game.root() IS the real subgame root.
         {
-            if gadget_tree_active {
-                advance_past_gadget(&mut game);
-            } else {
-                game.back_to_root();
-            }
+            game.back_to_root();
             let actions: Vec<GameAction> = game
                 .available_actions()
                 .iter()
@@ -2189,7 +2135,8 @@ pub fn game_solve_core(
         }
 
         // Set up boundary evaluators for non-gadget path (opt_out=None).
-        // In gadget-tree mode, boundaries are already wired by make_gadget_game.
+        // In gadget-tree (A2) mode, boundaries are already wired by
+        // make_per_boundary_gadget_game.
         if !gadget_tree_active {
             let n_boundaries = game.num_boundary_nodes();
             if let Some((_, ref kind)) = boundary_cut {
@@ -2209,10 +2156,10 @@ pub fn game_solve_core(
         let n_boundaries = game.num_boundary_nodes();
         let (mem_est, _) = game.memory_usage();
         if gadget_tree_active {
-            let n_real = n_boundaries.saturating_sub(2);
+            let n_original = n_boundaries / 3;
             eprintln!(
-                "[solve] gadget-tree mode: {} real boundaries + 2 gadget ordinals, per_boundary: {}",
-                n_real, game.per_boundary_evaluators.len(),
+                "[solve] gadget-tree (A2): {} original boundaries, {} total (incl. {} gadget terminals)",
+                n_original, n_boundaries, n_boundaries - n_original,
             );
         } else {
             eprintln!(
@@ -2238,7 +2185,8 @@ pub fn game_solve_core(
                 4 => Street::Turn,
                 _ => Street::River,
             };
-            let seed_start = if gadget_tree_active { 4 } else { 0 };
+            // Under A2, game.root() IS the real subgame root (no offset).
+            let seed_start = 0;
             crate::postflop::seed_solver_with_blueprint(
                 &game,
                 &ctx.strategy,
@@ -2252,9 +2200,10 @@ pub fn game_solve_core(
         }
 
         // Set up boundary tracer (no-op when disabled).
-        // In gadget-tree mode, skip ordinals 0/1 (static gadget terminals).
-        let skip_ordinals = if gadget_tree_active { 2 } else { 0 };
-        let tracer = trace_config.into_tracer_with_skip(max_iters, skip_ordinals);
+        // Under A2, cfvnet boundaries are at ordinals 0..N (no leading skip).
+        // Gadget terminals at N..3N have static pre-populated values;
+        // tracing them is harmless (shows constant opt-out values).
+        let tracer = trace_config.into_tracer(max_iters);
         let spot_paths: Option<Vec<String>> = tracer.as_ref().and_then(|_| {
             let n = game.num_boundary_nodes();
             if n > 0 {
@@ -2268,7 +2217,7 @@ pub fn game_solve_core(
         });
 
         // Initial matrix snapshot
-        let matrix = build_solve_matrix(&mut game, None, gadget_tree_active);
+        let matrix = build_solve_matrix(&mut game, None);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
 
         // Solve loop
@@ -2314,7 +2263,7 @@ pub fn game_solve_core(
 
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
-                let matrix = build_solve_matrix(&mut game, None, gadget_tree_active);
+                let matrix = build_solve_matrix(&mut game, None);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
 
                 if is_exact {
@@ -2350,16 +2299,13 @@ pub fn game_solve_core(
                 final_iter,
             );
         }
-        // Navigate to explorer-visible root for final matrix + EVs.
-        if gadget_tree_active {
-            advance_past_gadget(&mut game);
-        } else {
-            game.back_to_root();
-        }
+        // Navigate to root for final matrix + EVs.
+        // Under A2, game.root() IS the real subgame root.
+        game.back_to_root();
         game.cache_normalized_weights();
         let player = game.current_player();
         let evs = game.expected_values(player);
-        let final_matrix = build_solve_matrix(&mut game, Some(&evs), gadget_tree_active);
+        let final_matrix = build_solve_matrix(&mut game, Some(&evs));
         *ss_clone.matrix_snapshot.write() = Some(final_matrix);
 
         // Compute exploitability using cached boundary CFVs
@@ -2373,13 +2319,8 @@ pub fn game_solve_core(
             .store(final_exp.to_bits(), Ordering::Relaxed);
 
         // Build solve cache for all decision nodes in the solved tree.
-        // In gadget mode, start from the real subgame root (arena 4).
-        if gadget_tree_active {
-            advance_past_gadget(&mut game);
-        } else {
-            game.back_to_root();
-        }
-        let solve_cache = build_solve_cache(&mut game, gadget_tree_active);
+        game.back_to_root();
+        let solve_cache = build_solve_cache(&mut game);
         eprintln!("[solve] cached {} decision nodes for subgame navigation", solve_cache.len());
         *ss_clone.solve_cache.write() = solve_cache;
         *ss_clone.solve_path.write() = vec![];
@@ -3548,7 +3489,7 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
 
-        let matrix = build_solve_matrix(&mut game, None, false);
+        let matrix = build_solve_matrix(&mut game, None);
         // Should be a 13x13 grid
         assert_eq!(matrix.cells.len(), 13);
         assert_eq!(matrix.cells[0].len(), 13);
@@ -4432,7 +4373,7 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
 
-        let cache = build_solve_cache(&mut game, false);
+        let cache = build_solve_cache(&mut game);
         // Root should be present
         assert!(cache.contains_key(&vec![]), "cache should contain root entry");
         // Root should have actions
@@ -4759,207 +4700,7 @@ mod tests {
         assert!(matches!(config.turn, StreetBoundaryMode::ExactSubtree));
     }
 
-    // -------------------------------------------------------------------
-    // build_gadget_tree_solve_game tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn build_gadget_tree_solve_game_has_gadget_root_structure() {
-        // A flop gadget-tree game with depth_limit=0 should have:
-        // - root with 2 actions (gadget decision: play / opt-out)
-        // - per_boundary_evaluators.len() == 2 (StaticGadgetEvaluator at 0/1)
-        // - boundary_evaluator.is_some() (inner evaluator for ordinals 2+)
-        // - num_boundary_nodes() >= 2 (at least the 2 gadget terminals)
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
-        let weights = vec![1.0f32; 1326];
-        let sizes = vec![vec![0.5, 1.0]];
-        let pot = 20;
-        let eff_stack = 90;
-
-        // Build a temporary game to get hand counts for opt-out vectors.
-        let tmp = build_solve_game(
-            &board, &weights, &weights, pot, eff_stack, &sizes, false, Some(0),
-        ).unwrap();
-        let n_oop = tmp.private_cards(0).len();
-        let n_ip = tmp.private_cards(1).len();
-        drop(tmp);
-
-        let opt_out_values: [Vec<f32>; 2] = [
-            vec![0.0; n_oop],
-            vec![0.0; n_ip],
-        ];
-
-        // Use a PanicEvaluator as inner — verifies gadget ordinals
-        // don't dispatch to it.
-        struct PanicEval;
-        impl range_solver::game::BoundaryEvaluator for PanicEval {
-            fn compute_cfvs(
-                &self, _: usize, _: i32, _: f64, _: &[f32], _: usize, _: usize,
-            ) -> Vec<f32> {
-                panic!("inner evaluator should not be called during construction")
-            }
-        }
-        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(PanicEval);
-
-        let mut game = build_gadget_tree_solve_game(
-            &board, &weights, &weights, pot, eff_stack, &sizes,
-            Some(0), &opt_out_values, inner,
-        ).unwrap();
-
-        // Gadget root: 2 actions (play / opt-out)
-        game.back_to_root();
-        assert_eq!(
-            game.available_actions().len(), 2,
-            "gadget root should have exactly 2 actions"
-        );
-        // At least 2 boundary nodes (the 2 gadget terminals)
-        assert!(
-            game.num_boundary_nodes() >= 2,
-            "gadget game should have >= 2 boundary nodes, got {}",
-            game.num_boundary_nodes()
-        );
-        // Per-boundary evaluators: exactly 2 (StaticGadgetEvaluator at 0/1)
-        assert_eq!(
-            game.per_boundary_evaluators.len(), 2,
-            "per_boundary_evaluators should have exactly 2 entries"
-        );
-        // Inner evaluator set for ordinals 2+
-        assert!(
-            game.boundary_evaluator.is_some(),
-            "boundary_evaluator (inner) should be set"
-        );
-    }
-
-    #[test]
-    fn build_gadget_tree_solve_game_flop_has_real_boundaries_beyond_gadget() {
-        // A flop game with depth_limit=0 should have gadget ordinals 0/1
-        // PLUS real depth boundaries at ordinals 2+.
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
-        let weights = vec![1.0f32; 1326];
-        let sizes = vec![vec![0.5, 1.0]];
-        let pot = 20;
-        let eff_stack = 90;
-
-        let tmp = build_solve_game(
-            &board, &weights, &weights, pot, eff_stack, &sizes, false, Some(0),
-        ).unwrap();
-        let n_oop = tmp.private_cards(0).len();
-        let n_ip = tmp.private_cards(1).len();
-        let plain_boundaries = tmp.num_boundary_nodes();
-        drop(tmp);
-
-        let opt_out_values: [Vec<f32>; 2] = [
-            vec![0.0; n_oop],
-            vec![0.0; n_ip],
-        ];
-
-        struct NoopEval;
-        impl range_solver::game::BoundaryEvaluator for NoopEval {
-            fn compute_cfvs(
-                &self, _: usize, _: i32, _: f64, _: &[f32], n: usize, _: usize,
-            ) -> Vec<f32> {
-                vec![0.0; n]
-            }
-        }
-        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(NoopEval);
-
-        let game = build_gadget_tree_solve_game(
-            &board, &weights, &weights, pot, eff_stack, &sizes,
-            Some(0), &opt_out_values, inner,
-        ).unwrap();
-
-        // Total boundaries = 2 gadget + original depth boundaries
-        assert_eq!(
-            game.num_boundary_nodes(),
-            plain_boundaries + 2,
-            "gadget game should have original boundaries + 2 gadget ordinals"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // advance_past_gadget tests
-    // -------------------------------------------------------------------
-
-    /// Helper: build a gadget-tree game for testing advance_past_gadget.
-    fn make_gadget_game_for_advance() -> PostFlopGame {
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
-        let weights = vec![1.0f32; 1326];
-        let sizes = vec![vec![0.5, 1.0]];
-        let pot = 20;
-        let eff_stack = 90;
-
-        let tmp = build_solve_game(
-            &board, &weights, &weights, pot, eff_stack, &sizes, false, Some(0),
-        ).unwrap();
-        let n_oop = tmp.private_cards(0).len();
-        let n_ip = tmp.private_cards(1).len();
-        drop(tmp);
-
-        let opt_out_values: [Vec<f32>; 2] = [
-            vec![0.0; n_oop],
-            vec![0.0; n_ip],
-        ];
-
-        struct NoopEval;
-        impl range_solver::game::BoundaryEvaluator for NoopEval {
-            fn compute_cfvs(
-                &self, _: usize, _: i32, _: f64, _: &[f32], n: usize, _: usize,
-            ) -> Vec<f32> {
-                vec![0.0; n]
-            }
-        }
-        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(NoopEval);
-
-        build_gadget_tree_solve_game(
-            &board, &weights, &weights, pot, eff_stack, &sizes,
-            Some(0), &opt_out_values, inner,
-        ).unwrap()
-    }
-
-    #[test]
-    fn advance_past_gadget_moves_to_real_subgame_root() {
-        let mut game = make_gadget_game_for_advance();
-
-        // Before advance: at gadget root, player is IP (outer_player=1),
-        // only 2 actions (Terminate/Follow).
-        game.back_to_root();
-        assert_eq!(game.current_player(), 1, "gadget root player should be IP");
-        assert_eq!(game.available_actions().len(), 2, "gadget root has 2 actions");
-
-        // Advance past gadget layer
-        advance_past_gadget(&mut game);
-
-        // After advance: at real subgame root (arena 4), OOP acts first,
-        // more than 2 actions (real bet sizing).
-        assert_eq!(
-            game.current_player(), 0,
-            "real subgame root player should be OOP"
-        );
-        assert!(
-            game.available_actions().len() > 2,
-            "real subgame root should have >2 actions (bet sizes), got {}",
-            game.available_actions().len()
-        );
-    }
-
-    #[test]
-    fn advance_past_gadget_cache_excludes_gadget_nodes() {
-        let mut game = make_gadget_game_for_advance();
-        advance_past_gadget(&mut game);
-
-        let cache = build_solve_cache(&mut game, true);
-
-        // The root entry (path []) should be at the real subgame root,
-        // not the gadget root. OOP is the acting player.
-        let root_node = cache.get(&vec![]).expect("cache should have root entry");
-        assert_eq!(
-            root_node.position, "OOP",
-            "cache root should be OOP (real subgame), not IP (gadget)"
-        );
-        assert!(
-            root_node.actions.len() > 2,
-            "cache root should have >2 actions, got {}",
-            root_node.actions.len()
-        );
-    }
+    // Option A build_gadget_tree_solve_game and advance_past_gadget tests:
+    // DELETED (Phase D). The root gadget is retired. Under A2,
+    // game.root() IS the real subgame root.
 }

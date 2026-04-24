@@ -567,7 +567,7 @@ fn compute_cfvalue_recursive<T: Game>(
     let num_hands = result.len();
 
     // Opponent node with single action: no scratch needed.
-    if !node.is_chance() && node.player() != player && num_actions == 1 {
+    if !node.is_chance() && node.acting_player() != player && num_actions == 1 {
         compute_cfvalue_recursive(
             result,
             game,
@@ -576,6 +576,14 @@ fn compute_cfvalue_recursive<T: Game>(
             cfreach,
             save_cfvalues,
         );
+        return;
+    }
+
+    // Gadget disabled for non-owner: skip to Follow (child 1).
+    // Owner's own pass falls through to standard Decision logic.
+    if node.is_gadget() && node.gadget_owner() != Some(player) {
+        let child = &mut node.play(1);
+        compute_cfvalue_recursive(result, game, child, player, cfreach, save_cfvalues);
         return;
     }
 
@@ -675,7 +683,7 @@ fn compute_cfvalue_recursive<T: Game>(
         put_cfv_scratch(scratch);
     }
     // Player node
-    else if node.player() == player {
+    else if node.acting_player() == player {
         // Return scratch to TLS before child recursion.
         put_cfv_scratch(scratch);
 
@@ -824,6 +832,14 @@ fn compute_best_cfv_recursive<T: Game>(
         return;
     }
 
+    // Gadget disabled for non-owner: skip to Follow (child 1).
+    // Owner's own pass falls through to standard Decision logic.
+    if node.is_gadget() && node.gadget_owner() != Some(player) {
+        let child = &node.play(1);
+        compute_best_cfv_recursive(result, game, child, player, cfreach);
+        return;
+    }
+
     // Take scratch buffers from TLS.
     let mut scratch = take_cfv_scratch();
 
@@ -905,7 +921,7 @@ fn compute_best_cfv_recursive<T: Game>(
         put_cfv_scratch(scratch);
     }
     // Player node: take the best response (max over actions)
-    else if node.player() == player {
+    else if node.acting_player() == player {
         // Return scratch to TLS before child recursion.
         put_cfv_scratch(scratch);
 

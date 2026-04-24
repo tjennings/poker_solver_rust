@@ -381,6 +381,17 @@ impl PostFlopGame {
     ) -> crate::mutex_like::MutexGuardLike<'_, PostFlopNode> {
         self.node_arena[idx].lock()
     }
+
+    /// Returns a clone of boundary CFVs for a given ordinal and player.
+    /// Used in tests to verify gadget terminal pre-population.
+    pub fn get_boundary_cfvs_for_test(&self, ordinal: usize, player: usize) -> Vec<f32> {
+        let idx = ordinal * 2 + player;
+        if idx < self.boundary_cfvs.len() {
+            self.boundary_cfvs[idx].lock().unwrap().clone()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]

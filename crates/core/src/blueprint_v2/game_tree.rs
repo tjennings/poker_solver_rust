@@ -1047,35 +1047,6 @@ impl GameTree {
     /// exists (e.g., `node_idx` is the root or all ancestors are Decision
     /// nodes).
     ///
-    /// Reconstructs parent pointers via a single pass over all nodes.
-    /// O(N) per call -- acceptable since this is called once per subgame
-    /// setup, not per iteration.
-    #[must_use]
-    pub fn nearest_chance_ancestor(&self, node_idx: u32) -> Option<u32> {
-        let mut parent = vec![None; self.nodes.len()];
-        for (idx, node) in self.nodes.iter().enumerate() {
-            match node {
-                GameNode::Decision { children, .. } => {
-                    for &c in children {
-                        parent[c as usize] = Some(idx as u32);
-                    }
-                }
-                GameNode::Chance { child, .. } => {
-                    parent[*child as usize] = Some(idx as u32);
-                }
-                GameNode::Terminal { .. } => {}
-            }
-        }
-        let mut cur = node_idx;
-        while let Some(p) = parent[cur as usize] {
-            if matches!(self.nodes[p as usize], GameNode::Chance { .. }) {
-                return Some(p);
-            }
-            cur = p;
-        }
-        None
-    }
-
     /// Collect all `Chance` node arena indices reachable from `start`
     /// via DFS, in arena-encounter order.
     ///
@@ -2263,71 +2234,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nearest_chance_ancestor_finds_correct_node() {
-        // Build a 4-node tree:
-        //   0: Decision(P0) -> [1]
-        //   1: Chance(River, child=2)
-        //   2: Decision(P1) -> [3]
-        //   3: Terminal(Showdown)
-        //
-        // nearest_chance_ancestor(2) should be Some(1) (the Chance node).
-        // nearest_chance_ancestor(3) should be Some(1) (walk up through 2 to 1).
-        // nearest_chance_ancestor(1) should be None (no chance node ABOVE it
-        //   except root which is Decision).
-        // nearest_chance_ancestor(0) should be None (root, no parent).
-        let nodes = vec![
-            GameNode::Decision {
-                player: 0,
-                street: Street::Turn,
-                actions: vec![TreeAction::Check],
-                children: vec![1],
-                blueprint_decision_idx: None,
-            },
-            GameNode::Chance {
-                next_street: Street::River,
-                child: 2,
-            },
-            GameNode::Decision {
-                player: 1,
-                street: Street::River,
-                actions: vec![TreeAction::Check],
-                children: vec![3],
-                blueprint_decision_idx: None,
-            },
-            GameNode::Terminal {
-                kind: TerminalKind::Showdown,
-                pot: 100.0,
-                stacks: [50.0, 50.0],
-            },
-        ];
-        let tree = GameTree {
-            nodes,
-            root: 0,
-            dealer: 0,
-            starting_stack: 100.0,
-        };
-
-        assert_eq!(tree.nearest_chance_ancestor(2), Some(1));
-        assert_eq!(tree.nearest_chance_ancestor(3), Some(1));
-        assert_eq!(tree.nearest_chance_ancestor(1), None);
-        assert_eq!(tree.nearest_chance_ancestor(0), None);
-    }
-
-    #[test]
-    fn nearest_chance_ancestor_returns_none_for_root() {
-        // A single-node tree: just a terminal.
-        let nodes = vec![GameNode::Terminal {
-            kind: TerminalKind::Showdown,
-            pot: 10.0,
-            stacks: [5.0, 5.0],
-        }];
-        let tree = GameTree {
-            nodes,
-            root: 0,
-            dealer: 0,
-            starting_stack: 10.0,
-        };
-        assert_eq!(tree.nearest_chance_ancestor(0), None);
-    }
 }

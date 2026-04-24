@@ -134,21 +134,6 @@ impl PostFlopGame {
         Ok(game)
     }
 
-    /// Creates a new [`PostFlopGame`] with the gadget layer injected.
-    ///
-    /// Builds the game via [`Self::with_config`], then prepends the CFR-D
-    /// gadget decision nodes via [`gadget::inject_gadget_layer`]. Callers
-    /// must still invoke [`Self::allocate_memory`] before solving.
-    pub fn with_config_and_gadget(
-        card_config: CardConfig,
-        action_tree: ActionTree,
-        gadget_config: crate::game::gadget::GadgetConfig,
-    ) -> Result<Self, String> {
-        let mut game = Self::with_config(card_config, action_tree)?;
-        crate::game::gadget::inject_gadget_layer(&mut game, &gadget_config);
-        Ok(game)
-    }
-
     /// Updates the game configuration. Any previous solved result is lost.
     pub fn update_config(
         &mut self,
@@ -549,108 +534,10 @@ impl PostFlopGame {
 }
 
 // ---------------------------------------------------------------------------
-// Gadget injection (Option C — lives here for direct field access)
+// Gadget injection (lives here for direct field access)
 // ---------------------------------------------------------------------------
 
 impl PostFlopGame {
-    /// Prepends 4 gadget nodes at arena indices 0..=3.
-    ///
-    /// Topology (when `outer_player == 1`, IP outer):
-    /// ```text
-    /// arena[0] = G_IP   (Decision, player=IP,  children=[1, 2])
-    /// arena[1] = G_IP.T (depth-boundary terminal, ordinal 0)
-    /// arena[2] = G_OOP  (Decision, player=OOP, children=[3, 4])
-    /// arena[3] = G_OOP.T(depth-boundary terminal, ordinal 1)
-    /// arena[4..] = original tree (shifted +4)
-    /// ```
-    ///
-    /// When `outer_player == 0`, the acting players at arena[0] and arena[2]
-    /// are swapped (OOP outer, IP inner).
-    pub(crate) fn inject_gadget_layer_impl(
-        &mut self,
-        config: &super::gadget::GadgetConfig,
-    ) {
-        let num_oop = self.num_private_hands(0);
-        let num_ip = self.num_private_hands(1);
-
-        self.validate_gadget_config(config, num_oop, num_ip);
-
-        // Determine which player is outer vs inner.
-        let (outer, inner) = if config.outer_player == 1 {
-            (PLAYER_IP, PLAYER_OOP)
-        } else {
-            (PLAYER_OOP, PLAYER_IP)
-        };
-
-        let num_hands_outer = self.num_private_hands(outer as usize);
-        let num_hands_inner = self.num_private_hands(inner as usize);
-
-        // 1. Prepend 4 default nodes at the front of node_arena.
-        //    children_offset is relative, so existing offsets stay valid.
-        let mut new_arena: Vec<MutexLike<PostFlopNode>> = (0..4)
-            .map(|_| MutexLike::new(PostFlopNode::default()))
-            .collect();
-        new_arena.append(&mut self.node_arena);
-        self.node_arena = new_arena;
-
-        // 2. Wire the 4 new nodes.
-        self.wire_gadget_outer(0, outer, num_hands_outer);
-        self.wire_gadget_terminal(1);
-        self.wire_gadget_inner(2, inner, num_hands_inner);
-        self.wire_gadget_terminal(3);
-
-        // 3. Rebuild node_to_boundary: shift existing entries +4 in arena
-        //    index and +2 in ordinal; insert gadget terminals at ordinals 0,1.
-        self.rebuild_boundary_map_for_gadget();
-
-        // 4. Resize boundary storage and pre-populate gadget boundary CFVs.
-        self.resize_boundary_storage_for_gadget(config, num_oop, num_ip);
-
-        // 5. Update num_storage counters for the 2 new decision nodes.
-        let outer_elements = 2u64 * num_hands_outer as u64;
-        let inner_elements = 2u64 * num_hands_inner as u64;
-        self.num_storage += outer_elements + inner_elements;
-        // Only the outer (root-like) node gets IP cfvalue storage.
-        self.num_storage_ip += num_ip as u64;
-
-        // 6. Reallocate storage buffers and re-assign pointers.
-        self.reallocate_storage_for_gadget();
-    }
-
-    /// Validates gadget config lengths and values against the game state.
-    fn validate_gadget_config(
-        &self,
-        config: &super::gadget::GadgetConfig,
-        num_oop: usize,
-        num_ip: usize,
-    ) {
-        assert_eq!(
-            config.opt_out_oop.len(),
-            num_oop,
-            "opt_out_oop length must match OOP hand count"
-        );
-        assert_eq!(
-            config.opt_out_ip.len(),
-            num_ip,
-            "opt_out_ip length must match IP hand count"
-        );
-        assert!(
-            config.outer_player == 0 || config.outer_player == 1,
-            "outer_player must be 0 or 1"
-        );
-        assert!(
-            self.num_continuations <= 1,
-            "gadget injection with multi-continuation (K > 1) is not yet supported: \
-             boundary_cont_regrets / boundary_cont_strategy are not resized. K={}",
-            self.num_continuations,
-        );
-        assert!(
-            self.state < State::Solved,
-            "inject_gadget_layer must not be called after solve completes; state = {:?}",
-            self.state,
-        );
-    }
-
     /// Reallocates storage buffers and re-assigns node pointers after gadget
     /// injection, if memory has already been allocated.
     fn reallocate_storage_for_gadget(&mut self) {
@@ -668,87 +555,215 @@ impl PostFlopGame {
             self.allocate_memory_nodes();
         }
     }
+}
 
-    /// Configures arena[idx] as the outer gadget decision node.
-    fn wire_gadget_outer(&self, idx: usize, player: u8, num_hands: usize) {
-        let mut node = self.node_arena[idx].lock();
-        node.player = player;
-        node.prev_action = Action::None;
-        node.num_children = 2;
-        // children_offset is relative: children start at idx+1
-        node.children_offset = 1;
-        // num_elements = num_actions * num_private_hands(acting_player)
-        node.num_elements = (2 * num_hands) as u32;
-        // Root-like node gets IP cfvalue storage.
-        node.num_elements_ip = self.num_private_hands(PLAYER_IP as usize) as u16;
-        // Copy board cards from the original root (now at arena[4]).
-        let orig_root = self.node_arena[4].lock();
-        node.turn = orig_root.turn;
-        node.river = orig_root.river;
-    }
+// ---------------------------------------------------------------------------
+// Per-boundary gadget injection (Option A2)
+// ---------------------------------------------------------------------------
 
-    /// Configures arena[idx] as the inner gadget decision node.
-    fn wire_gadget_inner(&self, idx: usize, player: u8, num_hands: usize) {
-        let mut node = self.node_arena[idx].lock();
-        node.player = player;
-        node.prev_action = Action::Check; // sentinel: not None/Chance
-        node.num_children = 2;
-        // children_offset is relative: children start at idx+1
-        node.children_offset = 1;
-        node.num_elements = (2 * num_hands) as u32;
-        node.num_elements_ip = 0; // not a root/post-chance node
-        // Copy board cards from the original root.
-        let orig_root = self.node_arena[4].lock();
-        node.turn = orig_root.turn;
-        node.river = orig_root.river;
-    }
-
-    /// Configures arena[idx] as a gadget depth-boundary terminal.
-    fn wire_gadget_terminal(&self, idx: usize) {
-        let mut node = self.node_arena[idx].lock();
-        node.player = PLAYER_TERMINAL_FLAG | PLAYER_DEPTH_BOUNDARY_FLAG;
-        node.prev_action = Action::Check; // sentinel for "Terminate" action
-        node.num_children = 0;
-        node.children_offset = 0;
-        node.num_elements = 0;
-        node.num_elements_ip = 0;
-        // Copy board cards from the original root.
-        let orig_root = self.node_arena[4].lock();
-        node.turn = orig_root.turn;
-        node.river = orig_root.river;
-    }
-
-    /// Rebuilds `node_to_boundary` after gadget injection.
+impl PostFlopGame {
+    /// Core implementation of per-boundary gadget injection.
     ///
-    /// Existing boundary nodes shifted +4 in arena index; their ordinals
-    /// shift +2. Gadget terminals at arena[1] and arena[3] get ordinals 0,1.
-    fn rebuild_boundary_map_for_gadget(&mut self) {
-        let old_map = std::mem::take(&mut self.node_to_boundary);
+    /// Strategy: for each boundary terminal, REPLACE it in-place with a G_IP
+    /// gadget decision node, and APPEND 3 new nodes (T_IP, G_OOP, T_OOP)
+    /// plus a copy of the original boundary to the end of the arena.
+    ///
+    /// This preserves parent->child offset invariants for all existing nodes,
+    /// since the boundary's arena slot is reused (same index, different content).
+    /// G_IP's children (T_IP and G_OOP) are appended, so children_offset is
+    /// forward-pointing from G_IP.
+    ///
+    /// Post-injection boundary ordinal scheme:
+    /// - Ordinals 0..N: original cfvnet boundaries (stable).
+    /// - Ordinals N..3N: gadget terminals. For original boundary `b`:
+    ///   - ordinal `N + 2*b`     = Terminate_IP_b
+    ///   - ordinal `N + 2*b + 1` = Terminate_OOP_b
+    pub(crate) fn inject_per_boundary_gadgets_impl(
+        &mut self,
+        config: &super::gadget::GadgetConfigPerBoundary,
+    ) {
+        let n_boundaries = self.num_boundary_nodes();
+        self.validate_per_boundary_config(config, n_boundaries);
+
+        let boundary_indices = self.boundary_indices_by_ordinal();
+        self.inject_gadget_nodes(&boundary_indices);
+        self.rebuild_boundary_map_per_boundary(n_boundaries, &boundary_indices);
+        self.resize_boundary_storage_per_boundary(config, n_boundaries);
+        self.update_storage_counters_per_boundary(n_boundaries);
+        self.reallocate_storage_for_gadget();
+    }
+
+    /// Validates per-boundary gadget config.
+    fn validate_per_boundary_config(
+        &self,
+        config: &super::gadget::GadgetConfigPerBoundary,
+        n_boundaries: usize,
+    ) {
+        assert_eq!(
+            config.per_boundary_opt_outs.len(),
+            n_boundaries,
+            "per_boundary_opt_outs length ({}) must match boundary count ({})",
+            config.per_boundary_opt_outs.len(),
+            n_boundaries,
+        );
+        for (b, opt_outs) in config.per_boundary_opt_outs.iter().enumerate() {
+            assert_eq!(
+                opt_outs[0].len(),
+                self.num_private_hands(0),
+                "boundary {b}: OOP opt-out length mismatch"
+            );
+            assert_eq!(
+                opt_outs[1].len(),
+                self.num_private_hands(1),
+                "boundary {b}: IP opt-out length mismatch"
+            );
+        }
+        assert!(
+            self.state < State::Solved,
+            "inject_per_boundary_gadgets must not be called after solve"
+        );
+    }
+
+    /// Returns boundary terminal arena indices ordered by ordinal.
+    fn boundary_indices_by_ordinal(&self) -> Vec<usize> {
+        self.boundary_node_indices()
+    }
+
+    /// For each boundary terminal: replace it in-place with G_IP, and
+    /// append [T_IP, G_OOP, T_OOP, cfvnet_copy] to the arena.
+    ///
+    /// Layout per boundary `b` (ordinal-ordered):
+    /// ```text
+    ///   arena[old_b]           = G_IP_b  (replaces the old boundary)
+    ///   arena[append_base + 0] = T_IP_b
+    ///   arena[append_base + 1] = G_OOP_b
+    ///   arena[append_base + 2] = T_OOP_b
+    ///   arena[append_base + 3] = cfvnet_b (copy of original boundary)
+    /// ```
+    fn inject_gadget_nodes(&mut self, boundary_indices: &[usize]) {
+        let n = boundary_indices.len();
+        let old_len = self.node_arena.len();
+        let num_hands_ip = self.num_private_hands(1);
+        let num_hands_oop = self.num_private_hands(0);
+
+        // Reserve space for 4 new nodes per boundary.
+        self.node_arena
+            .extend((0..4 * n).map(|_| MutexLike::new(PostFlopNode::default())));
+
+        for (b, &old_idx) in boundary_indices.iter().enumerate() {
+            let append_base = old_len + 4 * b;
+
+            // Read original boundary data before overwriting.
+            let (turn, river, amount, prev_action) = {
+                let node = self.node_arena[old_idx].lock();
+                (node.turn, node.river, node.amount, node.prev_action)
+            };
+
+            // Copy original boundary to appended slot (cfvnet_b).
+            {
+                let mut cfvnet = self.node_arena[append_base + 3].lock();
+                cfvnet.player = PLAYER_TERMINAL_FLAG | PLAYER_DEPTH_BOUNDARY_FLAG;
+                cfvnet.prev_action = prev_action;
+                cfvnet.turn = turn;
+                cfvnet.river = river;
+                cfvnet.amount = amount;
+                cfvnet.num_children = 0;
+                cfvnet.children_offset = 0;
+                cfvnet.num_elements = 0;
+                cfvnet.num_elements_ip = 0;
+            }
+
+            // Replace old boundary with G_IP_b.
+            {
+                let mut node = self.node_arena[old_idx].lock();
+                node.player = PLAYER_GADGET_FLAG | PLAYER_IP;
+                node.prev_action = prev_action;
+                node.num_children = 2;
+                // Children at append_base + 0 (T_IP) and append_base + 1 (G_OOP).
+                node.children_offset = (append_base - old_idx) as u32;
+                node.num_elements = (2 * num_hands_ip) as u32;
+                node.num_elements_ip = 0;
+                node.turn = turn;
+                node.river = river;
+                node.amount = amount;
+            }
+
+            // T_IP_b at append_base + 0.
+            {
+                let mut node = self.node_arena[append_base].lock();
+                node.player = PLAYER_TERMINAL_FLAG | PLAYER_DEPTH_BOUNDARY_FLAG;
+                node.prev_action = Action::Check;
+                node.turn = turn;
+                node.river = river;
+                node.amount = amount;
+            }
+
+            // G_OOP_b at append_base + 1.
+            {
+                let mut node = self.node_arena[append_base + 1].lock();
+                node.player = PLAYER_GADGET_FLAG | PLAYER_OOP;
+                node.prev_action = Action::Check;
+                node.num_children = 2;
+                // Children at append_base + 2 (T_OOP) and append_base + 3 (cfvnet).
+                node.children_offset = 1;
+                node.num_elements = (2 * num_hands_oop) as u32;
+                node.num_elements_ip = 0;
+                node.turn = turn;
+                node.river = river;
+                node.amount = amount;
+            }
+
+            // T_OOP_b at append_base + 2.
+            {
+                let mut node = self.node_arena[append_base + 2].lock();
+                node.player = PLAYER_TERMINAL_FLAG | PLAYER_DEPTH_BOUNDARY_FLAG;
+                node.prev_action = Action::Check;
+                node.turn = turn;
+                node.river = river;
+                node.amount = amount;
+            }
+        }
+    }
+
+    /// Rebuilds `node_to_boundary` after per-boundary gadget injection.
+    ///
+    /// Original cfvnet boundaries move to appended positions but retain
+    /// ordinals 0..N. Gadget terminals get ordinals N..3N:
+    ///   - N + 2*b     = Terminate_IP (at append_base + 0)
+    ///   - N + 2*b + 1 = Terminate_OOP (at append_base + 2)
+    fn rebuild_boundary_map_per_boundary(
+        &mut self,
+        n_original: usize,
+        _boundary_indices: &[usize],
+    ) {
+        let old_len = self.node_arena.len() - 4 * n_original;
         let new_len = self.node_arena.len();
         let mut new_map = vec![u32::MAX; new_len];
 
-        // Gadget terminals at fixed positions.
-        new_map[1] = 0; // G_outer.Terminate -> ordinal 0
-        new_map[3] = 1; // G_inner.Terminate -> ordinal 1
+        // cfvnet boundaries moved to append_base + 3 for each ordinal b.
+        for b in 0..n_original {
+            let append_base = old_len + 4 * b;
+            new_map[append_base + 3] = b as u32;
+        }
 
-        // Shift existing ordinals: old arena idx -> new arena idx = old + 4,
-        // old ordinal -> new ordinal = old + 2.
-        for (old_idx, &old_ordinal) in old_map.iter().enumerate() {
-            if old_ordinal != u32::MAX {
-                let new_idx = old_idx + 4;
-                new_map[new_idx] = old_ordinal + 2;
-            }
+        // Remove old boundary indices from map (they are now G_IP nodes).
+        // (They're already gone since we rebuilt from scratch.)
+
+        // Gadget terminal ordinals.
+        for b in 0..n_original {
+            let append_base = old_len + 4 * b;
+            new_map[append_base] = (n_original + 2 * b) as u32;      // T_IP
+            new_map[append_base + 2] = (n_original + 2 * b + 1) as u32; // T_OOP
         }
 
         self.node_to_boundary = new_map;
     }
 
-    /// Resizes boundary storage and pre-populates gadget boundary CFVs.
-    fn resize_boundary_storage_for_gadget(
+    /// Resizes boundary storage and pre-populates gadget terminal CFVs.
+    fn resize_boundary_storage_per_boundary(
         &mut self,
-        config: &super::gadget::GadgetConfig,
-        num_oop: usize,
-        num_ip: usize,
+        config: &super::gadget::GadgetConfigPerBoundary,
+        n_original: usize,
     ) {
         let old_cfvs = std::mem::take(&mut self.boundary_cfvs);
         let old_reach = std::mem::take(&mut self.boundary_reach);
@@ -758,10 +773,8 @@ impl PostFlopGame {
             .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
             .collect();
 
-        let old_boundary_count = old_cfvs.len() / 2;
-        let new_boundary_count = old_boundary_count + 2;
+        let new_boundary_count = 3 * n_original;
 
-        // Allocate new storage.
         let new_cfvs: Vec<std::sync::Mutex<Vec<f32>>> = (0..new_boundary_count * 2)
             .map(|_| std::sync::Mutex::new(Vec::new()))
             .collect();
@@ -772,26 +785,44 @@ impl PostFlopGame {
             .map(|_| std::sync::atomic::AtomicBool::new(false))
             .collect();
 
-        // Pre-populate gadget boundary CFVs (ordinals 0 and 1).
-        Self::populate_gadget_boundary_cfvs(&new_cfvs, config, num_oop, num_ip);
-
-        // Move existing boundary data to new positions (ordinals shifted +2).
-        for old_ord in 0..old_boundary_count {
-            let new_ord = old_ord + 2;
+        for old_ord in 0..n_original {
             for player in 0..2 {
-                let old_idx = old_ord * 2 + player;
-                let new_idx = new_ord * 2 + player;
-                let data = old_cfvs[old_idx].lock().unwrap().clone();
-                *new_cfvs[new_idx].lock().unwrap() = data;
-                let reach_data = old_reach[old_idx].lock().unwrap().clone();
-                *new_reach[new_idx].lock().unwrap() = reach_data;
+                let idx = old_ord * 2 + player;
+                if idx < old_cfvs.len() {
+                    *new_cfvs[idx].lock().unwrap() =
+                        old_cfvs[idx].lock().unwrap().clone();
+                }
+                if idx < old_reach.len() {
+                    *new_reach[idx].lock().unwrap() =
+                        old_reach[idx].lock().unwrap().clone();
+                }
             }
             if old_ord < old_is_raw.len() {
-                new_is_raw[new_ord].store(
+                new_is_raw[old_ord].store(
                     old_is_raw[old_ord],
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
+        }
+
+        // Pre-populate gadget terminal CFVs.
+        let num_oop = self.num_private_hands(0);
+        let num_ip = self.num_private_hands(1);
+        for b in 0..n_original {
+            let ip_term_ord = n_original + 2 * b;
+            let oop_term_ord = n_original + 2 * b + 1;
+
+            // IP Terminate: IP gets opt-out, OOP neutralized.
+            // TODO(Phase C): replace OOP zeros with zero-sum complement
+            *new_cfvs[ip_term_ord * 2].lock().unwrap() = vec![0.0; num_oop];
+            *new_cfvs[ip_term_ord * 2 + 1].lock().unwrap() =
+                config.per_boundary_opt_outs[b][1].clone();
+
+            // OOP Terminate: OOP gets opt-out, IP neutralized.
+            *new_cfvs[oop_term_ord * 2].lock().unwrap() =
+                config.per_boundary_opt_outs[b][0].clone();
+            // TODO(Phase C): replace IP zeros with zero-sum complement
+            *new_cfvs[oop_term_ord * 2 + 1].lock().unwrap() = vec![0.0; num_ip];
         }
 
         self.boundary_cfvs = new_cfvs;
@@ -799,31 +830,12 @@ impl PostFlopGame {
         self.boundary_is_raw = new_is_raw;
     }
 
-    /// Writes opt-out CFVs into gadget boundary slots (ordinals 0 and 1).
-    ///
-    /// Ordinal 0 = outer.Terminate: outer player takes opt-out,
-    ///             opponent is neutralized (zeros).
-    /// Ordinal 1 = inner.Terminate: inner player takes opt-out,
-    ///             opponent is neutralized (zeros).
-    fn populate_gadget_boundary_cfvs(
-        cfvs: &[std::sync::Mutex<Vec<f32>>],
-        config: &super::gadget::GadgetConfig,
-        num_oop: usize,
-        num_ip: usize,
-    ) {
-        if config.outer_player == 1 {
-            // IP outer: ordinal 0 = G_IP.T, ordinal 1 = G_OOP.T
-            *cfvs[0].lock().unwrap() = vec![0.0; num_oop]; // OOP neutralized
-            *cfvs[1].lock().unwrap() = config.opt_out_ip.clone(); // IP opt-out
-            *cfvs[2].lock().unwrap() = config.opt_out_oop.clone(); // OOP opt-out
-            *cfvs[3].lock().unwrap() = vec![0.0; num_ip]; // IP neutralized
-        } else {
-            // OOP outer: ordinal 0 = G_OOP.T, ordinal 1 = G_IP.T
-            *cfvs[0].lock().unwrap() = config.opt_out_oop.clone(); // OOP opt-out
-            *cfvs[1].lock().unwrap() = vec![0.0; num_ip]; // IP neutralized
-            *cfvs[2].lock().unwrap() = vec![0.0; num_oop]; // OOP neutralized
-            *cfvs[3].lock().unwrap() = config.opt_out_ip.clone(); // IP opt-out
-        }
+    /// Updates num_storage counters for the new gadget decision nodes.
+    fn update_storage_counters_per_boundary(&mut self, n_boundaries: usize) {
+        let num_hands_ip = self.num_private_hands(1) as u64;
+        let num_hands_oop = self.num_private_hands(0) as u64;
+        let per_boundary_elements = 2 * num_hands_ip + 2 * num_hands_oop;
+        self.num_storage += per_boundary_elements * n_boundaries as u64;
     }
 }
 

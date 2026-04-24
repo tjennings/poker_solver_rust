@@ -93,6 +93,29 @@ pub trait GameNode: Send + Sync {
     #[doc(hidden)]
     fn player(&self) -> usize;
 
+    /// Returns the acting player (0 or 1) extracted from the player byte,
+    /// masking off any flag bits. For non-gadget decision nodes this is
+    /// identical to `player()`. For gadget nodes, `player()` includes the
+    /// gadget flag whereas `acting_player()` returns only the owner index.
+    #[doc(hidden)]
+    fn acting_player(&self) -> usize {
+        self.player()
+    }
+
+    /// Returns true if this node is a per-boundary CFR-D gadget Decision.
+    /// Default: false (non-gadget games).
+    #[doc(hidden)]
+    fn is_gadget(&self) -> bool {
+        false
+    }
+
+    /// Returns the gadget owner (0=OOP, 1=IP) if this is a gadget Decision,
+    /// or `None` for non-gadget nodes. Default: None.
+    #[doc(hidden)]
+    fn gadget_owner(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns the number of actions.
     #[doc(hidden)]
     fn num_actions(&self) -> usize;

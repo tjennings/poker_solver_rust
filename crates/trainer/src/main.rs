@@ -414,8 +414,8 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         tolerance: f32,
 
-        /// Enable Option A tree-structural CFR-D gadget (via make_gadget_game).
-        /// Prepends gadget decision nodes to the game tree for safe re-solve.
+        /// Enable per-boundary CFR-D gadget (Option A2).
+        /// Injects gadget subtrees at each depth-boundary terminal for safe re-solve.
         /// Mutually exclusive with --gadget-clamp.
         #[arg(long, default_value_t = false, conflicts_with = "gadget_clamp")]
         gadget: bool,
