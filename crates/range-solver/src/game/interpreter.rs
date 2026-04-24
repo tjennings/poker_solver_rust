@@ -134,6 +134,21 @@ impl PostFlopGame {
         Ok(game)
     }
 
+    /// Creates a new [`PostFlopGame`] with the gadget layer injected.
+    ///
+    /// Builds the game via [`Self::with_config`], then prepends the CFR-D
+    /// gadget decision nodes via [`gadget::inject_gadget_layer`]. Callers
+    /// must still invoke [`Self::allocate_memory`] before solving.
+    pub fn with_config_and_gadget(
+        card_config: CardConfig,
+        action_tree: ActionTree,
+        gadget_config: crate::game::gadget::GadgetConfig,
+    ) -> Result<Self, String> {
+        let mut game = Self::with_config(card_config, action_tree)?;
+        crate::game::gadget::inject_gadget_layer(&mut game, &gadget_config);
+        Ok(game)
+    }
+
     /// Updates the game configuration. Any previous solved result is lost.
     pub fn update_config(
         &mut self,

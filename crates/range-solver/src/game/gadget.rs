@@ -176,6 +176,57 @@ mod tests {
         inject_gadget_layer(&mut game, &cfg);
     }
 
+    /// Build the same config pair as `minimal_game` but return them unconsumed.
+    fn minimal_config() -> (CardConfig, ActionTree) {
+        let oop: Range = "AA,KK".parse().unwrap();
+        let ip: Range = "QQ,JJ".parse().unwrap();
+        let cc = CardConfig {
+            range: [oop, ip],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tc = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 200,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let at = ActionTree::new(tc).unwrap();
+        (cc, at)
+    }
+
+    #[test]
+    fn with_config_and_gadget_returns_ready_game() {
+        // Use a throwaway game to discover num_private_hands.
+        let tmp = minimal_game();
+        let n_oop = tmp.num_private_hands(0);
+        let n_ip = tmp.num_private_hands(1);
+        drop(tmp);
+
+        let (cc, at) = minimal_config();
+        let cfg = GadgetConfig {
+            opt_out_oop: vec![0.1; n_oop],
+            opt_out_ip: vec![0.1; n_ip],
+            outer_player: 1,
+        };
+
+        let mut game = PostFlopGame::with_config_and_gadget(cc, at, cfg).unwrap();
+
+        // Root is the gadget (Decision, 2 actions, IP as outer).
+        assert!(!game.root().is_terminal());
+        assert_eq!(game.root().num_actions(), 2);
+        assert_eq!(game.root().acting_player(), 1);
+
+        // Two boundary terminals added by gadget injection.
+        assert!(game.num_boundary_nodes() >= 2);
+
+        // allocate_memory should still work cleanly after this flow.
+        game.allocate_memory(false);
+    }
+
     #[test]
     fn inject_with_oop_outer_swaps_nesting() {
         let mut game = minimal_game();
