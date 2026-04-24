@@ -42,8 +42,10 @@ pub struct GadgetConfigPerBoundary {
 ///
 /// Gadget terminal CFVs are pre-populated:
 /// - Gadget player: opt_out values from config.
-/// - Non-gadget player: zeros (neutralized).
-///   // TODO(Phase C): replace with zero-sum complement.
+/// - Non-gadget player: zeros (neutralized). Under Option Y's
+///   traverser-disable semantics the non-owner's traversal short-circuits
+///   at the gadget Decision above this terminal, so the non-gadget-player
+///   CFV here is never queried — zero is inert. No zero-sum complement needed.
 pub fn inject_per_boundary_gadgets(
     game: &mut super::PostFlopGame,
     config: &GadgetConfigPerBoundary,
@@ -362,7 +364,7 @@ mod tests {
             // OOP at IP Terminate: neutralized (zeros).
             let oop_at_ip = game.get_boundary_cfvs_for_test(ip_term_ord, 0);
             assert!(!oop_at_ip.is_empty(), "OOP neutralized should be populated");
-            // TODO(Phase C): replace with zero-sum complement
+            // Non-gadget player: zero (inert — unreachable under Option Y disable).
             assert!(
                 oop_at_ip.iter().all(|&v| v == 0.0),
                 "non-gadget player neutralized to zero"
@@ -374,7 +376,7 @@ mod tests {
             // IP at OOP Terminate: neutralized (zeros).
             let ip_at_oop = game.get_boundary_cfvs_for_test(oop_term_ord, 1);
             assert!(!ip_at_oop.is_empty(), "IP neutralized should be populated");
-            // TODO(Phase C): replace with zero-sum complement
+            // Non-gadget player: zero (inert — unreachable under Option Y disable).
             assert!(
                 ip_at_oop.iter().all(|&v| v == 0.0),
                 "non-gadget player neutralized to zero"

@@ -812,16 +812,16 @@ impl PostFlopGame {
             let ip_term_ord = n_original + 2 * b;
             let oop_term_ord = n_original + 2 * b + 1;
 
-            // IP Terminate: IP gets opt-out, OOP neutralized.
-            // TODO(Phase C): replace OOP zeros with zero-sum complement
+            // IP Terminate: IP gets opt-out, OOP neutralized to zero.
+            // (Inert under Option Y disable — non-owner short-circuits above.)
             *new_cfvs[ip_term_ord * 2].lock().unwrap() = vec![0.0; num_oop];
             *new_cfvs[ip_term_ord * 2 + 1].lock().unwrap() =
                 config.per_boundary_opt_outs[b][1].clone();
 
-            // OOP Terminate: OOP gets opt-out, IP neutralized.
+            // OOP Terminate: OOP gets opt-out, IP neutralized to zero.
             *new_cfvs[oop_term_ord * 2].lock().unwrap() =
                 config.per_boundary_opt_outs[b][0].clone();
-            // TODO(Phase C): replace IP zeros with zero-sum complement
+            // (Inert under Option Y disable — non-owner short-circuits above.)
             *new_cfvs[oop_term_ord * 2 + 1].lock().unwrap() = vec![0.0; num_ip];
         }
 
