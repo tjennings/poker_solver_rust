@@ -323,6 +323,20 @@ impl PostFlopGame {
 }
 
 #[cfg(test)]
+impl PostFlopGame {
+    pub fn node_arena_len_for_test(&self) -> usize {
+        self.node_arena.len()
+    }
+
+    pub fn node_arena_get_for_test(
+        &self,
+        idx: usize,
+    ) -> crate::mutex_like::MutexGuardLike<'_, PostFlopNode> {
+        self.node_arena[idx].lock()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
