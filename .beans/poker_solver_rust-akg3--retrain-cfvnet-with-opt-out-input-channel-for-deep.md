@@ -5,7 +5,7 @@ status: todo
 type: task
 priority: normal
 created_at: 2026-04-23T19:17:15Z
-updated_at: 2026-04-24T02:17:19Z
+updated_at: 2026-04-24T04:32:59Z
 blocked_by:
     - poker_solver_rust-lay5
 ---
@@ -80,3 +80,19 @@ The retrain is the only remaining piece. Once cfvnet learns to respect opt-out b
 - Design doc: docs/plans/2026-04-23-deepstack-gadget.md
 - Impl plan: docs/plans/2026-04-23-libratus-gadget-impl-plan.md
 - Parent bean: poker_solver_rust-lay5 (completed)
+
+
+
+## Re-scoped 2026-04-24 (post-brainstorm)
+
+**Original framing** ("Retrain cfvnet with opt-out input channel for DeepStack-proper gadget") is obsoleted by the brainstorm completed in `poker_solver_rust-u3rf`. See `docs/plans/2026-04-24-option-a-deepstack-gadget-design.md`.
+
+Option A (structural CFR-D tree modification using pre-computed bucketed blueprint CBVs) ships under a new implementation bean. It does NOT require a cfvnet retrain: opt-out values come from existing `CbvTable` data, not from cfvnet.
+
+**New akg3 scope (pending Option A MVP outcome):**
+
+Improve opt-out tightness for Option A, most likely via un-abstracted per-combo blueprint CBVs (Libratus strategy 4b, Brown & Sandholm 2017 §6). Per goal-(a) safety this is NOT required for MVP ship; it opens iff the bucketed opt-outs used in the MVP prove too loose in practice (exploitability persistently worse than no-gadget).
+
+**Deferred trigger condition:** Option A MVP ships and passes test (4) safety invariant; `JhTh9h|…|7d` `subgame_exp` is reported; if the gap-vs-iter-10-baseline is unacceptably large, akg3 activates.
+
+**Alternative off-ramp:** scrap akg3 entirely if Option A's safety claim alone is sufficient for the project's needs (no exploitability-tightness work required).
