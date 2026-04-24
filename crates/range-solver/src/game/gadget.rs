@@ -175,4 +175,24 @@ mod tests {
         };
         inject_gadget_layer(&mut game, &cfg);
     }
+
+    #[test]
+    fn inject_with_oop_outer_swaps_nesting() {
+        let mut game = minimal_game();
+        let cfg = GadgetConfig {
+            opt_out_oop: vec![0.5; game.num_private_hands(0)],
+            opt_out_ip: vec![-0.5; game.num_private_hands(1)],
+            outer_player: 0, // OOP outer
+        };
+        inject_gadget_layer(&mut game, &cfg);
+
+        let root = game.root();
+        assert_eq!(root.acting_player(), 0, "OOP is now outer");
+
+        // Boundary ordinal 0 = G_OOP.Terminate
+        // Boundary ordinal 1 = G_IP.Terminate
+        // CFVs at ordinal 0: OOP gets opt_out_oop, IP gets zeros.
+        // CFVs at ordinal 1: IP gets opt_out_ip, OOP gets zeros.
+        // (Verify via get_boundary_cfvs accessor or pull raw values.)
+    }
 }
