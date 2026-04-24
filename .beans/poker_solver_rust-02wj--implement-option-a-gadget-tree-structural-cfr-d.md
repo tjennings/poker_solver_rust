@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-04-24T04:48:05Z
-updated_at: 2026-04-24T06:55:55Z
+updated_at: 2026-04-24T13:24:05Z
 blocked_by:
     - poker_solver_rust-u3rf
 ---
@@ -82,3 +82,16 @@ Test `gadget_safety_invariant_realized_cfv_geq_opt_out` at commit `5fc8153e` ver
 - Trivial tasks (3, 5, 6, 7, 9, 14-skeleton) self-verified by spot-check, saving review overhead without compromising correctness.
 - Pre-existing unrelated `blueprint_mp::mccfr::traverse_updates_strategy_sums` failure tracked in bean `wcc4` (low priority, separate track).
 - Follow-up retirement bean: `bgkr` (blocked-by this bean).
+
+
+
+### Merged to main 2026-04-24
+
+Merge commit: `50799416` — "Merge branch 'feat/option-a-gadget-tree' — Option A CFR-D gadget"
+
+Post-merge verification: `cargo test -p range-solver -p poker-solver-tauri --lib` — 247 range-solver tests pass, 0 failures. Workspace builds clean.
+
+Bean status: still in-progress pending the iter-15 E2E empirical run (Task 14). Close this bean after:
+1. User runs the harness against real blueprint data from main
+2. Results recorded in `docs/progress/2026-04-24-option-a-iter-15.md`
+3. akg3 triage decision made based on iter-15 numbers
