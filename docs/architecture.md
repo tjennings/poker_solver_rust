@@ -301,6 +301,26 @@ This follows the approach described in **Modicum** (Brown, Sandholm & Amos, Neur
 - Evaluator construction: `crates/tauri-app/src/postflop.rs` (`build_rollout_evaluator`)
 - Bench/validate CLI: `crates/trainer/src/bench_rollout.rs`, `crates/trainer/src/validate_rollout.rs`
 
+## Safe Subgame Solving -- CFR-D Gadget (Option A)
+
+The subgame solver (`range-solver::PostFlopGame`) supports a safe re-solving gadget per the [Burch/Johanson/Bowling 2014 CFR-D construction (AAAI-14, Section 3)](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf). When enabled (via the `--gadget` CLI flag or the Tauri `enable_gadget` command flag), `PostFlopGame::with_config_and_gadget` prepends two nested `Decision(player, [Terminate, Follow])` nodes at arena indices 0--3, with Terminate children as depth-boundary terminals at reserved boundary ordinals 0 and 1. Per-hand opt-out CFVs come from the blueprint's `CbvTable` via `BlueprintCbvOptOut::opt_out_at_subgame_root` (MVP: uses the parent chance-ancestor CBV as an approximation).
+
+Regret matching at each gadget `Decision` node ensures `avg_realized_CFV[hand] >= opt_out[hand]`, bounding subgame exploitability per [Brown & Sandholm 2017, Theorem 2](https://arxiv.org/abs/1705.02955).
+
+**Key files:**
+- Gadget config and tree injection: `crates/range-solver/src/game/gadget.rs` (`GadgetConfig`, `inject_gadget_layer`)
+- Constructor with gadget wiring: `crates/range-solver/src/game/interpreter.rs` (`PostFlopGame::with_config_and_gadget`)
+- Static evaluator and opt-out provider: `crates/tauri-app/src/gadget.rs` (`StaticGadgetEvaluator`, `make_gadget_game`, `BlueprintCbvOptOut::opt_out_at_subgame_root`)
+- CLI routing: `crates/trainer/src/compare_solve.rs` (`--gadget` / `--gadget-clamp`)
+
+### Supersedes
+
+The post-clamp `GadgetEvaluator` (boundary-wrapper path) is retained for A/B diagnostic comparison via `--gadget-clamp` but is not the default. Retirement tracked in a follow-up bean.
+
+### Full Design Doc
+
+See `docs/plans/2026-04-24-option-a-deepstack-gadget-design.md`.
+
 ## Known Limitations
 
 - **No real-time subgame solving yet:** The blueprint is a static strategy. Pluribus-style real-time search is planned but not implemented.

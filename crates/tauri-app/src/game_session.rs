@@ -1215,12 +1215,15 @@ fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
     blueprint_sizes_to_range_solver(sizes)
 }
 
-/// Build a `PostFlopGame` from session state, ready for solving.
+/// Build the `CardConfig` and `ActionTree` for a postflop solve without
+/// constructing the `PostFlopGame`. Useful when the caller needs to pass
+/// these to `make_gadget_game` (Option A tree-structural gadget) rather
+/// than the normal `PostFlopGame::with_config` path.
 ///
 /// When `exact` is true, `depth_limit` is set to `None` so the game tree
 /// extends through all remaining streets to showdown (no boundary nodes).
 #[allow(clippy::too_many_arguments)]
-pub fn build_solve_game(
+pub fn build_solve_game_parts(
     board: &[String],
     oop_weights: &[f32],
     ip_weights: &[f32],
@@ -1229,7 +1232,7 @@ pub fn build_solve_game(
     bet_sizes: &[Vec<f64>],
     exact: bool,
     depth_limit_override: Option<u8>,
-) -> Result<PostFlopGame, String> {
+) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::CardConfig;
     use range_solver::range::Range;
@@ -1268,12 +1271,6 @@ pub fn build_solve_game(
         add_allin_threshold: 0.0,
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
-        // Exact mode: solve through all streets to showdown (no boundaries).
-        // Subgame mode: boundaries placed after depth_limit street transitions.
-        //   depth_limit=0: current street only (boundaries at next transition)
-        //   depth_limit=1: current + next street (e.g., flop+turn, boundaries at river)
-        //   depth_limit=2: from flop = full solve (flop+turn+river)
-        // River: no boundaries needed in either mode (already at showdown).
         depth_limit: if exact || initial_state == range_solver::BoardState::River {
             None
         } else {
@@ -1283,6 +1280,27 @@ pub fn build_solve_game(
 
     let action_tree =
         ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
+    Ok((card_config, action_tree))
+}
+
+/// Build a `PostFlopGame` from session state, ready for solving.
+///
+/// Delegates to [`build_solve_game_parts`] for config construction, then
+/// builds and allocates the game.
+pub fn build_solve_game(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    bet_sizes: &[Vec<f64>],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+) -> Result<PostFlopGame, String> {
+    let (card_config, action_tree) = build_solve_game_parts(
+        board, oop_weights, ip_weights, pot, effective_stack,
+        bet_sizes, exact, depth_limit_override,
+    )?;
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
     game.allocate_memory(false);
@@ -3264,6 +3282,25 @@ mod tests {
         let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(0)).unwrap();
         // River solve has no boundaries regardless of depth_limit_override
         assert_eq!(game.num_boundary_nodes(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // build_solve_game_parts test
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_solve_game_parts_returns_card_config_and_action_tree() {
+        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5, 1.0]];
+        let (card_config, action_tree) =
+            build_solve_game_parts(&board, &weights, &weights, 20, 90, &sizes, false, None)
+                .unwrap();
+        // The card_config should have both ranges set
+        assert!(!card_config.range[0].is_empty());
+        assert!(!card_config.range[1].is_empty());
+        // The action tree should have no invalid terminals
+        assert!(action_tree.invalid_terminals().is_empty());
     }
 
     // -------------------------------------------------------------------

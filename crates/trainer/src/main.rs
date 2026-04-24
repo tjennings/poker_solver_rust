@@ -414,15 +414,21 @@ enum Commands {
         #[arg(long, default_value_t = 0.0)]
         tolerance: f32,
 
-        /// Enable Libratus-style range gadget at subgame boundaries.
-        /// Constrains opponent CFVs to be at least as good as the blueprint
-        /// CBV opt-out, producing a safe re-solve.
-        #[arg(long, default_value_t = false)]
+        /// Enable Option A tree-structural CFR-D gadget (via make_gadget_game).
+        /// Prepends gadget decision nodes to the game tree for safe re-solve.
+        /// Mutually exclusive with --gadget-clamp.
+        #[arg(long, default_value_t = false, conflicts_with = "gadget_clamp")]
         gadget: bool,
 
-        /// Opt-out provider when --gadget is set. "blueprint-cbv" reads from
-        /// the bundle's CbvTable (production). "constant" uses a fixed value
-        /// from --gadget-constant (diagnostic).
+        /// Enable legacy post-clamp GadgetEvaluator at subgame boundaries.
+        /// Clamps opponent CFVs upward to blueprint opt-out values.
+        /// Mutually exclusive with --gadget.
+        #[arg(long, default_value_t = false, conflicts_with = "gadget")]
+        gadget_clamp: bool,
+
+        /// Opt-out provider when --gadget or --gadget-clamp is set.
+        /// "blueprint-cbv" reads from the bundle's CbvTable (production).
+        /// "constant" uses a fixed value from --gadget-constant (diagnostic).
         #[arg(long, default_value = "blueprint-cbv")]
         gadget_provider: String,
 
@@ -1356,6 +1362,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             trace_dir,
             tolerance,
             gadget,
+            gadget_clamp,
             gadget_provider,
             gadget_constant,
         } => {
@@ -1397,6 +1404,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trace_config,
                 tolerance,
                 gadget,
+                gadget_clamp,
                 &gadget_provider,
                 gadget_constant,
             )
@@ -2974,5 +2982,92 @@ snapshots:
         } else {
             panic!("expected CompareSolve");
         }
+    }
+
+    /// --gadget-clamp flag defaults to false.
+    #[test]
+    fn compare_solve_gadget_clamp_defaults_false() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/dummy",
+            "--spot", "any",
+        ]).expect("should parse");
+        if let super::Commands::CompareSolve { gadget_clamp, .. } = cli.command {
+            assert!(!gadget_clamp, "gadget_clamp should default to false");
+        } else {
+            panic!("expected CompareSolve");
+        }
+    }
+
+    /// --gadget-clamp can be set explicitly.
+    #[test]
+    fn compare_solve_gadget_clamp_can_be_set() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/dummy",
+            "--spot", "any",
+            "--gadget-clamp",
+        ]).expect("should parse");
+        if let super::Commands::CompareSolve { gadget_clamp, .. } = cli.command {
+            assert!(gadget_clamp, "gadget_clamp should be true when --gadget-clamp is passed");
+        } else {
+            panic!("expected CompareSolve");
+        }
+    }
+
+    /// --gadget and --gadget-clamp are mutually exclusive: passing both is an error.
+    #[test]
+    fn compare_solve_gadget_and_gadget_clamp_mutually_exclusive() {
+        use clap::Parser;
+
+        let result = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/dummy",
+            "--spot", "any",
+            "--gadget",
+            "--gadget-clamp",
+        ]);
+        assert!(result.is_err(), "--gadget and --gadget-clamp should be mutually exclusive");
+    }
+
+    /// --gadget-clamp accepts --gadget-provider and --gadget-constant flags.
+    #[test]
+    fn compare_solve_gadget_clamp_with_provider_and_constant() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle", "/tmp/dummy",
+            "--spot", "any",
+            "--gadget-clamp",
+            "--gadget-provider", "constant",
+            "--gadget-constant", "-0.5",
+        ]).expect("should parse");
+        if let super::Commands::CompareSolve {
+            gadget, gadget_clamp, gadget_provider, gadget_constant, ..
+        } = cli.command {
+            assert!(!gadget);
+            assert!(gadget_clamp);
+            assert_eq!(gadget_provider, "constant");
+            assert_eq!(gadget_constant, -0.5);
+        } else {
+            panic!("expected CompareSolve");
+        }
+    }
+
+    /// gadget_mode_label returns correct mode strings.
+    #[test]
+    fn gadget_mode_label_returns_correct_modes() {
+        assert_eq!(super::compare_solve::gadget_mode_label(true, false), "tree");
+        assert_eq!(super::compare_solve::gadget_mode_label(false, true), "clamp");
+        assert_eq!(super::compare_solve::gadget_mode_label(false, false), "off");
     }
 }

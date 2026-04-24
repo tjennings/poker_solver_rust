@@ -16,11 +16,12 @@ use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::Street;
 
 use poker_solver_tauri::{
-    GameSession, build_solve_game,
+    GameSession, build_solve_game, build_solve_game_parts,
     parse_rs_poker_card, seed_solver_with_blueprint,
     StreetBoundaryConfig, BoundaryKind, resolve_street_boundary,
 };
 use poker_solver_tauri::postflop::CbvContext;
+use poker_solver_tauri::gadget;
 
 use range_solver::card::card_to_string;
 use range_solver::interface::Game;
@@ -151,6 +152,19 @@ pub fn check_bias_divergence(
         }
     }
     warnings
+}
+
+/// Returns a human-readable label for the active gadget mode.
+///
+/// Used for both the startup `eprintln!` message and test assertions.
+pub fn gadget_mode_label(gadget: bool, gadget_clamp: bool) -> &'static str {
+    if gadget {
+        "tree"
+    } else if gadget_clamp {
+        "clamp"
+    } else {
+        "off"
+    }
 }
 
 /// Per-hand L1 distance (mass moved) between two strategy vectors.
@@ -801,6 +815,207 @@ fn format_hand(c1: u8, c2: u8) -> String {
     format!("{s1}{s2}")
 }
 
+/// Build the subgame game via Option A tree-structural gadget path.
+///
+/// Uses `make_gadget_game` to prepend gadget decision nodes, then wires
+/// boundary evaluators for ordinals 2+ (real depth boundaries).
+#[allow(clippy::too_many_arguments)]
+fn build_gadget_tree_game(
+    board: &[String],
+    oop_w: &[f32],
+    ip_w: &[f32],
+    pot: i32,
+    eff_stack: i32,
+    bet_sizes: &[Vec<f64>],
+    depth_limit: Option<u8>,
+    ctx: &Arc<CbvContext>,
+    current_node: u32,
+    board_cards: &[poker_solver_core::poker::Card],
+    boundary_cut: &Option<(u8, BoundaryKind)>,
+    gadget_provider: &str,
+    gadget_constant: f32,
+) -> Result<PostFlopGame, String> {
+    // Build a temporary game to extract private_cards (needed for opt-out
+    // computation and inner evaluator). Then build the real gadget game.
+    let board_u8: Vec<u8> = board_cards.iter()
+        .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
+        .collect();
+
+    let (tmp_cc, tmp_at) = build_solve_game_parts(
+        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+    )?;
+    let tmp_game = PostFlopGame::with_config(tmp_cc, tmp_at)
+        .map_err(|e| format!("Failed to build temp game: {e}"))?;
+    let private_cards: [Vec<(u8, u8)>; 2] = [
+        tmp_game.private_cards(0).to_vec(),
+        tmp_game.private_cards(1).to_vec(),
+    ];
+    let tree_cfg = tmp_game.tree_config().clone();
+    drop(tmp_game);
+
+    let [opt_out_oop, opt_out_ip] = compute_opt_out_values(
+        gadget_provider, gadget_constant, ctx, current_node,
+        pot as f32, &board_u8, &private_cards,
+    )?;
+
+    let gadget_config = range_solver::game::gadget::GadgetConfig {
+        opt_out_oop,
+        opt_out_ip,
+        outer_player: 1, // IP outer (default)
+    };
+
+    // Build inner boundary evaluator for ordinals 2+.
+    let inner_evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
+        match boundary_cut {
+            Some((_, BoundaryKind::ExactSubtree)) | None => {
+                Arc::new(poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
+                    board_u8.clone(),
+                    private_cards.clone(),
+                    [vec![1.0; private_cards[0].len()], vec![1.0; private_cards[1].len()]],
+                    tree_cfg,
+                ).with_solve_iters(500))
+            }
+            Some((_, BoundaryKind::Cfvnet(model_path))) => {
+                let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
+                    Path::new(model_path),
+                ).map_err(|e| format!("ONNX session load failed: {e}"))?;
+                Arc::new(cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+                    session,
+                    board_u8.clone(),
+                    private_cards.clone(),
+                ))
+            }
+        };
+
+    // Build the real gadget game (consuming fresh card_config + action_tree).
+    let (card_config, action_tree) = build_solve_game_parts(
+        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+    )?;
+    let game = gadget::make_gadget_game(
+        card_config, action_tree, gadget_config, inner_evaluator,
+    )?;
+
+    // Wire per-boundary evaluators for ordinals 2+ (real depth boundaries).
+    // make_gadget_game already set ordinals 0/1 to StaticGadgetEvaluator
+    // and set boundary_evaluator for ordinals 2+.
+    // Additional per-boundary evaluators beyond the generic boundary_evaluator
+    // are not needed here — the generic evaluator handles all real boundaries.
+
+    let n_real_boundaries = game.num_boundary_nodes().saturating_sub(2);
+    eprintln!(
+        "[compare] gadget-tree mode: {} real boundaries + 2 gadget ordinals",
+        n_real_boundaries,
+    );
+
+    Ok(game)
+}
+
+/// Set up legacy clamp-path boundary evaluators (--gadget-clamp mode).
+///
+/// When gadget_clamp is true, constructs an OptOutProvider and wraps each
+/// boundary evaluator in a GadgetEvaluator. When false, wires boundaries
+/// without clamp wrapping.
+#[allow(clippy::too_many_arguments)]
+fn setup_clamp_boundaries(
+    game: &mut PostFlopGame,
+    gadget_clamp: bool,
+    gadget_provider: &str,
+    gadget_constant: f32,
+    board_cards: &[poker_solver_core::poker::Card],
+    ctx: &Arc<CbvContext>,
+    current_node: u32,
+    boundary_cut: &Option<(u8, BoundaryKind)>,
+) -> Result<(), String> {
+    let opt_out: Option<Arc<dyn gadget::OptOutProvider>> = if gadget_clamp {
+        let board_u8: Vec<u8> = board_cards.iter()
+            .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
+            .collect();
+        let private_cards: [Vec<(u8, u8)>; 2] = [
+            game.private_cards(0).to_vec(),
+            game.private_cards(1).to_vec(),
+        ];
+        Some(compute_opt_out_provider(
+            gadget_provider, gadget_constant, ctx, current_node,
+            &board_u8, &private_cards,
+        )?)
+    } else {
+        None
+    };
+
+    let n_boundaries = game.num_boundary_nodes();
+    if let Some((_, kind)) = boundary_cut {
+        if n_boundaries > 0 {
+            match kind {
+                BoundaryKind::Cfvnet(model_path) => {
+                    setup_neural_boundaries(game, Path::new(model_path), opt_out);
+                }
+                BoundaryKind::ExactSubtree => {
+                    setup_exact_subtree_boundaries(game, opt_out);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute per-hand opt-out bcfv values for the gadget tree path.
+///
+/// Returns `[opt_out_oop, opt_out_ip]` vectors.
+fn compute_opt_out_values(
+    gadget_provider: &str,
+    gadget_constant: f32,
+    ctx: &Arc<CbvContext>,
+    current_node: u32,
+    subgame_pot_chips: f32,
+    board_u8: &[u8],
+    private_cards: &[Vec<(u8, u8)>; 2],
+) -> Result<[Vec<f32>; 2], String> {
+    match gadget_provider {
+        "constant" => {
+            eprintln!("[compare] gadget-tree: ConstantOptOut({gadget_constant})");
+            Ok([
+                vec![gadget_constant; private_cards[0].len()],
+                vec![gadget_constant; private_cards[1].len()],
+            ])
+        }
+        "blueprint-cbv" => {
+            eprintln!("[compare] gadget-tree: BlueprintCbvOptOut (per-boundary pot)");
+            Ok(gadget::BlueprintCbvOptOut::opt_out_at_subgame_root(
+                ctx, current_node, subgame_pot_chips, board_u8, private_cards,
+            ))
+        }
+        other => Err(format!(
+            "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
+        )),
+    }
+}
+
+/// Compute an OptOutProvider for the legacy clamp path.
+fn compute_opt_out_provider(
+    gadget_provider: &str,
+    gadget_constant: f32,
+    ctx: &Arc<CbvContext>,
+    current_node: u32,
+    board_u8: &[u8],
+    private_cards: &[Vec<(u8, u8)>; 2],
+) -> Result<Arc<dyn gadget::OptOutProvider>, String> {
+    match gadget_provider {
+        "constant" => {
+            eprintln!("[compare] gadget-clamp: ConstantOptOut({gadget_constant})");
+            Ok(Arc::new(gadget::ConstantOptOut(gadget_constant)))
+        }
+        "blueprint-cbv" => {
+            eprintln!("[compare] gadget-clamp: BlueprintCbvOptOut (per-boundary pot)");
+            Ok(Arc::new(gadget::BlueprintCbvOptOut::from_cbv_context(
+                ctx, current_node, board_u8, private_cards,
+            )))
+        }
+        other => Err(format!(
+            "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
+        )),
+    }
+}
+
 /// Run the compare-solve harness.
 ///
 /// `tolerance > 0` enables a pass/fail check on the final strategy at the
@@ -821,9 +1036,12 @@ pub fn run(
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
+    gadget_clamp: bool,
     gadget_provider: &str,
     gadget_constant: f32,
 ) -> Result<(), String> {
+    let mode = gadget_mode_label(gadget, gadget_clamp);
+    eprintln!("gadget mode: {mode}");
     // 1. Load bundle
     let (config, strategy, tree, decision_map, ctx) =
         load_bundle_with_snapshot(bundle_dir, snapshot)?;
@@ -911,8 +1129,27 @@ pub fn run(
     // 5. Build subgame game (with depth limit from SBC)
     // When all-exact (no boundary cut), build as exact too (no boundaries).
     let subgame_is_exact = boundary_cut.is_none();
+    let current_node = session.node_idx();
+    let gadget_tree_active = gadget && !subgame_is_exact;
     eprintln!("[compare] building subgame game...");
-    let mut subgame_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, subgame_is_exact, depth_limit)?;
+    let mut subgame_game = if gadget_tree_active {
+        build_gadget_tree_game(
+            &board, &oop_w, &ip_w, pot, eff_stack, bet_sizes,
+            depth_limit, &ctx, current_node, &board_cards,
+            &boundary_cut, gadget_provider, gadget_constant,
+        )?
+    } else {
+        let mut game = build_solve_game(
+            &board, &oop_w, &ip_w, pot, eff_stack,
+            bet_sizes, subgame_is_exact, depth_limit,
+        )?;
+        // Wire legacy clamp path if --gadget-clamp
+        setup_clamp_boundaries(
+            &mut game, gadget_clamp, gadget_provider, gadget_constant,
+            &board_cards, &ctx, current_node, &boundary_cut,
+        )?;
+        game
+    };
 
     let n_boundaries = subgame_game.num_boundary_nodes();
     let (mem_subgame, _) = subgame_game.memory_usage();
@@ -927,7 +1164,6 @@ pub fn run(
 
     // 6. Seed both solvers with blueprint strategy
     let seed_street = street;
-    let current_node = session.node_idx();
     seed_solver_with_blueprint(
         &exact_game, &ctx.strategy, &ctx.all_buckets, &ctx.abstract_tree,
         &board_cards, seed_street, current_node,
@@ -937,64 +1173,24 @@ pub fn run(
         &board_cards, seed_street, current_node,
     );
 
-    // 7. Set up boundary evaluators if a cut is active
-    let opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>> = if gadget {
-        match gadget_provider {
-            "constant" => {
-                eprintln!("[compare] gadget enabled: ConstantOptOut({gadget_constant})");
-                Some(Arc::new(poker_solver_tauri::gadget::ConstantOptOut(gadget_constant)))
-            }
-            "blueprint-cbv" => {
-                eprintln!("[compare] gadget enabled: BlueprintCbvOptOut (per-boundary pot)");
-                let board_u8: Vec<u8> = board_cards.iter()
-                    .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
-                    .collect();
-                let private_cards: [Vec<(u8, u8)>; 2] = [
-                    subgame_game.private_cards(0).to_vec(),
-                    subgame_game.private_cards(1).to_vec(),
-                ];
-                Some(Arc::new(
-                    poker_solver_tauri::gadget::BlueprintCbvOptOut::from_cbv_context(
-                        &ctx,
-                        current_node,
-                        &board_u8,
-                        &private_cards,
-                    ),
-                ))
-            }
-            other => {
-                return Err(format!(
-                    "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
-                ));
-            }
-        }
-    } else {
-        None
-    };
-    if let Some((_, ref kind)) = boundary_cut {
-        if n_boundaries > 0 {
-            match kind {
-                BoundaryKind::Cfvnet(model_path) => {
-                    setup_neural_boundaries(&mut subgame_game, Path::new(model_path), opt_out);
-                }
-                BoundaryKind::ExactSubtree => {
-                    setup_exact_subtree_boundaries(&mut subgame_game, opt_out);
-                }
-            }
-        }
-    }
-
     let _ = dump_boundary_cfvs;
 
     // 7b. Build boundary tracer (no-op if --trace-boundaries not given)
-    let tracer = trace_config.into_tracer(iters);
+    // In gadget-tree mode ordinals 0 and 1 are static gadget terminals
+    // whose CFVs never change during solve -- skip tracing them.
+    let skip = if gadget_tree_active { 2 } else { 0 };
+    let tracer = trace_config.into_tracer_with_skip(iters, skip);
     if tracer.is_some() {
         eprintln!(
-            "[compare] boundary tracing enabled ({n_boundaries} boundaries)"
+            "[compare] boundary tracing enabled ({n_boundaries} boundaries, skip {skip} leading)"
         );
     }
 
-    // 7c. Build spot strings for each boundary ordinal
+    // 7c. Build spot strings for each boundary ordinal.
+    // In gadget-tree mode, ordinals 0 and 1 are gadget Terminate nodes
+    // (not real depth boundaries). The tracer and spot_paths vectors are
+    // indexed by ordinal, so we keep all entries to maintain alignment.
+    // The BoundaryTracer's ordinal filter controls which are actually traced.
     let spot_paths: Option<Vec<String>> = if tracer.is_some() && n_boundaries > 0 {
         let postflop_paths = build_boundary_spot_paths(&subgame_game);
         Some(
