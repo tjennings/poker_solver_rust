@@ -1,4 +1,5 @@
 mod evaluation;
+pub mod gadget;
 mod interpreter;
 mod node;
 mod query;
