@@ -370,6 +370,46 @@ Reports per-street: bucket size stats, intra-bucket equity std (lower = better),
 
 ---
 
+### compare-solve
+
+Compare a blueprint's strategy against an exact subgame re-solve on a specific postflop spot. Loads a blueprint bundle, extracts ranges at the specified node, solves the subgame with DCFR (range-solver), and reports strategy deltas between the blueprint and exact solutions.
+
+```bash
+cargo run -p poker-solver-trainer --release -- compare-solve \
+  --bundle /path/to/blueprint/bundle \
+  --spot 'sb:2bb,bb:10bb,sb:22bb,bb:call|JhTh9h|bb:15bb,sb:call|7d' \
+  --iters 200 --river-boundary cfvnet \
+  --river-model /path/to/cfvnet_river.onnx
+```
+
+Options:
+- `--bundle <DIR>` -- Path to blueprint bundle directory (required)
+- `--snapshot <NAME>` -- Snapshot name, e.g. `snapshot_0013`; defaults to latest
+- `--spot <SPOT>` -- Spot encoding: actions and board cards separated by `|` (required)
+- `--iters <N>` -- DCFR iterations for the subgame solve (default: 200)
+- `--tolerance <F>` -- Max per-cell strategy delta before non-zero exit (default: 0.0, disabled)
+- `--verbose` -- Print per-iteration progress
+- `--flop-boundary <MODE>` -- Flop boundary evaluator: `exact` (default) or `cfvnet`
+- `--turn-boundary <MODE>` -- Turn boundary evaluator: `exact` (default) or `cfvnet`
+- `--river-boundary <MODE>` -- River boundary evaluator: `exact` (default) or `cfvnet`
+- `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
+- `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
+- `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
+
+#### Gadget Flags (Safe Re-solving)
+
+The following flags enable safe subgame re-solving via a CFR-D gadget. See `docs/architecture.md` (Safe Subgame Solving) for algorithmic details.
+
+- `--gadget` -- **Option A (tree-structural CFR-D gadget).** Enables the [Burch 2014 Section 3](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf) safe re-solving gadget via tree modification: two nested `Decision(player, [Terminate, Follow])` nodes prepended at the subgame root, with per-hand opt-out CFVs from blueprint CBVs. Regret matching at each gadget decision ensures the opponent's realized CFV at the subgame root is at least their blueprint best-response (opt-out) value. Mutually exclusive with `--gadget-clamp`.
+
+- `--gadget-clamp` -- **Legacy post-clamp diagnostic.** Preserves access to the previous `GadgetEvaluator` wrapper approach (post-clamp to the opt-out floor at depth boundaries). Retained for A/B comparison while Option A rolls out. Mutually exclusive with `--gadget`. Will be retired in a follow-up change.
+
+- `--gadget-provider <PROVIDER>` -- Opt-out value source. `blueprint-cbv` (default) reads from the bundle's `CbvTable`; `constant` uses a fixed value from `--gadget-constant`. Applies to both `--gadget` and `--gadget-clamp` paths.
+
+- `--gadget-constant <F>` -- Constant opt-out value (pot-normalised bcfv) when `--gadget-provider=constant` (default: 0.0). Ignored otherwise.
+
+---
+
 ## Training TUI Dashboard
 
 When `tui.enabled: true` in the config, `train-blueprint` launches a full-screen terminal dashboard instead of text output.
