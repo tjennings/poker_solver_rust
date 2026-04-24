@@ -4,6 +4,32 @@
 //!
 //! See docs/plans/2026-04-24-option-a-deepstack-gadget-design.md and
 //! docs/plans/2026-04-24-option-a-deepstack-gadget-plan.md.
+//!
+//! # External callers of arena-index APIs (Task 9 audit, 2026-04-24)
+//!
+//! After `inject_gadget_layer`, arena indices 0..=3 are the gadget layer
+//! and all pre-existing nodes shift by +4. `node_to_boundary` ordinals
+//! 0 and 1 are reserved for gadget terminals; pre-existing boundary
+//! ordinals shift +2.
+//!
+//! External callsites holding arena indices or boundary ordinals
+//! (audited via `grep -rn 'node_index|node_arena\[|boundary_node_indices'`
+//! excluding tests and range-solver/src/game/):
+//!
+//! - `crates/tauri-app/src/boundary_trace.rs:218, 274` — uses
+//!   `boundary_node_indices()` to walk cfvnet-eligible boundaries.
+//!   Post-gadget, ordinals 0/1 are the gadget terminals and are NOT
+//!   cfvnet boundaries. The walk must skip ordinals 0 and 1 when
+//!   operating on a gadget-enabled game.
+//! - `crates/trainer/src/compare_solve.rs:635` — same concern.
+//!
+//! Task 13 (CLI integration) is responsible for routing the gadget path
+//! such that these callers either (a) skip ordinals 0/1 explicitly, or
+//! (b) only operate on the `boundary_evaluator` (ordinals 2+) path. The
+//! per-boundary dispatch pattern at `crates/range-solver/src/game/evaluation.rs:111-123`
+//! already routes ordinals 0/1 to `per_boundary_evaluators` (populated
+//! by `make_gadget_game` in Task 10), so cfvnet is not invoked on those
+//! ordinals during solve — but CLI-level reporting code needs the filter.
 
 #[allow(unused_imports)]
 use crate::action_tree::*;
