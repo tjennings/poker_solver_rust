@@ -151,4 +151,28 @@ mod tests {
         // G_OOP.Terminate at arena 3 -> ordinal 1
         assert_eq!(game.boundary_ordinal(3), Some(1));
     }
+
+    #[test]
+    #[should_panic(expected = "opt_out_oop length must match")]
+    fn inject_panics_on_oop_length_mismatch() {
+        let mut game = minimal_game();
+        let cfg = GadgetConfig {
+            opt_out_oop: vec![0.0; 99], // wrong length
+            opt_out_ip: vec![0.0; game.num_private_hands(1)],
+            outer_player: 1,
+        };
+        inject_gadget_layer(&mut game, &cfg);
+    }
+
+    #[test]
+    #[should_panic(expected = "outer_player must be 0 or 1")]
+    fn inject_panics_on_invalid_outer_player() {
+        let mut game = minimal_game();
+        let cfg = GadgetConfig {
+            opt_out_oop: vec![0.0; game.num_private_hands(0)],
+            opt_out_ip: vec![0.0; game.num_private_hands(1)],
+            outer_player: 42,
+        };
+        inject_gadget_layer(&mut game, &cfg);
+    }
 }
