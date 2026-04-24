@@ -400,9 +400,9 @@ Options:
 
 The following flags enable safe subgame re-solving via a CFR-D gadget. See `docs/architecture.md` (Safe Subgame Solving) for algorithmic details.
 
-- `--gadget` -- **Option A (tree-structural CFR-D gadget).** Enables the [Burch 2014 Section 3](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf) safe re-solving gadget via tree modification: two nested `Decision(player, [Terminate, Follow])` nodes prepended at the subgame root, with per-hand opt-out CFVs from blueprint CBVs. Regret matching at each gadget decision ensures the opponent's realized CFV at the subgame root is at least their blueprint best-response (opt-out) value. Mutually exclusive with `--gadget-clamp`.
+- `--gadget` -- **Option A2 (per-boundary CFR-D gadget).** Enables the [Burch 2014 Section 3](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf) safe re-solving gadget via tree modification: a 4-node gadget subtree (`G_IP -> [Terminate_IP | G_OOP -> [Terminate_OOP | existing cfvnet]]`) is injected at each cfvnet depth-boundary, with per-hand per-boundary opt-out CFVs from blueprint CBVs. Traverser-dependent activation ensures each player's gadget is regret-matched only on their own traverser pass; on the non-owner's pass the gadget is a passthrough. Startup prints `gadget mode: tree`. Mutually exclusive with `--gadget-clamp`.
 
-- `--gadget-clamp` -- **Legacy post-clamp diagnostic.** Preserves access to the previous `GadgetEvaluator` wrapper approach (post-clamp to the opt-out floor at depth boundaries). Retained for A/B comparison while Option A rolls out. Mutually exclusive with `--gadget`. Will be retired in a follow-up change.
+- `--gadget-clamp` -- **Legacy post-clamp diagnostic.** Preserves access to the previous `GadgetEvaluator` wrapper approach (post-clamp to the opt-out floor at depth boundaries). Retained for A/B comparison while Option A2 rolls out. Mutually exclusive with `--gadget`. Will be retired in a follow-up change.
 
 - `--gadget-provider <PROVIDER>` -- Opt-out value source. `blueprint-cbv` (default) reads from the bundle's `CbvTable`; `constant` uses a fixed value from `--gadget-constant`. Applies to both `--gadget` and `--gadget-clamp` paths.
 

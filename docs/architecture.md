@@ -301,25 +301,44 @@ This follows the approach described in **Modicum** (Brown, Sandholm & Amos, Neur
 - Evaluator construction: `crates/tauri-app/src/postflop.rs` (`build_rollout_evaluator`)
 - Bench/validate CLI: `crates/trainer/src/bench_rollout.rs`, `crates/trainer/src/validate_rollout.rs`
 
-## Safe Subgame Solving -- CFR-D Gadget (Option A)
+## Safe Subgame Solving -- CFR-D Gadget (Option A2)
 
-The subgame solver (`range-solver::PostFlopGame`) supports a safe re-solving gadget per the [Burch/Johanson/Bowling 2014 CFR-D construction (AAAI-14, Section 3)](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf). When enabled (via the `--gadget` CLI flag or the Tauri `enable_gadget` command flag), `PostFlopGame::with_config_and_gadget` prepends two nested `Decision(player, [Terminate, Follow])` nodes at arena indices 0--3, with Terminate children as depth-boundary terminals at reserved boundary ordinals 0 and 1. Per-hand opt-out CFVs come from the blueprint's `CbvTable` via `BlueprintCbvOptOut::opt_out_at_subgame_root` (MVP: uses the parent chance-ancestor CBV as an approximation).
+The subgame solver (`range-solver::PostFlopGame`) supports safe re-solving via a per-boundary CFR-D gadget per [Burch/Johanson/Bowling 2014 Section 3](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf). When enabled (via the `--gadget` CLI flag or the Tauri `enable_gadget` command flag), a 4-node gadget subtree is injected at each cfvnet depth-boundary in the postflop tree:
 
-Regret matching at each gadget `Decision` node ensures `avg_realized_CFV[hand] >= opt_out[hand]`, bounding subgame exploitability per [Brown & Sandholm 2017, Theorem 2](https://arxiv.org/abs/1705.02955).
+```
+Chance(river) -> G_IP  (Decision, owner=IP,  actions=[Terminate, Follow])
+                  |-- Terminate_IP   (depth boundary terminal)
+                  '-- Follow -> G_OOP (Decision, owner=OOP, actions=[Terminate, Follow])
+                                 |-- Terminate_OOP  (depth boundary terminal)
+                                 '-- Follow -> EXISTING cfvnet boundary
+```
+
+**Gadget Decision nodes** carry a `PLAYER_GADGET_FLAG` (bit 6 of the player byte) combined with the owner player bits. The `is_gadget()` and `gadget_owner()` methods on `PostFlopNode` decode these.
+
+**Traverser-dependent activation (Option Y).** On a gadget Decision node, if `owner == traverser`, the solver runs standard CFR regret-matching -- the owner's own pass updates regrets and accumulates strategy sums. If `owner != traverser`, the gadget is disabled: the solver forces sigma=(0,1), skips directly to Follow, and performs no regret or strategy-sum update. Under the non-owner's pass the gadget behaves as if it does not exist. This matches the CFR-D semantics from [Burch 2014 Section 3](https://webdocs.cs.ualberta.ca/~bowling/papers/14aaai-cfrd.pdf) and [Brown & Sandholm 2017](https://arxiv.org/abs/1705.02955), where the opponent's gadget is visited but not regret-updated on the traverser's pass.
+
+**Opt-out values** are computed once at game construction by `BlueprintCbvOptOut::from_cbv_context`. For each cfvnet depth-boundary (chance node descendant of the abstract tree root), the provider looks up the per-bucket CBV from the blueprint's `CbvTable`, normalizes by that boundary's own half-pot to produce bcfv units, and maps each concrete hand to its bucket. This yields per-boundary, per-player, per-hand opt-out values.
+
+**Ordinal layout.** The original cfvnet boundaries retain ordinals 0..N. New gadget Terminate terminals occupy ordinals N..3N (for original boundary `b`: ordinal `N+2*b` = Terminate_IP, ordinal `N+2*b+1` = Terminate_OOP). Gadget terminal CFVs are pre-populated at injection time: the gadget player receives opt-out values; the non-gadget player receives zeros (neutralized).
+
+**Safety invariant.** Regret-matching at each active gadget ensures `avg_realized_CFV[h] >= opt_out[h]` per gadget owner, per boundary, per hand. This is the Burch 2014 Section 3 sufficiency condition. Verified by the test `per_boundary_safety_invariant_avg_realized_cfv_geq_opt_out` at 0.01 tolerance after 1000 iterations.
+
+**Tree invariant.** `game.root()` returns the real subgame root (not a gadget layer). Explorer, blueprint seeding, and all external arena-index consumers require no special handling.
 
 **Key files:**
-- Gadget config and tree injection: `crates/range-solver/src/game/gadget.rs` (`GadgetConfig`, `inject_gadget_layer`)
-- Constructor with gadget wiring: `crates/range-solver/src/game/interpreter.rs` (`PostFlopGame::with_config_and_gadget`)
-- Static evaluator and opt-out provider: `crates/tauri-app/src/gadget.rs` (`StaticGadgetEvaluator`, `make_gadget_game`, `BlueprintCbvOptOut::opt_out_at_subgame_root`)
-- CLI routing: `crates/trainer/src/compare_solve.rs` (`--gadget` / `--gadget-clamp`)
+- Gadget config and tree injection: `crates/range-solver/src/game/gadget.rs` (`GadgetConfigPerBoundary`, `inject_per_boundary_gadgets`)
+- Solver traverser-disable logic: `crates/range-solver/src/solver.rs` (gadget activation check near line 245)
+- Compose helper and opt-out provider: `crates/tauri-app/src/gadget.rs` (`make_per_boundary_gadget_game`, `BlueprintCbvOptOut::from_cbv_context`)
+- CLI routing: `crates/trainer/src/compare_solve.rs` (`--gadget` / `--gadget-clamp`, `build_gadget_tree_game`)
 
 ### Supersedes
 
-The post-clamp `GadgetEvaluator` (boundary-wrapper path) is retained for A/B diagnostic comparison via `--gadget-clamp` but is not the default. Retirement tracked in a follow-up bean.
+Option A (root-level gadget, merged at `50799416`) placed two nested Decision nodes at the subgame root (arena indices 0--3). Option A2 replaces this with per-boundary placement, matching the standard CFR-D structural prescription. The post-clamp `GadgetEvaluator` (boundary-wrapper path) is retained for A/B diagnostic comparison via `--gadget-clamp`. Retirement tracked in a follow-up bean.
 
-### Full Design Doc
+### Design History
 
-See `docs/plans/2026-04-24-option-a-deepstack-gadget-design.md`.
+- Original Option A design: `docs/plans/2026-04-24-option-a-deepstack-gadget-design.md` (documents the root-gadget design, now superseded by Option A2).
+- Option A2 pivot rationale: `docs/plans/2026-04-24-option-a2-per-boundary-gadget-addendum.md`.
 
 ## Known Limitations
 
