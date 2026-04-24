@@ -566,6 +566,69 @@ impl range_solver::game::BoundaryEvaluator for StaticGadgetEvaluator {
     }
 }
 
+/// Compose a gadget-enabled `PostFlopGame` with the full evaluator stack:
+/// - `per_boundary_evaluators[0]` = StaticGadgetEvaluator for the outer
+///   gadget's Terminate (ordinal 0).
+/// - `per_boundary_evaluators[1]` = StaticGadgetEvaluator for the inner
+///   gadget's Terminate (ordinal 1).
+/// - `boundary_evaluator` = the caller-supplied inner evaluator (cfvnet /
+///   exact subtree) for ordinals 2+ (real depth boundaries).
+///
+/// When `outer_player=1` (IP outer, the default):
+///   ordinal 0 = G_IP.Terminate  -> IP gets opt_out_ip, OOP neutralised to zero.
+///   ordinal 1 = G_OOP.Terminate -> OOP gets opt_out_oop, IP neutralised to zero.
+/// When `outer_player=0` (OOP outer), the mapping inverts.
+///
+/// Callers must not manually set `per_boundary_evaluators[0/1]` after this.
+pub fn make_gadget_game(
+    card_config: range_solver::card::CardConfig,
+    action_tree: range_solver::action_tree::ActionTree,
+    gadget_config: range_solver::game::gadget::GadgetConfig,
+    inner_evaluator: Arc<dyn range_solver::game::BoundaryEvaluator>,
+) -> Result<range_solver::game::PostFlopGame, String> {
+    let mut game = range_solver::game::PostFlopGame::with_config_and_gadget(
+        card_config,
+        action_tree,
+        gadget_config.clone(),
+    )?;
+    game.allocate_memory(false);
+
+    let n_oop = range_solver::interface::Game::num_private_hands(&game, 0);
+    let n_ip = range_solver::interface::Game::num_private_hands(&game, 1);
+
+    let (eval_0, eval_1) = if gadget_config.outer_player == 1 {
+        (
+            Arc::new(StaticGadgetEvaluator::new(
+                vec![0.0; n_oop],
+                gadget_config.opt_out_ip,
+            )),
+            Arc::new(StaticGadgetEvaluator::new(
+                gadget_config.opt_out_oop,
+                vec![0.0; n_ip],
+            )),
+        )
+    } else {
+        (
+            Arc::new(StaticGadgetEvaluator::new(
+                gadget_config.opt_out_oop,
+                vec![0.0; n_ip],
+            )),
+            Arc::new(StaticGadgetEvaluator::new(
+                vec![0.0; n_oop],
+                gadget_config.opt_out_ip,
+            )),
+        )
+    };
+
+    game.per_boundary_evaluators = vec![
+        eval_0 as Arc<dyn range_solver::game::BoundaryEvaluator>,
+        eval_1 as Arc<dyn range_solver::game::BoundaryEvaluator>,
+    ];
+    game.boundary_evaluator = Some(inner_evaluator);
+
+    Ok(game)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
