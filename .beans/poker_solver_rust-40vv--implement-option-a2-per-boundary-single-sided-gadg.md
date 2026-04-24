@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-40vv
 title: 'Implement Option A2: per-boundary single-sided gadget with traverser-disable'
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-04-24T17:02:45Z
-updated_at: 2026-04-24T20:16:07Z
+updated_at: 2026-04-24T20:21:38Z
 blocked_by:
     - poker_solver_rust-02wj
 ---
@@ -56,3 +56,37 @@ Design basis: ml-researcher comparison preserved in session transcript; design d
 - **Phase F** — docs (dispatched; see commit TBD).
 - **E2E harness on JhTh9h|…|7d** — user to run directly from main post-docs merge.
 - **Close akg3** — triage decision based on iter-15/16 E2E results.
+
+
+
+## Final completion 2026-04-24
+
+Phase F (docs) completed: commit `c1f5cd12` (docs agent) + `c36b13c2` (Phase C framing fix) + `2820b8f5` (stale TODO cleanup in code comments).
+
+### Full commit ledger on main
+
+1. `bbda235b` Phase A — per-boundary tree injection + PLAYER_GADGET_FLAG
+2. `ac19a5b1` Phase B (initial, wrong condition)
+3. `e2252a3d` Phase B fix — Option Y + per-boundary safety invariant test ✅
+4. `d55d427b` Phase D — retire Option A + wire A2 through CLI / Tauri / explorer
+5. `8af0d107` Merge to main
+6. `c1f5cd12` Phase F — docs (architecture.md, training.md, A2 pivot addendum)
+7. `c36b13c2` docs fix — clarify Phase C is skipped, not deferred
+8. `2820b8f5` code cleanup — replace stale TODO(Phase C) comments
+
+Phase C deliberately SKIPPED: under Option Y's traverser-disable semantics the non-gadget player never queries the gadget Terminate's non-gadget-player CFV, so zero-sum complement is moot.
+
+### Ship gate PASSED
+
+`per_boundary_safety_invariant_avg_realized_cfv_geq_opt_out` at `e2252a3d` verifies Burch 2014 §3 sufficiency at each cfvnet boundary per gadget owner per hand — 0.01 tol after 1000 iters.
+
+### Outstanding follow-ups (separate beans)
+
+- akg3: opt-out tightness improvement (bucketed → per-combo / un-abstracted CBVs). Rescoped, still relevant under A2.
+- bgkr: retire legacy GadgetEvaluator post-clamp once --gadget-clamp diagnostic need passes. Unchanged by A2 (kept for A/B).
+- wcc4: pre-existing blueprint_mp::mccfr flaky test. Unrelated.
+- 4rxu: BoundaryTracer unbounded-fd pool. Unchanged by A2 (tracer unaffected).
+
+### User to run
+
+E2E harness on JhTh9h|…|7d from main to get empirical subgame_exp number for docs/progress/2026-04-24-option-a-iter-15.md (or create a new iter-16 file). Informational only; safety is already gated by test e2252a3d.
