@@ -4236,13 +4236,14 @@ mod tests {
 
     #[test]
     fn seed_with_gadget_game_seeds_decision_nodes() {
-        // Build a gadget game (IP outer) and verify seeding from
-        // start_arena_index=4 (skipping the 4 gadget nodes) maps
-        // blueprint strategy to at least 1 decision node.
+        // Under A2 (per-boundary gadget), game.root() IS the real subgame
+        // root. Seeding from arena 0 should map blueprint strategy to at
+        // least 1 decision node. (No gadget layer at the top to skip.)
         //
-        // Uses 50%+allin bet sizes (3 actions: check, bet50%, allin)
-        // so the blueprint root has 3 actions vs the gadget's 2,
-        // preventing an accidental action-count match at arena 0.
+        // Uses a river game with 50%+allin bet sizes (3 actions: check,
+        // bet50%, allin) — no depth boundaries in a river game, so the
+        // A2 gadget injection is a no-op (zero boundaries), but seeding
+        // must still work from arena 0.
         use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
         use poker_solver_core::blueprint_v2::Street;
         use range_solver::interface::Game;
@@ -4258,9 +4259,9 @@ mod tests {
         let oop_w = weights_from_range("AA,KK,QQ");
         let ip_w = weights_from_range("JJ,TT,99");
 
-        // Build a non-gadget game first to discover hand counts.
+        // Build a plain game (river, no boundaries, no gadget).
         let bet_sizes = vec![vec![0.5f32, 10.0]]; // 50% + allin => 3 actions
-        let (tmp_game, _, _, _, _) = build_subgame_solver(
+        let (game, _, _, _, _) = build_subgame_solver(
             &board_cards,
             &bet_sizes,
             100,
@@ -4278,39 +4279,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let n_oop = tmp_game.num_private_hands(0);
-        let n_ip = tmp_game.num_private_hands(1);
-        drop(tmp_game);
-
-        // Build the gadget game with matching bet sizes.
-        let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();
-        let ip_range: range_solver::range::Range = "JJ,TT,99".parse().unwrap();
-        let cc = range_solver::card::CardConfig {
-            range: [oop_range, ip_range],
-            flop: range_solver::card::flop_from_str("As Kh 7d").unwrap(),
-            turn: range_solver::card::card_from_str("4c").unwrap(),
-            river: range_solver::card::card_from_str("2c").unwrap(),
-        };
-        let sizes = range_solver::bet_size::BetSizeOptions::try_from(("50%, a", "")).unwrap();
-        let tc = range_solver::action_tree::TreeConfig {
-            initial_state: range_solver::BoardState::River,
-            starting_pot: 100,
-            effective_stack: 200,
-            river_bet_sizes: [sizes.clone(), sizes],
-            ..Default::default()
-        };
-        let at = range_solver::action_tree::ActionTree::new(tc).unwrap();
-        let cfg = range_solver::game::gadget::GadgetConfig {
-            opt_out_oop: vec![0.0; n_oop],
-            opt_out_ip: vec![0.0; n_ip],
-            outer_player: 1,
-        };
-        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> =
-            Arc::new(crate::gadget::StaticGadgetEvaluator::new(
-                vec![0.0; n_oop],
-                vec![0.0; n_ip],
-            ));
-        let game = crate::gadget::make_gadget_game(cc, at, cfg, inner).unwrap();
 
         // Build blueprint tree + strategy with matching 50%+allin sizes.
         let blueprint_tree = V2GameTree::build_subgame(
@@ -4355,10 +4323,8 @@ mod tests {
         let mut all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
         all_buckets.equity_fallback = true;
 
-        // Seeding from arena 0 should seed 0 nodes (gadget root has 2
-        // actions but blueprint root has 3, so action count mismatch
-        // causes visitor to skip all nodes).
-        let count_from_0 = seed_solver_with_blueprint(
+        // Seeding from arena 0 (real subgame root) should seed at least 1.
+        let count = seed_solver_with_blueprint(
             &game,
             &strategy,
             &all_buckets,
@@ -4368,25 +4334,9 @@ mod tests {
             blueprint_tree.root,
             0,
         );
-        assert_eq!(
-            count_from_0, 0,
-            "seeding from arena 0 (gadget root) should seed 0 nodes due to action mismatch"
-        );
-
-        // Seeding from arena 4 (skip gadget layer) should seed at least 1.
-        let count_from_4 = seed_solver_with_blueprint(
-            &game,
-            &strategy,
-            &all_buckets,
-            &blueprint_tree,
-            &board_cards,
-            Street::River,
-            blueprint_tree.root,
-            4,
-        );
         assert!(
-            count_from_4 > 0,
-            "seeding from arena 4 should seed at least 1 node, got 0"
+            count > 0,
+            "seeding from arena 0 should seed at least 1 node, got 0"
         );
     }
 }
