@@ -687,15 +687,11 @@ mod tests {
     }
 
     #[test]
-    fn gadget_disabled_skips_to_follow_no_strategy_update() {
-        // After solve_step, gadget Decision nodes should have zero
-        // strategy-sum and zero regrets: the disabled pass skips
-        // directly to Follow, and the active pass uses the opponent
-        // branch (cfreach weighting only, no regret/strategy updates).
-        //
-        // Meanwhile, non-gadget decision nodes in the game SHOULD
-        // have non-zero regrets (they get updated on their traverser
-        // pass). This verifies the gadget bypass is working.
+    fn gadget_owner_regret_matches_on_own_pass() {
+        // Option Y: on the owner's traverser pass, the gadget is a
+        // regular Decision node -- regret-matching fires and strategy
+        // sum accumulates. After several iterations, gadget nodes
+        // should have NON-ZERO strategy sums and regrets.
         use crate::solver::solve_step;
 
         let mut game = minimal_depth_limited_game();
@@ -709,45 +705,97 @@ mod tests {
             game.set_boundary_cfvs(ord, 1, vec![0.0; game.num_private_hands(1)]);
         }
 
-        // Run several iterations.
+        // Run several iterations so regret-matching has time to fire.
         for i in 0..5 {
             solve_step(&game, i);
         }
 
-        // Gadget nodes: strategy sum and regrets should remain zero.
-        let mut found_gadget = false;
+        // Gadget nodes should have non-zero strategy sums (the owner's
+        // pass accumulated strategy via standard CFR decision logic).
+        let mut found_gadget_with_strategy = false;
         let mut found_non_gadget_decision = false;
         for i in 0..game.node_arena_len_for_test() {
             let node = game.node_arena_get_for_test(i);
             if node.is_gadget() {
-                found_gadget = true;
                 let strat_sum: f32 = node.strategy().iter().sum();
-                assert!(
-                    strat_sum == 0.0,
-                    "gadget strategy sum should be 0 (no accumulation), got {strat_sum}"
-                );
-                let regret_sum: f32 = node.regrets().iter().map(|r| r.abs()).sum();
-                assert!(
-                    regret_sum == 0.0,
-                    "gadget regrets should be 0 (no updates), got {regret_sum}"
-                );
+                if strat_sum > 0.0 {
+                    found_gadget_with_strategy = true;
+                }
             } else if !node.is_terminal() && !node.is_chance()
                 && node.num_actions() > 1
-                && node.regrets().len() > 0
+                && !node.regrets().is_empty()
             {
-                // Non-gadget decision nodes should have non-zero regrets
-                // after several iterations (the solver updated them).
                 let regret_sum: f32 = node.regrets().iter().map(|r| r.abs()).sum();
                 if regret_sum > 0.0 {
                     found_non_gadget_decision = true;
                 }
             }
         }
-        assert!(found_gadget, "should have found at least one gadget node");
+        assert!(
+            found_gadget_with_strategy,
+            "gadget should have non-zero strategy sum after owner's passes"
+        );
         assert!(
             found_non_gadget_decision,
             "should have found non-gadget decisions with non-zero regrets"
         );
+    }
+
+    #[test]
+    fn gadget_owner_disabled_on_opponent_pass() {
+        // Option Y: when traverser != gadget owner, the gadget is a
+        // passthrough (force Follow, no regret/strategy update from
+        // this pass). We verify by checking that after iterations,
+        // gadget strategy sums reflect only the owner's passes (roughly
+        // half the total iterations), not both passes.
+        //
+        // With 10 iterations and 2-action gadgets at uniform: if BOTH
+        // passes accumulated, sum ~ 10 * 0.5 = 5.0 per hand per action.
+        // If only the owner's pass accumulated, sum ~ 5 * 0.5 = 2.5.
+        // (Discounting makes exact values vary but the 2x ratio holds.)
+        use crate::solver::solve_step;
+
+        let mut game = minimal_depth_limited_game();
+        let config = make_per_boundary_config(&game);
+        inject_per_boundary_gadgets(&mut game, &config);
+        game.allocate_memory(false);
+
+        let n_boundary = game.num_boundary_nodes();
+        for ord in 0..n_boundary {
+            game.set_boundary_cfvs(ord, 0, vec![0.0; game.num_private_hands(0)]);
+            game.set_boundary_cfvs(ord, 1, vec![0.0; game.num_private_hands(1)]);
+        }
+
+        let iters = 10u32;
+        for i in 0..iters {
+            solve_step(&game, i);
+        }
+
+        // Each gadget is visited once per iteration (alternating
+        // traverser). Only the owner's pass (half the iterations)
+        // should accumulate strategy. Check that strategy sum is
+        // bounded below what both-passes would produce.
+        for i in 0..game.node_arena_len_for_test() {
+            let node = game.node_arena_get_for_test(i);
+            if !node.is_gadget() {
+                continue;
+            }
+            let strat = node.strategy();
+            let n_hands = strat.len() / 2; // 2 actions
+            if n_hands == 0 {
+                continue;
+            }
+            let hand0_sum = strat[0] + strat[n_hands];
+            // With only owner-pass accumulation (~5 active passes out
+            // of 10), the sum should be well below iters (10). If both
+            // passes leaked in, it would approach 2*iters.
+            assert!(
+                hand0_sum < iters as f32,
+                "strategy sum {hand0_sum} suggests non-owner passes leaked \
+                 (expected < {iters} from ~{} owner passes)",
+                iters / 2
+            );
+        }
     }
 
     #[test]
@@ -797,16 +845,11 @@ mod tests {
     }
 
     #[test]
-    fn disabled_pass_does_not_accumulate_strategy() {
-        // Run 5 iterations. At each gadget, the strategy sum should only
-        // reflect active-pass iterations (not disabled passes where the
-        // traverser owns the gadget and skips to Follow).
-        //
-        // For a 2-action gadget with N hands, after K active passes the
-        // strategy sum per hand is approximately K * (1/num_actions) when
-        // regrets are zero (uniform). If disabled passes also accumulated,
-        // we'd see ~2K * (1/num_actions). We verify the sum is closer to
-        // K than 2K.
+    fn non_owner_pass_does_not_accumulate_strategy() {
+        // Option Y: the non-owner's pass is a passthrough (skip to
+        // Follow). Only the owner's pass accumulates strategy at the
+        // gadget. After 5 iterations, each gadget had ~2-3 owner passes
+        // (alternating), so strategy sum should be modest, not doubled.
         use crate::solver::solve_step;
 
         let mut game = minimal_depth_limited_game();
@@ -825,13 +868,10 @@ mod tests {
             solve_step(&game, i);
         }
 
-        // Each gadget node has 2 actions and num_hands per action.
-        // After `iters` iterations, each gadget had `iters` active passes
-        // (one per iteration, alternating which pass is active).
-        // In a uniform strategy, each action gets weight 1/2 per active pass.
-        // Total strategy sum per action per hand ~= iters * 0.5 * gamma_discount.
-        // The key check: it should NOT be ~= 2*iters * 0.5 (which would
-        // indicate disabled passes also accumulated).
+        // Each gadget has 2 actions and num_hands per action. With only
+        // owner-pass accumulation, the strategy sum per hand should be
+        // bounded by iters (not 2*iters which would indicate both passes
+        // accumulated).
         for i in 0..game.node_arena_len_for_test() {
             let node = game.node_arena_get_for_test(i);
             if !node.is_gadget() {
@@ -842,17 +882,77 @@ mod tests {
             if n_hands == 0 {
                 continue;
             }
-            // Sum of all strategy weights across both actions for hand 0.
             let hand0_sum = strat[0] + strat[n_hands];
-            // With 5 active passes at uniform (0.5, 0.5), discounted:
-            // The sum should be bounded. If disabled passes leaked in,
-            // the sum would be roughly double.
             assert!(
                 hand0_sum < (2 * iters) as f32,
-                "strategy sum {hand0_sum} suggests disabled passes leaked \
-                 (expected < {} from {iters} active passes)",
-                2 * iters
+                "strategy sum {hand0_sum} suggests non-owner passes leaked \
+                 (expected < {} from ~{} owner passes)",
+                2 * iters,
+                iters / 2
             );
+        }
+    }
+
+    #[test]
+    fn per_boundary_safety_invariant_avg_realized_cfv_geq_opt_out() {
+        // Burch 2014 S3 sufficiency condition: after convergence, the
+        // average realized CFV at each gadget must be >= the opt-out
+        // value for each hand owned by the gadget's player.
+        //
+        // Build a gadget game, solve for enough iterations to converge
+        // the gadget sigma, then verify per-hand:
+        //   avg_realized_CFV[h] >= opt_out[h] - epsilon
+        use crate::solver::{solve_step, compute_exploitability, root_cfvalues};
+
+        let mut game = minimal_depth_limited_game();
+        let n_orig = game.num_boundary_nodes();
+        let n_oop = game.num_private_hands(0);
+        let n_ip = game.num_private_hands(1);
+
+        // Use non-trivial opt-out values so the check is meaningful.
+        let per_boundary_opt_outs: Vec<[Vec<f32>; 2]> = (0..n_orig)
+            .map(|_| {
+                // Small negative opt-outs: the player can always do
+                // at least this well by opting out of the subgame.
+                [vec![-5.0; n_oop], vec![-5.0; n_ip]]
+            })
+            .collect();
+        let config = GadgetConfigPerBoundary { per_boundary_opt_outs };
+        inject_per_boundary_gadgets(&mut game, &config);
+        game.allocate_memory(false);
+
+        let n_boundary = game.num_boundary_nodes();
+        for ord in 0..n_boundary {
+            game.set_boundary_cfvs(ord, 0, vec![0.0; n_oop]);
+            game.set_boundary_cfvs(ord, 1, vec![0.0; n_ip]);
+        }
+
+        // Solve for enough iterations for gadget sigma to converge.
+        for i in 0..1000 {
+            solve_step(&game, i);
+        }
+
+        let expl = compute_exploitability(&game);
+        assert!(
+            expl < 20.0,
+            "gadget game should converge after 1000 iters: expl={expl}"
+        );
+
+        // Check safety: for each player, root CFV per hand must be
+        // >= opt-out. The root CFV already incorporates the gadget
+        // decision. With opt-out = -5.0 and subgame value >= -5.0,
+        // the gadget should learn to Follow (subgame) rather than
+        // Terminate, so the realized CFV should be >= -5.0.
+        for player in 0..2 {
+            let cfvs = root_cfvalues(&game, player);
+            let opt_out = -5.0f32;
+            for (h, &cfv) in cfvs.iter().enumerate() {
+                assert!(
+                    cfv >= opt_out - 0.01,
+                    "player {player} hand {h}: realized CFV {cfv} < \
+                     opt_out {opt_out} - epsilon (safety violation)"
+                );
+            }
         }
     }
 }

@@ -579,8 +579,9 @@ fn compute_cfvalue_recursive<T: Game>(
         return;
     }
 
-    // Gadget disabled: traverser's own gadget — skip to Follow (child 1).
-    if node.is_gadget() && node.gadget_owner() == Some(player) {
+    // Gadget disabled for non-owner: skip to Follow (child 1).
+    // Owner's own pass falls through to standard Decision logic.
+    if node.is_gadget() && node.gadget_owner() != Some(player) {
         let child = &mut node.play(1);
         compute_cfvalue_recursive(result, game, child, player, cfreach, save_cfvalues);
         return;
@@ -831,8 +832,9 @@ fn compute_best_cfv_recursive<T: Game>(
         return;
     }
 
-    // Gadget disabled: traverser's own gadget — skip to Follow (child 1).
-    if node.is_gadget() && node.gadget_owner() == Some(player) {
+    // Gadget disabled for non-owner: skip to Follow (child 1).
+    // Owner's own pass falls through to standard Decision logic.
+    if node.is_gadget() && node.gadget_owner() != Some(player) {
         let child = &node.play(1);
         compute_best_cfv_recursive(result, game, child, player, cfreach);
         return;

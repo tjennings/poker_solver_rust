@@ -242,11 +242,13 @@ fn solve_recursive<T: Game>(
         return;
     }
 
-    // Gadget disabled: traverser's own gadget — go directly to Follow
-    // (action index 1). No regret update, no strategy-sum accumulation.
-    // The bit-AND with PLAYER_GADGET_FLAG (0x40) is the fast-path check;
-    // for non-gadget games `is_gadget()` is a single branch-not-taken.
-    if node.is_gadget() && node.gadget_owner() == Some(player) {
+    // Gadget disabled for non-owner: when the traverser is NOT the gadget
+    // owner, force sigma=(0,1) — skip straight to Follow (action 1).
+    // The owner's own pass uses standard Decision logic (fall-through),
+    // so regret-matching fires and the gadget sigma actually learns.
+    // Burch 2014 / Brown-Sandholm 2017: each player owns their gadget,
+    // updates regrets on own pass; opponent sees it as a passthrough.
+    if node.is_gadget() && node.gadget_owner() != Some(player) {
         let child = &mut node.play(1);
         solve_recursive(result, game, child, player, cfreach, params);
         return;
@@ -342,11 +344,9 @@ fn solve_recursive<T: Game>(
     // -- Current player's decision node --
     // Use acting_player() to mask off flag bits (e.g. PLAYER_GADGET_FLAG).
     // For non-gadget decision nodes, acting_player() == player() (0 or 1).
-    // For active gadgets (disabled case already returned above),
-    // acting_player() returns the gadget owner (the non-traverser), so
-    // they fall through to the opponent branch, which is correct: the
-    // gadget owner's strategy weights cfreach, and the traverser's CFVs
-    // are computed as sum of weighted child CFVs.
+    // For gadgets where owner == traverser (non-owner already returned
+    // above), the gadget is the owner's own decision — standard CFR
+    // regret-matching applies (owner updates regrets on own pass).
     else if node.acting_player() == player {
         // Return scratch to TLS before child recursion.
         put_scratch(scratch);
