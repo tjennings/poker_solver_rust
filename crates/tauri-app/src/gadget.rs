@@ -498,8 +498,22 @@ pub fn make_per_boundary_gadget_game(
         cbv_context, abstract_root, board, &private_cards,
     );
 
+    let concrete_boundaries = game.num_boundary_nodes();
+    let abstract_boundaries = provider.num_boundaries();
+
+    let per_boundary_opt_outs = if concrete_boundaries == abstract_boundaries {
+        provider.per_boundary_opt_outs().clone()
+    } else {
+        eprintln!(
+            "[gadget] abstract/concrete boundary mismatch: \
+             abstract={abstract_boundaries}, concrete={concrete_boundaries}; \
+             broadcasting averaged opt-outs to all concrete boundaries"
+        );
+        broadcast_opt_outs(provider.per_boundary_opt_outs(), concrete_boundaries)
+    };
+
     let config = range_solver::game::gadget::GadgetConfigPerBoundary {
-        per_boundary_opt_outs: provider.per_boundary_opt_outs().clone(),
+        per_boundary_opt_outs,
     };
 
     range_solver::game::gadget::inject_per_boundary_gadgets(&mut game, &config);
@@ -507,6 +521,43 @@ pub fn make_per_boundary_gadget_game(
     game.boundary_evaluator = Some(inner_evaluator);
 
     Ok(game)
+}
+
+/// Average abstract per-boundary opt-outs into a single per-hand vector,
+/// then replicate to `target_count` concrete boundaries.
+///
+/// Used when the concrete action tree has a different number of boundaries
+/// than the abstract tree (e.g., wider bet sizes in the explorer config).
+/// Averaging across abstract boundaries preserves the overall opt-out level
+/// while avoiding the panic from a length mismatch.
+fn broadcast_opt_outs(
+    abstract_opt_outs: &[[Vec<f32>; 2]],
+    target_count: usize,
+) -> Vec<[Vec<f32>; 2]> {
+    assert!(
+        !abstract_opt_outs.is_empty(),
+        "broadcast_opt_outs: abstract_opt_outs must not be empty"
+    );
+    let n_abs = abstract_opt_outs.len();
+    let n_oop = abstract_opt_outs[0][0].len();
+    let n_ip = abstract_opt_outs[0][1].len();
+
+    let mut avg: [Vec<f64>; 2] = [vec![0.0; n_oop], vec![0.0; n_ip]];
+    for entry in abstract_opt_outs {
+        for (h, &v) in entry[0].iter().enumerate() {
+            avg[0][h] += v as f64;
+        }
+        for (h, &v) in entry[1].iter().enumerate() {
+            avg[1][h] += v as f64;
+        }
+    }
+    let inv = 1.0 / n_abs as f64;
+    let oop_avg: Vec<f32> = avg[0].iter().map(|&s| (s * inv) as f32).collect();
+    let ip_avg: Vec<f32> = avg[1].iter().map(|&s| (s * inv) as f32).collect();
+
+    (0..target_count)
+        .map(|_| [oop_avg.clone(), ip_avg.clone()])
+        .collect()
 }
 
 /// Compose a per-boundary-gadget-enabled `PostFlopGame` with constant
@@ -1232,6 +1283,161 @@ mod tests {
         // Should match baseline exactly
         assert_eq!(gadget_oop, baseline_oop, "OOP should match baseline");
         assert_eq!(gadget_ip, baseline_ip, "IP should match baseline");
+    }
+
+    // ---------------------------------------------------------------
+    // Abstract vs concrete boundary mismatch tests
+    // ---------------------------------------------------------------
+
+    /// Regression test: make_per_boundary_gadget_game must not panic when
+    /// the blueprint's abstract action tree has fewer boundaries than the
+    /// concrete subgame's action tree (e.g., blueprint built with narrow
+    /// bet sizing, explorer using wider bet sizes).
+    ///
+    /// Reproduces the panic:
+    ///   assertion `left == right` failed: per_boundary_opt_outs length (3)
+    ///   must match boundary count (N)
+    #[test]
+    fn make_per_boundary_gadget_game_handles_abstract_concrete_mismatch() {
+        use range_solver::action_tree::{ActionTree, TreeConfig};
+        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::card::{card_from_str, flop_from_str, CardConfig, NOT_DEALT};
+        use range_solver::interface::Game;
+        use range_solver::range::Range;
+        use range_solver::BoardState;
+
+        // Abstract tree has 3 chance descendants (from make_multi_node_cbv_context).
+        let (ctx, board, _private_cards) = make_multi_node_cbv_context();
+        let cbv_context = Arc::new(ctx);
+        let abstract_root: u32 = 0;
+        let abstract_boundaries = cbv_context
+            .abstract_tree.chance_descendants(abstract_root).len();
+        assert_eq!(abstract_boundaries, 3, "test setup: abstract has 3 boundaries");
+
+        // Helper to build a concrete turn-start depth-limited config with wide
+        // bet sizes that produce more boundaries than the abstract tree's 3.
+        let make_concrete = || -> (CardConfig, ActionTree, usize) {
+            let oop: Range = "AA,KK".parse().unwrap();
+            let ip: Range = "QQ,JJ".parse().unwrap();
+            let cc = CardConfig {
+                range: [oop, ip],
+                flop: flop_from_str("7h 5d 2c").unwrap(),
+                turn: card_from_str("3s").unwrap(),
+                river: NOT_DEALT,
+            };
+            let sizes = BetSizeOptions::try_from(("33%, 50%, 75%, 100%, a", "")).unwrap();
+            let tc = TreeConfig {
+                initial_state: BoardState::Turn,
+                starting_pot: 100,
+                effective_stack: 200,
+                turn_bet_sizes: [sizes.clone(), sizes.clone()],
+                river_bet_sizes: [sizes.clone(), sizes],
+                depth_limit: Some(0),
+                ..Default::default()
+            };
+            let at = ActionTree::new(tc).unwrap();
+            let tmp = range_solver::game::PostFlopGame::with_config(
+                cc.clone(), at,
+            ).unwrap();
+            let n = tmp.num_boundary_nodes();
+            // Rebuild since ActionTree is consumed.
+            let sizes2 = BetSizeOptions::try_from(("33%, 50%, 75%, 100%, a", "")).unwrap();
+            let tc2 = TreeConfig {
+                initial_state: BoardState::Turn,
+                starting_pot: 100,
+                effective_stack: 200,
+                turn_bet_sizes: [sizes2.clone(), sizes2.clone()],
+                river_bet_sizes: [sizes2.clone(), sizes2],
+                depth_limit: Some(0),
+                ..Default::default()
+            };
+            let at2 = ActionTree::new(tc2).unwrap();
+            (cc, at2, n)
+        };
+
+        let (cc, at, concrete_boundaries) = make_concrete();
+        assert!(
+            concrete_boundaries > abstract_boundaries,
+            "test setup: concrete ({concrete_boundaries}) should have \
+             more boundaries than abstract ({abstract_boundaries})"
+        );
+
+        // Stub boundary evaluator that can handle any hand count.
+        // We need to know hand counts, so build a throwaway game.
+        let (cc2, at2, _) = make_concrete();
+        let probe = range_solver::game::PostFlopGame::with_config(cc2, at2).unwrap();
+        let n_oop = probe.num_private_hands(0);
+        let n_ip = probe.num_private_hands(1);
+        let inner: Arc<dyn range_solver::game::BoundaryEvaluator> =
+            Arc::new(StubEvaluator {
+                oop_cfvs: vec![0.0; n_oop],
+                ip_cfvs: vec![0.0; n_ip],
+            });
+
+        // This must not panic (previously panicked with length mismatch).
+        let game = make_per_boundary_gadget_game(
+            cc, at, &cbv_context, abstract_root, &board, inner,
+        ).expect("make_per_boundary_gadget_game should not fail");
+
+        // After gadget injection: 3x concrete boundaries.
+        assert_eq!(
+            game.num_boundary_nodes(),
+            3 * concrete_boundaries,
+            "gadget injection should triple the concrete boundary count"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // broadcast_opt_outs tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn broadcast_opt_outs_single_boundary_replicates_unchanged() {
+        let abstract_opt_outs = vec![
+            [vec![0.5, -0.3], vec![0.1, 0.2, 0.3]],
+        ];
+        let result = broadcast_opt_outs(&abstract_opt_outs, 4);
+        assert_eq!(result.len(), 4);
+        for entry in &result {
+            assert_eq!(entry[0], vec![0.5, -0.3]);
+            assert_eq!(entry[1], vec![0.1, 0.2, 0.3]);
+        }
+    }
+
+    #[test]
+    fn broadcast_opt_outs_averages_across_boundaries() {
+        let abstract_opt_outs = vec![
+            [vec![1.0, 2.0], vec![3.0]],
+            [vec![3.0, 4.0], vec![5.0]],
+        ];
+        let result = broadcast_opt_outs(&abstract_opt_outs, 3);
+        assert_eq!(result.len(), 3);
+        // OOP hand 0: avg(1.0, 3.0) = 2.0
+        // OOP hand 1: avg(2.0, 4.0) = 3.0
+        // IP hand 0: avg(3.0, 5.0) = 4.0
+        for entry in &result {
+            assert!((entry[0][0] - 2.0).abs() < 1e-6);
+            assert!((entry[0][1] - 3.0).abs() < 1e-6);
+            assert!((entry[1][0] - 4.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "abstract_opt_outs must not be empty")]
+    fn broadcast_opt_outs_panics_on_empty() {
+        broadcast_opt_outs(&[], 5);
+    }
+
+    #[test]
+    fn broadcast_opt_outs_target_one() {
+        let abstract_opt_outs = vec![
+            [vec![1.0], vec![2.0]],
+            [vec![3.0], vec![4.0]],
+        ];
+        let result = broadcast_opt_outs(&abstract_opt_outs, 1);
+        assert_eq!(result.len(), 1);
+        assert!((result[0][0][0] - 2.0).abs() < 1e-6);
+        assert!((result[0][1][0] - 3.0).abs() < 1e-6);
     }
 
     #[test]
