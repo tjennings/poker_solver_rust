@@ -41,6 +41,51 @@ pub fn chip_cfv_to_bcfv(chip_cfv: f32, half_pot_chips: f32) -> f32 {
     (chip_cfv - half_pot_chips) / half_pot_chips
 }
 
+/// Compute per-hand opt-out values for a Chance boundary node.
+///
+/// Looks up the CBV ordinal for the Chance node, retrieves per-bucket
+/// values from the table, and converts to bcfv units using the
+/// boundary's own half-pot.
+fn compute_chance_boundary_optout(
+    cbv_context: &crate::postflop::CbvContext,
+    ordinal_map: &std::collections::HashMap<u32, usize>,
+    chance_arena_idx: u32,
+    street: poker_solver_core::blueprint_v2::Street,
+    rs_board: &[poker_solver_core::poker::Card],
+    private_cards: &[Vec<(u8, u8)>; 2],
+) -> [Vec<f32>; 2] {
+    use poker_solver_core::blueprint_v2::cbv::CbvTable;
+
+    let cbv_ordinal =
+        CbvTable::require_ordinal(ordinal_map, chance_arena_idx);
+    let pot_at_chance =
+        cbv_context.abstract_tree.pot_at_node(chance_arena_idx);
+    let half_pot = (pot_at_chance / 2.0) as f32;
+    assert!(
+        half_pot > 0.0,
+        "chance node {chance_arena_idx} has non-positive pot \
+         ({pot_at_chance})"
+    );
+
+    let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    for player in 0..2 {
+        let hands = &private_cards[player];
+        per_hand[player].reserve(hands.len());
+        for &(c1, c2) in hands {
+            let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
+            let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
+            let bucket = cbv_context.all_buckets.get_bucket(
+                street, [rs_c1, rs_c2], rs_board,
+            );
+            let chip_cbv = cbv_context.cbv_table.lookup(
+                cbv_ordinal, bucket as usize,
+            );
+            per_hand[player].push(chip_cfv_to_bcfv(chip_cbv, half_pot));
+        }
+    }
+    per_hand
+}
+
 /// Constant opt-out provider for testing.
 ///
 /// Returns the same CFV for every hand at every boundary.
@@ -119,6 +164,7 @@ impl BlueprintCbvOptOut {
         private_cards: &[Vec<(u8, u8)>; 2],
     ) -> Self {
         use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        use poker_solver_core::blueprint_v2::game_tree::GameNode;
 
         assert!(
             !cbv_context.cbv_table.values.is_empty(),
@@ -127,13 +173,16 @@ impl BlueprintCbvOptOut {
 
         let ordinal_map =
             CbvTable::build_node_to_ordinal_map(&cbv_context.abstract_tree);
-        let chance_nodes =
-            cbv_context.abstract_tree.chance_descendants(abstract_root);
+        // Use boundary_descendants (not chance_descendants) to include
+        // both Chance nodes AND all-in Showdown terminals. The concrete
+        // range-solver tree creates depth boundaries for both.
+        let boundary_nodes =
+            cbv_context.abstract_tree.boundary_descendants(abstract_root);
 
         assert!(
-            !chance_nodes.is_empty(),
-            "no chance nodes found below abstract tree node {abstract_root}; \
-             cannot construct BlueprintCbvOptOut"
+            !boundary_nodes.is_empty(),
+            "no boundary nodes found below abstract tree node \
+             {abstract_root}; cannot construct BlueprintCbvOptOut"
         );
 
         let street = match board.len() {
@@ -148,38 +197,37 @@ impl BlueprintCbvOptOut {
             .map(|&id| crate::exploration::range_solver_to_rs_card(id))
             .collect();
 
-        let mut per_boundary = Vec::with_capacity(chance_nodes.len());
-        for &chance_arena_idx in &chance_nodes {
-            let cbv_ordinal =
-                CbvTable::require_ordinal(&ordinal_map, chance_arena_idx);
-            let pot_at_chance =
-                cbv_context.abstract_tree.pot_at_node(chance_arena_idx);
-            let half_pot = (pot_at_chance / 2.0) as f32;
-            assert!(
-                half_pot > 0.0,
-                "chance node {chance_arena_idx} has non-positive pot \
-                 ({pot_at_chance})"
-            );
-
-            let mut per_hand: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
-            for player in 0..2 {
-                let hands = &private_cards[player];
-                per_hand[player].reserve(hands.len());
-                for &(c1, c2) in hands {
-                    let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
-                    let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
-                    let bucket = cbv_context.all_buckets.get_bucket(
-                        street, [rs_c1, rs_c2], &rs_board,
+        let mut per_boundary = Vec::with_capacity(boundary_nodes.len());
+        for &arena_idx in &boundary_nodes {
+            let node = &cbv_context.abstract_tree.nodes[arena_idx as usize];
+            match node {
+                GameNode::Chance { .. } => {
+                    // Normal street transition: look up CBV opt-out.
+                    let per_hand = self::compute_chance_boundary_optout(
+                        cbv_context, &ordinal_map, arena_idx,
+                        street, &rs_board, private_cards,
                     );
-                    let chip_cbv = cbv_context.cbv_table.lookup(
-                        cbv_ordinal, bucket as usize,
-                    );
-                    per_hand[player].push(
-                        chip_cfv_to_bcfv(chip_cbv, half_pot),
+                    per_boundary.push(per_hand);
+                }
+                GameNode::Terminal { .. } => {
+                    // All-in Showdown on the starting street. Both
+                    // players already committed all chips, so the
+                    // opponent cannot opt out. Use NEG_INFINITY to
+                    // ensure the gadget never clamps at this boundary.
+                    let n_oop = private_cards[0].len();
+                    let n_ip = private_cards[1].len();
+                    per_boundary.push([
+                        vec![f32::NEG_INFINITY; n_oop],
+                        vec![f32::NEG_INFINITY; n_ip],
+                    ]);
+                }
+                GameNode::Decision { .. } => {
+                    panic!(
+                        "boundary_descendants returned Decision node \
+                         at arena index {arena_idx}; this is a bug"
                     );
                 }
             }
-            per_boundary.push(per_hand);
         }
         Self { per_boundary_cbv: per_boundary }
     }
@@ -505,9 +553,10 @@ pub fn make_per_boundary_gadget_game(
         provider.per_boundary_opt_outs().clone()
     } else {
         eprintln!(
-            "[gadget] abstract/concrete boundary mismatch: \
-             abstract={abstract_boundaries}, concrete={concrete_boundaries}; \
-             broadcasting averaged opt-outs to all concrete boundaries"
+            "[gadget] boundary count mismatch: abstract={abstract_boundaries}, \
+             concrete={concrete_boundaries}; this may indicate a bet-size \
+             config difference between blueprint and subgame. \
+             Broadcasting averaged opt-outs to all concrete boundaries."
         );
         broadcast_opt_outs(provider.per_boundary_opt_outs(), concrete_boundaries)
     };
@@ -1438,6 +1487,174 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!((result[0][0][0] - 2.0).abs() < 1e-6);
         assert!((result[0][1][0] - 3.0).abs() < 1e-6);
+    }
+
+    /// Build a CbvContext whose abstract tree has BOTH Chance nodes AND
+    /// all-in Showdown terminals on the starting street. This mirrors
+    /// what a real blueprint tree looks like: all-in-call paths produce
+    /// Showdown terminals (not Chance nodes) because there are no further
+    /// decisions. The concrete range-solver tree, however, creates depth
+    /// boundaries for ALL of these paths.
+    ///
+    /// Tree structure (root=0, Turn):
+    ///   0: Decision(P0, Turn, [Check, AllIn])
+    ///     1: Decision(P1, Turn, [Check])
+    ///       2: Chance(River, child=3) -- boundary 0 (normal)
+    ///         3: Terminal(Showdown, pot=10)
+    ///     4: Decision(P1, Turn, [Fold, Call])
+    ///       5: Terminal(Fold)
+    ///       6: Terminal(Showdown, pot=100, stacks=[0,0]) -- boundary 1 (all-in)
+    ///
+    /// `chance_descendants(0)` returns [2] (1 node).
+    /// `boundary_descendants(0)` returns [2, 6] (2 nodes).
+    /// A concrete range-solver tree with identical bet sizes and
+    /// depth_limit=0 would have 2 depth boundaries.
+    fn make_allin_showdown_cbv_context()
+        -> (crate::postflop::CbvContext, Vec<u8>, [Vec<(u8, u8)>; 2])
+    {
+        use crate::postflop::CbvContext;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+        use poker_solver_core::blueprint_v2::cbv::CbvTable;
+        use poker_solver_core::blueprint_v2::game_tree::{
+            GameNode, GameTree, TerminalKind, TreeAction,
+        };
+        use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+        use poker_solver_core::blueprint_v2::Street;
+        use range_solver::card::flop_from_str;
+
+        let nodes = vec![
+            // 0: Root decision (2 actions: Check, AllIn)
+            GameNode::Decision {
+                player: 0,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check, TreeAction::AllIn],
+                children: vec![1, 4],
+                blueprint_decision_idx: None,
+            },
+            // 1: P1 after check
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Check],
+                children: vec![2],
+                blueprint_decision_idx: None,
+            },
+            // 2: Chance (check-check) => river transition
+            GameNode::Chance {
+                next_street: Street::River,
+                child: 3,
+            },
+            // 3: Terminal after river (placeholder)
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 10.0,
+                stacks: [45.0, 45.0],
+            },
+            // 4: P1 after all-in
+            GameNode::Decision {
+                player: 1,
+                street: Street::Turn,
+                actions: vec![TreeAction::Fold, TreeAction::Call],
+                children: vec![5, 6],
+                blueprint_decision_idx: None,
+            },
+            // 5: Fold terminal
+            GameNode::Terminal {
+                kind: TerminalKind::Fold { winner: 0 },
+                pot: 10.0,
+                stacks: [45.0, 45.0],
+            },
+            // 6: All-in call => Showdown (NOT a Chance node!)
+            // Both stacks are 0 because both players are all-in.
+            GameNode::Terminal {
+                kind: TerminalKind::Showdown,
+                pot: 100.0,
+                stacks: [0.0, 0.0],
+            },
+        ];
+
+        // 1 CBV entry for the single Chance node (ordinal 0).
+        // The all-in Showdown at node 6 has no CBV entry because
+        // the blueprint tree doesn't have a Chance node there.
+        let cbv_table = CbvTable {
+            values: vec![10.0, -5.0],
+            node_offsets: vec![0],
+            buckets_per_node: vec![2],
+        };
+
+        let mut ab = AllBuckets::new([2, 2, 2, 2], [None, None, None, None]);
+        ab.equity_fallback = true;
+        let all_buckets = Arc::new(ab);
+        let strategy = Arc::new(BlueprintV2Strategy::empty());
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        };
+
+        let ctx = CbvContext {
+            cbv_table,
+            abstract_tree: tree,
+            all_buckets,
+            strategy,
+        };
+
+        let flop = flop_from_str("7h 5d 2c").unwrap();
+        let board = vec![flop[0], flop[1], flop[2], 7u8, 30u8];
+        let oop_hands = vec![(48u8, 49u8)];
+        let ip_hands = vec![(4u8, 5u8)];
+        let private_cards = [oop_hands, ip_hands];
+
+        (ctx, board, private_cards)
+    }
+
+    /// The abstract tree has 1 Chance + 1 all-in Showdown, but
+    /// `from_cbv_context` currently only counts Chance nodes (1).
+    /// The concrete tree would have 2 depth boundaries.
+    /// `from_cbv_context` must return 2 boundaries so counts match.
+    #[test]
+    fn from_cbv_context_counts_allin_showdown_as_boundary() {
+        let (ctx, board, private_cards) = make_allin_showdown_cbv_context();
+
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards,
+        );
+
+        // Must find 2 boundaries: Chance node + all-in Showdown.
+        assert_eq!(
+            provider.num_boundaries(), 2,
+            "from_cbv_context should count both Chance and all-in \
+             Showdown boundaries; got {}",
+            provider.num_boundaries(),
+        );
+    }
+
+    /// For all-in Showdown boundaries (no CBV entry), opt-out must be
+    /// very negative (f32::NEG_INFINITY) so the gadget never clamps --
+    /// the opponent already committed all chips and cannot opt out.
+    #[test]
+    fn from_cbv_context_allin_boundary_opt_out_is_neg_infinity() {
+        let (ctx, board, private_cards) = make_allin_showdown_cbv_context();
+
+        let provider = BlueprintCbvOptOut::from_cbv_context(
+            &ctx, 0, &board, &private_cards,
+        );
+
+        // Boundary 0 is the Chance node => normal CBV opt-out.
+        // Boundary 1 is the all-in Showdown => should be NEG_INFINITY.
+        let oop_cfvs = provider.opt_out_cfvs(
+            1, 0, 100, 200, &board, &private_cards[0],
+        );
+        let ip_cfvs = provider.opt_out_cfvs(
+            1, 1, 100, 200, &board, &private_cards[1],
+        );
+        for &v in oop_cfvs.iter().chain(ip_cfvs.iter()) {
+            assert!(
+                v == f32::NEG_INFINITY,
+                "all-in boundary opt-out should be NEG_INFINITY, got {v}"
+            );
+        }
     }
 
     #[test]

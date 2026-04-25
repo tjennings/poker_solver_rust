@@ -1075,6 +1075,55 @@ impl GameTree {
         }
         result
     }
+
+    /// Collect all arena indices that correspond to depth-boundary
+    /// terminals in an equivalent range-solver tree with `depth_limit=0`.
+    ///
+    /// This includes:
+    /// - **Chance nodes** on the first street (normal call/check-check
+    ///   paths that transition to the next street)
+    /// - **Showdown terminals** reachable on the starting street without
+    ///   crossing a Chance node (all-in-call paths where both players
+    ///   commit all chips before the street transition)
+    ///
+    /// Fold terminals are excluded (they are always fold terminals in
+    /// both trees, never depth boundaries).
+    ///
+    /// DFS does NOT recurse past Chance nodes -- only first-level
+    /// boundaries are collected, matching `depth_limit=0` behaviour.
+    ///
+    /// The ordering matches DFS left-to-right traversal, which aligns
+    /// with the range-solver's boundary ordinal assignment.
+    #[must_use]
+    pub fn boundary_descendants(&self, start: u32) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut stack = vec![start];
+        while let Some(idx) = stack.pop() {
+            match &self.nodes[idx as usize] {
+                GameNode::Chance { .. } => {
+                    // Normal street transition -- this IS a boundary.
+                    // Do NOT recurse past it (depth_limit=0 stops here).
+                    result.push(idx);
+                }
+                GameNode::Decision { children, .. } => {
+                    for &c in children.iter().rev() {
+                        stack.push(c);
+                    }
+                }
+                GameNode::Terminal { kind, .. } => {
+                    // Showdown terminals on the starting street (before
+                    // any Chance node) are all-in runout paths. The
+                    // concrete tree creates a depth boundary for these.
+                    // Fold terminals are always fold terminals in both
+                    // trees and are never depth boundaries.
+                    if matches!(kind, TerminalKind::Showdown) {
+                        result.push(idx);
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 /// Check if two actions are the same type (ignoring size values).
@@ -2231,6 +2280,66 @@ mod tests {
         for &c in &chances {
             let pot = tree.pot_at_node(c);
             assert!(pot > 0.0, "pot at chance node {c} should be positive, got {pot}");
+        }
+    }
+
+    /// A turn subgame has all-in paths that create Showdown terminals
+    /// (not Chance nodes) in the abstract tree, but depth-boundary
+    /// terminals in the concrete tree. `boundary_descendants` must
+    /// return both Chance nodes AND all-in Showdown nodes so the
+    /// gadget can produce matching opt-out vectors.
+    #[test]
+    fn boundary_descendants_includes_allin_showdowns() {
+        // Build a turn subgame with a single bet size + all-in.
+        // Both players start with 45 chips remaining (pot=10).
+        let tree = GameTree::build_subgame(
+            Street::Turn,
+            10.0,           // pot
+            [5.0, 5.0],    // invested
+            50.0,           // starting stack
+            &[vec![0.5]],   // 50% pot bet size
+            None,           // no depth limit (full blueprint tree)
+            0,              // dealer
+        );
+
+        let chance_count = tree.chance_descendants(tree.root).len();
+        let boundary_count = tree.boundary_descendants(tree.root).len();
+
+        // boundary_descendants must include all chance nodes
+        assert!(
+            boundary_count >= chance_count,
+            "boundary_descendants ({boundary_count}) must be >= \
+             chance_descendants ({chance_count})"
+        );
+
+        // With all-in actions available, there must be all-in-call
+        // paths that produce Showdown terminals instead of Chance nodes.
+        // These extra paths cause the mismatch with the concrete tree.
+        assert!(
+            boundary_count > chance_count,
+            "boundary_descendants ({boundary_count}) should be > \
+             chance_descendants ({chance_count}) because all-in-call \
+             paths create Showdown terminals, not Chance nodes"
+        );
+    }
+
+    /// `boundary_descendants` results must be a superset of
+    /// `chance_descendants` -- every Chance node is also a boundary.
+    #[test]
+    fn boundary_descendants_superset_of_chance_descendants() {
+        let tree = GameTree::build_subgame(
+            Street::Turn, 10.0, [5.0, 5.0], 50.0,
+            &[vec![0.5]], None, 0,
+        );
+        let chances = tree.chance_descendants(tree.root);
+        let boundaries = tree.boundary_descendants(tree.root);
+        let boundary_set: std::collections::HashSet<u32> =
+            boundaries.iter().copied().collect();
+        for &c in &chances {
+            assert!(
+                boundary_set.contains(&c),
+                "chance node {c} missing from boundary_descendants"
+            );
         }
     }
 
