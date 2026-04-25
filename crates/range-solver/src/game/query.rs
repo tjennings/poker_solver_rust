@@ -159,7 +159,7 @@ impl PostFlopGame {
         if self.state <= State::Uninitialized {
             panic!("Game is not successfully initialized");
         }
-        self.node().player()
+        self.node().acting_player()
     }
 
     /// Returns the current board cards.
@@ -285,7 +285,7 @@ impl PostFlopGame {
                 panic!("Invalid action");
             }
 
-            let player = node.player();
+            let player = node.acting_player();
             let num_hands = self.num_private_hands(player);
 
             // Update the weights
@@ -448,7 +448,7 @@ impl PostFlopGame {
             if node.is_terminal() || node.is_chance() {
                 continue;
             }
-            let player = node.player();
+            let player = node.acting_player();
             let num_actions = node.num_actions();
             let num_hands = self.num_private_hands(player);
 
@@ -1462,4 +1462,104 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Gadget root (IP-acting) expected_values_detail tests
+
+    // -----------------------------------------------------------------------
+    // Regression: current_player() must strip PLAYER_GADGET_FLAG
+    // -----------------------------------------------------------------------
+
+    /// Build a depth-limited turn game with per-boundary gadgets injected.
+    /// Returns the game with memory allocated, ready for queries.
+    fn build_gadget_game() -> PostFlopGame {
+        let oop: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let cc = CardConfig {
+            range: [oop, ip],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tc = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let at = ActionTree::new(tc).unwrap();
+        let mut game = PostFlopGame::with_config(cc, at).unwrap();
+
+        // Inject per-boundary gadgets.
+        let n = game.num_boundary_nodes();
+        assert!(n > 0, "need at least one boundary for gadget test");
+        let n_oop = game.num_private_hands(0);
+        let n_ip = game.num_private_hands(1);
+        let config = crate::game::gadget::GadgetConfigPerBoundary {
+            per_boundary_opt_outs: (0..n)
+                .map(|b| {
+                    [
+                        vec![0.1 * (b + 1) as f32; n_oop],
+                        vec![0.2 * (b + 1) as f32; n_ip],
+                    ]
+                })
+                .collect(),
+        };
+        crate::game::gadget::inject_per_boundary_gadgets(&mut game, &config);
+        game.allocate_memory(false);
+        game
+    }
+
+    /// Find all gadget Decision node arena indices in the game.
+    fn find_gadget_node_indices(game: &PostFlopGame) -> Vec<usize> {
+        (0..game.node_arena_len_for_test())
+            .filter(|&i| game.node_arena_get_for_test(i).is_gadget())
+            .collect()
+    }
+
+    #[test]
+    fn current_player_returns_acting_player_at_gadget_node() {
+        let mut game = build_gadget_game();
+        let gadget_indices = find_gadget_node_indices(&game);
+        assert!(
+            !gadget_indices.is_empty(),
+            "should have gadget nodes after injection"
+        );
+
+        for &idx in &gadget_indices {
+            // Navigate to the gadget node by pushing its arena index directly.
+            game.node_history.clear();
+            game.node_history.push(idx);
+
+            let player = game.current_player();
+            assert!(
+                player <= 1,
+                "current_player() at gadget node (arena idx {idx}) returned {player}, \
+                 expected 0 or 1 (PLAYER_GADGET_FLAG not stripped)"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_strategy_does_not_panic_with_gadget_nodes() {
+        let game = build_gadget_game();
+
+        // seed_strategy iterates all decision nodes including gadget nodes.
+        // With the bug, node.player() returns 65 (PLAYER_GADGET_FLAG | 1)
+        // which panics in num_private_hands(65).
+        let mut visited_gadget = false;
+        game.seed_strategy(|_idx, player, _n_actions, _n_hands| {
+            assert!(
+                player <= 1,
+                "seed_strategy visitor received player={player}, expected 0 or 1"
+            );
+            visited_gadget = true;
+            None
+        });
+        assert!(
+            visited_gadget,
+            "seed_strategy should have visited gadget decision nodes"
+        );
+    }
 }

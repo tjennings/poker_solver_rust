@@ -361,7 +361,7 @@ pub fn extract_strategy_at_prev(
 ) -> Option<StrategyAtPrevDecision> {
     let (node_idx, actions) = preceding_map.get(&ordinal)?;
     let node = game.node_at(*node_idx);
-    let player = node.player();
+    let player = node.acting_player();
     let num_actions = node.num_actions();
     drop(node);
 
