@@ -114,7 +114,7 @@ function SolveProgress({ state }: { state: GameState }) {
         <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
         <div className="progress-text">
           {solve.solver_name} - {solve.iteration}/{solve.max_iterations} iters
-          {' '} | expl: {solve.exploitability.toFixed(3)}
+          {' '} | expl: {solve.exploitability != null ? solve.exploitability.toFixed(3) : 'n/a'}
           {' '} | {solve.elapsed_secs.toFixed(1)}s
           {solve.rollout_hands_per_sec > 0 && ` | ${Math.round(solve.rollout_hands_per_sec).toLocaleString()} hands/s`}
           {solve.is_complete
