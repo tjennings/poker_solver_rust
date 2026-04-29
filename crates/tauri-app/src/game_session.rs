@@ -1325,6 +1325,8 @@ fn build_gadget_tree_game_for_solve(
     cbv_ctx: &Option<Arc<crate::postflop::CbvContext>>,
     current_node_idx: u32,
     boundary_cut: &Option<(u8, BoundaryKind)>,
+    solve_iters: u32,
+    target_exp: f32,
 ) -> Result<PostFlopGame, String> {
     let ctx = cbv_ctx.as_ref().ok_or(
         "enable_gadget=true but no CbvContext loaded (blueprint must include CBV tables)",
@@ -1338,7 +1340,7 @@ fn build_gadget_tree_game_for_solve(
     // Build inner boundary evaluator for cfvnet ordinals 0..N.
     let inner_evaluator = build_inner_evaluator_for_solve(
         board, oop_w, ip_w, pot, eff_stack, bet_sizes, depth_limit,
-        &board_u8, boundary_cut,
+        &board_u8, boundary_cut, solve_iters, target_exp,
     )?;
 
     // Build gadget game via A2 per-boundary injection.
@@ -1364,6 +1366,8 @@ fn build_inner_evaluator_for_solve(
     depth_limit: Option<u8>,
     board_u8: &[u8],
     boundary_cut: &Option<(u8, BoundaryKind)>,
+    solve_iters: u32,
+    target_exp: f32,
 ) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
     let (tmp_cc, tmp_at) = build_solve_game_parts(
         board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
@@ -1389,7 +1393,8 @@ fn build_inner_evaluator_for_solve(
                     private_cards,
                     initial_weights,
                     tree_cfg,
-                ).with_solve_iters(500))
+                ).with_solve_iters(solve_iters)
+                 .with_target_exploitability(target_exp))
             }
             Some((_, BoundaryKind::Cfvnet(model_path))) => {
                 let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
@@ -2093,6 +2098,7 @@ pub fn game_solve_core(
             match build_gadget_tree_game_for_solve(
                 &board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes,
                 depth_limit_override, &cbv_ctx, current_node_idx, &boundary_cut,
+                max_iters, target_exp,
             ) {
                 Ok(g) => g,
                 Err(e) => {
@@ -2146,7 +2152,9 @@ pub fn game_solve_core(
                             setup_neural_boundaries(&mut game, model_path, None);
                         }
                         BoundaryKind::ExactSubtree => {
-                            setup_exact_subtree_boundaries_with_gadget(&mut game, None);
+                            setup_exact_subtree_boundaries_with_gadget(
+                                &mut game, None, max_iters, target_exp,
+                            );
                         }
                     }
                 }
@@ -2408,6 +2416,8 @@ fn setup_neural_boundaries(
 fn setup_exact_subtree_boundaries_with_gadget(
     game: &mut PostFlopGame,
     opt_out: Option<Arc<dyn crate::gadget::OptOutProvider>>,
+    solve_iters: u32,
+    target_exp: f32,
 ) {
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
@@ -2434,7 +2444,8 @@ fn setup_exact_subtree_boundaries_with_gadget(
                 private_cards.clone(),
                 initial_weights.clone(),
                 bet_sizes.clone(),
-            ),
+            ).with_solve_iters(solve_iters)
+             .with_target_exploitability(target_exp),
         );
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
             Some(provider) => Arc::new(

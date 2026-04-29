@@ -472,6 +472,8 @@ fn setup_neural_boundaries(
 fn setup_exact_subtree_boundaries(
     game: &mut PostFlopGame,
     opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>>,
+    solve_iters: u32,
+    target_exp: f32,
 ) {
     let boundary_boards = game.boundary_boards();
     let n_boundaries = game.num_boundary_nodes();
@@ -499,7 +501,8 @@ fn setup_exact_subtree_boundaries(
                 initial_weights.clone(),
                 tree_cfg.clone(),
             )
-            .with_solve_iters(500),
+            .with_solve_iters(solve_iters)
+            .with_target_exploitability(target_exp),
         );
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
             Some(provider) => Arc::new(
@@ -835,6 +838,8 @@ fn build_gadget_tree_game(
     boundary_cut: &Option<(u8, BoundaryKind)>,
     gadget_provider: &str,
     gadget_constant: f32,
+    solve_iters: u32,
+    target_exp: f32,
 ) -> Result<PostFlopGame, String> {
     let board_u8: Vec<u8> = board_cards.iter()
         .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
@@ -843,7 +848,7 @@ fn build_gadget_tree_game(
     // Build inner boundary evaluator (handles cfvnet ordinals 0..N).
     let inner_evaluator = build_inner_evaluator(
         board, oop_w, ip_w, pot, eff_stack, bet_sizes, depth_limit,
-        &board_u8, boundary_cut,
+        &board_u8, boundary_cut, solve_iters, target_exp,
     )?;
 
     // Build the gadget game via the appropriate provider.
@@ -896,6 +901,8 @@ fn build_inner_evaluator(
     depth_limit: Option<u8>,
     board_u8: &[u8],
     boundary_cut: &Option<(u8, BoundaryKind)>,
+    solve_iters: u32,
+    target_exp: f32,
 ) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
     let (tmp_cc, tmp_at) = build_solve_game_parts(
         board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
@@ -921,7 +928,8 @@ fn build_inner_evaluator(
                     private_cards,
                     initial_weights,
                     tree_cfg,
-                ).with_solve_iters(500))
+                ).with_solve_iters(solve_iters)
+                 .with_target_exploitability(target_exp))
             }
             Some((_, BoundaryKind::Cfvnet(model_path))) => {
                 let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
@@ -952,6 +960,8 @@ fn setup_clamp_boundaries(
     ctx: &Arc<CbvContext>,
     current_node: u32,
     boundary_cut: &Option<(u8, BoundaryKind)>,
+    solve_iters: u32,
+    target_exp: f32,
 ) -> Result<(), String> {
     let opt_out: Option<Arc<dyn gadget::OptOutProvider>> = if gadget_clamp {
         let board_u8: Vec<u8> = board_cards.iter()
@@ -977,7 +987,9 @@ fn setup_clamp_boundaries(
                     setup_neural_boundaries(game, Path::new(model_path), opt_out);
                 }
                 BoundaryKind::ExactSubtree => {
-                    setup_exact_subtree_boundaries(game, opt_out);
+                    setup_exact_subtree_boundaries(
+                        game, opt_out, solve_iters, target_exp,
+                    );
                 }
             }
         }
@@ -1132,6 +1144,7 @@ pub fn run(
             &board, &oop_w, &ip_w, pot, eff_stack, bet_sizes,
             depth_limit, &ctx, current_node, &board_cards,
             &boundary_cut, gadget_provider, gadget_constant,
+            iters, 3.0,
         )?
     } else {
         let mut game = build_solve_game(
@@ -1142,6 +1155,7 @@ pub fn run(
         setup_clamp_boundaries(
             &mut game, gadget_clamp, gadget_provider, gadget_constant,
             &board_cards, &ctx, current_node, &boundary_cut,
+            iters, 3.0,
         )?;
         game
     };

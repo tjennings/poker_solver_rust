@@ -12,10 +12,16 @@ use std::time::Instant;
 use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::card::{CardConfig, NOT_DEALT};
 use range_solver::range::Range;
-use range_solver::{solve_step, finalize, root_cfvalues_with_reach, BoardState, PostFlopGame};
+use range_solver::{root_cfvalues_with_reach, BoardState, PostFlopGame};
+#[cfg(test)]
+use range_solver::{solve_step, finalize};
 
 /// Default number of DCFR iterations for the exact subtree solve.
 const DEFAULT_SOLVE_ITERS: u32 = 500;
+
+/// Default target exploitability (mbb) for the exact subtree solve.
+/// Matches the outer solver default in the Tauri UI (3.0 mbb).
+const DEFAULT_TARGET_EXPLOITABILITY: f32 = 3.0;
 
 /// Boundary evaluator that solves the downstream subtree exactly via DCFR.
 pub struct SubtreeExactEvaluator {
@@ -31,6 +37,8 @@ pub struct SubtreeExactEvaluator {
     parent_tree_config: TreeConfig,
     /// Number of DCFR iterations to run.
     solve_iters: u32,
+    /// Target exploitability (mbb). Solve terminates when reached.
+    pub(crate) target_exploitability: f32,
     /// Cache keyed by (pot, remaining_stack, oop_reach, ip_reach) digest.
     cache: Mutex<HashMap<u64, (Vec<f32>, Vec<f32>)>>,
 }
@@ -49,6 +57,7 @@ impl SubtreeExactEvaluator {
             parent_initial_weights,
             parent_tree_config,
             solve_iters: DEFAULT_SOLVE_ITERS,
+            target_exploitability: DEFAULT_TARGET_EXPLOITABILITY,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -56,6 +65,13 @@ impl SubtreeExactEvaluator {
     /// Set the number of DCFR iterations (for testing).
     pub fn with_solve_iters(mut self, iters: u32) -> Self {
         self.solve_iters = iters;
+        self
+    }
+
+    /// Set the target exploitability (mbb). The inner solve terminates
+    /// when either `solve_iters` or `target_exploitability` is reached.
+    pub fn with_target_exploitability(mut self, target: f32) -> Self {
+        self.target_exploitability = target;
         self
     }
 }
@@ -133,7 +149,9 @@ fn reach_is_all_zero(reach: &[f32]) -> bool {
     reach.iter().all(|&v| v.abs() < 1e-9)
 }
 
-/// Build the subtree game, run DCFR, finalize, and extract boundary CFVs.
+/// Build the subtree game, solve via `range_solver::solve()`, and extract
+/// boundary CFVs. The solve terminates when either `solve_iters` or
+/// `target_exploitability` is reached (whichever comes first).
 ///
 /// The subtree is built with the PARENT's initial weights (so that
 /// `num_combinations` matches the parent exactly). After solving, per-hand
@@ -149,6 +167,7 @@ fn solve_subtree(
     oop_reach: &[f32],
     ip_reach: &[f32],
     solve_iters: u32,
+    target_exploitability: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     if reach_is_all_zero(oop_reach) || reach_is_all_zero(ip_reach) {
         return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
@@ -174,8 +193,7 @@ fn solve_subtree(
         .unwrap_or_else(|e| panic!("subtree PostFlopGame failed: {e}"));
     game.allocate_memory(false);
 
-    run_dcfr(&mut game, solve_iters);
-    finalize(&mut game);
+    range_solver::solve(&mut game, solve_iters, target_exploitability, false);
 
     // Remap parent reach to subtree hand ordering
     let sub_oop_reach = remap_reach_to_subtree(
@@ -313,7 +331,8 @@ fn remap_cfvs_to_parent(
         .collect()
 }
 
-/// Run DCFR for the given number of iterations.
+/// Run DCFR for the given number of iterations (test-only helper).
+#[cfg(test)]
 fn run_dcfr(game: &mut PostFlopGame, iters: u32) {
     for t in 0..iters {
         solve_step(game, t);
@@ -383,6 +402,7 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
             oop_reach,
             ip_reach,
             self.solve_iters,
+            self.target_exploitability,
         );
         GLOBAL_SOLVE_SECS.fetch_add(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
 
@@ -607,6 +627,67 @@ mod tests {
         let k1 = cache_key(100, 150.0, &a, &b);
         let k2 = cache_key(100, 200.0, &a, &b);
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn with_target_exploitability_sets_field() {
+        let eval = make_river_evaluator(50)
+            .with_target_exploitability(1.5);
+        assert!(
+            (eval.target_exploitability - 1.5).abs() < 1e-6,
+            "target_exploitability should be 1.5, got {}",
+            eval.target_exploitability,
+        );
+    }
+
+    #[test]
+    fn default_target_exploitability_is_3() {
+        let eval = make_river_evaluator(50);
+        assert!(
+            (eval.target_exploitability - 3.0).abs() < 1e-6,
+            "default target_exploitability should be 3.0, got {}",
+            eval.target_exploitability,
+        );
+    }
+
+    /// A very loose target (e.g. 1000.0 mbb) should let the solve exit early
+    /// (on the first exploitability check). With max_iters=200 the solve
+    /// should finish much faster than one with target=0.0.
+    #[test]
+    fn loose_target_exploitability_exits_early() {
+        let eval_loose = make_river_evaluator(200)
+            .with_target_exploitability(1000.0);
+        let eval_tight = make_river_evaluator(200)
+            .with_target_exploitability(0.0);
+
+        let num_oop = eval_loose.private_cards[0].len();
+        let num_ip = eval_loose.private_cards[1].len();
+        let oop_reach = vec![1.0f32; num_oop];
+        let ip_reach = vec![1.0f32; num_ip];
+
+        // Loose target should be significantly faster
+        let t0 = Instant::now();
+        let _ = eval_loose.compute_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
+        );
+        let loose_ms = t0.elapsed().as_millis();
+
+        let t1 = Instant::now();
+        let _ = eval_tight.compute_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
+        );
+        let tight_ms = t1.elapsed().as_millis();
+
+        eprintln!(
+            "[test] loose target: {loose_ms}ms, tight target: {tight_ms}ms"
+        );
+
+        // The loose solve should take less than half the time of the tight
+        // solve (it exits at iteration ~5 when exploitability < 1000 mbb).
+        assert!(
+            loose_ms < tight_ms,
+            "loose target ({loose_ms}ms) should be faster than tight target ({tight_ms}ms)"
+        );
     }
 
     #[test]
