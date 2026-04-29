@@ -31,7 +31,7 @@ pub struct SubtreeExactEvaluator {
     parent_tree_config: TreeConfig,
     /// Number of DCFR iterations to run.
     solve_iters: u32,
-    /// Cache keyed by rounded reach digest.
+    /// Cache keyed by (pot, remaining_stack, continuation_index, reach) digest.
     cache: Mutex<HashMap<u64, (Vec<f32>, Vec<f32>)>>,
 }
 
@@ -60,11 +60,23 @@ impl SubtreeExactEvaluator {
     }
 }
 
-/// Compute a cache key from two reach vectors by rounding to 3 decimals
-/// and hashing the resulting byte representation.
-fn reach_cache_key(oop_reach: &[f32], ip_reach: &[f32]) -> u64 {
+/// Compute a cache key from all per-call inputs that affect the downstream
+/// subtree solve: pot, remaining stack, continuation index, and both reach
+/// vectors. Reach values are rounded to 3 decimals; remaining_stack is
+/// rounded to 1 decimal (chip-level precision).
+fn cache_key(
+    pot: i32,
+    remaining_stack: f64,
+    continuation_index: usize,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pot.hash(&mut hasher);
+    let stack_rounded = (remaining_stack * 10.0).round() as i64;
+    stack_rounded.hash(&mut hasher);
+    continuation_index.hash(&mut hasher);
     for &v in oop_reach {
         let rounded = (v * 1000.0).round() as i32;
         rounded.hash(&mut hasher);
@@ -348,11 +360,11 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
         ip_reach: &[f32],
         _num_oop: usize,
         _num_ip: usize,
-        _continuation_index: usize,
+        continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
         let n_calls = GLOBAL_CALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let key = reach_cache_key(oop_reach, ip_reach);
+        let key = cache_key(pot, remaining_stack, continuation_index, oop_reach, ip_reach);
         {
             let cache = self.cache.lock().expect("cache lock poisoned");
             if let Some(cached) = cache.get(&key) {
@@ -563,21 +575,48 @@ mod tests {
     }
 
     #[test]
-    fn reach_cache_key_deterministic() {
+    fn cache_key_deterministic() {
         let a = vec![1.0f32, 0.5, 0.333];
         let b = vec![0.0f32, 1.0, 0.667];
-        let k1 = reach_cache_key(&a, &b);
-        let k2 = reach_cache_key(&a, &b);
+        let k1 = cache_key(100, 150.0, 0, &a, &b);
+        let k2 = cache_key(100, 150.0, 0, &a, &b);
         assert_eq!(k1, k2);
     }
 
     #[test]
-    fn reach_cache_key_differs_for_different_reach() {
+    fn cache_key_differs_for_different_reach() {
         let a = vec![1.0f32, 0.5, 0.333];
         let b = vec![0.0f32, 1.0, 0.667];
         let c = vec![0.0f32, 1.0, 0.668];
-        let k1 = reach_cache_key(&a, &b);
-        let k2 = reach_cache_key(&a, &c);
+        let k1 = cache_key(100, 150.0, 0, &a, &b);
+        let k2 = cache_key(100, 150.0, 0, &a, &c);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_pot() {
+        let a = vec![1.0f32, 0.5, 0.333];
+        let b = vec![0.0f32, 1.0, 0.667];
+        let k1 = cache_key(100, 150.0, 0, &a, &b);
+        let k2 = cache_key(200, 150.0, 0, &a, &b);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_remaining_stack() {
+        let a = vec![1.0f32, 0.5, 0.333];
+        let b = vec![0.0f32, 1.0, 0.667];
+        let k1 = cache_key(100, 150.0, 0, &a, &b);
+        let k2 = cache_key(100, 200.0, 0, &a, &b);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_continuation_index() {
+        let a = vec![1.0f32, 0.5, 0.333];
+        let b = vec![0.0f32, 1.0, 0.667];
+        let k1 = cache_key(100, 150.0, 0, &a, &b);
+        let k2 = cache_key(100, 150.0, 1, &a, &b);
         assert_ne!(k1, k2);
     }
 
