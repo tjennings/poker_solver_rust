@@ -22,9 +22,9 @@ function BoundaryEvaluationSettings({
   config: GlobalConfig;
   setConfig: (update: Partial<GlobalConfig>) => void;
 }) {
-  // Determine the first cfvnet street (if any) — later streets are disabled.
-  const firstCfvnetIdx = STREETS.findIndex(
-    s => config[`${s}_boundary_mode`] === 'cfvnet',
+  // Determine the first cut street (if any) — later streets are disabled.
+  const firstCutIdx = STREETS.findIndex(
+    s => config[`${s}_boundary_mode`] !== 'exact',
   );
 
   const handlePickModel = async (street: Street) => {
@@ -52,9 +52,9 @@ function BoundaryEvaluationSettings({
       {STREETS.map((street, idx) => {
         const modeKey = `${street}_boundary_mode` as keyof GlobalConfig;
         const pathKey = `${street}_model_path` as keyof GlobalConfig;
-        const mode = config[modeKey] as 'exact' | 'cfvnet';
+        const mode = config[modeKey] as 'exact' | 'cfvnet' | 'exact_subtree';
         const modelPath = config[pathKey] as string;
-        const disabled = firstCfvnetIdx !== -1 && idx > firstCfvnetIdx;
+        const disabled = firstCutIdx !== -1 && idx > firstCutIdx;
 
         return (
           <div key={street} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem' }}>
@@ -80,6 +80,7 @@ function BoundaryEvaluationSettings({
             >
               <option value="exact">Exact</option>
               <option value="cfvnet">CFVNet</option>
+              <option value="exact_subtree">Exact Subtree</option>
             </select>
             {mode === 'cfvnet' && !disabled && (
               <>
@@ -119,7 +120,7 @@ function BoundaryEvaluationSettings({
         );
       })}
       <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.5rem' }}>
-        Selecting CFVNet on a street cuts the solve at that street boundary and uses the chosen ONNX model for counterfactual values. Earlier streets must be Exact.
+        Selecting CFVNet or Exact Subtree on a street cuts the solve at that street boundary. CFVNet uses an ONNX model for counterfactual values; Exact Subtree solves the downstream subtree exactly via DCFR. Earlier streets must be Exact.
       </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: hasAnyCut(config) ? 'pointer' : 'not-allowed' }}>
         <input
@@ -129,11 +130,11 @@ function BoundaryEvaluationSettings({
           onChange={(e) => setConfig({ enable_safe_resolving: e.target.checked })}
           style={{ accentColor: '#00d9ff' }}
         />
-        Safe re-solving (Libratus gadget)
+        Safe re-solving (CFR-D gadget)
       </label>
       {!hasAnyCut(config) && (
         <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.3rem', marginLeft: '1.8rem' }}>
-          Enable a per-street cut mode (CFVNet) to use the gadget.
+          Enable a per-street cut mode (CFVNet or Exact Subtree) on any street to activate the gadget.
         </p>
       )}
     </div>

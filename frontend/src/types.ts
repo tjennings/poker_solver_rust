@@ -146,7 +146,8 @@ export interface SimulationResult {
 
 export type StreetBoundaryMode =
   | { mode: 'exact' }
-  | { mode: 'cfvnet'; model_path: string };
+  | { mode: 'cfvnet'; model_path: string }
+  | { mode: 'exact_subtree' };
 
 export interface StreetBoundaryConfig {
   flop: StreetBoundaryMode;
@@ -164,16 +165,16 @@ export interface GlobalConfig {
   range_clamp_threshold: number;
   // Per-street boundary config + remembered model paths per street
   // (paths persist across "exact" toggles so users don't lose them).
-  flop_boundary_mode: 'exact' | 'cfvnet';
-  turn_boundary_mode: 'exact' | 'cfvnet';
-  river_boundary_mode: 'exact' | 'cfvnet';
+  flop_boundary_mode: 'exact' | 'cfvnet' | 'exact_subtree';
+  turn_boundary_mode: 'exact' | 'cfvnet' | 'exact_subtree';
+  river_boundary_mode: 'exact' | 'cfvnet' | 'exact_subtree';
   flop_model_path: string;
   turn_model_path: string;
   river_model_path: string;
   // Boundary tracing (debug)
   trace_boundaries: string;
   trace_iters: string;
-  // Safe re-solving (Libratus gadget)
+  // Safe re-solving (CFR-D gadget)
   enable_safe_resolving: boolean;
 }
 

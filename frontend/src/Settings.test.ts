@@ -44,4 +44,16 @@ describe('hasAnyCut', () => {
       river_boundary_mode: 'cfvnet',
     })).toBe(true);
   });
+
+  it('returns true when flop is exact_subtree', () => {
+    expect(hasAnyCut({ ...allExact, flop_boundary_mode: 'exact_subtree' })).toBe(true);
+  });
+
+  it('returns true when turn is exact_subtree', () => {
+    expect(hasAnyCut({ ...allExact, turn_boundary_mode: 'exact_subtree' })).toBe(true);
+  });
+
+  it('returns true when river is exact_subtree', () => {
+    expect(hasAnyCut({ ...allExact, river_boundary_mode: 'exact_subtree' })).toBe(true);
+  });
 });

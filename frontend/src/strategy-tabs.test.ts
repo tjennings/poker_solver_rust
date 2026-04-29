@@ -194,4 +194,41 @@ describe('buildSolveParams', () => {
     const params = buildSolveParams('subgame', config);
     expect(params.enableGadget).toBe(false);
   });
+
+  // ExactSubtree boundary mode tests
+
+  it('builds exact_subtree streetBoundaryConfig for river', () => {
+    const config = {
+      ...defaultConfig,
+      river_boundary_mode: 'exact_subtree' as const,
+    };
+    const params = buildSolveParams('subgame', config);
+    expect(params.streetBoundaryConfig).toEqual({
+      flop: { mode: 'exact' },
+      turn: { mode: 'exact' },
+      river: { mode: 'exact_subtree' },
+    });
+  });
+
+  it('builds exact_subtree streetBoundaryConfig for turn', () => {
+    const config = {
+      ...defaultConfig,
+      turn_boundary_mode: 'exact_subtree' as const,
+    };
+    const params = buildSolveParams('subgame', config);
+    expect(params.streetBoundaryConfig).toEqual({
+      flop: { mode: 'exact' },
+      turn: { mode: 'exact_subtree' },
+      river: { mode: 'exact' },
+    });
+  });
+
+  it('does not require model_path for exact_subtree mode', () => {
+    const config = {
+      ...defaultConfig,
+      river_boundary_mode: 'exact_subtree' as const,
+      river_model_path: '',
+    };
+    expect(() => buildSolveParams('subgame', config)).not.toThrow();
+  });
 });
