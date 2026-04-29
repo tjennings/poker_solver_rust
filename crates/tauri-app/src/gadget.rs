@@ -212,13 +212,17 @@ impl BlueprintCbvOptOut {
                 GameNode::Terminal { .. } => {
                     // All-in Showdown on the starting street. Both
                     // players already committed all chips, so the
-                    // opponent cannot opt out. Use NEG_INFINITY to
-                    // ensure the gadget never clamps at this boundary.
+                    // opponent cannot opt out. Use -1e9 (always
+                    // dominated) instead of NEG_INFINITY because
+                    // NEG_INFINITY * 0 = NaN in solver arithmetic
+                    // (bcfvs[h] * payoff_scale * cfreach_adj), which
+                    // propagates through compute_mes_ev ->
+                    // compute_exploitability, breaking the BR pass.
                     let n_oop = private_cards[0].len();
                     let n_ip = private_cards[1].len();
                     per_boundary.push([
-                        vec![f32::NEG_INFINITY; n_oop],
-                        vec![f32::NEG_INFINITY; n_ip],
+                        vec![-1e9_f32; n_oop],
+                        vec![-1e9_f32; n_ip],
                     ]);
                 }
                 GameNode::Decision { .. } => {
@@ -1631,10 +1635,15 @@ mod tests {
     }
 
     /// For all-in Showdown boundaries (no CBV entry), opt-out must be
-    /// very negative (f32::NEG_INFINITY) so the gadget never clamps --
-    /// the opponent already committed all chips and cannot opt out.
+    /// finite and very negative so the gadget never clamps -- the
+    /// opponent already committed all chips and cannot opt out.
+    ///
+    /// Must NOT be NEG_INFINITY: solver arithmetic
+    /// `bcfvs[h] * payoff_scale * cfreach_adj` produces NaN when
+    /// bcfvs[h] = -inf and any factor is 0. NaN propagates through
+    /// compute_mes_ev -> compute_exploitability, breaking the BR pass.
     #[test]
-    fn from_cbv_context_allin_boundary_opt_out_is_neg_infinity() {
+    fn from_cbv_context_allin_boundary_opt_out_is_finite_and_very_negative() {
         let (ctx, board, private_cards) = make_allin_showdown_cbv_context();
 
         let provider = BlueprintCbvOptOut::from_cbv_context(
@@ -1642,7 +1651,7 @@ mod tests {
         );
 
         // Boundary 0 is the Chance node => normal CBV opt-out.
-        // Boundary 1 is the all-in Showdown => should be NEG_INFINITY.
+        // Boundary 1 is the all-in Showdown => must be finite + dominated.
         let oop_cfvs = provider.opt_out_cfvs(
             1, 0, 100, 200, &board, &private_cards[0],
         );
@@ -1651,8 +1660,12 @@ mod tests {
         );
         for &v in oop_cfvs.iter().chain(ip_cfvs.iter()) {
             assert!(
-                v == f32::NEG_INFINITY,
-                "all-in boundary opt-out should be NEG_INFINITY, got {v}"
+                v.is_finite(),
+                "all-in boundary opt-out must be finite (not NEG_INFINITY), got {v}"
+            );
+            assert!(
+                v < -1e8,
+                "all-in boundary opt-out must be very negative (dominated), got {v}"
             );
         }
     }
