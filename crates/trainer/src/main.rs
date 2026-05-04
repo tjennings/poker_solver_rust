@@ -398,6 +398,10 @@ enum Commands {
         #[arg(long, default_value = "current", hide = true)]
         oracle_orientation: String,
 
+        /// Diagnostic exact_oracle raw CFV multiplier.
+        #[arg(long, default_value_t = 1.0, hide = true)]
+        oracle_scale: f32,
+
         /// Boundary ordinals to trace (comma-separated, or "all").
         /// Produces one JSONL file per ordinal in --trace-dir.
         #[arg(long)]
@@ -1441,6 +1445,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             river_boundary,
             river_model,
             oracle_orientation,
+            oracle_scale,
             trace_boundaries,
             trace_iters,
             trace_dir,
@@ -1502,6 +1507,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 sbc,
                 oracle_boundary_flags,
                 oracle_orientation,
+                oracle_scale,
                 trace_config,
                 tolerance,
                 gadget,

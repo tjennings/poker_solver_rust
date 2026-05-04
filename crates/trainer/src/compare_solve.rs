@@ -588,6 +588,7 @@ struct OracleBoundaryEvaluator {
     exact_game: Arc<PostFlopGame>,
     history: Vec<usize>,
     orientation: OracleCfvOrientation,
+    scale: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,6 +640,12 @@ impl OracleCfvOrientation {
     }
 }
 
+fn scale_cfvs(values: &mut [f32], scale: f32) {
+    if scale != 1.0 {
+        values.iter_mut().for_each(|v| *v *= scale);
+    }
+}
+
 impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
     fn compute_cfvs(
         &self,
@@ -666,8 +673,12 @@ impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
             continuation_index, 0,
             "exact_oracle supports only the unbiased continuation"
         );
-        let oop = cfvalues_after_history_with_reach(&self.exact_game, &self.history, 0, ip_reach);
-        let ip = cfvalues_after_history_with_reach(&self.exact_game, &self.history, 1, oop_reach);
+        let mut oop =
+            cfvalues_after_history_with_reach(&self.exact_game, &self.history, 0, ip_reach);
+        let mut ip =
+            cfvalues_after_history_with_reach(&self.exact_game, &self.history, 1, oop_reach);
+        scale_cfvs(&mut oop, self.scale);
+        scale_cfvs(&mut ip, self.scale);
         Some(self.orientation.orient(oop, ip))
     }
 }
@@ -715,7 +726,13 @@ fn setup_oracle_boundaries(
     game: &mut PostFlopGame,
     exact_game: Arc<PostFlopGame>,
     orientation: OracleCfvOrientation,
+    scale: f32,
 ) -> Result<(), String> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(format!(
+            "invalid --oracle-scale value {scale}: expected a positive finite value"
+        ));
+    }
     let histories = build_boundary_play_histories(game);
     let n_boundaries = game.num_boundary_nodes();
     if histories.len() != n_boundaries {
@@ -731,6 +748,7 @@ fn setup_oracle_boundaries(
                 exact_game: Arc::clone(&exact_game),
                 history,
                 orientation,
+                scale,
             }) as Arc<dyn range_solver::game::BoundaryEvaluator>
         })
         .collect();
@@ -738,7 +756,7 @@ fn setup_oracle_boundaries(
     game.boundary_evaluator = None;
     eprintln!(
         "[compare] exact-oracle mode: {n_boundaries} boundaries \
-         (solved exact game, orientation={})",
+         (solved exact game, orientation={}, scale={scale:.6})",
         orientation.label()
     );
     Ok(())
@@ -1321,6 +1339,7 @@ pub fn run(
     street_boundary_config: StreetBoundaryConfig,
     oracle_boundary_flags: [bool; 3],
     oracle_orientation: OracleCfvOrientation,
+    oracle_scale: f32,
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
@@ -1562,6 +1581,7 @@ pub fn run(
             &mut subgame_game,
             Arc::clone(&exact_game),
             oracle_orientation,
+            oracle_scale,
         )?;
     }
 
@@ -1971,6 +1991,7 @@ mod tests {
             &mut subgame,
             Arc::clone(&exact_game),
             OracleCfvOrientation::Current,
+            1.0,
         )
         .unwrap();
 
