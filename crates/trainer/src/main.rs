@@ -394,6 +394,10 @@ enum Commands {
         #[arg(long)]
         river_model: Option<String>,
 
+        /// Diagnostic exact_oracle CFV orientation transform.
+        #[arg(long, default_value = "current", hide = true)]
+        oracle_orientation: String,
+
         /// Boundary ordinals to trace (comma-separated, or "all").
         /// Produces one JSONL file per ordinal in --trace-dir.
         #[arg(long)]
@@ -1436,6 +1440,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             turn_model,
             river_boundary,
             river_model,
+            oracle_orientation,
             trace_boundaries,
             trace_iters,
             trace_dir,
@@ -1474,6 +1479,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 turn_boundary == "exact_oracle",
                 river_boundary == "exact_oracle",
             ];
+            let oracle_orientation =
+                compare_solve::OracleCfvOrientation::parse(&oracle_orientation)
+                    .map_err(|e| -> Box<dyn Error> { e.into() })?;
             let sbc = poker_solver_tauri::StreetBoundaryConfig {
                 flop: parse_mode(&flop_boundary, flop_model, "flop")?,
                 turn: parse_mode(&turn_boundary, turn_model, "turn")?,
@@ -1493,6 +1501,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 dump_boundary_cfvs,
                 sbc,
                 oracle_boundary_flags,
+                oracle_orientation,
                 trace_config,
                 tolerance,
                 gadget,

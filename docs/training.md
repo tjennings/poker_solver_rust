@@ -395,6 +395,7 @@ Options:
 - `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
 - `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
+- `--oracle-orientation <MODE>` -- Hidden `exact_oracle` diagnostic. Accepted values are `current`, `swap`, `sign-flip`, and `swap-sign-flip`; use only to audit OOP/IP and sign orientation at the raw boundary-CFV handoff.
 
 Boundary modes:
 - `exact` -- Continue solving through the full tree with no depth boundary.

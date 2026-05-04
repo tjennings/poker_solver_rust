@@ -587,6 +587,56 @@ fn setup_exact_subtree_boundaries(
 struct OracleBoundaryEvaluator {
     exact_game: Arc<PostFlopGame>,
     history: Vec<usize>,
+    orientation: OracleCfvOrientation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleCfvOrientation {
+    Current,
+    SwapPlayers,
+    SignFlip,
+    SwapPlayersSignFlip,
+}
+
+impl OracleCfvOrientation {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "current" => Ok(Self::Current),
+            "swap" => Ok(Self::SwapPlayers),
+            "sign-flip" => Ok(Self::SignFlip),
+            "swap-sign-flip" => Ok(Self::SwapPlayersSignFlip),
+            other => Err(format!(
+                "invalid --oracle-orientation value '{other}': expected \
+                 'current', 'swap', 'sign-flip', or 'swap-sign-flip'"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::SwapPlayers => "swap",
+            Self::SignFlip => "sign-flip",
+            Self::SwapPlayersSignFlip => "swap-sign-flip",
+        }
+    }
+
+    fn orient(self, mut oop: Vec<f32>, mut ip: Vec<f32>) -> (Vec<f32>, Vec<f32>) {
+        match self {
+            Self::Current => (oop, ip),
+            Self::SwapPlayers => (ip, oop),
+            Self::SignFlip => {
+                oop.iter_mut().for_each(|v| *v = -*v);
+                ip.iter_mut().for_each(|v| *v = -*v);
+                (oop, ip)
+            }
+            Self::SwapPlayersSignFlip => {
+                oop.iter_mut().for_each(|v| *v = -*v);
+                ip.iter_mut().for_each(|v| *v = -*v);
+                (ip, oop)
+            }
+        }
+    }
 }
 
 impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
@@ -615,10 +665,10 @@ impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
         assert_eq!(
             continuation_index, 0,
             "exact_oracle supports only the unbiased continuation"
-    );
+        );
         let oop = cfvalues_after_history_with_reach(&self.exact_game, &self.history, 0, ip_reach);
         let ip = cfvalues_after_history_with_reach(&self.exact_game, &self.history, 1, oop_reach);
-        Some((oop, ip))
+        Some(self.orientation.orient(oop, ip))
     }
 }
 
@@ -664,6 +714,7 @@ fn build_boundary_play_histories(game: &PostFlopGame) -> Vec<Vec<usize>> {
 fn setup_oracle_boundaries(
     game: &mut PostFlopGame,
     exact_game: Arc<PostFlopGame>,
+    orientation: OracleCfvOrientation,
 ) -> Result<(), String> {
     let histories = build_boundary_play_histories(game);
     let n_boundaries = game.num_boundary_nodes();
@@ -679,12 +730,17 @@ fn setup_oracle_boundaries(
             Arc::new(OracleBoundaryEvaluator {
                 exact_game: Arc::clone(&exact_game),
                 history,
+                orientation,
             }) as Arc<dyn range_solver::game::BoundaryEvaluator>
         })
         .collect();
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
-    eprintln!("[compare] exact-oracle mode: {n_boundaries} boundaries (solved exact game)");
+    eprintln!(
+        "[compare] exact-oracle mode: {n_boundaries} boundaries \
+         (solved exact game, orientation={})",
+        orientation.label()
+    );
     Ok(())
 }
 
@@ -1264,6 +1320,7 @@ pub fn run(
     dump_boundary_cfvs: bool,
     street_boundary_config: StreetBoundaryConfig,
     oracle_boundary_flags: [bool; 3],
+    oracle_orientation: OracleCfvOrientation,
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
@@ -1501,7 +1558,11 @@ pub fn run(
     let exact_game = Arc::new(exact_game);
 
     if oracle_boundary_active {
-        setup_oracle_boundaries(&mut subgame_game, Arc::clone(&exact_game))?;
+        setup_oracle_boundaries(
+            &mut subgame_game,
+            Arc::clone(&exact_game),
+            oracle_orientation,
+        )?;
     }
 
     // 9. Solve subgame (with optional tracer)
@@ -1850,6 +1911,50 @@ mod tests {
     }
 
     #[test]
+    fn oracle_cfv_orientation_parses_labels() {
+        assert_eq!(
+            OracleCfvOrientation::parse("current").unwrap(),
+            OracleCfvOrientation::Current
+        );
+        assert_eq!(
+            OracleCfvOrientation::parse("swap").unwrap(),
+            OracleCfvOrientation::SwapPlayers
+        );
+        assert_eq!(
+            OracleCfvOrientation::parse("sign-flip").unwrap(),
+            OracleCfvOrientation::SignFlip
+        );
+        assert_eq!(
+            OracleCfvOrientation::parse("swap-sign-flip").unwrap(),
+            OracleCfvOrientation::SwapPlayersSignFlip
+        );
+        assert!(OracleCfvOrientation::parse("bad").is_err());
+    }
+
+    #[test]
+    fn oracle_cfv_orientation_transforms_vectors() {
+        let oop = vec![1.0, -2.0];
+        let ip = vec![3.0, -4.0];
+
+        assert_eq!(
+            OracleCfvOrientation::Current.orient(oop.clone(), ip.clone()),
+            (oop.clone(), ip.clone())
+        );
+        assert_eq!(
+            OracleCfvOrientation::SwapPlayers.orient(oop.clone(), ip.clone()),
+            (ip.clone(), oop.clone())
+        );
+        assert_eq!(
+            OracleCfvOrientation::SignFlip.orient(oop.clone(), ip.clone()),
+            (vec![-1.0, 2.0], vec![-3.0, 4.0])
+        );
+        assert_eq!(
+            OracleCfvOrientation::SwapPlayersSignFlip.orient(oop, ip),
+            (vec![-3.0, 4.0], vec![-1.0, 2.0])
+        );
+    }
+
+    #[test]
     fn oracle_boundary_one_boundary_contract_matches_exact() {
         let mut exact_game = make_one_boundary_turn_game(None);
         let mut subgame = make_one_boundary_turn_game(Some(0));
@@ -1862,7 +1967,12 @@ mod tests {
         let exact_exp = run_contract_solve(&mut exact_game, 400);
         exact_game.back_to_root();
         let exact_game = Arc::new(exact_game);
-        setup_oracle_boundaries(&mut subgame, Arc::clone(&exact_game)).unwrap();
+        setup_oracle_boundaries(
+            &mut subgame,
+            Arc::clone(&exact_game),
+            OracleCfvOrientation::Current,
+        )
+        .unwrap();
 
         let subgame_exp = run_contract_solve(&mut subgame, 400);
         subgame.back_to_root();
