@@ -389,12 +389,18 @@ Options:
 - `--iters <N>` -- DCFR iterations for the subgame solve (default: 200)
 - `--tolerance <F>` -- Max per-cell strategy delta before non-zero exit (default: 0.0, disabled)
 - `--verbose` -- Print per-iteration progress
-- `--flop-boundary <MODE>` -- Flop boundary evaluator: `exact` (default) or `cfvnet`
-- `--turn-boundary <MODE>` -- Turn boundary evaluator: `exact` (default) or `cfvnet`
-- `--river-boundary <MODE>` -- River boundary evaluator: `exact` (default) or `cfvnet`
+- `--flop-boundary <MODE>` -- Flop boundary evaluator: `exact` (default), `cfvnet`, `exact_subtree`, or `exact_oracle`
+- `--turn-boundary <MODE>` -- Turn boundary evaluator: `exact` (default), `cfvnet`, `exact_subtree`, or `exact_oracle`
+- `--river-boundary <MODE>` -- River boundary evaluator: `exact` (default), `cfvnet`, `exact_subtree`, or `exact_oracle`
 - `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
 - `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
+
+Boundary modes:
+- `exact` -- Continue solving through the full tree with no depth boundary.
+- `cfvnet` -- Use an ONNX CFV network at the selected depth boundary.
+- `exact_subtree` -- At each boundary, solve a fresh exact subtree using the live boundary reaches.
+- `exact_oracle` -- Diagnostic mode: solve the full exact game first, then evaluate each depth boundary with that solved exact continuation and the subgame's live boundary reaches. This isolates boundary integration from exact-subtree re-solving noise.
 
 #### Gadget Flags (Safe Re-solving)
 

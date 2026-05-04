@@ -7,29 +7,32 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+use poker_solver_core::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::Street;
 
-use poker_solver_tauri::{
-    GameSession, build_solve_game, build_solve_game_parts,
-    parse_rs_poker_card, seed_solver_with_blueprint,
-    StreetBoundaryConfig, BoundaryKind, resolve_street_boundary,
-};
-use poker_solver_tauri::postflop::CbvContext;
 use poker_solver_tauri::gadget;
+use poker_solver_tauri::postflop::CbvContext;
+use poker_solver_tauri::{
+    BoundaryKind, GameSession, StreetBoundaryConfig, StreetBoundaryMode, build_solve_game,
+    build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
+    seed_solver_with_blueprint,
+};
 
 use range_solver::card::card_to_string;
 use range_solver::interface::Game;
-use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
+use range_solver::{
+    Action, PostFlopGame, cfvalues_after_history_with_reach, compute_exploitability, finalize,
+    solve_step,
+};
 
 use crate::boundary_trace::{
-    BoundaryTracer, assemble_full_spot, build_boundary_spot_paths,
-    build_preceding_decision_map, capture_boundary_traces,
+    BoundaryTracer, assemble_full_spot, build_boundary_spot_paths, build_preceding_decision_map,
+    capture_boundary_traces,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,24 +53,40 @@ impl BoundaryCfvStats {
     /// Compute summary statistics from a slice of per-hand CFVs.
     pub fn from_slice(cfvs: &[f32]) -> Self {
         if cfvs.is_empty() {
-            return Self { min: 0.0, max: 0.0, mean: 0.0, stddev: 0.0, count_nonzero: 0 };
+            return Self {
+                min: 0.0,
+                max: 0.0,
+                mean: 0.0,
+                stddev: 0.0,
+                count_nonzero: 0,
+            };
         }
         let mut min = f32::INFINITY;
         let mut max = f32::NEG_INFINITY;
         let mut sum = 0.0f64;
         let mut count_nonzero = 0usize;
         for &v in cfvs {
-            if v < min { min = v; }
-            if v > max { max = v; }
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
             sum += v as f64;
-            if v != 0.0 { count_nonzero += 1; }
+            if v != 0.0 {
+                count_nonzero += 1;
+            }
         }
         let n = cfvs.len() as f64;
         let mean = sum / n;
-        let var = cfvs.iter().map(|&v| {
+        let var = cfvs
+            .iter()
+            .map(|&v| {
             let d = v as f64 - mean;
             d * d
-        }).sum::<f64>() / n;
+            })
+            .sum::<f64>()
+            / n;
         Self {
             min,
             max,
@@ -108,10 +127,13 @@ pub fn check_cfv_non_finite(stats: &BoundaryCfvStats) -> Vec<String> {
 /// suggesting a unit mismatch (e.g., chips vs pot-fractions).
 pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
     let mut warnings = Vec::new();
-    let magnitudes: Vec<f64> = all_stats.iter().map(|s| {
+    let magnitudes: Vec<f64> = all_stats
+        .iter()
+        .map(|s| {
         let m = s.mean.abs().max(s.stddev.abs()) as f64;
         if m < 1e-10 { 1e-10 } else { m }
-    }).collect();
+        })
+        .collect();
     if magnitudes.len() < 2 {
         return warnings;
     }
@@ -120,7 +142,9 @@ pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
     if max_mag / min_mag > 100.0 {
         warnings.push(format!(
             "unit mismatch suspected: magnitude range {:.4}..{:.4} (ratio {:.0}x)",
-            min_mag, max_mag, max_mag / min_mag,
+            min_mag,
+            max_mag,
+            max_mag / min_mag,
         ));
     }
     warnings
@@ -128,10 +152,7 @@ pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
 
 /// Check if biased CFVs diverge wildly from the unbiased baseline.
 /// `bias_stats[0]` is assumed to be Unbiased.
-pub fn check_bias_divergence(
-    bias_stats: &[&BoundaryCfvStats],
-    bias_names: &[&str],
-) -> Vec<String> {
+pub fn check_bias_divergence(bias_stats: &[&BoundaryCfvStats], bias_names: &[&str]) -> Vec<String> {
     let mut warnings = Vec::new();
     if bias_stats.is_empty() {
         return warnings;
@@ -144,7 +165,11 @@ pub fn check_bias_divergence(
         let mag = bias_stats[i].mean.abs().max(bias_stats[i].stddev.abs()) as f64;
         let ratio = if mag < 1e-10 { 0.0 } else { mag / base_mag };
         if ratio > 100.0 || (base_mag > 1e-6 && ratio < 0.01) {
-            let name = if i < bias_names.len() { bias_names[i] } else { "?" };
+            let name = if i < bias_names.len() {
+                bias_names[i]
+            } else {
+                "?"
+            };
             warnings.push(format!(
                 "{name} bias divergence: mean={:.4} vs unbiased={:.4} (ratio {:.0}x)",
                 bias_stats[i].mean, bias_stats[0].mean, ratio,
@@ -198,7 +223,11 @@ pub fn compute_mass_moved(
         }
     }
 
-    let mean = if num_hands > 0 { total / num_hands as f64 } else { 0.0 };
+    let mean = if num_hands > 0 {
+        total / num_hands as f64
+    } else {
+        0.0
+    };
     (mean, max_mass, max_idx)
 }
 
@@ -219,8 +248,14 @@ pub fn compute_action_bias(
     let mut result = Vec::new();
     for (a, label) in action_labels.iter().enumerate() {
         let base = a * num_hands;
-        let exact_sum: f64 = exact[base..base + num_hands].iter().map(|&v| v as f64).sum();
-        let subgame_sum: f64 = subgame[base..base + num_hands].iter().map(|&v| v as f64).sum();
+        let exact_sum: f64 = exact[base..base + num_hands]
+            .iter()
+            .map(|&v| v as f64)
+            .sum();
+        let subgame_sum: f64 = subgame[base..base + num_hands]
+            .iter()
+            .map(|&v| v as f64)
+            .sum();
         let class_name = classify_action(label);
         result.push((class_name, subgame_sum - exact_sum));
     }
@@ -272,11 +307,17 @@ pub fn top_hands_by_mass(
     hands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     hands.truncate(top_n);
 
-    hands.into_iter().map(|(h, mass)| {
-        let exact_probs: Vec<f32> = (0..num_actions).map(|a| exact[a * num_hands + h]).collect();
-        let subgame_probs: Vec<f32> = (0..num_actions).map(|a| subgame[a * num_hands + h]).collect();
+    hands
+        .into_iter()
+        .map(|(h, mass)| {
+            let exact_probs: Vec<f32> =
+                (0..num_actions).map(|a| exact[a * num_hands + h]).collect();
+            let subgame_probs: Vec<f32> = (0..num_actions)
+                .map(|a| subgame[a * num_hands + h])
+                .collect();
         (h, mass, exact_probs, subgame_probs)
-    }).collect()
+        })
+        .collect()
 }
 
 /// Find the strategy.bin path within a bundle, optionally pinned to a snapshot.
@@ -285,7 +326,10 @@ pub fn top_hands_by_mass(
 /// 1. If `snapshot` is Some, use `bundle_dir/<snapshot>/strategy.bin`
 /// 2. Else, try `bundle_dir/final/strategy.bin`
 /// 3. Else, use the latest `snapshot_*` directory
-fn find_strategy_path(bundle_dir: &Path, snapshot: Option<&str>) -> Result<std::path::PathBuf, String> {
+fn find_strategy_path(
+    bundle_dir: &Path,
+    snapshot: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
     if let Some(snap) = snapshot {
         let p = bundle_dir.join(snap).join("strategy.bin");
         if p.exists() {
@@ -325,9 +369,17 @@ fn find_strategy_path(bundle_dir: &Path, snapshot: Option<&str>) -> Result<std::
 fn load_bundle_with_snapshot(
     bundle_dir: &Path,
     snapshot: Option<&str>,
-) -> Result<(BlueprintV2Config, BlueprintV2Strategy, V2GameTree, Vec<u32>, Arc<CbvContext>), String> {
-    let config = load_config(bundle_dir)
-        .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
+) -> Result<
+    (
+        BlueprintV2Config,
+        BlueprintV2Strategy,
+        V2GameTree,
+        Vec<u32>,
+        Arc<CbvContext>,
+    ),
+    String,
+> {
+    let config = load_config(bundle_dir).map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
     let strat_path = find_strategy_path(bundle_dir, snapshot)?;
     eprintln!("Loading strategy from {}...", strat_path.display());
@@ -339,7 +391,10 @@ fn load_bundle_with_snapshot(
         config.game.stack_depth,
         config.game.small_blind,
         config.game.big_blind,
-        &aa.preflop, &aa.flop, &aa.turn, &aa.river,
+        &aa.preflop,
+        &aa.flop,
+        &aa.turn,
+        &aa.river,
         config.game.allow_preflop_limp,
     );
     let decision_map = tree.decision_index_map();
@@ -358,8 +413,14 @@ fn load_bundle_with_snapshot(
         config.clustering.river.buckets,
     ];
     let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
-    for (i, name) in ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"]
-        .iter().enumerate()
+    for (i, name) in [
+        "preflop.buckets",
+        "flop.buckets",
+        "turn.buckets",
+        "river.buckets",
+    ]
+    .iter()
+    .enumerate()
     {
         let path = cluster_dir.join(name);
         if path.exists() {
@@ -385,10 +446,16 @@ fn load_bundle_with_snapshot(
         CbvTable::load(&cbv_path).ok()
     } else {
         let alt = bundle_dir.join("cbv_p0.bin");
-        if alt.exists() { CbvTable::load(&alt).ok() } else { None }
+        if alt.exists() {
+            CbvTable::load(&alt).ok()
+        } else {
+            None
+        }
     };
     let cbv_table = cbv_table.unwrap_or_else(|| CbvTable {
-        values: vec![], node_offsets: vec![], buckets_per_node: vec![],
+        values: vec![],
+        node_offsets: vec![],
+        buckets_per_node: vec![],
     });
 
     let ctx = Arc::new(CbvContext {
@@ -442,15 +509,13 @@ fn setup_neural_boundaries(
         );
         let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
-            Some(provider) => Arc::new(
-                poker_solver_tauri::gadget::GadgetEvaluator::new(
+            Some(provider) => Arc::new(poker_solver_tauri::gadget::GadgetEvaluator::new(
                     inner,
                     Arc::clone(provider),
                     ordinal,
                     board_4,
                     private_cards_pair,
-                ),
-            ),
+            )),
             None => inner,
         };
         per_boundary.push(wrapped);
@@ -458,9 +523,7 @@ fn setup_neural_boundaries(
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
-    eprintln!(
-        "[compare] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",
-    );
+    eprintln!("[compare] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",);
 }
 
 /// Wire per-boundary `SubtreeExactEvaluator`s into the game's
@@ -505,24 +568,124 @@ fn setup_exact_subtree_boundaries(
             .with_target_exploitability(target_exp),
         );
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
-            Some(provider) => Arc::new(
-                poker_solver_tauri::gadget::GadgetEvaluator::new(
+            Some(provider) => Arc::new(poker_solver_tauri::gadget::GadgetEvaluator::new(
                     eval,
                     Arc::clone(provider),
                     ordinal,
                     board.clone(),
                     private_cards.clone(),
-                ),
-            ),
+            )),
             None => eval,
         };
         per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
-    eprintln!(
-        "[compare] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}"
+    eprintln!("[compare] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}");
+}
+
+struct OracleBoundaryEvaluator {
+    exact_game: Arc<PostFlopGame>,
+    history: Vec<usize>,
+}
+
+impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
+    fn compute_cfvs(
+        &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        unreachable!("OracleBoundaryEvaluator must be used through raw CFV path")
+    }
+
+    fn compute_raw_cfvs_both(
+        &self,
+        _pot: i32,
+        _remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        assert_eq!(
+            continuation_index, 0,
+            "exact_oracle supports only the unbiased continuation"
     );
+        let oop = cfvalues_after_history_with_reach(&self.exact_game, &self.history, 0, ip_reach);
+        let ip = cfvalues_after_history_with_reach(&self.exact_game, &self.history, 1, oop_reach);
+        Some((oop, ip))
+    }
+}
+
+fn build_boundary_play_histories(game: &PostFlopGame) -> Vec<Vec<usize>> {
+    let boundary_indices = game.boundary_node_indices();
+    let n = boundary_indices.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut index_to_ord = std::collections::HashMap::with_capacity(n);
+    for (ord, &idx) in boundary_indices.iter().enumerate() {
+        index_to_ord.insert(idx, ord);
+    }
+
+    let mut paths: Vec<Option<Vec<usize>>> = vec![None; n];
+    let mut stack: Vec<(usize, Vec<usize>)> = vec![(0, Vec::new())];
+    while let Some((node_idx, history)) = stack.pop() {
+        if let Some(&ord) = index_to_ord.get(&node_idx) {
+            paths[ord] = Some(history.clone());
+        }
+
+        for (action_idx, child_idx) in game.child_indices(node_idx).into_iter().enumerate() {
+            let child = game.node_at(child_idx);
+            let action = child.prev_action();
+            drop(child);
+
+            let mut child_history = history.clone();
+            match action {
+                Action::Chance(card) => child_history.push(card as usize),
+                _ => child_history.push(action_idx),
+            }
+            stack.push((child_idx, child_history));
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|path| path.unwrap_or_else(|| vec![usize::MAX]))
+        .collect()
+}
+
+fn setup_oracle_boundaries(
+    game: &mut PostFlopGame,
+    exact_game: Arc<PostFlopGame>,
+) -> Result<(), String> {
+    let histories = build_boundary_play_histories(game);
+    let n_boundaries = game.num_boundary_nodes();
+    if histories.len() != n_boundaries {
+        return Err(format!(
+            "oracle boundary history count mismatch: histories={} boundaries={n_boundaries}",
+            histories.len(),
+        ));
+    }
+    let per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> = histories
+        .into_iter()
+        .map(|history| {
+            Arc::new(OracleBoundaryEvaluator {
+                exact_game: Arc::clone(&exact_game),
+                history,
+            }) as Arc<dyn range_solver::game::BoundaryEvaluator>
+        })
+        .collect();
+    game.per_boundary_evaluators = per_boundary;
+    game.boundary_evaluator = None;
+    eprintln!("[compare] exact-oracle mode: {n_boundaries} boundaries (solved exact game)");
+    Ok(())
 }
 
 // capture_boundary_traces, build_1326_range, expand_to_1326 live in
@@ -551,7 +714,11 @@ fn run_dcfr_solve(
         }
 
         // DCFR discount params for boundary continuation regrets
-        let nearest_pow4 = if t == 0 { 0 } else { 1u32 << ((t.leading_zeros() ^ 31) & !1) };
+        let nearest_pow4 = if t == 0 {
+            0
+        } else {
+            1u32 << ((t.leading_zeros() ^ 31) & !1)
+        };
         let t_alpha = (t as i32 - 1).max(0) as f64;
         let t_gamma = (t - nearest_pow4) as f64;
         let pow_alpha = t_alpha * t_alpha.sqrt();
@@ -640,11 +807,7 @@ fn find_sample_hand_indices(private_cards: &[(u8, u8)]) -> Vec<(String, usize)> 
 ///
 /// Legacy path: retained for Phase 5 cleanup.
 #[allow(dead_code)]
-fn dump_boundary_cfv_stats(
-    game: &PostFlopGame,
-    pot: i32,
-    eff_stack: i32,
-) {
+fn dump_boundary_cfv_stats(game: &PostFlopGame, pot: i32, eff_stack: i32) {
     let n_boundaries = game.num_boundary_nodes();
     let k = game.num_continuations();
     let bias_names = ["Unbiased", "Fold", "Call", "Raise"];
@@ -670,10 +833,8 @@ fn dump_boundary_cfv_stats(
         let acting = node.acting_player();
         drop(node);
 
-        let turn_str = card_to_string(turn_card)
-            .unwrap_or_else(|_| "--".to_string());
-        let river_str = card_to_string(river_card)
-            .unwrap_or_else(|_| "--".to_string());
+        let turn_str = card_to_string(turn_card).unwrap_or_else(|_| "--".to_string());
+        let river_str = card_to_string(river_card).unwrap_or_else(|_| "--".to_string());
 
         println!(
             "--- boundary {ordinal}: pot={pot_at} invested={invested} \
@@ -683,9 +844,7 @@ fn dump_boundary_cfv_stats(
         for player in 0..2 {
             let player_label = if player == 0 { "OOP" } else { "IP" };
             let num_hands = game.num_private_hands(player);
-            let sample_hands = find_sample_hand_indices(
-                game.private_cards(player),
-            );
+            let sample_hands = find_sample_hand_indices(game.private_cards(player));
 
             let mut bias_stats_vec: Vec<BoundaryCfvStats> = Vec::new();
 
@@ -696,13 +855,18 @@ fn dump_boundary_cfv_stats(
                 println!(
                     "  {player_label} {}: n={num_hands} min={:.6} max={:.6} \
                      mean={:.6} stddev={:.6} nonzero={}",
-                    bias_names[ki], stats.min, stats.max,
-                    stats.mean, stats.stddev, stats.count_nonzero,
+                    bias_names[ki],
+                    stats.min,
+                    stats.max,
+                    stats.mean,
+                    stats.stddev,
+                    stats.count_nonzero,
                 );
 
                 // Print sample hands
                 if !sample_hands.is_empty() && !cfvs.is_empty() {
-                    let samples: Vec<String> = sample_hands.iter()
+                    let samples: Vec<String> = sample_hands
+                        .iter()
                         .map(|(label, idx)| {
                             let val = if *idx < cfvs.len() {
                                 cfvs[*idx]
@@ -717,18 +881,12 @@ fn dump_boundary_cfv_stats(
 
                 // Per-bias sanity checks
                 for w in check_cfv_out_of_range(&stats, chip_range) {
-                    let msg = format!(
-                        "boundary {ordinal} {player_label} {}: {w}",
-                        bias_names[ki],
-                    );
+                    let msg = format!("boundary {ordinal} {player_label} {}: {w}", bias_names[ki],);
                     println!("    WARNING {msg}");
                     all_warnings.push(msg);
                 }
                 for w in check_cfv_non_finite(&stats) {
-                    let msg = format!(
-                        "boundary {ordinal} {player_label} {}: {w}",
-                        bias_names[ki],
-                    );
+                    let msg = format!("boundary {ordinal} {player_label} {}: {w}", bias_names[ki],);
                     println!("    ERROR {msg}");
                     all_warnings.push(msg);
                 }
@@ -741,16 +899,10 @@ fn dump_boundary_cfv_stats(
 
             // Check bias divergence for this boundary x player
             if bias_stats_vec.len() >= 2 {
-                let refs: Vec<&BoundaryCfvStats> =
-                    bias_stats_vec.iter().collect();
-                let names: Vec<&str> = bias_names[..refs.len()]
-                    .iter()
-                    .copied()
-                    .collect();
+                let refs: Vec<&BoundaryCfvStats> = bias_stats_vec.iter().collect();
+                let names: Vec<&str> = bias_names[..refs.len()].iter().copied().collect();
                 for w in check_bias_divergence(&refs, &names) {
-                    let msg = format!(
-                        "boundary {ordinal} {player_label}: {w}",
-                    );
+                    let msg = format!("boundary {ordinal} {player_label}: {w}",);
                     println!("    WARNING {msg}");
                     all_warnings.push(msg);
                 }
@@ -841,33 +993,57 @@ fn build_gadget_tree_game(
     solve_iters: u32,
     target_exp: f32,
 ) -> Result<PostFlopGame, String> {
-    let board_u8: Vec<u8> = board_cards.iter()
+    let board_u8: Vec<u8> = board_cards
+        .iter()
         .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
         .collect();
 
     // Build inner boundary evaluator (handles cfvnet ordinals 0..N).
     let inner_evaluator = build_inner_evaluator(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, depth_limit,
-        &board_u8, boundary_cut, solve_iters, target_exp,
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        depth_limit,
+        &board_u8,
+        boundary_cut,
+        solve_iters,
+        target_exp,
     )?;
 
     // Build the gadget game via the appropriate provider.
     let (card_config, action_tree) = build_solve_game_parts(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        false,
+        depth_limit,
     )?;
 
     let game = match gadget_provider {
         "constant" => {
             eprintln!("[compare] gadget-tree (A2): ConstantOptOut({gadget_constant})");
             gadget::make_per_boundary_gadget_game_constant(
-                card_config, action_tree, gadget_constant, inner_evaluator,
+                card_config,
+                action_tree,
+                gadget_constant,
+                inner_evaluator,
             )?
         }
         "blueprint-cbv" => {
             eprintln!("[compare] gadget-tree (A2): BlueprintCbvOptOut (per-boundary pot)");
             gadget::make_per_boundary_gadget_game(
-                card_config, action_tree, ctx, current_node,
-                &board_u8, inner_evaluator,
+                card_config,
+                action_tree,
+                ctx,
+                current_node,
+                &board_u8,
+                inner_evaluator,
             )?
         }
         other => {
@@ -881,7 +1057,9 @@ fn build_gadget_tree_game(
     let n_original = n_total / 3;
     eprintln!(
         "[compare] gadget-tree (A2): {} original boundaries, {} total (incl. {} gadget terminals)",
-        n_original, n_total, n_total - n_original,
+        n_original,
+        n_total,
+        n_total - n_original,
     );
 
     Ok(game)
@@ -905,7 +1083,14 @@ fn build_inner_evaluator(
     target_exp: f32,
 ) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
     let (tmp_cc, tmp_at) = build_solve_game_parts(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        false,
+        depth_limit,
     )?;
     let tmp_game = PostFlopGame::with_config(tmp_cc, tmp_at)
         .map_err(|e| format!("Failed to build temp game: {e}"))?;
@@ -920,26 +1105,28 @@ fn build_inner_evaluator(
         vec![1.0f32; private_cards[0].len()],
         vec![1.0f32; private_cards[1].len()],
     ];
-    let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
-        match boundary_cut {
-            Some((_, BoundaryKind::ExactSubtree)) | None => {
-                Arc::new(poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
+    let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> = match boundary_cut {
+        Some((_, BoundaryKind::ExactSubtree)) | None => Arc::new(
+            poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
                     board_u8.to_vec(),
                     private_cards,
                     initial_weights,
                     tree_cfg,
-                ).with_solve_iters(solve_iters)
-                 .with_target_exploitability(target_exp))
-            }
+            )
+            .with_solve_iters(solve_iters)
+            .with_target_exploitability(target_exp),
+        ),
             Some((_, BoundaryKind::Cfvnet(model_path))) => {
-                let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
-                    Path::new(model_path),
-                ).map_err(|e| format!("ONNX session load failed: {e}"))?;
-                Arc::new(cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+            let session =
+                cfvnet::eval::boundary_evaluator::load_shared_onnx_session(Path::new(model_path))
+                    .map_err(|e| format!("ONNX session load failed: {e}"))?;
+            Arc::new(
+                cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
                     session,
                     board_u8.to_vec(),
                     private_cards,
-                ))
+                ),
+            )
             }
         };
     Ok(evaluator)
@@ -964,7 +1151,8 @@ fn setup_clamp_boundaries(
     target_exp: f32,
 ) -> Result<(), String> {
     let opt_out: Option<Arc<dyn gadget::OptOutProvider>> = if gadget_clamp {
-        let board_u8: Vec<u8> = board_cards.iter()
+        let board_u8: Vec<u8> = board_cards
+            .iter()
             .map(|c| poker_solver_tauri::rs_card_to_range_solver(*c))
             .collect();
         let private_cards: [Vec<(u8, u8)>; 2] = [
@@ -972,8 +1160,12 @@ fn setup_clamp_boundaries(
             game.private_cards(1).to_vec(),
         ];
         Some(compute_opt_out_provider(
-            gadget_provider, gadget_constant, ctx, current_node,
-            &board_u8, &private_cards,
+            gadget_provider,
+            gadget_constant,
+            ctx,
+            current_node,
+            &board_u8,
+            &private_cards,
         )?)
     } else {
         None
@@ -987,9 +1179,7 @@ fn setup_clamp_boundaries(
                     setup_neural_boundaries(game, Path::new(model_path), opt_out);
                 }
                 BoundaryKind::ExactSubtree => {
-                    setup_exact_subtree_boundaries(
-                        game, opt_out, solve_iters, target_exp,
-                    );
+                    setup_exact_subtree_boundaries(game, opt_out, solve_iters, target_exp);
                 }
             }
         }
@@ -1014,13 +1204,46 @@ fn compute_opt_out_provider(
         "blueprint-cbv" => {
             eprintln!("[compare] gadget-clamp: BlueprintCbvOptOut (per-boundary pot)");
             Ok(Arc::new(gadget::BlueprintCbvOptOut::from_cbv_context(
-                ctx, current_node, board_u8, private_cards,
+                ctx,
+                current_node,
+                board_u8,
+                private_cards,
             )))
         }
         other => Err(format!(
             "invalid --gadget-provider '{other}': expected 'blueprint-cbv' or 'constant'"
         )),
     }
+}
+
+fn resolved_boundary_is_oracle(
+    config: &StreetBoundaryConfig,
+    root_street: Street,
+    oracle_flags: [bool; 3],
+) -> bool {
+    let streets: &[(Street, &StreetBoundaryMode, bool)] = match root_street {
+        Street::Flop => &[
+            (Street::Flop, &config.flop, oracle_flags[0]),
+            (Street::Turn, &config.turn, oracle_flags[1]),
+            (Street::River, &config.river, oracle_flags[2]),
+        ],
+        Street::Turn => &[
+            (Street::Turn, &config.turn, oracle_flags[1]),
+            (Street::River, &config.river, oracle_flags[2]),
+        ],
+        Street::River => &[(Street::River, &config.river, oracle_flags[2])],
+        Street::Preflop => return false,
+    };
+
+    for (i, (_, mode, is_oracle)) in streets.iter().enumerate() {
+        if i == 0 && !matches!(mode, StreetBoundaryMode::Exact) {
+            continue;
+        }
+        if !matches!(mode, StreetBoundaryMode::Exact) {
+            return *is_oracle;
+        }
+    }
+    false
 }
 
 /// Run the compare-solve harness.
@@ -1040,6 +1263,7 @@ pub fn run(
     verbose: bool,
     dump_boundary_cfvs: bool,
     street_boundary_config: StreetBoundaryConfig,
+    oracle_boundary_flags: [bool; 3],
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
@@ -1063,7 +1287,9 @@ pub fn run(
         return Err("Spot is a terminal node, nothing to solve".to_string());
     }
     if state.board.is_empty() || state.board.len() < 3 {
-        return Err("Spot must be at a postflop decision node (deal board cards first)".to_string());
+        return Err(
+            "Spot must be at a postflop decision node (deal board cards first)".to_string(),
+        );
     }
 
     // 3. Extract solving parameters from session
@@ -1094,13 +1320,22 @@ pub fn run(
     };
 
     // Parse board cards for rs_poker
-    let board_cards: Vec<poker_solver_core::poker::Card> = board.iter()
+    let board_cards: Vec<poker_solver_core::poker::Card> = board
+        .iter()
         .map(|s| parse_rs_poker_card(s))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Resolve boundary config
     let boundary_cut = resolve_street_boundary(&street_boundary_config, street);
     let depth_limit = boundary_cut.as_ref().map(|(d, _)| *d);
+    let oracle_boundary_active =
+        resolved_boundary_is_oracle(&street_boundary_config, street, oracle_boundary_flags);
+    if oracle_boundary_active && (gadget || gadget_clamp) {
+        return Err(
+            "exact_oracle boundary mode is incompatible with --gadget and --gadget-clamp"
+                .to_string(),
+        );
+    }
 
     // Print header (display values in BB = chips / 2)
     let pot_bb = pot as f64 / 2.0;
@@ -1113,6 +1348,9 @@ pub fn run(
         "iters: {iters}  boundary: {}",
         match &boundary_cut {
             Some((d, BoundaryKind::Cfvnet(p))) => format!("depth={d}, model={p}"),
+            Some((d, BoundaryKind::ExactSubtree)) if oracle_boundary_active => {
+                format!("depth={d}, exact_oracle")
+            }
             Some((d, BoundaryKind::ExactSubtree)) => format!("depth={d}, exact_subtree"),
             None => "all-exact".to_string(),
         }
@@ -1121,7 +1359,8 @@ pub fn run(
 
     // 4. Build exact game
     eprintln!("[compare] building exact game...");
-    let mut exact_game = build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, true, None)?;
+    let mut exact_game =
+        build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, true, None)?;
 
     let (mem_exact, _) = exact_game.memory_usage();
     if verbose {
@@ -1138,24 +1377,53 @@ pub fn run(
     let subgame_is_exact = boundary_cut.is_none();
     let current_node = session.node_idx();
     let gadget_tree_active = gadget && !subgame_is_exact;
+    let setup_boundary_cut = if oracle_boundary_active {
+        None
+    } else {
+        boundary_cut.clone()
+    };
     eprintln!("[compare] building subgame game...");
     let mut subgame_game = if gadget_tree_active {
         build_gadget_tree_game(
-            &board, &oop_w, &ip_w, pot, eff_stack, bet_sizes,
-            depth_limit, &ctx, current_node, &board_cards,
-            &boundary_cut, gadget_provider, gadget_constant,
-            iters, 3.0,
+            &board,
+            &oop_w,
+            &ip_w,
+            pot,
+            eff_stack,
+            bet_sizes,
+            depth_limit,
+            &ctx,
+            current_node,
+            &board_cards,
+            &setup_boundary_cut,
+            gadget_provider,
+            gadget_constant,
+            iters,
+            3.0,
         )?
     } else {
         let mut game = build_solve_game(
-            &board, &oop_w, &ip_w, pot, eff_stack,
-            bet_sizes, subgame_is_exact, depth_limit,
+            &board,
+            &oop_w,
+            &ip_w,
+            pot,
+            eff_stack,
+            bet_sizes,
+            subgame_is_exact,
+            depth_limit,
         )?;
         // Wire legacy clamp path if --gadget-clamp
         setup_clamp_boundaries(
-            &mut game, gadget_clamp, gadget_provider, gadget_constant,
-            &board_cards, &ctx, current_node, &boundary_cut,
-            iters, 3.0,
+            &mut game,
+            gadget_clamp,
+            gadget_provider,
+            gadget_constant,
+            &board_cards,
+            &ctx,
+            current_node,
+            &setup_boundary_cut,
+            iters,
+            3.0,
         )?;
         game
     };
@@ -1175,12 +1443,24 @@ pub fn run(
     let seed_street = street;
     let subgame_seed_start = if gadget_tree_active { 4 } else { 0 };
     seed_solver_with_blueprint(
-        &exact_game, &ctx.strategy, &ctx.all_buckets, &ctx.abstract_tree,
-        &board_cards, seed_street, current_node, 0,
+        &exact_game,
+        &ctx.strategy,
+        &ctx.all_buckets,
+        &ctx.abstract_tree,
+        &board_cards,
+        seed_street,
+        current_node,
+        0,
     );
     seed_solver_with_blueprint(
-        &subgame_game, &ctx.strategy, &ctx.all_buckets, &ctx.abstract_tree,
-        &board_cards, seed_street, current_node, subgame_seed_start,
+        &subgame_game,
+        &ctx.strategy,
+        &ctx.all_buckets,
+        &ctx.abstract_tree,
+        &board_cards,
+        seed_street,
+        current_node,
+        subgame_seed_start,
     );
 
     let _ = dump_boundary_cfvs;
@@ -1215,19 +1495,27 @@ pub fn run(
 
     // 8. Solve exact
     eprintln!("[compare] solving exact ({iters} iters)...");
-    let (exact_wall, exact_exp) = run_dcfr_solve(
-        &mut exact_game, iters, "exact", verbose, None, None,
-    );
+    let (exact_wall, exact_exp) =
+        run_dcfr_solve(&mut exact_game, iters, "exact", verbose, None, None);
+    exact_game.back_to_root();
+    let exact_game = Arc::new(exact_game);
+
+    if oracle_boundary_active {
+        setup_oracle_boundaries(&mut subgame_game, Arc::clone(&exact_game))?;
+    }
 
     // 9. Solve subgame (with optional tracer)
     eprintln!("[compare] solving subgame ({iters} iters)...");
     let (subgame_wall, subgame_exp) = run_dcfr_solve(
-        &mut subgame_game, iters, "subgame", verbose, tracer.as_ref(),
+        &mut subgame_game,
+        iters,
+        "subgame",
+        verbose,
+        tracer.as_ref(),
         spot_paths.as_deref(),
     );
 
     // 10. Extract strategies at root
-    exact_game.back_to_root();
     subgame_game.back_to_root();
 
     let exact_player = exact_game.current_player();
@@ -1245,12 +1533,14 @@ pub fn run(
     if exact_actions.len() != subgame_actions.len() {
         return Err(format!(
             "Action count mismatch: exact={} subgame={}",
-            exact_actions.len(), subgame_actions.len()
+            exact_actions.len(),
+            subgame_actions.len()
         ));
     }
 
     // 11. Run diff helpers
-    let (mean_mass, max_mass, max_idx) = compute_mass_moved(&exact_strat, &subgame_strat, num_hands, num_actions);
+    let (mean_mass, max_mass, max_idx) =
+        compute_mass_moved(&exact_strat, &subgame_strat, num_hands, num_actions);
 
     let action_labels: Vec<String> = exact_actions.iter().map(format_action_label).collect();
     let bias = compute_action_bias(&exact_strat, &subgame_strat, num_hands, &action_labels);
@@ -1307,7 +1597,11 @@ pub fn run(
     println!(
         "exploitability delta: hybrid {:+.2} mbb/hand ({})",
         exp_delta_mbb,
-        if exp_delta_mbb > 0.0 { "worse" } else { "better" }
+        if exp_delta_mbb > 0.0 {
+            "worse"
+        } else {
+            "better"
+        }
     );
     println!();
 
@@ -1321,10 +1615,14 @@ pub fn run(
             format!("#{h_idx}")
         };
 
-        let exact_str: Vec<String> = exact_probs.iter().zip(&action_short)
+        let exact_str: Vec<String> = exact_probs
+            .iter()
+            .zip(&action_short)
             .map(|(p, a)| format!("{a}:{p:.2}"))
             .collect();
-        let subgame_str: Vec<String> = subgame_probs.iter().zip(&action_short)
+        let subgame_str: Vec<String> = subgame_probs
+            .iter()
+            .zip(&action_short)
             .map(|(p, a)| format!("{a}:{p:.2}"))
             .collect();
 
@@ -1342,23 +1640,19 @@ pub fn run(
     // reach-weighted per-class aggregate (the same quantity the UI shows) to
     // stay consistent with what humans will inspect.
     if tolerance > 0.0 {
-        let agg_exact =
-            aggregate_by_class(&exact_strat, private_cards, num_hands, num_actions);
-        let agg_sub =
-            aggregate_by_class(&subgame_strat, private_cards, num_hands, num_actions);
+        let agg_exact = aggregate_by_class(&exact_strat, private_cards, num_hands, num_actions);
+        let agg_sub = aggregate_by_class(&subgame_strat, private_cards, num_hands, num_actions);
         let mut worst: Option<(String, String, f32, f32, f32)> = None; // class, action, e, s, |Δ|
         for (class, e_probs) in &agg_exact {
-            let Some(s_probs) = agg_sub.get(class) else { continue };
+            let Some(s_probs) = agg_sub.get(class) else {
+                continue;
+            };
             for a in 0..num_actions {
                 let e = e_probs[a];
                 let s = s_probs[a];
                 let d = (e - s).abs();
                 if worst.as_ref().map_or(true, |w| d > w.4) {
-                    worst = Some((
-                        class.clone(),
-                        action_labels[a].clone(),
-                        e, s, d,
-                    ));
+                    worst = Some((class.clone(), action_labels[a].clone(), e, s, d));
                 }
             }
         }
@@ -1440,6 +1734,81 @@ fn canonical_hand_name(c1: u8, c2: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
+    use range_solver::bet_size::BetSizeOptions;
+    use range_solver::card::{CardConfig, flop_from_str};
+
+    fn make_depth_limited_flop_game() -> PostFlopGame {
+        let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: range_solver::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: range_solver::card::NOT_DEALT,
+            river: range_solver::card::NOT_DEALT,
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 100,
+            effective_stack: 200,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes],
+            depth_limit: Some(1),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+        game
+    }
+
+    #[test]
+    fn boundary_play_histories_encode_player_indices_and_chance_cards() {
+        let game = make_depth_limited_flop_game();
+        let histories = build_boundary_play_histories(&game);
+        assert_eq!(histories.len(), game.num_boundary_nodes());
+        assert!(!histories.is_empty());
+
+        let root_actions = game.child_indices(0).len();
+        let has_player_action = histories
+            .iter()
+            .any(|h| h.first().is_some_and(|&a| a < root_actions));
+        let boards = game.boundary_boards();
+        let has_chance_card = histories.iter().zip(boards.iter()).any(|(history, board)| {
+            board
+                .get(3)
+                .is_some_and(|card| history.contains(&(*card as usize)))
+        });
+        assert!(
+            has_player_action,
+            "expected at least one root player action index"
+        );
+        assert!(
+            has_chance_card,
+            "expected at least one chance card id in histories"
+        );
+    }
+
+    #[test]
+    fn resolved_boundary_is_oracle_tracks_first_non_exact_boundary() {
+        let cfg = StreetBoundaryConfig {
+            flop: StreetBoundaryMode::Exact,
+            turn: StreetBoundaryMode::Exact,
+            river: StreetBoundaryMode::ExactSubtree,
+        };
+        assert!(resolved_boundary_is_oracle(
+            &cfg,
+            Street::Flop,
+            [false, false, true]
+        ));
+        assert!(!resolved_boundary_is_oracle(
+            &cfg,
+            Street::Flop,
+            [false, false, false]
+        ));
+    }
 
     // ---------------------------------------------------------------
     // compute_mass_moved tests
@@ -1521,13 +1890,22 @@ mod tests {
         assert!((bias[0].1 - 0.6).abs() < 1e-6, "fold delta={}", bias[0].1);
         assert_eq!(bias[0].0, "Fold");
         // Call delta: 1.5 - 2.1 = -0.6
-        assert!((bias[1].1 - (-0.6)).abs() < 1e-6, "call delta={}", bias[1].1);
+        assert!(
+            (bias[1].1 - (-0.6)).abs() < 1e-6,
+            "call delta={}",
+            bias[1].1
+        );
         assert_eq!(bias[1].0, "Call");
     }
 
     #[test]
     fn action_bias_classifies_bet_labels() {
-        let labels = vec!["Fold".to_string(), "Check".to_string(), "4bb".to_string(), "All-in".to_string()];
+        let labels = vec![
+            "Fold".to_string(),
+            "Check".to_string(),
+            "4bb".to_string(),
+            "All-in".to_string(),
+        ];
         let strat = vec![0.25f32; 8]; // 4 actions, 2 hands, all uniform
         let bias = compute_action_bias(&strat, &strat, 2, &labels);
         assert_eq!(bias[0].0, "Fold");
@@ -1752,7 +2130,11 @@ mod tests {
     #[test]
     fn check_out_of_range_flags_large_cfvs() {
         let stats = BoundaryCfvStats {
-            min: -5.0, max: 2000.0, mean: 100.0, stddev: 500.0, count_nonzero: 10,
+            min: -5.0,
+            max: 2000.0,
+            mean: 100.0,
+            stddev: 500.0,
+            count_nonzero: 10,
         };
         let warnings = check_cfv_out_of_range(&stats, 200.0);
         assert_eq!(warnings.len(), 1);
@@ -1762,7 +2144,11 @@ mod tests {
     #[test]
     fn check_out_of_range_passes_normal_values() {
         let stats = BoundaryCfvStats {
-            min: -50.0, max: 80.0, mean: 10.0, stddev: 20.0, count_nonzero: 10,
+            min: -50.0,
+            max: 80.0,
+            mean: 10.0,
+            stddev: 20.0,
+            count_nonzero: 10,
         };
         let warnings = check_cfv_out_of_range(&stats, 200.0);
         assert!(warnings.is_empty());
@@ -1771,7 +2157,11 @@ mod tests {
     #[test]
     fn check_non_finite_flags_nan() {
         let stats = BoundaryCfvStats {
-            min: f32::NAN, max: 5.0, mean: f32::NAN, stddev: 1.0, count_nonzero: 5,
+            min: f32::NAN,
+            max: 5.0,
+            mean: f32::NAN,
+            stddev: 1.0,
+            count_nonzero: 5,
         };
         let warnings = check_cfv_non_finite(&stats);
         assert!(!warnings.is_empty());
@@ -1781,7 +2171,11 @@ mod tests {
     #[test]
     fn check_non_finite_flags_inf() {
         let stats = BoundaryCfvStats {
-            min: -1.0, max: f32::INFINITY, mean: 5.0, stddev: 1.0, count_nonzero: 5,
+            min: -1.0,
+            max: f32::INFINITY,
+            mean: 5.0,
+            stddev: 1.0,
+            count_nonzero: 5,
         };
         let warnings = check_cfv_non_finite(&stats);
         assert!(!warnings.is_empty());
@@ -1790,7 +2184,11 @@ mod tests {
     #[test]
     fn check_non_finite_passes_normal() {
         let stats = BoundaryCfvStats {
-            min: -10.0, max: 10.0, mean: 0.0, stddev: 5.0, count_nonzero: 10,
+            min: -10.0,
+            max: 10.0,
+            mean: 0.0,
+            stddev: 5.0,
+            count_nonzero: 10,
         };
         let warnings = check_cfv_non_finite(&stats);
         assert!(warnings.is_empty());
@@ -1800,10 +2198,18 @@ mod tests {
     fn check_unit_mismatch_flags_large_ratio() {
         // One boundary has mean magnitude ~0.001, another ~1000
         let stats_a = BoundaryCfvStats {
-            min: -0.002, max: 0.002, mean: 0.001, stddev: 0.0005, count_nonzero: 10,
+            min: -0.002,
+            max: 0.002,
+            mean: 0.001,
+            stddev: 0.0005,
+            count_nonzero: 10,
         };
         let stats_b = BoundaryCfvStats {
-            min: -2000.0, max: 2000.0, mean: 1000.0, stddev: 500.0, count_nonzero: 10,
+            min: -2000.0,
+            max: 2000.0,
+            mean: 1000.0,
+            stddev: 500.0,
+            count_nonzero: 10,
         };
         let warnings = check_unit_mismatch(&[stats_a, stats_b]);
         assert!(!warnings.is_empty());
@@ -1813,10 +2219,18 @@ mod tests {
     #[test]
     fn check_unit_mismatch_passes_similar_scales() {
         let stats_a = BoundaryCfvStats {
-            min: -50.0, max: 50.0, mean: 10.0, stddev: 20.0, count_nonzero: 10,
+            min: -50.0,
+            max: 50.0,
+            mean: 10.0,
+            stddev: 20.0,
+            count_nonzero: 10,
         };
         let stats_b = BoundaryCfvStats {
-            min: -80.0, max: 80.0, mean: 15.0, stddev: 30.0, count_nonzero: 10,
+            min: -80.0,
+            max: 80.0,
+            mean: 15.0,
+            stddev: 30.0,
+            count_nonzero: 10,
         };
         let warnings = check_unit_mismatch(&[stats_a, stats_b]);
         assert!(warnings.is_empty());
@@ -1826,16 +2240,32 @@ mod tests {
     fn check_bias_divergence_flags_extreme_ratio() {
         // Unbiased mean=1.0, Fold mean=1000.0 -> 1000x ratio
         let unbiased = BoundaryCfvStats {
-            min: 0.5, max: 1.5, mean: 1.0, stddev: 0.2, count_nonzero: 10,
+            min: 0.5,
+            max: 1.5,
+            mean: 1.0,
+            stddev: 0.2,
+            count_nonzero: 10,
         };
         let fold = BoundaryCfvStats {
-            min: 500.0, max: 1500.0, mean: 1000.0, stddev: 200.0, count_nonzero: 10,
+            min: 500.0,
+            max: 1500.0,
+            mean: 1000.0,
+            stddev: 200.0,
+            count_nonzero: 10,
         };
         let call = BoundaryCfvStats {
-            min: 0.4, max: 1.6, mean: 1.1, stddev: 0.3, count_nonzero: 10,
+            min: 0.4,
+            max: 1.6,
+            mean: 1.1,
+            stddev: 0.3,
+            count_nonzero: 10,
         };
         let raise = BoundaryCfvStats {
-            min: 0.3, max: 1.7, mean: 0.9, stddev: 0.25, count_nonzero: 10,
+            min: 0.3,
+            max: 1.7,
+            mean: 0.9,
+            stddev: 0.25,
+            count_nonzero: 10,
         };
         let bias_names = ["Unbiased", "Fold", "Call", "Raise"];
         let all = [&unbiased, &fold, &call, &raise];
@@ -1847,16 +2277,32 @@ mod tests {
     #[test]
     fn check_bias_divergence_passes_similar() {
         let unbiased = BoundaryCfvStats {
-            min: -10.0, max: 50.0, mean: 20.0, stddev: 15.0, count_nonzero: 10,
+            min: -10.0,
+            max: 50.0,
+            mean: 20.0,
+            stddev: 15.0,
+            count_nonzero: 10,
         };
         let fold = BoundaryCfvStats {
-            min: -15.0, max: 55.0, mean: 22.0, stddev: 16.0, count_nonzero: 10,
+            min: -15.0,
+            max: 55.0,
+            mean: 22.0,
+            stddev: 16.0,
+            count_nonzero: 10,
         };
         let call = BoundaryCfvStats {
-            min: -12.0, max: 48.0, mean: 18.0, stddev: 14.0, count_nonzero: 10,
+            min: -12.0,
+            max: 48.0,
+            mean: 18.0,
+            stddev: 14.0,
+            count_nonzero: 10,
         };
         let raise = BoundaryCfvStats {
-            min: -8.0, max: 52.0, mean: 21.0, stddev: 15.5, count_nonzero: 10,
+            min: -8.0,
+            max: 52.0,
+            mean: 21.0,
+            stddev: 15.5,
+            count_nonzero: 10,
         };
         let bias_names = ["Unbiased", "Fold", "Call", "Raise"];
         let all = [&unbiased, &fold, &call, &raise];

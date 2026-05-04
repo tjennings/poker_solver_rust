@@ -1,6 +1,7 @@
 use crate::interface::*;
 use crate::mutex_like::*;
 use crate::sliceop::*;
+use crate::{Action, PostFlopGame};
 use std::cell::Cell;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
@@ -251,10 +252,7 @@ pub(crate) fn normalized_strategy(strategy: &[f32], num_actions: usize) -> Vec<f
 
 /// Normalizes a compressed (u16) cumulative strategy.
 #[inline]
-pub(crate) fn normalized_strategy_compressed(
-    strategy: &[u16],
-    num_actions: usize,
-) -> Vec<f32> {
+pub(crate) fn normalized_strategy_compressed(strategy: &[u16], num_actions: usize) -> Vec<f32> {
     let mut normalized = Vec::with_capacity(strategy.len());
     let uninit = normalized.spare_capacity_mut();
 
@@ -305,11 +303,7 @@ fn normalized_strategy_into(buf: &mut Vec<f32>, strategy: &[f32], num_actions: u
 
 /// Normalizes a compressed (u16) cumulative strategy into `buf`, reusing its allocation.
 #[inline]
-fn normalized_strategy_compressed_into(
-    buf: &mut Vec<f32>,
-    strategy: &[u16],
-    num_actions: usize,
-) {
+fn normalized_strategy_compressed_into(buf: &mut Vec<f32>, strategy: &[u16], num_actions: usize) {
     buf.clear();
     buf.reserve(strategy.len());
     buf.extend(strategy.iter().map(|&s| s as f32));
@@ -419,11 +413,7 @@ pub fn root_cfvalues<T: Game>(game: &T, player: usize) -> Vec<f32> {
 /// actual cfreach at the boundary rather than the subtree game's initial
 /// weights.
 #[inline]
-pub fn root_cfvalues_with_reach<T: Game>(
-    game: &T,
-    player: usize,
-    opp_reach: &[f32],
-) -> Vec<f32> {
+pub fn root_cfvalues_with_reach<T: Game>(game: &T, player: usize, opp_reach: &[f32]) -> Vec<f32> {
     if !game.is_ready() && !game.is_solved() {
         panic!("Game is not ready");
     }
@@ -433,6 +423,61 @@ pub fn root_cfvalues_with_reach<T: Game>(
         &mut out.spare_capacity_mut()[..nh],
         game,
         &mut game.root(),
+        player,
+        opp_reach,
+        false,
+    );
+    // SAFETY: compute_cfvalue_recursive writes all nh elements.
+    unsafe { out.set_len(nh) };
+    out
+}
+
+/// Like [`root_cfvalues_with_reach`] but starts from a supplied
+/// `PostFlopGame::play` history instead of the root.
+///
+/// Player-action entries are child indices. Chance-node entries are dealt card
+/// IDs, matching [`PostFlopGame::play`] and [`PostFlopGame::apply_history`].
+#[inline]
+pub fn cfvalues_after_history_with_reach(
+    game: &PostFlopGame,
+    history: &[usize],
+    player: usize,
+    opp_reach: &[f32],
+) -> Vec<f32> {
+    if !game.is_ready() && !game.is_solved() {
+        panic!("Game is not ready");
+    }
+    let nh = game.num_private_hands(player);
+    let mut node_idx = 0usize;
+    for &action in history {
+        let node = game.node_at(node_idx);
+        let children = game.child_indices(node_idx);
+        let child_index = if node.is_chance() {
+            children
+                .iter()
+                .position(|&child_idx| {
+                    matches!(
+                        game.node_at(child_idx).prev_action(),
+                        Action::Chance(card) if card as usize == action
+                    )
+                })
+                .unwrap_or_else(|| panic!("Invalid chance action card {action}"))
+        } else {
+            if action >= node.num_actions() {
+                panic!("Invalid action index {action}");
+            }
+            action
+        };
+        drop(node);
+        node_idx = children[child_index];
+    }
+
+    let mut out = Vec::with_capacity(nh);
+    let mut node = game.node_at(node_idx);
+    compute_cfvalue_recursive(
+        &mut out.spare_capacity_mut()[..nh],
+        game,
+        &mut node,
         player,
         opp_reach,
         false,
@@ -669,8 +714,7 @@ fn compute_cfvalue_recursive<T: Game>(
             // SAFETY: All elements of result have been written above.
             let result = unsafe { &*(result as *const _ as *const [f32]) };
             if game.is_compression_enabled() {
-                let cfv_scale =
-                    encode_signed_slice(node.cfvalues_chance_compressed_mut(), result);
+                let cfv_scale = encode_signed_slice(node.cfvalues_chance_compressed_mut(), result);
                 node.set_cfvalue_chance_scale(cfv_scale);
             } else {
                 node.cfvalues_chance_mut().copy_from_slice(result);
@@ -708,11 +752,7 @@ fn compute_cfvalue_recursive<T: Game>(
                 num_actions,
             );
         } else {
-            normalized_strategy_into(
-                &mut scratch.strategy_buf,
-                node.strategy(),
-                num_actions,
-            );
+            normalized_strategy_into(&mut scratch.strategy_buf, node.strategy(), num_actions);
         }
 
         let locking = game.locking_strategy(node);
@@ -725,8 +765,7 @@ fn compute_cfvalue_recursive<T: Game>(
 
         if save_cfvalues {
             if game.is_compression_enabled() {
-                let cfv_scale =
-                    encode_signed_slice(node.cfvalues_compressed_mut(), &cfv_buf);
+                let cfv_scale = encode_signed_slice(node.cfvalues_compressed_mut(), &cfv_buf);
                 node.set_cfvalue_scale(cfv_scale);
             } else {
                 node.cfvalues_mut().copy_from_slice(&cfv_buf);
@@ -745,11 +784,7 @@ fn compute_cfvalue_recursive<T: Game>(
                 num_actions,
             );
         } else {
-            normalized_strategy_into(
-                &mut scratch.strategy_buf,
-                node.strategy(),
-                num_actions,
-            );
+            normalized_strategy_into(&mut scratch.strategy_buf, node.strategy(), num_actions);
         }
 
         let locking = game.locking_strategy(node);
@@ -960,11 +995,7 @@ fn compute_best_cfv_recursive<T: Game>(
                 num_actions,
             );
         } else {
-            normalized_strategy_into(
-                &mut scratch.strategy_buf,
-                node.strategy(),
-                num_actions,
-            );
+            normalized_strategy_into(&mut scratch.strategy_buf, node.strategy(), num_actions);
         }
 
         let locking = game.locking_strategy(node);
@@ -1010,6 +1041,49 @@ fn compute_best_cfv_recursive<T: Game>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action_tree::{ActionTree, BoardState, TreeConfig};
+    use crate::bet_size::BetSizeOptions;
+    use crate::card::{card_from_str, flop_from_str, CardConfig};
+
+    fn build_test_river_game() -> PostFlopGame {
+        let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 100,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+        game
+    }
+
+    #[test]
+    fn cfvalues_after_empty_history_matches_root_helper() {
+        let game = build_test_river_game();
+        for player in 0..2 {
+            let opp_reach = game.initial_weights(player ^ 1);
+            let root = root_cfvalues_with_reach(&game, player, opp_reach);
+            let after = cfvalues_after_history_with_reach(&game, &[], player, opp_reach);
+            assert_eq!(after.len(), root.len());
+            for (a, b) in after.iter().zip(root.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "player={player} after-history cfv {a} != root cfv {b}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_apply_swap() {

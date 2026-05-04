@@ -1,3 +1,4 @@
+mod bench_rollout;
 mod blueprint_tui;
 mod blueprint_tui_audit;
 mod blueprint_tui_audit_widget;
@@ -6,18 +7,17 @@ mod blueprint_tui_metrics;
 mod blueprint_tui_resolve;
 mod blueprint_tui_scenarios;
 mod blueprint_tui_widgets;
-mod bench_rollout;
 mod boundary_trace;
 mod compare_solve;
 mod inspect_spot;
-mod validate_rollout;
+#[allow(dead_code)]
+mod log_file;
 mod mp_tui;
 mod mp_tui_scenarios;
 mod mp_tui_widgets;
 #[allow(dead_code)]
-mod log_file;
-#[allow(dead_code)]
 mod validate_blueprint;
+mod validate_rollout;
 mod validation_spots;
 
 use std::error::Error;
@@ -370,7 +370,7 @@ enum Commands {
         #[arg(long)]
         dump_boundary_cfvs: bool,
 
-        /// Flop boundary mode: "exact" or "cfvnet"
+        /// Flop boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
         #[arg(long, default_value = "exact")]
         flop_boundary: String,
 
@@ -378,7 +378,7 @@ enum Commands {
         #[arg(long)]
         flop_model: Option<String>,
 
-        /// Turn boundary mode: "exact" or "cfvnet"
+        /// Turn boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
         #[arg(long, default_value = "exact")]
         turn_boundary: String,
 
@@ -386,7 +386,7 @@ enum Commands {
         #[arg(long)]
         turn_model: Option<String>,
 
-        /// River boundary mode: "exact" or "cfvnet"
+        /// River boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
         #[arg(long, default_value = "exact")]
         river_boundary: String,
 
@@ -472,7 +472,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 bp_config.clustering.turn.buckets,
                 bp_config.clustering.river.buckets,
             );
-            eprintln!("  Actions: preflop_depths={} flop_depths={} turn_depths={} river_depths={}",
+            eprintln!(
+                "  Actions: preflop_depths={} flop_depths={} turn_depths={} river_depths={}",
                 bp_config.action_abstraction.preflop.len(),
                 bp_config.action_abstraction.flop.len(),
                 bp_config.action_abstraction.turn.len(),
@@ -525,29 +526,35 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let audit_panel = resolved_audit.panel;
 
                 // Wire config reload trigger.
-                trainer.config_reload_trigger =
-                    Arc::clone(&metrics.config_reload_trigger);
+                trainer.config_reload_trigger = Arc::clone(&metrics.config_reload_trigger);
 
                 // Wire strategy refresh callback from trainer to TUI metrics.
                 let scenarios_node_indices: Vec<u32> =
                     scenarios.iter().map(|s| s.node_idx).collect();
-                trainer.scenario_ev_tracker.set_nodes(scenarios_node_indices.clone());
+                trainer
+                    .scenario_ev_tracker
+                    .set_nodes(scenarios_node_indices.clone());
                 trainer.scenario_node_indices = scenarios_node_indices;
                 trainer.strategy_refresh_interval_secs =
                     tui_config.telemetry.strategy_delta_interval_seconds;
 
                 let boards_for_refresh = Arc::clone(&shared_boards);
                 let metrics_for_refresh = Arc::clone(&metrics);
-                trainer.on_strategy_refresh =
-                    Some(Box::new(move |scenario_idx, node_idx, storage, tree, hand_evs| {
+                trainer.on_strategy_refresh = Some(Box::new(
+                    move |scenario_idx, node_idx, storage, tree, hand_evs| {
                         let boards = boards_for_refresh.read().unwrap();
                         if scenario_idx < boards.len() {
                             let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                                tree, storage, node_idx, &boards[scenario_idx], Some(hand_evs),
+                                tree,
+                                storage,
+                                node_idx,
+                                &boards[scenario_idx],
+                                Some(hand_evs),
                             );
                             metrics_for_refresh.update_scenario_grid(scenario_idx, grid);
                         }
-                    }));
+                    },
+                ));
 
                 let metrics_for_delta = Arc::clone(&metrics);
                 trainer.on_strategy_delta = Some(Box::new(move |delta| {
@@ -616,8 +623,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         for audit in audits.iter_mut() {
                             audit.tick(storage);
                         }
-                        let snapshots: Vec<_> =
-                            audits.iter().map(|a| a.snapshot()).collect();
+                        let snapshots: Vec<_> = audits.iter().map(|a| a.snapshot()).collect();
                         metrics_for_audit.update_regret_audits(snapshots);
                     }));
                 }
@@ -638,12 +644,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                         // Re-resolve scenarios.
                         let resolved = blueprint_tui_resolve::resolve_scenarios(
-                            tree, storage, &new_tui_config.scenarios,
+                            tree,
+                            storage,
+                            &new_tui_config.scenarios,
                         );
 
                         // Re-resolve audits.
                         let audits = blueprint_tui_resolve::resolve_audits(
-                            tree, storage, &new_tui_config.regret_audits, sparkline_window,
+                            tree,
+                            storage,
+                            &new_tui_config.regret_audits,
+                            sparkline_window,
                         );
 
                         // Swap shared data for callbacks.
@@ -666,14 +677,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 // Random scenario carousel.
                 if tui_config.random_scenario.enabled {
-                    trainer.random_scenario_hold_minutes =
-                        tui_config.random_scenario.hold_minutes;
+                    trainer.random_scenario_hold_minutes = tui_config.random_scenario.hold_minutes;
                     let metrics_for_random = Arc::clone(&metrics);
                     let pool = tui_config.random_scenario.pool.clone();
-                    trainer.on_random_scenario =
-                        Some(Box::new(move |storage, tree, hand_evs| {
-                            use rand::seq::IndexedRandom;
+                    trainer.on_random_scenario = Some(Box::new(move |storage, tree, hand_evs| {
                             use poker_solver_core::blueprint_v2::game_tree::GameNode;
+                        use rand::seq::IndexedRandom;
                             let mut rng = rand::rng();
 
                             let Some(street_label) = pool.choose(&mut rng) else {
@@ -707,8 +716,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             };
                             let node_hand_evs = &hand_evs[player];
 
-                            let board =
-                                blueprint_tui_scenarios::random_board(street, &mut rng);
+                        let board = blueprint_tui_scenarios::random_board(street, &mut rng);
                             let board_display = if board.is_empty() {
                                 String::new()
                             } else {
@@ -720,17 +728,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                             };
 
                             let grid = blueprint_tui_scenarios::extract_strategy_grid(
-                                tree, storage, node_idx, &board, Some(node_hand_evs),
+                            tree,
+                            storage,
+                            node_idx,
+                            &board,
+                            Some(node_hand_evs),
                             );
 
                             let name = blueprint_tui_scenarios::random_scenario_name(
-                                tree, node_idx, &board_display,
+                            tree,
+                            node_idx,
+                            &board_display,
                             );
 
                             let street_label_str = format!("{street:?}");
 
                             metrics_for_random.update_random_scenario(
-                                name, node_idx, grid, board_display, street_label_str,
+                            name,
+                            node_idx,
+                            grid,
+                            board_display,
+                            street_label_str,
                             );
                         }));
                 }
@@ -772,13 +790,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("  Output: {}", output.display());
                 eprintln!(
                     "  Buckets: flop={}, turn={}/flop, river={}/flop",
-                    bp_config.clustering.flop.buckets,
-                    pf_cfg.turn_buckets,
-                    pf_cfg.river_buckets,
+                    bp_config.clustering.flop.buckets, pf_cfg.turn_buckets, pf_cfg.river_buckets,
                 );
                 eprintln!();
 
-                let per_flop_config = poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig {
+                let per_flop_config =
+                    poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig {
                     flop_buckets: bp_config.clustering.flop.buckets,
                     turn_buckets: pf_cfg.turn_buckets,
                     river_buckets: pf_cfg.river_buckets,
@@ -801,10 +818,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 // Bars 2..N: one per active thread, showing current flop + phase
                 let thread_count = rayon::current_num_threads();
-                let bar_style = ProgressStyle::with_template("  {msg:>30} {bar:30.white/black} {pos}/{len} ETA {eta}")
+                let bar_style = ProgressStyle::with_template(
+                    "  {msg:>30} {bar:30.white/black} {pos}/{len} ETA {eta}",
+                )
                     .unwrap()
                     .progress_chars("##-");
-                let spinner_style = ProgressStyle::with_template("  {msg:>30} {spinner:.cyan} {elapsed_precise}")
+                let spinner_style =
+                    ProgressStyle::with_template("  {msg:>30} {spinner:.cyan} {elapsed_precise}")
                     .unwrap();
                 let thread_bars: Vec<ProgressBar> = (0..thread_count)
                     .map(|_| {
@@ -848,13 +868,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     // Parse "phase pos/total" from msg
                                     if let Some((phase, counts)) = msg.rsplit_once(' ') {
                                         if let Some((pos_s, total_s)) = counts.split_once('/') {
-                                            if let (Ok(pos), Ok(total)) = (pos_s.parse::<u64>(), total_s.parse::<u64>()) {
+                                            if let (Ok(pos), Ok(total)) =
+                                                (pos_s.parse::<u64>(), total_s.parse::<u64>())
+                                            {
                                                 let new_msg = format!("{stage} {phase}");
                                                 if total <= 1 {
                                                     // No meaningful progress — show spinner
                                                     bar.set_style(spinner_style_clone.clone());
                                                     bar.set_message(new_msg);
-                                                    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+                                                    bar.enable_steady_tick(
+                                                        std::time::Duration::from_millis(100),
+                                                    );
                                                 } else {
                                                     // Real progress bar
                                                     if bar.message() != new_msg {
@@ -881,7 +905,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for bar in &thread_bars {
                     bar.finish_and_clear();
                 }
-                eprintln!("Per-flop clustering complete. Files saved to {}", output.display());
+                eprintln!(
+                    "Per-flop clustering complete. Files saved to {}",
+                    output.display()
+                );
             } else {
                 eprintln!("Blueprint V2 Clustering Pipeline");
                 eprintln!("  Output: {}", output.display());
@@ -895,7 +922,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!();
 
                 if poker_solver_core::blueprint_v2::trainer::bucket_files_exist(&output) {
-                    eprintln!("Bucket files already exist in {}, skipping clustering", output.display());
+                    eprintln!(
+                        "Bucket files already exist in {}, skipping clustering",
+                        output.display()
+                    );
                 } else {
                     let mp = MultiProgress::new();
                     let street_bar = mp.add(ProgressBar::new(4));
@@ -908,7 +938,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                     let phase_bar = mp.add(ProgressBar::new(1000));
                     phase_bar.set_style(
-                        ProgressStyle::with_template("  {msg:>12} {bar:40.white/black} {pos}/{len}")
+                        ProgressStyle::with_template(
+                            "  {msg:>12} {bar:40.white/black} {pos}/{len}",
+                        )
                             .unwrap()
                             .progress_chars("##-"),
                     );
@@ -962,7 +994,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 cross_street_transition_matrix, sample_hands_for_bucket,
             };
 
-            let reports = poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_cluster_dir(&cluster_dir)?;
+            let reports =
+                poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_cluster_dir(
+                    &cluster_dir,
+                )?;
             if reports.is_empty() {
                 eprintln!("No .buckets files found in {}", cluster_dir.display());
             } else {
@@ -972,7 +1007,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if audit {
                 eprintln!("\nEquity audit ({audit_boards} sample boards per street)...");
-                let audit_reports = poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cluster_dir(
+                let audit_reports =
+                    poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cluster_dir(
                     &cluster_dir,
                     audit_boards,
                     42,
@@ -988,7 +1024,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     eprintln!("No river.buckets found in {}", cluster_dir.display());
                 } else {
                     let bf = BucketFile::load(&river_path)?;
-                    let report = poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cfvnet_buckets(
+                    let report =
+                        poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cfvnet_buckets(
                         cfvnet_dir,
                         &bf,
                         10,
@@ -1012,14 +1049,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             if transition_audit {
-                use poker_solver_core::blueprint_v2::cluster_diagnostics::audit_transition_consistency;
                 use poker_solver_core::blueprint_v2::centroid_file::CentroidFile;
+                use poker_solver_core::blueprint_v2::cluster_diagnostics::audit_transition_consistency;
                 let pairs = [("flop", "turn"), ("turn", "river")];
                 for (from_name, to_name) in &pairs {
                     let from_path = cluster_dir.join(format!("{from_name}.buckets"));
                     let to_path = cluster_dir.join(format!("{to_name}.buckets"));
                     if from_path.exists() && to_path.exists() {
-                        eprintln!("\nTransition consistency audit: {from_name} → {to_name} ({transition_audit_boards} sample boards)...");
+                        eprintln!(
+                            "\nTransition consistency audit: {from_name} → {to_name} ({transition_audit_boards} sample boards)..."
+                        );
                         let from_bf = BucketFile::load(&from_path)?;
                         let to_bf = BucketFile::load(&to_path)?;
                         // Load centroid file for the current (from) street if available.
@@ -1030,7 +1069,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                             None
                         };
                         let report = audit_transition_consistency(
-                            &from_bf, &to_bf, transition_audit_boards, 42,
+                            &from_bf,
+                            &to_bf,
+                            transition_audit_boards,
+                            42,
                             centroids.as_ref(),
                         );
                         eprintln!("{}", report.summary());
@@ -1041,14 +1083,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             let per_flop_marker = cluster_dir.join("flop_0000.buckets");
             if per_flop_marker.exists() {
                 eprintln!("\nPer-flop bucket files detected.");
-                let pf_report = poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_per_flop_dir(&cluster_dir, 10)?;
-                eprintln!("  Files: {}, sampled: {}", pf_report.total_flop_files, pf_report.sampled_files);
-                eprintln!("  Turn buckets: {}, River buckets: {}", pf_report.turn_bucket_count, pf_report.river_bucket_count);
-                eprintln!("  Avg turn cards: {:.1}, Avg rivers/turn: {:.1}", pf_report.avg_turn_cards, pf_report.avg_river_cards_per_turn);
+                let pf_report =
+                    poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_per_flop_dir(
+                        &cluster_dir,
+                        10,
+                    )?;
+                eprintln!(
+                    "  Files: {}, sampled: {}",
+                    pf_report.total_flop_files, pf_report.sampled_files
+                );
+                eprintln!(
+                    "  Turn buckets: {}, River buckets: {}",
+                    pf_report.turn_bucket_count, pf_report.river_bucket_count
+                );
+                eprintln!(
+                    "  Avg turn cards: {:.1}, Avg rivers/turn: {:.1}",
+                    pf_report.avg_turn_cards, pf_report.avg_river_cards_per_turn
+                );
 
                 if audit {
                     let pf_flop_samples = audit_boards.min(20);
-                    eprintln!("\nPer-flop equity audit ({} flop samples, 5 rivers/turn)...", pf_flop_samples);
+                    eprintln!(
+                        "\nPer-flop equity audit ({} flop samples, 5 rivers/turn)...",
+                        pf_flop_samples
+                    );
                     let pf_audit = poker_solver_core::blueprint_v2::cluster_diagnostics::audit_per_flop_equity(
                         &cluster_dir, pf_flop_samples, 5, 42,
                     )?;
@@ -1063,9 +1121,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if let Some(ref args) = sample_bucket {
                 let street_str = &args[0];
-                let bucket_id: u16 = args[1].parse().map_err(|e| {
-                    format!("invalid bucket id '{}': {e}", args[1])
-                })?;
+                let bucket_id: u16 = args[1]
+                    .parse()
+                    .map_err(|e| format!("invalid bucket id '{}': {e}", args[1]))?;
                 let path = cluster_dir.join(format!("{street_str}.buckets"));
                 if !path.exists() {
                     eprintln!("Bucket file not found: {}", path.display());
@@ -1090,7 +1148,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             use poker_solver_core::blueprint_v2::equity_cache::EquityDeltaCache;
 
             if output.exists() {
-                eprintln!("Cache already exists at {}, nothing to do", output.display());
+                eprintln!(
+                    "Cache already exists at {}, nothing to do",
+                    output.display()
+                );
                 return Ok(());
             }
 
@@ -1213,7 +1274,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             eprintln!("Blueprint Validation");
             eprintln!("  Blueprint: {}", blueprint.display());
-            eprintln!("  Spots file: {} ({} spots)", spots.display(), spots_file.spots.len());
+            eprintln!(
+                "  Spots file: {} ({} spots)",
+                spots.display(),
+                spots_file.spots.len()
+            );
             if let Some(ref dir) = cluster_dir {
                 eprintln!("  Cluster dir: {}", dir.display());
             }
@@ -1242,7 +1307,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         for (ai, action_name) in result.actions_display.iter().enumerate() {
                             let avg_freq: f32 = (0..result.num_hands)
                                 .map(|h| result.strategy[ai * result.num_hands + h])
-                                .sum::<f32>() / result.num_hands as f32;
+                                .sum::<f32>()
+                                / result.num_hands as f32;
                             eprintln!("      {action_name}: {:.1}%", avg_freq * 100.0);
                         }
                         results.push((spot.name.clone(), result));
@@ -1257,7 +1323,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Summary table
             if !results.is_empty() {
                 println!();
-                println!("{:<40} {:>6} {:>6} {:>12}", "Spot", "Hands", "Acts", "Exploit");
+                println!(
+                    "{:<40} {:>6} {:>6} {:>12}",
+                    "Spot", "Hands", "Acts", "Exploit"
+                );
                 println!("{}", "-".repeat(66));
                 for (name, r) in &results {
                     println!(
@@ -1310,8 +1379,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         Commands::InspectSpot { config, spot } => {
-            inspect_spot::run(&config, &spot)
-                .map_err(|e| -> Box<dyn Error> { e.into() })?;
+            inspect_spot::run(&config, &spot).map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
         Commands::BenchRollout {
             bundle,
@@ -1323,8 +1391,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             opponent_samples,
         } => {
             bench_rollout::run(
-                &bundle, duration_secs, &board, pot, stacks,
-                enumerate_depth, opponent_samples,
+                &bundle,
+                duration_secs,
+                &board,
+                pot,
+                stacks,
+                enumerate_depth,
+                opponent_samples,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -1339,8 +1412,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             opponent_samples,
         } => {
             validate_rollout::run(
-                &bundle, &board, pot, stacks, num_runs, pass_threshold,
-                enumerate_depth, opponent_samples,
+                &bundle,
+                &board,
+                pot,
+                stacks,
+                num_runs,
+                pass_threshold,
+                enumerate_depth,
+                opponent_samples,
             )
             .map_err(|e| -> Box<dyn Error> { e.into() })?;
         }
@@ -1366,23 +1445,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             gadget_provider,
             gadget_constant,
         } => {
-            let parse_mode = |mode: &str, model: Option<String>, street: &str|
+            let parse_mode =
+                |mode: &str,
+                 model: Option<String>,
+                 street: &str|
                 -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
                 match mode {
                     "exact" => Ok(poker_solver_tauri::StreetBoundaryMode::Exact),
                     "cfvnet" => {
                         let path = model.ok_or_else(|| {
-                            format!("--{street}-model is required when --{street}-boundary=cfvnet")
+                                format!(
+                                    "--{street}-model is required when --{street}-boundary=cfvnet"
+                                )
                         })?;
                         Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet { model_path: path })
                     }
                     "exact_subtree" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
+                        "exact_oracle" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
                     other => Err(format!(
                         "invalid --{street}-boundary value '{other}': \
-                         expected 'exact', 'cfvnet', or 'exact_subtree'"
-                    ).into()),
+                         expected 'exact', 'cfvnet', 'exact_subtree', or 'exact_oracle'"
+                        )
+                        .into()),
                 }
             };
+            let oracle_boundary_flags = [
+                flop_boundary == "exact_oracle",
+                turn_boundary == "exact_oracle",
+                river_boundary == "exact_oracle",
+            ];
             let sbc = poker_solver_tauri::StreetBoundaryConfig {
                 flop: parse_mode(&flop_boundary, flop_model, "flop")?,
                 turn: parse_mode(&turn_boundary, turn_model, "turn")?,
@@ -1401,6 +1492,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 verbose,
                 dump_boundary_cfvs,
                 sbc,
+                oracle_boundary_flags,
                 trace_config,
                 tolerance,
                 gadget,
@@ -1446,14 +1538,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
-    use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+    use poker_solver_core::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
     use poker_solver_core::blueprint_v2::game_tree::GameTree;
     use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 
-    let yaml = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
-    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("Failed to parse config: {e}"))?;
+    let yaml =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig =
+        serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to parse config: {e}"))?;
 
     // Create output directory if needed
     std::fs::create_dir_all(&rebel_config.output_dir)
@@ -1468,7 +1560,12 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     // Load bucket files from cluster directory
     eprintln!("Loading bucket files from {}...", rebel_config.cluster_dir);
     let cluster_dir = std::path::Path::new(&rebel_config.cluster_dir);
-    let bucket_names = ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"];
+    let bucket_names = [
+        "preflop.buckets",
+        "flop.buckets",
+        "turn.buckets",
+        "river.buckets",
+    ];
     let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
     for (i, name) in bucket_names.iter().enumerate() {
         let path = cluster_dir.join(name);
@@ -1477,7 +1574,10 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
                 Ok(bf) => {
                     eprintln!(
                         "  Loaded {}: {} boards, {} combos/board, {} buckets",
-                        name, bf.header.board_count, bf.header.combos_per_board, bf.header.bucket_count,
+                        name,
+                        bf.header.board_count,
+                        bf.header.combos_per_board,
+                        bf.header.bucket_count,
                     );
                     bucket_files[i] = Some(bf);
                 }
@@ -1498,7 +1598,10 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let buckets = {
         let per_flop_marker = cluster_dir.join("flop_0000.buckets");
         if per_flop_marker.exists() {
-            eprintln!("  Detected per-flop bucket files in {}", cluster_dir.display());
+            eprintln!(
+                "  Detected per-flop bucket files in {}",
+                cluster_dir.display()
+            );
             buckets.with_per_flop_dir(cluster_dir.to_path_buf())
         } else {
             buckets
@@ -1507,7 +1610,10 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
 
     // Build game tree from blueprint config
     let bp_config_path = std::path::Path::new(&rebel_config.blueprint_path).join("config.yaml");
-    eprintln!("Loading blueprint config from {}...", bp_config_path.display());
+    eprintln!(
+        "Loading blueprint config from {}...",
+        bp_config_path.display()
+    );
     let bp_config = load_config(std::path::Path::new(&rebel_config.blueprint_path))
         .map_err(|e| format!("Failed to load blueprint config: {e}"))?;
     let tree = GameTree::build(
@@ -1521,25 +1627,33 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     );
 
     // Open or create buffer
-    let buffer_path = std::path::Path::new(&rebel_config.output_dir)
-        .join(&rebel_config.buffer.path);
+    let buffer_path =
+        std::path::Path::new(&rebel_config.output_dir).join(&rebel_config.buffer.path);
     let buffer = if buffer_path.exists() {
-        let buf = rebel::data_buffer::DiskBuffer::open(&buffer_path, rebel_config.buffer.max_records)
+        let buf =
+            rebel::data_buffer::DiskBuffer::open(&buffer_path, rebel_config.buffer.max_records)
             .map_err(|e| format!("Failed to open buffer: {e}"))?;
-        eprintln!("Resuming from existing buffer: {} records at {}", buf.len(), buffer_path.display());
+        eprintln!(
+            "Resuming from existing buffer: {} records at {}",
+            buf.len(),
+            buffer_path.display()
+        );
         std::sync::Mutex::new(buf)
     } else {
         eprintln!("Creating buffer at {}...", buffer_path.display());
         std::sync::Mutex::new(
             rebel::data_buffer::DiskBuffer::create(&buffer_path, rebel_config.buffer.max_records)
-                .map_err(|e| format!("Failed to create buffer: {e}"))?
+                .map_err(|e| format!("Failed to create buffer: {e}"))?,
         )
     };
 
     // Skip PBS generation if buffer already has records
     let existing_count = buffer.lock().unwrap().len();
     if existing_count > 0 {
-        eprintln!("Buffer has {} existing records, skipping PBS generation", existing_count);
+        eprintln!(
+            "Buffer has {} existing records, skipping PBS generation",
+            existing_count
+        );
     } else {
         eprintln!(
             "Generating {} hands with {} threads...",
@@ -1569,14 +1683,10 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         None,
         rebel_config.seed.threads,
     );
-    eprintln!(
-        "Solved {}/{} records successfully",
-        solved, record_count
-    );
+    eprintln!("Solved {}/{} records successfully", solved, record_count);
 
     // --- Step 4: Export buffer → cfvnet training files ---
-    let export_path = std::path::Path::new(&rebel_config.output_dir)
-        .join("training_data.bin");
+    let export_path = std::path::Path::new(&rebel_config.output_dir).join("training_data.bin");
     eprintln!("Exporting training data to {}...", export_path.display());
     let exported = rebel::training::export_training_data(&buf, &export_path)
         .map_err(|e| format!("Failed to export training data: {e}"))?;
@@ -1599,14 +1709,14 @@ fn run_rebel_train(
     offline_only: bool,
 ) -> Result<(), Box<dyn Error>> {
     use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
-    use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+    use poker_solver_core::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
     use poker_solver_core::blueprint_v2::game_tree::GameTree;
     use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 
-    let yaml = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
-    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("Failed to parse config: {e}"))?;
+    let yaml =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig =
+        serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to parse config: {e}"))?;
 
     eprintln!("ReBeL Training Pipeline");
     eprintln!("  Blueprint: {}", rebel_config.blueprint_path);
@@ -1633,7 +1743,12 @@ fn run_rebel_train(
     // Load bucket files
     eprintln!("Loading bucket files from {}...", rebel_config.cluster_dir);
     let cluster_dir = std::path::Path::new(&rebel_config.cluster_dir);
-    let bucket_names = ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"];
+    let bucket_names = [
+        "preflop.buckets",
+        "flop.buckets",
+        "turn.buckets",
+        "river.buckets",
+    ];
     let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
     for (i, name) in bucket_names.iter().enumerate() {
         let path = cluster_dir.join(name);
@@ -1642,7 +1757,10 @@ fn run_rebel_train(
                 Ok(bf) => {
                     eprintln!(
                         "  Loaded {}: {} boards, {} combos/board, {} buckets",
-                        name, bf.header.board_count, bf.header.combos_per_board, bf.header.bucket_count,
+                        name,
+                        bf.header.board_count,
+                        bf.header.combos_per_board,
+                        bf.header.bucket_count,
                     );
                     bucket_files[i] = Some(bf);
                 }
@@ -1663,7 +1781,10 @@ fn run_rebel_train(
     let buckets = {
         let per_flop_marker = cluster_dir.join("flop_0000.buckets");
         if per_flop_marker.exists() {
-            eprintln!("  Detected per-flop bucket files in {}", cluster_dir.display());
+            eprintln!(
+                "  Detected per-flop bucket files in {}",
+                cluster_dir.display()
+            );
             buckets.with_per_flop_dir(cluster_dir.to_path_buf())
         } else {
             buckets
@@ -1672,7 +1793,10 @@ fn run_rebel_train(
 
     // Build game tree from blueprint config
     let bp_config_path = std::path::Path::new(&rebel_config.blueprint_path).join("config.yaml");
-    eprintln!("Loading blueprint config from {}...", bp_config_path.display());
+    eprintln!(
+        "Loading blueprint config from {}...",
+        bp_config_path.display()
+    );
     let bp_config = load_config(std::path::Path::new(&rebel_config.blueprint_path))
         .map_err(|e| format!("Failed to load blueprint config: {e}"))?;
     let tree = GameTree::build(
@@ -1691,9 +1815,8 @@ fn run_rebel_train(
         std::path::PathBuf::from(model_path)
     } else {
         eprintln!("\n--- Phase 1: Offline Seeding ---");
-        let result = rebel::orchestration::run_offline_seeding(
-            &rebel_config, &strategy, &tree, &buckets,
-        )?;
+        let result =
+            rebel::orchestration::run_offline_seeding(&rebel_config, &strategy, &tree, &buckets)?;
         eprintln!(
             "\nOffline seeding complete: {} total records, model at {}",
             result.total_records,
@@ -1722,9 +1845,9 @@ fn run_rebel_train(
         use burn::module::Module;
         use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
         use cfvnet::model::network::CfvNet;
-        use rebel::inference_server::{spawn_inference_server, InferenceServerConfig};
+        use rebel::inference_server::{InferenceServerConfig, spawn_inference_server};
         use rebel::replay_buffer::ReplayBuffer;
-        use rebel::self_play::{self_play_training_loop, SelfPlayConfig};
+        use rebel::self_play::{SelfPlayConfig, self_play_training_loop};
 
         type TrainBackend = Autodiff<Wgpu>;
 
@@ -1740,9 +1863,8 @@ fn run_rebel_train(
         );
 
         // Load weights from checkpoint if available
-        let recorder = burn::record::NamedMpkGzFileRecorder::<
-            burn::record::FullPrecisionSettings,
-        >::new();
+        let recorder =
+            burn::record::NamedMpkGzFileRecorder::<burn::record::FullPrecisionSettings>::new();
         let model_file = model_path.join("model");
         if model_file.with_extension("mpk.gz").exists() {
             match model.clone().load_file(&model_file, &recorder, &device) {
@@ -1755,7 +1877,10 @@ fn run_rebel_train(
                 }
             }
         } else {
-            eprintln!("  No checkpoint found at {}, using random init", model_file.display());
+            eprintln!(
+                "  No checkpoint found at {}, using random init",
+                model_file.display()
+            );
         }
         eprintln!(
             "  CfvNet: {} layers x {} hidden",
@@ -1763,9 +1888,7 @@ fn run_rebel_train(
         );
 
         // Create replay buffer.
-        let replay_buffer = Arc::new(ReplayBuffer::new(
-            rebel_config.inference.replay_capacity,
-        ));
+        let replay_buffer = Arc::new(ReplayBuffer::new(rebel_config.inference.replay_capacity));
 
         // Spawn inference server.
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1785,8 +1908,10 @@ fn run_rebel_train(
             Arc::clone(&replay_buffer),
             Arc::clone(&shutdown),
         );
-        eprintln!("  Inference server spawned (batch_size={}, timeout={}us)",
-            rebel_config.inference.batch_size, rebel_config.inference.batch_timeout_us);
+        eprintln!(
+            "  Inference server spawned (batch_size={}, timeout={}us)",
+            rebel_config.inference.batch_size, rebel_config.inference.batch_timeout_us
+        );
 
         // Build SolveConfig and SelfPlayConfig.
         let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
@@ -1814,7 +1939,9 @@ fn run_rebel_train(
 
         // Shutdown inference server.
         shutdown.store(true, Ordering::Relaxed);
-        server_thread.join().expect("inference server thread panicked");
+        server_thread
+            .join()
+            .expect("inference server thread panicked");
         eprintln!("Self-play complete: {total} examples generated");
     }
 
@@ -1831,10 +1958,10 @@ fn run_rebel_eval(
     mode: &str,
     num_hands: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let yaml = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
-    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("Failed to parse config: {e}"))?;
+    let yaml =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig =
+        serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to parse config: {e}"))?;
 
     eprintln!("ReBeL Evaluation");
     eprintln!("  Config: {}", config_path.display());
@@ -1863,7 +1990,13 @@ fn run_rebel_eval(
             );
             eprintln!("Generated {} validation records", val_records.len());
 
-            eprintln!("  River records: {}", val_records.iter().filter(|r| r.board_card_count == 5).count());
+            eprintln!(
+                "  River records: {}",
+                val_records
+                    .iter()
+                    .filter(|r| r.board_card_count == 5)
+                    .count()
+            );
 
             // Model MSE evaluation requires loading CfvNet — not yet wired.
             eprintln!();
@@ -1871,7 +2004,10 @@ fn run_rebel_eval(
                 "Model MSE evaluation requires loading CfvNet ({} layers x {} units) — not yet wired.",
                 rebel_config.training.hidden_layers, rebel_config.training.hidden_size
             );
-            eprintln!("Validation set generated with {} records.", val_records.len());
+            eprintln!(
+                "Validation set generated with {} records.",
+                val_records.len()
+            );
         }
         "h2h" => {
             eprintln!("Head-to-head evaluation: {} hands", num_hands);
@@ -1895,10 +2031,10 @@ fn run_rebel_validate(
     num_examples: usize,
     output: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let yaml = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
-    let rebel_config: rebel::config::RebelConfig = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("Failed to parse config: {e}"))?;
+    let yaml =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
+    let rebel_config: rebel::config::RebelConfig =
+        serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to parse config: {e}"))?;
 
     eprintln!("ReBeL Validation Set Generator");
     eprintln!("  Config: {}", config_path.display());
@@ -1914,15 +2050,20 @@ fn run_rebel_validate(
 
     eprintln!("Generating validation set (seed={val_seed})...");
     let start = std::time::Instant::now();
-    let val_records = rebel::validation::generate_validation_set(
-        num_examples,
-        &solve_config,
-        val_seed,
-    );
+    let val_records =
+        rebel::validation::generate_validation_set(num_examples, &solve_config, val_seed);
     let elapsed = start.elapsed();
 
-    let river_count = val_records.iter().filter(|r| r.board_card_count == 5).count();
-    eprintln!("Generated {} records ({} river) in {:.1}s", val_records.len(), river_count, elapsed.as_secs_f64());
+    let river_count = val_records
+        .iter()
+        .filter(|r| r.board_card_count == 5)
+        .count();
+    eprintln!(
+        "Generated {} records ({} river) in {:.1}s",
+        val_records.len(),
+        river_count,
+        elapsed.as_secs_f64()
+    );
 
     // Save to output file using DiskBuffer
     let output_path = std::path::Path::new(output);
@@ -1936,7 +2077,8 @@ fn run_rebel_validate(
     let mut buf = rebel::data_buffer::DiskBuffer::create(output_path, val_records.len())
         .map_err(|e| format!("Failed to create output file: {e}"))?;
     for rec in &val_records {
-        buf.append(rec).map_err(|e| format!("Failed to write record: {e}"))?;
+        buf.append(rec)
+            .map_err(|e| format!("Failed to write record: {e}"))?;
     }
     eprintln!("Saved {} validation records to {output}", buf.len());
 
@@ -1966,9 +2108,9 @@ fn run_range_solve(
 ) -> Result<(), Box<dyn Error>> {
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, hole_to_string, CardConfig, NOT_DEALT};
+    use range_solver::card::{CardConfig, NOT_DEALT, card_from_str, flop_from_str, hole_to_string};
     use range_solver::range::Range;
-    use range_solver::{solve, PostFlopGame};
+    use range_solver::{PostFlopGame, solve};
 
     // --- Parse inputs ---
     let oop_range: Range = oop_range_str
@@ -2040,7 +2182,10 @@ fn run_range_solve(
         mem_uncompressed
     };
     eprintln!("Range Solver (Discounted CFR)");
-    eprintln!("  Board: {flop_str}{}", format_board_suffix(turn_str, river_str));
+    eprintln!(
+        "  Board: {flop_str}{}",
+        format_board_suffix(turn_str, river_str)
+    );
     eprintln!("  Initial state: {initial_state}");
     eprintln!("  Pot: {pot}, Effective stack: {effective_stack}");
     eprintln!(
@@ -2080,8 +2225,10 @@ fn run_range_solve(
     let num_hands = hands.len();
     let num_actions = actions.len();
 
-    println!("Root node: {} to act ({num_actions} actions, {num_hands} hands)",
-        if player == 0 { "OOP" } else { "IP" });
+    println!(
+        "Root node: {} to act ({num_actions} actions, {num_hands} hands)",
+        if player == 0 { "OOP" } else { "IP" }
+    );
     println!();
 
     // Print header
@@ -2127,7 +2274,7 @@ fn run_gpu_range_solve(
 ) -> Result<(), Box<dyn Error>> {
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, hole_to_string, CardConfig, NOT_DEALT};
+    use range_solver::card::{CardConfig, NOT_DEALT, card_from_str, flop_from_str, hole_to_string};
     use range_solver::range::Range;
 
     // --- Parse inputs ---
@@ -2194,7 +2341,10 @@ fn run_gpu_range_solve(
 
     // --- Print game info ---
     eprintln!("GPU Range Solver (Discounted CFR)");
-    eprintln!("  Board: {flop_str}{}", format_board_suffix(turn_str, river_str));
+    eprintln!(
+        "  Board: {flop_str}{}",
+        format_board_suffix(turn_str, river_str)
+    );
     eprintln!("  Initial state: {initial_state}");
     eprintln!("  Pot: {pot}, Effective stack: {effective_stack}");
     eprintln!(
@@ -2301,7 +2451,10 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
         run_mp_with_tui(&config, &tui_config)?;
     } else {
         let result = train_blueprint_mp(&config);
-        eprintln!("Training complete: {} meta-iterations", result.meta_iterations);
+        eprintln!(
+            "Training complete: {} meta-iterations",
+            result.meta_iterations
+        );
     }
     Ok(())
 }
@@ -2313,9 +2466,8 @@ fn run_mp_with_tui(
     use poker_solver_core::blueprint_mp::trainer::{run_training, setup_training};
 
     let ctx = setup_training(config);
-    let scenarios = resolve_tui_scenarios(
-        &ctx.tree, &tui_config.scenarios, config.game.num_players,
-    );
+    let scenarios =
+        resolve_tui_scenarios(&ctx.tree, &tui_config.scenarios, config.game.num_players);
     let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
         config.training.iterations,
         config.training.time_limit_minutes,
@@ -2325,23 +2477,28 @@ fn run_mp_with_tui(
     let storage = Arc::clone(&ctx.storage);
     let tree = Arc::clone(&ctx.tree);
     let scenario_node_ids: Vec<u32> = scenarios.iter().map(|s| s.node_idx).collect();
-    let tui_handle = spawn_mp_tui(
-        &metrics, scenarios, tui_config, config.game.num_players,
-    );
+    let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
     let train_config = config.clone();
-    let train_handle = std::thread::spawn(move || {
-        run_training(&ctx, &train_config.training, &train_config.game)
-    });
+    let train_handle =
+        std::thread::spawn(move || run_training(&ctx, &train_config.training, &train_config.game));
     bridge_mp_iterations(
-        &shared_iters, &storage, &tree, &scenario_node_ids,
-        &metrics, &quit_flag, &train_handle,
+        &shared_iters,
+        &storage,
+        &tree,
+        &scenario_node_ids,
+        &metrics,
+        &quit_flag,
+        &train_handle,
     );
     // Signal both the TUI and training thread to stop
     metrics.quit_requested.store(true, Ordering::Relaxed);
     quit_flag.store(true, Ordering::Relaxed);
     let result = train_handle.join().expect("training thread panicked");
     let _ = tui_handle.join();
-    eprintln!("Training complete: {} meta-iterations", result.meta_iterations);
+    eprintln!(
+        "Training complete: {} meta-iterations",
+        result.meta_iterations
+    );
     Ok(())
 }
 
@@ -2387,7 +2544,9 @@ fn bridge_mp_iterations<T>(
             last_telemetry = Instant::now();
         }
         if handle.is_finished() {
-            metrics.iterations.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+            metrics
+                .iterations
+                .store(source.load(Ordering::Relaxed), Ordering::Relaxed);
             break;
         }
         if metrics.quit_requested.load(Ordering::Relaxed) {
@@ -2414,7 +2573,11 @@ fn push_mp_telemetry(
     use poker_solver_core::blueprint_mp::trainer::{PRUNE_HITS, PRUNE_TOTAL};
     let hits = PRUNE_HITS.swap(0, Ordering::Relaxed);
     let total = PRUNE_TOTAL.swap(0, Ordering::Relaxed);
-    let prune_pct = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+    let prune_pct = if total > 0 {
+        hits as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
     metrics.push_prune_fraction(prune_pct);
     // Push strategy grids for each scenario
     for (idx, &node_idx) in scenario_node_ids.iter().enumerate() {
@@ -2435,7 +2598,8 @@ fn resolve_tui_scenarios(
     configs
         .iter()
         .filter_map(|sc| {
-            let (node_idx, _board) = mp_tui_scenarios::resolve_mp_spot(tree, &sc.spot, num_players)?;
+            let (node_idx, _board) =
+                mp_tui_scenarios::resolve_mp_spot(tree, &sc.spot, num_players)?;
             Some(mp_tui::ResolvedMpScenario {
                 name: sc.name.clone(),
                 node_idx,
@@ -2462,16 +2626,17 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
 #[cfg(test)]
 mod tests {
     use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
-    use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
     use poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig;
+    use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
     use test_macros::timed_test;
 
     /// The sample per_flop_200bkt.yaml must parse and have per_flop set.
     #[test]
     fn per_flop_sample_yaml_parses() {
-        let yaml = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/per_flop_200bkt.yaml"),
-        )
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/per_flop_200bkt.yaml"
+        ))
         .expect("sample per_flop_200bkt.yaml must exist");
         let cfg: BlueprintV2Config =
             serde_yaml::from_str(&yaml).expect("YAML must parse as BlueprintV2Config");
@@ -2487,12 +2652,12 @@ mod tests {
     /// PerFlopClusteringConfig can be constructed from a parsed config with per_flop.
     #[test]
     fn per_flop_config_construction_from_yaml() {
-        let yaml = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/per_flop_200bkt.yaml"),
-        )
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/per_flop_200bkt.yaml"
+        ))
         .expect("sample per_flop_200bkt.yaml must exist");
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(&yaml).expect("YAML must parse");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(&yaml).expect("YAML must parse");
 
         let pf = cfg.clustering.per_flop.as_ref().unwrap();
         let per_flop_config = PerFlopClusteringConfig {
@@ -2516,16 +2681,28 @@ mod tests {
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "gpu-range-solve",
-            "--oop-range", "AA",
-            "--ip-range", "KK",
-            "--flop", "Qs Jh 2c",
-            "--turn", "8d",
-            "--river", "3s",
-            "--pot", "100",
-            "--effective-stack", "100",
-            "--iterations", "100",
+            "--oop-range",
+            "AA",
+            "--ip-range",
+            "KK",
+            "--flop",
+            "Qs Jh 2c",
+            "--turn",
+            "8d",
+            "--river",
+            "3s",
+            "--pot",
+            "100",
+            "--effective-stack",
+            "100",
+            "--iterations",
+            "100",
         ]);
-        assert!(cli.is_ok(), "gpu-range-solve CLI must parse: {:?}", cli.err());
+        assert!(
+            cli.is_ok(),
+            "gpu-range-solve CLI must parse: {:?}",
+            cli.err()
+        );
     }
 
     /// run_gpu_range_solve constructs a game and solves it without error.
@@ -2547,18 +2724,22 @@ mod tests {
             "100%",
             "",
         );
-        assert!(result.is_ok(), "run_gpu_range_solve must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "run_gpu_range_solve must succeed: {:?}",
+            result.err()
+        );
     }
 
     /// A config without per_flop should have per_flop as None.
     #[test]
     fn standard_config_has_no_per_flop() {
-        let yaml = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/blueprint_v2_500bkt.yaml"),
-        )
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_v2_500bkt.yaml"
+        ))
         .expect("blueprint_v2_500bkt.yaml must exist");
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(&yaml).expect("YAML must parse");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(&yaml).expect("YAML must parse");
         assert!(
             cfg.clustering.per_flop.is_none(),
             "standard config should not have per_flop"
@@ -2568,9 +2749,10 @@ mod tests {
     /// The sample TUI config with regret_audits must parse and contain two audit entries.
     #[test]
     fn tui_sample_yaml_parses_regret_audits() {
-        let yaml = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../sample_configurations/blueprint_v2_with_tui.yaml"),
-        )
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_v2_with_tui.yaml"
+        ))
         .expect("blueprint_v2_with_tui.yaml must exist");
         let tui_cfg = crate::blueprint_tui_config::parse_tui_config(&yaml);
         assert_eq!(
@@ -2757,8 +2939,16 @@ snapshots:
             num_players: 6,
             stack_depth: 200.0,
             blinds: vec![
-                ForcedBet { seat: 4, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 5, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 4,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -2808,8 +2998,10 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/test",
-            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
         ]);
         assert!(cli.is_ok(), "default flags must parse: {:?}", cli.err());
 
@@ -2819,7 +3011,8 @@ snapshots:
             river_boundary,
             river_model,
             ..
-        } = cli.unwrap().command {
+        } = cli.unwrap().command
+        {
             assert_eq!(flop_boundary, "exact");
             assert_eq!(turn_boundary, "exact");
             assert_eq!(river_boundary, "exact");
@@ -2832,20 +3025,58 @@ snapshots:
         let cli2 = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/test",
-            "--spot", "sb:2bb,bb:call|Jd9d7d",
-            "--river-boundary", "cfvnet",
-            "--river-model", "/path/to/model.onnx",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
+            "--river-boundary",
+            "cfvnet",
+            "--river-model",
+            "/path/to/model.onnx",
         ]);
-        assert!(cli2.is_ok(), "river-cfvnet flags must parse: {:?}", cli2.err());
+        assert!(
+            cli2.is_ok(),
+            "river-cfvnet flags must parse: {:?}",
+            cli2.err()
+        );
 
         if let super::Commands::CompareSolve {
             river_boundary,
             river_model,
             ..
-        } = cli2.unwrap().command {
+        } = cli2.unwrap().command
+        {
             assert_eq!(river_boundary, "cfvnet");
             assert_eq!(river_model.as_deref(), Some("/path/to/model.onnx"));
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+
+        // River exact_oracle does not require a model path.
+        let cli3 = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
+            "--river-boundary",
+            "exact_oracle",
+        ]);
+        assert!(
+            cli3.is_ok(),
+            "river-exact-oracle flags must parse: {:?}",
+            cli3.err()
+        );
+
+        if let super::Commands::CompareSolve {
+            river_boundary,
+            river_model,
+            ..
+        } = cli3.unwrap().command
+        {
+            assert_eq!(river_boundary, "exact_oracle");
+            assert!(river_model.is_none());
         } else {
             panic!("expected CompareSolve variant");
         }
@@ -2860,11 +3091,16 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/test",
-            "--spot", "sb:2bb,bb:call|Jd9d7d",
-            "--trace-boundaries", "0,42,100",
-            "--trace-iters", "0,9",
-            "--trace-dir", "/tmp/traces",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
+            "--trace-boundaries",
+            "0,42,100",
+            "--trace-iters",
+            "0,9",
+            "--trace-dir",
+            "/tmp/traces",
         ]);
         assert!(cli.is_ok(), "trace flags must parse: {:?}", cli.err());
 
@@ -2873,7 +3109,8 @@ snapshots:
             trace_iters,
             trace_dir,
             ..
-        } = cli.unwrap().command {
+        } = cli.unwrap().command
+        {
             assert_eq!(trace_boundaries.as_deref(), Some("0,42,100"));
             assert_eq!(trace_iters, "0,9");
             assert_eq!(trace_dir, std::path::PathBuf::from("/tmp/traces"));
@@ -2885,8 +3122,10 @@ snapshots:
         let cli2 = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/test",
-            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
         ]);
         assert!(cli2.is_ok());
 
@@ -2895,7 +3134,8 @@ snapshots:
             trace_iters,
             trace_dir,
             ..
-        } = cli2.unwrap().command {
+        } = cli2.unwrap().command
+        {
             assert!(trace_boundaries.is_none());
             assert_eq!(trace_iters, "last");
             assert_eq!(trace_dir, std::path::PathBuf::from("./traces"));
@@ -2913,8 +3153,10 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/test",
-            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
         ]);
         assert!(cli.is_ok());
         if let super::Commands::CompareSolve { gadget, .. } = cli.unwrap().command {
@@ -2927,8 +3169,10 @@ snapshots:
         let cli2 = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/test",
-            "--spot", "sb:2bb,bb:call|Jd9d7d",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
             "--gadget",
         ]);
         assert!(cli2.is_ok());
@@ -2947,15 +3191,28 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/dummy",
-            "--spot", "any",
-            "--river-boundary", "cfvnet",
-            "--river-model", "/tmp/m",
+            "--bundle",
+            "/tmp/dummy",
+            "--spot",
+            "any",
+            "--river-boundary",
+            "cfvnet",
+            "--river-model",
+            "/tmp/m",
             "--gadget",
-            "--gadget-provider", "constant",
-            "--gadget-constant", "-0.5",
-        ]).expect("should parse");
-        if let super::Commands::CompareSolve { gadget, gadget_provider, gadget_constant, .. } = cli.command {
+            "--gadget-provider",
+            "constant",
+            "--gadget-constant",
+            "-0.5",
+        ])
+        .expect("should parse");
+        if let super::Commands::CompareSolve {
+            gadget,
+            gadget_provider,
+            gadget_constant,
+            ..
+        } = cli.command
+        {
             assert!(gadget);
             assert_eq!(gadget_provider, "constant");
             assert_eq!(gadget_constant, -0.5);
@@ -2972,11 +3229,20 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/dummy",
-            "--spot", "any",
+            "--bundle",
+            "/tmp/dummy",
+            "--spot",
+            "any",
             "--gadget",
-        ]).expect("should parse");
-        if let super::Commands::CompareSolve { gadget, gadget_provider, gadget_constant, .. } = cli.command {
+        ])
+        .expect("should parse");
+        if let super::Commands::CompareSolve {
+            gadget,
+            gadget_provider,
+            gadget_constant,
+            ..
+        } = cli.command
+        {
             assert!(gadget);
             assert_eq!(gadget_provider, "blueprint-cbv");
             assert_eq!(gadget_constant, 0.0);
@@ -2993,9 +3259,12 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/dummy",
-            "--spot", "any",
-        ]).expect("should parse");
+            "--bundle",
+            "/tmp/dummy",
+            "--spot",
+            "any",
+        ])
+        .expect("should parse");
         if let super::Commands::CompareSolve { gadget_clamp, .. } = cli.command {
             assert!(!gadget_clamp, "gadget_clamp should default to false");
         } else {
@@ -3011,12 +3280,18 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/dummy",
-            "--spot", "any",
+            "--bundle",
+            "/tmp/dummy",
+            "--spot",
+            "any",
             "--gadget-clamp",
-        ]).expect("should parse");
+        ])
+        .expect("should parse");
         if let super::Commands::CompareSolve { gadget_clamp, .. } = cli.command {
-            assert!(gadget_clamp, "gadget_clamp should be true when --gadget-clamp is passed");
+            assert!(
+                gadget_clamp,
+                "gadget_clamp should be true when --gadget-clamp is passed"
+            );
         } else {
             panic!("expected CompareSolve");
         }
@@ -3030,12 +3305,17 @@ snapshots:
         let result = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/dummy",
-            "--spot", "any",
+            "--bundle",
+            "/tmp/dummy",
+            "--spot",
+            "any",
             "--gadget",
             "--gadget-clamp",
         ]);
-        assert!(result.is_err(), "--gadget and --gadget-clamp should be mutually exclusive");
+        assert!(
+            result.is_err(),
+            "--gadget and --gadget-clamp should be mutually exclusive"
+        );
     }
 
     /// --gadget-clamp accepts --gadget-provider and --gadget-constant flags.
@@ -3046,15 +3326,25 @@ snapshots:
         let cli = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
-            "--bundle", "/tmp/dummy",
-            "--spot", "any",
+            "--bundle",
+            "/tmp/dummy",
+            "--spot",
+            "any",
             "--gadget-clamp",
-            "--gadget-provider", "constant",
-            "--gadget-constant", "-0.5",
-        ]).expect("should parse");
+            "--gadget-provider",
+            "constant",
+            "--gadget-constant",
+            "-0.5",
+        ])
+        .expect("should parse");
         if let super::Commands::CompareSolve {
-            gadget, gadget_clamp, gadget_provider, gadget_constant, ..
-        } = cli.command {
+            gadget,
+            gadget_clamp,
+            gadget_provider,
+            gadget_constant,
+            ..
+        } = cli.command
+        {
             assert!(!gadget);
             assert!(gadget_clamp);
             assert_eq!(gadget_provider, "constant");
@@ -3068,7 +3358,10 @@ snapshots:
     #[test]
     fn gadget_mode_label_returns_correct_modes() {
         assert_eq!(super::compare_solve::gadget_mode_label(true, false), "tree");
-        assert_eq!(super::compare_solve::gadget_mode_label(false, true), "clamp");
+        assert_eq!(
+            super::compare_solve::gadget_mode_label(false, true),
+            "clamp"
+        );
         assert_eq!(super::compare_solve::gadget_mode_label(false, false), "off");
     }
 }
