@@ -85,7 +85,13 @@ mod tests {
         let strategy = SolveStrategy::DepthLimited {
             evaluator: Arc::new(MockEvaluator),
         };
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let builder = GameBuilder::new(
+            vec![vec![
+                range_solver::bet_size::BetSize::PotRelative(0.5),
+                range_solver::bet_size::BetSize::PotRelative(1.0),
+            ]],
+            &strategy,
+        );
         let game = builder.build(&sit, &mut rng).expect("build");
         let eval = MockEvaluator;
         let results = eval.evaluate(&game);
@@ -103,7 +109,13 @@ mod tests {
         let strategy = SolveStrategy::DepthLimited {
             evaluator: Arc::new(MockEvaluator),
         };
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let builder = GameBuilder::new(
+            vec![vec![
+                range_solver::bet_size::BetSize::PotRelative(0.5),
+                range_solver::bet_size::BetSize::PotRelative(1.0),
+            ]],
+            &strategy,
+        );
         let game = builder.build(&sit, &mut rng).expect("build");
         let eval = MockEvaluator;
         let results = eval.evaluate(&game);
@@ -148,7 +160,13 @@ mod tests {
         let strategy = SolveStrategy::DepthLimited {
             evaluator: Arc::new(MockEvaluator),
         };
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let builder = GameBuilder::new(
+            vec![vec![
+                range_solver::bet_size::BetSize::PotRelative(0.5),
+                range_solver::bet_size::BetSize::PotRelative(1.0),
+            ]],
+            &strategy,
+        );
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let mut games = Vec::new();
         while games.len() < count {

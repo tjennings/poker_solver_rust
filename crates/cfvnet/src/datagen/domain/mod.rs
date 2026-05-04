@@ -52,7 +52,13 @@ mod tests {
         let datagen_config = DatagenConfig::default();
         let sit_gen = SituationGenerator::new(&datagen_config, 200, 4, 42, 5);
         let strategy = depth_limited_strategy();
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let builder = GameBuilder::new(
+            vec![vec![
+                range_solver::bet_size::BetSize::PotRelative(0.5),
+                range_solver::bet_size::BetSize::PotRelative(1.0),
+            ]],
+            &strategy,
+        );
 
         let mut total_records = 0;
         for sit in sit_gen {
@@ -100,7 +106,13 @@ mod tests {
         let datagen_config = DatagenConfig::default();
         let sit_gen = SituationGenerator::new(&datagen_config, 200, 4, 77, 3);
         let strategy = depth_limited_strategy();
-        let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+        let builder = GameBuilder::new(
+            vec![vec![
+                range_solver::bet_size::BetSize::PotRelative(0.5),
+                range_solver::bet_size::BetSize::PotRelative(1.0),
+            ]],
+            &strategy,
+        );
 
         let mut solved_count = 0;
         for sit in sit_gen {

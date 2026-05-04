@@ -1208,8 +1208,15 @@ mod tests {
     use super::*;
     use crate::config::{CfvnetConfig, DatagenConfig, GameConfig};
     use crate::datagen::storage::read_record;
+    #[cfg(feature = "gpu-turn-datagen")]
+    use range_solver::bet_size::BetSize;
     use std::io::BufReader;
     use tempfile::NamedTempFile;
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn pot(size: f64) -> BetSize {
+        BetSize::PotRelative(size)
+    }
 
     fn test_config(num_samples: u64, board_size: usize) -> CfvnetConfig {
         CfvnetConfig {
@@ -1622,12 +1629,10 @@ mod tests {
             use gpu_range_solver::{GpuBatchSolver, SubgameSpec};
 
             // Canonical turn bet sizes matching `turn_gpu_datagen.yaml`:
-            // [25%, 50%, 100%, allin] x [25%, 75%, allin]. `allin` becomes
-            // BetSize::AllIn at SPR=100; parse_bet_sizes_depth drops the 'a'
-            // token so we pass the numeric-only list here as production does.
-            let bet_sizes: Vec<Vec<f64>> = vec![
-                vec![0.25, 0.50, 1.00],
-                vec![0.25, 0.75],
+            // [25%, 50%, 100%, allin] x [25%, 75%, allin].
+            let bet_sizes: Vec<Vec<BetSize>> = vec![
+                vec![pot(0.25), pot(0.50), pot(1.00), BetSize::AllIn],
+                vec![pot(0.25), pot(0.75), BetSize::AllIn],
             ];
 
             let canonical_game =
@@ -1726,9 +1731,9 @@ mod tests {
                     .expect("load BoundaryNet");
 
             // Canonical turn bet sizes matching the smoke test above.
-            let bet_sizes: Vec<Vec<f64>> = vec![
-                vec![0.25, 0.50, 1.00],
-                vec![0.25, 0.75],
+            let bet_sizes: Vec<Vec<BetSize>> = vec![
+                vec![pot(0.25), pot(0.50), pot(1.00), BetSize::AllIn],
+                vec![pot(0.25), pot(0.75), BetSize::AllIn],
             ];
             let canonical_game =
                 crate::datagen::domain::game_tree::build_canonical_turn_tree(&bet_sizes)
@@ -1864,9 +1869,9 @@ mod tests {
             // Identical setup to layer_a_batched_matches_per_sit_within_tolerance:
             // canonical turn bet sizes, 4 deterministic sits with per-sit
             // perturbations so each produces distinct inputs.
-            let bet_sizes: Vec<Vec<f64>> = vec![
-                vec![0.25, 0.50, 1.00],
-                vec![0.25, 0.75],
+            let bet_sizes: Vec<Vec<BetSize>> = vec![
+                vec![pot(0.25), pot(0.50), pot(1.00), BetSize::AllIn],
+                vec![pot(0.25), pot(0.75), BetSize::AllIn],
             ];
             let canonical_game =
                 crate::datagen::domain::game_tree::build_canonical_turn_tree(&bet_sizes)

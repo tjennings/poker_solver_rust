@@ -174,7 +174,13 @@ mod tests {
             if sit.effective_stack <= 0 {
                 continue;
             }
-            let builder = GameBuilder::new(vec![vec![0.5, 1.0]], &strategy);
+            let builder = GameBuilder::new(
+                vec![vec![
+                    range_solver::bet_size::BetSize::PotRelative(0.5),
+                    range_solver::bet_size::BetSize::PotRelative(1.0),
+                ]],
+                &strategy,
+            );
             if let Some(game) = builder.build(&sit, &mut rng) {
                 return game;
             }

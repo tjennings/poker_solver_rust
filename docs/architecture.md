@@ -227,7 +227,7 @@ A neural network pipeline for learning river-street counterfactual values, enabl
 generate -> train -> evaluate -> compare
 ```
 
-1. **Generate** (`datagen`): Sample random river situations (board, pot, stack, ranges via DeepStack R(S,p)), solve each with range-solver DCFR, extract pot-relative CFVs for both players. Output: binary file of training records.
+1. **Generate** (`datagen`): Sample random river situations (board, pot, stack, ranges via DeepStack R(S,p)), solve each with range-solver DCFR, extract pot-relative CFVs for both players. Output: binary file of training records. Datagen bet sizes are parsed into typed range-solver sizes: pot-relative entries may be fuzzed per sample, while explicit `a` entries remain all-in actions. Nested `game.bet_sizes` use the first entry for opening bets and flatten later entries into the shared raise-size pool.
 
 2. **Train** (`model`): Train a 7-layer MLP (2720->500->...->1326) using Huber loss + auxiliary game-value consistency loss. Framework: burn (wgpu/ndarray backends).
 
