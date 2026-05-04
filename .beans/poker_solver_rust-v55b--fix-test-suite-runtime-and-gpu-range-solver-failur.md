@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-17T16:17:32Z
-updated_at: 2026-05-04T00:24:15Z
+updated_at: 2026-05-04T00:29:00Z
 ---
 
 Two issues blocking CLAUDE.md's <60s test-suite rule:
@@ -33,3 +33,7 @@ Split suggestion: a separate beans/PR fixes the `traverse_updates_strategy_sums`
 ## Progress 2026-05-04 Trainer Defaults
 
 Updated trainer default tests so the sample TUI assertion matches the checked-in 6-player ante config and the GPU range-solve runtime test is ignored unless CUDA/NVRTC libraries are available.
+
+## Progress 2026-05-04 Cfvnet Slow Tests
+
+Moved four slow cfvnet diagnostics behind explicit ignored-test runs: the exact turn pipeline solve plus three neural training convergence checks. These remain available with ignored tests while keeping the default cargo test gate focused on fast checks.

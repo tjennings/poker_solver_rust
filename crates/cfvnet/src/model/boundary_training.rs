@@ -761,6 +761,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow neural training convergence check"]
     fn boundary_training_reduces_loss() {
         let file = write_test_data(16);
         let device = Default::default();

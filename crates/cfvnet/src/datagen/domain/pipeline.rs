@@ -1244,6 +1244,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow exact turn pipeline solve"]
     fn pipeline_produces_records_for_turn_exact() {
         // Turn without a river model falls back to exact mode (full solve through river).
         range_solver::set_force_sequential(true);

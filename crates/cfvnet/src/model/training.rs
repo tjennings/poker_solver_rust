@@ -790,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow neural training convergence check"]
     fn overfit_single_batch() {
         let file = write_test_data(16);
 
@@ -932,6 +933,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow neural training convergence check"]
     fn training_reduces_loss() {
         let file = write_test_data(16);
         let device = Default::default();
