@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-17T16:17:32Z
-updated_at: 2026-05-04T00:19:04Z
+updated_at: 2026-05-04T00:21:23Z
 ---
 
 Two issues blocking CLAUDE.md's <60s test-suite rule:
@@ -27,3 +27,5 @@ Split suggestion: a separate beans/PR fixes the `traverse_updates_strategy_sums`
 ## Progress 2026-05-04\n\nFixed the hard non-CUDA failures by marking CUDA/NVRTC-dependent gpu-range-solver tests as ignored in the default suite while preserving CPU/source-shape tests. Fixed the pre-existing blueprint_mp strategy-sum failure by separating strategy probability fixed-point scaling from REGRET_SCALE. Remaining concern: full cargo test still exceeds the <60s target due to slow non-GPU integration/model tests.
 
 ## Progress 2026-05-04 Fast Gate\n\nMoved the slow convergence-harness end-to-end integration tests behind #[ignore = "slow end-to-end convergence harness pipeline"]. They remain runnable explicitly with ignored tests, but no longer dominate the default cargo test gate.
+
+## Progress 2026-05-04 MP Validation\n\nFixed the blueprint_mp validation failure by enabling AllBuckets equity fallback when multiplayer training is configured without a cluster_path, matching the existing sample configs and test-only training path.

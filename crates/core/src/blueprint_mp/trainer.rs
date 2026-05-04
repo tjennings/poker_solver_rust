@@ -58,7 +58,10 @@ pub fn setup_training(config: &BlueprintMpConfig) -> TrainContext {
         || [None, None, None, None],
         |path| load_bucket_files(std::path::Path::new(path)),
     );
-    let all_buckets = AllBuckets::new(bucket_counts, bucket_files);
+    let mut all_buckets = AllBuckets::new(bucket_counts, bucket_files);
+    if config.training.cluster_path.is_none() {
+        all_buckets.equity_fallback = true;
+    }
     TrainContext {
         tree: Arc::new(tree),
         storage: Arc::new(storage),
