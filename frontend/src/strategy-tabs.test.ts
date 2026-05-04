@@ -104,18 +104,15 @@ describe('buildSolveParams', () => {
     });
   });
 
-  it('builds cfvnet streetBoundaryConfig for turn with model path', () => {
+  it('throws for cfvnet turn boundary mode', () => {
     const config = {
       ...defaultConfig,
       turn_boundary_mode: 'cfvnet' as const,
       turn_model_path: '/models/turn_v1.onnx',
     };
-    const params = buildSolveParams('subgame', config);
-    expect(params.streetBoundaryConfig).toEqual({
-      flop: { mode: 'exact' },
-      turn: { mode: 'cfvnet', model_path: '/models/turn_v1.onnx' },
-      river: { mode: 'exact' },
-    });
+    expect(() => buildSolveParams('subgame', config)).toThrow(
+      'CFVNet boundary is only supported for river boundary mode',
+    );
   });
 
   it('throws if cfvnet mode has empty model_path', () => {
@@ -129,14 +126,14 @@ describe('buildSolveParams', () => {
     );
   });
 
-  it('throws if cfvnet mode has empty model_path for flop', () => {
+  it('throws for cfvnet flop boundary mode', () => {
     const config = {
       ...defaultConfig,
       flop_boundary_mode: 'cfvnet' as const,
-      flop_model_path: '',
+      flop_model_path: '/models/flop.onnx',
     };
     expect(() => buildSolveParams('subgame', config)).toThrow(
-      'Street boundary set to cfvnet but no model_path',
+      'CFVNet boundary is only supported for river boundary mode',
     );
   });
 

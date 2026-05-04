@@ -112,6 +112,21 @@ pub fn resolve_street_boundary(
     None // all exact
 }
 
+pub fn validate_cfvnet_boundary_cut(
+    boundary_cut: &Option<(u8, BoundaryKind)>,
+    root_street: Street,
+) -> Result<(), String> {
+    if matches!(boundary_cut, Some((0, BoundaryKind::Cfvnet(_)))) && root_street == Street::Flop {
+        return Err(
+            "CFVNet boundary from a flop solve would evaluate 3-card flop boards, \
+             but the ONNX evaluator supports only 4-card and 5-card boards. \
+             Use a river CFVNet boundary or Exact Subtree for earlier cuts."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 use crate::exploration::{
     board_for_street_slice, blueprint_sizes_to_range_solver, build_canonical_to_combo_map,
     canonical_hand_index_from_ranks, hand_label_from_matrix, parse_board, pot_at_v2_node,
@@ -2001,6 +2016,7 @@ pub fn game_solve_core(
     } else {
         resolve_street_boundary(&sbc, root_street)
     };
+    validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
 
     // Apply range clamping
     let clamp = range_clamp_threshold.unwrap_or(0.0) as f32;
@@ -4491,6 +4507,25 @@ mod tests {
         };
         let result = resolve_street_boundary(&config, Street::Flop);
         assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string()))));
+    }
+
+    #[test]
+    fn sbc_rejects_cfvnet_cut_that_would_use_flop_boards() {
+        let boundary_cut = Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string())));
+        let err = validate_cfvnet_boundary_cut(&boundary_cut, Street::Flop).unwrap_err();
+        assert!(err.contains("3-card flop boards"));
+    }
+
+    #[test]
+    fn sbc_allows_cfvnet_cut_with_turn_boundary_boards() {
+        let boundary_cut = Some((0, BoundaryKind::Cfvnet("/models/river.onnx".to_string())));
+        assert!(validate_cfvnet_boundary_cut(&boundary_cut, Street::Turn).is_ok());
+    }
+
+    #[test]
+    fn sbc_allows_exact_subtree_cut_from_flop_root() {
+        let boundary_cut = Some((0, BoundaryKind::ExactSubtree));
+        assert!(validate_cfvnet_boundary_cut(&boundary_cut, Street::Flop).is_ok());
     }
 
     #[test]

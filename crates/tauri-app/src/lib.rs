@@ -70,4 +70,5 @@ pub use game_session::{
     GameSession, GameSessionState, GameState, GameMatrix, GameMatrixCell, GameAction,
     SolveBoundaryEvaluator, build_solve_game, build_solve_game_parts,
     StreetBoundaryConfig, StreetBoundaryMode, BoundaryKind, resolve_street_boundary,
+    validate_cfvnet_boundary_cut,
 };

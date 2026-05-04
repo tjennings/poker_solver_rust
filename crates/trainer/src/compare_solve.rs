@@ -20,7 +20,7 @@ use poker_solver_tauri::postflop::CbvContext;
 use poker_solver_tauri::{
     BoundaryKind, GameSession, StreetBoundaryConfig, StreetBoundaryMode, build_solve_game,
     build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
-    seed_solver_with_blueprint,
+    seed_solver_with_blueprint, validate_cfvnet_boundary_cut,
 };
 
 use range_solver::card::card_to_string;
@@ -1863,6 +1863,7 @@ pub fn run(
 
     // Resolve boundary config
     let boundary_cut = resolve_street_boundary(&street_boundary_config, street);
+    validate_cfvnet_boundary_cut(&boundary_cut, street)?;
     let depth_limit = boundary_cut.as_ref().map(|(d, _)| *d);
     let oracle_boundary_active =
         resolved_boundary_is_oracle(&street_boundary_config, street, oracle_boundary_flags);

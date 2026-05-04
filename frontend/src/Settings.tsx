@@ -79,7 +79,7 @@ function BoundaryEvaluationSettings({
               title={disabled ? 'Earlier boundary cut takes precedence' : undefined}
             >
               <option value="exact">Exact</option>
-              <option value="cfvnet">CFVNet</option>
+              <option value="cfvnet" disabled={street !== 'river'}>CFVNet</option>
               <option value="exact_subtree">Exact Subtree</option>
             </select>
             {mode === 'cfvnet' && !disabled && (
@@ -120,7 +120,7 @@ function BoundaryEvaluationSettings({
         );
       })}
       <p style={{ fontSize: '0.7rem', color: '#555', marginTop: '0.5rem' }}>
-        Selecting CFVNet or Exact Subtree on a street cuts the solve at that street boundary. CFVNet uses an ONNX model for counterfactual values; Exact Subtree solves the downstream subtree exactly via DCFR. Earlier streets must be Exact.
+        Selecting CFVNet or Exact Subtree on a street cuts the solve at that street boundary. CFVNet uses an ONNX model for counterfactual values on supported turn/river board states; Exact Subtree solves the downstream subtree exactly via DCFR. Earlier streets must be Exact.
       </p>
       <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem', fontSize: '0.85rem', color: '#eee', cursor: hasAnyCut(config) ? 'pointer' : 'not-allowed' }}>
         <input

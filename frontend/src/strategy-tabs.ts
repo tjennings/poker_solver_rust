@@ -25,10 +25,14 @@ export interface SolveParams {
 }
 
 function modeFromConfig(
+  street: 'flop' | 'turn' | 'river',
   mode: 'exact' | 'cfvnet' | 'exact_subtree' | undefined,
   modelPath: string | undefined,
 ): StreetBoundaryMode {
   if (mode === 'cfvnet') {
+    if (street !== 'river') {
+      throw new Error('CFVNet boundary is only supported for river boundary mode');
+    }
     if (!modelPath) throw new Error('Street boundary set to cfvnet but no model_path');
     return { mode: 'cfvnet', model_path: modelPath };
   }
@@ -52,9 +56,9 @@ export function buildSolveParams(
     matrixSnapshotInterval: (config.matrix_snapshot_interval as number | undefined) ?? 10,
     rangeClampThreshold: (config.range_clamp_threshold as number | undefined) ?? 0.05,
     streetBoundaryConfig: {
-      flop: modeFromConfig(config.flop_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.flop_model_path as string | undefined),
-      turn: modeFromConfig(config.turn_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.turn_model_path as string | undefined),
-      river: modeFromConfig(config.river_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.river_model_path as string | undefined),
+      flop: modeFromConfig('flop', config.flop_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.flop_model_path as string | undefined),
+      turn: modeFromConfig('turn', config.turn_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.turn_model_path as string | undefined),
+      river: modeFromConfig('river', config.river_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.river_model_path as string | undefined),
     },
     traceBoundaries: (config.trace_boundaries as string | undefined) ?? '',
     traceIters: (config.trace_iters as string | undefined) ?? 'last',
