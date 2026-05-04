@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-05-04T04:29:26Z
-updated_at: 2026-05-04T04:29:26Z
+updated_at: 2026-05-04T04:32:02Z
 parent: poker_solver_rust-e90m
 ---
 
@@ -13,7 +13,7 @@ Add or run a focused diagnostic that compares exact vs depth-limited root action
 
 Checklist:
 
-[ ] Inspect solver storage/query APIs for root action CFVs and regrets.
+[x] Inspect solver storage/query APIs for root action CFVs and regrets.
 [ ] Add the narrowest compare-solve diagnostic needed to print per-action root values/deltas.
 [ ] Run canonical exact_oracle comparison at one early iteration and a higher-divergence setting.
 [ ] Record whether divergence appears before or after boundary value injection.
