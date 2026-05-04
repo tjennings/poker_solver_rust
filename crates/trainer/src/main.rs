@@ -2530,6 +2530,7 @@ mod tests {
 
     /// run_gpu_range_solve constructs a game and solves it without error.
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn run_gpu_range_solve_returns_ok() {
         let result = super::run_gpu_range_solve(
             "AA",
@@ -2718,8 +2719,8 @@ snapshots:
         ))
         .expect("blueprint_mp_6player_ante.yaml must exist");
         let tui_cfg = crate::blueprint_tui_config::parse_tui_config(&yaml);
-        // TUI should be disabled by default but scenarios should be present
-        assert!(!tui_cfg.enabled);
+        // The sample enables TUI scenarios for interactive monitoring.
+        assert!(tui_cfg.enabled);
         assert!(!tui_cfg.scenarios.is_empty(), "should have TUI scenarios");
     }
 

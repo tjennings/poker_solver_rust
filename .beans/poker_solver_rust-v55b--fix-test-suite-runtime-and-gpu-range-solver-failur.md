@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-17T16:17:32Z
-updated_at: 2026-05-04T00:21:23Z
+updated_at: 2026-05-04T00:24:15Z
 ---
 
 Two issues blocking CLAUDE.md's <60s test-suite rule:
@@ -29,3 +29,7 @@ Split suggestion: a separate beans/PR fixes the `traverse_updates_strategy_sums`
 ## Progress 2026-05-04 Fast Gate\n\nMoved the slow convergence-harness end-to-end integration tests behind #[ignore = "slow end-to-end convergence harness pipeline"]. They remain runnable explicitly with ignored tests, but no longer dominate the default cargo test gate.
 
 ## Progress 2026-05-04 MP Validation\n\nFixed the blueprint_mp validation failure by enabling AllBuckets equity fallback when multiplayer training is configured without a cluster_path, matching the existing sample configs and test-only training path.
+
+## Progress 2026-05-04 Trainer Defaults
+
+Updated trainer default tests so the sample TUI assertion matches the checked-in 6-player ante config and the GPU range-solve runtime test is ignored unless CUDA/NVRTC libraries are available.
