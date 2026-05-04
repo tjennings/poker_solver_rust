@@ -2290,6 +2290,9 @@ pub fn game_solve_core(
         // Finalize: normalize strategy, compute EVs.
         // (This replaces the per-node strategy buffer with the CFR
         // time-averaged equilibrium — the same values the UI reads.)
+        if has_per_boundary {
+            game.clear_boundary_cfvs();
+        }
         finalize(&mut game);
 
         // Flush the "last iter" trace AFTER finalize so the strategy recorded

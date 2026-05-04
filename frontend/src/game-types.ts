@@ -28,6 +28,7 @@ export interface ComboDetail {
   cards: string;
   probabilities: number[];
   weight: number;
+  bucket?: number | null;
 }
 
 export interface GameMatrixCell {
