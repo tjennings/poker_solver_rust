@@ -5,11 +5,11 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-04T13:38:41Z
-updated_at: 2026-05-04T14:22:02Z
+updated_at: 2026-05-04T14:34:11Z
 parent: poker_solver_rust-e90m
 ---
 
-Tauri subgame with cfvnet boundary reports an always-shove strategy while exact reports always-call on spot: sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Kh.\n\n## Tasks\n\n- [x] Reproduce the spot in compare-solve with the local cfvnet model.\n- [x] Compare against exact and exact_oracle/exact_subtree controls where possible.\n- [x] Determine whether this is Tauri wiring, compare-solve parity, CFVNet value calibration, or model/domain mismatch.\n- [ ] Fix or document the next concrete repair step.
+Tauri subgame with cfvnet boundary reports an always-shove strategy while exact reports always-call on spot: sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Kh.\n\n## Tasks\n\n- [x] Reproduce the spot in compare-solve with the local cfvnet model.\n- [x] Compare against exact and exact_oracle/exact_subtree controls where possible.\n- [x] Determine whether this is Tauri wiring, compare-solve parity, CFVNet value calibration, or model/domain mismatch.\n- [x] Fix or document the next concrete repair step.
 
 ## 2026-05-04 Cross-Check Results
 
@@ -37,3 +37,16 @@ Kh spot result with `checkpoint_epoch675.onnx`:
 - Exact-subtree raw control is closer overall (OOP mean_abs 0.267354/corr 0.9727, IP mean_abs 0.146042/corr 0.9859) but still has some noisy OOP high-pot boundaries.
 
 Conclusion: this is not Tauri wiring, compare-solve parity, player orientation, or a simple scalar unit bug. The next concrete repair path is to quantify which boundary/value errors flip the root regrets, then decide between model retraining/domain coverage for paired-turn Kx spots and a safer boundary handoff/dampening strategy.
+
+
+## 2026-05-04 Root Attribution Diagnostic
+
+Added compare-solve root boundary attribution under --dump-boundary-cfvs. The diagnostic swaps the same seeded subgame between the candidate per-boundary evaluator and an exact_oracle evaluator, preserving the boundary reach snapshot, then prints root action CFVs and immediate regret-input pressure.
+
+Kh spot result with checkpoint_epoch675.onnx:
+
+• Max root action CFV gap: 2.472203 chips at 55bb 8c9c.
+• Max root regret-input gap: 1.778852 chips at 55bb 7c7d.
+• Reach-weighted root regret-input deltas versus exact oracle: Check -0.041571, 24bb +0.188941, 55bb +0.571200, All-in +0.490248.
+
+Conclusion: CFVNet boundary errors are not merely noisy in aggregate; at the root they create positive regret pressure for the large bet and all-in branches where exact_oracle says those actions are negative or barely positive. The next repair should target CFVNet calibration/domain coverage for paired-turn Kx states, or gate/dampen CFVNet boundaries when root attribution shows large positive bet-pressure deltas.

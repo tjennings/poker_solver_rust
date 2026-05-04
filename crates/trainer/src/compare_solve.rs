@@ -7,33 +7,33 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
-use poker_solver_core::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
+use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+use poker_solver_core::blueprint_v2::Street;
 
 use poker_solver_tauri::gadget;
 use poker_solver_tauri::postflop::CbvContext;
 use poker_solver_tauri::{
-    BoundaryKind, GameSession, StreetBoundaryConfig, StreetBoundaryMode, build_solve_game,
-    build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
-    seed_solver_with_blueprint, validate_cfvnet_boundary_cut,
+    build_solve_game, build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
+    seed_solver_with_blueprint, validate_cfvnet_boundary_cut, BoundaryKind, GameSession,
+    StreetBoundaryConfig, StreetBoundaryMode,
 };
 
 use range_solver::card::card_to_string;
 use range_solver::game::BoundaryEvaluator;
 use range_solver::interface::Game;
 use range_solver::{
-    Action, PostFlopGame, cfvalues_after_history_with_reach, compute_current_ev,
-    compute_exploitability, finalize, root_action_cfvalues, root_regrets, solve_step,
+    cfvalues_after_history_with_reach, compute_current_ev, compute_exploitability, finalize,
+    root_action_cfvalues, root_regrets, solve_step, Action, PostFlopGame,
 };
 
 use crate::boundary_trace::{
-    BoundaryTracer, assemble_full_spot, build_boundary_spot_paths, build_preceding_decision_map,
-    capture_boundary_traces,
+    assemble_full_spot, build_boundary_spot_paths, build_preceding_decision_map,
+    capture_boundary_traces, BoundaryTracer,
 };
 
 // ---------------------------------------------------------------------------
@@ -203,7 +203,11 @@ pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
         .iter()
         .map(|s| {
             let m = s.mean.abs().max(s.stddev.abs()) as f64;
-            if m < 1e-10 { 1e-10 } else { m }
+            if m < 1e-10 {
+                1e-10
+            } else {
+                m
+            }
         })
         .collect();
     if magnitudes.len() < 2 {
@@ -231,7 +235,11 @@ pub fn check_bias_divergence(bias_stats: &[&BoundaryCfvStats], bias_names: &[&st
     }
     let base_mag = {
         let m = bias_stats[0].mean.abs().max(bias_stats[0].stddev.abs()) as f64;
-        if m < 1e-10 { 1e-10 } else { m }
+        if m < 1e-10 {
+            1e-10
+        } else {
+            m
+        }
     };
     for i in 1..bias_stats.len() {
         let mag = bias_stats[i].mean.abs().max(bias_stats[i].stddev.abs()) as f64;
@@ -834,6 +842,58 @@ fn weighted_action_means(snapshot: &RootUpdateSnapshot) -> Vec<f64> {
             snapshot.action_cfvs[offset..offset + snapshot.num_hands]
                 .iter()
                 .zip(&snapshot.weights)
+                .map(|(&v, &w)| v as f64 * w as f64)
+                .sum::<f64>()
+                / weight_sum
+        })
+        .collect()
+}
+
+fn root_regret_inputs(snapshot: &RootUpdateSnapshot, strategy: &[f32]) -> Vec<f32> {
+    let num_actions = snapshot.action_labels.len();
+    let expected_len = num_actions * snapshot.num_hands;
+    assert_eq!(
+        strategy.len(),
+        expected_len,
+        "root strategy length must match action CFV layout"
+    );
+    assert_eq!(
+        snapshot.action_cfvs.len(),
+        expected_len,
+        "root action CFV length must match action layout"
+    );
+
+    let mut baseline = vec![0.0f32; snapshot.num_hands];
+    for action in 0..num_actions {
+        let offset = action * snapshot.num_hands;
+        for hand in 0..snapshot.num_hands {
+            baseline[hand] += strategy[offset + hand] * snapshot.action_cfvs[offset + hand];
+        }
+    }
+
+    let mut inputs = Vec::with_capacity(expected_len);
+    for action in 0..num_actions {
+        let offset = action * snapshot.num_hands;
+        for (hand, base) in baseline.iter().enumerate() {
+            inputs.push(snapshot.action_cfvs[offset + hand] - *base);
+        }
+    }
+    inputs
+}
+
+fn weighted_action_values(values: &[f32], weights: &[f32], num_hands: usize) -> Vec<f64> {
+    if num_hands == 0 {
+        return Vec::new();
+    }
+    let weight_sum: f64 = weights.iter().take(num_hands).map(|&w| w as f64).sum();
+    values
+        .chunks(num_hands)
+        .map(|row| {
+            if weight_sum == 0.0 {
+                return 0.0;
+            }
+            row.iter()
+                .zip(weights)
                 .map(|(&v, &w)| v as f64 * w as f64)
                 .sum::<f64>()
                 / weight_sum
@@ -1567,9 +1627,125 @@ fn top_cfv_delta_rows(
         .collect()
 }
 
+fn print_root_boundary_attribution(
+    game: &mut PostFlopGame,
+    exact_game: &Arc<PostFlopGame>,
+    histories: &[Vec<usize>],
+    oracle_orientation: OracleCfvOrientation,
+    oracle_scale: f32,
+) -> Result<(), String> {
+    let n_boundaries = game.num_boundary_nodes();
+    if histories.len() != n_boundaries {
+        return Err(format!(
+            "root attribution boundary history count mismatch: histories={} boundaries={n_boundaries}",
+            histories.len(),
+        ));
+    }
+
+    game.back_to_root();
+    let strategy = game.strategy();
+    let saved_reach = clone_boundary_reach(game);
+
+    game.clear_boundary_cfvs();
+    restore_boundary_reach(game, &saved_reach);
+    let candidate_snapshot = capture_root_update_snapshot(game);
+    let candidate_inputs = root_regret_inputs(&candidate_snapshot, &strategy);
+
+    let oracle_evaluators: Vec<Arc<dyn BoundaryEvaluator>> = histories
+        .iter()
+        .cloned()
+        .map(|history| {
+            Arc::new(OracleBoundaryEvaluator {
+                exact_game: Arc::clone(exact_game),
+                history,
+                orientation: oracle_orientation,
+                scale: oracle_scale,
+            }) as Arc<dyn BoundaryEvaluator>
+        })
+        .collect();
+    let candidate_evaluators =
+        std::mem::replace(&mut game.per_boundary_evaluators, oracle_evaluators);
+
+    game.clear_boundary_cfvs();
+    restore_boundary_reach(game, &saved_reach);
+    let oracle_snapshot = capture_root_update_snapshot(game);
+    let oracle_inputs = root_regret_inputs(&oracle_snapshot, &strategy);
+
+    game.per_boundary_evaluators = candidate_evaluators;
+    game.clear_boundary_cfvs();
+    restore_boundary_reach(game, &saved_reach);
+
+    if candidate_snapshot.player != oracle_snapshot.player
+        || candidate_snapshot.action_labels != oracle_snapshot.action_labels
+        || candidate_snapshot.num_hands != oracle_snapshot.num_hands
+    {
+        return Err("root attribution snapshot mismatch between candidate and oracle".to_string());
+    }
+
+    let private_cards = game.private_cards(candidate_snapshot.player);
+    let (cfv_gap, cfv_action, cfv_hand) = max_gap(
+        &candidate_snapshot.action_cfvs,
+        &oracle_snapshot.action_cfvs,
+        &candidate_snapshot.action_labels,
+        candidate_snapshot.num_hands,
+        private_cards,
+    );
+    let (input_gap, input_action, input_hand) = max_gap(
+        &candidate_inputs,
+        &oracle_inputs,
+        &candidate_snapshot.action_labels,
+        candidate_snapshot.num_hands,
+        private_cards,
+    );
+
+    let candidate_means = weighted_action_means(&candidate_snapshot);
+    let oracle_means = weighted_action_means(&oracle_snapshot);
+    let candidate_input_means = weighted_action_values(
+        &candidate_inputs,
+        &candidate_snapshot.weights,
+        candidate_snapshot.num_hands,
+    );
+    let oracle_input_means = weighted_action_values(
+        &oracle_inputs,
+        &oracle_snapshot.weights,
+        oracle_snapshot.num_hands,
+    );
+
+    println!("=== Root boundary attribution: candidate vs exact oracle ===");
+    println!(
+        "max_abs_action_cfv_gap: {:.6} chips ({:.2} mbb) at {} {}",
+        cfv_gap,
+        cfv_gap as f64 * 500.0,
+        cfv_action,
+        cfv_hand
+    );
+    println!(
+        "max_abs_regret_input_gap: {:.6} chips ({:.2} mbb) at {} {}",
+        input_gap,
+        input_gap as f64 * 500.0,
+        input_action,
+        input_hand
+    );
+    println!("per-action root pressure (reach-weighted chips):");
+    for (idx, label) in candidate_snapshot.action_labels.iter().enumerate() {
+        let cand_cfv = candidate_means[idx];
+        let oracle_cfv = oracle_means[idx];
+        let cand_input = candidate_input_means[idx];
+        let oracle_input = oracle_input_means[idx];
+        println!(
+            "  {label:<10} cfv cand={cand_cfv:+.6} oracle={oracle_cfv:+.6} delta={:+.6} | regret_input cand={cand_input:+.6} oracle={oracle_input:+.6} delta={:+.6}",
+            cand_cfv - oracle_cfv,
+            cand_input - oracle_input,
+        );
+    }
+    println!();
+
+    Ok(())
+}
+
 fn print_boundary_cfv_comparison(
-    game: &PostFlopGame,
-    exact_game: &PostFlopGame,
+    game: &mut PostFlopGame,
+    exact_game: &Arc<PostFlopGame>,
     oracle_orientation: OracleCfvOrientation,
     oracle_scale: f32,
     exact_subtree_iters: u32,
@@ -1590,6 +1766,13 @@ fn print_boundary_cfv_comparison(
     let boundary_indices = game.boundary_node_indices();
     let boundary_boards = game.boundary_boards();
     let histories = build_boundary_play_histories(game);
+    print_root_boundary_attribution(
+        game,
+        exact_game,
+        &histories,
+        oracle_orientation,
+        oracle_scale,
+    )?;
     let tree_cfg = game.tree_config().clone();
     let private_cards = [
         game.private_cards(0).to_vec(),
@@ -1667,10 +1850,18 @@ fn print_boundary_cfv_comparison(
             return Err("exact_subtree reference did not provide raw CFVs".to_string());
         };
 
-        let mut oracle_oop =
-            cfvalues_after_history_with_reach(exact_game, &histories[ordinal], 0, ip_reach_ref);
-        let mut oracle_ip =
-            cfvalues_after_history_with_reach(exact_game, &histories[ordinal], 1, oop_reach_ref);
+        let mut oracle_oop = cfvalues_after_history_with_reach(
+            exact_game.as_ref(),
+            &histories[ordinal],
+            0,
+            ip_reach_ref,
+        );
+        let mut oracle_ip = cfvalues_after_history_with_reach(
+            exact_game.as_ref(),
+            &histories[ordinal],
+            1,
+            oop_reach_ref,
+        );
         scale_cfvs(&mut oracle_oop, oracle_scale);
         scale_cfvs(&mut oracle_ip, oracle_scale);
         let (oracle_oop, oracle_ip) = oracle_orientation.orient(oracle_oop, oracle_ip);
@@ -2397,8 +2588,8 @@ pub fn run(
 
         if dump_boundary_cfvs {
             print_boundary_cfv_comparison(
-                &subgame_game,
-                exact_game.as_ref(),
+                &mut subgame_game,
+                &exact_game,
                 oracle_orientation,
                 oracle_scale,
                 subgame_iters,
@@ -2599,9 +2790,9 @@ fn aggregate_by_class(
         let entry = sums
             .entry(class)
             .or_insert_with(|| (0.0, vec![0.0; num_actions]));
-        entry.0 += 1.0; // uniform weight across combos (tolerance check treats
-        // all AA combos equally); reach-weighted comparison is
-        // future work — simple-mean is adequate for 0.1%.
+        // Uniform weight across combos (tolerance check treats all AA combos
+        // equally); reach-weighted comparison is future work.
+        entry.0 += 1.0;
         for a in 0..num_actions {
             entry.1[a] += strategy[a * num_hands + h] as f64;
         }
@@ -2644,7 +2835,7 @@ mod tests {
     use super::*;
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
+    use range_solver::card::{card_from_str, flop_from_str, CardConfig};
 
     fn make_depth_limited_flop_game() -> PostFlopGame {
         let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();
@@ -2798,6 +2989,39 @@ mod tests {
             OracleCfvOrientation::SwapPlayersSignFlip.orient(oop, ip),
             (vec![-3.0, 4.0], vec![-1.0, 2.0])
         );
+    }
+
+    #[test]
+    fn root_regret_inputs_subtract_current_strategy_baseline() {
+        let snapshot = RootUpdateSnapshot {
+            player: 0,
+            action_labels: vec!["Check".to_string(), "24bb".to_string()],
+            num_hands: 2,
+            weights: vec![1.0, 1.0],
+            action_cfvs: vec![4.0, 8.0, 10.0, 2.0],
+            regrets: vec![0.0; 4],
+        };
+        let strategy = vec![0.25, 0.75, 0.75, 0.25];
+
+        let inputs = root_regret_inputs(&snapshot, &strategy);
+
+        assert_eq!(inputs.len(), 4);
+        assert!((inputs[0] - -4.5).abs() < 1e-6);
+        assert!((inputs[1] - 1.5).abs() < 1e-6);
+        assert!((inputs[2] - 1.5).abs() < 1e-6);
+        assert!((inputs[3] - -4.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weighted_action_values_uses_reach_weights() {
+        let values = vec![1.0, 3.0, 5.0, 9.0];
+        let weights = vec![1.0, 3.0];
+
+        let means = weighted_action_values(&values, &weights, 2);
+
+        assert_eq!(means.len(), 2);
+        assert!((means[0] - 2.5).abs() < 1e-9);
+        assert!((means[1] - 8.0).abs() < 1e-9);
     }
 
     #[test]
