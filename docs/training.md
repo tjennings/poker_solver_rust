@@ -386,7 +386,7 @@ Options:
 - `--bundle <DIR>` -- Path to blueprint bundle directory (required)
 - `--snapshot <NAME>` -- Snapshot name, e.g. `snapshot_0013`; defaults to latest
 - `--spot <SPOT>` -- Spot encoding: actions and board cards separated by `|` (required)
-- `--iters <N>` -- DCFR iterations for the subgame solve (default: 200)
+- `--iters <N>` -- DCFR iterations for both solves (default: 200)
 - `--tolerance <F>` -- Max per-cell strategy delta before non-zero exit (default: 0.0, disabled)
 - `--verbose` -- Print per-iteration progress
 - `--flop-boundary <MODE>` -- Flop boundary evaluator: `exact` (default), `cfvnet`, `exact_subtree`, or `exact_oracle`
@@ -397,6 +397,8 @@ Options:
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
 - `--oracle-orientation <MODE>` -- Hidden `exact_oracle` diagnostic. Accepted values are `current`, `swap`, `sign-flip`, and `swap-sign-flip`; use only to audit OOP/IP and sign orientation at the raw boundary-CFV handoff.
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
+- `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
+- `--subgame-iters <N>` -- Hidden diagnostic override for subgame solve iterations; defaults to `--iters`.
 
 Boundary modes:
 - `exact` -- Continue solving through the full tree with no depth boundary.

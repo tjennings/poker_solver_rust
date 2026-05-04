@@ -362,6 +362,14 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         iters: u32,
 
+        /// Diagnostic override for exact solve iterations.
+        #[arg(long, hide = true)]
+        exact_iters: Option<u32>,
+
+        /// Diagnostic override for subgame solve iterations.
+        #[arg(long, hide = true)]
+        subgame_iters: Option<u32>,
+
         /// Print per-iteration progress
         #[arg(long)]
         verbose: bool,
@@ -1436,6 +1444,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             snapshot,
             spot,
             iters,
+            exact_iters,
+            subgame_iters,
             verbose,
             dump_boundary_cfvs,
             flop_boundary,
@@ -1502,6 +1512,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 snapshot.as_deref(),
                 &spot,
                 iters,
+                exact_iters,
+                subgame_iters,
                 verbose,
                 dump_boundary_cfvs,
                 sbc,
@@ -3154,6 +3166,46 @@ snapshots:
             assert!(trace_boundaries.is_none());
             assert_eq!(trace_iters, "last");
             assert_eq!(trace_dir, std::path::PathBuf::from("./traces"));
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+    }
+
+    /// compare-solve hidden iteration overrides should parse independently.
+    #[test]
+    fn compare_solve_iteration_override_flags_parse() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
+            "--iters",
+            "200",
+            "--exact-iters",
+            "1000",
+            "--subgame-iters",
+            "400",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "iteration override flags must parse: {:?}",
+            cli.err()
+        );
+
+        if let super::Commands::CompareSolve {
+            iters,
+            exact_iters,
+            subgame_iters,
+            ..
+        } = cli.unwrap().command
+        {
+            assert_eq!(iters, 200);
+            assert_eq!(exact_iters, Some(1000));
+            assert_eq!(subgame_iters, Some(400));
         } else {
             panic!("expected CompareSolve variant");
         }

@@ -1334,6 +1334,8 @@ pub fn run(
     snapshot: Option<&str>,
     spot: &str,
     iters: u32,
+    exact_iters: Option<u32>,
+    subgame_iters: Option<u32>,
     verbose: bool,
     dump_boundary_cfvs: bool,
     street_boundary_config: StreetBoundaryConfig,
@@ -1347,6 +1349,8 @@ pub fn run(
     gadget_provider: &str,
     gadget_constant: f32,
 ) -> Result<(), String> {
+    let exact_iters = exact_iters.unwrap_or(iters);
+    let subgame_iters = subgame_iters.unwrap_or(iters);
     let mode = gadget_mode_label(gadget, gadget_clamp);
     eprintln!("gadget mode: {mode}");
     // 1. Load bundle
@@ -1420,8 +1424,13 @@ pub fn run(
     println!("spot: {spot}");
     println!("board: {board_str}  pot: {pot_bb:.0}  eff_stack: {eff_bb:.0}");
     println!("position: {position}");
+    let iter_label = if exact_iters == subgame_iters {
+        exact_iters.to_string()
+    } else {
+        format!("exact={exact_iters}, subgame={subgame_iters}")
+    };
     println!(
-        "iters: {iters}  boundary: {}",
+        "iters: {iter_label}  boundary: {}",
         match &boundary_cut {
             Some((d, BoundaryKind::Cfvnet(p))) => format!("depth={d}, model={p}"),
             Some((d, BoundaryKind::ExactSubtree)) if oracle_boundary_active => {
@@ -1474,7 +1483,7 @@ pub fn run(
             &setup_boundary_cut,
             gadget_provider,
             gadget_constant,
-            iters,
+            subgame_iters,
             3.0,
         )?
     } else {
@@ -1498,7 +1507,7 @@ pub fn run(
             &ctx,
             current_node,
             &setup_boundary_cut,
-            iters,
+            subgame_iters,
             3.0,
         )?;
         game
@@ -1545,7 +1554,7 @@ pub fn run(
     // In gadget-tree mode ordinals 0 and 1 are static gadget terminals
     // whose CFVs never change during solve -- skip tracing them.
     let skip = if gadget_tree_active { 2 } else { 0 };
-    let tracer = trace_config.into_tracer_with_skip(iters, skip);
+    let tracer = trace_config.into_tracer_with_skip(subgame_iters, skip);
     if tracer.is_some() {
         eprintln!(
             "[compare] boundary tracing enabled ({n_boundaries} boundaries, skip {skip} leading)"
@@ -1570,9 +1579,9 @@ pub fn run(
     };
 
     // 8. Solve exact
-    eprintln!("[compare] solving exact ({iters} iters)...");
+    eprintln!("[compare] solving exact ({exact_iters} iters)...");
     let (exact_wall, exact_exp) =
-        run_dcfr_solve(&mut exact_game, iters, "exact", verbose, None, None);
+        run_dcfr_solve(&mut exact_game, exact_iters, "exact", verbose, None, None);
     exact_game.back_to_root();
     let exact_game = Arc::new(exact_game);
 
@@ -1586,10 +1595,10 @@ pub fn run(
     }
 
     // 9. Solve subgame (with optional tracer)
-    eprintln!("[compare] solving subgame ({iters} iters)...");
+    eprintln!("[compare] solving subgame ({subgame_iters} iters)...");
     let (subgame_wall, subgame_exp) = run_dcfr_solve(
         &mut subgame_game,
-        iters,
+        subgame_iters,
         "subgame",
         verbose,
         tracer.as_ref(),
