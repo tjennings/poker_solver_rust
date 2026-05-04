@@ -1,4 +1,4 @@
-# BoundaryNet River — datagen with bet size fuzzing
+# BoundaryNet River — datagen with Supremus-style bet size fuzzing
 #
 # Generates diverse river training data with randomized bet sizes
 # to improve generalization across different bet tree structures.
@@ -6,7 +6,7 @@
 # Run (CPU, 16 threads):
 #   cargo run -p cfvnet --release -- generate \
 #     -c sample_configurations/boundary_net_river_datagen.yaml \
-#     -o local_data/cfvnet/river_fuzzed \
+#     -o local_data/cfvnet/river_supremus \
 #     --num-samples 5000000 \
 #     --threads 16 \
 #     --per-file 10000
@@ -14,14 +14,18 @@
 # Run (GPU):
 #   cargo run -p cfvnet --release --features gpu-datagen -- generate \
 #     -c sample_configurations/boundary_net_river_datagen.yaml \
-#     -o local_data/cfvnet/river_fuzzed \
+#     -o local_data/cfvnet/river_supremus \
 #     --num-samples 5000000
 
 game:
   initial_stack: 200
+  # Supremus-style river action abstraction. Fold, check, and call are implicit.
+  # Rows encode the intended first bet, second bet, and third bet options.
+  # The third bet is all-in only; no non-all-in raise sizes are allowed there.
   bet_sizes:
     - ["25%", "50%", "100%", "a"]
     - ["25%", "75%", "a"]
+    - ["a"]
   board_size: 5
 
 datagen:
