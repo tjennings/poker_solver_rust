@@ -192,6 +192,11 @@ pub fn gadget_mode_label(gadget: bool, gadget_clamp: bool) -> &'static str {
     }
 }
 
+fn subgame_seed_start_for_compare(_gadget_tree_active: bool) -> usize {
+    // Option A2 keeps game.root() as the real subgame root, matching Tauri.
+    0
+}
+
 /// Per-hand L1 distance (mass moved) between two strategy vectors.
 ///
 /// Returns `(mean_mass, max_mass, max_hand_idx)`.
@@ -2009,7 +2014,7 @@ pub fn run(
 
     // 6. Seed both solvers with blueprint strategy
     let seed_street = street;
-    let subgame_seed_start = if gadget_tree_active { 4 } else { 0 };
+    let subgame_seed_start = subgame_seed_start_for_compare(gadget_tree_active);
     seed_solver_with_blueprint(
         &exact_game,
         &ctx.strategy,
@@ -2973,6 +2978,12 @@ mod tests {
         };
         let warnings = check_unit_mismatch(&[stats_a, stats_b]);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn a2_gadget_seed_start_matches_real_subgame_root() {
+        assert_eq!(subgame_seed_start_for_compare(false), 0);
+        assert_eq!(subgame_seed_start_for_compare(true), 0);
     }
 
     #[test]

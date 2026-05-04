@@ -54,7 +54,7 @@ export function buildSolveParams(
     maxIterations: (config.solve_iterations as number | undefined) ?? 200,
     targetExploitability: (config.target_exploitability as number | undefined) ?? 3.0,
     matrixSnapshotInterval: (config.matrix_snapshot_interval as number | undefined) ?? 10,
-    rangeClampThreshold: (config.range_clamp_threshold as number | undefined) ?? 0.05,
+    rangeClampThreshold: (config.range_clamp_threshold as number | undefined) ?? 0.0,
     streetBoundaryConfig: {
       flop: modeFromConfig('flop', config.flop_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.flop_model_path as string | undefined),
       turn: modeFromConfig('turn', config.turn_boundary_mode as 'exact' | 'cfvnet' | 'exact_subtree' | undefined, config.turn_model_path as string | undefined),

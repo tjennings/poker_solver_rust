@@ -9,7 +9,7 @@ describe('hasAnyCut', () => {
     solve_iterations: 200,
     backend_url: '',
     matrix_snapshot_interval: 10,
-    range_clamp_threshold: 0.05,
+    range_clamp_threshold: 0.0,
     flop_boundary_mode: 'exact',
     turn_boundary_mode: 'exact',
     river_boundary_mode: 'exact',

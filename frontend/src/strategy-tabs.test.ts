@@ -32,7 +32,7 @@ describe('buildSolveParams', () => {
     solve_iterations: 200,
     target_exploitability: 3.0,
     matrix_snapshot_interval: 10,
-    range_clamp_threshold: 0.05,
+    range_clamp_threshold: 0.0,
     flop_boundary_mode: 'exact' as const,
     turn_boundary_mode: 'exact' as const,
     river_boundary_mode: 'exact' as const,
@@ -56,7 +56,7 @@ describe('buildSolveParams', () => {
     expect(params.maxIterations).toBe(200);
     expect(params.targetExploitability).toBe(3.0);
     expect(params.matrixSnapshotInterval).toBe(10);
-    expect(params.rangeClampThreshold).toBe(0.05);
+    expect(params.rangeClampThreshold).toBe(0.0);
   });
 
   it('uses config values when provided', () => {
