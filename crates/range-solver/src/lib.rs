@@ -26,6 +26,6 @@ pub use card::CardConfig;
 pub use game::PostFlopGame;
 pub use game::StrengthItem;
 pub use solver::{
-    compute_average, compute_current_ev, compute_exploitability, finalize, root_cfvalues,
-    root_cfvalues_with_reach, solve, solve_step,
+    compute_average, compute_current_ev, compute_exploitability, finalize, root_action_cfvalues,
+    root_cfvalues, root_cfvalues_with_reach, root_regrets, solve, solve_step,
 };

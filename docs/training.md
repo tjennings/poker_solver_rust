@@ -400,6 +400,7 @@ Options:
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
 - `--subgame-iters <N>` -- Hidden diagnostic override for subgame solve iterations; defaults to `--iters`.
 - `--oracle-iteration-aligned` -- Hidden `exact_oracle` diagnostic. Runs exact and subgame in lockstep and evaluates each subgame boundary against the exact continuation at the same iteration. Requires matching `--exact-iters` and `--subgame-iters`.
+- `--root-update-trace-iters <csv>` -- Hidden diagnostic for `--oracle-iteration-aligned`. Prints exact/subgame root action CFV gaps and root regret-update gaps for the listed zero-based iterations.
 
 Boundary modes:
 - `exact` -- Continue solving through the full tree with no depth boundary.

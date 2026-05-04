@@ -432,6 +432,67 @@ pub fn root_cfvalues_with_reach<T: Game>(game: &T, player: usize, opp_reach: &[f
     out
 }
 
+/// Returns per-action root counterfactual values for the root actor's current
+/// strategy profile.
+///
+/// The output uses action-major layout: action `a`, hand `h` is stored at
+/// `a * num_private_hands(player) + h`.
+#[inline]
+pub fn root_action_cfvalues<T: Game>(game: &T, player: usize) -> Vec<f32> {
+    if !game.is_ready() && !game.is_solved() {
+        panic!("Game is not ready");
+    }
+    let root = game.root();
+    assert!(
+        !root.is_terminal() && !root.is_chance(),
+        "root_action_cfvalues requires a decision root"
+    );
+    assert_eq!(
+        root.acting_player(),
+        player,
+        "root_action_cfvalues requires the root actor"
+    );
+
+    let num_actions = root.num_actions();
+    let num_hands = game.num_private_hands(player);
+    let mut out = Vec::with_capacity(num_actions * num_hands);
+    for action in 0..num_actions {
+        compute_cfvalue_recursive(
+            row_mut(out.spare_capacity_mut(), action, num_hands),
+            game,
+            &mut root.play(action),
+            player,
+            game.initial_weights(player ^ 1),
+            false,
+        );
+    }
+    // SAFETY: each action row has been fully written above.
+    unsafe { out.set_len(num_actions * num_hands) };
+    out
+}
+
+/// Returns the root cumulative regrets in action-major layout.
+#[inline]
+pub fn root_regrets<T: Game>(game: &T) -> Vec<f32> {
+    if !game.is_ready() && !game.is_solved() {
+        panic!("Game is not ready");
+    }
+    let root = game.root();
+    assert!(
+        !root.is_terminal() && !root.is_chance(),
+        "root_regrets requires a decision root"
+    );
+    if game.is_compression_enabled() {
+        let scale = root.regret_scale() / i16::MAX as f32;
+        root.regrets_compressed()
+            .iter()
+            .map(|&v| v as f32 * scale)
+            .collect()
+    } else {
+        root.regrets().to_vec()
+    }
+}
+
 /// Like [`root_cfvalues_with_reach`] but starts from a supplied
 /// `PostFlopGame::play` history instead of the root.
 ///

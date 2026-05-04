@@ -35,22 +35,30 @@ All runs used `--river-boundary exact_oracle --tolerance 1.0`.
 
 ## Results
 
+Note: the original version of this note recorded stale-cache exploitability for
+iteration-aligned subgame finalization. The root-update diagnostic found that
+the evaluator-backed boundary CFV cache must be cleared before finalization so
+final average-strategy EVs are recomputed with the final reaches. The table
+below reflects the corrected behavior.
+
 | mode | exact iters | subgame iters | exact exp | subgame exp | delta | mean mass | max mass |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | finalized average | 200 | 200 | 23.06 | 42.85 | +19.79 | 0.080 | 0.893 |
-| iteration aligned | 200 | 200 | 23.06 | 88.83 | +65.76 | 0.091 | 0.915 |
+| iteration aligned | 200 | 200 | 23.06 | 18.95 | -4.12 | 0.091 | 0.915 |
 | finalized average | 1000 | 1000 | 2.29 | 223.65 | +221.36 | 0.122 | 0.995 |
-| iteration aligned | 1000 | 1000 | 2.29 | 94.81 | +92.52 | 0.041 | 1.000 |
+| iteration aligned | 1000 | 1000 | 2.29 | 3.92 | +1.63 | 0.041 | 1.000 |
 
 Units are mbb/hand for exploitability.
 
 ## Interpretation
 
-Iteration alignment does not recover exact. It worsens the 200/200 control and
-improves, but does not fix, the 1000/1000 run. That means final-average
-decoupling is a contributor at high iteration counts, but not the whole story.
+Iteration alignment largely recovers exploitability once finalization clears
+stale evaluator-backed boundary CFVs. The root policy can still be very
+different on individual hands, but the corrected 1000/1000 run is close in
+exploitability: +1.63 mbb/hand over the exact solve.
 
-The remaining gap is more likely a multi-boundary consistency issue:
+The remaining root-policy gap is more likely a multi-boundary consistency or
+near-indifference issue:
 
 - The one-boundary oracle contract still passes.
 - The depth-limited trunk has multiple river-boundary terminals competing for

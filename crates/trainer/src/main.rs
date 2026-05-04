@@ -414,6 +414,10 @@ enum Commands {
         #[arg(long, default_value_t = false, hide = true)]
         oracle_iteration_aligned: bool,
 
+        /// Diagnostic: emit root action CFV/regret update traces for iterations.
+        #[arg(long, hide = true)]
+        root_update_trace_iters: Option<String>,
+
         /// Boundary ordinals to trace (comma-separated, or "all").
         /// Produces one JSONL file per ordinal in --trace-dir.
         #[arg(long)]
@@ -1461,6 +1465,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             oracle_orientation,
             oracle_scale,
             oracle_iteration_aligned,
+            root_update_trace_iters,
             trace_boundaries,
             trace_iters,
             trace_dir,
@@ -1526,6 +1531,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 oracle_orientation,
                 oracle_scale,
                 oracle_iteration_aligned,
+                root_update_trace_iters.as_deref(),
                 trace_config,
                 tolerance,
                 gadget,
@@ -3196,6 +3202,8 @@ snapshots:
             "--subgame-iters",
             "400",
             "--oracle-iteration-aligned",
+            "--root-update-trace-iters",
+            "0,999",
         ]);
         assert!(
             cli.is_ok(),
@@ -3208,6 +3216,7 @@ snapshots:
             exact_iters,
             subgame_iters,
             oracle_iteration_aligned,
+            root_update_trace_iters,
             ..
         } = cli.unwrap().command
         {
@@ -3215,6 +3224,7 @@ snapshots:
             assert_eq!(exact_iters, Some(1000));
             assert_eq!(subgame_iters, Some(400));
             assert!(oracle_iteration_aligned);
+            assert_eq!(root_update_trace_iters.as_deref(), Some("0,999"));
         } else {
             panic!("expected CompareSolve variant");
         }

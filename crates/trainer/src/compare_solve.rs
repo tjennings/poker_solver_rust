@@ -27,7 +27,7 @@ use range_solver::card::card_to_string;
 use range_solver::interface::Game;
 use range_solver::{
     Action, PostFlopGame, cfvalues_after_history_with_reach, compute_exploitability, finalize,
-    solve_step,
+    root_action_cfvalues, root_regrets, solve_step,
 };
 
 use crate::boundary_trace::{
@@ -653,6 +653,230 @@ fn scale_cfvs(values: &mut [f32], scale: f32) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RootUpdateSnapshot {
+    player: usize,
+    action_labels: Vec<String>,
+    num_hands: usize,
+    weights: Vec<f32>,
+    action_cfvs: Vec<f32>,
+    regrets: Vec<f32>,
+}
+
+fn parse_root_update_trace_iters(raw: Option<&str>) -> Result<Vec<u32>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut iters = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let iter = part
+            .parse::<u32>()
+            .map_err(|_| format!("invalid --root-update-trace-iters value '{part}'"))?;
+        if !iters.contains(&iter) {
+            iters.push(iter);
+        }
+    }
+    iters.sort_unstable();
+    Ok(iters)
+}
+
+fn should_trace_root_update(trace_iters: &[u32], iter: u32) -> bool {
+    trace_iters.binary_search(&iter).is_ok()
+}
+
+fn dcfr_regret_discount(iter: u32, regret: f32) -> f32 {
+    let t_alpha = (iter as i32 - 1).max(0) as f64;
+    let pow_alpha = t_alpha * t_alpha.sqrt();
+    let alpha = (pow_alpha / (pow_alpha + 1.0)) as f32;
+    let beta = 0.5f32;
+    if regret.is_sign_positive() {
+        alpha
+    } else {
+        beta
+    }
+}
+
+fn capture_root_update_snapshot(game: &PostFlopGame) -> RootUpdateSnapshot {
+    let player = game.current_player();
+    let actions = game.available_actions();
+    let action_labels = actions.iter().map(format_action_label).collect();
+    let num_hands = game.num_private_hands(player);
+    RootUpdateSnapshot {
+        player,
+        action_labels,
+        num_hands,
+        weights: game.initial_weights(player).to_vec(),
+        action_cfvs: root_action_cfvalues(game, player),
+        regrets: root_regrets(game),
+    }
+}
+
+fn clone_boundary_reach(game: &PostFlopGame) -> Vec<Vec<f32>> {
+    game.boundary_reach
+        .iter()
+        .map(|reach| reach.lock().unwrap().clone())
+        .collect()
+}
+
+fn restore_boundary_reach(game: &PostFlopGame, saved: &[Vec<f32>]) {
+    for (reach, saved_reach) in game.boundary_reach.iter().zip(saved) {
+        *reach.lock().unwrap() = saved_reach.clone();
+    }
+}
+
+fn capture_subgame_root_update_snapshot(
+    game: &mut PostFlopGame,
+    restore_probe_state: bool,
+) -> RootUpdateSnapshot {
+    let saved_reach = restore_probe_state.then(|| clone_boundary_reach(game));
+    let snapshot = capture_root_update_snapshot(game);
+    if let Some(saved_reach) = saved_reach {
+        game.clear_boundary_cfvs();
+        restore_boundary_reach(game, &saved_reach);
+    }
+    snapshot
+}
+
+fn weighted_action_means(snapshot: &RootUpdateSnapshot) -> Vec<f64> {
+    let weight_sum: f64 = snapshot.weights.iter().map(|&w| w as f64).sum();
+    (0..snapshot.action_labels.len())
+        .map(|action| {
+            if weight_sum == 0.0 {
+                return 0.0;
+            }
+            let offset = action * snapshot.num_hands;
+            snapshot.action_cfvs[offset..offset + snapshot.num_hands]
+                .iter()
+                .zip(&snapshot.weights)
+                .map(|(&v, &w)| v as f64 * w as f64)
+                .sum::<f64>()
+                / weight_sum
+        })
+        .collect()
+}
+
+fn regret_update(before: &RootUpdateSnapshot, after: &RootUpdateSnapshot, iter: u32) -> Vec<f32> {
+    before
+        .regrets
+        .iter()
+        .zip(&after.regrets)
+        .map(|(&before_regret, &after_regret)| {
+            after_regret - before_regret * dcfr_regret_discount(iter, before_regret)
+        })
+        .collect()
+}
+
+fn max_gap(
+    left: &[f32],
+    right: &[f32],
+    action_labels: &[String],
+    num_hands: usize,
+    private_cards: &[(u8, u8)],
+) -> (f32, String, String) {
+    let mut best = (0.0f32, 0usize);
+    for (idx, (&l, &r)) in left.iter().zip(right).enumerate() {
+        let gap = (l - r).abs();
+        if gap > best.0 {
+            best = (gap, idx);
+        }
+    }
+    let action = best.1 / num_hands;
+    let hand = best.1 % num_hands;
+    let action_label = action_labels
+        .get(action)
+        .cloned()
+        .unwrap_or_else(|| format!("#{action}"));
+    let hand_label = private_cards
+        .get(hand)
+        .map(|&(c1, c2)| format_hand(c1, c2))
+        .unwrap_or_else(|| format!("#{hand}"));
+    (best.0, action_label, hand_label)
+}
+
+fn print_root_update_trace(
+    iter: u32,
+    exact_before: &RootUpdateSnapshot,
+    exact_after: &RootUpdateSnapshot,
+    subgame_before: &RootUpdateSnapshot,
+    subgame_after: &RootUpdateSnapshot,
+    private_cards: &[(u8, u8)],
+) {
+    assert_eq!(exact_before.player, subgame_before.player);
+    assert_eq!(exact_before.action_labels, subgame_before.action_labels);
+    let exact_update = regret_update(exact_before, exact_after, iter);
+    let subgame_update = regret_update(subgame_before, subgame_after, iter);
+
+    let (update_input_gap, update_action, update_hand) = max_gap(
+        &exact_before.action_cfvs,
+        &subgame_before.action_cfvs,
+        &exact_before.action_labels,
+        exact_before.num_hands,
+        private_cards,
+    );
+    let (oracle_timing_gap, oracle_action, oracle_hand) = max_gap(
+        &exact_after.action_cfvs,
+        &subgame_before.action_cfvs,
+        &exact_before.action_labels,
+        exact_before.num_hands,
+        private_cards,
+    );
+    let (regret_gap, regret_action, regret_hand) = max_gap(
+        &exact_update,
+        &subgame_update,
+        &exact_before.action_labels,
+        exact_before.num_hands,
+        private_cards,
+    );
+
+    eprintln!("=== Root update trace: iter {iter} ===");
+    eprintln!(
+        "player={} actions={}",
+        exact_before.player,
+        exact_before.action_labels.join(",")
+    );
+    eprintln!(
+        "max_abs_action_cfv_gap exact_pre_vs_sub_pre: {:.6} chips ({:.2} mbb) at {} {}",
+        update_input_gap,
+        update_input_gap as f64 * 500.0,
+        update_action,
+        update_hand
+    );
+    eprintln!(
+        "max_abs_action_cfv_gap exact_post_vs_sub_pre: {:.6} chips ({:.2} mbb) at {} {}",
+        oracle_timing_gap,
+        oracle_timing_gap as f64 * 500.0,
+        oracle_action,
+        oracle_hand
+    );
+    eprintln!(
+        "max_abs_regret_update_gap: {:.6} chips ({:.2} mbb) at {} {}",
+        regret_gap,
+        regret_gap as f64 * 500.0,
+        regret_action,
+        regret_hand
+    );
+
+    let exact_means = weighted_action_means(exact_before);
+    let subgame_means = weighted_action_means(subgame_before);
+    for (idx, label) in exact_before.action_labels.iter().enumerate() {
+        let exact_mean = exact_means[idx];
+        let subgame_mean = subgame_means[idx];
+        eprintln!(
+            "  action {label}: exact_pre_mean={exact_mean:.6} sub_pre_mean={subgame_mean:.6} delta={:.6} chips",
+            subgame_mean - exact_mean
+        );
+    }
+}
+
 impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
     fn compute_cfvs(
         &self,
@@ -914,11 +1138,14 @@ fn run_dcfr_solve(
         }
     }
 
+    if has_per_boundary {
+        game.clear_boundary_cfvs();
+    }
     finalize(game);
     game.back_to_root();
     game.cache_normalized_weights();
 
-    // Compute exploitability with cached boundary CFVs.
+    // Compute exploitability with the finalization-cached boundary CFVs.
     // Disable lazy evaluators so exploitability uses the cached values.
     let saved_evaluator = game.boundary_evaluator.take();
     let saved_per_boundary = std::mem::take(&mut game.per_boundary_evaluators);
@@ -936,6 +1163,7 @@ fn run_iteration_aligned_oracle_solve(
     iters: u32,
     oracle_orientation: OracleCfvOrientation,
     oracle_scale: f32,
+    root_update_trace_iters: &[u32],
     verbose: bool,
     tracer: Option<&BoundaryTracer>,
     spot_paths: Option<&[String]>,
@@ -955,13 +1183,17 @@ fn run_iteration_aligned_oracle_solve(
     let preceding_map = tracer.as_ref().map(|_| build_preceding_decision_map(subgame_game));
 
     for t in 0..iters {
+        let trace_root_update = should_trace_root_update(root_update_trace_iters, t);
         let exact_iter_start = Instant::now();
-        {
+        let (exact_before, exact_after) = {
             let exact_guard = exact_game
                 .write()
                 .expect("iteration-aligned exact oracle lock poisoned");
+            let before = trace_root_update.then(|| capture_root_update_snapshot(&exact_guard));
             solve_step(&*exact_guard, t);
-        }
+            let after = trace_root_update.then(|| capture_root_update_snapshot(&exact_guard));
+            (before, after)
+        };
         exact_wall += exact_iter_start.elapsed().as_secs_f64();
 
         if has_per_boundary {
@@ -981,9 +1213,27 @@ fn run_iteration_aligned_oracle_solve(
         let gamma = (t_gamma / (t_gamma + 1.0)).powi(3) as f32;
         subgame_game.set_boundary_discount(alpha, beta, gamma);
 
+        let subgame_before = trace_root_update
+            .then(|| capture_subgame_root_update_snapshot(subgame_game, has_per_boundary));
         let subgame_iter_start = Instant::now();
         solve_step(subgame_game, t);
         subgame_wall += subgame_iter_start.elapsed().as_secs_f64();
+        let subgame_after = trace_root_update
+            .then(|| capture_subgame_root_update_snapshot(subgame_game, has_per_boundary));
+
+        if let (Some(exact_before), Some(exact_after), Some(subgame_before), Some(subgame_after)) =
+            (exact_before, exact_after, subgame_before, subgame_after)
+        {
+            let private_cards = subgame_game.private_cards(subgame_before.player);
+            print_root_update_trace(
+                t,
+                &exact_before,
+                &exact_after,
+                &subgame_before,
+                &subgame_after,
+                private_cards,
+            );
+        }
 
         if let Some(tr) = tracer {
             capture_boundary_traces(subgame_game, tr, spot_paths, preceding_map.as_ref(), t);
@@ -1017,6 +1267,9 @@ fn run_iteration_aligned_oracle_solve(
     exact_wall += exact_finalize_start.elapsed().as_secs_f64();
 
     let subgame_finalize_start = Instant::now();
+    if has_per_boundary {
+        subgame_game.clear_boundary_cfvs();
+    }
     finalize(subgame_game);
     subgame_game.back_to_root();
     subgame_game.cache_normalized_weights();
@@ -1543,6 +1796,7 @@ pub fn run(
     oracle_orientation: OracleCfvOrientation,
     oracle_scale: f32,
     oracle_iteration_aligned: bool,
+    root_update_trace_iters: Option<&str>,
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
@@ -1552,6 +1806,7 @@ pub fn run(
 ) -> Result<(), String> {
     let exact_iters = exact_iters.unwrap_or(iters);
     let subgame_iters = subgame_iters.unwrap_or(iters);
+    let root_update_trace_iters = parse_root_update_trace_iters(root_update_trace_iters)?;
     let mode = gadget_mode_label(gadget, gadget_clamp);
     eprintln!("gadget mode: {mode}");
     // 1. Load bundle
@@ -1630,6 +1885,11 @@ pub fn run(
             );
         }
     }
+    if !root_update_trace_iters.is_empty() && !oracle_iteration_aligned {
+        return Err(
+            "--root-update-trace-iters currently requires --oracle-iteration-aligned".to_string(),
+        );
+    }
 
     // Print header (display values in BB = chips / 2)
     let pot_bb = pot as f64 / 2.0;
@@ -1659,6 +1919,9 @@ pub fn run(
             ""
         }
     );
+    if !root_update_trace_iters.is_empty() {
+        println!("root_update_trace_iters: {root_update_trace_iters:?}");
+    }
     println!();
 
     // 4. Build exact game
@@ -1808,6 +2071,7 @@ pub fn run(
                 exact_iters,
                 oracle_orientation,
                 oracle_scale,
+                &root_update_trace_iters,
                 verbose,
                 tracer.as_ref(),
                 spot_paths.as_deref(),
