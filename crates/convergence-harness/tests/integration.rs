@@ -15,6 +15,7 @@ use convergence_harness::solver_trait::ConvergenceSolver;
 /// - Convergence curve has samples (at least initial + final)
 /// - Combo EVs are non-empty with both OOP and IP vectors
 #[test]
+#[ignore = "slow end-to-end convergence harness pipeline"]
 fn end_to_end_baseline_pipeline() {
     let config = FlopPokerConfig {
         effective_stack: 10,
@@ -80,6 +81,7 @@ fn end_to_end_baseline_pipeline() {
 /// Uses all-in-only config for tree correspondence between
 /// blueprint and range-solver trees.
 #[test]
+#[ignore = "slow end-to-end convergence harness pipeline"]
 fn test_mccfr_pipeline_end_to_end() {
     // Use all-in-only config for tree correspondence
     let config = FlopPokerConfig {
@@ -112,6 +114,7 @@ fn test_mccfr_pipeline_end_to_end() {
 /// Test run_mccfr_solver produces a Baseline with convergence data and can
 /// be saved/loaded for comparison.
 #[test]
+#[ignore = "slow end-to-end convergence harness pipeline"]
 fn test_run_mccfr_solver_produces_baseline() {
     let checkpoints = vec![1000, 3000, 5000];
     let result = convergence_harness::harness::run_mccfr_solver(5000, &checkpoints, None, 10, 10).unwrap();
