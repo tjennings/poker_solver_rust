@@ -41,6 +41,13 @@ pub struct BetSizeOptions {
 
     /// Bet size options for raise.
     pub raise: Vec<BetSize>,
+
+    /// Optional bet-size rows keyed by the number of bets already made on the current street.
+    ///
+    /// When this is empty, `raise` is used for every raise as before. When present, row `0`
+    /// corresponds to the first bet, row `1` to the second bet / first raise, and so on.
+    /// Raise depths past the configured rows are forced to all-in only.
+    pub per_num_bets: Vec<Vec<BetSize>>,
 }
 
 /// Bet size options for the donk bets.
@@ -106,7 +113,11 @@ impl TryFrom<(&str, &str)> for BetSizeOptions {
         bet.sort_unstable_by(|l, r| l.partial_cmp(r).unwrap());
         raise.sort_unstable_by(|l, r| l.partial_cmp(r).unwrap());
 
-        Ok(BetSizeOptions { bet, raise })
+        Ok(BetSizeOptions {
+            bet,
+            raise,
+            per_num_bets: Vec::new(),
+        })
     }
 }
 
@@ -294,6 +305,7 @@ mod tests {
                 BetSizeOptions {
                     bet: vec![PotRelative(0.4), PotRelative(0.7)],
                     raise: Vec::new(),
+                    per_num_bets: Vec::new(),
                 },
             ),
             (
@@ -302,6 +314,7 @@ mod tests {
                 BetSizeOptions {
                     bet: vec![Additive(50, 0), Geometric(0, f64::INFINITY), AllIn],
                     raise: vec![PotRelative(0.25), PrevBetRelative(2.5), Geometric(0, 2.0)],
+                    per_num_bets: Vec::new(),
                 },
             ),
         ];

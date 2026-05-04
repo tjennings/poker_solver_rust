@@ -663,13 +663,14 @@ datagen:
   solver_iterations: 500
 ```
 
-CFVnet datagen accepts the same bet-size token style as the range solver for pot-relative sizes and all-in. In nested form, `game.bet_sizes[0]` is used for opening bets and later entries are flattened into the raise-size pool. Example:
+CFVnet datagen accepts the same bet-size token style as the range solver for pot-relative sizes and all-in. In nested form, rows are keyed by the number of bets already made on the street: `game.bet_sizes[0]` is used for the first bet, `game.bet_sizes[1]` for the second bet / first raise, and so on. Raise depths past the configured rows are forced to all-in only. Example:
 
 ```yaml
 game:
   bet_sizes:
     - ["25%", "50%", "100%", "a"]  # first bet
-    - ["25%", "75%", "a"]          # raises
+    - ["25%", "75%", "a"]          # second bet / first raise
+    - ["a"]                        # third bet is all-in only
 ```
 
 The `a` token is preserved as an explicit all-in action in the generated range-solver tree. `datagen.bet_size_fuzz` perturbs only pot-relative sizes; all-in remains exact and unfuzzed.

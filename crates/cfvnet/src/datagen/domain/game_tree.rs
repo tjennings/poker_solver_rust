@@ -108,17 +108,16 @@ fn build_turn_game_inner(
     let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
     let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
 
-    // bet_sizes[0] = first bet sizes, bet_sizes[1+] = raise sizes.
+    // bet_sizes rows are keyed by the number of bets already made on this street:
+    // row 0 = first bet, row 1 = second bet / first raise, and so on. After the
+    // last configured row, range-solver forces all-in-only raises.
     let bet = bet_sizes.first().map(|v| v.to_vec()).unwrap_or_default();
-    let raise = if bet_sizes.len() > 1 {
-        bet_sizes[1..]
-            .iter()
-            .flat_map(|v| v.iter().copied())
-            .collect()
-    } else {
-        Vec::new()
+    let raise = bet_sizes.get(1).map_or_else(Vec::new, Vec::clone);
+    let bet_size_opts = BetSizeOptions {
+        bet,
+        raise,
+        per_num_bets: bet_sizes.to_vec(),
     };
-    let bet_size_opts = BetSizeOptions { bet, raise };
 
     let is_river = board_u8.len() >= 5;
 
@@ -390,6 +389,88 @@ mod tests {
         assert!(
             raise_actions.contains(&Action::AllIn(1_000)),
             "explicit all-in raise should be present with thresholds disabled: {raise_actions:?}"
+        );
+    }
+
+    #[test]
+    fn river_exact_per_round_rows_restrict_third_bet_to_allin() {
+        let board = [0, 4, 8, 12, 16];
+        let ranges = [[1.0_f32; NUM_COMBOS]; 2];
+        let sizes = vec![vec![pot(0.5)], vec![pot(0.75)], vec![BetSize::AllIn]];
+
+        let mut game = build_turn_game_exact(&board, 100.0, 1_000.0, &ranges, &sizes)
+            .expect("river exact tree should build");
+
+        let root_bet_index = game
+            .available_actions()
+            .iter()
+            .position(|action| matches!(action, Action::Bet(_)))
+            .expect("root should expose a first bet");
+        game.play(root_bet_index);
+
+        let second_bet_index = game
+            .available_actions()
+            .iter()
+            .position(|action| matches!(action, Action::Raise(_)))
+            .expect("second bet should expose a non-all-in raise");
+        game.play(second_bet_index);
+
+        let third_bet_actions = game.available_actions();
+        assert!(
+            third_bet_actions.contains(&Action::AllIn(1_000)),
+            "third bet should expose all-in: {third_bet_actions:?}"
+        );
+        assert!(
+            !third_bet_actions
+                .iter()
+                .any(|action| matches!(action, Action::Raise(_))),
+            "third bet should not expose non-all-in raises: {third_bet_actions:?}"
+        );
+    }
+
+    #[test]
+    fn river_exact_per_round_rows_force_allin_after_last_configured_row() {
+        let board = [0, 4, 8, 12, 16];
+        let ranges = [[1.0_f32; NUM_COMBOS]; 2];
+        let sizes = vec![
+            vec![pot(0.1)],
+            vec![pot(0.1)],
+            vec![pot(0.1)],
+            vec![pot(0.1)],
+            vec![pot(0.1)],
+        ];
+
+        let mut game = build_turn_game_exact(&board, 100.0, 1_000_000.0, &ranges, &sizes)
+            .expect("river exact tree should build");
+
+        let first_bet_index = game
+            .available_actions()
+            .iter()
+            .position(|action| matches!(action, Action::Bet(_)))
+            .expect("first row should expose a non-all-in bet");
+        game.play(first_bet_index);
+
+        for round in 1..=4 {
+            let actions = game.available_actions();
+            let raise_index = actions
+                .iter()
+                .position(|action| matches!(action, Action::Raise(_)))
+                .unwrap_or_else(|| {
+                    panic!("row {round} should expose a non-all-in raise: {actions:?}")
+                });
+            game.play(raise_index);
+        }
+
+        let forced_actions = game.available_actions();
+        assert!(
+            forced_actions.contains(&Action::AllIn(1_000_000)),
+            "beyond configured rows should expose all-in: {forced_actions:?}"
+        );
+        assert!(
+            !forced_actions
+                .iter()
+                .any(|action| matches!(action, Action::Raise(_))),
+            "beyond configured rows should not expose non-all-in raises: {forced_actions:?}"
         );
     }
 }

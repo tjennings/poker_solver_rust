@@ -18,6 +18,8 @@ pub const PLAYER_FOLD_FLAG: u8 = 24; // TERMINAL_FLAG(8) | 16
 pub const PLAYER_DEPTH_BOUNDARY_FLAG: u8 = 40; // TERMINAL_FLAG(8) | 32
 pub const PLAYER_GADGET_FLAG: u8 = 64; // bit 6: marks gadget Decision nodes
 
+const ALL_IN_ONLY_BET_SIZES: [BetSize; 1] = [BetSize::AllIn];
+
 // ---------------------------------------------------------------------------
 // Action
 // ---------------------------------------------------------------------------
@@ -808,7 +810,17 @@ impl ActionTree {
 
             if !info.allin_flag {
                 // raise
-                for &bet_size in &bet_options[player as usize].raise {
+                let player_options = &bet_options[player as usize];
+                let raise_sizes = if player_options.per_num_bets.is_empty() {
+                    player_options.raise.as_slice()
+                } else {
+                    player_options
+                        .per_num_bets
+                        .get(info.num_bets as usize)
+                        .map_or(ALL_IN_ONLY_BET_SIZES.as_slice(), Vec::as_slice)
+                };
+
+                for &bet_size in raise_sizes {
                     match bet_size {
                         BetSize::PotRelative(ratio) => {
                             let amount = prev_amount + (pot as f64 * ratio).round() as i32;

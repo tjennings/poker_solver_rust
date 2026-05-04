@@ -20,8 +20,9 @@
 game:
   initial_stack: 200
   # Supremus-style river action abstraction. Fold, check, and call are implicit.
-  # Rows encode the intended first bet, second bet, and third bet options.
-  # The third bet is all-in only; no non-all-in raise sizes are allowed there.
+  # Rows encode each successive bet/raise round. Row 0 is the first bet, row 1
+  # is the second bet / first raise, and so on. Later rows not listed here are
+  # forced to all-in only.
   bet_sizes:
     - ["25%", "50%", "100%", "a"]
     - ["25%", "75%", "a"]

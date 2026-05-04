@@ -71,6 +71,7 @@ fn build_turn_postflop_game(
     let bet_size_opts = BetSizeOptions {
         bet: sizes.clone(),
         raise: Vec::new(),
+        per_num_bets: Vec::new(),
     };
 
     let card_config = CardConfig {

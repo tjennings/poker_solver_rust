@@ -363,6 +363,7 @@ fn fractions_to_bet_size_options(
         BetSizeOptions {
             bet: bets,
             raise: raises,
+            per_num_bets: Vec::new(),
         }
     };
 
