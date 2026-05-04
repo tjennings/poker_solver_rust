@@ -1736,7 +1736,7 @@ mod tests {
     use super::*;
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{CardConfig, flop_from_str};
+    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
 
     fn make_depth_limited_flop_game() -> PostFlopGame {
         let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();
@@ -1762,6 +1762,45 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
         game.allocate_memory(false);
         game
+    }
+
+    fn make_one_boundary_turn_game(depth_limit: Option<u8>) -> PostFlopGame {
+        let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: range_solver::range::Range = "JJ,TT,99".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs 7h 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: range_solver::card::NOT_DEALT,
+        };
+        let turn_sizes = BetSizeOptions::try_from(("50%", "")).unwrap();
+        let river_sizes = BetSizeOptions::try_from(("50%", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 200,
+            turn_bet_sizes: [turn_sizes.clone(), turn_sizes],
+            river_bet_sizes: [river_sizes.clone(), river_sizes],
+            add_allin_threshold: 0.0,
+            force_allin_threshold: 0.0,
+            merging_threshold: 0.0,
+            depth_limit,
+            ..Default::default()
+        };
+        let mut tree = ActionTree::new(tree_config).unwrap();
+        tree.remove_line(&[Action::Bet(50), Action::Call])
+            .unwrap();
+        tree.remove_line(&[Action::Check, Action::Bet(50), Action::Call])
+            .unwrap();
+        assert!(tree.invalid_terminals().is_empty());
+
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+        game
+    }
+
+    fn run_contract_solve(game: &mut PostFlopGame, iters: u32) -> f32 {
+        run_dcfr_solve(game, iters, "contract", false, None, None).1 as f32
     }
 
     #[test]
@@ -1808,6 +1847,54 @@ mod tests {
             Street::Flop,
             [false, false, false]
         ));
+    }
+
+    #[test]
+    fn oracle_boundary_one_boundary_contract_matches_exact() {
+        let mut exact_game = make_one_boundary_turn_game(None);
+        let mut subgame = make_one_boundary_turn_game(Some(0));
+        assert_eq!(
+            subgame.num_boundary_nodes(),
+            1,
+            "test game should isolate a single boundary handoff"
+        );
+
+        let exact_exp = run_contract_solve(&mut exact_game, 400);
+        exact_game.back_to_root();
+        let exact_game = Arc::new(exact_game);
+        setup_oracle_boundaries(&mut subgame, Arc::clone(&exact_game)).unwrap();
+
+        let subgame_exp = run_contract_solve(&mut subgame, 400);
+        subgame.back_to_root();
+        let exp_delta = (subgame_exp - exact_exp).abs();
+
+        let exact_player = exact_game.current_player();
+        assert_eq!(exact_player, subgame.current_player());
+        assert_eq!(exact_game.available_actions(), subgame.available_actions());
+
+        let exact_strat = exact_game.strategy_at_index(0);
+        let subgame_strat = subgame.strategy_at_index(0);
+        let num_hands = exact_game.num_private_hands(exact_player);
+        let num_actions = exact_game.available_actions().len();
+        let (mean_mass, max_mass, max_idx) =
+            compute_mass_moved(&exact_strat, &subgame_strat, num_hands, num_actions);
+
+        eprintln!(
+            "one-boundary oracle contract: exact_exp={exact_exp:.6}, \
+             subgame_exp={subgame_exp:.6}, exp_delta={exp_delta:.6}, \
+             mean_mass={mean_mass:.6}, max_mass={max_mass:.6}, max_idx={max_idx}"
+        );
+        assert!(
+            exp_delta < 0.02,
+            "one-boundary oracle exploitability diverged: exact_exp={exact_exp:.6}, \
+             subgame_exp={subgame_exp:.6}, exp_delta={exp_delta:.6}"
+        );
+        assert!(
+            max_mass < 0.02,
+            "one-boundary oracle contract diverged: exact_exp={exact_exp:.6}, \
+             subgame_exp={subgame_exp:.6}, mean_mass={mean_mass:.6}, \
+             max_mass={max_mass:.6}, max_idx={max_idx}"
+        );
     }
 
     // ---------------------------------------------------------------
