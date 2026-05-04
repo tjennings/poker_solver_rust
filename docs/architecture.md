@@ -262,6 +262,8 @@ Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game
 
 **BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. When solving turn subgames, the solver queries BoundaryNet at river boundary nodes instead of full-depth DCFR, enabling fast turn solving. The Tauri explorer supports loading a trained BoundaryNet model via `boundary_model_path` config.
 
+Depth-boundary evaluators have two value conventions. Legacy evaluators return normalized boundary CFVs, and the range-solver converts them through the standard half-pot and opponent-reach formula before regret updates. Raw CFV evaluators return already reach-integrated per-combination chip CFVs. For raw evaluators, each boundary visit caches only the current traverser's value slot; the opposite player is computed on that player's own traversal after their current opponent reach has been recorded.
+
 ### Key Files
 
 - Config: `crates/cfvnet/src/config.rs`
