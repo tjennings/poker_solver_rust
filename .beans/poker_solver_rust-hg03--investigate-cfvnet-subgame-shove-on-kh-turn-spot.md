@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-hg03
 title: Investigate CFVNet subgame shove on Kh turn spot
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-05-04T13:38:41Z
-updated_at: 2026-05-04T14:34:11Z
+updated_at: 2026-05-04T14:35:59Z
 parent: poker_solver_rust-e90m
 ---
 
