@@ -4,7 +4,7 @@
 //! Built to debug bean izod — subgame converging worse than its blueprint seed.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use poker_solver_core::blueprint_v2::Street;
@@ -591,6 +591,13 @@ struct OracleBoundaryEvaluator {
     scale: f32,
 }
 
+struct SharedOracleBoundaryEvaluator {
+    exact_game: Arc<RwLock<PostFlopGame>>,
+    history: Vec<usize>,
+    orientation: OracleCfvOrientation,
+    scale: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleCfvOrientation {
     Current,
@@ -683,6 +690,45 @@ impl range_solver::game::BoundaryEvaluator for OracleBoundaryEvaluator {
     }
 }
 
+impl range_solver::game::BoundaryEvaluator for SharedOracleBoundaryEvaluator {
+    fn compute_cfvs(
+        &self,
+        _player: usize,
+        _pot: i32,
+        _remaining_stack: f64,
+        _opponent_reach: &[f32],
+        _num_hands: usize,
+        _continuation_index: usize,
+    ) -> Vec<f32> {
+        unreachable!("SharedOracleBoundaryEvaluator must be used through raw CFV path")
+    }
+
+    fn compute_raw_cfvs_both(
+        &self,
+        _pot: i32,
+        _remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        assert_eq!(
+            continuation_index, 0,
+            "iteration-aligned exact_oracle supports only the unbiased continuation"
+        );
+        let exact_game = self
+            .exact_game
+            .read()
+            .expect("iteration-aligned exact oracle lock poisoned");
+        let mut oop = cfvalues_after_history_with_reach(&exact_game, &self.history, 0, ip_reach);
+        let mut ip = cfvalues_after_history_with_reach(&exact_game, &self.history, 1, oop_reach);
+        scale_cfvs(&mut oop, self.scale);
+        scale_cfvs(&mut ip, self.scale);
+        Some(self.orientation.orient(oop, ip))
+    }
+}
+
 fn build_boundary_play_histories(game: &PostFlopGame) -> Vec<Vec<usize>> {
     let boundary_indices = game.boundary_node_indices();
     let n = boundary_indices.len();
@@ -757,6 +803,46 @@ fn setup_oracle_boundaries(
     eprintln!(
         "[compare] exact-oracle mode: {n_boundaries} boundaries \
          (solved exact game, orientation={}, scale={scale:.6})",
+        orientation.label()
+    );
+    Ok(())
+}
+
+fn setup_iteration_aligned_oracle_boundaries(
+    game: &mut PostFlopGame,
+    exact_game: Arc<RwLock<PostFlopGame>>,
+    orientation: OracleCfvOrientation,
+    scale: f32,
+) -> Result<(), String> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(format!(
+            "invalid --oracle-scale value {scale}: expected a positive finite value"
+        ));
+    }
+    let histories = build_boundary_play_histories(game);
+    let n_boundaries = game.num_boundary_nodes();
+    if histories.len() != n_boundaries {
+        return Err(format!(
+            "oracle boundary history count mismatch: histories={} boundaries={n_boundaries}",
+            histories.len(),
+        ));
+    }
+    let per_boundary: Vec<Arc<dyn range_solver::game::BoundaryEvaluator>> = histories
+        .into_iter()
+        .map(|history| {
+            Arc::new(SharedOracleBoundaryEvaluator {
+                exact_game: Arc::clone(&exact_game),
+                history,
+                orientation,
+                scale,
+            }) as Arc<dyn range_solver::game::BoundaryEvaluator>
+        })
+        .collect();
+    game.per_boundary_evaluators = per_boundary;
+    game.boundary_evaluator = None;
+    eprintln!(
+        "[compare] exact-oracle mode: {n_boundaries} boundaries \
+         (iteration-aligned exact game, orientation={}, scale={scale:.6})",
         orientation.label()
     );
     Ok(())
@@ -842,6 +928,120 @@ fn run_dcfr_solve(
 
     let wall = start.elapsed().as_secs_f64();
     (wall, exp as f64)
+}
+
+fn run_iteration_aligned_oracle_solve(
+    exact_game: PostFlopGame,
+    subgame_game: &mut PostFlopGame,
+    iters: u32,
+    oracle_orientation: OracleCfvOrientation,
+    oracle_scale: f32,
+    verbose: bool,
+    tracer: Option<&BoundaryTracer>,
+    spot_paths: Option<&[String]>,
+) -> Result<(PostFlopGame, f64, f64, f64, f64), String> {
+    let exact_game = Arc::new(RwLock::new(exact_game));
+    setup_iteration_aligned_oracle_boundaries(
+        subgame_game,
+        Arc::clone(&exact_game),
+        oracle_orientation,
+        oracle_scale,
+    )?;
+
+    let start = Instant::now();
+    let mut exact_wall = 0.0;
+    let mut subgame_wall = 0.0;
+    let has_per_boundary = !subgame_game.per_boundary_evaluators.is_empty();
+    let preceding_map = tracer.as_ref().map(|_| build_preceding_decision_map(subgame_game));
+
+    for t in 0..iters {
+        let exact_iter_start = Instant::now();
+        {
+            let exact_guard = exact_game
+                .write()
+                .expect("iteration-aligned exact oracle lock poisoned");
+            solve_step(&*exact_guard, t);
+        }
+        exact_wall += exact_iter_start.elapsed().as_secs_f64();
+
+        if has_per_boundary {
+            subgame_game.clear_boundary_cfvs();
+        }
+
+        let nearest_pow4 = if t == 0 {
+            0
+        } else {
+            1u32 << ((t.leading_zeros() ^ 31) & !1)
+        };
+        let t_alpha = (t as i32 - 1).max(0) as f64;
+        let t_gamma = (t - nearest_pow4) as f64;
+        let pow_alpha = t_alpha * t_alpha.sqrt();
+        let alpha = (pow_alpha / (pow_alpha + 1.0)) as f32;
+        let beta = 0.5f32;
+        let gamma = (t_gamma / (t_gamma + 1.0)).powi(3) as f32;
+        subgame_game.set_boundary_discount(alpha, beta, gamma);
+
+        let subgame_iter_start = Instant::now();
+        solve_step(subgame_game, t);
+        subgame_wall += subgame_iter_start.elapsed().as_secs_f64();
+
+        if let Some(tr) = tracer {
+            capture_boundary_traces(subgame_game, tr, spot_paths, preceding_map.as_ref(), t);
+        }
+
+        if verbose && (t + 1) % 20 == 0 {
+            let wall = start.elapsed().as_secs_f64();
+            eprintln!("[aligned] iter {}/{iters}  wall {wall:.1}s", t + 1);
+        }
+        if (t + 1) % 10 == 0 {
+            let wall = start.elapsed().as_secs_f64();
+            let per_iter = wall / (t + 1) as f64;
+            let eta = per_iter * (iters - (t + 1)) as f64;
+            eprintln!(
+                "[aligned] {}/{iters} iters | {wall:.1}s elapsed | {per_iter:.2}s/iter | ETA {eta:.0}s",
+                t + 1
+            );
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+        }
+    }
+
+    let exact_finalize_start = Instant::now();
+    {
+        let mut exact_guard = exact_game
+            .write()
+            .expect("iteration-aligned exact oracle lock poisoned");
+        finalize(&mut *exact_guard);
+        exact_guard.back_to_root();
+        exact_guard.cache_normalized_weights();
+    }
+    exact_wall += exact_finalize_start.elapsed().as_secs_f64();
+
+    let subgame_finalize_start = Instant::now();
+    finalize(subgame_game);
+    subgame_game.back_to_root();
+    subgame_game.cache_normalized_weights();
+    let saved_evaluator = subgame_game.boundary_evaluator.take();
+    let saved_per_boundary = std::mem::take(&mut subgame_game.per_boundary_evaluators);
+    let subgame_exp = compute_exploitability(subgame_game) as f64;
+    subgame_game.boundary_evaluator = saved_evaluator;
+    subgame_game.per_boundary_evaluators = saved_per_boundary;
+    subgame_wall += subgame_finalize_start.elapsed().as_secs_f64();
+
+    let exact_exp = {
+        let exact_guard = exact_game
+            .read()
+            .expect("iteration-aligned exact oracle lock poisoned");
+        compute_exploitability(&*exact_guard) as f64
+    };
+
+    subgame_game.boundary_evaluator = None;
+    subgame_game.per_boundary_evaluators.clear();
+    let exact_game = Arc::try_unwrap(exact_game)
+        .map_err(|_| "iteration-aligned exact oracle still has live references".to_string())?
+        .into_inner()
+        .map_err(|_| "iteration-aligned exact oracle lock poisoned".to_string())?;
+
+    Ok((exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp))
 }
 
 /// Find indices in private_cards matching representative sample hands.
@@ -1342,6 +1542,7 @@ pub fn run(
     oracle_boundary_flags: [bool; 3],
     oracle_orientation: OracleCfvOrientation,
     oracle_scale: f32,
+    oracle_iteration_aligned: bool,
     trace_config: crate::boundary_trace::TraceConfig,
     tolerance: f32,
     gadget: bool,
@@ -1416,6 +1617,19 @@ pub fn run(
                 .to_string(),
         );
     }
+    if oracle_iteration_aligned {
+        if !oracle_boundary_active {
+            return Err(
+                "--oracle-iteration-aligned requires an exact_oracle boundary mode".to_string(),
+            );
+        }
+        if exact_iters != subgame_iters {
+            return Err(
+                "--oracle-iteration-aligned requires --exact-iters and --subgame-iters to match"
+                    .to_string(),
+            );
+        }
+    }
 
     // Print header (display values in BB = chips / 2)
     let pot_bb = pot as f64 / 2.0;
@@ -1430,7 +1644,7 @@ pub fn run(
         format!("exact={exact_iters}, subgame={subgame_iters}")
     };
     println!(
-        "iters: {iter_label}  boundary: {}",
+        "iters: {iter_label}  boundary: {}{}",
         match &boundary_cut {
             Some((d, BoundaryKind::Cfvnet(p))) => format!("depth={d}, model={p}"),
             Some((d, BoundaryKind::ExactSubtree)) if oracle_boundary_active => {
@@ -1438,6 +1652,11 @@ pub fn run(
             }
             Some((d, BoundaryKind::ExactSubtree)) => format!("depth={d}, exact_subtree"),
             None => "all-exact".to_string(),
+        },
+        if oracle_iteration_aligned {
+            "  oracle_alignment=iteration"
+        } else {
+            ""
         }
     );
     println!();
@@ -1578,32 +1797,60 @@ pub fn run(
         None
     };
 
-    // 8. Solve exact
-    eprintln!("[compare] solving exact ({exact_iters} iters)...");
-    let (exact_wall, exact_exp) =
-        run_dcfr_solve(&mut exact_game, exact_iters, "exact", verbose, None, None);
-    exact_game.back_to_root();
-    let exact_game = Arc::new(exact_game);
+    let (exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp) =
+        if oracle_iteration_aligned {
+            eprintln!(
+                "[compare] solving exact/subgame in iteration-aligned mode ({exact_iters} iters)..."
+            );
+            run_iteration_aligned_oracle_solve(
+                exact_game,
+                &mut subgame_game,
+                exact_iters,
+                oracle_orientation,
+                oracle_scale,
+                verbose,
+                tracer.as_ref(),
+                spot_paths.as_deref(),
+            )
+            .map(|(exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp)| {
+                (
+                    Arc::new(exact_game),
+                    exact_wall,
+                    exact_exp,
+                    subgame_wall,
+                    subgame_exp,
+                )
+            })?
+        } else {
+            // 8. Solve exact
+            eprintln!("[compare] solving exact ({exact_iters} iters)...");
+            let (exact_wall, exact_exp) =
+                run_dcfr_solve(&mut exact_game, exact_iters, "exact", verbose, None, None);
+            exact_game.back_to_root();
+            let exact_game = Arc::new(exact_game);
 
-    if oracle_boundary_active {
-        setup_oracle_boundaries(
-            &mut subgame_game,
-            Arc::clone(&exact_game),
-            oracle_orientation,
-            oracle_scale,
-        )?;
-    }
+            if oracle_boundary_active {
+                setup_oracle_boundaries(
+                    &mut subgame_game,
+                    Arc::clone(&exact_game),
+                    oracle_orientation,
+                    oracle_scale,
+                )?;
+            }
 
-    // 9. Solve subgame (with optional tracer)
-    eprintln!("[compare] solving subgame ({subgame_iters} iters)...");
-    let (subgame_wall, subgame_exp) = run_dcfr_solve(
-        &mut subgame_game,
-        subgame_iters,
-        "subgame",
-        verbose,
-        tracer.as_ref(),
-        spot_paths.as_deref(),
-    );
+            // 9. Solve subgame (with optional tracer)
+            eprintln!("[compare] solving subgame ({subgame_iters} iters)...");
+            let (subgame_wall, subgame_exp) = run_dcfr_solve(
+                &mut subgame_game,
+                subgame_iters,
+                "subgame",
+                verbose,
+                tracer.as_ref(),
+                spot_paths.as_deref(),
+            );
+
+            (exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp)
+        };
 
     // 10. Extract strategies at root
     subgame_game.back_to_root();

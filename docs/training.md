@@ -399,6 +399,7 @@ Options:
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
 - `--subgame-iters <N>` -- Hidden diagnostic override for subgame solve iterations; defaults to `--iters`.
+- `--oracle-iteration-aligned` -- Hidden `exact_oracle` diagnostic. Runs exact and subgame in lockstep and evaluates each subgame boundary against the exact continuation at the same iteration. Requires matching `--exact-iters` and `--subgame-iters`.
 
 Boundary modes:
 - `exact` -- Continue solving through the full tree with no depth boundary.

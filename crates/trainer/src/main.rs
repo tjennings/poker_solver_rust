@@ -410,6 +410,10 @@ enum Commands {
         #[arg(long, default_value_t = 1.0, hide = true)]
         oracle_scale: f32,
 
+        /// Diagnostic exact_oracle mode: solve exact and subgame in lockstep.
+        #[arg(long, default_value_t = false, hide = true)]
+        oracle_iteration_aligned: bool,
+
         /// Boundary ordinals to trace (comma-separated, or "all").
         /// Produces one JSONL file per ordinal in --trace-dir.
         #[arg(long)]
@@ -1456,6 +1460,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             river_model,
             oracle_orientation,
             oracle_scale,
+            oracle_iteration_aligned,
             trace_boundaries,
             trace_iters,
             trace_dir,
@@ -1520,6 +1525,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 oracle_boundary_flags,
                 oracle_orientation,
                 oracle_scale,
+                oracle_iteration_aligned,
                 trace_config,
                 tolerance,
                 gadget,
@@ -3189,6 +3195,7 @@ snapshots:
             "1000",
             "--subgame-iters",
             "400",
+            "--oracle-iteration-aligned",
         ]);
         assert!(
             cli.is_ok(),
@@ -3200,12 +3207,14 @@ snapshots:
             iters,
             exact_iters,
             subgame_iters,
+            oracle_iteration_aligned,
             ..
         } = cli.unwrap().command
         {
             assert_eq!(iters, 200);
             assert_eq!(exact_iters, Some(1000));
             assert_eq!(subgame_iters, Some(400));
+            assert!(oracle_iteration_aligned);
         } else {
             panic!("expected CompareSolve variant");
         }
