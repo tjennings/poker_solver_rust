@@ -24,10 +24,11 @@ use poker_solver_tauri::{
 };
 
 use range_solver::card::card_to_string;
+use range_solver::game::BoundaryEvaluator;
 use range_solver::interface::Game;
 use range_solver::{
-    Action, PostFlopGame, cfvalues_after_history_with_reach, compute_exploitability, finalize,
-    root_action_cfvalues, root_regrets, solve_step,
+    Action, PostFlopGame, cfvalues_after_history_with_reach, compute_current_ev,
+    compute_exploitability, finalize, root_action_cfvalues, root_regrets, solve_step,
 };
 
 use crate::boundary_trace::{
@@ -47,6 +48,15 @@ pub struct BoundaryCfvStats {
     pub mean: f32,
     pub stddev: f32,
     pub count_nonzero: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BoundaryCfvDeltaStats {
+    mean_abs: f32,
+    max_abs: f32,
+    rmse: f32,
+    corr: f32,
+    magnitude_ratio: f32,
 }
 
 impl BoundaryCfvStats {
@@ -82,8 +92,8 @@ impl BoundaryCfvStats {
         let var = cfvs
             .iter()
             .map(|&v| {
-            let d = v as f64 - mean;
-            d * d
+                let d = v as f64 - mean;
+                d * d
             })
             .sum::<f64>()
             / n;
@@ -94,6 +104,68 @@ impl BoundaryCfvStats {
             stddev: var.sqrt() as f32,
             count_nonzero,
         }
+    }
+}
+
+fn cfv_magnitude(stats: &BoundaryCfvStats) -> f32 {
+    stats.mean.abs().max(stats.stddev.abs()).max(1e-10)
+}
+
+fn cfv_delta_stats(candidate: &[f32], reference: &[f32]) -> BoundaryCfvDeltaStats {
+    let n = candidate.len().min(reference.len());
+    if n == 0 {
+        return BoundaryCfvDeltaStats {
+            mean_abs: 0.0,
+            max_abs: 0.0,
+            rmse: 0.0,
+            corr: 0.0,
+            magnitude_ratio: 0.0,
+        };
+    }
+
+    let mut sum_abs = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut cand_sum = 0.0f64;
+    let mut ref_sum = 0.0f64;
+    for i in 0..n {
+        let delta = candidate[i] - reference[i];
+        let abs = delta.abs();
+        sum_abs += abs as f64;
+        sum_sq += (delta as f64) * (delta as f64);
+        max_abs = max_abs.max(abs);
+        cand_sum += candidate[i] as f64;
+        ref_sum += reference[i] as f64;
+    }
+
+    let inv_n = 1.0 / n as f64;
+    let cand_mean = cand_sum * inv_n;
+    let ref_mean = ref_sum * inv_n;
+    let mut cov = 0.0f64;
+    let mut cand_var = 0.0f64;
+    let mut ref_var = 0.0f64;
+    for i in 0..n {
+        let cand = candidate[i] as f64 - cand_mean;
+        let reference = reference[i] as f64 - ref_mean;
+        cov += cand * reference;
+        cand_var += cand * cand;
+        ref_var += reference * reference;
+    }
+    let corr = if cand_var > 0.0 && ref_var > 0.0 {
+        (cov / (cand_var.sqrt() * ref_var.sqrt())) as f32
+    } else {
+        0.0
+    };
+
+    let cand_stats = BoundaryCfvStats::from_slice(&candidate[..n]);
+    let ref_stats = BoundaryCfvStats::from_slice(&reference[..n]);
+
+    BoundaryCfvDeltaStats {
+        mean_abs: (sum_abs * inv_n) as f32,
+        max_abs,
+        rmse: (sum_sq * inv_n).sqrt() as f32,
+        corr,
+        magnitude_ratio: cfv_magnitude(&cand_stats) / cfv_magnitude(&ref_stats),
     }
 }
 
@@ -130,8 +202,8 @@ pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
     let magnitudes: Vec<f64> = all_stats
         .iter()
         .map(|s| {
-        let m = s.mean.abs().max(s.stddev.abs()) as f64;
-        if m < 1e-10 { 1e-10 } else { m }
+            let m = s.mean.abs().max(s.stddev.abs()) as f64;
+            if m < 1e-10 { 1e-10 } else { m }
         })
         .collect();
     if magnitudes.len() < 2 {
@@ -320,7 +392,7 @@ pub fn top_hands_by_mass(
             let subgame_probs: Vec<f32> = (0..num_actions)
                 .map(|a| subgame[a * num_hands + h])
                 .collect();
-        (h, mass, exact_probs, subgame_probs)
+            (h, mass, exact_probs, subgame_probs)
         })
         .collect()
 }
@@ -515,11 +587,11 @@ fn setup_neural_boundaries(
         let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
             Some(provider) => Arc::new(poker_solver_tauri::gadget::GadgetEvaluator::new(
-                    inner,
-                    Arc::clone(provider),
-                    ordinal,
-                    board_4,
-                    private_cards_pair,
+                inner,
+                Arc::clone(provider),
+                ordinal,
+                board_4,
+                private_cards_pair,
             )),
             None => inner,
         };
@@ -574,11 +646,11 @@ fn setup_exact_subtree_boundaries(
         );
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
             Some(provider) => Arc::new(poker_solver_tauri::gadget::GadgetEvaluator::new(
-                    eval,
-                    Arc::clone(provider),
-                    ordinal,
-                    board.clone(),
-                    private_cards.clone(),
+                eval,
+                Arc::clone(provider),
+                ordinal,
+                board.clone(),
+                private_cards.clone(),
             )),
             None => eval,
         };
@@ -1185,7 +1257,9 @@ fn run_iteration_aligned_oracle_solve(
     let mut exact_wall = 0.0;
     let mut subgame_wall = 0.0;
     let has_per_boundary = !subgame_game.per_boundary_evaluators.is_empty();
-    let preceding_map = tracer.as_ref().map(|_| build_preceding_decision_map(subgame_game));
+    let preceding_map = tracer
+        .as_ref()
+        .map(|_| build_preceding_decision_map(subgame_game));
 
     for t in 0..iters {
         let trace_root_update = should_trace_root_update(root_update_trace_iters, t);
@@ -1313,11 +1387,11 @@ fn find_sample_hand_indices(private_cards: &[(u8, u8)]) -> Vec<(String, usize)> 
     // Card IDs: rank = card >> 2, suit = card & 3
     // 2=0..A=12, club=0 diamond=1 heart=2 spade=3
     let targets: Vec<(&str, u8, u8)> = vec![
-        ("AA",  48, 51), // Ac As
+        ("AA", 48, 51),  // Ac As
         ("AKs", 48, 44), // Ac Kc
-        ("JJ",  36, 37), // Jc Jd
-        ("54s", 12,  8), // 5c 4c
-        ("72o", 20,  1), // 7c 2d
+        ("JJ", 36, 37),  // Jc Jd
+        ("54s", 12, 8),  // 5c 4c
+        ("72o", 20, 1),  // 7c 2d
     ];
 
     let mut result = Vec::new();
@@ -1461,6 +1535,219 @@ fn dump_boundary_cfv_stats(game: &PostFlopGame, pot: i32, eff_stack: i32) {
         }
     }
     println!();
+}
+
+fn top_cfv_delta_rows(
+    candidate: &[f32],
+    reference: &[f32],
+    private_cards: &[(u8, u8)],
+    limit: usize,
+) -> Vec<String> {
+    let n = candidate
+        .len()
+        .min(reference.len())
+        .min(private_cards.len());
+    let mut rows: Vec<(f32, usize)> = (0..n)
+        .map(|i| ((candidate[i] - reference[i]).abs(), i))
+        .collect();
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    rows.into_iter()
+        .take(limit)
+        .map(|(_, i)| {
+            let (c1, c2) = private_cards[i];
+            let delta = candidate[i] - reference[i];
+            format!(
+                "{} cand={:.6} ref={:.6} delta={:+.6}",
+                format_hand(c1, c2),
+                candidate[i],
+                reference[i],
+                delta,
+            )
+        })
+        .collect()
+}
+
+fn print_boundary_cfv_comparison(
+    game: &PostFlopGame,
+    exact_game: &PostFlopGame,
+    oracle_orientation: OracleCfvOrientation,
+    oracle_scale: f32,
+    exact_subtree_iters: u32,
+    exact_subtree_target_exp: f32,
+) -> Result<(), String> {
+    let n_boundaries = game.num_boundary_nodes();
+    if n_boundaries == 0 || game.per_boundary_evaluators.is_empty() {
+        println!("=== Boundary CFV comparison skipped: no per-boundary evaluators ===");
+        return Ok(());
+    }
+
+    // Force one read-only evaluation pass before solving. This populates the
+    // boundary reach cache using the same seeded strategy that will feed the
+    // depth-boundary evaluators during DCFR.
+    let _ = compute_current_ev(game);
+    game.clear_boundary_cfvs();
+
+    let boundary_indices = game.boundary_node_indices();
+    let boundary_boards = game.boundary_boards();
+    let histories = build_boundary_play_histories(game);
+    let tree_cfg = game.tree_config().clone();
+    let private_cards = [
+        game.private_cards(0).to_vec(),
+        game.private_cards(1).to_vec(),
+    ];
+    let initial_weights = [
+        game.initial_weights(0).to_vec(),
+        game.initial_weights(1).to_vec(),
+    ];
+    let num_oop = game.num_private_hands(0);
+    let num_ip = game.num_private_hands(1);
+
+    println!();
+    println!(
+        "=== Boundary CFV comparison: injected candidate vs exact oracle ({n_boundaries} boundaries) ==="
+    );
+    println!(
+        "exact_subtree raw control: iters={exact_subtree_iters}, target_exp={exact_subtree_target_exp:.3}"
+    );
+
+    let mut all_oop = Vec::new();
+    let mut all_ip = Vec::new();
+    let mut all_subtree_oop = Vec::new();
+    let mut all_subtree_ip = Vec::new();
+
+    for ordinal in 0..n_boundaries {
+        let Some(board) = boundary_boards.get(ordinal) else {
+            continue;
+        };
+        let node_idx = boundary_indices[ordinal];
+        let node = game.node_at(node_idx);
+        let pot_at = game.tree_config().starting_pot + 2 * node.bet_amount();
+        let remaining = (game.tree_config().effective_stack as f64 - pot_at as f64 / 2.0).max(0.0);
+        let turn_str = card_to_string(node.turn_card()).unwrap_or_else(|_| "--".to_string());
+        let river_str = card_to_string(node.river_card()).unwrap_or_else(|_| "--".to_string());
+        drop(node);
+
+        let oop_reach = game.boundary_reach(ordinal, 0);
+        let ip_reach = game.boundary_reach(ordinal, 1);
+        let oop_reach_ref = if oop_reach.is_empty() {
+            game.initial_weights(0)
+        } else {
+            oop_reach.as_slice()
+        };
+        let ip_reach_ref = if ip_reach.is_empty() {
+            game.initial_weights(1)
+        } else {
+            ip_reach.as_slice()
+        };
+
+        game.clear_boundary_cfvs();
+        let cand_oop =
+            cfvalues_after_history_with_reach(game, &histories[ordinal], 0, ip_reach_ref);
+        let cand_ip =
+            cfvalues_after_history_with_reach(game, &histories[ordinal], 1, oop_reach_ref);
+        game.clear_boundary_cfvs();
+
+        let exact_eval = poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
+            board.clone(),
+            private_cards.clone(),
+            initial_weights.clone(),
+            tree_cfg.clone(),
+        )
+        .with_solve_iters(exact_subtree_iters)
+        .with_target_exploitability(exact_subtree_target_exp);
+        let Some((subtree_oop, subtree_ip)) = exact_eval.compute_raw_cfvs_both(
+            pot_at,
+            remaining,
+            oop_reach_ref,
+            ip_reach_ref,
+            num_oop,
+            num_ip,
+            0,
+        ) else {
+            return Err("exact_subtree reference did not provide raw CFVs".to_string());
+        };
+
+        let mut oracle_oop =
+            cfvalues_after_history_with_reach(exact_game, &histories[ordinal], 0, ip_reach_ref);
+        let mut oracle_ip =
+            cfvalues_after_history_with_reach(exact_game, &histories[ordinal], 1, oop_reach_ref);
+        scale_cfvs(&mut oracle_oop, oracle_scale);
+        scale_cfvs(&mut oracle_ip, oracle_scale);
+        let (oracle_oop, oracle_ip) = oracle_orientation.orient(oracle_oop, oracle_ip);
+
+        let oop_delta = cfv_delta_stats(&cand_oop, &oracle_oop);
+        let ip_delta = cfv_delta_stats(&cand_ip, &oracle_ip);
+        let subtree_oop_delta = cfv_delta_stats(&subtree_oop, &oracle_oop);
+        let subtree_ip_delta = cfv_delta_stats(&subtree_ip, &oracle_ip);
+        all_oop.push(oop_delta.clone());
+        all_ip.push(ip_delta.clone());
+        all_subtree_oop.push(subtree_oop_delta.clone());
+        all_subtree_ip.push(subtree_ip_delta.clone());
+
+        println!(
+            "--- boundary {ordinal}: pot={pot_at} remaining={remaining:.1} turn={turn_str} river={river_str} ---"
+        );
+        println!(
+            "  OOP candidate-vs-oracle: mean_abs={:.6} rmse={:.6} max_abs={:.6} corr={:.4} mag_ratio={:.3}",
+            oop_delta.mean_abs,
+            oop_delta.rmse,
+            oop_delta.max_abs,
+            oop_delta.corr,
+            oop_delta.magnitude_ratio,
+        );
+        println!(
+            "  IP  candidate-vs-oracle: mean_abs={:.6} rmse={:.6} max_abs={:.6} corr={:.4} mag_ratio={:.3}",
+            ip_delta.mean_abs,
+            ip_delta.rmse,
+            ip_delta.max_abs,
+            ip_delta.corr,
+            ip_delta.magnitude_ratio,
+        );
+        println!(
+            "  exact_subtree-vs-oracle: OOP mean_abs={:.6} corr={:.4}; IP mean_abs={:.6} corr={:.4}",
+            subtree_oop_delta.mean_abs,
+            subtree_oop_delta.corr,
+            subtree_ip_delta.mean_abs,
+            subtree_ip_delta.corr,
+        );
+        for row in top_cfv_delta_rows(&cand_oop, &oracle_oop, &private_cards[0], 3) {
+            println!("    OOP top_delta {row}");
+        }
+        for row in top_cfv_delta_rows(&cand_ip, &oracle_ip, &private_cards[1], 3) {
+            println!("    IP  top_delta {row}");
+        }
+    }
+
+    if !all_oop.is_empty() {
+        let avg = |values: &[BoundaryCfvDeltaStats], f: fn(&BoundaryCfvDeltaStats) -> f32| {
+            values.iter().map(f).sum::<f32>() / values.len() as f32
+        };
+        println!("=== Boundary CFV comparison aggregate ===");
+        println!(
+            "OOP avg: mean_abs={:.6} rmse={:.6} corr={:.4} mag_ratio={:.3}",
+            avg(&all_oop, |s| s.mean_abs),
+            avg(&all_oop, |s| s.rmse),
+            avg(&all_oop, |s| s.corr),
+            avg(&all_oop, |s| s.magnitude_ratio),
+        );
+        println!(
+            "IP  avg: mean_abs={:.6} rmse={:.6} corr={:.4} mag_ratio={:.3}",
+            avg(&all_ip, |s| s.mean_abs),
+            avg(&all_ip, |s| s.rmse),
+            avg(&all_ip, |s| s.corr),
+            avg(&all_ip, |s| s.magnitude_ratio),
+        );
+        println!(
+            "exact_subtree raw control avg: OOP mean_abs={:.6} corr={:.4}; IP mean_abs={:.6} corr={:.4}",
+            avg(&all_subtree_oop, |s| s.mean_abs),
+            avg(&all_subtree_oop, |s| s.corr),
+            avg(&all_subtree_ip, |s| s.mean_abs),
+            avg(&all_subtree_ip, |s| s.corr),
+        );
+    }
+    println!();
+
+    Ok(())
 }
 
 /// Format a range-solver action for display.
@@ -1640,15 +1927,15 @@ fn build_inner_evaluator(
     let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> = match boundary_cut {
         Some((_, BoundaryKind::ExactSubtree)) | None => Arc::new(
             poker_solver_tauri::exact_subtree::SubtreeExactEvaluator::new(
-                    board_u8.to_vec(),
-                    private_cards,
-                    initial_weights,
-                    tree_cfg,
+                board_u8.to_vec(),
+                private_cards,
+                initial_weights,
+                tree_cfg,
             )
             .with_solve_iters(solve_iters)
             .with_target_exploitability(target_exp),
         ),
-            Some((_, BoundaryKind::Cfvnet(model_path))) => {
+        Some((_, BoundaryKind::Cfvnet(model_path))) => {
             let session =
                 cfvnet::eval::boundary_evaluator::load_shared_onnx_session(Path::new(model_path))
                     .map_err(|e| format!("ONNX session load failed: {e}"))?;
@@ -1659,8 +1946,8 @@ fn build_inner_evaluator(
                     private_cards,
                 ),
             )
-            }
-        };
+        }
+    };
     Ok(evaluator)
 }
 
@@ -2036,8 +2323,6 @@ pub fn run(
         subgame_seed_start,
     );
 
-    let _ = dump_boundary_cfvs;
-
     // 7b. Build boundary tracer (no-op if --trace-boundaries not given)
     // In gadget-tree mode ordinals 0 and 1 are static gadget terminals
     // whose CFVs never change during solve -- skip tracing them.
@@ -2066,23 +2351,24 @@ pub fn run(
         None
     };
 
-    let (exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp) =
-        if oracle_iteration_aligned {
-            eprintln!(
-                "[compare] solving exact/subgame in iteration-aligned mode ({exact_iters} iters)..."
-            );
-            run_iteration_aligned_oracle_solve(
-                exact_game,
-                &mut subgame_game,
-                exact_iters,
-                oracle_orientation,
-                oracle_scale,
-                &root_update_trace_iters,
-                verbose,
-                tracer.as_ref(),
-                spot_paths.as_deref(),
-            )
-            .map(|(exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp)| {
+    let (exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp) = if oracle_iteration_aligned
+    {
+        eprintln!(
+            "[compare] solving exact/subgame in iteration-aligned mode ({exact_iters} iters)..."
+        );
+        run_iteration_aligned_oracle_solve(
+            exact_game,
+            &mut subgame_game,
+            exact_iters,
+            oracle_orientation,
+            oracle_scale,
+            &root_update_trace_iters,
+            verbose,
+            tracer.as_ref(),
+            spot_paths.as_deref(),
+        )
+        .map(
+            |(exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp)| {
                 (
                     Arc::new(exact_game),
                     exact_wall,
@@ -2090,37 +2376,52 @@ pub fn run(
                     subgame_wall,
                     subgame_exp,
                 )
-            })?
-        } else {
-            // 8. Solve exact
-            eprintln!("[compare] solving exact ({exact_iters} iters)...");
-            let (exact_wall, exact_exp) =
-                run_dcfr_solve(&mut exact_game, exact_iters, "exact", verbose, None, None);
-            exact_game.back_to_root();
-            let exact_game = Arc::new(exact_game);
+            },
+        )?
+    } else {
+        // 8. Solve exact
+        eprintln!("[compare] solving exact ({exact_iters} iters)...");
+        let (exact_wall, exact_exp) =
+            run_dcfr_solve(&mut exact_game, exact_iters, "exact", verbose, None, None);
+        exact_game.back_to_root();
+        let exact_game = Arc::new(exact_game);
 
-            if oracle_boundary_active {
-                setup_oracle_boundaries(
-                    &mut subgame_game,
-                    Arc::clone(&exact_game),
-                    oracle_orientation,
-                    oracle_scale,
-                )?;
-            }
-
-            // 9. Solve subgame (with optional tracer)
-            eprintln!("[compare] solving subgame ({subgame_iters} iters)...");
-            let (subgame_wall, subgame_exp) = run_dcfr_solve(
+        if oracle_boundary_active {
+            setup_oracle_boundaries(
                 &mut subgame_game,
-                subgame_iters,
-                "subgame",
-                verbose,
-                tracer.as_ref(),
-                spot_paths.as_deref(),
-            );
+                Arc::clone(&exact_game),
+                oracle_orientation,
+                oracle_scale,
+            )?;
+        }
 
-            (exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp)
-        };
+        if dump_boundary_cfvs {
+            print_boundary_cfv_comparison(
+                &subgame_game,
+                exact_game.as_ref(),
+                oracle_orientation,
+                oracle_scale,
+                subgame_iters,
+                3.0,
+            )?;
+            let _ = compute_current_ev(&subgame_game);
+            dump_boundary_cfv_stats(&subgame_game, pot, eff_stack);
+            subgame_game.clear_boundary_cfvs();
+        }
+
+        // 9. Solve subgame (with optional tracer)
+        eprintln!("[compare] solving subgame ({subgame_iters} iters)...");
+        let (subgame_wall, subgame_exp) = run_dcfr_solve(
+            &mut subgame_game,
+            subgame_iters,
+            "subgame",
+            verbose,
+            tracer.as_ref(),
+            spot_paths.as_deref(),
+        );
+
+        (exact_game, exact_wall, exact_exp, subgame_wall, subgame_exp)
+    };
 
     // 10. Extract strategies at root
     subgame_game.back_to_root();
@@ -2299,8 +2600,8 @@ fn aggregate_by_class(
             .entry(class)
             .or_insert_with(|| (0.0, vec![0.0; num_actions]));
         entry.0 += 1.0; // uniform weight across combos (tolerance check treats
-                         // all AA combos equally); reach-weighted comparison is
-                         // future work — simple-mean is adequate for 0.1%.
+        // all AA combos equally); reach-weighted comparison is
+        // future work — simple-mean is adequate for 0.1%.
         for a in 0..num_actions {
             entry.1[a] += strategy[a * num_hands + h] as f64;
         }
@@ -2395,8 +2696,7 @@ mod tests {
             ..Default::default()
         };
         let mut tree = ActionTree::new(tree_config).unwrap();
-        tree.remove_line(&[Action::Bet(50), Action::Call])
-            .unwrap();
+        tree.remove_line(&[Action::Bet(50), Action::Call]).unwrap();
         tree.remove_line(&[Action::Check, Action::Bet(50), Action::Call])
             .unwrap();
         assert!(tree.invalid_terminals().is_empty());
@@ -2573,7 +2873,7 @@ mod tests {
         // exact: hand 0 always action 0, hand 1 always action 1
         // subgame: opposite
         // 2 actions, 2 hands
-        let exact   = vec![1.0f32, 0.0, 0.0, 1.0]; // a0: [1,0], a1: [0,1]
+        let exact = vec![1.0f32, 0.0, 0.0, 1.0]; // a0: [1,0], a1: [0,1]
         let subgame = vec![0.0f32, 1.0, 1.0, 0.0]; // a0: [0,1], a1: [1,0]
         let (mean, max, max_idx) = compute_mass_moved(&exact, &subgame, 2, 2);
         // Each hand has |1-0|+|0-1| = 2, /2 = 1.0
@@ -2588,7 +2888,7 @@ mod tests {
         // 3 actions, 2 hands
         // exact:   a0=[0.5, 0.2], a1=[0.3, 0.5], a2=[0.2, 0.3]
         // subgame: a0=[0.6, 0.1], a1=[0.2, 0.6], a2=[0.2, 0.3]
-        let exact   = vec![0.5, 0.2, 0.3, 0.5, 0.2, 0.3];
+        let exact = vec![0.5, 0.2, 0.3, 0.5, 0.2, 0.3];
         let subgame = vec![0.6, 0.1, 0.2, 0.6, 0.2, 0.3];
         let (mean, max, max_idx) = compute_mass_moved(&exact, &subgame, 2, 3);
         // hand 0: |0.5-0.6|+|0.3-0.2|+|0.2-0.2| = 0.1+0.1+0 = 0.2, /2 = 0.1
@@ -2626,7 +2926,7 @@ mod tests {
         // 2 actions (Fold, Call), 3 hands
         // exact:   fold=[0.3, 0.3, 0.3], call=[0.7, 0.7, 0.7]
         // subgame: fold=[0.5, 0.5, 0.5], call=[0.5, 0.5, 0.5]
-        let exact   = vec![0.3, 0.3, 0.3, 0.7, 0.7, 0.7];
+        let exact = vec![0.3, 0.3, 0.3, 0.7, 0.7, 0.7];
         let subgame = vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
         let labels = vec!["Fold".to_string(), "Call".to_string()];
         let bias = compute_action_bias(&exact, &subgame, 3, &labels);
@@ -2667,8 +2967,8 @@ mod tests {
         // 2 actions, 4 hands
         // exact:   a0=[0.5, 0.2, 0.9, 0.4], a1=[0.5, 0.8, 0.1, 0.6]
         // subgame: a0=[0.5, 0.5, 0.1, 0.4], a1=[0.5, 0.5, 0.9, 0.6]
-        let exact   = vec![0.5, 0.2, 0.9, 0.4,  0.5, 0.8, 0.1, 0.6];
-        let subgame = vec![0.5, 0.5, 0.1, 0.4,  0.5, 0.5, 0.9, 0.6];
+        let exact = vec![0.5, 0.2, 0.9, 0.4, 0.5, 0.8, 0.1, 0.6];
+        let subgame = vec![0.5, 0.5, 0.1, 0.4, 0.5, 0.5, 0.9, 0.6];
         let top = top_hands_by_mass(&exact, &subgame, 4, 2, 2);
         assert_eq!(top.len(), 2);
         // hand 2 has mass = (|0.9-0.1|+|0.1-0.9|)/2 = 0.8
@@ -2683,7 +2983,7 @@ mod tests {
 
     #[test]
     fn top_hands_includes_strategy_vectors() {
-        let exact   = vec![1.0f32, 0.0, 0.0, 1.0];
+        let exact = vec![1.0f32, 0.0, 0.0, 1.0];
         let subgame = vec![0.0f32, 1.0, 1.0, 0.0];
         let top = top_hands_by_mass(&exact, &subgame, 2, 2, 1);
         assert_eq!(top.len(), 1);
@@ -2825,6 +3125,33 @@ mod tests {
         assert!((stats.mean - 7.0).abs() < 1e-6);
         assert!((stats.stddev - 0.0).abs() < 1e-6);
         assert_eq!(stats.count_nonzero, 100);
+    }
+
+    #[test]
+    fn cfv_delta_stats_identical_vectors() {
+        let stats = cfv_delta_stats(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+        assert_eq!(stats.mean_abs, 0.0);
+        assert_eq!(stats.max_abs, 0.0);
+        assert_eq!(stats.rmse, 0.0);
+        assert!((stats.corr - 1.0).abs() < 1e-6);
+        assert!((stats.magnitude_ratio - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cfv_delta_stats_detects_scale_and_orientation() {
+        let stats = cfv_delta_stats(&[-2.0, -4.0, -6.0], &[1.0, 2.0, 3.0]);
+        assert!(stats.mean_abs > 0.0);
+        assert!(stats.corr < -0.99);
+        assert!((stats.magnitude_ratio - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_cfv_delta_rows_sort_by_abs_delta() {
+        let private_cards = vec![(48, 51), (40, 44), (0, 4)];
+        let rows = top_cfv_delta_rows(&[1.0, 10.0, 3.0], &[1.0, 4.0, -3.0], &private_cards, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("delta=+6.000000"));
+        assert!(rows[1].contains("delta=+6.000000"));
     }
 
     // ---------------------------------------------------------------

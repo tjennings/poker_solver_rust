@@ -5,11 +5,11 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-04T13:38:41Z
-updated_at: 2026-05-04T13:43:18Z
+updated_at: 2026-05-04T14:22:02Z
 parent: poker_solver_rust-e90m
 ---
 
-Tauri subgame with cfvnet boundary reports an always-shove strategy while exact reports always-call on spot: sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Kh.\n\n## Tasks\n\n- [x] Reproduce the spot in compare-solve with the local cfvnet model.\n- [x] Compare against exact and exact_oracle/exact_subtree controls where possible.\n- [ ] Determine whether this is Tauri wiring, compare-solve parity, CFVNet value calibration, or model/domain mismatch.\n- [ ] Fix or document the next concrete repair step.
+Tauri subgame with cfvnet boundary reports an always-shove strategy while exact reports always-call on spot: sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Kh.\n\n## Tasks\n\n- [x] Reproduce the spot in compare-solve with the local cfvnet model.\n- [x] Compare against exact and exact_oracle/exact_subtree controls where possible.\n- [x] Determine whether this is Tauri wiring, compare-solve parity, CFVNet value calibration, or model/domain mismatch.\n- [ ] Fix or document the next concrete repair step.
 
 ## 2026-05-04 Cross-Check Results
 
@@ -24,3 +24,16 @@ Controls on the same spot:
 - `exact_subtree`: final_exp 243.43 mbb/hand, mean mass moved 0.032. This is still worse than oracle but does not reproduce the always-shove/all-bet collapse.
 
 Conclusion so far: this isolates the reported Tauri behavior to CFVNet boundary values/model-domain behavior rather than Tauri wiring or the generic boundary injection path.
+
+## 2026-05-04 CFVNet Boundary Diagnostic
+
+Added `compare-solve --dump-boundary-cfvs` diagnostics that compare the injected boundary contribution against `exact_oracle` raw CFVs and print an `exact_subtree` raw-control comparison before the subgame solve.
+
+Kh spot result with `checkpoint_epoch675.onnx`:
+
+- CFVNet is not sign-flipped: aggregate candidate-vs-oracle correlation is positive (OOP 0.8448, IP 0.8739).
+- CFVNet is not grossly unit-scaled: aggregate magnitude ratio is OOP 0.719, IP 0.683.
+- CFVNet is materially noisy/damped versus oracle: aggregate mean_abs is OOP 0.397778, IP 0.346796, with boundary-level max deltas up to roughly 2.48 raw CFV.
+- Exact-subtree raw control is closer overall (OOP mean_abs 0.267354/corr 0.9727, IP mean_abs 0.146042/corr 0.9859) but still has some noisy OOP high-pot boundaries.
+
+Conclusion: this is not Tauri wiring, compare-solve parity, player orientation, or a simple scalar unit bug. The next concrete repair path is to quantify which boundary/value errors flip the root regrets, then decide between model retraining/domain coverage for paired-turn Kx spots and a safer boundary handoff/dampening strategy.
