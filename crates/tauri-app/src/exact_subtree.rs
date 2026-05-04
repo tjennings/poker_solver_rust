@@ -169,8 +169,116 @@ fn solve_subtree(
     solve_iters: u32,
     target_exploitability: f32,
 ) -> (Vec<f32>, Vec<f32>) {
-    if reach_is_all_zero(oop_reach) || reach_is_all_zero(ip_reach) {
+    let (oop_raw, ip_raw, game_private_cards) = solve_subtree_raw_inner(
+        board,
+        private_cards,
+        parent_weights,
+        parent_tree_config,
+        pot,
+        remaining_stack,
+        oop_reach,
+        ip_reach,
+        solve_iters,
+        target_exploitability,
+    );
+
+    if oop_raw.is_empty() && ip_raw.is_empty() {
         return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
+    }
+
+    let half_pot = pot as f64 / 2.0;
+    let num_combos = num_combinations_from_private_cards(
+        &game_private_cards[0],
+        &game_private_cards[1],
+    );
+
+    // Remap parent reach to subtree hand ordering for cfreach_adj.
+    let sub_oop_reach = remap_reach_to_subtree(
+        oop_reach, private_cards, &game_private_cards[0], 0,
+    );
+    let sub_ip_reach = remap_reach_to_subtree(
+        ip_reach, private_cards, &game_private_cards[1], 1,
+    );
+
+    // Convert cfvalues to bcfv format:
+    // bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])
+    let oop_bcfv = cfv_to_bcfv(
+        &oop_raw, &game_private_cards[0],
+        &game_private_cards[1], &sub_ip_reach,
+        half_pot, num_combos,
+    );
+    let ip_bcfv = cfv_to_bcfv(
+        &ip_raw, &game_private_cards[1],
+        &game_private_cards[0], &sub_oop_reach,
+        half_pot, num_combos,
+    );
+
+    // Remap from subtree ordering to parent ordering
+    let oop_out = remap_cfvs_to_parent(
+        &oop_bcfv, &game_private_cards[0], &private_cards[0],
+    );
+    let ip_out = remap_cfvs_to_parent(
+        &ip_bcfv, &game_private_cards[1], &private_cards[1],
+    );
+    (oop_out, ip_out)
+}
+
+/// Solve the downstream subtree and return raw per-combination CFVs in parent
+/// hand ordering. These values are suitable for the range-solver raw boundary
+/// path and avoid legacy bcfv normalization.
+fn solve_subtree_raw(
+    board: &[u8],
+    private_cards: &[Vec<(u8, u8)>; 2],
+    parent_weights: &[Vec<f32>; 2],
+    parent_tree_config: &TreeConfig,
+    pot: i32,
+    remaining_stack: f64,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    solve_iters: u32,
+    target_exploitability: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let (oop_raw, ip_raw, game_private_cards) = solve_subtree_raw_inner(
+        board,
+        private_cards,
+        parent_weights,
+        parent_tree_config,
+        pot,
+        remaining_stack,
+        oop_reach,
+        ip_reach,
+        solve_iters,
+        target_exploitability,
+    );
+
+    if oop_raw.is_empty() && ip_raw.is_empty() {
+        return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
+    }
+
+    let oop_out = remap_cfvs_to_parent(
+        &oop_raw, &game_private_cards[0], &private_cards[0],
+    );
+    let ip_out = remap_cfvs_to_parent(
+        &ip_raw, &game_private_cards[1], &private_cards[1],
+    );
+    (oop_out, ip_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_subtree_raw_inner(
+    board: &[u8],
+    private_cards: &[Vec<(u8, u8)>; 2],
+    parent_weights: &[Vec<f32>; 2],
+    parent_tree_config: &TreeConfig,
+    pot: i32,
+    remaining_stack: f64,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+    solve_iters: u32,
+    target_exploitability: f32,
+) -> (Vec<f32>, Vec<f32>, [Vec<(u8, u8)>; 2]) {
+    if reach_is_all_zero(oop_reach) || reach_is_all_zero(ip_reach) {
+        return (Vec::new(), Vec::new(), [Vec::new(), Vec::new()]);
     }
 
     let card_config = build_card_config(board, private_cards, parent_weights);
@@ -203,34 +311,33 @@ fn solve_subtree(
         ip_reach, private_cards, game.private_cards(1), 1,
     );
 
-    let half_pot = pot as f64 / 2.0;
-    let num_combos = game.num_combinations();
-
     // Compute cfvalues using actual boundary reach
     let oop_cfv = root_cfvalues_with_reach(&game, 0, &sub_ip_reach);
     let ip_cfv = root_cfvalues_with_reach(&game, 1, &sub_oop_reach);
 
-    // Convert cfvalues to bcfv format:
-    // bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])
-    let oop_bcfv = cfv_to_bcfv(
-        &oop_cfv, game.private_cards(0),
-        game.private_cards(1), &sub_ip_reach,
-        half_pot, num_combos,
-    );
-    let ip_bcfv = cfv_to_bcfv(
-        &ip_cfv, game.private_cards(1),
-        game.private_cards(0), &sub_oop_reach,
-        half_pot, num_combos,
-    );
+    (
+        oop_cfv,
+        ip_cfv,
+        [
+            game.private_cards(0).to_vec(),
+            game.private_cards(1).to_vec(),
+        ],
+    )
+}
 
-    // Remap from subtree ordering to parent ordering
-    let oop_out = remap_cfvs_to_parent(
-        &oop_bcfv, game.private_cards(0), &private_cards[0],
-    );
-    let ip_out = remap_cfvs_to_parent(
-        &ip_bcfv, game.private_cards(1), &private_cards[1],
-    );
-    (oop_out, ip_out)
+fn num_combinations_from_private_cards(
+    oop_cards: &[(u8, u8)],
+    ip_cards: &[(u8, u8)],
+) -> f64 {
+    let mut n = 0.0;
+    for &(o1, o2) in oop_cards {
+        for &(i1, i2) in ip_cards {
+            if o1 != i1 && o1 != i2 && o2 != i1 && o2 != i2 {
+                n += 1.0;
+            }
+        }
+    }
+    n
 }
 
 /// Floor for `cfreach_adj` before division. Below this we treat the hand as
@@ -410,6 +517,30 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
         cache.insert(key, result.clone());
         log_progress(n_calls, true);
         result
+    }
+
+    fn compute_raw_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        Some(solve_subtree_raw(
+            &self.board,
+            &self.private_cards,
+            &self.parent_initial_weights,
+            &self.parent_tree_config,
+            pot,
+            remaining_stack,
+            oop_reach,
+            ip_reach,
+            self.solve_iters,
+            self.target_exploitability,
+        ))
     }
 }
 
@@ -705,6 +836,39 @@ mod tests {
             100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
         );
         assert_eq!(oop_single, oop_both, "single-player should match both");
+    }
+
+    #[test]
+    fn evaluator_raw_cfvs_are_direct_per_combo_values() {
+        let eval = make_river_evaluator(50);
+        let num_oop = eval.private_cards[0].len();
+        let num_ip = eval.private_cards[1].len();
+        let oop_reach = vec![1.0f32; num_oop];
+        let ip_reach = vec![1.0f32; num_ip];
+
+        let (raw_oop, raw_ip) = eval
+            .compute_raw_cfvs_both(
+                100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
+            )
+            .expect("exact_subtree should provide raw boundary CFVs");
+        let (legacy_oop, legacy_ip) = eval.compute_cfvs_both(
+            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
+        );
+
+        assert_eq!(raw_oop.len(), num_oop);
+        assert_eq!(raw_ip.len(), num_ip);
+        assert!(
+            raw_oop.iter().chain(raw_ip.iter()).all(|v| v.is_finite()),
+            "raw CFVs should be finite"
+        );
+        assert_ne!(
+            raw_oop, legacy_oop,
+            "raw OOP values should not be legacy bcfv values"
+        );
+        assert_ne!(
+            raw_ip, legacy_ip,
+            "raw IP values should not be legacy bcfv values"
+        );
     }
 
     // =====================================================================
