@@ -964,6 +964,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_solver_constructs_from_topology() {
         use super::*;
         let game = make_river_game();
@@ -976,6 +977,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_solver_solve_single_subgame() {
         use super::*;
         let game = make_river_game();
@@ -996,6 +998,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_solver_solve_multiple_subgames() {
         use super::*;
         let game = make_river_game();
@@ -1019,6 +1022,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_solver_results_match_single_solve() {
         use super::*;
         let game = make_river_game();
@@ -1067,6 +1071,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_solver_reusable_across_batches() {
         use super::*;
         let game = make_river_game();
@@ -1087,6 +1092,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_solver_empty_batch_returns_empty() {
         use super::*;
         let game = make_river_game();
@@ -1126,6 +1132,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn compute_evs_from_strategy_sum_produces_finite_values() {
         use super::*;
         let game = make_river_game();
@@ -1159,6 +1166,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn incremental_matches_batch() {
         use super::*;
         let game = make_river_game();
@@ -1198,6 +1206,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn turn_leaf_injection_incremental() {
         use super::*;
         use crate::extract::{extract_terminal_data, extract_topology, NodeType};
@@ -1260,6 +1269,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn set_leaf_injection_allocates_buffers() {
         use super::*;
         let game = make_river_game();
@@ -1277,6 +1287,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn download_reach_has_correct_size() {
         use super::*;
         let game = make_river_game();
@@ -1296,6 +1307,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn compute_reach_at_nodes_matches_evs_function() {
         use super::*;
         use crate::extract::{extract_terminal_data, extract_topology};
@@ -1370,6 +1382,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn solve_batch_handles_more_than_1024_hands() {
         use super::*;
 
@@ -1397,6 +1410,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batched_fold_payoffs_matches_single() {
         use super::*;
         let game = make_river_game();
@@ -1433,6 +1447,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn multi_game_batch_different_payoffs() {
         use super::*;
         let game = make_river_game();
@@ -1479,6 +1494,7 @@ mod tests {
     /// nodes (overriding the showdown eval that would have run at the same
     /// depth immediately before leaf injection).
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batched_leaf_cfvs_matches_single() {
         use super::*;
         let game = make_river_game();
@@ -1567,6 +1583,7 @@ mod tests {
     /// Uses `showdown_nodes` as leaf injection points so the injected values
     /// actually propagate up the tree and influence regrets / strategies.
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn multi_game_batch_different_leaf_cfvs() {
         use super::*;
         let game = make_river_game();
@@ -1666,6 +1683,7 @@ mod tests {
     /// are set to `None` instead of `Some(mtd.showdown_outcomes_*)`, so no
     /// showdown-pass contributes to CFVs — only the injected leaf CFVs do.
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn batch_with_none_showdowns_returns_leaf_injection_values() {
         use super::*;
         let game = make_river_game();
@@ -1768,6 +1786,7 @@ mod tests {
     /// topology batched-datagen model all specs in a batch share the same
     /// terminal structure, so mixed states are a bug.
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     #[should_panic(expected = "uniformly Some or None")]
     fn prepare_batch_panics_on_mixed_showdown_presence() {
         use super::*;

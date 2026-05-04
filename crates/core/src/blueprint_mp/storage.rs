@@ -21,6 +21,13 @@ use super::mmap_buffer::MmapBuffer;
 /// DCFR discounting keeps actual values well below saturation.
 pub const REGRET_SCALE: f64 = 1.0;
 
+/// Fixed-point scaling factor for average-strategy probabilities.
+///
+/// This is intentionally separate from `REGRET_SCALE`: regrets are chip-valued
+/// and currently fit at scale 1, while probabilities need fractional precision
+/// before being stored in integer strategy sums.
+pub const STRATEGY_SCALE: f64 = 1_000.0;
+
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct MpStorage {
     /// Cumulative regrets: one `AtomicI16` per (node, bucket, action).

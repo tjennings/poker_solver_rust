@@ -1774,6 +1774,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_solve_turn_decomposed_converges() {
         let game = make_turn_game();
         let topo = extract_topology(&game);
@@ -1804,6 +1805,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_solve_turn_decomposed_matches_legacy() {
         let game = make_turn_game();
         let topo = extract_topology(&game);
@@ -1840,6 +1842,7 @@ mod tests {
     // === Hand-parallel solver tests ===
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_solve_river_converges() {
         let game = make_river_game();
         let topo = extract_topology(&game);
@@ -1870,6 +1873,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_matches_mega_kernel_river() {
         let game = make_river_game();
         let topo = extract_topology(&game);
@@ -1898,6 +1902,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_1iter_regrets_match_mega() {
         // Verify that HP kernel produces identical regrets to MEGA after 1 iteration.
         // This catches fold eval bugs (e.g., incomplete s_card_reach zeroing).
@@ -1928,6 +1933,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_1iter_strategy_sum_nonzero() {
         let game = make_river_game();
         let topo = extract_topology(&game);
@@ -1951,6 +1957,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_exploitability_matches_legacy_after_500_iterations() {
         let game = make_river_game();
         let topo = extract_topology(&game);

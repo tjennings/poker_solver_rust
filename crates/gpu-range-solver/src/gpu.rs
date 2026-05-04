@@ -389,6 +389,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn kernels_compile_and_load_all_functions() {
         let ctx = CudaContext::new(0).unwrap();
         let kernels = CfrKernels::compile(&ctx);
@@ -396,6 +397,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_kernel_compiles_and_loads() {
         let ctx = CudaContext::new(0).unwrap();
         let kernel = MegaKernel::compile(&ctx);
@@ -403,6 +405,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_kernel_max_cooperative_blocks_positive() {
         let ctx = CudaContext::new(0).unwrap();
         let kernel = MegaKernel::compile(&ctx).unwrap();
@@ -411,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_state_allocates_correct_sizes() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
@@ -423,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_state_batched_allocates_correct_sizes() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
@@ -436,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_state_batched_upload_topology() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
@@ -457,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_state_upload_topology_roundtrips() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
@@ -497,6 +504,7 @@ mod tests {
     // === Hand-parallel GPU state tests ===
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_kernel_compiles_and_loads() {
         let ctx = CudaContext::new(0).unwrap();
         let kernel = HandParallelKernel::compile(&ctx);
@@ -504,6 +512,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_state_allocates() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
@@ -517,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_state_single_batch() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();

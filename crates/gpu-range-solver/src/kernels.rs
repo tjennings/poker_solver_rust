@@ -949,6 +949,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn kernel_source_compiles_with_nvrtc() {
         let ptx = cudarc::nvrtc::compile_ptx(CFR_KERNELS_SOURCE);
         assert!(ptx.is_ok(), "CUDA source must compile: {:?}", ptx.err());
@@ -998,6 +999,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_kernel_source_compiles_with_nvrtc() {
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(
             CFR_MEGA_KERNEL_SOURCE,
@@ -1102,6 +1104,7 @@ mod tests {
     // === Hand-parallel kernel tests ===
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn hand_parallel_kernel_compiles() {
         let ptx = cudarc::nvrtc::compile_ptx_with_opts(
             HAND_PARALLEL_KERNEL_SOURCE,

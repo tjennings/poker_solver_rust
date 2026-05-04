@@ -13,7 +13,7 @@
 use rand::Rng;
 
 use super::game_tree::{MpGameNode, MpGameTree, TerminalKind};
-use super::storage::{MpStorage, REGRET_SCALE};
+use super::storage::{MpStorage, REGRET_SCALE, STRATEGY_SCALE};
 use super::terminal::{resolve_fold, resolve_showdown};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat};
 use super::MAX_PLAYERS;
@@ -224,7 +224,7 @@ fn update_traverser_strategy_sums(
     strategy: &[f64; MAX_ACTIONS],
 ) {
     for (a, &prob) in strategy[..num_actions].iter().enumerate() {
-        let raw = prob * REGRET_SCALE;
+        let raw = prob * STRATEGY_SCALE;
         let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
         storage.add_strategy_sum(node_idx, bucket, a, delta);
     }
@@ -253,7 +253,7 @@ fn traverse_opponent(
     let sampled = sample_action(&strategy[..num_actions], rng);
 
     // Update strategy sums for the sampled action
-    let raw = strategy[sampled] * REGRET_SCALE;
+    let raw = strategy[sampled] * STRATEGY_SCALE;
     let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
     storage.add_strategy_sum(node_idx, bucket, sampled, delta);
 

@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-17T16:17:32Z
-updated_at: 2026-05-04T00:14:26Z
+updated_at: 2026-05-04T00:18:17Z
 ---
 
 Two issues blocking CLAUDE.md's <60s test-suite rule:
@@ -23,3 +23,5 @@ Narrower gate `cargo test -p poker-solver-core -p poker-solver-tauri` runs in **
 Split suggestion: a separate beans/PR fixes the `traverse_updates_strategy_sums` expectation or the underlying rescale bug. Blocks fully-green workspace but does not block perf/subgame-rollout work.
 
 ## Current Blocker\n\nPre-change cargo test on non-CUDA macOS fails in gpu-range-solver because cudarc cannot load libcuda.dylib/libnvrtc.dylib. This blocks the oracle-boundary diagnostic until GPU-only tests skip cleanly when CUDA is unavailable.
+
+## Progress 2026-05-04\n\nFixed the hard non-CUDA failures by marking CUDA/NVRTC-dependent gpu-range-solver tests as ignored in the default suite while preserving CPU/source-shape tests. Fixed the pre-existing blueprint_mp strategy-sum failure by separating strategy probability fixed-point scaling from REGRET_SCALE. Remaining concern: full cargo test still exceeds the <60s target due to slow non-GPU integration/model tests.

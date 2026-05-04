@@ -117,6 +117,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_solve_river_game_reduces_exploitability() {
         let game = make_river_game();
         let config = GpuSolverConfig {
@@ -164,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_solve_turn_game_reduces_exploitability() {
         let game = make_turn_game();
         let config = GpuSolverConfig {
@@ -186,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_solve_turn_game_matches_cpu() {
         let game = make_turn_game();
 
@@ -212,6 +215,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn gpu_solve_matches_cpu_convergence() {
         let game = make_river_game();
 
@@ -245,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_kernel_1iter_strategy_sum_nonzero() {
         let game = make_river_game();
         use range_solver::interface::Game;
@@ -264,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_kernel_turn_solve_converges() {
         let game = make_turn_game();
 
@@ -301,6 +307,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn mega_kernel_solve_river_converges() {
         let game = make_river_game();
 
