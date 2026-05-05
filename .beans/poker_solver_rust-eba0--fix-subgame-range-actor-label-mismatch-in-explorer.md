@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-eba0
 title: Fix subgame range + actor label mismatch in Explorer
-status: todo
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-17T17:05:22Z
-updated_at: 2026-04-17T17:05:22Z
+updated_at: 2026-05-05T12:55:26Z
 ---
 
 Subgame solver's range matrix disagrees with Blueprint and Exact tabs at the same decision node, and the actor label is wrong.
@@ -52,3 +52,13 @@ Blueprint's correct label comes from `position_label()` at lines 297–303, whic
 ## Why now
 
 Subgame solving is the primary way the user validates blueprint strategy at specific nodes. If the Subgame tab shows a different range than Blueprint at the same node, every downstream check is unreliable.
+
+## 2026-05-05 User Report
+
+Screenshots show turn-start subgame solve correctly updates the matrix, but after navigating an action the card labels switch to OOP/IP and the matrix reverts/appears unsolved. Expected behavior:
+
+- [ ] Always display seat labels (BB/SB), never OOP/IP, for Blueprint/Subgame/Exact.
+- [ ] After a subgame solve, solved matrices remain available while navigating actions within that street.
+- [ ] Navigating back to earlier actions in the street must not reset the matrix.
+- [ ] Blueprint, Subgame, and Exact each show the representative matrix for the current game state.
+- [ ] Add regression coverage for solved cache persistence and seat-label vocabulary.
