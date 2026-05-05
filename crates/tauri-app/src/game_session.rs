@@ -1846,9 +1846,10 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
 
     let player = game.current_player();
     let strategy = game.strategy();
-    let private_cards = game.private_cards(player);
     let num_hands = game.num_private_hands(player);
-    let initial_weights = game.initial_weights(player);
+    game.cache_normalized_weights();
+    let reach_weights = game.normalized_weights(player).to_vec();
+    let private_cards = game.private_cards(player);
     let available_actions = game.available_actions();
 
     let game_actions: Vec<GameAction> = available_actions
@@ -1866,7 +1867,7 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
 
     for (hand_idx, &(c1_raw, c2_raw)) in private_cards.iter().enumerate() {
         let (row, col, _) = card_pair_to_matrix(c1_raw, c2_raw);
-        let w = initial_weights[hand_idx] as f64;
+        let w = reach_weights[hand_idx] as f64;
         combo_counts[row][col] += 1;
         weight_sums[row][col] += w;
         if let Some(evs) = hand_evs {
@@ -1892,7 +1893,7 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
         combo_details[row][col].push(ComboDetail {
             cards: format!("{s1}{s2}"),
             probabilities: probs,
-            weight: initial_weights[hand_idx],
+            weight: reach_weights[hand_idx],
             bucket: None,
         });
     }
@@ -6006,6 +6007,81 @@ mod tests {
             assert_eq!(matrix.cells.len(), 13);
             assert!(!matrix.actions.is_empty());
         }
+    }
+
+    #[test]
+    fn build_solve_matrix_at_current_uses_navigated_reach_weights() {
+        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::card::{card_from_str, flop_from_str, NOT_DEALT};
+        use range_solver::range::Range;
+        use range_solver::{Action, ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
+
+        let oop_range: Range = "AA,KK,QQ,JJ".parse().unwrap();
+        let ip_range: Range = "AA,KK,QQ,JJ".parse().unwrap();
+        let flop = flop_from_str("2c3d4h").unwrap();
+        let turn = card_from_str("Js").unwrap();
+
+        let sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 20,
+            effective_stack: 90,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_donk_sizes: None,
+            river_donk_sizes: None,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.1,
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn,
+            river: NOT_DEALT,
+        };
+        let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+        game.allocate_memory(false);
+
+        let root_actions = game.available_actions();
+        let check_idx = root_actions
+            .iter()
+            .position(|action| *action == Action::Check)
+            .expect("turn root should offer check");
+        let num_actions = root_actions.len();
+        let num_hands = game.num_private_hands(game.current_player());
+
+        let mut locked_strategy = vec![0.0f32; num_actions * num_hands];
+        let non_check_idx = (0..num_actions)
+            .find(|idx| *idx != check_idx)
+            .expect("turn root should have a non-check action");
+        for hand_idx in 0..num_hands {
+            locked_strategy[non_check_idx * num_hands + hand_idx] = 1.0;
+        }
+        game.lock_current_strategy(&locked_strategy);
+        game.play(check_idx);
+
+        assert!(!game.is_terminal_node());
+        assert!(!game.is_chance_node());
+
+        let matrix = build_solve_matrix_at_current(&mut game, None);
+        let total_weight: f32 = matrix
+            .cells
+            .iter()
+            .flatten()
+            .map(|cell| cell.weight)
+            .sum();
+
+        assert_eq!(
+            total_weight, 0.0,
+            "child matrix must use the post-action reach, not the root range"
+        );
     }
 
     // (RefreshProgress tests deleted: rollout boundary-eval path removed)
