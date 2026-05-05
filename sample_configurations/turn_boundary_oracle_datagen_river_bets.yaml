@@ -32,7 +32,7 @@ game:
 
 datagen:
   street: "turn_boundary"
-  turn_boundary_target_source: "river_net"
+  turn_boundary_target_source: "exact_river"
   blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
   num_samples: 5000000
   per_file: 10000
