@@ -2243,8 +2243,14 @@ fn resolved_boundary_is_oracle(
         Street::Preflop => return false,
     };
 
-    for (i, (_, mode, is_oracle)) in streets.iter().enumerate() {
+    for (i, (street, mode, is_oracle)) in streets.iter().enumerate() {
         if i == 0 && !matches!(mode, StreetBoundaryMode::Exact) {
+            continue;
+        }
+        if root_street == Street::Turn
+            && *street == Street::River
+            && matches!(mode, StreetBoundaryMode::ExactSubtree)
+        {
             continue;
         }
         if !matches!(mode, StreetBoundaryMode::Exact) {

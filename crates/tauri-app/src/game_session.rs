@@ -92,7 +92,7 @@ pub fn resolve_street_boundary(
 
     // First non-Exact street defines the cut point.
     // If the root street itself is non-Exact, no cut possible — skip it.
-    for (i, (_street, mode)) in streets.iter().enumerate() {
+    for (i, (street, mode)) in streets.iter().enumerate() {
         if i == 0 && !matches!(mode, StreetBoundaryMode::Exact) {
             continue;
         }
@@ -102,6 +102,12 @@ pub fn resolve_street_boundary(
                 return Some(((i - 1) as u8, BoundaryKind::Cfvnet(model_path.clone())));
             }
             StreetBoundaryMode::ExactSubtree => {
+                // A turn-root solve is small enough to solve exactly, and the
+                // river exact-subtree shortcut is not yet strategy-equivalent
+                // at in-street bet/raise response nodes.
+                if root_street == Street::Turn && *street == Street::River {
+                    continue;
+                }
                 return Some(((i - 1) as u8, BoundaryKind::ExactSubtree));
             }
         }
@@ -6549,7 +6555,7 @@ mod tests {
             river: StreetBoundaryMode::ExactSubtree,
         };
         let result = resolve_street_boundary(&config, Street::Turn);
-        assert_eq!(result, Some((0, BoundaryKind::ExactSubtree)));
+        assert_eq!(result, None);
     }
 
     #[test]

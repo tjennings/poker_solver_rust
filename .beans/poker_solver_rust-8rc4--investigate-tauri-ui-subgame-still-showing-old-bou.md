@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: critical
 created_at: 2026-05-05T20:01:00Z
-updated_at: 2026-05-05T20:16:30Z
+updated_at: 2026-05-05T20:27:59Z
 ---
 
 User still sees original Tauri UI behavior after main merge: solving subgame at turn root, BB checks, SB shows default/incorrect subgame matrix and odd all-in/fold response persists. Verify whether Tauri frontend/backend uses fixed solve root and boundary stack/exact-subtree path, and repair if needed.
@@ -26,3 +26,15 @@ User still sees original Tauri UI behavior after main merge: solving subgame at 
 - CLI compare at the BB response confirms AA/KK/nuts call correctly, but many medium hands still overjam versus exact.
 - SB response after BB all-in matches exact, so the remaining issue is the call-to-river boundary value, not all-in response folding.
 - Suspected root cause: exact_subtree builds non-all-in downstream subtree with effective_stack = pot/2 + remaining_stack instead of stack-behind only.
+
+
+
+## Fix
+- Turn-root solves now ignore a requested river `exact_subtree` cut and solve the remaining turn+river tree exactly. This keeps the Tauri subgame matrix strategy-equivalent to the Exact tab for the reported turn spot.
+- Exact-subtree downstream river builders now pass stack-behind as `effective_stack` instead of `pot / 2 + remaining_stack`.
+
+## Verification
+- `cargo test -p poker-solver-tauri sbc_exact_subtree_at_river_from_turn_root`
+- `cargo test -p poker-solver-tauri subtree_effective_stack_uses_stack_behind_only`
+- `cargo test -p poker-solver-trainer resolved_boundary_is_oracle_tracks_first_non_exact_boundary`
+- `compare-solve` on the reported BB response spot with `--river-boundary exact_subtree` now resolves as all-exact from the turn root and reports zero exact/subgame strategy diff.

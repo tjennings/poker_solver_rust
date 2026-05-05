@@ -356,6 +356,10 @@ fn all_in_showdown_raw_cfvs_for_player(
         .collect()
 }
 
+fn subtree_effective_stack(remaining_stack: f64) -> i32 {
+    remaining_stack.round().max(1.0) as i32
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_subtree_raw_inner(
     board: &[u8],
@@ -375,7 +379,7 @@ fn solve_subtree_raw_inner(
 
     let card_config = build_card_config(board, private_cards, parent_weights);
     let initial_state = board_state_from_len(board.len());
-    let effective_stack = (pot / 2).saturating_add(remaining_stack.round() as i32);
+    let effective_stack = subtree_effective_stack(remaining_stack);
 
     let tree_config = TreeConfig {
         initial_state,
@@ -971,6 +975,14 @@ mod tests {
             raw_ip, legacy_ip,
             "raw IP values should not be legacy bcfv values"
         );
+    }
+
+    #[test]
+    fn subtree_effective_stack_uses_stack_behind_only() {
+        assert_eq!(subtree_effective_stack(79.0), 79);
+        assert_eq!(subtree_effective_stack(79.4), 79);
+        assert_eq!(subtree_effective_stack(79.5), 80);
+        assert_eq!(subtree_effective_stack(0.0), 1);
     }
 
     // =====================================================================
