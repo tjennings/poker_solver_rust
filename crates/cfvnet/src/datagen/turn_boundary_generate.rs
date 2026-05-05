@@ -16,7 +16,8 @@ use crate::datagen::turn_boundary_dataset::TurnBoundaryDatasetWriter;
 use crate::datagen::turn_boundary_oracle::BoundaryNetRiverRunoutOracle;
 use crate::datagen::turn_boundary_oracle::{
     ExactRiverSolverOracle, RiverRunoutOracle, TurnBoundaryInput,
-    build_exact_turn_boundary_records, build_turn_boundary_record,
+    build_exact_turn_boundary_records, build_exact_turn_boundary_records_parallel,
+    build_turn_boundary_record,
 };
 
 use super::domain::RangeSource;
@@ -171,6 +172,16 @@ fn generate_turn_boundary_data_with_exact_oracle(
         TargetSource::ExactRiver,
         SourceMetadata::default(),
     )?;
+    let pool = if config.datagen.threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(config.datagen.threads)
+                .build()
+                .map_err(|e| format!("thread pool: {e}"))?,
+        )
+    } else {
+        None
+    };
 
     let pb = ProgressBar::new(config.datagen.num_samples);
     pb.set_style(
@@ -182,7 +193,7 @@ fn generate_turn_boundary_data_with_exact_oracle(
     for _ in 0..config.datagen.num_samples {
         let sampled =
             sample_turn_boundary_situation(config, &range_source, &sampling_policy, &mut rng)?;
-        let built = build_exact_turn_boundary_records_for_sample(&sampled, oracle)?;
+        let built = build_exact_turn_boundary_records_for_sample(&sampled, oracle, pool.as_ref())?;
         validation_builder.record(&built.records[0], built.raise_depth, built.boundary_ordinal);
         validation_builder.record(&built.records[1], built.raise_depth, built.boundary_ordinal);
         writer.write_with_coverage(
@@ -533,6 +544,7 @@ fn build_turn_boundary_records_for_sample<'a, O: RiverRunoutOracle>(
 fn build_exact_turn_boundary_records_for_sample<'a>(
     sampled: &SampledSituation<'a>,
     oracle: &ExactRiverSolverOracle,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<BuiltTurnBoundaryRecords<'a>, String> {
     let sit = &sampled.situation;
     let input = TurnBoundaryInput {
@@ -543,7 +555,10 @@ fn build_exact_turn_boundary_records_for_sample<'a>(
         oop_range: sit.ranges[0],
         ip_range: sit.ranges[1],
     };
-    let records = build_exact_turn_boundary_records(&input, oracle)?;
+    let records = match pool {
+        Some(pool) => build_exact_turn_boundary_records_parallel(&input, oracle, pool)?,
+        None => build_exact_turn_boundary_records(&input, oracle)?,
+    };
     Ok(BuiltTurnBoundaryRecords {
         records,
         raise_depth: sampled.raise_depth,

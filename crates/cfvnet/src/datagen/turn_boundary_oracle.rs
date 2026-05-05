@@ -3,6 +3,7 @@ use crate::datagen::solver::{SolveConfig, solve_situation};
 use crate::datagen::storage::{NUM_COMBOS, TrainingRecord};
 use crate::eval::boundary_evaluator::encode_boundary_inference_input;
 use range_solver::card::index_to_card_pair;
+use rayon::prelude::*;
 
 /// A sampled turn boundary state that should be evaluated by averaging legal
 /// river runouts.
@@ -211,24 +212,49 @@ pub fn build_exact_turn_boundary_records(
 ) -> Result<[TrainingRecord; 2], String> {
     validate_input(input)?;
 
+    build_exact_turn_boundary_records_from_runouts(input, oracle, None)
+}
+
+pub fn build_exact_turn_boundary_records_parallel(
+    input: &TurnBoundaryInput,
+    oracle: &ExactRiverSolverOracle,
+    pool: &rayon::ThreadPool,
+) -> Result<[TrainingRecord; 2], String> {
+    validate_input(input)?;
+
+    build_exact_turn_boundary_records_from_runouts(input, oracle, Some(pool))
+}
+
+fn build_exact_turn_boundary_records_from_runouts(
+    input: &TurnBoundaryInput,
+    oracle: &ExactRiverSolverOracle,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<[TrainingRecord; 2], String> {
     let mut oop_sums = [0.0_f32; NUM_COMBOS];
     let mut ip_sums = [0.0_f32; NUM_COMBOS];
     let mut counts = [0_u8; NUM_COMBOS];
 
-    for river in remaining_river_cards(&input.board) {
-        let mut board = [0_u8; 5];
-        board[..4].copy_from_slice(&input.board);
-        board[4] = river;
+    let rivers = remaining_river_cards(&input.board);
+    let runouts = match pool {
+        Some(pool) => pool.install(|| {
+            rivers
+                .par_iter()
+                .map(|&river| {
+                    let previous = range_solver::set_force_sequential(true);
+                    let result = solve_exact_river_runout(input, oracle, river);
+                    range_solver::set_force_sequential(previous);
+                    result
+                })
+                .collect::<Vec<_>>()
+        }),
+        None => rivers
+            .iter()
+            .map(|&river| solve_exact_river_runout(input, oracle, river))
+            .collect(),
+    };
 
-        let (oop_values, ip_values) = oracle.evaluate_both(RiverRunoutInput {
-            board,
-            pot: input.pot,
-            effective_stack: input.effective_stack,
-            player: 0,
-            oop_range: &input.oop_range,
-            ip_range: &input.ip_range,
-        })?;
-
+    for runout in runouts {
+        let (river, oop_values, ip_values) = runout?;
         for idx in 0..NUM_COMBOS {
             if !combo_conflicts_with_card(idx, river)
                 && !combo_conflicts_with_board(idx, &input.board)
@@ -244,6 +270,28 @@ pub fn build_exact_turn_boundary_records(
         record_from_sums(input, 0, &oop_sums, &counts),
         record_from_sums(input, 1, &ip_sums, &counts),
     ])
+}
+
+type ExactRiverRunout = (u8, [f32; NUM_COMBOS], [f32; NUM_COMBOS]);
+
+fn solve_exact_river_runout(
+    input: &TurnBoundaryInput,
+    oracle: &ExactRiverSolverOracle,
+    river: u8,
+) -> Result<ExactRiverRunout, String> {
+    let mut board = [0_u8; 5];
+    board[..4].copy_from_slice(&input.board);
+    board[4] = river;
+
+    let (oop_values, ip_values) = oracle.evaluate_both(RiverRunoutInput {
+        board,
+        pot: input.pot,
+        effective_stack: input.effective_stack,
+        player: 0,
+        oop_range: &input.oop_range,
+        ip_range: &input.ip_range,
+    })?;
+    Ok((river, oop_values, ip_values))
 }
 
 fn record_from_sums(

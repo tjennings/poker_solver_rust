@@ -9,11 +9,13 @@
 #     -c sample_configurations/turn_boundary_oracle_datagen_river_bets.yaml \
 #     -o local_data/cfvnet/turn_boundary/river_bets_exact_v1/data.bin \
 #     --num-samples 1000 \
+#     --threads 4 \
 #     --per-file 10000
 #
 # Exact-river labels are slow: each turn sample averages exact solves over 48
-# river runouts. Use this for trusted validation/correction shards, not 5M-scale
-# teacher data.
+# river runouts. `threads` controls bounded river-runout parallelism within one
+# turn sample; benchmark 2/4/8 locally. Use this for trusted validation/correction
+# shards, not 5M-scale teacher data.
 
 game:
   initial_stack: 200
@@ -56,9 +58,9 @@ datagen:
         raise_depth: "3bet_plus"
   solver_iterations: 500
   target_exploitability: 0.01
-  # Exact-river turn-boundary generation relies on range-solver's internal
-  # parallelism. Outer sample-level parallelism was slower for this workload.
-  threads: 1
+  # Bounded exact-river runout parallelism within one sampled turn state.
+  # Avoid very high values; many simultaneous solver instances are slower.
+  threads: 4
 
 training:
   hidden_layers: 7
