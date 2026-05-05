@@ -116,6 +116,12 @@ impl fmt::Display for BoardState {
 ///     initial_state: BoardState::Turn,
 ///     starting_pot: 200,
 ///     effective_stack: 900,
+///     initial_player: PLAYER_OOP,
+///     initial_stacks: None,
+///     initial_prev_action: Action::None,
+///     initial_prev_amount: 0,
+///     initial_amount: 0,
+///     initial_num_bets: 0,
 ///     rake_rate: 0.05,
 ///     rake_cap: 30.0,
 ///     flop_bet_sizes: Default::default(),
@@ -139,6 +145,35 @@ pub struct TreeConfig {
 
     /// Initial effective stack. Must be greater than `0`.
     pub effective_stack: i32,
+
+    /// Player to act at the root node (`0` = OOP, `1` = IP).
+    ///
+    /// Defaults to OOP, matching a fresh postflop street. Set this to `1`
+    /// for in-street subgames where IP is already facing an OOP action.
+    pub initial_player: u8,
+
+    /// Optional remaining stacks at the root node for `[OOP, IP]`.
+    ///
+    /// When unset, both players start with `effective_stack`, preserving the
+    /// legacy fresh-street root. Unequal stacks encode a pending call because
+    /// action generation computes `to_call` from the acting player's stack
+    /// minus the opponent's stack.
+    pub initial_stacks: Option<[i32; 2]>,
+
+    /// Previous action leading into the root node.
+    ///
+    /// Use `Bet`, `Raise`, or `AllIn` with `initial_prev_amount` to construct
+    /// a root where the acting player is facing a bet.
+    pub initial_prev_action: Action,
+
+    /// Previous bet or raise-to amount on the current street.
+    pub initial_prev_amount: i32,
+
+    /// Matched amount already committed by both players on the current street.
+    pub initial_amount: i32,
+
+    /// Number of bets/raises already made on the current street.
+    pub initial_num_bets: i32,
 
     /// Rake rate. Must be between `0.0` and `1.0`, inclusive.
     pub rake_rate: f64,
@@ -249,6 +284,19 @@ impl BuildTreeInfo {
             prev_amount: 0,
             street_transitions: 0,
         }
+    }
+
+    #[inline]
+    fn from_config(config: &TreeConfig) -> Self {
+        let mut info = Self::new(config.effective_stack);
+        if let Some(stacks) = config.initial_stacks {
+            info.stack = stacks;
+        }
+        info.prev_action = config.initial_prev_action;
+        info.num_bets = config.initial_num_bets;
+        info.allin_flag = matches!(config.initial_prev_action, Action::AllIn(_));
+        info.prev_amount = config.initial_prev_amount;
+        info
     }
 
     #[inline]
@@ -583,6 +631,49 @@ impl ActionTree {
             ));
         }
 
+        if config.initial_player > PLAYER_IP {
+            return Err(format!(
+                "Initial player must be 0 or 1: {}",
+                config.initial_player
+            ));
+        }
+
+        if let Some(stacks) = config.initial_stacks {
+            if stacks[0] < 0 || stacks[1] < 0 {
+                return Err(format!(
+                    "Initial stacks must be non-negative: [{}, {}]",
+                    stacks[0], stacks[1]
+                ));
+            }
+            if stacks[0] == 0 && stacks[1] == 0 {
+                return Err(format!(
+                    "At least one initial stack must be positive: [{}, {}]",
+                    stacks[0], stacks[1]
+                ));
+            }
+        }
+
+        if config.initial_prev_amount < 0 {
+            return Err(format!(
+                "Initial previous amount must be non-negative: {}",
+                config.initial_prev_amount
+            ));
+        }
+
+        if config.initial_amount < 0 {
+            return Err(format!(
+                "Initial matched amount must be non-negative: {}",
+                config.initial_amount
+            ));
+        }
+
+        if config.initial_num_bets < 0 {
+            return Err(format!(
+                "Initial number of bets must be non-negative: {}",
+                config.initial_num_bets
+            ));
+        }
+
         if config.rake_rate < 0.0 {
             return Err(format!(
                 "Rake rate must be non-negative: {}",
@@ -634,7 +725,9 @@ impl ActionTree {
         let mut root = self.root.lock();
         *root = ActionTreeNode::default();
         root.board_state = self.config.initial_state;
-        self.build_tree_recursive(&mut root, BuildTreeInfo::new(self.config.effective_stack));
+        root.player = self.config.initial_player;
+        root.amount = self.config.initial_amount;
+        self.build_tree_recursive(&mut root, BuildTreeInfo::from_config(&self.config));
     }
 
     /// Recursively builds the action tree.
@@ -1361,6 +1454,12 @@ mod tests {
         assert_eq!(config.initial_state, BoardState::Flop);
         assert_eq!(config.starting_pot, 0);
         assert_eq!(config.effective_stack, 0);
+        assert_eq!(config.initial_player, PLAYER_OOP);
+        assert!(config.initial_stacks.is_none());
+        assert_eq!(config.initial_prev_action, Action::None);
+        assert_eq!(config.initial_prev_amount, 0);
+        assert_eq!(config.initial_amount, 0);
+        assert_eq!(config.initial_num_bets, 0);
         assert_eq!(config.rake_rate, 0.0);
         assert_eq!(config.rake_cap, 0.0);
         assert_eq!(config.add_allin_threshold, 0.0);
@@ -1379,6 +1478,12 @@ mod tests {
             initial_state: BoardState::Turn,
             starting_pot: 200,
             effective_stack: 900,
+            initial_player: PLAYER_IP,
+            initial_stacks: Some([860, 900]),
+            initial_prev_action: Action::Bet(40),
+            initial_prev_amount: 40,
+            initial_amount: 0,
+            initial_num_bets: 1,
             rake_rate: 0.05,
             rake_cap: 30.0,
             flop_bet_sizes: Default::default(),
@@ -1395,6 +1500,11 @@ mod tests {
         assert_eq!(config.initial_state, BoardState::Turn);
         assert_eq!(config.starting_pot, 200);
         assert_eq!(config.effective_stack, 900);
+        assert_eq!(config.initial_player, PLAYER_IP);
+        assert_eq!(config.initial_stacks, Some([860, 900]));
+        assert_eq!(config.initial_prev_action, Action::Bet(40));
+        assert_eq!(config.initial_prev_amount, 40);
+        assert_eq!(config.initial_num_bets, 1);
         assert!((config.rake_rate - 0.05).abs() < f64::EPSILON);
         assert!((config.rake_cap - 30.0).abs() < f64::EPSILON);
         assert!(config.river_donk_sizes.is_some());
@@ -1628,6 +1738,69 @@ mod tests {
         // IP folds => terminal
         tree.play(Action::Fold).unwrap();
         assert!(tree.is_terminal_node());
+    }
+
+    #[test]
+    fn test_turn_tree_can_start_ip_facing_oop_bet() {
+        let sizes = BetSizeOptions::try_from(("50%, a", "50%, a")).unwrap();
+        let config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            initial_player: PLAYER_IP,
+            initial_stacks: Some([80, 100]),
+            initial_prev_action: Action::Bet(20),
+            initial_prev_amount: 20,
+            initial_amount: 0,
+            initial_num_bets: 1,
+            turn_bet_sizes: [sizes.clone(), sizes],
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.0,
+            merging_threshold: 0.0,
+            ..Default::default()
+        };
+
+        let tree = ActionTree::new(config).unwrap();
+        let root = tree.root.lock();
+        assert_eq!(root.player, PLAYER_IP);
+        assert_eq!(root.amount, 0);
+
+        let actions = &root.actions;
+        assert!(actions.contains(&Action::Fold));
+        assert!(actions.contains(&Action::Call));
+        assert!(actions.iter().any(|a| matches!(a, Action::Raise(_))));
+        assert!(actions.iter().any(|a| matches!(a, Action::AllIn(_))));
+        assert!(!actions.contains(&Action::Check));
+    }
+
+    #[test]
+    fn test_turn_tree_can_start_ip_facing_allin_with_zero_oop_stack() {
+        let sizes = BetSizeOptions::try_from(("50%, a", "50%, a")).unwrap();
+        let config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            initial_player: PLAYER_IP,
+            initial_stacks: Some([0, 100]),
+            initial_prev_action: Action::AllIn(100),
+            initial_prev_amount: 100,
+            initial_amount: 0,
+            initial_num_bets: 1,
+            turn_bet_sizes: [sizes.clone(), sizes],
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.0,
+            merging_threshold: 0.0,
+            ..Default::default()
+        };
+
+        let tree = ActionTree::new(config).unwrap();
+        let root = tree.root.lock();
+        assert_eq!(root.player, PLAYER_IP);
+        assert_eq!(root.actions, vec![Action::Fold, Action::Call]);
+        assert!(root
+            .actions
+            .iter()
+            .all(|a| !matches!(a, Action::Bet(_) | Action::Raise(_) | Action::AllIn(_))));
     }
 
     #[test]

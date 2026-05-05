@@ -36,6 +36,7 @@ fn main() {
         force_allin_threshold: 0.15, // force all-in if (SPR after the opponent's call) <= 0.15
         merging_threshold: 0.1,
         depth_limit: None,
+        ..Default::default()
     };
 
     // build the game tree

@@ -79,6 +79,7 @@ pub fn build_flop_poker_game_with_config(config: &FlopPokerConfig) -> Result<Pos
         force_allin_threshold: 0.0,
         merging_threshold: 0.0,
         depth_limit: None,
+        ..Default::default()
     };
 
     let action_tree = ActionTree::new(tree_config)?;

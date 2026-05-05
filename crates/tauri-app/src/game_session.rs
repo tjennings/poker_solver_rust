@@ -205,6 +205,57 @@ pub struct CachedSolveNode {
     pub position: String,
 }
 
+/// Session position where a solve cache was rooted.
+#[derive(Debug, Clone)]
+pub struct SolveAnchor {
+    pub node_idx: u32,
+    pub board: Vec<String>,
+    pub action_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SolveGameRoot {
+    pub starting_pot: i32,
+    pub initial_player: u8,
+    pub initial_stacks: [i32; 2],
+    pub initial_prev_action: range_solver::Action,
+    pub initial_prev_amount: i32,
+    pub initial_amount: i32,
+    pub initial_num_bets: i32,
+}
+
+impl SolveGameRoot {
+    fn fresh_street(pot: i32, effective_stack: i32) -> Self {
+        Self {
+            starting_pot: pot,
+            initial_player: 0,
+            initial_stacks: [effective_stack, effective_stack],
+            initial_prev_action: range_solver::Action::None,
+            initial_prev_amount: 0,
+            initial_amount: 0,
+            initial_num_bets: 0,
+        }
+    }
+}
+
+fn effective_stack_for_solve_root(root: &SolveGameRoot) -> i32 {
+    root.initial_stacks
+        .iter()
+        .copied()
+        .filter(|stack| *stack > 0)
+        .min()
+        .unwrap_or(1)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BettingState {
+    pot: f64,
+    stacks: [f64; 2],
+    street_bets: [f64; 2],
+    num_bets: u8,
+    last_aggressive_action: Option<TreeAction>,
+}
+
 /// Complete game state returned to the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct GameState {
@@ -249,6 +300,8 @@ pub struct SolveState {
     pub solve_cache: RwLock<HashMap<Vec<usize>, CachedSolveNode>>,
     /// Current position within the solved tree (action path from solve root).
     pub solve_path: RwLock<Vec<usize>>,
+    /// Session anchor for the cached solve tree.
+    pub solve_anchor: RwLock<Option<SolveAnchor>>,
 }
 
 impl Default for SolveState {
@@ -265,6 +318,7 @@ impl Default for SolveState {
             solve_position: RwLock::new(String::new()),
             solve_cache: RwLock::new(HashMap::new()),
             solve_path: RwLock::new(vec![]),
+            solve_anchor: RwLock::new(None),
         }
     }
 }
@@ -283,6 +337,7 @@ impl SolveState {
         *self.solve_position.write() = String::new();
         *self.solve_cache.write() = HashMap::new();
         *self.solve_path.write() = vec![];
+        *self.solve_anchor.write() = None;
     }
 }
 
@@ -930,14 +985,163 @@ impl GameSession {
         pot_at_v2_node(&self.tree, self.node_idx) as i32
     }
 
-    /// Compute remaining stacks [BB, SB] (in chips).
-    #[allow(clippy::cast_possible_truncation)]
-    fn compute_stacks(&self) -> [i32; 2] {
+    fn values_by_range_slot(&self, values_by_v2_player: [f64; 2]) -> [i32; 2] {
+        let bb_player = (1 - self.tree.dealer) as usize;
+        let sb_player = self.tree.dealer as usize;
+        [
+            values_by_v2_player[bb_player].round() as i32,
+            values_by_v2_player[sb_player].round() as i32,
+        ]
+    }
+
+    fn approximate_stacks_from_pot(&self) -> [i32; 2] {
         let pot = pot_at_v2_node(&self.tree, self.node_idx);
         let stack_depth = self.config.game.stack_depth;
         let each_invested = pot / 2.0;
         let remaining = (stack_depth - each_invested) as i32;
         [remaining, remaining]
+    }
+
+    /// Compute remaining stacks [BB, SB] (in chips).
+    #[allow(clippy::cast_possible_truncation)]
+    fn compute_stacks(&self) -> [i32; 2] {
+        self.replay_betting_state()
+            .map(|state| self.values_by_range_slot(state.stacks))
+            .unwrap_or_else(|_| self.approximate_stacks_from_pot())
+    }
+
+    fn replay_betting_state(&self) -> Result<BettingState, String> {
+        let sb = self.tree.dealer as usize;
+        let bb = (1 - self.tree.dealer) as usize;
+        let mut stacks = [self.config.game.stack_depth; 2];
+        stacks[sb] -= self.config.game.small_blind;
+        stacks[bb] -= self.config.game.big_blind;
+        let mut street_bets = [0.0; 2];
+        street_bets[sb] = self.config.game.small_blind;
+        street_bets[bb] = self.config.game.big_blind;
+        let mut pot = self.config.game.small_blind + self.config.game.big_blind;
+        let mut node_idx = self.tree.root;
+        let mut num_bets = 0u8;
+        let mut last_aggressive_action = None;
+
+        for record in &self.action_history {
+            while let V2GameNode::Chance { child, .. } = &self.tree.nodes[node_idx as usize] {
+                node_idx = *child;
+                street_bets = [0.0; 2];
+                num_bets = 0;
+                last_aggressive_action = None;
+            }
+
+            let (player, actions, children) = match &self.tree.nodes[node_idx as usize] {
+                V2GameNode::Decision {
+                    player,
+                    actions,
+                    children,
+                    ..
+                } => (*player as usize, actions, children),
+                _ => {
+                    return Err(format!(
+                        "Action history reached non-decision node {node_idx}"
+                    ));
+                }
+            };
+
+            let action_idx: usize = record
+                .action_id
+                .parse()
+                .map_err(|_| format!("Invalid action_id in history: {}", record.action_id))?;
+            let action = actions
+                .get(action_idx)
+                .ok_or_else(|| format!("Action {action_idx} out of range at node {node_idx}"))?;
+
+            let opponent = player ^ 1;
+            match action {
+                TreeAction::Fold | TreeAction::Check => {}
+                TreeAction::Call => {
+                    let to_call = (street_bets[opponent] - street_bets[player]).max(0.0);
+                    let actual = to_call.min(stacks[player]);
+                    stacks[player] -= actual;
+                    street_bets[player] += actual;
+                    pot += actual;
+                }
+                TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
+                    let additional = (*amount - street_bets[player])
+                        .max(0.0)
+                        .min(stacks[player]);
+                    stacks[player] -= additional;
+                    street_bets[player] += additional;
+                    pot += additional;
+                    num_bets = num_bets.saturating_add(1);
+                    last_aggressive_action = Some(*action);
+                }
+                TreeAction::AllIn => {
+                    let additional = stacks[player];
+                    stacks[player] = 0.0;
+                    street_bets[player] += additional;
+                    pot += additional;
+                    num_bets = num_bets.saturating_add(1);
+                    last_aggressive_action = Some(*action);
+                }
+            }
+
+            node_idx = *children
+                .get(action_idx)
+                .ok_or_else(|| format!("Action {action_idx} has no child at node {node_idx}"))?;
+        }
+
+        while let V2GameNode::Chance { child, .. } = &self.tree.nodes[node_idx as usize] {
+            node_idx = *child;
+            street_bets = [0.0; 2];
+            num_bets = 0;
+            last_aggressive_action = None;
+        }
+
+        Ok(BettingState {
+            pot,
+            stacks,
+            street_bets,
+            num_bets,
+            last_aggressive_action,
+        })
+    }
+
+    fn solve_game_root_for_player(&self, v2_player: u8) -> Result<SolveGameRoot, String> {
+        let state = self.replay_betting_state()?;
+        let initial_player = self.weight_index(v2_player) as u8;
+        let initial_stacks = self.values_by_range_slot(state.stacks);
+        let street_bets = self.values_by_range_slot(state.street_bets);
+        let actor = initial_player as usize;
+        let opponent = actor ^ 1;
+        let to_call = (street_bets[opponent] - street_bets[actor]).max(0);
+        let matched_amount = street_bets[0].min(street_bets[1]);
+        let current_pot = self.compute_pot();
+        debug_assert!((state.pot - f64::from(current_pot)).abs() < 1.0);
+        let street_start_pot =
+            (current_pot - street_bets[0] - street_bets[1]).max(1);
+
+        let (initial_prev_action, initial_prev_amount, initial_num_bets) = if to_call > 0 {
+            let prev_amount = street_bets[opponent];
+            let prev_action = match state.last_aggressive_action {
+                Some(TreeAction::AllIn) => range_solver::Action::AllIn(prev_amount),
+                Some(TreeAction::Raise(_)) if state.num_bets > 1 => {
+                    range_solver::Action::Raise(prev_amount)
+                }
+                _ => range_solver::Action::Bet(prev_amount),
+            };
+            (prev_action, prev_amount, i32::from(state.num_bets.max(1)))
+        } else {
+            (range_solver::Action::None, 0, 0)
+        };
+
+        Ok(SolveGameRoot {
+            starting_pot: street_start_pot,
+            initial_player,
+            initial_stacks,
+            initial_prev_action,
+            initial_prev_amount,
+            initial_amount: matched_amount,
+            initial_num_bets,
+        })
     }
 
     /// Encode the current game state as a human-readable spot string.
@@ -1174,6 +1378,90 @@ fn action_type_string(action: &TreeAction) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticAction {
+    action_type: String,
+    amount_bb: Option<i32>,
+}
+
+fn action_amount_bb_from_label(label: &str) -> Option<i32> {
+    let normalized = label.trim().to_ascii_lowercase().replace(' ', "");
+    let bb = normalized.strip_suffix("bb")?;
+    bb.parse::<f64>().ok().map(|amount| amount.round() as i32)
+}
+
+fn semantic_action_from_tree_action(action: &TreeAction) -> SemanticAction {
+    let amount_bb = match action {
+        TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
+            Some((amount / 2.0).round() as i32)
+        }
+        _ => None,
+    };
+
+    SemanticAction {
+        action_type: action_type_string(action),
+        amount_bb,
+    }
+}
+
+fn semantic_action_from_game_action(action: &GameAction) -> SemanticAction {
+    let action_type = action.action_type.to_ascii_lowercase();
+    let amount_bb = match action_type.as_str() {
+        "bet" | "raise" => action_amount_bb_from_label(&action.label),
+        _ => None,
+    };
+
+    SemanticAction {
+        action_type,
+        amount_bb,
+    }
+}
+
+fn semantic_action_from_record(record: &ActionRecord) -> Option<SemanticAction> {
+    record
+        .actions
+        .iter()
+        .find(|action| action.id == record.action_id)
+        .map(semantic_action_from_game_action)
+}
+
+fn semantic_actions_match(left: &SemanticAction, right: &SemanticAction) -> bool {
+    if left.action_type != right.action_type {
+        return false;
+    }
+
+    match left.action_type.as_str() {
+        "fold" | "check" | "call" | "allin" => true,
+        "bet" | "raise" => left.amount_bb.is_some() && left.amount_bb == right.amount_bb,
+        _ => false,
+    }
+}
+
+fn session_action_id_matching_cached_action(
+    session: &GameSession,
+    cached_action: &GameAction,
+) -> Result<String, String> {
+    let cached_semantic = semantic_action_from_game_action(cached_action);
+    let V2GameNode::Decision { actions, .. } = &session.tree.nodes[session.node_idx as usize]
+    else {
+        return Err("Cannot map solver action: session is not at a decision node".to_string());
+    };
+
+    actions
+        .iter()
+        .enumerate()
+        .find_map(|(idx, action)| {
+            let session_semantic = semantic_action_from_tree_action(action);
+            semantic_actions_match(&cached_semantic, &session_semantic).then(|| idx.to_string())
+        })
+        .ok_or_else(|| {
+            format!(
+                "Solver action '{}' ({}) does not match any action at the current session node",
+                cached_action.label, cached_action.action_type
+            )
+        })
+}
+
 /// Convert a `Street` to its display string.
 fn street_to_string(street: Street) -> String {
     match street {
@@ -1243,6 +1531,31 @@ pub fn build_solve_game_parts(
     exact: bool,
     depth_limit_override: Option<u8>,
 ) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
+    build_solve_game_parts_with_root(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        bet_sizes,
+        exact,
+        depth_limit_override,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_solve_game_parts_with_root(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    bet_sizes: &[Vec<f64>],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::CardConfig;
     use range_solver::range::Range;
@@ -1265,11 +1578,18 @@ pub fn build_solve_game_parts(
         turn,
         river,
     };
+    let root = root.unwrap_or_else(|| SolveGameRoot::fresh_street(pot, effective_stack));
 
     let tree_config = TreeConfig {
         initial_state,
-        starting_pot: pot,
+        starting_pot: root.starting_pot,
         effective_stack,
+        initial_player: root.initial_player,
+        initial_stacks: Some(root.initial_stacks),
+        initial_prev_action: root.initial_prev_action,
+        initial_prev_amount: root.initial_prev_amount,
+        initial_amount: root.initial_amount,
+        initial_num_bets: root.initial_num_bets,
         rake_rate: 0.0,
         rake_cap: 0.0,
         flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
@@ -1306,7 +1626,7 @@ pub fn build_solve_game(
     exact: bool,
     depth_limit_override: Option<u8>,
 ) -> Result<PostFlopGame, String> {
-    let (card_config, action_tree) = build_solve_game_parts(
+    build_solve_game_with_root(
         board,
         oop_weights,
         ip_weights,
@@ -1315,6 +1635,32 @@ pub fn build_solve_game(
         bet_sizes,
         exact,
         depth_limit_override,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_solve_game_with_root(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    bet_sizes: &[Vec<f64>],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+) -> Result<PostFlopGame, String> {
+    let (card_config, action_tree) = build_solve_game_parts_with_root(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
     )?;
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
@@ -1336,6 +1682,7 @@ fn build_gadget_tree_game_for_solve(
     pot: i32,
     eff_stack: i32,
     bet_sizes: &[Vec<f64>],
+    root: SolveGameRoot,
     depth_limit: Option<u8>,
     cbv_ctx: &Option<Arc<crate::postflop::CbvContext>>,
     current_node_idx: u32,
@@ -1361,6 +1708,7 @@ fn build_gadget_tree_game_for_solve(
         pot,
         eff_stack,
         bet_sizes,
+        root,
         depth_limit,
         &board_u8,
         boundary_cut,
@@ -1369,7 +1717,7 @@ fn build_gadget_tree_game_for_solve(
     )?;
 
     // Build gadget game via A2 per-boundary injection.
-    let (card_config, action_tree) = build_solve_game_parts(
+    let (card_config, action_tree) = build_solve_game_parts_with_root(
         board,
         oop_w,
         ip_w,
@@ -1378,6 +1726,7 @@ fn build_gadget_tree_game_for_solve(
         bet_sizes,
         false,
         depth_limit,
+        Some(root),
     )?;
     eprintln!("[solve] gadget-tree (A2): BlueprintCbvOptOut (per-boundary pot)");
     crate::gadget::make_per_boundary_gadget_game(
@@ -1399,13 +1748,14 @@ fn build_inner_evaluator_for_solve(
     pot: i32,
     eff_stack: i32,
     bet_sizes: &[Vec<f64>],
+    root: SolveGameRoot,
     depth_limit: Option<u8>,
     board_u8: &[u8],
     boundary_cut: &Option<(u8, BoundaryKind)>,
     solve_iters: u32,
     target_exp: f32,
 ) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
-    let (tmp_cc, tmp_at) = build_solve_game_parts(
+    let (tmp_cc, tmp_at) = build_solve_game_parts_with_root(
         board,
         oop_w,
         ip_w,
@@ -1414,6 +1764,7 @@ fn build_inner_evaluator_for_solve(
         bet_sizes,
         false,
         depth_limit,
+        Some(root),
     )?;
     let tmp_game = PostFlopGame::with_config(tmp_cc, tmp_at)
         .map_err(|e| format!("Failed to build temp game: {e}"))?;
@@ -1601,14 +1952,18 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
 /// Walk the solved game tree and cache a `CachedSolveNode` at every decision node.
 ///
 /// Returns a map from action path (e.g., `[0, 1]`) to cached node data.
-fn build_solve_cache(game: &mut PostFlopGame) -> HashMap<Vec<usize>, CachedSolveNode> {
+fn build_solve_cache(
+    game: &mut PostFlopGame,
+    player_labels: &[String; 2],
+) -> HashMap<Vec<usize>, CachedSolveNode> {
     let mut cache = HashMap::new();
-    build_solve_cache_recursive(game, &mut vec![], &mut cache);
+    build_solve_cache_recursive(game, player_labels, &mut vec![], &mut cache);
     cache
 }
 
 fn build_solve_cache_recursive(
     game: &mut PostFlopGame,
+    player_labels: &[String; 2],
     path: &mut Vec<usize>,
     cache: &mut HashMap<Vec<usize>, CachedSolveNode>,
 ) {
@@ -1624,7 +1979,10 @@ fn build_solve_cache_recursive(
         .map(|(i, a)| range_solver_action_to_game_action(a, i))
         .collect();
     let player = game.current_player();
-    let position = if player == 0 { "OOP" } else { "IP" };
+    let position = player_labels
+        .get(player)
+        .cloned()
+        .unwrap_or_else(|| format!("P{player}"));
 
     let num_actions = actions.len();
     cache.insert(
@@ -1632,14 +1990,14 @@ fn build_solve_cache_recursive(
         CachedSolveNode {
             matrix,
             actions,
-            position: position.to_string(),
+            position,
         },
     );
 
     for i in 0..num_actions {
         game.play(i);
         path.push(i);
-        build_solve_cache_recursive(game, path, cache);
+        build_solve_cache_recursive(game, player_labels, path, cache);
         path.pop();
         // Navigate back: PostFlopGame has no undo, so replay from root.
         game.back_to_root();
@@ -1811,6 +2169,111 @@ pub fn game_new_core(
     Ok(())
 }
 
+fn solve_state_for_source(
+    session_state: &GameSessionState,
+    source: Option<&str>,
+) -> Option<Arc<SolveState>> {
+    match source {
+        Some("subgame") => Some(Arc::clone(&session_state.subgame_solve)),
+        Some("exact") => Some(Arc::clone(&session_state.exact_solve)),
+        _ => None,
+    }
+}
+
+fn resolve_solve_path_from_session(ss: &SolveState, session: &GameSession) -> Option<Vec<usize>> {
+    let anchor = ss.solve_anchor.read().clone();
+    let Some(anchor) = anchor.as_ref() else {
+        return Some(ss.solve_path.read().clone());
+    };
+
+    if session.board != anchor.board {
+        return None;
+    }
+
+    if session.action_history.len() < anchor.action_ids.len() {
+        return None;
+    }
+
+    if session
+        .action_history
+        .iter()
+        .take(anchor.action_ids.len())
+        .map(|a| &a.action_id)
+        .ne(anchor.action_ids.iter())
+    {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    let cache = ss.solve_cache.read();
+    for record in session.action_history.iter().skip(anchor.action_ids.len()) {
+        let node = cache.get(&path)?;
+        let record_semantic = semantic_action_from_record(record)?;
+        let action_idx = node.actions.iter().position(|action| {
+            let cached_semantic = semantic_action_from_game_action(action);
+            semantic_actions_match(&record_semantic, &cached_semantic)
+        })?;
+        path.push(action_idx);
+        if !cache.contains_key(&path) {
+            return None;
+        }
+    }
+
+    if path.is_empty() && session.node_idx != anchor.node_idx {
+        return None;
+    }
+
+    Some(path)
+}
+
+fn set_solve_path_if_changed(ss: &SolveState, path: &[usize]) {
+    if ss.solve_path.read().as_slice() != path {
+        *ss.solve_path.write() = path.to_vec();
+    }
+}
+
+fn cached_node_for_path(ss: &SolveState, path: &[usize]) -> Option<CachedSolveNode> {
+    ss.solve_cache.read().get(path).cloned()
+}
+
+fn validate_solve_root_actor_label(
+    current_player: usize,
+    player_labels: &[String; 2],
+    position_label: &str,
+) -> Result<(), String> {
+    let range_label = player_labels
+        .get(current_player)
+        .cloned()
+        .unwrap_or_else(|| format!("P{current_player}"));
+    if range_label != position_label {
+        return Err(format!(
+            "Solve root actor mismatch: session is {position_label} but range solver root is {range_label}"
+        ));
+    }
+    Ok(())
+}
+
+fn reset_solve_state_for_start(
+    ss: &SolveState,
+    max_iters: u32,
+    position_label: String,
+    solve_anchor: SolveAnchor,
+) {
+    ss.iteration.store(0, Ordering::Relaxed);
+    ss.max_iterations.store(max_iters, Ordering::Relaxed);
+    ss.exploitability_bits
+        .store(f32::MAX.to_bits(), Ordering::Relaxed);
+    ss.cancel.store(false, Ordering::Relaxed);
+    ss.solving.store(true, Ordering::Release);
+    *ss.solve_start.write() = Some(Instant::now());
+    *ss.matrix_snapshot.write() = None;
+    *ss.solve_actions.write() = vec![];
+    *ss.solve_position.write() = position_label;
+    *ss.solve_anchor.write() = Some(solve_anchor);
+    *ss.solve_cache.write() = HashMap::new();
+    *ss.solve_path.write() = vec![];
+}
+
 /// Get the current game state, including solve progress if active.
 ///
 /// `source` controls which strategy data is returned:
@@ -1826,10 +2289,8 @@ pub fn game_get_state_core(
     let mut state = session.get_state();
 
     // Blueprint source: return raw blueprint data, no solve overlay
-    let ss = match source.as_deref() {
-        Some("subgame") => &session_state.subgame_solve,
-        Some("exact") => &session_state.exact_solve,
-        _ => return Ok(state),
+    let Some(ss) = solve_state_for_source(session_state, source.as_deref()) else {
+        return Ok(state);
     };
     let is_solving = ss.solving.load(Ordering::Relaxed);
     let iteration = ss.iteration.load(Ordering::Relaxed);
@@ -1852,25 +2313,26 @@ pub fn game_get_state_core(
             is_complete: !is_solving && iteration > 0,
         });
 
-        // Prefer solve cache (navigated position) over root snapshot
-        let cache = ss.solve_cache.read();
-        let path = ss.solve_path.read();
-        if let Some(node) = cache.get(&*path) {
-            state.matrix = Some(node.matrix.clone());
-            state.actions = node.actions.clone();
-            state.position = node.position.clone();
-        } else {
-            // Fall back to root snapshot (during solve or before cache is built)
-            if let Some(matrix) = ss.matrix_snapshot.read().clone() {
-                state.matrix = Some(matrix);
-            }
-            let actions = ss.solve_actions.read();
-            if !actions.is_empty() {
-                state.actions = actions.clone();
-            }
-            let position = ss.solve_position.read();
-            if !position.is_empty() {
-                state.position = position.clone();
+        if let Some(path) = resolve_solve_path_from_session(&ss, session) {
+            set_solve_path_if_changed(&ss, &path);
+            // Prefer solve cache (navigated position) over root snapshot
+            if let Some(node) = cached_node_for_path(&ss, &path) {
+                state.matrix = Some(node.matrix.clone());
+                state.actions = node.actions.clone();
+                state.position = node.position.clone();
+            } else if path.is_empty() {
+                // Fall back to root snapshot during solve or before cache is built.
+                if let Some(matrix) = ss.matrix_snapshot.read().clone() {
+                    state.matrix = Some(matrix);
+                }
+                let actions = ss.solve_actions.read();
+                if !actions.is_empty() {
+                    state.actions = actions.clone();
+                }
+                let position = ss.solve_position.read();
+                if !position.is_empty() {
+                    state.position = position.clone();
+                }
             }
         }
     }
@@ -1889,53 +2351,88 @@ pub fn game_play_action_core(
     action_id: &str,
     source: Option<String>,
 ) -> Result<GameState, String> {
-    let ss = match source.as_deref() {
-        Some("exact") => &session_state.exact_solve,
-        _ => &session_state.subgame_solve,
-    };
-    let cache = ss.solve_cache.read();
+    let ss = solve_state_for_source(session_state, source.as_deref());
+    let source_navigation = if let Some(ss) = ss.as_ref() {
+        let guard = session_state.session.read();
+        let session = guard.as_ref().ok_or("No game session active")?;
+        if let Some(current_path) = resolve_solve_path_from_session(ss, session) {
+            set_solve_path_if_changed(ss, &current_path);
 
-    if !cache.is_empty() {
-        let current_path = ss.solve_path.read().clone();
-        if let Some(current_node) = cache.get(&current_path) {
-            if let Some(action_idx) = current_node.actions.iter().position(|a| a.id == action_id) {
-                let mut new_path = current_path.clone();
-                new_path.push(action_idx);
-
-                if let Some(child_node) = cache.get(&new_path) {
-                    let child_matrix = child_node.matrix.clone();
-                    let child_actions = child_node.actions.clone();
-                    let child_position = child_node.position.clone();
-                    drop(cache);
-
-                    // Play the action on the session for board/range tracking
-                    let mut guard = session_state.session.write();
-                    let session = guard.as_mut().ok_or("No game session active")?;
-                    session.play_action(action_id)?;
-                    let mut state = session.get_state();
-                    drop(guard);
-
-                    // Override with cached data
-                    state.matrix = Some(child_matrix);
-                    state.actions = child_actions;
-                    state.position = child_position;
-                    *ss.solve_path.write() = new_path;
-
-                    return Ok(state);
+            let cache = ss.solve_cache.read();
+            if let Some(current_node) = cache.get(&current_path) {
+                if let Some(action_idx) = current_node
+                    .actions
+                    .iter()
+                    .position(|action| action.id == action_id)
+                {
+                    let cached_action = &current_node.actions[action_idx];
+                    let session_action_id =
+                        session_action_id_matching_cached_action(session, cached_action)?;
+                    let mut new_path = current_path;
+                    new_path.push(action_idx);
+                    Some((
+                        session_action_id,
+                        cache.get(&new_path).map(|child_node| {
+                            (
+                                new_path,
+                                child_node.matrix.clone(),
+                                child_node.actions.clone(),
+                                child_node.position.clone(),
+                            )
+                        }),
+                    ))
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        } else {
+            None
         }
-    }
-    drop(cache);
+    } else {
+        None
+    };
 
-    // Not in solved tree -- normal navigation, reset solve state
+    let session_action_id = match source_navigation {
+        Some((
+            session_action_id,
+            Some((new_path, child_matrix, child_actions, child_position)),
+        )) => {
+            let ss = ss
+                .as_ref()
+                .expect("source navigation exists only when solve state exists");
+
+            // Play the action on the session for board/range tracking
+            let mut guard = session_state.session.write();
+            let session = guard.as_mut().ok_or("No game session active")?;
+            session.play_action(&session_action_id)?;
+            let mut state = session.get_state();
+            drop(guard);
+
+            // Override with cached data
+            state.matrix = Some(child_matrix);
+            state.actions = child_actions;
+            state.position = child_position;
+            *ss.solve_path.write() = new_path;
+
+            return Ok(state);
+        }
+        Some((session_action_id, None)) => session_action_id,
+        None => action_id.to_string(),
+    };
+
+    // Normal navigation. Blueprint/None sources never consume solve caches, and
+    // source-specific cache misses preserve existing caches for later reuse.
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
-    session.play_action(action_id)?;
+    session.play_action(&session_action_id)?;
     let state = session.get_state();
-    drop(guard);
-    session_state.subgame_solve.reset();
-    session_state.exact_solve.reset();
+    if let Some(ss) = ss.as_ref() {
+        if let Some(path) = resolve_solve_path_from_session(ss, session) {
+            set_solve_path_if_changed(ss, &path);
+        }
+    }
     Ok(state)
 }
 
@@ -1953,43 +2450,61 @@ pub fn game_deal_card_core(
 /// Undo the last action and return the new game state.
 ///
 /// If within a solved subgame tree, pops the last action from the solve path
-/// and serves the parent's cached matrix. If at the solve root, resets the
-/// solve state entirely.
+/// and serves the parent's cached matrix. If the selected source is blueprint
+/// or the selected solve cache cannot serve the current session path, this is
+/// normal session navigation and existing solve caches are preserved.
 ///
 /// `source` selects which solve cache to navigate within.
 pub fn game_back_core(
     session_state: &GameSessionState,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let ss = solve_state_for_source(session_state, source.as_deref());
+    let cached_parent = ss.as_ref().and_then(|ss| {
+        let guard = session_state.session.read();
+        let session = guard.as_ref()?;
+        let mut path = resolve_solve_path_from_session(ss, session)?;
+        set_solve_path_if_changed(ss, &path);
+
+        if path.is_empty() {
+            return None;
+        }
+        path.pop();
+        cached_node_for_path(ss, &path).map(|node| {
+            (
+                path,
+                node.matrix.clone(),
+                node.actions.clone(),
+                node.position.clone(),
+            )
+        })
+    });
+
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.back()?;
     let mut state = session.get_state();
+    let after_back_path = if cached_parent.is_none() {
+        ss.as_ref()
+            .and_then(|ss| resolve_solve_path_from_session(ss, session))
+    } else {
+        None
+    };
     drop(guard);
 
-    let ss = match source.as_deref() {
-        Some("exact") => &session_state.exact_solve,
-        _ => &session_state.subgame_solve,
-    };
-    let cache = ss.solve_cache.read();
-
-    if !cache.is_empty() {
-        let mut path = ss.solve_path.write();
-        if !path.is_empty() {
-            // Pop last action to get parent path
-            path.pop();
-            if let Some(node) = cache.get(&*path) {
-                state.matrix = Some(node.matrix.clone());
-                state.actions = node.actions.clone();
-                state.position = node.position.clone();
-            }
-            return Ok(state);
+    if let (Some(ss), Some((parent_path, matrix, actions, position))) = (ss.as_ref(), cached_parent)
+    {
+        state.matrix = Some(matrix);
+        state.actions = actions;
+        state.position = position;
+        *ss.solve_path.write() = parent_path;
+    } else if let (Some(ss), Some(path)) = (ss.as_ref(), after_back_path) {
+        if let Some(node) = cached_node_for_path(ss, &path) {
+            state.matrix = Some(node.matrix.clone());
+            state.actions = node.actions.clone();
+            state.position = node.position.clone();
         }
-        // At solve root and going back -- navigating before solve root, reset
-        drop(path);
-        drop(cache);
-        session_state.subgame_solve.reset();
-        session_state.exact_solve.reset();
+        set_solve_path_if_changed(ss, &path);
     }
 
     Ok(state)
@@ -2034,6 +2549,9 @@ pub fn game_solve_core(
         cbv_ctx,
         current_node_idx,
         position_label,
+        solve_anchor,
+        player_labels,
+        solve_root,
         root_street,
     ) = {
         let guard = session_state.session.read();
@@ -2053,8 +2571,8 @@ pub fn game_solve_core(
         let oop_w = session.weights[0].clone();
         let ip_w = session.weights[1].clone();
         let pot = session.compute_pot();
-        let stacks = session.compute_stacks();
-        let eff_stack = stacks[0].min(stacks[1]);
+        let solve_root = session.solve_game_root_for_player(player)?;
+        let eff_stack = effective_stack_for_solve_root(&solve_root);
 
         let street = session.current_street();
         let sizes = match street {
@@ -2067,6 +2585,19 @@ pub fn game_solve_core(
         let cbv_ctx = session.cbv_context.clone();
         let position = session.position_label(player).to_string();
         let current_node = session.node_idx;
+        let solve_anchor = SolveAnchor {
+            node_idx: current_node,
+            board: board.clone(),
+            action_ids: session
+                .action_history
+                .iter()
+                .map(|a| a.action_id.clone())
+                .collect(),
+        };
+        let player_labels = [
+            session.position_label(1 - session.tree.dealer).to_string(),
+            session.position_label(session.tree.dealer).to_string(),
+        ];
 
         (
             board,
@@ -2078,6 +2609,9 @@ pub fn game_solve_core(
             cbv_ctx,
             current_node,
             position,
+            solve_anchor,
+            player_labels,
+            solve_root,
             street,
         )
     };
@@ -2152,82 +2686,77 @@ pub fn game_solve_core(
         }
     };
 
-    // Reset solve state atomics
+    // Reset solve state for this mode before building, so progress snapshots
+    // cannot read a stale solved tree from an earlier solve.
     let ss = ss_ref;
-    ss.iteration.store(0, Ordering::Relaxed);
-    ss.max_iterations.store(max_iters, Ordering::Relaxed);
-    ss.exploitability_bits
-        .store(f32::MAX.to_bits(), Ordering::Relaxed);
-    ss.cancel.store(false, Ordering::Relaxed);
-    ss.solving.store(true, Ordering::Release);
-    *ss.solve_start.write() = Some(Instant::now());
-    *ss.matrix_snapshot.write() = None;
-    *ss.solve_position.write() = position_label;
+    reset_solve_state_for_start(ss, max_iters, position_label, solve_anchor);
+
+    let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
+    let build_exact = is_exact || boundary_cut.is_none();
+
+    // Gadget tree mode (A2): when gadget is enabled AND a boundary
+    // cut is active, build via make_per_boundary_gadget_game which
+    // injects per-boundary gadget subtrees. game.root() remains the
+    // real subgame root.
+    let gadget_tree_active = gadget_enabled && boundary_cut.is_some() && cbv_ctx.is_some();
+
+    let game_result = if gadget_tree_active {
+        build_gadget_tree_game_for_solve(
+            &board,
+            &oop_w,
+            &ip_w,
+            pot,
+            eff_stack,
+            &bet_sizes,
+            solve_root,
+            depth_limit_override,
+            &cbv_ctx,
+            current_node_idx,
+            &boundary_cut,
+            max_iters,
+            target_exp,
+        )
+    } else {
+        if gadget_enabled && boundary_cut.is_none() {
+            eprintln!("[solve] enable_gadget=true but no boundary cut; gadget has no effect");
+        }
+        if gadget_enabled && cbv_ctx.is_none() {
+            eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
+        }
+        build_solve_game_with_root(
+            &board,
+            &oop_w,
+            &ip_w,
+            pot,
+            eff_stack,
+            &bet_sizes,
+            build_exact,
+            depth_limit_override,
+            Some(solve_root),
+        )
+    };
+    let mut game = match game_result {
+        Ok(game) => game,
+        Err(e) => {
+            ss.solving.store(false, Ordering::Release);
+            return Err(e);
+        }
+    };
+
+    let position_label_for_guard = ss.solve_position.read().clone();
+    if let Err(e) = validate_solve_root_actor_label(
+        game.current_player(),
+        &player_labels,
+        &position_label_for_guard,
+    ) {
+        debug_assert!(false, "{e}");
+        eprintln!("[solve] {e}");
+    }
 
     // Spawn background thread
     let ss_clone = Arc::clone(ss_ref);
     let board_clone = board.clone();
     std::thread::spawn(move || {
-        // Build game with depth_limit from boundary config.
-        // When no boundary cut is active (all-exact SBC or explicit exact mode),
-        // build as exact (no boundaries).
-        let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
-        let build_exact = is_exact || boundary_cut.is_none();
-
-        // Gadget tree mode (A2): when gadget is enabled AND a boundary
-        // cut is active, build via make_per_boundary_gadget_game which
-        // injects per-boundary gadget subtrees. game.root() remains the
-        // real subgame root.
-        let gadget_tree_active = gadget_enabled && boundary_cut.is_some() && cbv_ctx.is_some();
-
-        let mut game = if gadget_tree_active {
-            match build_gadget_tree_game_for_solve(
-                &board_clone,
-                &oop_w,
-                &ip_w,
-                pot,
-                eff_stack,
-                &bet_sizes,
-                depth_limit_override,
-                &cbv_ctx,
-                current_node_idx,
-                &boundary_cut,
-                max_iters,
-                target_exp,
-            ) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("[solve] failed to build gadget-tree game: {e}");
-                    ss_clone.solving.store(false, Ordering::Release);
-                    return;
-                }
-            }
-        } else {
-            if gadget_enabled && boundary_cut.is_none() {
-                eprintln!("[solve] enable_gadget=true but no boundary cut; gadget has no effect");
-            }
-            if gadget_enabled && cbv_ctx.is_none() {
-                eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
-            }
-            match build_solve_game(
-                &board_clone,
-                &oop_w,
-                &ip_w,
-                pot,
-                eff_stack,
-                &bet_sizes,
-                build_exact,
-                depth_limit_override,
-            ) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("[solve] failed to build game: {e}");
-                    ss_clone.solving.store(false, Ordering::Release);
-                    return;
-                }
-            }
-        };
-
         // Store available actions at the explorer-visible root.
         // Under A2, game.root() IS the real subgame root.
         {
@@ -2440,7 +2969,7 @@ pub fn game_solve_core(
 
         // Build solve cache for all decision nodes in the solved tree.
         game.back_to_root();
-        let solve_cache = build_solve_cache(&mut game);
+        let solve_cache = build_solve_cache(&mut game, &player_labels);
         eprintln!(
             "[solve] cached {} decision nodes for subgame navigation",
             solve_cache.len()
@@ -3688,6 +4217,48 @@ mod tests {
         assert!(action_tree.invalid_terminals().is_empty());
     }
 
+    #[test]
+    fn build_solve_game_with_root_can_start_sb_facing_bb_bet() {
+        let board = vec![
+            "Ah".to_string(),
+            "Kd".to_string(),
+            "Qc".to_string(),
+            "Js".to_string(),
+        ];
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5], vec![1.0]];
+        let root = SolveGameRoot {
+            starting_pot: 40,
+            initial_player: 1,
+            initial_stacks: [140, 180],
+            initial_prev_action: range_solver::Action::Bet(40),
+            initial_prev_amount: 40,
+            initial_amount: 0,
+            initial_num_bets: 1,
+        };
+
+        let game = build_solve_game_with_root(
+            &board,
+            &weights,
+            &weights,
+            80,
+            140,
+            &sizes,
+            true,
+            None,
+            Some(root),
+        )
+        .unwrap();
+
+        assert_eq!(game.current_player(), 1);
+        let actions = game.available_actions();
+        assert!(actions.contains(&range_solver::Action::Fold));
+        assert!(actions.contains(&range_solver::Action::Call));
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, range_solver::Action::Raise(_))));
+    }
+
     // -------------------------------------------------------------------
     // solve state reset on game_new tests
     // -------------------------------------------------------------------
@@ -3757,6 +4328,7 @@ mod tests {
             force_allin_threshold: 0.15,
             merging_threshold: 0.1,
             depth_limit: Some(0),
+            ..Default::default()
         };
         let action_tree = ActionTree::new(tree_config).unwrap();
         let card_config = CardConfig {
@@ -3878,6 +4450,47 @@ mod tests {
                     kind: TerminalKind::Fold { winner: 0 },
                     pot: 8.0,
                     stacks: [196.0, 196.0],
+                },
+            ],
+            root: 0,
+            dealer: 0,
+            starting_stack: 200.0,
+        };
+        GameSession::new_for_test(tree)
+    }
+
+    fn make_bet_amount_session() -> GameSession {
+        use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
+        let tree = V2GameTree {
+            nodes: vec![
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Fold, TreeAction::Bet(8.0)],
+                    children: vec![1, 2],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 1 },
+                    pot: 6.0,
+                    stacks: [199.0, 201.0],
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Fold, TreeAction::Call],
+                    children: vec![3, 4],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 0 },
+                    pot: 16.0,
+                    stacks: [192.0, 200.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 16.0,
+                    stacks: [192.0, 192.0],
                 },
             ],
             root: 0,
@@ -4058,6 +4671,262 @@ mod tests {
     fn make_multi_street_session() -> GameSession {
         let tree = make_multi_street_tree();
         GameSession::new_for_test(tree)
+    }
+
+    fn make_turn_sb_facing_bb_bet_session() -> GameSession {
+        use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
+
+        let tree = V2GameTree {
+            nodes: vec![
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Bet(20.0)],
+                    children: vec![1],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Call],
+                    children: vec![2],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Flop,
+                    child: 3,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![4],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![5],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Turn,
+                    child: 6,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Bet(40.0)],
+                    children: vec![7],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call, TreeAction::Raise(120.0)],
+                    children: vec![8, 9, 10],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 1 },
+                    pot: 80.0,
+                    stacks: [180.0, 140.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 120.0,
+                    stacks: [140.0, 140.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 200.0,
+                    stacks: [60.0, 140.0],
+                },
+            ],
+            root: 0,
+            dealer: 0,
+            starting_stack: 200.0,
+        };
+
+        let mut session = GameSession::new_for_test(tree);
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Ah").unwrap();
+        session.deal_card("Kd").unwrap();
+        session.deal_card("Qc").unwrap();
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Js").unwrap();
+        session.play_action("0").unwrap();
+        session
+    }
+
+    #[test]
+    fn solve_root_config_matches_sb_to_act_facing_bb_bet() {
+        let session = make_turn_sb_facing_bb_bet_session();
+        let node = &session.tree.nodes[session.node_idx as usize];
+        let player = match node {
+            V2GameNode::Decision { player, .. } => *player,
+            _ => panic!("expected decision node"),
+        };
+        assert_eq!(session.position_label(player), "SB");
+
+        let root = session.solve_game_root_for_player(player).unwrap();
+        assert_eq!(root.initial_player, 1);
+        assert_eq!(root.initial_stacks, [140, 180]);
+        assert_eq!(root.initial_prev_action, range_solver::Action::Bet(40));
+        assert_eq!(root.initial_prev_amount, 40);
+        assert_eq!(root.initial_amount, 0);
+        assert_eq!(root.initial_num_bets, 1);
+        assert_eq!(root.starting_pot, 40);
+
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5], vec![1.0]];
+        let game = build_solve_game_with_root(
+            &session.board,
+            &weights,
+            &weights,
+            session.compute_pot(),
+            effective_stack_for_solve_root(&root),
+            &sizes,
+            true,
+            None,
+            Some(root),
+        )
+        .unwrap();
+
+        assert_eq!(game.current_player(), 1);
+        assert!(validate_solve_root_actor_label(
+            game.current_player(),
+            &["BB".to_string(), "SB".to_string()],
+            session.position_label(player),
+        )
+        .is_ok());
+    }
+
+    fn make_turn_sb_facing_bb_all_in_session() -> GameSession {
+        use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
+
+        let tree = V2GameTree {
+            nodes: vec![
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Bet(20.0)],
+                    children: vec![1],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Call],
+                    children: vec![2],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Flop,
+                    child: 3,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![4],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![5],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Turn,
+                    child: 6,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::AllIn],
+                    children: vec![7],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call],
+                    children: vec![8, 9],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 1 },
+                    pot: 220.0,
+                    stacks: [180.0, 0.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 400.0,
+                    stacks: [0.0, 0.0],
+                },
+            ],
+            root: 0,
+            dealer: 0,
+            starting_stack: 200.0,
+        };
+
+        let mut session = GameSession::new_for_test(tree);
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Ah").unwrap();
+        session.deal_card("Kd").unwrap();
+        session.deal_card("Qc").unwrap();
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Js").unwrap();
+        session.play_action("0").unwrap();
+        session
+    }
+
+    #[test]
+    fn build_solve_game_with_root_accepts_all_in_response_with_one_zero_stack() {
+        let session = make_turn_sb_facing_bb_all_in_session();
+        let node = &session.tree.nodes[session.node_idx as usize];
+        let player = match node {
+            V2GameNode::Decision { player, .. } => *player,
+            _ => panic!("expected decision node"),
+        };
+
+        let root = session.solve_game_root_for_player(player).unwrap();
+        assert_eq!(root.initial_player, 1);
+        assert_eq!(root.initial_stacks, [0, 180]);
+        assert_eq!(root.initial_prev_action, range_solver::Action::AllIn(180));
+        assert_eq!(effective_stack_for_solve_root(&root), 180);
+
+        let weights = vec![1.0f32; 1326];
+        let sizes = vec![vec![0.5], vec![1.0]];
+        let game = build_solve_game_with_root(
+            &session.board,
+            &weights,
+            &weights,
+            session.compute_pot(),
+            effective_stack_for_solve_root(&root),
+            &sizes,
+            true,
+            None,
+            Some(root),
+        )
+        .unwrap();
+
+        assert_eq!(game.current_player(), 1);
+        let actions = game.available_actions();
+        assert_eq!(actions.len(), 2);
+        assert!(actions.contains(&range_solver::Action::Fold));
+        assert!(actions.contains(&range_solver::Action::Call));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, range_solver::Action::Raise(_))));
     }
 
     // -------------------------------------------------------------------
@@ -4439,13 +5308,23 @@ mod tests {
         action_labels: &[&str],
         position: &str,
     ) -> CachedSolveNode {
+        fn action_type_for_label(label: &str) -> String {
+            match label.trim().to_ascii_lowercase().as_str() {
+                "fold" => "fold".to_string(),
+                "check" => "check".to_string(),
+                "call" => "call".to_string(),
+                "all-in" | "allin" => "allin".to_string(),
+                _ => "bet".to_string(),
+            }
+        }
+
         let actions: Vec<GameAction> = action_labels
             .iter()
             .enumerate()
             .map(|(i, &lbl)| GameAction {
                 id: i.to_string(),
                 label: lbl.to_string(),
-                action_type: "check".to_string(),
+                action_type: action_type_for_label(lbl),
             })
             .collect();
         let matrix = GameMatrix {
@@ -4468,6 +5347,43 @@ mod tests {
         }
     }
 
+    fn make_cached_node_with_actions(
+        hand_label: &str,
+        actions: Vec<GameAction>,
+        position: &str,
+    ) -> CachedSolveNode {
+        let matrix = GameMatrix {
+            cells: vec![vec![GameMatrixCell {
+                hand: hand_label.to_string(),
+                suited: false,
+                pair: false,
+                probabilities: vec![1.0; actions.len()],
+                combo_count: 1,
+                weight: 1.0,
+                ev: None,
+                combos: vec![],
+            }]],
+            actions: actions.clone(),
+        };
+        CachedSolveNode {
+            matrix,
+            actions,
+            position: position.to_string(),
+        }
+    }
+
+    fn anchor_solve_to_current_session(ss: &SolveState, session: &GameSession) {
+        *ss.solve_anchor.write() = Some(SolveAnchor {
+            node_idx: session.node_idx,
+            board: session.board.clone(),
+            action_ids: session
+                .action_history
+                .iter()
+                .map(|a| a.action_id.clone())
+                .collect(),
+        });
+    }
+
     #[test]
     fn solve_state_default_has_empty_cache_and_path() {
         let ss = SolveState::default();
@@ -4481,10 +5397,10 @@ mod tests {
         // Populate cache and path
         ss.solve_cache
             .write()
-            .insert(vec![], make_cached_node("ROOT", &["Check", "Bet"], "OOP"));
+            .insert(vec![], make_cached_node("ROOT", &["Check", "Bet"], "BB"));
         ss.solve_cache
             .write()
-            .insert(vec![0], make_cached_node("CHILD0", &["Fold", "Call"], "IP"));
+            .insert(vec![0], make_cached_node("CHILD0", &["Fold", "Call"], "SB"));
         ss.solve_path.write().push(0);
 
         assert!(!ss.solve_cache.read().is_empty());
@@ -4527,7 +5443,7 @@ mod tests {
     }
 
     #[test]
-    fn play_action_resets_when_navigating_outside_solved_tree() {
+    fn play_action_preserves_cache_when_source_path_misses() {
         let gss = GameSessionState::default();
         let session = make_two_level_session();
         *gss.session.write() = Some(session);
@@ -4540,12 +5456,223 @@ mod tests {
             .insert(vec![], root_node);
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
-        // Play action "1" (Call) -- path [1] not in cache, should reset
+        // Play action "1" (Call) -- path [1] not in cache, should not reset
         let source = Some("subgame".to_string());
         let _state = game_play_action_core(&gss, "1", source).unwrap();
-        // Cache should be cleared
-        assert!(gss.subgame_solve.solve_cache.read().is_empty());
+        // Cache should be preserved for possible later reuse.
+        assert!(!gss.subgame_solve.solve_cache.read().is_empty());
         assert!(gss.subgame_solve.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn blueprint_play_does_not_consume_or_clear_subgame_cache() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], make_cached_node("ROOT", &["Fold", "Call"], "BB"));
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], make_cached_node("CHILD", &["Check"], "SB"));
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+
+        let _state = game_play_action_core(&gss, "1", None).unwrap();
+
+        assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
+        assert!(gss.subgame_solve.solve_cache.read().contains_key(&vec![1]));
+    }
+
+    #[test]
+    fn source_switch_after_blueprint_navigation_derives_cached_child_path() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        anchor_solve_to_current_session(&gss.subgame_solve, &session);
+        *gss.session.write() = Some(session);
+
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], make_cached_node("ROOT", &["Fold", "Call"], "BB"));
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], make_cached_node("CHILD", &["Check"], "SB"));
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+
+        let _blueprint_state = game_play_action_core(&gss, "1", None).unwrap();
+        assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
+
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
+        let matrix = state.matrix.expect("subgame child matrix");
+
+        assert_eq!(matrix.cells[0][0].hand, "CHILD");
+        assert_eq!(state.position, "SB");
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![1]);
+    }
+
+    #[test]
+    fn source_switch_matches_cached_path_by_action_semantics_not_id() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        anchor_solve_to_current_session(&gss.subgame_solve, &session);
+        *gss.session.write() = Some(session);
+
+        let root_actions = vec![
+            GameAction {
+                id: "0".to_string(),
+                label: "Call".to_string(),
+                action_type: "call".to_string(),
+            },
+            GameAction {
+                id: "1".to_string(),
+                label: "Fold".to_string(),
+                action_type: "fold".to_string(),
+            },
+        ];
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node_with_actions("ROOT", root_actions, "BB"),
+        );
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![0], make_cached_node("CHILD_CALL", &["Check"], "SB"));
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+
+        let _blueprint_state = game_play_action_core(&gss, "1", None).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
+        let matrix = state.matrix.expect("subgame child matrix");
+
+        assert_eq!(matrix.cells[0][0].hand, "CHILD_CALL");
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
+    }
+
+    #[test]
+    fn source_play_maps_solver_action_id_to_session_action_semantically() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        anchor_solve_to_current_session(&gss.subgame_solve, &session);
+        *gss.session.write() = Some(session);
+
+        let root_actions = vec![
+            GameAction {
+                id: "0".to_string(),
+                label: "Call".to_string(),
+                action_type: "call".to_string(),
+            },
+            GameAction {
+                id: "1".to_string(),
+                label: "Fold".to_string(),
+                action_type: "fold".to_string(),
+            },
+        ];
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node_with_actions("ROOT", root_actions, "BB"),
+        );
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![0], make_cached_node("CHILD_CALL", &["Check"], "SB"));
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+
+        let state = game_play_action_core(&gss, "0", Some("subgame".to_string())).unwrap();
+        let matrix = state.matrix.expect("subgame child matrix");
+
+        assert_eq!(matrix.cells[0][0].hand, "CHILD_CALL");
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
+        let session = gss.session.read();
+        let record = &session.as_ref().unwrap().action_history[0];
+        assert_eq!(record.action_id, "1");
+        assert_eq!(record.label, "Call");
+    }
+
+    #[test]
+    fn source_play_matches_bet_amount_when_solver_action_id_differs() {
+        let gss = GameSessionState::default();
+        let session = make_bet_amount_session();
+        anchor_solve_to_current_session(&gss.subgame_solve, &session);
+        *gss.session.write() = Some(session);
+
+        let root_actions = vec![
+            GameAction {
+                id: "0".to_string(),
+                label: "4bb".to_string(),
+                action_type: "bet".to_string(),
+            },
+            GameAction {
+                id: "1".to_string(),
+                label: "Fold".to_string(),
+                action_type: "fold".to_string(),
+            },
+        ];
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node_with_actions("ROOT", root_actions, "SB"),
+        );
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![0], make_cached_node("CHILD_BET", &["Fold", "Call"], "BB"));
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+
+        let state = game_play_action_core(&gss, "0", Some("subgame".to_string())).unwrap();
+        let matrix = state.matrix.expect("subgame child matrix");
+
+        assert_eq!(matrix.cells[0][0].hand, "CHILD_BET");
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
+        let session = gss.session.read();
+        let record = &session.as_ref().unwrap().action_history[0];
+        assert_eq!(record.action_id, "1");
+        assert_eq!(record.label, "4bb");
+    }
+
+    #[test]
+    fn solve_start_clears_stale_cache_and_path_for_mode() {
+        let ss = SolveState::default();
+        ss.solve_cache
+            .write()
+            .insert(vec![], make_cached_node("STALE", &["Call"], "BB"));
+        ss.solve_path.write().push(0);
+        *ss.solve_actions.write() = vec![GameAction {
+            id: "0".to_string(),
+            label: "Stale".to_string(),
+            action_type: "call".to_string(),
+        }];
+
+        reset_solve_state_for_start(
+            &ss,
+            123,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 7,
+                board: vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()],
+                action_ids: vec!["1".to_string()],
+            },
+        );
+
+        assert!(ss.solve_cache.read().is_empty());
+        assert!(ss.solve_path.read().is_empty());
+        assert!(ss.solve_actions.read().is_empty());
+        assert_eq!(ss.max_iterations.load(Ordering::Relaxed), 123);
+        assert_eq!(ss.solve_position.read().as_str(), "BB");
+        assert!(ss.solving.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn solve_root_actor_guard_reports_session_and_range_labels() {
+        let labels = ["BB".to_string(), "SB".to_string()];
+        let err = validate_solve_root_actor_label(0, &labels, "SB").unwrap_err();
+
+        assert_eq!(
+            err,
+            "Solve root actor mismatch: session is SB but range solver root is BB"
+        );
+        assert!(validate_solve_root_actor_label(0, &labels, "BB").is_ok());
     }
 
     #[test]
@@ -4579,10 +5706,11 @@ mod tests {
         let matrix = state.matrix.expect("should have root cached matrix");
         assert_eq!(matrix.cells[0][0].hand, "ROOT");
         assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
+        assert!(gss.subgame_solve.solve_cache.read().contains_key(&vec![]));
     }
 
     #[test]
-    fn back_at_solve_root_shows_root_matrix() {
+    fn back_at_solve_root_preserves_cache_without_overlay() {
         let gss = GameSessionState::default();
         let session = make_two_level_session();
         *gss.session.write() = Some(session);
@@ -4607,10 +5735,81 @@ mod tests {
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
         // Path is empty (at solve root)
 
-        // Go back -- should clear cache (navigating before solve root)
+        // Go back -- before solve root, source cache is not consumed or cleared.
         let _state = game_back_core(&gss, Some("subgame".to_string())).unwrap();
-        // Cache should be cleared since we went before the solve root
-        assert!(gss.subgame_solve.solve_cache.read().is_empty());
+        assert!(gss.subgame_solve.solve_cache.read().contains_key(&vec![]));
+        assert!(gss.subgame_solve.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn exact_and_subgame_caches_are_independent() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node("SUB_ROOT", &["Fold", "Call"], "BB"),
+        );
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], make_cached_node("SUB_CHILD", &["Check"], "SB"));
+        gss.exact_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node("EXACT_ROOT", &["Fold", "Call"], "BB"),
+        );
+        gss.exact_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], make_cached_node("EXACT_CHILD", &["Check"], "SB"));
+
+        let state = game_play_action_core(&gss, "1", Some("exact".to_string())).unwrap();
+        let matrix = state.matrix.expect("exact child matrix");
+
+        assert_eq!(matrix.cells[0][0].hand, "EXACT_CHILD");
+        assert_eq!(*gss.exact_solve.solve_path.read(), vec![1]);
+        assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
+        assert!(gss.subgame_solve.solve_cache.read().contains_key(&vec![1]));
+    }
+
+    #[test]
+    fn stale_solve_anchor_does_not_overlay_unrelated_session_state() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        *gss.session.write() = Some(session);
+
+        {
+            let session = gss.session.read();
+            let session = session.as_ref().unwrap();
+            *gss.subgame_solve.solve_anchor.write() = Some(SolveAnchor {
+                node_idx: session.node_idx,
+                board: vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()],
+                action_ids: session
+                    .action_history
+                    .iter()
+                    .map(|a| a.action_id.clone())
+                    .collect(),
+            });
+        }
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node("CACHE_ROOT", &["Fold", "Call"], "BB"),
+        );
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], make_cached_node("CACHE_CHILD", &["Check"], "SB"));
+
+        let _ = game_play_action_core(&gss, "1", None).unwrap();
+        let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
+
+        if let Some(matrix) = state.matrix {
+            assert_ne!(matrix.cells[0][0].hand, "CACHE_ROOT");
+        }
+        assert_eq!(*gss.subgame_solve.solve_path.read(), Vec::<usize>::new());
+        assert!(gss.subgame_solve.solve_cache.read().contains_key(&vec![]));
     }
 
     #[test]
@@ -4677,6 +5876,7 @@ mod tests {
             force_allin_threshold: 0.15,
             merging_threshold: 0.1,
             depth_limit: Some(0),
+            ..Default::default()
         };
         let action_tree = ActionTree::new(tree_config).unwrap();
         let card_config = CardConfig {
@@ -4688,11 +5888,24 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
 
-        let cache = build_solve_cache(&mut game);
+        let player_labels = ["BB".to_string(), "SB".to_string()];
+        let cache = build_solve_cache(&mut game, &player_labels);
         // Root should be present
         assert!(
             cache.contains_key(&vec![]),
             "cache should contain root entry"
+        );
+        assert!(
+            cache
+                .values()
+                .all(|node| node.position != "OOP" && node.position != "IP"),
+            "cache should use seat labels, not OOP/IP"
+        );
+        assert!(
+            cache
+                .values()
+                .all(|node| node.position == "BB" || node.position == "SB"),
+            "cache should contain only BB/SB labels"
         );
         // Root should have actions
         assert!(!cache[&vec![]].actions.is_empty());
@@ -4733,6 +5946,7 @@ mod tests {
             force_allin_threshold: 0.15,
             merging_threshold: 0.1,
             depth_limit: Some(0),
+            ..Default::default()
         };
         let action_tree = ActionTree::new(tree_config).unwrap();
         let card_config = CardConfig {

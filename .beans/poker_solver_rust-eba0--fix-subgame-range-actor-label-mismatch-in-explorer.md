@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-eba0
 title: Fix subgame range + actor label mismatch in Explorer
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-04-17T17:05:22Z
-updated_at: 2026-05-05T13:38:43Z
+updated_at: 2026-05-05T13:47:32Z
 ---
 
 Subgame solver's range matrix disagrees with Blueprint and Exact tabs at the same decision node, and the actor label is wrong.
@@ -90,3 +90,22 @@ Screenshots show turn-start subgame solve correctly updates the matrix, but afte
 ## Final Edge Finding
 
 - [ ] Fix Tauri solve startup for all-in response roots: effective_stack must remain positive when one rooted initial stack is zero and the facing player still has chips.
+
+
+## Summary of Changes
+
+[x] Always display seat labels (BB/SB), never OOP/IP, for Blueprint/Subgame/Exact matrices.
+[x] Added range-solver rooted postflop trees so turn/river solves can start at the current actor, with street stacks, pending bet/all-in state, and prior aggressive action metadata.
+[x] Anchored Subgame and Exact solved-matrix caches to the solve-start game state and preserve them while navigating or rewinding inside the solved subtree.
+[x] Resolved solved-cache paths and play-action routing by semantic action matching instead of numeric action IDs across source tabs.
+[x] Kept Blueprint, Subgame, and Exact matrices source-specific for the current game state; Blueprint navigation no longer consumes or clears solved caches.
+[x] Added regression coverage for seat labels, source switching, semantic action matching, stale-cache clearing, in-street solve roots, and all-in response roots.
+[x] Updated explorer and architecture docs for source-specific solved matrices and rooted range-solver postflop trees.
+
+## Verification
+
+[x] cargo test -p range-solver action_tree
+[x] cargo test -p poker-solver-tauri game_session::tests::
+[x] cargo test -p range-solver --doc
+[x] cargo test (58.38s)
+[x] git diff --check

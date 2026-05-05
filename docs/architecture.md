@@ -206,6 +206,7 @@ A self-contained postflop solver that computes Nash equilibrium strategies for s
 - PioSOLVER-compatible range syntax (AA, AKs, QQ-88, TT+, weights)
 - Bet size notation: pot-relative (50%), previous-bet-relative (2.5x), geometric (2e), additive (100c), all-in (a)
 - Suit isomorphism detection on turn/river to skip redundant chance nodes
+- Rooted postflop trees for in-street subgame solves, including custom acting player, street stacks, current bet amount, and prior aggressive action metadata
 - Arena-allocated game tree with `MutexLike` for lock-free interior mutability
 - Two-pass O(n) terminal evaluation using sorted hand strength arrays
 

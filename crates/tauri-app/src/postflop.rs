@@ -793,6 +793,7 @@ pub fn build_subgame_solver(
         } else {
             Some(0)
         },
+        ..Default::default()
     };
 
     let action_tree =

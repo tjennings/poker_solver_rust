@@ -68,6 +68,8 @@ Continue through turn and river by entering additional cards. The suit mapping f
 - **History strip** -- shows the full action sequence at the top; click any point to rewind
 - **Available actions** -- displayed for the current decision point with probabilities
 
+When using Blueprint, Subgame, or Exact strategy sources, the matrix is source-specific for the current game state. Solved Subgame and Exact sources keep their solved matrix cache anchored to the street state where the solve started, so taking actions or rewinding within that solved subtree continues to show the solved strategy instead of falling back to the blueprint matrix. Player labels in the Explorer are always seat positions (`BB`/`SB`).
+
 ## Simulator Tab
 
 Hand simulation interface for testing strategies against each other.
