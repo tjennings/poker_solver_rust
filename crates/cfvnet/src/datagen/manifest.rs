@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const TURN_BOUNDARY_SCHEMA_VERSION: u32 = 1;
 pub const TURN_BOUNDARY_BOARD_SIZE: u8 = 4;
@@ -148,6 +148,25 @@ impl DatasetManifest {
 
         Ok(())
     }
+
+    pub fn add_turn_boundary_shard(
+        &mut self,
+        dataset_dir: impl AsRef<Path>,
+        shard_path: impl AsRef<Path>,
+        records: u64,
+        target_source: Option<TargetSource>,
+    ) -> Result<(), ManifestValidationError> {
+        let path = manifest_shard_path(dataset_dir, shard_path)?;
+        self.shards.push(ShardMetadata {
+            path,
+            records,
+            board_size: TURN_BOUNDARY_BOARD_SIZE,
+            record_size_bytes: record_size(TURN_BOUNDARY_BOARD_SIZE as usize),
+            target_source,
+        });
+        self.coverage.total_records = self.shards.iter().map(|shard| shard.records).sum();
+        Ok(())
+    }
 }
 
 impl RecordSchema {
@@ -219,6 +238,29 @@ pub enum ManifestValidationError {
     ShardBoardSize { path: String, actual: u8 },
     #[error("shard {path} has record_size_bytes={actual}")]
     ShardRecordSize { path: String, actual: usize },
+    #[error("shard path {path} is not inside dataset directory {dataset_dir}")]
+    ShardOutsideDataset { dataset_dir: String, path: String },
+}
+
+/// Convert a shard path to the relative path stored in a manifest.
+pub fn manifest_shard_path(
+    dataset_dir: impl AsRef<Path>,
+    shard_path: impl AsRef<Path>,
+) -> Result<String, ManifestValidationError> {
+    let dataset_dir = dataset_dir.as_ref();
+    let shard_path = shard_path.as_ref();
+    let relative: PathBuf = if shard_path.is_absolute() {
+        let stripped = shard_path.strip_prefix(dataset_dir).map_err(|_| {
+            ManifestValidationError::ShardOutsideDataset {
+                dataset_dir: dataset_dir.display().to_string(),
+                path: shard_path.display().to_string(),
+            }
+        })?;
+        stripped.to_path_buf()
+    } else {
+        shard_path.to_path_buf()
+    };
+    Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
 #[cfg(test)]
@@ -271,5 +313,44 @@ mod tests {
 
         let err = manifest.validate_turn_boundary().unwrap_err();
         assert_eq!(err, ManifestValidationError::BoardSize { actual: 5 });
+    }
+
+    #[test]
+    fn add_shard_records_relative_manifest_path_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard0 = dir.path().join("turn.bin");
+        let shard1 = dir.path().join("turn_00001.bin");
+        let mut manifest = DatasetManifest::new_turn_boundary(TargetSource::RiverNet);
+
+        manifest
+            .add_turn_boundary_shard(dir.path(), &shard0, 128, None)
+            .unwrap();
+        manifest
+            .add_turn_boundary_shard(dir.path(), &shard1, 64, Some(TargetSource::ExactRiver))
+            .unwrap();
+
+        assert_eq!(manifest.shards[0].path, "turn.bin");
+        assert_eq!(manifest.shards[1].path, "turn_00001.bin");
+        assert_eq!(
+            manifest.shards[1].target_source,
+            Some(TargetSource::ExactRiver)
+        );
+        assert_eq!(manifest.coverage.total_records, 192);
+        manifest.validate_turn_boundary().unwrap();
+    }
+
+    #[test]
+    fn absolute_shard_outside_dataset_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = DatasetManifest::new_turn_boundary(TargetSource::RiverNet);
+
+        let err = manifest
+            .add_turn_boundary_shard(dir.path(), "/tmp/outside.bin", 1, None)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ManifestValidationError::ShardOutsideDataset { .. }
+        ));
     }
 }

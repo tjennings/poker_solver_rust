@@ -2,6 +2,9 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+use crate::datagen::manifest::{
+    manifest_shard_path, ManifestValidationError, ShardMetadata, TargetSource,
+};
 use crate::datagen::storage::{write_record, TrainingRecord};
 
 /// Writes training records to binary files with count tracking and optional per-file rotation.
@@ -12,6 +15,7 @@ pub struct RecordWriter {
     records_in_file: u64,
     file_index: u32,
     total_count: u64,
+    completed_files: Vec<(PathBuf, u64)>,
 }
 
 impl RecordWriter {
@@ -24,6 +28,7 @@ impl RecordWriter {
             records_in_file: 0,
             file_index: 0,
             total_count: 0,
+            completed_files: Vec::new(),
         })
     }
 
@@ -50,8 +55,42 @@ impl RecordWriter {
         self.total_count
     }
 
+    pub fn shard_metadata(
+        &self,
+        dataset_dir: &Path,
+        board_size: u8,
+        record_size_bytes: usize,
+        target_source: Option<TargetSource>,
+    ) -> Result<Vec<ShardMetadata>, ManifestValidationError> {
+        let mut shards = Vec::with_capacity(self.completed_files.len() + 1);
+        for (path, records) in &self.completed_files {
+            shards.push(ShardMetadata {
+                path: manifest_shard_path(dataset_dir, path)?,
+                records: *records,
+                board_size,
+                record_size_bytes,
+                target_source,
+            });
+        }
+        if self.records_in_file > 0 {
+            let path = Self::file_path(&self.base_path, self.file_index);
+            shards.push(ShardMetadata {
+                path: manifest_shard_path(dataset_dir, path)?,
+                records: self.records_in_file,
+                board_size,
+                record_size_bytes,
+                target_source,
+            });
+        }
+        Ok(shards)
+    }
+
     fn rotate(&mut self) -> Result<(), String> {
         self.flush()?;
+        if self.records_in_file > 0 {
+            let path = Self::file_path(&self.base_path, self.file_index);
+            self.completed_files.push((path, self.records_in_file));
+        }
         self.file_index += 1;
         self.writer = Self::open_file(&self.base_path, self.file_index)?;
         self.records_in_file = 0;
@@ -81,6 +120,7 @@ impl RecordWriter {
 mod tests {
     use super::*;
     use crate::datagen::storage::read_record;
+    use crate::datagen::storage::record_size;
     use std::io::BufReader;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -281,5 +321,46 @@ mod tests {
         let mut reader =
             BufReader::new(std::fs::File::open(dir.path().join("data_00002.bin")).unwrap());
         assert_eq!(read_record(&mut reader).unwrap().pot, 40.0);
+    }
+
+    #[test]
+    fn shard_metadata_reports_rotation_files_and_counts() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("data.bin");
+        let mut writer = RecordWriter::create(&base, Some(3)).unwrap();
+        for i in 0..10 {
+            writer.write(&[sample_record(0, i as f32)]).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let shards = writer
+            .shard_metadata(dir.path(), 4, record_size(4), Some(TargetSource::RiverNet))
+            .unwrap();
+
+        assert_eq!(shards.len(), 4);
+        assert_eq!(shards[0].path, "data.bin");
+        assert_eq!(shards[0].records, 3);
+        assert_eq!(shards[1].path, "data_00001.bin");
+        assert_eq!(shards[1].records, 3);
+        assert_eq!(shards[2].path, "data_00002.bin");
+        assert_eq!(shards[2].records, 3);
+        assert_eq!(shards[3].path, "data_00003.bin");
+        assert_eq!(shards[3].records, 1);
+        assert!(shards
+            .iter()
+            .all(|shard| shard.target_source == Some(TargetSource::RiverNet)));
+    }
+
+    #[test]
+    fn shard_metadata_omits_empty_initial_file() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("data.bin");
+        let writer = RecordWriter::create(&base, Some(3)).unwrap();
+
+        let shards = writer
+            .shard_metadata(dir.path(), 4, record_size(4), None)
+            .unwrap();
+
+        assert!(shards.is_empty());
     }
 }
