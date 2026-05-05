@@ -123,10 +123,7 @@ impl CbvTable {
     /// # Errors
     ///
     /// Returns an error if serialization fails.
-    pub fn save_to_writer<W: io::Write>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(), bincode::Error> {
+    pub fn save_to_writer<W: io::Write>(&self, writer: &mut W) -> Result<(), bincode::Error> {
         bincode::serialize_into(writer, self)
     }
 
@@ -207,8 +204,8 @@ mod tests {
 
     #[test]
     fn cbv_ordinal_of_node_maps_sparse_arena_to_dense() {
-        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
         use crate::blueprint_v2::Street;
+        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
 
         // Tree with chance nodes at arena indices 2 and 6 (NOT 0 and 1).
         // Ordinals should be 0 and 1 respectively.
@@ -290,8 +287,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "not a CBV boundary")]
     fn cbv_ordinal_of_node_panics_for_non_chance_node() {
-        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
         use crate::blueprint_v2::Street;
+        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
 
         let nodes = vec![
             GameNode::Decision {
@@ -326,8 +323,8 @@ mod tests {
 
     #[test]
     fn cbv_require_ordinal_returns_correct_value() {
-        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
         use crate::blueprint_v2::Street;
+        use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
 
         let nodes = vec![
             GameNode::Decision {

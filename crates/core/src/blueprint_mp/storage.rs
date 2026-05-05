@@ -54,7 +54,9 @@ impl MpStorage {
     #[must_use]
     pub fn new(tree: &MpGameTree, bucket_counts: [u16; 4]) -> Self {
         let (layout, total) = build_layout(&tree.nodes, bucket_counts);
-        let decision_count = tree.nodes.iter()
+        let decision_count = tree
+            .nodes
+            .iter()
             .filter(|n| matches!(n, MpGameNode::Decision { .. }))
             .count();
         let regret_bytes = total * std::mem::size_of::<AtomicI16>();
@@ -64,8 +66,11 @@ impl MpStorage {
         eprintln!(
             "  MP Storage: {} nodes ({} decision), {} slots \
              (virtual: {:.1} GB, est. physical: {:.1} GB at 60% visit rate)",
-            tree.nodes.len(), decision_count, total,
-            virtual_total as f64 / 1e9, estimated_physical / 1e9,
+            tree.nodes.len(),
+            decision_count,
+            total,
+            virtual_total as f64 / 1e9,
+            estimated_physical / 1e9,
         );
         Self {
             regrets: MmapBuffer::new(total),
@@ -98,7 +103,11 @@ impl MpStorage {
         self.regrets[idx]
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 let val = old.saturating_add(delta);
-                Some(if floor == i16::MIN { val } else { val.max(floor) })
+                Some(if floor == i16::MIN {
+                    val
+                } else {
+                    val.max(floor)
+                })
             })
             .ok();
     }
@@ -113,8 +122,7 @@ impl MpStorage {
     /// Add a delta to a single strategy sum value atomically.
     #[inline]
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
-        self.strategy_sums[self.slot(node_idx, bucket, action)]
-            .fetch_add(delta, Ordering::Relaxed);
+        self.strategy_sums[self.slot(node_idx, bucket, action)].fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Current strategy via regret matching, written into `out`.

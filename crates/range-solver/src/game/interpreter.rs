@@ -125,10 +125,7 @@ impl PostFlopGame {
     /// Validates the card configuration, enumerates private hands, computes
     /// hand strength tables, isomorphism data, and builds the game tree.
     #[inline]
-    pub fn with_config(
-        card_config: CardConfig,
-        action_tree: ActionTree,
-    ) -> Result<Self, String> {
+    pub fn with_config(card_config: CardConfig, action_tree: ActionTree) -> Result<Self, String> {
         let mut game = Self::default();
         game.update_config(card_config, action_tree)?;
         Ok(game)
@@ -190,8 +187,7 @@ impl PostFlopGame {
             panic!("Game is not successfully initialized");
         }
 
-        let num_elements =
-            2 * self.num_storage + self.num_storage_ip + self.num_storage_chance;
+        let num_elements = 2 * self.num_storage + self.num_storage_ip + self.num_storage_chance;
         let uncompressed = 4 * num_elements + self.misc_memory_usage;
         let compressed = 2 * num_elements + self.misc_memory_usage;
 
@@ -285,7 +281,11 @@ impl PostFlopGame {
     ) {
         assert_eq!(s1.len(), self.storage1.len(), "storage1 size mismatch");
         assert_eq!(s2.len(), self.storage2.len(), "storage2 size mismatch");
-        assert_eq!(s_ip.len(), self.storage_ip.len(), "storage_ip size mismatch");
+        assert_eq!(
+            s_ip.len(),
+            self.storage_ip.len(),
+            "storage_ip size mismatch"
+        );
         assert_eq!(
             s_chance.len(),
             self.storage_chance.len(),
@@ -527,9 +527,12 @@ impl PostFlopGame {
     /// Call once per solve_step iteration with the same DiscountParams the solver uses.
     pub fn set_boundary_discount(&self, alpha_t: f32, beta_t: f32, gamma_t: f32) {
         use std::sync::atomic::Ordering;
-        self.boundary_discount_alpha.store(alpha_t.to_bits(), Ordering::Relaxed);
-        self.boundary_discount_beta.store(beta_t.to_bits(), Ordering::Relaxed);
-        self.boundary_discount_gamma.store(gamma_t.to_bits(), Ordering::Relaxed);
+        self.boundary_discount_alpha
+            .store(alpha_t.to_bits(), Ordering::Relaxed);
+        self.boundary_discount_beta
+            .store(beta_t.to_bits(), Ordering::Relaxed);
+        self.boundary_discount_gamma
+            .store(gamma_t.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -545,8 +548,7 @@ impl PostFlopGame {
             let num_bytes: usize = if self.is_compression_enabled { 2 } else { 4 };
             let storage_bytes = (num_bytes as u64 * self.num_storage) as usize;
             let storage_ip_bytes = (num_bytes as u64 * self.num_storage_ip) as usize;
-            let storage_chance_bytes =
-                (num_bytes as u64 * self.num_storage_chance) as usize;
+            let storage_chance_bytes = (num_bytes as u64 * self.num_storage_chance) as usize;
 
             self.storage1 = vec![0; storage_bytes];
             self.storage2 = vec![0; storage_bytes];
@@ -752,7 +754,7 @@ impl PostFlopGame {
         // Gadget terminal ordinals.
         for b in 0..n_original {
             let append_base = old_len + 4 * b;
-            new_map[append_base] = (n_original + 2 * b) as u32;      // T_IP
+            new_map[append_base] = (n_original + 2 * b) as u32; // T_IP
             new_map[append_base + 2] = (n_original + 2 * b + 1) as u32; // T_OOP
         }
 
@@ -789,19 +791,15 @@ impl PostFlopGame {
             for player in 0..2 {
                 let idx = old_ord * 2 + player;
                 if idx < old_cfvs.len() {
-                    *new_cfvs[idx].lock().unwrap() =
-                        old_cfvs[idx].lock().unwrap().clone();
+                    *new_cfvs[idx].lock().unwrap() = old_cfvs[idx].lock().unwrap().clone();
                 }
                 if idx < old_reach.len() {
-                    *new_reach[idx].lock().unwrap() =
-                        old_reach[idx].lock().unwrap().clone();
+                    *new_reach[idx].lock().unwrap() = old_reach[idx].lock().unwrap().clone();
                 }
             }
             if old_ord < old_is_raw.len() {
-                new_is_raw[old_ord].store(
-                    old_is_raw[old_ord],
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                new_is_raw[old_ord]
+                    .store(old_is_raw[old_ord], std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -1031,16 +1029,12 @@ impl PostFlopGame {
                 }
                 (49 - self.isomorphism_card_turn.len(), river_coef)
             }
-            (turn, NOT_DEALT) => {
-                (1, 48 - self.isomorphism_card_river[turn as usize & 3].len())
-            }
+            (turn, NOT_DEALT) => (1, 48 - self.isomorphism_card_river[turn as usize & 3].len()),
             _ => (0, 1),
         };
 
-        let num_action_nodes = count_num_action_nodes(
-            &self.action_root.lock(),
-            self.tree_config.initial_state,
-        );
+        let num_action_nodes =
+            count_num_action_nodes(&self.action_root.lock(), self.tree_config.initial_state);
 
         [
             num_action_nodes[0],
@@ -1146,11 +1140,7 @@ impl PostFlopGame {
             };
             for action_index in 0..num_actions {
                 let child_index = node_index + children_offset + action_index;
-                self.build_tree_recursive(
-                    child_index,
-                    &action_node.children[0].lock(),
-                    info,
-                );
+                self.build_tree_recursive(child_index, &action_node.children[0].lock(), info);
             }
         } else {
             self.push_actions(node_index, action_node, info);
@@ -1712,7 +1702,10 @@ mod tests {
         let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
 
         // Should have boundary nodes
-        assert!(game.num_boundary_nodes() > 0, "depth-limited tree should have boundary nodes");
+        assert!(
+            game.num_boundary_nodes() > 0,
+            "depth-limited tree should have boundary nodes"
+        );
 
         // Should be able to allocate memory
         game.allocate_memory(false);
@@ -1819,7 +1812,10 @@ mod tests {
         // All boundary pots should be >= starting pot
         for ordinal in 0..game.num_boundary_nodes() {
             let pot = game.boundary_pot(ordinal);
-            assert!(pot >= 100, "boundary pot should be >= starting pot, got {pot}");
+            assert!(
+                pot >= 100,
+                "boundary pot should be >= starting pot, got {pot}"
+            );
         }
     }
 

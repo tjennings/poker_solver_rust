@@ -26,11 +26,14 @@ use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
 use super::game_tree::GameTree;
-use super::mccfr::{traverse_best_response, traverse_external, AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PruneStats, ScenarioEvTracker, PRUNE_HITS, PRUNE_TOTAL};
+use super::mccfr::{
+    AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PRUNE_HITS, PRUNE_TOTAL, PruneStats,
+    ScenarioEvTracker, traverse_best_response, traverse_external,
+};
 use super::storage::BlueprintStorage;
 use crate::cfr::optimizer::{BrcfrPlusOptimizer, CfrOptimizer, DcfrOptimizer, SapcfrPlusOptimizer};
 use crate::hands::CanonicalHand;
-use crate::poker::{Card, ALL_SUITS, ALL_VALUES};
+use crate::poker::{ALL_SUITS, ALL_VALUES, Card};
 
 /// Pre-initialized canonical deck — copied into the trainer's deck buffer
 /// via memcpy instead of rebuilding from VALUE×SUIT loops each deal.
@@ -57,10 +60,7 @@ fn sample_deal_with_rng(rng: &mut impl Rng) -> Deal {
         deck.swap(i, j);
     }
     Deal {
-        hole_cards: [
-            [deck[0], deck[1]],
-            [deck[2], deck[3]],
-        ],
+        hole_cards: [[deck[0], deck[1]], [deck[2], deck[3]]],
         board: [deck[4], deck[5], deck[6], deck[7], deck[8]],
     }
 }
@@ -68,9 +68,14 @@ fn sample_deal_with_rng(rng: &mut impl Rng) -> Deal {
 /// Check whether all 4 bucket files already exist in the given directory.
 #[must_use]
 pub fn bucket_files_exist(dir: &Path) -> bool {
-    ["river.buckets", "turn.buckets", "flop.buckets", "preflop.buckets"]
-        .iter()
-        .all(|name| dir.join(name).exists())
+    [
+        "river.buckets",
+        "turn.buckets",
+        "flop.buckets",
+        "preflop.buckets",
+    ]
+    .iter()
+    .all(|name| dir.join(name).exists())
 }
 
 /// Attempt to load `.buckets` files from the given directory.
@@ -92,7 +97,8 @@ pub fn load_bucket_files(dir: &Path) -> [Option<BucketFile>; 4] {
         if path.exists() {
             match BucketFile::load(&path) {
                 Ok(bf) => {
-                    eprintln!("  Loaded bucket file: {} ({} boards, {} combos/board, {} buckets)",
+                    eprintln!(
+                        "  Loaded bucket file: {} ({} boards, {} combos/board, {} buckets)",
                         path.display(),
                         bf.header.board_count,
                         bf.header.combos_per_board,
@@ -114,8 +120,7 @@ type StrategyRefreshCallback =
 /// Callback type for pushing a random scenario to the TUI.
 /// Receives per-position EV arrays `[position][hand_index]` so the callback
 /// can select the correct position based on the chosen node's player.
-type RandomScenarioCallback =
-    Box<dyn Fn(&BlueprintStorage, &GameTree, &[[f64; 169]; 2]) + Send>;
+type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree, &[[f64; 169]; 2]) + Send>;
 
 /// Outer training driver for Blueprint V2.
 ///
@@ -213,7 +218,8 @@ pub struct BlueprintTrainer {
 
     // --- Exploitability measurement ---
     /// Callback to push top exploitable spots to TUI after a BR pass.
-    pub on_exploitable_spots: Option<Box<dyn Fn(Vec<super::exploitable_spots::ExploitableSpot>) + Send>>,
+    pub on_exploitable_spots:
+        Option<Box<dyn Fn(Vec<super::exploitable_spots::ExploitableSpot>) + Send>>,
     /// Callback to push exploitability values to TUI metrics.
     pub on_exploitability: Option<Box<dyn Fn(f64) + Send>>,
     /// Called at the start of an exploitability/BR pass with the total sample count.
@@ -333,12 +339,19 @@ impl BlueprintTrainer {
                     if name_str.ends_with(".buckets") {
                         let dest_file = dest.join(&name);
                         std::fs::copy(entry.path(), &dest_file).unwrap_or_else(|e| {
-                            panic!("failed to copy {} to {}: {e}", entry.path().display(), dest_file.display())
+                            panic!(
+                                "failed to copy {} to {}: {e}",
+                                entry.path().display(),
+                                dest_file.display()
+                            )
                         });
                         copied += 1;
                     }
                 }
-                eprintln!("  Copied {copied} bucket files from {cluster_path} to {}", dest.display());
+                eprintln!(
+                    "  Copied {copied} bucket files from {cluster_path} to {}",
+                    dest.display()
+                );
             } else {
                 eprintln!("  Bucket files already present at {}", dest.display());
             }
@@ -514,7 +527,11 @@ impl BlueprintTrainer {
         self.storage.set_optimizer(optimizer);
         if self.config.training.use_baselines {
             let total = self.storage.regrets.len();
-            self.storage.baselines = Some((0..total).map(|_| std::sync::atomic::AtomicI32::new(0)).collect());
+            self.storage.baselines = Some(
+                (0..total)
+                    .map(|_| std::sync::atomic::AtomicI32::new(0))
+                    .collect(),
+            );
         }
 
         // Load metadata for iteration count and elapsed time.
@@ -531,7 +548,9 @@ impl BlueprintTrainer {
             // activate correctly after resume.
             if let Some(prev_min) = extract_json_u64(&meta_str, "elapsed_minutes") {
                 let backdate = std::time::Duration::from_secs(prev_min * 60);
-                self.start_time = Instant::now().checked_sub(backdate).unwrap_or(self.start_time);
+                self.start_time = Instant::now()
+                    .checked_sub(backdate)
+                    .unwrap_or(self.start_time);
             }
         }
 
@@ -574,23 +593,23 @@ impl BlueprintTrainer {
         // Validate bucket files unless explicitly skipped or no cluster_path configured
         // (no cluster_path means intentional equity-only mode).
         if !self.skip_bucket_validation && self.config.training.cluster_path.is_some() {
-        const STREET_NAMES: [&str; 3] = ["flop", "turn", "river"];
-        let mut missing = Vec::new();
-        for (i, name) in STREET_NAMES.iter().enumerate() {
-            if self.buckets.bucket_files[i + 1].is_none() {
-                missing.push(*name);
+            const STREET_NAMES: [&str; 3] = ["flop", "turn", "river"];
+            let mut missing = Vec::new();
+            for (i, name) in STREET_NAMES.iter().enumerate() {
+                if self.buckets.bucket_files[i + 1].is_none() {
+                    missing.push(*name);
+                }
             }
-        }
-        if !missing.is_empty() {
-            return Err(format!(
-                "No bucket files found for: {}. \
+            if !missing.is_empty() {
+                return Err(format!(
+                    "No bucket files found for: {}. \
                  Run the clustering pipeline first (cluster_path: {:?}). \
                  Training without proper buckets produces meaningless strategies.",
-                missing.join(", "),
-                self.config.training.cluster_path,
-            )
-            .into());
-        }
+                    missing.join(", "),
+                    self.config.training.cluster_path,
+                )
+                .into());
+            }
         }
 
         let batch_size = self.config.training.batch_size;
@@ -616,9 +635,7 @@ impl BlueprintTrainer {
             }
 
             // Pre-seed per-deal RNGs from the main RNG (only sequential part).
-            let thread_seeds: Vec<u64> = (0..this_batch)
-                .map(|_| self.rng.random())
-                .collect();
+            let thread_seeds: Vec<u64> = (0..this_batch).map(|_| self.rng.random()).collect();
 
             let prune = self.should_prune();
             // Config prune_threshold is in chip units; scale to match stored regrets.
@@ -643,39 +660,67 @@ impl BlueprintTrainer {
 
             // Fully parallel: each thread samples its own deal, precomputes
             // buckets, and traverses — no sequential deal generation.
-            let batch_prune_stats: PruneStats = thread_seeds.into_par_iter().map(|seed| {
-                let mut rng = SmallRng::seed_from_u64(seed);
-                let deal = sample_deal_with_rng(&mut rng);
-                let buckets = buckets_ref.precompute_buckets(&deal);
+            let batch_prune_stats: PruneStats = thread_seeds
+                .into_par_iter()
+                .map(|seed| {
+                    let mut rng = SmallRng::seed_from_u64(seed);
+                    let deal = sample_deal_with_rng(&mut rng);
+                    let buckets = buckets_ref.precompute_buckets(&deal);
 
-                // Count bucket visits (both players, all streets).
-                for player_buckets in &buckets {
-                    for (street, &bucket) in player_buckets.iter().enumerate() {
-                        if (bucket as usize) < visit_counters[street].len() {
-                            visit_counters[street][bucket as usize]
-                                .fetch_add(1, Ordering::Relaxed);
+                    // Count bucket visits (both players, all streets).
+                    for player_buckets in &buckets {
+                        for (street, &bucket) in player_buckets.iter().enumerate() {
+                            if (bucket as usize) < visit_counters[street].len() {
+                                visit_counters[street][bucket as usize]
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
-                }
 
-                let deal = DealWithBuckets { deal, buckets };
-                let mut stats = PruneStats::default();
+                    let deal = DealWithBuckets { deal, buckets };
+                    let mut stats = PruneStats::default();
 
-                let (_, s0) = traverse_external(
-                    tree, storage, &deal, 0, tree.root, prune, threshold,
-                    prune_streets, &mut rng, rake_rate, rake_cap,
-                    Some(ev_tracker), Some(full_ev_tracker), baseline_alpha,
-                );
-                stats.merge(s0);
-                let (_, s1) = traverse_external(
-                    tree, storage, &deal, 1, tree.root, prune, threshold,
-                    prune_streets, &mut rng, rake_rate, rake_cap,
-                    Some(ev_tracker), Some(full_ev_tracker), baseline_alpha,
-                );
-                stats.merge(s1);
+                    let (_, s0) = traverse_external(
+                        tree,
+                        storage,
+                        &deal,
+                        0,
+                        tree.root,
+                        prune,
+                        threshold,
+                        prune_streets,
+                        &mut rng,
+                        rake_rate,
+                        rake_cap,
+                        Some(ev_tracker),
+                        Some(full_ev_tracker),
+                        baseline_alpha,
+                    );
+                    stats.merge(s0);
+                    let (_, s1) = traverse_external(
+                        tree,
+                        storage,
+                        &deal,
+                        1,
+                        tree.root,
+                        prune,
+                        threshold,
+                        prune_streets,
+                        &mut rng,
+                        rake_rate,
+                        rake_cap,
+                        Some(ev_tracker),
+                        Some(full_ev_tracker),
+                        baseline_alpha,
+                    );
+                    stats.merge(s1);
 
-                stats
-            }).reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
+                    stats
+                })
+                .reduce(PruneStats::default, |mut a, b| {
+                    a.merge(b);
+                    a
+                });
 
             // Single atomic update for the whole batch.
             PRUNE_HITS.fetch_add(batch_prune_stats.hits, Ordering::Relaxed);
@@ -705,10 +750,7 @@ impl BlueprintTrainer {
         }
 
         Deal {
-            hole_cards: [
-                [self.deck[0], self.deck[1]],
-                [self.deck[2], self.deck[3]],
-            ],
+            hole_cards: [[self.deck[0], self.deck[1]], [self.deck[2], self.deck[3]]],
             board: [
                 self.deck[4],
                 self.deck[5],
@@ -799,12 +841,26 @@ impl BlueprintTrainer {
                 let deal = DealWithBuckets { deal, buckets };
 
                 let br0 = traverse_best_response(
-                    tree, storage, &deal, 0, tree.root, rake_rate, rake_cap,
-                    Some(storage), Some(vc_ref),
+                    tree,
+                    storage,
+                    &deal,
+                    0,
+                    tree.root,
+                    rake_rate,
+                    rake_cap,
+                    Some(storage),
+                    Some(vc_ref),
                 );
                 let br1 = traverse_best_response(
-                    tree, storage, &deal, 1, tree.root, rake_rate, rake_cap,
-                    Some(storage), Some(vc_ref),
+                    tree,
+                    storage,
+                    &deal,
+                    1,
+                    tree.root,
+                    rake_rate,
+                    rake_cap,
+                    Some(storage),
+                    Some(vc_ref),
                 );
                 if let Some(ref cb) = tick {
                     cb();
@@ -834,11 +890,8 @@ impl BlueprintTrainer {
 
         // Find and push top exploitable spots to TUI.
         if let Some(ref cb) = self.on_exploitable_spots {
-            let spots = super::exploitable_spots::find_top_exploitable_spots(
-                &self.tree,
-                &self.storage,
-                10,
-            );
+            let spots =
+                super::exploitable_spots::find_top_exploitable_spots(&self.tree, &self.storage, 10);
             cb(spots);
         }
 
@@ -909,7 +962,8 @@ impl BlueprintTrainer {
             elapsed_min >= self.last_print_time + self.config.training.print_every_minutes;
         let tui_refresh_triggered = self.strategy_refresh_trigger.swap(false, Ordering::Relaxed);
         let refresh_due = tui_refresh_triggered
-            || elapsed_secs >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs;
+            || elapsed_secs
+                >= self.last_strategy_refresh_secs + self.strategy_refresh_interval_secs;
 
         if print_due || refresh_due {
             self.update_strategy_delta();
@@ -995,7 +1049,10 @@ impl BlueprintTrainer {
             let hand_evs = if self.scenario_ev_tracker.node_indices.is_empty() {
                 [[0.0; 169], [0.0; 169]]
             } else {
-                [self.scenario_ev_tracker.hand_ev_array(0, 0), self.scenario_ev_tracker.hand_ev_array(0, 1)]
+                [
+                    self.scenario_ev_tracker.hand_ev_array(0, 0),
+                    self.scenario_ev_tracker.hand_ev_array(0, 1),
+                ]
             };
             callback(&self.storage, &self.tree, &hand_evs);
             self.last_random_scenario_min = elapsed_min;
@@ -1050,7 +1107,11 @@ impl BlueprintTrainer {
     fn apply_lcfr_discount(&mut self) {
         let interval = self.config.training.lcfr_discount_interval.max(1);
         let t = self.iterations / interval;
-        let t = self.config.training.dcfr_epoch_cap.map_or(t, |cap| t.min(cap));
+        let t = self
+            .config
+            .training
+            .dcfr_epoch_cap
+            .map_or(t, |cap| t.min(cap));
 
         if let Some(ref opt) = self.storage.optimizer {
             opt.apply_discount(
@@ -1182,11 +1243,7 @@ impl BlueprintTrainer {
             .iter()
             .fold((0.0_f64, 0_u64), |(s, c), atom| {
                 let r = atom.load(Ordering::Relaxed);
-                if r > 0 {
-                    (s + r as f64, c + 1)
-                } else {
-                    (s, c)
-                }
+                if r > 0 { (s + r as f64, c + 1) } else { (s, c) }
             });
         if count > 0 {
             sum / count as f64 / self.iterations as f64 / super::storage::REGRET_SCALE
@@ -1199,8 +1256,8 @@ impl BlueprintTrainer {
     #[must_use]
     pub fn prune_fraction(&self) -> f64 {
         // Config prune_threshold is in chip units; scale to match stored regrets.
-        let threshold = (f64::from(self.config.training.prune_threshold)
-            * super::storage::REGRET_SCALE) as i32;
+        let threshold =
+            (f64::from(self.config.training.prune_threshold) * super::storage::REGRET_SCALE) as i32;
         let total = self.storage.regrets.len() as f64;
         if total == 0.0 {
             return 0.0;
@@ -1237,11 +1294,7 @@ impl BlueprintTrainer {
             .iter()
             .fold((0.0_f64, 0_u64), |(s, c), atom| {
                 let r = atom.load(Ordering::Relaxed);
-                if r > 0 {
-                    (s + r as f64, c + 1)
-                } else {
-                    (s, c)
-                }
+                if r > 0 { (s + r as f64, c + 1) } else { (s, c) }
             });
         if count > 0 {
             sum / count as f64 / super::storage::REGRET_SCALE
@@ -1257,12 +1310,18 @@ impl BlueprintTrainer {
     /// Returns 0.0 if the node has no Fold action.
     #[allow(dead_code)]
     fn fold_value_at_node(tree: &GameTree, node_idx: u32, player: usize) -> f64 {
-        use super::game_tree::{GameNode, TreeAction, TerminalKind};
-        if let GameNode::Decision { actions, children, .. } = &tree.nodes[node_idx as usize] {
+        use super::game_tree::{GameNode, TerminalKind, TreeAction};
+        if let GameNode::Decision {
+            actions, children, ..
+        } = &tree.nodes[node_idx as usize]
+        {
             for (a, &child_idx) in children.iter().enumerate() {
                 if actions[a] == TreeAction::Fold {
-                    if let GameNode::Terminal { kind: TerminalKind::Fold { .. }, stacks, .. } =
-                        &tree.nodes[child_idx as usize]
+                    if let GameNode::Terminal {
+                        kind: TerminalKind::Fold { .. },
+                        stacks,
+                        ..
+                    } = &tree.nodes[child_idx as usize]
                     {
                         // Fold payoff = stacks[folder] - starting_stack (negative, loses blind)
                         return stacks[player] - tree.starting_stack;
@@ -1298,7 +1357,8 @@ impl BlueprintTrainer {
                 if self.scenario_ev_tracker.node_indices.is_empty() {
                     return (hand.to_string(), 0.0, 0);
                 }
-                let sum = self.scenario_ev_tracker.ev_sum[0][player][i].load(AO::Relaxed) as f64 / 1000.0;
+                let sum =
+                    self.scenario_ev_tracker.ev_sum[0][player][i].load(AO::Relaxed) as f64 / 1000.0;
                 let count = self.scenario_ev_tracker.ev_count[0][player][i].load(AO::Relaxed);
                 let avg = if count > 0 { sum / count as f64 } else { 0.0 };
                 (hand.to_string(), avg, count)
@@ -1317,9 +1377,11 @@ impl BlueprintTrainer {
                 if self.scenario_ev_tracker.node_indices.is_empty() {
                     return (hand.to_string(), 0.0, 0);
                 }
-                let sum0 = self.scenario_ev_tracker.ev_sum[0][0][i].load(AO::Relaxed) as f64 / 1000.0;
+                let sum0 =
+                    self.scenario_ev_tracker.ev_sum[0][0][i].load(AO::Relaxed) as f64 / 1000.0;
                 let count0 = self.scenario_ev_tracker.ev_count[0][0][i].load(AO::Relaxed);
-                let sum1 = self.scenario_ev_tracker.ev_sum[0][1][i].load(AO::Relaxed) as f64 / 1000.0;
+                let sum1 =
+                    self.scenario_ev_tracker.ev_sum[0][1][i].load(AO::Relaxed) as f64 / 1000.0;
                 let count1 = self.scenario_ev_tracker.ev_count[0][1][i].load(AO::Relaxed);
                 let total_count = count0 + count1;
                 let avg = if total_count > 0 {
@@ -1368,7 +1430,8 @@ impl BlueprintTrainer {
         bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
 
         // Save full-tree EV tracker.
-        self.full_ev_tracker.save(&snapshot_dir.join("hand_ev.bin"))?;
+        self.full_ev_tracker
+            .save(&snapshot_dir.join("hand_ev.bin"))?;
 
         // Compute and save counterfactual boundary values (CBVs) for
         // real-time subgame solving. One table per player, indexed by
@@ -1377,10 +1440,12 @@ impl BlueprintTrainer {
         let transitions = crate::blueprint_v2::cbv_compute::build_transitions_from_buckets(
             &self.buckets.bucket_files,
         );
-        let [p0_cbvs, p1_cbvs] =
-            crate::blueprint_v2::cbv_compute::compute_cbvs_with_transitions(
-                &strategy, &self.tree, bucket_counts, &transitions,
-            );
+        let [p0_cbvs, p1_cbvs] = crate::blueprint_v2::cbv_compute::compute_cbvs_with_transitions(
+            &strategy,
+            &self.tree,
+            bucket_counts,
+            &transitions,
+        );
         p0_cbvs.save(&snapshot_dir.join("cbv_p0.bin"))?;
         p1_cbvs.save(&snapshot_dir.join("cbv_p1.bin"))?;
 
@@ -1396,7 +1461,12 @@ impl BlueprintTrainer {
                 let total: u64 = counts.iter().sum();
                 let nonzero = counts.iter().filter(|&&c| c > 0).count();
                 let max = counts.iter().max().copied().unwrap_or(0);
-                let min_nonzero = counts.iter().filter(|&&c| c > 0).min().copied().unwrap_or(0);
+                let min_nonzero = counts
+                    .iter()
+                    .filter(|&&c| c > 0)
+                    .min()
+                    .copied()
+                    .unwrap_or(0);
                 if !self.tui_active {
                     eprintln!(
                         "[bucket visits] {name}: {nonzero}/{} buckets visited, total={total}, min={min_nonzero}, max={max}",
@@ -1404,7 +1474,9 @@ impl BlueprintTrainer {
                     );
                 }
                 let _ = write!(visit_json, "  \"{name}\": {:?}", counts);
-                if s < 3 { visit_json.push(','); }
+                if s < 3 {
+                    visit_json.push(',');
+                }
                 visit_json.push('\n');
             }
             visit_json.push('}');
@@ -1514,10 +1586,30 @@ mod tests {
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
-                flop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
-                turn: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
-                river: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                preflop: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                flop: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                turn: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                river: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
                 seed: 42,
                 kmeans_iterations: 50,
                 cfvnet_river_data: None,
@@ -1662,11 +1754,13 @@ mod tests {
         config.training.iterations = Some(20);
         let mut trainer = toy_trainer(config);
 
-        assert!(trainer
-            .storage
-            .regrets
-            .iter()
-            .all(|r| r.load(Ordering::Relaxed) == 0));
+        assert!(
+            trainer
+                .storage
+                .regrets
+                .iter()
+                .all(|r| r.load(Ordering::Relaxed) == 0)
+        );
 
         trainer.train().expect("training should complete");
 
@@ -1712,10 +1806,7 @@ mod tests {
         trainer.apply_lcfr_discount();
 
         assert_eq!(trainer.storage.regrets[0].load(Ordering::Relaxed), 0);
-        assert_eq!(
-            trainer.storage.strategy_sums[0].load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(trainer.storage.strategy_sums[0].load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1802,11 +1893,14 @@ mod tests {
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
         assert!(snapshot_dir.join("hand_ev.json").exists());
-        assert!(snapshot_dir.join("hand_ev.bin").exists(), "full-tree EV tracker should be saved");
+        assert!(
+            snapshot_dir.join("hand_ev.bin").exists(),
+            "full-tree EV tracker should be saved"
+        );
 
         // Verify hand_ev.json is valid JSON with 169 entries.
-        let ev_json = std::fs::read_to_string(snapshot_dir.join("hand_ev.json"))
-            .expect("read hand_ev.json");
+        let ev_json =
+            std::fs::read_to_string(snapshot_dir.join("hand_ev.json")).expect("read hand_ev.json");
         let ev_map: std::collections::BTreeMap<String, serde_json::Value> =
             serde_json::from_str(&ev_json).expect("parse hand_ev.json");
         assert_eq!(ev_map.len(), 169, "should have 169 hand entries");
@@ -1836,11 +1930,7 @@ mod tests {
         let remaining: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("snapshot_")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot_"))
             .collect();
         assert_eq!(remaining.len(), 2, "should keep exactly max_snapshots");
 
@@ -1871,16 +1961,20 @@ mod tests {
         let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
         assert_eq!(trainer.iterations, 200);
-        assert!(trainer
-            .storage
-            .regrets
-            .iter()
-            .any(|r| r.load(Ordering::Relaxed) != 0));
-        assert!(trainer
-            .storage
-            .strategy_sums
-            .iter()
-            .any(|s| s.load(Ordering::Relaxed) != 0));
+        assert!(
+            trainer
+                .storage
+                .regrets
+                .iter()
+                .any(|r| r.load(Ordering::Relaxed) != 0)
+        );
+        assert!(
+            trainer
+                .storage
+                .strategy_sums
+                .iter()
+                .any(|s| s.load(Ordering::Relaxed) != 0)
+        );
     }
 
     #[test]
@@ -1954,7 +2048,10 @@ mod tests {
         );
 
         // Full EV tracker should have been loaded from hand_ev.bin.
-        assert!(snapshot_dir.join("hand_ev.bin").exists(), "hand_ev.bin should exist in snapshot");
+        assert!(
+            snapshot_dir.join("hand_ev.bin").exists(),
+            "hand_ev.bin should exist in snapshot"
+        );
 
         trainer2.train().expect("resumed training");
         assert_eq!(trainer2.iterations, 40, "should reach 40 total");
@@ -1966,8 +2063,14 @@ mod tests {
         let trainer = BlueprintTrainer::new(config);
         let evs_p0 = trainer.hand_ev_array(0);
         let evs_p1 = trainer.hand_ev_array(1);
-        assert!(evs_p0.iter().all(|&v| v == 0.0), "position 0 EVs should start at zero");
-        assert!(evs_p1.iter().all(|&v| v == 0.0), "position 1 EVs should start at zero");
+        assert!(
+            evs_p0.iter().all(|&v| v == 0.0),
+            "position 0 EVs should start at zero"
+        );
+        assert!(
+            evs_p1.iter().all(|&v| v == 0.0),
+            "position 1 EVs should start at zero"
+        );
     }
 
     #[test]
@@ -1976,7 +2079,9 @@ mod tests {
         let mut trainer = BlueprintTrainer::new(config);
 
         // Set up tracker with a single node (root).
-        trainer.scenario_ev_tracker.set_nodes(vec![trainer.tree.root]);
+        trainer
+            .scenario_ev_tracker
+            .set_nodes(vec![trainer.tree.root]);
 
         // Manually set EV data for position 0, hand index 5.
         trainer.scenario_ev_tracker.accumulate(0, 0, 5, 3.0);
@@ -1988,8 +2093,16 @@ mod tests {
         let evs_p0 = trainer.hand_ev_array(0);
         let evs_p1 = trainer.hand_ev_array(1);
 
-        assert!((evs_p0[5] - 1.5).abs() < 1e-2, "position 0 hand 5 EV should be 1.5, got {}", evs_p0[5]);
-        assert!((evs_p1[5] - (-1.0)).abs() < 1e-2, "position 1 hand 5 EV should be -1.0, got {}", evs_p1[5]);
+        assert!(
+            (evs_p0[5] - 1.5).abs() < 1e-2,
+            "position 0 hand 5 EV should be 1.5, got {}",
+            evs_p0[5]
+        );
+        assert!(
+            (evs_p1[5] - (-1.0)).abs() < 1e-2,
+            "position 1 hand 5 EV should be -1.0, got {}",
+            evs_p1[5]
+        );
         // Other hands should still be zero.
         assert!(evs_p0[0] == 0.0);
         assert!(evs_p1[0] == 0.0);
@@ -2001,7 +2114,9 @@ mod tests {
         let mut trainer = BlueprintTrainer::new(config);
 
         // Set up tracker with a single node (root).
-        trainer.scenario_ev_tracker.set_nodes(vec![trainer.tree.root]);
+        trainer
+            .scenario_ev_tracker
+            .set_nodes(vec![trainer.tree.root]);
 
         trainer.scenario_ev_tracker.accumulate(0, 0, 0, 5.0);
         trainer.scenario_ev_tracker.accumulate(0, 1, 0, 5.0);
@@ -2042,7 +2157,10 @@ mod tests {
 
         // Root (scenario 0) is player 0's decision -- should have EVs for p0.
         let evs_p0 = trainer.scenario_ev_tracker.hand_ev_array(0, 0);
-        assert!(evs_p0.iter().any(|&v| v != 0.0), "position 0 should have some non-zero EVs at root");
+        assert!(
+            evs_p0.iter().any(|&v| v != 0.0),
+            "position 0 should have some non-zero EVs at root"
+        );
 
         // Find a player 1 scenario node and check it has EVs.
         let mut found_p1 = false;
@@ -2055,7 +2173,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_p1, "position 1 should have some non-zero EVs at its decision nodes");
+        assert!(
+            found_p1,
+            "position 1 should have some non-zero EVs at its decision nodes"
+        );
     }
 
     #[test]
@@ -2088,13 +2209,17 @@ mod tests {
             river_cards_per_turn: vec![vec![river_card]],
             river_buckets_per_turn,
         };
-        pf.save(&dir.path().join("flop_0000.buckets")).expect("save per-flop file");
+        pf.save(&dir.path().join("flop_0000.buckets"))
+            .expect("save per-flop file");
 
         let mut config = toy_config();
         config.training.cluster_path = Some(dir.path().to_string_lossy().into_owned());
 
         let trainer = toy_trainer(config);
-        assert!(trainer.buckets.has_per_flop_dir(), "trainer should auto-detect per-flop bucket files");
+        assert!(
+            trainer.buckets.has_per_flop_dir(),
+            "trainer should auto-detect per-flop bucket files"
+        );
     }
 
     #[test]
@@ -2106,7 +2231,10 @@ mod tests {
         config.training.cluster_path = Some(dir.path().to_string_lossy().into_owned());
 
         let trainer = toy_trainer(config);
-        assert!(!trainer.buckets.has_per_flop_dir(), "trainer should not enable per-flop without marker file");
+        assert!(
+            !trainer.buckets.has_per_flop_dir(),
+            "trainer should not enable per-flop without marker file"
+        );
     }
 
     #[test]
@@ -2116,7 +2244,9 @@ mod tests {
         config.training.use_baselines = true;
         config.training.baseline_alpha = 0.05;
         let mut trainer = toy_trainer(config);
-        trainer.train().expect("training with baselines should complete");
+        trainer
+            .train()
+            .expect("training with baselines should complete");
         assert_eq!(trainer.iterations, 50);
     }
 
@@ -2142,7 +2272,11 @@ mod tests {
     fn trainer_creates_dcfr_optimizer_by_default() {
         let config = toy_config();
         let trainer = BlueprintTrainer::new(config);
-        let opt = trainer.storage.optimizer.as_ref().expect("optimizer should be set");
+        let opt = trainer
+            .storage
+            .optimizer
+            .as_ref()
+            .expect("optimizer should be set");
         assert_eq!(opt.name(), "dcfr");
         assert!(!opt.needs_predictions());
         assert!(trainer.storage.predictions.is_none());
@@ -2154,7 +2288,11 @@ mod tests {
         config.training.optimizer = "sapcfr+".to_string();
         config.training.sapcfr_eta = 0.75;
         let trainer = BlueprintTrainer::new(config);
-        let opt = trainer.storage.optimizer.as_ref().expect("optimizer should be set");
+        let opt = trainer
+            .storage
+            .optimizer
+            .as_ref()
+            .expect("optimizer should be set");
         assert_eq!(opt.name(), "sapcfr+");
         assert!(opt.needs_predictions());
         assert!(trainer.storage.predictions.is_some());
@@ -2167,10 +2305,16 @@ mod tests {
         config.training.sapcfr_eta = 0.5;
         config.training.iterations = Some(50);
         let mut trainer = toy_trainer(config);
-        trainer.train().expect("training with sapcfr+ should complete");
+        trainer
+            .train()
+            .expect("training with sapcfr+ should complete");
         assert_eq!(trainer.iterations, 50);
         assert!(
-            trainer.storage.regrets.iter().any(|r| r.load(Ordering::Relaxed) != 0),
+            trainer
+                .storage
+                .regrets
+                .iter()
+                .any(|r| r.load(Ordering::Relaxed) != 0),
             "regrets should be updated after sapcfr+ training"
         );
     }
@@ -2183,7 +2327,11 @@ mod tests {
         config.training.iterations = Some(50);
         let mut trainer = toy_trainer(config);
         trainer.train().expect("training should complete");
-        let preds = trainer.storage.predictions.as_ref().expect("predictions should be Some");
+        let preds = trainer
+            .storage
+            .predictions
+            .as_ref()
+            .expect("predictions should be Some");
         assert!(
             preds.iter().any(|p| p.load(Ordering::Relaxed) != 0),
             "predictions should be populated after training"
@@ -2242,7 +2390,10 @@ mod tests {
         let dec_map = trainer.tree.decision_index_map();
         let dec_idx = dec_map[root as usize] as usize;
         let evs_before = trainer.full_ev_tracker.hand_ev_array(dec_idx, 0);
-        assert!((evs_before[42] - 10.0).abs() < 0.01, "precondition: full_ev_tracker should have data");
+        assert!(
+            (evs_before[42] - 10.0).abs() < 0.01,
+            "precondition: full_ev_tracker should have data"
+        );
 
         // Also accumulate into the scenario_ev_tracker.
         trainer.scenario_ev_tracker.set_nodes(vec![root]);
@@ -2254,7 +2405,9 @@ mod tests {
         trainer.iterations = 1; // need at least 1 iteration to pass
 
         // Trigger check_timed_actions which includes strategy refresh.
-        trainer.check_timed_actions().expect("check_timed_actions should not fail");
+        trainer
+            .check_timed_actions()
+            .expect("check_timed_actions should not fail");
 
         // scenario_ev_tracker SHOULD be reset (windowed for TUI display).
         let scenario_evs = trainer.scenario_ev_tracker.hand_ev_array(0, 0);
@@ -2307,9 +2460,16 @@ mod tests {
         config.training.optimizer = "brcfr+".to_string();
         config.training.brcfr_eta = 0.7;
         let trainer = BlueprintTrainer::new(config);
-        let opt = trainer.storage.optimizer.as_ref().expect("optimizer should be set");
+        let opt = trainer
+            .storage
+            .optimizer
+            .as_ref()
+            .expect("optimizer should be set");
         assert_eq!(opt.name(), "brcfr+");
-        assert!(trainer.storage.predictions.is_some(), "predictions should be enabled");
+        assert!(
+            trainer.storage.predictions.is_some(),
+            "predictions should be enabled"
+        );
     }
 
     #[test]
@@ -2326,7 +2486,11 @@ mod tests {
         // After training 400 iters with warmup=200, interval=200, we should have
         // had at least 1 BR pass (at iter 200).
         // Predictions should be populated.
-        let preds = trainer.storage.predictions.as_ref().expect("predictions enabled");
+        let preds = trainer
+            .storage
+            .predictions
+            .as_ref()
+            .expect("predictions enabled");
         let any_nonzero = preds.iter().any(|a| a.load(Ordering::Relaxed) != 0);
         assert!(any_nonzero, "predictions should be populated after BR pass");
         // last_br_iteration should have been advanced past 0.
@@ -2369,10 +2533,7 @@ mod tests {
         );
         // Each call should have received a non-empty vec (there are predictions)
         for (i, spots) in calls.iter().enumerate() {
-            assert!(
-                !spots.is_empty(),
-                "call {i} should have non-empty spots",
-            );
+            assert!(!spots.is_empty(), "call {i} should have non-empty spots",);
         }
     }
 

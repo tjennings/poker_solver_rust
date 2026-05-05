@@ -27,7 +27,12 @@ impl<'de> Deserialize<'de> for BetSizeConfig {
 
 impl Default for BetSizeConfig {
     fn default() -> Self {
-        BetSizeConfig(vec![vec!["25%".into(), "50%".into(), "100%".into(), "a".into()]])
+        BetSizeConfig(vec![vec![
+            "25%".into(),
+            "50%".into(),
+            "100%".into(),
+            "a".into(),
+        ]])
     }
 }
 
@@ -111,7 +116,10 @@ impl GameConfig {
             return Err("bet_sizes must have at least one depth".into());
         }
         if self.board_size != 4 && self.board_size != 5 {
-            return Err(format!("board_size must be 4 or 5, got {}", self.board_size));
+            return Err(format!(
+                "board_size must be 4 or 5, got {}",
+                self.board_size
+            ));
         }
         Ok(())
     }
@@ -516,7 +524,10 @@ datagen:
   num_samples: 100
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.game.river_model_path.as_deref(), Some("/path/to/river_model"));
+        assert_eq!(
+            config.game.river_model_path.as_deref(),
+            Some("/path/to/river_model")
+        );
     }
 
     #[test]
@@ -621,7 +632,10 @@ datagen:
   river_output: "/tmp/river_data.bin"
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.datagen.river_output.as_deref(), Some("/tmp/river_data.bin"));
+        assert_eq!(
+            config.datagen.river_output.as_deref(),
+            Some("/tmp/river_data.bin")
+        );
     }
 
     #[test]
@@ -655,7 +669,10 @@ datagen:
   blueprint_path: "/path/to/blueprint_bundle"
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.datagen.blueprint_path.as_deref(), Some("/path/to/blueprint_bundle"));
+        assert_eq!(
+            config.datagen.blueprint_path.as_deref(),
+            Some("/path/to/blueprint_bundle")
+        );
     }
 
     #[test]

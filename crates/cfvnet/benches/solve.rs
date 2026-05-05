@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -48,7 +48,10 @@ fn bench_solve_situation(c: &mut Criterion) {
 
     c.bench_function("solve_situation", |b| {
         b.iter(|| {
-            solve_situation(criterion::black_box(&situation), criterion::black_box(&solve_config))
+            solve_situation(
+                criterion::black_box(&situation),
+                criterion::black_box(&solve_config),
+            )
         })
     });
 }

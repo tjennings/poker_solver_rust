@@ -1,9 +1,9 @@
 use rand::Rng;
 
+use crate::blueprint_v2::Street;
 use crate::blueprint_v2::bundle::BlueprintV2Strategy;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind, TreeAction};
 use crate::blueprint_v2::mccfr::AllBuckets;
-use crate::blueprint_v2::Street;
 use crate::poker::Card;
 
 /// Decision-depth threshold: enumerate all children at depths 0 and 1,
@@ -23,7 +23,7 @@ const CHANCE_BOOST_FACTOR: u32 = 3;
 /// Classification of poker actions for biasing purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionClass {
-    Fold,  // includes Check (passive)
+    Fold, // includes Check (passive)
     Call,
     Raise, // includes Bet, Raise, AllIn (aggressive)
 }
@@ -98,7 +98,7 @@ fn card_bit(card: Card) -> u32 {
 
 /// Build a deck of remaining cards excluding both hands and the board.
 fn remaining_deck(hero: [Card; 2], opponent: [Card; 2], board: &[Card]) -> Vec<Card> {
-    use crate::poker::{ALL_VALUES, ALL_SUITS};
+    use crate::poker::{ALL_SUITS, ALL_VALUES};
 
     let mut used = 0u64;
     for &c in &hero {
@@ -154,7 +154,10 @@ pub struct RolloutContext<'a> {
 /// crossed, which handles floating-point drift where probabilities do not
 /// sum to exactly 1.0.
 fn sample_action_index(rng: &mut impl Rng, probs: &[f32]) -> usize {
-    debug_assert!(!probs.is_empty(), "sample_action_index requires non-empty probs");
+    debug_assert!(
+        !probs.is_empty(),
+        "sample_action_index requires non-empty probs"
+    );
     let r: f32 = rng.random_range(0.0..1.0);
     let mut cum = 0.0_f32;
     for (i, &p) in probs.iter().enumerate() {
@@ -201,7 +204,12 @@ pub fn rollout_from_boundary(
         cached_buckets: None,
     };
     rollout_inner(
-        hero_hand, opponent_hand, board, ctx, abstract_node, rng,
+        hero_hand,
+        opponent_hand,
+        board,
+        ctx,
+        abstract_node,
+        rng,
         state,
     )
 }
@@ -243,8 +251,7 @@ fn eval_terminal(
         }
         TerminalKind::Showdown => {
             let player_rank = crate::showdown_equity::rank_hand(hero_hand, board);
-            let opponent_rank =
-                crate::showdown_equity::rank_hand(opponent_hand, board);
+            let opponent_rank = crate::showdown_equity::rank_hand(opponent_hand, board);
             match player_rank.cmp(&opponent_rank) {
                 std::cmp::Ordering::Greater => state.pot - state.invested[p],
                 std::cmp::Ordering::Less => -state.invested[p],
@@ -273,13 +280,21 @@ fn eval_decision(
     abstract_node: u32,
 ) -> f64 {
     let actor = acting_player as usize;
-    let buckets = state.cached_buckets.unwrap_or_else(|| [
-        ctx.buckets.get_bucket(street, hero_hand, board),
-        ctx.buckets.get_bucket(street, opponent_hand, board),
-    ]);
-    let acting_bucket = if acting_player == ctx.player { buckets[0] } else { buckets[1] };
+    let buckets = state.cached_buckets.unwrap_or_else(|| {
+        [
+            ctx.buckets.get_bucket(street, hero_hand, board),
+            ctx.buckets.get_bucket(street, opponent_hand, board),
+        ]
+    });
+    let acting_bucket = if acting_player == ctx.player {
+        buckets[0]
+    } else {
+        buckets[1]
+    };
     let decision_idx = ctx.decision_idx_map[abstract_node as usize];
-    let probs = ctx.strategy.get_action_probs(decision_idx as usize, acting_bucket);
+    let probs = ctx
+        .strategy
+        .get_action_probs(decision_idx as usize, acting_bucket);
     let action_classes: Vec<ActionClass> = actions.iter().map(classify_action).collect();
     let biased = bias_strategy(probs, &action_classes, ctx.bias, ctx.bias_factor);
     let base = RolloutState {
@@ -293,20 +308,54 @@ fn eval_decision(
     if state.decision_depth < ctx.enumerate_decision_depth {
         let mut ev = 0.0;
         for (i, &child) in children.iter().enumerate() {
-            let (p, inv) = apply_action(&actions[i], state.pot, state.invested, actor, ctx.starting_stack, scale, state.street_start_invested);
+            let (p, inv) = apply_action(
+                &actions[i],
+                state.pot,
+                state.invested,
+                actor,
+                ctx.starting_stack,
+                scale,
+                state.street_start_invested,
+            );
             let child_ev = rollout_inner(
-                hero_hand, opponent_hand, board, ctx, child, rng,
-                RolloutState { pot: p, invested: inv, ..base },
+                hero_hand,
+                opponent_hand,
+                board,
+                ctx,
+                child,
+                rng,
+                RolloutState {
+                    pot: p,
+                    invested: inv,
+                    ..base
+                },
             );
             ev += f64::from(biased[i]) * child_ev;
         }
         ev
     } else {
         let chosen = sample_action_index(rng, &biased);
-        let (p, inv) = apply_action(&actions[chosen], state.pot, state.invested, actor, ctx.starting_stack, scale, state.street_start_invested);
+        let (p, inv) = apply_action(
+            &actions[chosen],
+            state.pot,
+            state.invested,
+            actor,
+            ctx.starting_stack,
+            scale,
+            state.street_start_invested,
+        );
         rollout_inner(
-            hero_hand, opponent_hand, board, ctx, children[chosen], rng,
-            RolloutState { pot: p, invested: inv, ..base },
+            hero_hand,
+            opponent_hand,
+            board,
+            ctx,
+            children[chosen],
+            rng,
+            RolloutState {
+                pot: p,
+                invested: inv,
+                ..base
+            },
         )
     }
 }
@@ -324,8 +373,11 @@ fn eval_chance(
     let deck = remaining_deck(hero_hand, opponent_hand, board);
     #[allow(clippy::cast_possible_truncation)]
     let deck_len = deck.len() as u32;
-    let chance_boost: u32 =
-        if state.chance_depth < CHANCE_BOOST_DEPTH { CHANCE_BOOST_FACTOR } else { 1 };
+    let chance_boost: u32 = if state.chance_depth < CHANCE_BOOST_DEPTH {
+        CHANCE_BOOST_FACTOR
+    } else {
+        1
+    };
     let n = (ctx.num_rollouts * chance_boost).min(deck_len);
     if n == 0 {
         return 0.0;
@@ -346,7 +398,12 @@ fn eval_chance(
             ..*state
         };
         let child_ev = rollout_inner(
-            hero_hand, opponent_hand, &new_board, ctx, child, rng,
+            hero_hand,
+            opponent_hand,
+            &new_board,
+            ctx,
+            child,
+            rng,
             child_state,
         );
         total += child_ev;
@@ -383,18 +440,26 @@ fn rollout_inner(
             eval_terminal(kind, hero_hand, opponent_hand, board, ctx, &state)
         }
         GameNode::Decision {
-            player: acting_player, street, actions, children, ..
-        } => {
-            eval_decision(
-                *acting_player, *street, actions, children,
-                hero_hand, opponent_hand, board, ctx, rng,
-                &state, abstract_node,
-            )
-        }
+            player: acting_player,
+            street,
+            actions,
+            children,
+            ..
+        } => eval_decision(
+            *acting_player,
+            *street,
+            actions,
+            children,
+            hero_hand,
+            opponent_hand,
+            board,
+            ctx,
+            rng,
+            &state,
+            abstract_node,
+        ),
         GameNode::Chance { child, .. } => {
-            eval_chance(
-                *child, hero_hand, opponent_hand, board, ctx, rng, &state,
-            )
+            eval_chance(*child, hero_hand, opponent_hand, board, ctx, rng, &state)
         }
     }
 }
@@ -484,7 +549,10 @@ mod tests {
         assert_eq!(classify_action(&TreeAction::Check), ActionClass::Fold);
         assert_eq!(classify_action(&TreeAction::Call), ActionClass::Call);
         assert_eq!(classify_action(&TreeAction::Bet(5.0)), ActionClass::Raise);
-        assert_eq!(classify_action(&TreeAction::Raise(10.0)), ActionClass::Raise);
+        assert_eq!(
+            classify_action(&TreeAction::Raise(10.0)),
+            ActionClass::Raise
+        );
         assert_eq!(classify_action(&TreeAction::AllIn), ActionClass::Raise);
     }
 
@@ -527,7 +595,12 @@ mod tests {
     #[test]
     fn bias_preserves_sum_to_one() {
         let probs = vec![0.1_f32, 0.3, 0.4, 0.2];
-        let actions = vec![ActionClass::Fold, ActionClass::Call, ActionClass::Raise, ActionClass::Raise];
+        let actions = vec![
+            ActionClass::Fold,
+            ActionClass::Call,
+            ActionClass::Raise,
+            ActionClass::Raise,
+        ];
         let biased = bias_strategy(&probs, &actions, BiasType::Raise, 5.0);
         let sum: f32 = biased.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
@@ -545,32 +618,41 @@ mod tests {
 
     // ---- rollout_from_boundary tests ----
 
-    use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
-    use crate::blueprint_v2::bundle::BlueprintV2Strategy;
-    use crate::blueprint_v2::mccfr::AllBuckets;
     use crate::blueprint_v2::Street;
-    use crate::poker::{Card, Value, Suit};
+    use crate::blueprint_v2::bundle::BlueprintV2Strategy;
+    use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
+    use crate::blueprint_v2::mccfr::AllBuckets;
+    use crate::poker::{Card, Suit, Value};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
     /// Build a minimal tree with a single fold terminal.
     /// Player 0 folds, player 1 wins. Pot=10.
     fn fold_terminal_tree() -> (GameTree, Vec<u32>) {
-        let nodes = vec![
-            GameNode::Terminal {
-                kind: TerminalKind::Fold { winner: 1 },
-                pot: 10.0,
-                stacks: [97.0, 95.0],
-            },
-        ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let nodes = vec![GameNode::Terminal {
+            kind: TerminalKind::Fold { winner: 1 },
+            pot: 10.0,
+            stacks: [97.0, 95.0],
+        }];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let decision_idx_map = vec![u32::MAX]; // no decision nodes
         (tree, decision_idx_map)
     }
 
     fn dummy_hands() -> ([Card; 2], [Card; 2]) {
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         (hero, opp)
     }
 
@@ -616,7 +698,16 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // player=1 (winner): payoff = pot - invested[1] = 10 - 5 = 5
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 1, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            1,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [3.0, 5.0]);
         assert!((ev - 5.0).abs() < 1e-9, "Winner EV should be 5.0, got {ev}");
     }
@@ -630,21 +721,36 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // player=0 (loser): payoff = -invested[0] = -3
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [3.0, 5.0]);
-        assert!((ev - (-3.0)).abs() < 1e-9, "Loser EV should be -3.0, got {ev}");
+        assert!(
+            (ev - (-3.0)).abs() < 1e-9,
+            "Loser EV should be -3.0, got {ev}"
+        );
     }
 
     /// Build a showdown terminal with pot=20.
     fn showdown_terminal_tree() -> (GameTree, Vec<u32>) {
-        let nodes = vec![
-            GameNode::Terminal {
-                kind: TerminalKind::Showdown,
-                pot: 20.0,
-                stacks: [92.0, 92.0],
-            },
-        ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let nodes = vec![GameNode::Terminal {
+            kind: TerminalKind::Showdown,
+            pot: 20.0,
+            stacks: [92.0, 92.0],
+        }];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let decision_idx_map = vec![u32::MAX];
         (tree, decision_idx_map)
     }
@@ -657,8 +763,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // AKs vs 23o on a board that gives AK the best hand
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         // Board: A K Q 7 4 (different suits to avoid flush)
         let board = [
             Card::new(Value::Ace, Suit::Heart),
@@ -669,7 +781,16 @@ mod tests {
         ];
 
         // hero (player=0) has trip aces with K kicker, opponent has nothing
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 20.0, [8.0, 8.0]);
         // Hero wins: pot - invested[0] = 20 - 8 = 12
         assert!((ev - 12.0).abs() < 1e-9, "Hero should win 12.0, got {ev}");
@@ -683,8 +804,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // hero has 23, opp has AK
-        let hero = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
-        let opp = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
+        let hero = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
+        let opp = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
         let board = [
             Card::new(Value::Ace, Suit::Heart),
             Card::new(Value::King, Suit::Diamond),
@@ -694,7 +821,16 @@ mod tests {
         ];
 
         // hero (player=0) loses
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 20.0, [8.0, 8.0]);
         assert!((ev - (-8.0)).abs() < 1e-9, "Hero should lose 8.0, got {ev}");
     }
@@ -702,22 +838,31 @@ mod tests {
     #[test]
     fn rollout_showdown_tie_splits_pot() {
         // Both have same kickers - tie scenario
-        let nodes = vec![
-            GameNode::Terminal {
-                kind: TerminalKind::Showdown,
-                pot: 20.0,
-                stacks: [90.0, 90.0],
-            },
-        ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let nodes = vec![GameNode::Terminal {
+            kind: TerminalKind::Showdown,
+            pot: 20.0,
+            stacks: [90.0, 90.0],
+        }];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let dim = vec![u32::MAX];
         let buckets = dummy_buckets();
         let strategy = dummy_strategy();
         let mut rng = StdRng::seed_from_u64(42);
 
         // Both have AK same kickers, board gives same best 5-card hand
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Ace, Suit::Heart), Card::new(Value::King, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Queen, Suit::Diamond),
             Card::new(Value::Jack, Suit::Club),
@@ -726,7 +871,16 @@ mod tests {
             Card::new(Value::Five, Suit::Diamond),
         ];
 
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 20.0, [10.0, 10.0]);
         // Tie: pot/2 - invested[0] = 10 - 10 = 0
         assert!((ev).abs() < 1e-9, "Tie should give EV 0.0, got {ev}");
@@ -761,7 +915,12 @@ mod tests {
                 stacks: [93.0, 93.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let decision_idx_map = vec![0, u32::MAX, u32::MAX];
 
         // Build a strategy with 1 decision node, 2 actions, 10 river buckets.
@@ -792,8 +951,14 @@ mod tests {
 
         // Hero = player 0 = AK, Opp = player 1 = 23
         // Board where hero (AK) wins at showdown
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Ace, Suit::Heart),
             Card::new(Value::King, Suit::Diamond),
@@ -809,7 +974,16 @@ mod tests {
         // Initial state: pot=10, invested=[3,7]. Player 0 facing a bet.
         // Fold: pot=10, invested=[3,7] → loser payoff = -3
         // Call: invested[0] matches invested[1]=7, pot=10+(7-3)=14, invested=[7,7] → winner payoff = 14-7=7
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 7.0]);
         assert!((ev - 1.0).abs() < 0.01, "Expected EV ~1.0, got {ev}");
     }
@@ -820,8 +994,14 @@ mod tests {
         let buckets = dummy_buckets();
         let mut rng = StdRng::seed_from_u64(42);
 
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Ace, Suit::Heart),
             Card::new(Value::King, Suit::Diamond),
@@ -831,14 +1011,36 @@ mod tests {
         ];
 
         // Unbiased EV = 0.6 * (-3) + 0.4 * 7 = 1.0
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
-        let unbiased_ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 7.0]);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
+        let unbiased_ev =
+            rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 7.0]);
 
         // Bias toward Call (factor 10): call gets more weight, fold less
         // So EV should increase (call=+7 is more favored than fold=-3)
         let ctx_biased = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Call, 10.0, 0, 1);
-        let biased_ev = rollout_from_boundary(hero, opp, &board, &ctx_biased, 0, &mut rng, 10.0, [3.0, 7.0]);
-        assert!(biased_ev > unbiased_ev, "Call bias should increase EV when call is +7");
+        let biased_ev = rollout_from_boundary(
+            hero,
+            opp,
+            &board,
+            &ctx_biased,
+            0,
+            &mut rng,
+            10.0,
+            [3.0, 7.0],
+        );
+        assert!(
+            biased_ev > unbiased_ev,
+            "Call bias should increase EV when call is +7"
+        );
     }
 
     #[test]
@@ -847,7 +1049,10 @@ mod tests {
         // The EV should approximate the showdown value across sampled runouts.
         let nodes = vec![
             // Node 0: Chance node to turn
-            GameNode::Chance { next_street: Street::Turn, child: 1 },
+            GameNode::Chance {
+                next_street: Street::Turn,
+                child: 1,
+            },
             // Node 1: Showdown terminal (pot=10)
             GameNode::Terminal {
                 kind: TerminalKind::Showdown,
@@ -855,7 +1060,12 @@ mod tests {
                 stacks: [95.0, 95.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let dim = vec![u32::MAX, u32::MAX];
         let buckets = dummy_buckets();
         let strategy = dummy_strategy();
@@ -863,8 +1073,14 @@ mod tests {
 
         // Hero AA vs Opp 72o on a flop of K84 rainbow
         // Hero is strongly favored; most runouts hero wins
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::Ace, Suit::Heart)];
-        let opp = [Card::new(Value::Seven, Suit::Club), Card::new(Value::Two, Suit::Diamond)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Ace, Suit::Heart),
+        ];
+        let opp = [
+            Card::new(Value::Seven, Suit::Club),
+            Card::new(Value::Two, Suit::Diamond),
+        ];
         let board = vec![
             Card::new(Value::King, Suit::Diamond),
             Card::new(Value::Eight, Suit::Club),
@@ -872,7 +1088,16 @@ mod tests {
         ];
 
         // With many rollouts, hero should have positive EV
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 100);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            100,
+        );
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [5.0, 5.0]);
         // AA vs 72o on K84: hero is ~90%+ equity
         // EV should be positive (win 5 most of the time)
@@ -881,8 +1106,14 @@ mod tests {
 
     #[test]
     fn remaining_deck_excludes_all_known_cards() {
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Queen, Suit::Diamond),
             Card::new(Value::Jack, Suit::Club),
@@ -906,16 +1137,28 @@ mod tests {
 
     #[test]
     fn remaining_deck_empty_board() {
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let deck = remaining_deck(hero, opp, &[]);
         assert_eq!(deck.len(), 48, "52 - 4 = 48 remaining cards");
     }
 
     #[test]
     fn remaining_deck_full_board() {
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Queen, Suit::Diamond),
             Card::new(Value::Jack, Suit::Club),
@@ -956,7 +1199,12 @@ mod tests {
                 stacks: [93.0, 93.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let dim = vec![0, u32::MAX, u32::MAX];
 
         // Strategy: all buckets play [0.5, 0.5]
@@ -977,8 +1225,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         // Hero AK, Opp 23. Board where hero wins showdown.
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Ace, Suit::Heart),
             Card::new(Value::King, Suit::Diamond),
@@ -992,7 +1246,16 @@ mod tests {
         // Fold by opp: pot=10, invested=[3,3] → player 0 wins: 10 - 3 = 7
         // Call by opp: invested[1]=invested[0]=3 (no change), pot=10 → showdown hero wins: 10 - 3 = 7
         // EV = 0.5 * 7 + 0.5 * 7 = 7
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         let ev = rollout_from_boundary(hero, opp, &board, &ctx, 0, &mut rng, 10.0, [3.0, 3.0]);
         assert!((ev - 7.0).abs() < 0.01, "EV should be 7.0, got {ev}");
     }
@@ -1006,7 +1269,10 @@ mod tests {
         for _ in 0..10_000 {
             counts[sample_action_index(&mut rng, &probs)] += 1;
         }
-        assert_eq!(counts[0], 0, "Zero-probability action should never be chosen");
+        assert_eq!(
+            counts[0], 0,
+            "Zero-probability action should never be chosen"
+        );
         assert!(
             (counts[1] as f64 / 10_000.0 - 0.8).abs() < 0.02,
             "Action 1 should be ~80%, got {}",
@@ -1105,7 +1371,12 @@ mod tests {
                 stacks: [93.0, 93.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let decision_idx_map = vec![0, u32::MAX, 1, 2, u32::MAX, u32::MAX, u32::MAX];
 
         let bucket_counts: [u16; 4] = [169, 10, 10, 10];
@@ -1126,7 +1397,11 @@ mod tests {
         let strategy = BlueprintV2Strategy::from_parts(
             action_probs,
             vec![2, 2, 2],
-            vec![Street::River as u8, Street::River as u8, Street::River as u8],
+            vec![
+                Street::River as u8,
+                Street::River as u8,
+                Street::River as u8,
+            ],
             bucket_counts,
         );
 
@@ -1146,8 +1421,14 @@ mod tests {
         let (tree, decision_idx_map, strategy) = make_three_level_tree();
         let buckets = dummy_buckets();
 
-        let hero = [Card::new(Value::Ace, Suit::Spade), Card::new(Value::King, Suit::Spade)];
-        let opp = [Card::new(Value::Two, Suit::Heart), Card::new(Value::Three, Suit::Heart)];
+        let hero = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Spade),
+        ];
+        let opp = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
         let board = [
             Card::new(Value::Ace, Suit::Heart),
             Card::new(Value::King, Suit::Diamond),
@@ -1172,8 +1453,14 @@ mod tests {
         };
         let mut rng_ex = SmallRng::seed_from_u64(0);
         let exact_ev = rollout_from_boundary(
-            hero, opp, &board, &ctx_exhaustive, 0, &mut rng_ex,
-            10.0, [3.0, 7.0],
+            hero,
+            opp,
+            &board,
+            &ctx_exhaustive,
+            0,
+            &mut rng_ex,
+            10.0,
+            [3.0, 7.0],
         );
 
         // Sampled run — uses default enumerate depth (SAMPLE_AFTER_DECISION_DEPTH)
@@ -1187,8 +1474,14 @@ mod tests {
         let mut rng_s = SmallRng::seed_from_u64(123);
         for _ in 0..n_samples {
             total += rollout_from_boundary(
-                hero, opp, &board, &ctx_sampled, 0, &mut rng_s,
-                10.0, [3.0, 7.0],
+                hero,
+                opp,
+                &board,
+                &ctx_sampled,
+                0,
+                &mut rng_s,
+                10.0,
+                [3.0, 7.0],
             );
         }
         let sampled_mean = total / n_samples as f64;
@@ -1205,21 +1498,33 @@ mod tests {
     #[test]
     #[should_panic(expected = "DepthBoundary should not appear during rollout")]
     fn rollout_depth_boundary_panics() {
-        let nodes = vec![
-            GameNode::Terminal {
-                kind: TerminalKind::DepthBoundary,
-                pot: 10.0,
-                stacks: [95.0, 95.0],
-            },
-        ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 100.0 };
+        let nodes = vec![GameNode::Terminal {
+            kind: TerminalKind::DepthBoundary,
+            pot: 10.0,
+            stacks: [95.0, 95.0],
+        }];
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 100.0,
+        };
         let dim = vec![u32::MAX];
         let (hero, opp) = dummy_hands();
         let buckets = dummy_buckets();
         let strategy = dummy_strategy();
         let mut rng = StdRng::seed_from_u64(42);
 
-        let ctx = make_ctx(&tree, &dim, &strategy, &buckets, BiasType::Unbiased, 1.0, 0, 1);
+        let ctx = make_ctx(
+            &tree,
+            &dim,
+            &strategy,
+            &buckets,
+            BiasType::Unbiased,
+            1.0,
+            0,
+            1,
+        );
         rollout_from_boundary(hero, opp, &[], &ctx, 0, &mut rng, 10.0, [5.0, 5.0]);
     }
 
@@ -1242,7 +1547,13 @@ mod tests {
         let starting_stack = 2.27;
 
         let (new_pot, new_invested) = apply_action(
-            &action, pot, invested, actor, starting_stack, scale, street_start,
+            &action,
+            pot,
+            invested,
+            actor,
+            starting_stack,
+            scale,
+            street_start,
         );
 
         // invested[0] = 0.5 + 29 * scale = 0.8295
@@ -1275,9 +1586,8 @@ mod tests {
         let street_start = [0.5, 0.5]; // same street
         let actor = 1; // P1 raising
 
-        let (new_pot, new_invested) = apply_action(
-            &action, pot, invested, actor, 2.27, scale, street_start,
-        );
+        let (new_pot, new_invested) =
+            apply_action(&action, pot, invested, actor, 2.27, scale, street_start);
 
         let expected_invested = 0.5 + 66.0 * scale; // ~1.25
         assert!(
@@ -1302,7 +1612,13 @@ mod tests {
         let starting_stack = 2.27;
 
         let (_, new_invested) = apply_action(
-            &action, pot, invested, actor, starting_stack, scale, street_start,
+            &action,
+            pot,
+            invested,
+            actor,
+            starting_stack,
+            scale,
+            street_start,
         );
 
         assert!(
@@ -1323,7 +1639,13 @@ mod tests {
         let starting_stack = 2.27;
 
         let (new_pot, new_invested) = apply_action(
-            &action, pot, invested, actor, starting_stack, scale, street_start,
+            &action,
+            pot,
+            invested,
+            actor,
+            starting_stack,
+            scale,
+            street_start,
         );
 
         assert!(
@@ -1348,7 +1670,13 @@ mod tests {
         let starting_stack = 2.27;
 
         let (new_pot, new_invested) = apply_action(
-            &action, pot, invested, actor, starting_stack, scale, street_start,
+            &action,
+            pot,
+            invested,
+            actor,
+            starting_stack,
+            scale,
+            street_start,
         );
 
         // Call matches opponent's investment
@@ -1376,7 +1704,13 @@ mod tests {
         let scale = 1.0;
 
         let (new_pot, new_invested) = apply_action(
-            &action, pot, invested, actor, starting_stack, scale, street_start,
+            &action,
+            pot,
+            invested,
+            actor,
+            starting_stack,
+            scale,
+            street_start,
         );
 
         // invested[0] = street_start[0] + 22 * 1.0 = 5 + 22 = 27
@@ -1397,18 +1731,24 @@ mod tests {
 
         // P0 bets
         let (pot1, inv1) = apply_action(
-            &TreeAction::Bet(29.0), 1.0, [0.5, 0.5], 0, 2.27, scale, street_start,
+            &TreeAction::Bet(29.0),
+            1.0,
+            [0.5, 0.5],
+            0,
+            2.27,
+            scale,
+            street_start,
         );
         // P1 calls (matches P0's investment)
-        let (pot2, inv2) = apply_action(
-            &TreeAction::Call, pot1, inv1, 1, 2.27, scale, street_start,
-        );
+        let (pot2, inv2) =
+            apply_action(&TreeAction::Call, pot1, inv1, 1, 2.27, scale, street_start);
 
         // Both players should have equal investment after call
         assert!(
             (inv2[0] - inv2[1]).abs() < 1e-6,
             "After call, investments should match: {:.4} vs {:.4}",
-            inv2[0], inv2[1]
+            inv2[0],
+            inv2[1]
         );
         // Pot should have increased by bet amount twice (bet + call)
         let bet_amount = 29.0 * scale;

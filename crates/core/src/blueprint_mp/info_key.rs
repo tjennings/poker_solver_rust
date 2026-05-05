@@ -83,7 +83,9 @@ impl InfoKey128 {
     #[must_use]
     pub fn bucket_bits(self) -> u32 {
         #[allow(clippy::cast_possible_truncation)]
-        { ((self.hi >> BUCKET_SHIFT) & BUCKET_MASK) as u32 }
+        {
+            ((self.hi >> BUCKET_SHIFT) & BUCKET_MASK) as u32
+        }
     }
 
     /// Extract the street.
@@ -102,7 +104,9 @@ impl InfoKey128 {
     #[must_use]
     pub fn spr_bucket(self) -> u32 {
         #[allow(clippy::cast_possible_truncation)]
-        { ((self.hi >> SPR_SHIFT) & SPR_MASK) as u32 }
+        {
+            ((self.hi >> SPR_SHIFT) & SPR_MASK) as u32
+        }
     }
 
     /// Construct from raw `(hi, lo)` pair.
@@ -173,18 +177,12 @@ impl std::fmt::Debug for InfoKey128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_macros::timed_test;
     use std::collections::HashSet;
+    use test_macros::timed_test;
 
     #[timed_test]
     fn round_trip_components() {
-        let key = InfoKey128::new(
-            Seat::from_raw(3),
-            0x0ABC_DEF,
-            Street::Flop,
-            17,
-            &[1, 2, 3],
-        );
+        let key = InfoKey128::new(Seat::from_raw(3), 0x0ABC_DEF, Street::Flop, 17, &[1, 2, 3]);
         assert_eq!(key.seat(), Seat::from_raw(3));
         assert_eq!(key.bucket_bits(), 0x0ABC_DEF);
         assert_eq!(key.street(), Street::Flop);

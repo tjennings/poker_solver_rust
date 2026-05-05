@@ -217,10 +217,7 @@ mod tests {
     #[test]
     fn gadget_config_per_boundary_constructs() {
         let cfg = GadgetConfigPerBoundary {
-            per_boundary_opt_outs: vec![
-                [vec![0.1; 3], vec![0.2; 2]],
-                [vec![0.3; 3], vec![0.4; 2]],
-            ],
+            per_boundary_opt_outs: vec![[vec![0.1; 3], vec![0.2; 2]], [vec![0.3; 3], vec![0.4; 2]]],
         };
         assert_eq!(cfg.per_boundary_opt_outs.len(), 2);
         assert_eq!(cfg.per_boundary_opt_outs[0][0].len(), 3);
@@ -514,7 +511,8 @@ mod tests {
                 if strat_sum > 0.0 {
                     found_gadget_with_strategy = true;
                 }
-            } else if !node.is_terminal() && !node.is_chance()
+            } else if !node.is_terminal()
+                && !node.is_chance()
                 && node.num_actions() > 1
                 && !node.regrets().is_empty()
             {
@@ -613,7 +611,7 @@ mod tests {
         // A depth-limited game with per-boundary gadgets should converge
         // (exploitability decreases over iterations). This verifies the
         // active gadget path's regret updates drive strategy convergence.
-        use crate::solver::{solve_step, compute_exploitability};
+        use crate::solver::{compute_exploitability, solve_step};
 
         let mut game = minimal_depth_limited_game();
         let config = make_per_boundary_config(&game);
@@ -695,7 +693,7 @@ mod tests {
         // Build a gadget game, solve for enough iterations to converge
         // the gadget sigma, then verify per-hand:
         //   avg_realized_CFV[h] >= opt_out[h] - epsilon
-        use crate::solver::{solve_step, compute_exploitability, root_cfvalues};
+        use crate::solver::{compute_exploitability, root_cfvalues, solve_step};
 
         let mut game = minimal_depth_limited_game();
         let n_orig = game.num_boundary_nodes();
@@ -710,7 +708,9 @@ mod tests {
                 [vec![-5.0; n_oop], vec![-5.0; n_ip]]
             })
             .collect();
-        let config = GadgetConfigPerBoundary { per_boundary_opt_outs };
+        let config = GadgetConfigPerBoundary {
+            per_boundary_opt_outs,
+        };
         inject_per_boundary_gadgets(&mut game, &config);
         game.allocate_memory(false);
 

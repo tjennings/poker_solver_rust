@@ -1,21 +1,28 @@
 use range_solver::bet_size::BetSizeOptions;
 
 use crate::config::{DatagenConfig, GameConfig};
-use crate::datagen::sampler::{sample_situation, Situation};
-use crate::datagen::solver::{solve_situation, SolveConfig, SolveResult};
-use crate::eval::metrics::{compute_prediction_metrics, PredictionMetrics};
+use crate::datagen::sampler::{Situation, sample_situation};
+use crate::datagen::solver::{SolveConfig, SolveResult, solve_situation};
+use crate::eval::metrics::{PredictionMetrics, compute_prediction_metrics};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 /// Generate a random comparison spot from a seed.
-pub fn generate_comparison_spot(seed: u64, initial_stack: i32, datagen: &DatagenConfig) -> Situation {
+pub fn generate_comparison_spot(
+    seed: u64,
+    initial_stack: i32,
+    datagen: &DatagenConfig,
+) -> Situation {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let board_size = crate::config::board_cards_for_street(&datagen.street);
     sample_situation(datagen, initial_stack, board_size, &mut rng)
 }
 
 /// Default solve config for comparison spots.
-pub fn default_solve_config(game: &GameConfig, datagen: &DatagenConfig) -> Result<SolveConfig, String> {
+pub fn default_solve_config(
+    game: &GameConfig,
+    datagen: &DatagenConfig,
+) -> Result<SolveConfig, String> {
     let bet_str = game.bet_sizes.join_flat(",");
     let bet_sizes = BetSizeOptions::try_from((bet_str.as_str(), ""))
         .map_err(|e| format!("invalid bet sizes: {e}"))?;
@@ -81,7 +88,8 @@ where
     let mut spots = Vec::with_capacity(num_spots);
 
     for i in 0..num_spots {
-        let spot = generate_comparison_spot(base_seed + i as u64, game_config.initial_stack, datagen);
+        let spot =
+            generate_comparison_spot(base_seed + i as u64, game_config.initial_stack, datagen);
         let result = solve_situation(&spot, &solve_config)?;
         let predicted = predict_fn(&spot, &result);
         let mask: Vec<bool> = result.valid_mask.to_vec();
@@ -126,8 +134,10 @@ mod tests {
         let datagen = DatagenConfig::default();
 
         // Use exact OOP EVs as "predictions" — error should be zero
-        let summary = run_comparison(&game, &datagen, 2, 42, |_sit, result| result.oop_evs.to_vec())
-            .unwrap();
+        let summary = run_comparison(&game, &datagen, 2, 42, |_sit, result| {
+            result.oop_evs.to_vec()
+        })
+        .unwrap();
 
         assert!(
             summary.mean_mae < 1e-6,
@@ -151,8 +161,10 @@ mod tests {
         };
         let datagen = DatagenConfig::default();
 
-        let summary = run_comparison(&game, &datagen, 3, 42, |_sit, result| result.oop_evs.to_vec())
-            .unwrap();
+        let summary = run_comparison(&game, &datagen, 3, 42, |_sit, result| {
+            result.oop_evs.to_vec()
+        })
+        .unwrap();
 
         assert_eq!(summary.spots.len(), 3);
         for spot in &summary.spots {

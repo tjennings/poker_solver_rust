@@ -130,10 +130,8 @@ pub fn install_panic_hook() {
         // Restore terminal FIRST so panic output is readable.
         if TUI_ACTIVE.load(Ordering::Relaxed) {
             let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stderr(),
-                crossterm::terminal::LeaveAlternateScreen
-            );
+            let _ =
+                crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen);
             TUI_ACTIVE.store(false, Ordering::Relaxed);
         }
 
@@ -152,9 +150,7 @@ pub fn install_panic_hook() {
             .unwrap_or_else(|| "<unknown>".into());
 
         let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!(
-            "PANIC at {location}: {payload}\n\nBacktrace:\n{bt}"
-        );
+        let msg = format!("PANIC at {location}: {payload}\n\nBacktrace:\n{bt}");
 
         // Write to log file.
         write_to_log("========== PANIC ==========");

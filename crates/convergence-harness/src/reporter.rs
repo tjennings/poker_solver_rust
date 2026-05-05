@@ -85,7 +85,10 @@ impl ComparisonResult {
         s.push_str(&format!("Gap:      {:.1e}\n\n", gap));
 
         s.push_str("--- Strategy Distance (L1) ---\n");
-        s.push_str(&format!("Overall average: {:.4}\n", self.overall_l1_distance));
+        s.push_str(&format!(
+            "Overall average: {:.4}\n",
+            self.overall_l1_distance
+        ));
         if self.overall_l1_distance < 0.05 {
             s.push_str("Assessment: Excellent — abstraction is faithful.\n\n");
         } else if self.overall_l1_distance < 0.1 {
@@ -110,8 +113,7 @@ impl ComparisonResult {
                 && first.exploitability > 0.0
             {
                 let log_ratio = (first.exploitability / last.exploitability).ln();
-                let iter_ratio =
-                    (last.iteration as f64 / first.iteration.max(1) as f64).ln();
+                let iter_ratio = (last.iteration as f64 / first.iteration.max(1) as f64).ln();
                 if iter_ratio > 0.0 {
                     let rate = log_ratio / iter_ratio;
                     s.push_str("\n--- Convergence Rate ---\n");
@@ -194,11 +196,23 @@ mod tests {
         let result = sample_result();
         let summary = result.human_summary();
 
-        assert!(summary.contains("Test Solver"), "Should contain solver name");
+        assert!(
+            summary.contains("Test Solver"),
+            "Should contain solver name"
+        );
         assert!(summary.contains("100"), "Should contain iteration count");
-        assert!(summary.contains("5.0e-2"), "Should contain solver exploitability");
-        assert!(summary.contains("1.0e-3"), "Should contain baseline exploitability");
-        assert!(summary.contains("Concerning"), "L1=0.12 should be assessed as Concerning");
+        assert!(
+            summary.contains("5.0e-2"),
+            "Should contain solver exploitability"
+        );
+        assert!(
+            summary.contains("1.0e-3"),
+            "Should contain baseline exploitability"
+        );
+        assert!(
+            summary.contains("Concerning"),
+            "L1=0.12 should be assessed as Concerning"
+        );
     }
 
     #[test]
@@ -206,7 +220,10 @@ mod tests {
         let mut result = sample_result();
         result.overall_l1_distance = 0.03;
         let summary = result.human_summary();
-        assert!(summary.contains("Excellent"), "L1=0.03 should be assessed as Excellent");
+        assert!(
+            summary.contains("Excellent"),
+            "L1=0.03 should be assessed as Excellent"
+        );
     }
 
     #[test]
@@ -214,7 +231,10 @@ mod tests {
         let mut result = sample_result();
         result.overall_l1_distance = 0.07;
         let summary = result.human_summary();
-        assert!(summary.contains("Good"), "L1=0.07 should be assessed as Good");
+        assert!(
+            summary.contains("Good"),
+            "L1=0.07 should be assessed as Good"
+        );
     }
 
     #[test]
@@ -222,7 +242,10 @@ mod tests {
         let mut result = sample_result();
         result.overall_l1_distance = 0.5;
         let summary = result.human_summary();
-        assert!(summary.contains("Poor"), "L1=0.5 should be assessed as Poor");
+        assert!(
+            summary.contains("Poor"),
+            "L1=0.5 should be assessed as Poor"
+        );
     }
 
     #[test]
@@ -277,7 +300,11 @@ mod tests {
         let csv_str = std::fs::read_to_string(dir.path().join("convergence.csv")).unwrap();
         let lines: Vec<&str> = csv_str.lines().collect();
         // header + 2 data rows
-        assert_eq!(lines.len(), 3, "convergence.csv should have header + 2 rows");
+        assert_eq!(
+            lines.len(),
+            3,
+            "convergence.csv should have header + 2 rows"
+        );
     }
 
     #[test]
@@ -286,8 +313,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         result.save(dir.path()).unwrap();
 
-        let csv_str =
-            std::fs::read_to_string(dir.path().join("strategy_distance.csv")).unwrap();
+        let csv_str = std::fs::read_to_string(dir.path().join("strategy_distance.csv")).unwrap();
         let lines: Vec<&str> = csv_str.lines().collect();
         // header + 2 nodes
         assert_eq!(

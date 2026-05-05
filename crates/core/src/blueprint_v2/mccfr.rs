@@ -45,12 +45,12 @@ impl PruneStats {
 
 use rustc_hash::FxHashMap;
 
+use super::Street;
 use super::bucket_file::{BucketFile, PackedBoard};
 use super::cluster_pipeline::{canonical_key, combo_index};
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::per_flop_bucket_file::PerFlopBucketFile;
 use super::storage::BlueprintStorage;
-use super::Street;
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::poker::{Card, Hand, Rankable};
 
@@ -109,10 +109,7 @@ pub struct AllBuckets {
 
 impl AllBuckets {
     #[must_use]
-    pub fn new(
-        bucket_counts: [u16; 4],
-        bucket_files: [Option<BucketFile>; 4],
-    ) -> Self {
+    pub fn new(bucket_counts: [u16; 4], bucket_files: [Option<BucketFile>; 4]) -> Self {
         let board_maps = std::array::from_fn(|i| {
             bucket_files[i].as_ref().and_then(|bf| {
                 if bf.boards.is_empty() {
@@ -228,10 +225,9 @@ impl AllBuckets {
                      with hole cards {hole:?}. Bucket files must be generated before training.",
                 );
             }
-        } else if let (Some(bf), Some(board_map)) = (
-            &self.bucket_files[street_idx],
-            &self.board_maps[street_idx],
-        ) {
+        } else if let (Some(bf), Some(board_map)) =
+            (&self.bucket_files[street_idx], &self.board_maps[street_idx])
+        {
             if let Ok(canonical) = CanonicalBoard::from_cards(board) {
                 let packed = canonical_key(&canonical.cards);
                 if let Some(&board_idx) = board_map.get(&packed) {
@@ -271,12 +267,7 @@ impl AllBuckets {
     /// file (loading from cache or disk), then finds the turn/river card
     /// indices and returns the bucket. Returns `None` if the flop or
     /// card is not found in the per-flop file.
-    fn lookup_per_flop(
-        &self,
-        street_idx: usize,
-        hole: [Card; 2],
-        board: &[Card],
-    ) -> Option<u16> {
+    fn lookup_per_flop(&self, street_idx: usize, hole: [Card; 2], board: &[Card]) -> Option<u16> {
         let index_map = self.flop_index_map.as_ref()?;
 
         // Canonicalize the flop (first 3 board cards)
@@ -316,7 +307,10 @@ impl AllBuckets {
     fn get_per_flop_file(&self, flop_key: PackedBoard) -> Option<Arc<PerFlopBucketFile>> {
         // Fast path: read lock
         {
-            let cache = self.per_flop_cache.read().expect("per_flop_cache read lock");
+            let cache = self
+                .per_flop_cache
+                .read()
+                .expect("per_flop_cache read lock");
             if let Some(pf) = cache.get(&flop_key) {
                 return Some(Arc::clone(pf));
             }
@@ -331,7 +325,10 @@ impl AllBuckets {
         let pf = PerFlopBucketFile::load(&path).ok()?;
         let arc = Arc::new(pf);
 
-        let mut cache = self.per_flop_cache.write().expect("per_flop_cache write lock");
+        let mut cache = self
+            .per_flop_cache
+            .write()
+            .expect("per_flop_cache write lock");
         cache.insert(flop_key, Arc::clone(&arc));
         Some(arc)
     }
@@ -435,8 +432,7 @@ impl FullTreeEvTracker {
         let idx = dec_idx as usize;
         self.ev_sum[idx][player][hand_index]
             .fetch_add((ev * 1000.0) as i64, AtomicOrdering::Relaxed);
-        self.ev_count[idx][player][hand_index]
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.ev_count[idx][player][hand_index].fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Compute average EV per hand for a decision node and player.
@@ -445,13 +441,8 @@ impl FullTreeEvTracker {
         std::array::from_fn(|i| {
             let sum =
                 self.ev_sum[decision_idx][player][i].load(AtomicOrdering::Relaxed) as f64 / 1000.0;
-            let count =
-                self.ev_count[decision_idx][player][i].load(AtomicOrdering::Relaxed);
-            if count > 0 {
-                sum / count as f64
-            } else {
-                0.0
-            }
+            let count = self.ev_count[decision_idx][player][i].load(AtomicOrdering::Relaxed);
+            if count > 0 { sum / count as f64 } else { 0.0 }
         })
     }
 
@@ -473,10 +464,8 @@ impl FullTreeEvTracker {
         for node_idx in 0..self.num_nodes {
             for player in 0..2 {
                 for hand in 0..169 {
-                    let sum =
-                        self.ev_sum[node_idx][player][hand].load(AtomicOrdering::Relaxed);
-                    let count =
-                        self.ev_count[node_idx][player][hand].load(AtomicOrdering::Relaxed);
+                    let sum = self.ev_sum[node_idx][player][hand].load(AtomicOrdering::Relaxed);
+                    let count = self.ev_count[node_idx][player][hand].load(AtomicOrdering::Relaxed);
                     f.write_all(&sum.to_le_bytes())?;
                     f.write_all(&count.to_le_bytes())?;
                 }
@@ -507,10 +496,8 @@ impl FullTreeEvTracker {
                     f.read_exact(&mut buf8)?;
                     let count = u64::from_le_bytes(buf8);
                     if node_idx < nodes_to_load {
-                        self.ev_sum[node_idx][player][hand]
-                            .store(sum, AtomicOrdering::Relaxed);
-                        self.ev_count[node_idx][player][hand]
-                            .store(count, AtomicOrdering::Relaxed);
+                        self.ev_sum[node_idx][player][hand].store(sum, AtomicOrdering::Relaxed);
+                        self.ev_count[node_idx][player][hand].store(count, AtomicOrdering::Relaxed);
                     }
                 }
             }
@@ -556,10 +543,20 @@ impl ScenarioEvTracker {
     pub fn new(node_indices: Vec<u32>) -> Self {
         let len = node_indices.len();
         let ev_sum = (0..len)
-            .map(|_| [std::array::from_fn(|_| AtomicI64::new(0)), std::array::from_fn(|_| AtomicI64::new(0))])
+            .map(|_| {
+                [
+                    std::array::from_fn(|_| AtomicI64::new(0)),
+                    std::array::from_fn(|_| AtomicI64::new(0)),
+                ]
+            })
             .collect();
         let ev_count = (0..len)
-            .map(|_| [std::array::from_fn(|_| AtomicU64::new(0)), std::array::from_fn(|_| AtomicU64::new(0))])
+            .map(|_| {
+                [
+                    std::array::from_fn(|_| AtomicU64::new(0)),
+                    std::array::from_fn(|_| AtomicU64::new(0)),
+                ]
+            })
             .collect();
         Self {
             node_indices,
@@ -583,15 +580,15 @@ impl ScenarioEvTracker {
     pub fn accumulate(&self, scenario_idx: usize, player: usize, hand_index: usize, ev: f64) {
         self.ev_sum[scenario_idx][player][hand_index]
             .fetch_add((ev * 1000.0) as i64, AtomicOrdering::Relaxed);
-        self.ev_count[scenario_idx][player][hand_index]
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.ev_count[scenario_idx][player][hand_index].fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Compute average EV per hand for a scenario and player.
     #[must_use]
     pub fn hand_ev_array(&self, scenario_idx: usize, player: usize) -> [f64; 169] {
         std::array::from_fn(|i| {
-            let sum = self.ev_sum[scenario_idx][player][i].load(AtomicOrdering::Relaxed) as f64 / 1000.0;
+            let sum =
+                self.ev_sum[scenario_idx][player][i].load(AtomicOrdering::Relaxed) as f64 / 1000.0;
             let count = self.ev_count[scenario_idx][player][i].load(AtomicOrdering::Relaxed);
             if count > 0 { sum / count as f64 } else { 0.0 }
         })
@@ -658,16 +655,37 @@ pub fn traverse_external(
     baseline_alpha: f64,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
-        GameNode::Terminal { kind, pot, stacks } => {
-            (terminal_value(*kind, *pot, stacks, tree.starting_stack, traverser, &deal.deal, rake_rate, rake_cap), PruneStats::default())
-        }
+        GameNode::Terminal { kind, pot, stacks } => (
+            terminal_value(
+                *kind,
+                *pot,
+                stacks,
+                tree.starting_stack,
+                traverser,
+                &deal.deal,
+                rake_rate,
+                rake_cap,
+            ),
+            PruneStats::default(),
+        ),
 
         GameNode::Chance { child, .. } => {
             // Board cards are pre-dealt in the Deal; just recurse.
             traverse_external(
-                tree, storage, deal, traverser, *child, prune, prune_threshold,
-                prune_streets, rng, rake_rate, rake_cap, ev_tracker,
-                full_ev_tracker, baseline_alpha,
+                tree,
+                storage,
+                deal,
+                traverser,
+                *child,
+                prune,
+                prune_threshold,
+                prune_streets,
+                rng,
+                rake_rate,
+                rake_cap,
+                ev_tracker,
+                full_ev_tracker,
+                baseline_alpha,
             )
         }
 
@@ -813,13 +831,28 @@ pub fn traverse_best_response(
     visit_counts: Option<&[AtomicU32]>,
 ) -> f64 {
     match &tree.nodes[node_idx as usize] {
-        GameNode::Terminal { kind, pot, stacks } => {
-            terminal_value(*kind, *pot, stacks, tree.starting_stack, traverser, &deal.deal, rake_rate, rake_cap)
-        }
+        GameNode::Terminal { kind, pot, stacks } => terminal_value(
+            *kind,
+            *pot,
+            stacks,
+            tree.starting_stack,
+            traverser,
+            &deal.deal,
+            rake_rate,
+            rake_cap,
+        ),
 
-        GameNode::Chance { child, .. } => {
-            traverse_best_response(tree, storage, deal, traverser, *child, rake_rate, rake_cap, predict_storage, visit_counts)
-        }
+        GameNode::Chance { child, .. } => traverse_best_response(
+            tree,
+            storage,
+            deal,
+            traverser,
+            *child,
+            rake_rate,
+            rake_cap,
+            predict_storage,
+            visit_counts,
+        ),
 
         GameNode::Decision {
             player,
@@ -837,8 +870,15 @@ pub fn traverse_best_response(
                 let mut action_values = [0.0f64; 16];
                 for (a, &child_idx) in children.iter().enumerate() {
                     let v = traverse_best_response(
-                        tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
-                        predict_storage, visit_counts,
+                        tree,
+                        storage,
+                        deal,
+                        traverser,
+                        child_idx,
+                        rake_rate,
+                        rake_cap,
+                        predict_storage,
+                        visit_counts,
                     );
                     action_values[a] = v;
                     if v > best {
@@ -875,8 +915,15 @@ pub fn traverse_best_response(
                 for (a, &child_idx) in children.iter().enumerate() {
                     if strategy[a] > 0.0 {
                         let v = traverse_best_response(
-                            tree, storage, deal, traverser, child_idx, rake_rate, rake_cap,
-                            predict_storage, visit_counts,
+                            tree,
+                            storage,
+                            deal,
+                            traverser,
+                            child_idx,
+                            rake_rate,
+                            rake_cap,
+                            predict_storage,
+                            visit_counts,
                         );
                         value += strategy[a] * v;
                     }
@@ -927,10 +974,8 @@ fn traverse_traverser(
             // Never prune actions that lead directly to a terminal node
             // (folds, all-ins) — these are high-leverage and must always
             // be explored (matches Pluribus pruning exceptions).
-            let child_is_terminal = matches!(
-                tree.nodes[child_idx as usize],
-                GameNode::Terminal { .. }
-            );
+            let child_is_terminal =
+                matches!(tree.nodes[child_idx as usize], GameNode::Terminal { .. });
             if !child_is_terminal {
                 stats.total += 1;
                 if storage.get_regret(node_idx, bucket, a) < prune_threshold {
@@ -942,9 +987,20 @@ fn traverse_traverser(
         }
 
         let (child_ev, child_stats) = traverse_external(
-            tree, storage, deal, traverser, child_idx, prune, prune_threshold,
-            prune_streets, rng, rake_rate, rake_cap, ev_tracker,
-            full_ev_tracker, baseline_alpha,
+            tree,
+            storage,
+            deal,
+            traverser,
+            child_idx,
+            prune,
+            prune_threshold,
+            prune_streets,
+            rng,
+            rake_rate,
+            rake_cap,
+            ev_tracker,
+            full_ev_tracker,
+            baseline_alpha,
         );
         action_values[a] = child_ev;
         node_value += strategy[a] * child_ev;
@@ -1051,9 +1107,20 @@ fn traverse_opponent(
     }
 
     let (v_sampled, stats) = traverse_external(
-        tree, storage, deal, traverser, children[chosen], prune, prune_threshold,
-        prune_streets, rng, rake_rate, rake_cap, ev_tracker,
-        full_ev_tracker, baseline_alpha,
+        tree,
+        storage,
+        deal,
+        traverser,
+        children[chosen],
+        prune,
+        prune_threshold,
+        prune_streets,
+        rng,
+        rake_rate,
+        rake_cap,
+        ev_tracker,
+        full_ev_tracker,
+        baseline_alpha,
     );
 
     // Baseline-corrected value (VR-MCCFR).
@@ -1062,12 +1129,7 @@ fn traverse_opponent(
     for (a, slot) in baseline_buf[..num_actions].iter_mut().enumerate() {
         *slot = storage.get_baseline(node_idx, bucket, a);
     }
-    let v = baseline_corrected_value(
-        strategy,
-        &baseline_buf[..num_actions],
-        chosen,
-        v_sampled,
-    );
+    let v = baseline_corrected_value(strategy, &baseline_buf[..num_actions], chosen, v_sampled);
 
     // Update baseline for the sampled action with the observed value.
     storage.update_baseline(node_idx, bucket, chosen, v_sampled, baseline_alpha);
@@ -1125,7 +1187,11 @@ mod tests {
         tracker.accumulate(0, 0, 42, 2.5);
         tracker.accumulate(0, 0, 42, 3.5);
         let evs = tracker.hand_ev_array(0, 0);
-        assert!((evs[42] - 3.0).abs() < 1e-3, "expected avg 3.0, got {}", evs[42]);
+        assert!(
+            (evs[42] - 3.0).abs() < 1e-3,
+            "expected avg 3.0, got {}",
+            evs[42]
+        );
         // Unaccumulated hands should be 0.
         assert!((evs[0] - 0.0).abs() < 1e-10);
     }
@@ -1193,7 +1259,11 @@ mod tests {
         tracker.accumulate(tree.root, 0, 42, 3.5);
         let dec_idx = tree.decision_index_map()[tree.root as usize];
         let evs = tracker.hand_ev_array(dec_idx as usize, 0);
-        assert!((evs[42] - 3.0).abs() < 0.01, "expected avg 3.0, got {}", evs[42]);
+        assert!(
+            (evs[42] - 3.0).abs() < 0.01,
+            "expected avg 3.0, got {}",
+            evs[42]
+        );
     }
 
     #[test]
@@ -1255,8 +1325,16 @@ mod tests {
         let dec_idx = tree.decision_index_map()[tree.root as usize];
         let evs_p0 = tracker2.hand_ev_array(dec_idx as usize, 0);
         let evs_p1 = tracker2.hand_ev_array(dec_idx as usize, 1);
-        assert!((evs_p0[10] - 5.0).abs() < 0.01, "p0 hand 10 should be 5.0, got {}", evs_p0[10]);
-        assert!((evs_p1[100] - (-2.5)).abs() < 0.01, "p1 hand 100 should be -2.5, got {}", evs_p1[100]);
+        assert!(
+            (evs_p0[10] - 5.0).abs() < 0.01,
+            "p0 hand 10 should be 5.0, got {}",
+            evs_p0[10]
+        );
+        assert!(
+            (evs_p1[100] - (-2.5)).abs() < 0.01,
+            "p1 hand 100 should be -2.5, got {}",
+            evs_p1[100]
+        );
         std::fs::remove_file(&tmp).ok();
     }
 
@@ -1289,8 +1367,20 @@ mod tests {
 
         for _ in 0..20 {
             traverse_external(
-                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                [true; 4], &mut rng, 0.0, 0.0, None, Some(&tracker), 0.0,
+                &tree,
+                &storage,
+                &precomputed,
+                0,
+                tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                None,
+                Some(&tracker),
+                0.0,
             );
         }
 
@@ -1299,11 +1389,15 @@ mod tests {
         let hand_idx = crate::hands::CanonicalHand::from_cards(
             precomputed.deal.hole_cards[0][0],
             precomputed.deal.hole_cards[0][1],
-        ).index();
+        )
+        .index();
         let dec_idx = tree.decision_index_map()[tree.root as usize];
         let evs = tracker.hand_ev_array(dec_idx as usize, 0);
         let count = tracker.ev_count[dec_idx as usize][0][hand_idx].load(Ordering::Relaxed);
-        assert!(count > 0, "should have accumulated samples for traverser hand");
+        assert!(
+            count > 0,
+            "should have accumulated samples for traverser hand"
+        );
         assert!(evs[hand_idx].is_finite(), "EV should be finite");
     }
 
@@ -1320,8 +1414,20 @@ mod tests {
 
         for _ in 0..20 {
             traverse_external(
-                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                [true; 4], &mut rng, 0.0, 0.0, Some(&tracker), None, 0.0,
+                &tree,
+                &storage,
+                &precomputed,
+                0,
+                tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                Some(&tracker),
+                None,
+                0.0,
             );
         }
 
@@ -1330,10 +1436,14 @@ mod tests {
         let hand_idx = crate::hands::CanonicalHand::from_cards(
             precomputed.deal.hole_cards[0][0],
             precomputed.deal.hole_cards[0][1],
-        ).index();
+        )
+        .index();
         let evs = tracker.hand_ev_array(0, 0);
         let count = tracker.ev_count[0][0][hand_idx].load(Ordering::Relaxed);
-        assert!(count > 0, "should have accumulated samples for traverser hand");
+        assert!(
+            count > 0,
+            "should have accumulated samples for traverser hand"
+        );
         assert!(evs[hand_idx].is_finite(), "EV should be finite");
     }
 
@@ -1346,14 +1456,26 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
         assert!(ev.is_finite(), "EV should be finite without tracker");
     }
     use crate::poker::{Card, Suit, Value};
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use std::sync::atomic::Ordering;
 
     fn make_deal() -> Deal {
@@ -1399,16 +1521,25 @@ mod tests {
     fn traverse_returns_finite() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
-            [10, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
         assert!(ev.is_finite(), "EV should be finite, got {ev}");
     }
@@ -1417,20 +1548,41 @@ mod tests {
     fn traverse_both_players() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
-            [10, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
         let (ev0, _) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
         let (ev1, _) = traverse_external(
-            &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            1,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
 
         assert!(ev0.is_finite());
@@ -1441,22 +1593,39 @@ mod tests {
     fn traverse_updates_regrets() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
-            [10, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
-        assert!(storage.regrets.iter().all(|r| r.load(Ordering::Relaxed) == 0));
+        assert!(
+            storage
+                .regrets
+                .iter()
+                .all(|r| r.load(Ordering::Relaxed) == 0)
+        );
 
         let (_ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
 
         assert!(
-            storage.regrets.iter().any(|r| r.load(Ordering::Relaxed) != 0),
+            storage
+                .regrets
+                .iter()
+                .any(|r| r.load(Ordering::Relaxed) != 0),
             "regrets should be updated after traversal"
         );
     }
@@ -1465,20 +1634,32 @@ mod tests {
     fn traverse_updates_strategy_sums() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
-            [10, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
         let (_ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
 
         assert!(
-            storage.strategy_sums.iter().any(|s| s.load(Ordering::Relaxed) != 0),
+            storage
+                .strategy_sums
+                .iter()
+                .any(|s| s.load(Ordering::Relaxed) != 0),
             "strategy sums should be updated after traversal"
         );
     }
@@ -1487,29 +1668,53 @@ mod tests {
     fn multiple_iterations_change_strategy() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
-            [10, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let deal = make_deal();
         let precomputed = make_precomputed(&buckets, deal);
         let mut rng = StdRng::seed_from_u64(42);
 
         for _ in 0..50 {
             let _ = traverse_external(
-                &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-                [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+                &tree,
+                &storage,
+                &precomputed,
+                0,
+                tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                None,
+                None,
+                0.0,
             );
             let _ = traverse_external(
-                &tree, &storage, &precomputed, 1, tree.root, false, -310_000_000,
-                [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+                &tree,
+                &storage,
+                &precomputed,
+                1,
+                tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                None,
+                None,
+                0.0,
             );
         }
 
         // After 50 iterations, at least one traverser decision node
         // should have a non-uniform current strategy.
         for (i, node) in tree.nodes.iter().enumerate() {
-            if let GameNode::Decision { player: 0, street, .. } = node {
+            if let GameNode::Decision {
+                player: 0, street, ..
+            } = node
+            {
                 let visible = AllBuckets::board_for_street(&precomputed.deal.board, *street);
                 let bucket = buckets.get_bucket(*street, precomputed.deal.hole_cards[0], visible);
                 let strategy = storage.current_strategy(i as u32, bucket);
@@ -1526,10 +1731,7 @@ mod tests {
     fn traverse_with_pruning() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
-        let buckets = AllBuckets::new(
-            [10, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
         let mut rng = StdRng::seed_from_u64(42);
 
@@ -1539,8 +1741,20 @@ mod tests {
         }
 
         let (ev, _stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, true, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            true,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
         assert!(ev.is_finite());
     }
@@ -1551,11 +1765,32 @@ mod tests {
 
         // Using stacks=[0,0], starting_stack=0 => pot-only semantics.
         // winner gets pot, loser gets 0.
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, &[0.0; 2], 0.0, 0, &deal, 0.0, 0.0);
+        let v = terminal_value(
+            TerminalKind::Fold { winner: 1 },
+            1.5,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
+        );
         assert!(v.abs() < 1e-10, "Loser gets 0 on fold, got {v}");
 
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, &[0.0; 2], 0.0, 1, &deal, 0.0, 0.0);
-        assert!((v - 1.5).abs() < 1e-10, "Winner gets pot=1.5 on fold, got {v}");
+        let v = terminal_value(
+            TerminalKind::Fold { winner: 1 },
+            1.5,
+            &[0.0; 2],
+            0.0,
+            1,
+            &deal,
+            0.0,
+            0.0,
+        );
+        assert!(
+            (v - 1.5).abs() < 1e-10,
+            "Winner gets pot=1.5 on fold, got {v}"
+        );
     }
 
     #[test]
@@ -1565,7 +1800,16 @@ mod tests {
         // Both have a straight on 2-3-4-5-6; AKs (6-high straight) vs
         // QJh (6-high straight). Both make the same board straight, so
         // this should be a tie (chop). stacks=[0,0], starting_stack=0 => tie = pot/2.
-        let v = terminal_value(TerminalKind::Showdown, 4.0, &[0.0; 2], 0.0, 0, &deal, 0.0, 0.0);
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            4.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
+        );
         assert!(
             (v - 2.0).abs() < 1e-10,
             "Equal hands should chop (EV=pot/2=2.0), got {v}"
@@ -1603,11 +1847,32 @@ mod tests {
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // pot=10, 5% rake, cap 1.0 -> rake = min(10*0.05, 1.0) = 0.5
         // winner = pot - rake = 10 - 0.5 = 9.5
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 10.0, &[0.0; 2], 0.0, 1, &deal, 0.05, 1.0);
-        assert!((v - 9.5).abs() < 1e-10, "Winner gets pot - rake = 9.5, got {v}");
+        let v = terminal_value(
+            TerminalKind::Fold { winner: 1 },
+            10.0,
+            &[0.0; 2],
+            0.0,
+            1,
+            &deal,
+            0.05,
+            1.0,
+        );
+        assert!(
+            (v - 9.5).abs() < 1e-10,
+            "Winner gets pot - rake = 9.5, got {v}"
+        );
 
         // Loser gets 0
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 10.0, &[0.0; 2], 0.0, 0, &deal, 0.05, 1.0);
+        let v = terminal_value(
+            TerminalKind::Fold { winner: 1 },
+            10.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.05,
+            1.0,
+        );
         assert!(v.abs() < 1e-10, "Loser gets 0, got {v}");
     }
 
@@ -1617,11 +1882,32 @@ mod tests {
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // pot=10, 5% rake, no cap -> rake = 0.5
         // winner = pot - rake = 10 - 0.5 = 9.5
-        let v = terminal_value(TerminalKind::Showdown, 10.0, &[0.0; 2], 0.0, 0, &deal, 0.05, 0.0);
-        assert!((v - 9.5).abs() < 1e-10, "Winner gets pot - rake = 9.5, got {v}");
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            10.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.05,
+            0.0,
+        );
+        assert!(
+            (v - 9.5).abs() < 1e-10,
+            "Winner gets pot - rake = 9.5, got {v}"
+        );
 
         // Loser gets 0
-        let v = terminal_value(TerminalKind::Showdown, 10.0, &[0.0; 2], 0.0, 1, &deal, 0.05, 0.0);
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            10.0,
+            &[0.0; 2],
+            0.0,
+            1,
+            &deal,
+            0.05,
+            0.0,
+        );
         assert!(v.abs() < 1e-10, "Loser gets 0, got {v}");
     }
 
@@ -1631,8 +1917,20 @@ mod tests {
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // pot=10, 5% rake, no cap -> rake = 0.5
         // tie: pot/2 - rake/2 = 5 - 0.25 = 4.75
-        let v = terminal_value(TerminalKind::Showdown, 10.0, &[0.0; 2], 0.0, 0, &deal, 0.05, 0.0);
-        assert!((v - 4.75).abs() < 1e-10, "Tie: pot/2 - rake/2 = 4.75, got {v}");
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            10.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.05,
+            0.0,
+        );
+        assert!(
+            (v - 4.75).abs() < 1e-10,
+            "Tie: pot/2 - rake/2 = 4.75, got {v}"
+        );
     }
 
     #[test]
@@ -1641,7 +1939,16 @@ mod tests {
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // pot=100, 5% rake, cap 3.0 -> rake = min(5.0, 3.0) = 3.0 (capped)
         // tie: pot/2 - rake/2 = 50 - 1.5 = 48.5
-        let v = terminal_value(TerminalKind::Showdown, 100.0, &[0.0; 2], 0.0, 0, &deal, 0.05, 3.0);
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            100.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.05,
+            3.0,
+        );
         assert!((v - 48.5).abs() < 1e-10, "Capped rake tie = 48.5, got {v}");
     }
 
@@ -1650,7 +1957,16 @@ mod tests {
         let deal = make_deal_p0_wins();
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // pot=10, rate=0 -> no rake. Winner gets pot = 10.
-        let v = terminal_value(TerminalKind::Showdown, 10.0, &[0.0; 2], 0.0, 0, &deal, 0.0, 3.0);
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            10.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.0,
+            3.0,
+        );
         assert!((v - 10.0).abs() < 1e-10, "Zero rate means no rake, got {v}");
     }
 
@@ -1660,8 +1976,20 @@ mod tests {
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // pot=100, 10% rake, no cap -> rake = 10.0
         // winner = pot - rake = 100 - 10 = 90
-        let v = terminal_value(TerminalKind::Showdown, 100.0, &[0.0; 2], 0.0, 0, &deal, 0.10, 0.0);
-        assert!((v - 90.0).abs() < 1e-10, "Winner gets pot - rake = 90, got {v}");
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            100.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.10,
+            0.0,
+        );
+        assert!(
+            (v - 90.0).abs() < 1e-10,
+            "Winner gets pot - rake = 90, got {v}"
+        );
     }
 
     #[test]
@@ -1670,20 +1998,56 @@ mod tests {
 
         // stacks=[0,0], starting_stack=0 => pot-only semantics.
         // SB fold at root, pot=1.5. Loser=0, winner=1.5.
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, &[0.0; 2], 0.0, 0, &deal, 0.0, 0.0);
+        let v = terminal_value(
+            TerminalKind::Fold { winner: 1 },
+            1.5,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
+        );
         assert!(v.abs() < 1e-10, "Loser gets 0 on fold, got {v}");
 
-        let v = terminal_value(TerminalKind::Fold { winner: 1 }, 1.5, &[0.0; 2], 0.0, 1, &deal, 0.0, 0.0);
+        let v = terminal_value(
+            TerminalKind::Fold { winner: 1 },
+            1.5,
+            &[0.0; 2],
+            0.0,
+            1,
+            &deal,
+            0.0,
+            0.0,
+        );
         assert!((v - 1.5).abs() < 1e-10, "Winner gets pot=1.5, got {v}");
 
         // After raise: pot=6.0
         let deal_p0_wins = make_deal_p0_wins();
         // Player 0 wins showdown: pot = 6.0
-        let v = terminal_value(TerminalKind::Showdown, 6.0, &[0.0; 2], 0.0, 0, &deal_p0_wins, 0.0, 0.0);
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            6.0,
+            &[0.0; 2],
+            0.0,
+            0,
+            &deal_p0_wins,
+            0.0,
+            0.0,
+        );
         assert!((v - 6.0).abs() < 1e-10, "Winner gets pot = 6.0, got {v}");
 
         // Player 1 loses: 0
-        let v = terminal_value(TerminalKind::Showdown, 6.0, &[0.0; 2], 0.0, 1, &deal_p0_wins, 0.0, 0.0);
+        let v = terminal_value(
+            TerminalKind::Showdown,
+            6.0,
+            &[0.0; 2],
+            0.0,
+            1,
+            &deal_p0_wins,
+            0.0,
+            0.0,
+        );
         assert!(v.abs() < 1e-10, "Loser gets 0, got {v}");
     }
 
@@ -1696,9 +2060,14 @@ mod tests {
         // stacks = [47.5, 49.0], pot = 3.5, starting_stack = 50.0
         // Winner (player 0): (47.5 + 3.5 - 0) - 50 = 1.0
         let v = terminal_value(
-            TerminalKind::Fold { winner: 0 }, 3.5,
-            &[47.5, 49.0], 50.0,
-            0, &deal, 0.0, 0.0,
+            TerminalKind::Fold { winner: 0 },
+            3.5,
+            &[47.5, 49.0],
+            50.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
         );
         assert!((v - 1.0).abs() < 1e-10, "Winner EV should be 1.0, got {v}");
     }
@@ -1709,11 +2078,19 @@ mod tests {
         // stacks = [47.5, 49.0], pot = 3.5, starting_stack = 50.0
         // Loser (player 1): 49.0 - 50.0 = -1.0
         let v = terminal_value(
-            TerminalKind::Fold { winner: 0 }, 3.5,
-            &[47.5, 49.0], 50.0,
-            1, &deal, 0.0, 0.0,
+            TerminalKind::Fold { winner: 0 },
+            3.5,
+            &[47.5, 49.0],
+            50.0,
+            1,
+            &deal,
+            0.0,
+            0.0,
         );
-        assert!((v - (-1.0)).abs() < 1e-10, "Loser EV should be -1.0, got {v}");
+        assert!(
+            (v - (-1.0)).abs() < 1e-10,
+            "Loser EV should be -1.0, got {v}"
+        );
     }
 
     #[test]
@@ -1721,14 +2098,24 @@ mod tests {
         let deal = make_deal();
         // stacks = [47.5, 49.0], pot = 3.5, starting_stack = 50.0
         let winner_ev = terminal_value(
-            TerminalKind::Fold { winner: 0 }, 3.5,
-            &[47.5, 49.0], 50.0,
-            0, &deal, 0.0, 0.0,
+            TerminalKind::Fold { winner: 0 },
+            3.5,
+            &[47.5, 49.0],
+            50.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
         );
         let loser_ev = terminal_value(
-            TerminalKind::Fold { winner: 0 }, 3.5,
-            &[47.5, 49.0], 50.0,
-            1, &deal, 0.0, 0.0,
+            TerminalKind::Fold { winner: 0 },
+            3.5,
+            &[47.5, 49.0],
+            50.0,
+            1,
+            &deal,
+            0.0,
+            0.0,
         );
         assert!(
             (winner_ev + loser_ev).abs() < 1e-10,
@@ -1742,9 +2129,14 @@ mod tests {
         // Both put in 5.0 each. stacks = [45.0, 45.0], pot = 10.0, starting_stack = 50.0
         // Winner (player 0): (45 + 10 - 0) - 50 = 5.0
         let v = terminal_value(
-            TerminalKind::Showdown, 10.0,
-            &[45.0, 45.0], 50.0,
-            0, &deal, 0.0, 0.0,
+            TerminalKind::Showdown,
+            10.0,
+            &[45.0, 45.0],
+            50.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
         );
         assert!((v - 5.0).abs() < 1e-10, "Winner EV should be 5.0, got {v}");
     }
@@ -1755,11 +2147,19 @@ mod tests {
         // stacks = [45.0, 45.0], pot = 10.0, starting_stack = 50.0
         // Loser (player 1): 45.0 - 50.0 = -5.0
         let v = terminal_value(
-            TerminalKind::Showdown, 10.0,
-            &[45.0, 45.0], 50.0,
-            1, &deal, 0.0, 0.0,
+            TerminalKind::Showdown,
+            10.0,
+            &[45.0, 45.0],
+            50.0,
+            1,
+            &deal,
+            0.0,
+            0.0,
         );
-        assert!((v - (-5.0)).abs() < 1e-10, "Loser EV should be -5.0, got {v}");
+        assert!(
+            (v - (-5.0)).abs() < 1e-10,
+            "Loser EV should be -5.0, got {v}"
+        );
     }
 
     #[test]
@@ -1768,9 +2168,14 @@ mod tests {
         // stacks = [45.0, 45.0], pot = 10.0, starting_stack = 50.0
         // Tie: (45 + 10/2 - 0) - 50 = 0.0
         let v = terminal_value(
-            TerminalKind::Showdown, 10.0,
-            &[45.0, 45.0], 50.0,
-            0, &deal, 0.0, 0.0,
+            TerminalKind::Showdown,
+            10.0,
+            &[45.0, 45.0],
+            50.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
         );
         assert!(v.abs() < 1e-10, "Tie EV should be 0.0, got {v}");
     }
@@ -1782,11 +2187,19 @@ mod tests {
         // stacks = [45.0, 45.0], starting_stack = 50.0
         // Winner (player 0): (45 + 10 - 0.5) - 50 = 4.5
         let v = terminal_value(
-            TerminalKind::Fold { winner: 0 }, 10.0,
-            &[45.0, 45.0], 50.0,
-            0, &deal, 0.05, 1.0,
+            TerminalKind::Fold { winner: 0 },
+            10.0,
+            &[45.0, 45.0],
+            50.0,
+            0,
+            &deal,
+            0.05,
+            1.0,
         );
-        assert!((v - 4.5).abs() < 1e-10, "Winner with rake should be 4.5, got {v}");
+        assert!(
+            (v - 4.5).abs() < 1e-10,
+            "Winner with rake should be 4.5, got {v}"
+        );
     }
 
     #[test]
@@ -1796,11 +2209,19 @@ mod tests {
         // stacks = [45.0, 45.0], starting_stack = 50.0
         // Loser (player 1): 45.0 - 50.0 = -5.0 (rake does not affect loser)
         let v = terminal_value(
-            TerminalKind::Fold { winner: 0 }, 10.0,
-            &[45.0, 45.0], 50.0,
-            1, &deal, 0.05, 1.0,
+            TerminalKind::Fold { winner: 0 },
+            10.0,
+            &[45.0, 45.0],
+            50.0,
+            1,
+            &deal,
+            0.05,
+            1.0,
         );
-        assert!((v - (-5.0)).abs() < 1e-10, "Loser EV should be -5.0 (unaffected by rake), got {v}");
+        assert!(
+            (v - (-5.0)).abs() < 1e-10,
+            "Loser EV should be -5.0 (unaffected by rake), got {v}"
+        );
     }
 
     #[test]
@@ -1810,11 +2231,19 @@ mod tests {
         // stacks = [0.0, 0.0], starting_stack = 50.0
         // Winner (player 0): (0 + 100 - 3) - 50 = 47.0
         let v = terminal_value(
-            TerminalKind::Showdown, 100.0,
-            &[0.0, 0.0], 50.0,
-            0, &deal, 0.05, 3.0,
+            TerminalKind::Showdown,
+            100.0,
+            &[0.0, 0.0],
+            50.0,
+            0,
+            &deal,
+            0.05,
+            3.0,
         );
-        assert!((v - 47.0).abs() < 1e-10, "Winner with capped rake should be 47.0, got {v}");
+        assert!(
+            (v - 47.0).abs() < 1e-10,
+            "Winner with capped rake should be 47.0, got {v}"
+        );
     }
 
     #[test]
@@ -1824,11 +2253,19 @@ mod tests {
         // stacks = [45.0, 45.0], starting_stack = 50.0
         // Tie: (45 + 5 - 0.25) - 50 = -0.25
         let v = terminal_value(
-            TerminalKind::Showdown, 10.0,
-            &[45.0, 45.0], 50.0,
-            0, &deal, 0.05, 0.0,
+            TerminalKind::Showdown,
+            10.0,
+            &[45.0, 45.0],
+            50.0,
+            0,
+            &deal,
+            0.05,
+            0.0,
         );
-        assert!((v - (-0.25)).abs() < 1e-10, "Tie with rake EV should be -0.25, got {v}");
+        assert!(
+            (v - (-0.25)).abs() < 1e-10,
+            "Tie with rake EV should be -0.25, got {v}"
+        );
     }
 
     #[test]
@@ -1841,17 +2278,30 @@ mod tests {
         // Winner (BB = 1): (43 + 10) - 50 = 3.0
         // Loser (SB = 0): 47 - 50 = -3.0
         let v = terminal_value(
-            TerminalKind::Fold { winner: 1 }, 10.0,
-            &[47.0, 43.0], 50.0,
-            1, &deal, 0.0, 0.0,
+            TerminalKind::Fold { winner: 1 },
+            10.0,
+            &[47.0, 43.0],
+            50.0,
+            1,
+            &deal,
+            0.0,
+            0.0,
         );
         assert!((v - 3.0).abs() < 1e-10, "Winner EV should be 3.0, got {v}");
         let v = terminal_value(
-            TerminalKind::Fold { winner: 1 }, 10.0,
-            &[47.0, 43.0], 50.0,
-            0, &deal, 0.0, 0.0,
+            TerminalKind::Fold { winner: 1 },
+            10.0,
+            &[47.0, 43.0],
+            50.0,
+            0,
+            &deal,
+            0.0,
+            0.0,
         );
-        assert!((v - (-3.0)).abs() < 1e-10, "Loser EV should be -3.0, got {v}");
+        assert!(
+            (v - (-3.0)).abs() < 1e-10,
+            "Loser EV should be -3.0, got {v}"
+        );
     }
 
     /// Helper: shorthand card constructor.
@@ -1863,10 +2313,7 @@ mod tests {
 
     #[test]
     fn equity_fallback_aa_high_bucket() {
-        let all = AllBuckets::new(
-            [169, 400, 100, 1000],
-            [None, None, None, None],
-        );
+        let all = AllBuckets::new([169, 400, 100, 1000], [None, None, None, None]);
         let deal = Deal {
             hole_cards: [
                 [c(Value::Ace, Suit::Spade), c(Value::Ace, Suit::Heart)],
@@ -1892,10 +2339,7 @@ mod tests {
 
     #[test]
     fn get_bucket_equity_fallback() {
-        let all = AllBuckets::new(
-            [169, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let all = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
 
         let board = vec![
             Card::new(Value::Ace, Suit::Spade),
@@ -1963,8 +2407,8 @@ mod tests {
 
     #[test]
     fn lookup_bucket_returns_bucket_from_file() {
-        use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
         use crate::abstraction::isomorphism::CanonicalBoard;
+        use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
 
         let flop_cards = vec![
             c(Value::Ace, Suit::Spade),
@@ -1973,10 +2417,7 @@ mod tests {
         ];
         let bf = make_test_bucket_file(Street::Flop, &[flop_cards.clone()], 50);
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, Some(bf), None, None],
-        );
+        let all = AllBuckets::new([169, 50, 10, 10], [None, Some(bf), None, None]);
 
         let hole = [c(Value::Queen, Suit::Spade), c(Value::Jack, Suit::Club)];
         let bucket = all.lookup_bucket(1, hole, &flop_cards);
@@ -1988,17 +2429,20 @@ mod tests {
         let board_idx = board_map[&packed];
         let (c0, c1) = canonical.canonicalize_holding(hole[0], hole[1]);
         let ci = combo_index(c0, c1);
-        let expected = all.bucket_files[1].as_ref().unwrap().get_bucket(board_idx, ci);
+        let expected = all.bucket_files[1]
+            .as_ref()
+            .unwrap()
+            .get_bucket(board_idx, ci);
 
-        assert_eq!(bucket, expected, "lookup_bucket should return the bucket file value");
+        assert_eq!(
+            bucket, expected,
+            "lookup_bucket should return the bucket file value"
+        );
     }
 
     #[test]
     fn lookup_bucket_falls_back_to_equity_without_file() {
-        let all = AllBuckets::new(
-            [169, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let all = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
 
         let flop = [
             c(Value::Ace, Suit::Spade),
@@ -2009,7 +2453,10 @@ mod tests {
 
         let bucket = all.lookup_bucket(1, hole, &flop);
         // Should fall back to equity-based bucketing: valid in [0, 10)
-        assert!(bucket < 10, "equity fallback bucket should be < 10, got {bucket}");
+        assert!(
+            bucket < 10,
+            "equity fallback bucket should be < 10, got {bucket}"
+        );
 
         // Cross-check with manual equity computation
         let equity = crate::showdown_equity::compute_equity(hole, &flop);
@@ -2057,14 +2504,26 @@ mod tests {
                 deal.hole_cards[player][1],
             );
             let expected_preflop = (hand.index() as u16).min(168);
-            assert_eq!(result[player][0], expected_preflop, "preflop bucket for player {player}");
+            assert_eq!(
+                result[player][0], expected_preflop,
+                "preflop bucket for player {player}"
+            );
         }
 
         // Postflop buckets should be valid
         for player in 0..2 {
-            assert!(result[player][1] < 50, "flop bucket valid for player {player}");
-            assert!(result[player][2] < 30, "turn bucket valid for player {player}");
-            assert!(result[player][3] < 20, "river bucket valid for player {player}");
+            assert!(
+                result[player][1] < 50,
+                "flop bucket valid for player {player}"
+            );
+            assert!(
+                result[player][2] < 30,
+                "turn bucket valid for player {player}"
+            );
+            assert!(
+                result[player][3] < 20,
+                "river bucket valid for player {player}"
+            );
         }
     }
 
@@ -2077,25 +2536,21 @@ mod tests {
         ];
         let bf = make_test_bucket_file(Street::Flop, &[flop_cards.clone()], 50);
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, Some(bf), None, None],
-        );
+        let all = AllBuckets::new([169, 50, 10, 10], [None, Some(bf), None, None]);
 
         let hole = [c(Value::Queen, Suit::Spade), c(Value::Jack, Suit::Club)];
         let bucket_via_get = all.get_bucket(Street::Flop, hole, &flop_cards);
         let bucket_via_lookup = all.lookup_bucket(1, hole, &flop_cards);
 
-        assert_eq!(bucket_via_get, bucket_via_lookup,
-            "get_bucket and lookup_bucket should agree for flop");
+        assert_eq!(
+            bucket_via_get, bucket_via_lookup,
+            "get_bucket and lookup_bucket should agree for flop"
+        );
     }
 
     #[test]
     fn get_bucket_preflop_returns_canonical_hand_index() {
-        let all = AllBuckets::new(
-            [169, 10, 10, 10],
-            [None, None, None, None],
-        );
+        let all = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
 
         let hole = [c(Value::Ace, Suit::Spade), c(Value::King, Suit::Spade)];
         let bucket = all.get_bucket(Street::Preflop, hole, &[]);
@@ -2114,10 +2569,7 @@ mod tests {
         ];
         let bf = make_test_bucket_file(Street::Flop, &[flop_cards], 50);
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, Some(bf), None, None],
-        );
+        let all = AllBuckets::new([169, 50, 10, 10], [None, Some(bf), None, None]);
 
         // Preflop has no bucket file -> no board map
         assert!(all.board_maps[0].is_none());
@@ -2161,7 +2613,8 @@ mod tests {
             let mut rb = vec![0u16; num_rivers * 1326];
             for r in 0..num_rivers {
                 for ci in 0..1326 {
-                    rb[r * 1326 + ci] = ((t * 50 + r * 10 + ci) % river_bucket_count as usize) as u16;
+                    rb[r * 1326 + ci] =
+                        ((t * 50 + r * 10 + ci) % river_bucket_count as usize) as u16;
                 }
             }
             river_buckets_per_turn.push(rb);
@@ -2194,16 +2647,17 @@ mod tests {
         let river_card = c(Value::Ten, Suit::Club);
 
         save_test_per_flop_file(
-            dir.path(), flop,
+            dir.path(),
+            flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10,
+            10,
+            0,
         );
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, None, None, None],
-        ).with_per_flop_dir(dir.path().to_path_buf());
+        let all = AllBuckets::new([169, 50, 10, 10], [None, None, None, None])
+            .with_per_flop_dir(dir.path().to_path_buf());
 
         assert!(all.per_flop_dir.is_some());
         assert!(all.flop_index_map.is_some());
@@ -2227,16 +2681,17 @@ mod tests {
         let river_card = c(Value::Ten, Suit::Club);
 
         let pf = save_test_per_flop_file(
-            dir.path(), flop,
+            dir.path(),
+            flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10,
+            10,
+            0,
         );
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, None, None, None],
-        ).with_per_flop_dir(dir.path().to_path_buf());
+        let all = AllBuckets::new([169, 50, 10, 10], [None, None, None, None])
+            .with_per_flop_dir(dir.path().to_path_buf());
 
         // Build a turn board: flop + turn_card
         let turn_board = [flop[0], flop[1], flop[2], turn_card];
@@ -2271,16 +2726,17 @@ mod tests {
         let river_card = c(Value::Ten, Suit::Club);
 
         let _pf = save_test_per_flop_file(
-            dir.path(), flop,
+            dir.path(),
+            flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10,
+            10,
+            0,
         );
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, None, None, None],
-        ).with_per_flop_dir(dir.path().to_path_buf());
+        let all = AllBuckets::new([169, 50, 10, 10], [None, None, None, None])
+            .with_per_flop_dir(dir.path().to_path_buf());
 
         // Build a river board: flop + turn + river
         let river_board = [flop[0], flop[1], flop[2], turn_card, river_card];
@@ -2310,23 +2766,32 @@ mod tests {
         let river_card = deal.board[4];
 
         save_test_per_flop_file(
-            dir.path(), flop,
+            dir.path(),
+            flop,
             vec![turn_card],
             vec![vec![river_card]],
-            10, 10, 0,
+            10,
+            10,
+            0,
         );
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, None, None, None],
-        ).with_per_flop_dir(dir.path().to_path_buf());
+        let all = AllBuckets::new([169, 50, 10, 10], [None, None, None, None])
+            .with_per_flop_dir(dir.path().to_path_buf());
 
         let result = all.precompute_buckets(&deal);
 
         // Turn and river buckets should be valid (in [0, 10))
         for player in 0..2 {
-            assert!(result[player][2] < 10, "turn bucket valid for player {player}: {}", result[player][2]);
-            assert!(result[player][3] < 10, "river bucket valid for player {player}: {}", result[player][3]);
+            assert!(
+                result[player][2] < 10,
+                "turn bucket valid for player {player}: {}",
+                result[player][2]
+            );
+            assert!(
+                result[player][3] < 10,
+                "river bucket valid for player {player}: {}",
+                result[player][3]
+            );
         }
     }
 
@@ -2342,29 +2807,29 @@ mod tests {
 
         // Save a per-flop file
         save_test_per_flop_file(
-            dir.path(), flop,
+            dir.path(),
+            flop,
             vec![c(Value::Ace, Suit::Club)],
             vec![vec![c(Value::Ten, Suit::Club)]],
-            10, 10, 0,
+            10,
+            10,
+            0,
         );
 
         // Also provide a global flop bucket file
-        let flop_bf = make_test_bucket_file(
-            Street::Flop,
-            &[vec![flop[0], flop[1], flop[2]]],
-            50,
-        );
+        let flop_bf = make_test_bucket_file(Street::Flop, &[vec![flop[0], flop[1], flop[2]]], 50);
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, Some(flop_bf), None, None],
-        ).with_per_flop_dir(dir.path().to_path_buf());
+        let all = AllBuckets::new([169, 50, 10, 10], [None, Some(flop_bf), None, None])
+            .with_per_flop_dir(dir.path().to_path_buf());
 
         let hole = [c(Value::King, Suit::Club), c(Value::Nine, Suit::Diamond)];
 
         // Flop lookup should use global bucket file, not per-flop
         let bucket = all.get_bucket(Street::Flop, hole, &[flop[0], flop[1], flop[2]]);
-        assert!(bucket < 50, "flop bucket should use global file (< 50), got {bucket}");
+        assert!(
+            bucket < 50,
+            "flop bucket should use global file (< 50), got {bucket}"
+        );
     }
 
     #[test]
@@ -2378,16 +2843,17 @@ mod tests {
             c(Value::Two, Suit::Diamond),
         ];
         save_test_per_flop_file(
-            dir.path(), flop,
+            dir.path(),
+            flop,
             vec![c(Value::Ace, Suit::Club)],
             vec![vec![c(Value::Ten, Suit::Club)]],
-            10, 10, 0,
+            10,
+            10,
+            0,
         );
 
-        let all = AllBuckets::new(
-            [169, 50, 10, 10],
-            [None, None, None, None],
-        ).with_per_flop_dir(dir.path().to_path_buf());
+        let all = AllBuckets::new([169, 50, 10, 10], [None, None, None, None])
+            .with_per_flop_dir(dir.path().to_path_buf());
 
         // Try a different flop that has no per-flop file
         let other_flop = [
@@ -2395,13 +2861,21 @@ mod tests {
             c(Value::King, Suit::Heart),
             c(Value::Three, Suit::Diamond),
         ];
-        let turn_board = [other_flop[0], other_flop[1], other_flop[2], c(Value::Four, Suit::Club)];
+        let turn_board = [
+            other_flop[0],
+            other_flop[1],
+            other_flop[2],
+            c(Value::Four, Suit::Club),
+        ];
 
         let hole = [c(Value::Seven, Suit::Club), c(Value::Eight, Suit::Diamond)];
 
         // Should fall back to equity-based bucketing (returns valid bucket in [0,10))
         let bucket = all.get_bucket(Street::Turn, hole, &turn_board);
-        assert!(bucket < 10, "should fall back to equity bucketing, got {bucket}");
+        assert!(
+            bucket < 10,
+            "should fall back to equity bucketing, got {bucket}"
+        );
     }
 
     // --- Baseline-corrected value tests ---
@@ -2450,10 +2924,7 @@ mod tests {
         // sum = 0.6*2.0 + 0.4*8.0 = 1.2 + 3.2 = 4.4
         // correction = 3.5 - 2.0 = 1.5
         // total = 4.4 + 1.5 = 5.9
-        assert!(
-            (v - 5.9).abs() < 1e-10,
-            "expected 5.9, got {v}"
-        );
+        assert!((v - 5.9).abs() < 1e-10, "expected 5.9, got {v}");
     }
 
     #[test]
@@ -2488,14 +2959,31 @@ mod tests {
         }
 
         let (ev, stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root,
-            true, -310_000_000, [true; 4],
-            &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            true,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
         assert!(ev.is_finite());
         // With all streets enabled and negative regrets, should see prune hits.
-        assert!(stats.total > 0, "should have prune candidates when all streets enabled");
-        assert!(stats.hits > 0, "should have prune hits when all streets enabled");
+        assert!(
+            stats.total > 0,
+            "should have prune candidates when all streets enabled"
+        );
+        assert!(
+            stats.hits > 0,
+            "should have prune hits when all streets enabled"
+        );
     }
 
     #[test]
@@ -2516,12 +3004,26 @@ mod tests {
         }
 
         let (_ev, stats) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root,
-            true, -310_000_000, [false; 4],
-            &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            true,
+            -310_000_000,
+            [false; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
         assert_eq!(stats.hits, 0, "no prune hits when all streets disabled");
-        assert_eq!(stats.total, 0, "no prune candidates when all streets disabled");
+        assert_eq!(
+            stats.total, 0,
+            "no prune candidates when all streets disabled"
+        );
     }
 
     #[test]
@@ -2545,17 +3047,39 @@ mod tests {
         // Disable preflop pruning only.
         let mask = [false, true, true, true];
         let (_ev, stats_no_preflop) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root,
-            true, -310_000_000, mask,
-            &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            true,
+            -310_000_000,
+            mask,
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
 
         // Now enable all streets.
         let mut rng2 = StdRng::seed_from_u64(42);
         let (_, stats_all) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root,
-            true, -310_000_000, [true; 4],
-            &mut rng2, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            true,
+            -310_000_000,
+            [true; 4],
+            &mut rng2,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
 
         // With preflop disabled, there should be fewer prune candidates
@@ -2563,7 +3087,8 @@ mod tests {
         assert!(
             stats_no_preflop.total <= stats_all.total,
             "partial mask should have <= prune candidates vs all-enabled: {} vs {}",
-            stats_no_preflop.total, stats_all.total,
+            stats_no_preflop.total,
+            stats_all.total,
         );
     }
 
@@ -2576,10 +3101,36 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
-        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None, None);
-        assert!(br0.is_finite(), "BR value for p0 should be finite, got {br0}");
-        assert!(br1.is_finite(), "BR value for p1 should be finite, got {br1}");
+        let br0 = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
+        let br1 = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            1,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
+        assert!(
+            br0.is_finite(),
+            "BR value for p0 should be finite, got {br0}"
+        );
+        assert!(
+            br1.is_finite(),
+            "BR value for p1 should be finite, got {br1}"
+        );
     }
 
     #[test]
@@ -2595,12 +3146,34 @@ mod tests {
         // Run external sampling to get the current strategy value.
         let mut rng = StdRng::seed_from_u64(42);
         let (ev0, _) = traverse_external(
-            &tree, &storage, &precomputed, 0, tree.root, false, -310_000_000,
-            [true; 4], &mut rng, 0.0, 0.0, None, None, 0.0,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            false,
+            -310_000_000,
+            [true; 4],
+            &mut rng,
+            0.0,
+            0.0,
+            None,
+            None,
+            0.0,
         );
 
         // BR value: the best response can only do at least as well.
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
+        let br0 = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
         assert!(
             br0 >= ev0 - 0.01,
             "BR value ({br0}) should be >= external sampling value ({ev0})",
@@ -2614,8 +3187,28 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br_no_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
-        let br_with_rake = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.05, 3.0, None, None);
+        let br_no_rake = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
+        let br_with_rake = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.05,
+            3.0,
+            None,
+            None,
+        );
         // Rake should reduce the BR value (or keep equal if terminal is fold).
         assert!(
             br_with_rake <= br_no_rake + 0.01,
@@ -2633,8 +3226,28 @@ mod tests {
         let buckets = AllBuckets::new([10, 10, 10, 10], [None, None, None, None]);
         let precomputed = make_precomputed(&buckets, make_deal());
 
-        let br0 = traverse_best_response(&tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None);
-        let br1 = traverse_best_response(&tree, &storage, &precomputed, 1, tree.root, 0.0, 0.0, None, None);
+        let br0 = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
+        let br1 = traverse_best_response(
+            &tree,
+            &storage,
+            &precomputed,
+            1,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
+        );
         // Exploitability = (br0 + br1) / 2 should be non-negative.
         let exploit = (br0 + br1) / 2.0;
         assert!(
@@ -2662,11 +3275,27 @@ mod tests {
         }
 
         let br0 = traverse_best_response(
-            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, Some(&predict_store), None,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            Some(&predict_store),
+            None,
         );
         // BR value should be the same as without predictions.
         let br0_plain = traverse_best_response(
-            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0, None, None,
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            None,
+            None,
         );
         assert!(
             (br0 - br0_plain).abs() < 1e-10,
@@ -2676,11 +3305,17 @@ mod tests {
         );
 
         // Predictions should have been written (at least some non-zero).
-        let preds = predict_store.predictions.as_ref().expect("predictions enabled");
+        let preds = predict_store
+            .predictions
+            .as_ref()
+            .expect("predictions enabled");
         let any_nonzero = preds
             .iter()
             .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 0);
-        assert!(any_nonzero, "predictions should be populated by BR traversal");
+        assert!(
+            any_nonzero,
+            "predictions should be populated by BR traversal"
+        );
 
         // With strategy-weighted baseline, predictions should have both
         // positive (BR-preferred actions) and negative (BR-avoided actions).
@@ -2723,8 +3358,15 @@ mod tests {
 
         // Call once to get a baseline.
         traverse_best_response(
-            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0,
-            Some(&predict_store), Some(&visit_counts),
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            Some(&predict_store),
+            Some(&visit_counts),
         );
 
         // Snapshot predictions after first call.
@@ -2736,8 +3378,15 @@ mod tests {
 
         // Call again with the same deal -- predictions should accumulate.
         traverse_best_response(
-            &tree, &storage, &precomputed, 0, tree.root, 0.0, 0.0,
-            Some(&predict_store), Some(&visit_counts),
+            &tree,
+            &storage,
+            &precomputed,
+            0,
+            tree.root,
+            0.0,
+            0.0,
+            Some(&predict_store),
+            Some(&visit_counts),
         );
 
         let second_pass: Vec<i32> = preds
@@ -2750,7 +3399,8 @@ mod tests {
         for (i, (&f, &s)) in first_pass.iter().zip(second_pass.iter()).enumerate() {
             if f != 0 {
                 assert_eq!(
-                    s, 2 * f,
+                    s,
+                    2 * f,
                     "prediction[{i}] should be 2*{f} after two identical calls, got {s}"
                 );
             }
@@ -2760,6 +3410,9 @@ mod tests {
         let any_visited = visit_counts
             .iter()
             .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == 2);
-        assert!(any_visited, "visit counts should show 2 visits for traversed slots");
+        assert!(
+            any_visited,
+            "visit counts should show 2 visits for traversed slots"
+        );
     }
 }

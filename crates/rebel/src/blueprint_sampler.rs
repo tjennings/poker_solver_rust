@@ -5,16 +5,16 @@
 // 2. Traversing the game tree under blueprint strategy
 // 3. Snapshotting Public Belief States at each street boundary (Chance node)
 
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::poker::{Card, Suit, Value};
 use rand::Rng;
 use range_solver::card::index_to_card_pair;
 
 use crate::belief_update::{sample_action, update_reach};
-use crate::pbs::{combo_index, Pbs, NUM_COMBOS};
+use crate::pbs::{NUM_COMBOS, Pbs, combo_index};
 
 /// A dealt hand: hole cards for two players plus the full 5-card board.
 ///
@@ -77,11 +77,7 @@ pub const BLOCKED_BUCKET: u16 = u16::MAX;
 ///
 /// Board-blocked combos get `BLOCKED_BUCKET` (`u16::MAX`) so they can never
 /// alias a real bucket.
-pub fn compute_combo_buckets(
-    buckets: &AllBuckets,
-    street: Street,
-    board: &[u8],
-) -> [u16; 1326] {
+pub fn compute_combo_buckets(buckets: &AllBuckets, street: Street, board: &[u8]) -> [u16; 1326] {
     let mut result = [BLOCKED_BUCKET; 1326];
 
     // Build a set of board cards for fast blocking check
@@ -448,7 +444,11 @@ fn traverse<R: Rng>(
             let player = *player;
             let street = *street;
             let decision_idx = decision_idx_map[node_idx as usize];
-            debug_assert_ne!(decision_idx, u32::MAX, "Decision node must have valid decision_idx");
+            debug_assert_ne!(
+                decision_idx,
+                u32::MAX,
+                "Decision node must have valid decision_idx"
+            );
 
             // Get the actual hole cards bucket for the acting player
             let hole = deal.hole_cards[player as usize];
@@ -654,12 +654,20 @@ mod tests {
         // Player 0 calls, matching player 1's investment
         let invested = [5.0, 10.0];
         let result = apply_action(&TreeAction::Call, invested, 0, 100.0);
-        assert_eq!(result, [10.0, 10.0], "Call should match opponent's investment");
+        assert_eq!(
+            result,
+            [10.0, 10.0],
+            "Call should match opponent's investment"
+        );
 
         // Player 1 calls, matching player 0's investment
         let invested = [20.0, 10.0];
         let result = apply_action(&TreeAction::Call, invested, 1, 100.0);
-        assert_eq!(result, [20.0, 20.0], "Call should match opponent's investment");
+        assert_eq!(
+            result,
+            [20.0, 20.0],
+            "Call should match opponent's investment"
+        );
     }
 
     #[test]
@@ -740,11 +748,7 @@ mod tests {
         );
 
         let pot = invested[0] + invested[1];
-        assert!(
-            (pot - 5.0).abs() < 1e-9,
-            "Pot should be 5.0, got {}",
-            pot
-        );
+        assert!((pot - 5.0).abs() < 1e-9, "Pot should be 5.0, got {}", pot);
     }
 
     #[test]
@@ -781,11 +785,7 @@ mod tests {
         );
 
         let pot = invested[0] + invested[1];
-        assert!(
-            (pot - 60.0).abs() < 1e-9,
-            "Pot should be 60.0, got {}",
-            pot
-        );
+        assert!((pot - 60.0).abs() < 1e-9, "Pot should be 60.0, got {}", pot);
 
         let effective_stack = stack - invested[0].max(invested[1]);
         assert!(
@@ -802,7 +802,10 @@ mod tests {
         assert_eq!(board_for_street(&board, Street::Preflop), &[] as &[u8]);
         assert_eq!(board_for_street(&board, Street::Flop), &[10, 20, 30]);
         assert_eq!(board_for_street(&board, Street::Turn), &[10, 20, 30, 40]);
-        assert_eq!(board_for_street(&board, Street::River), &[10, 20, 30, 40, 50]);
+        assert_eq!(
+            board_for_street(&board, Street::River),
+            &[10, 20, 30, 40, 50]
+        );
     }
 
     #[test]

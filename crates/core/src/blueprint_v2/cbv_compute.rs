@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 
 use super::cbv::CbvTable;
+use crate::blueprint_v2::Street;
 use crate::blueprint_v2::bundle::BlueprintV2Strategy;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TerminalKind};
-use crate::blueprint_v2::Street;
 
 /// Shared context for the recursive backward-induction traversal.
 ///
@@ -427,11 +427,8 @@ pub fn compute_cbvs_with_transitions(
 
                 // Phase 2: Apply transition matrix to convert next-street
                 // bucket values to prev-street bucket values.
-                let prev_values = apply_transition(
-                    &child_values,
-                    transitions[slot].as_ref(),
-                    prev_buckets,
-                );
+                let prev_values =
+                    apply_transition(&child_values, transitions[slot].as_ref(), prev_buckets);
 
                 // Store in CBV table
                 let pos = chance_pos[chance_arena_idx as usize];
@@ -440,7 +437,11 @@ pub fn compute_cbvs_with_transitions(
                     let table = &mut tables[player as usize];
                     let node_buckets = table.buckets_per_node[pos] as usize;
                     let offset = table.node_offsets[pos];
-                    for (b, &val) in prev_values.iter().enumerate().take(prev_buckets.min(node_buckets)) {
+                    for (b, &val) in prev_values
+                        .iter()
+                        .enumerate()
+                        .take(prev_buckets.min(node_buckets))
+                    {
                         table.values[offset + b] = val;
                     }
                 }
@@ -506,7 +507,8 @@ fn compute_street_values(
                 if p < 1e-9 {
                     continue;
                 }
-                let child_value = compute_street_values(ctx, bucket, child_idx, chance_continuation);
+                let child_value =
+                    compute_street_values(ctx, bucket, child_idx, chance_continuation);
                 value += p * child_value;
             }
 
@@ -639,7 +641,12 @@ mod tests {
             },
         ];
 
-        GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 }
+        GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        }
     }
 
     /// With uniform strategy (fresh storage), verify that the CBV
@@ -732,33 +739,15 @@ mod tests {
         let bucket_counts: [u16; 4] = [4, 4, 4, 4];
 
         // Player 0 wins fold: pot-only model gives pot.
-        let v = terminal_bucket_value(
-            TerminalKind::Fold { winner: 0 },
-            2.0,
-            0,
-            0,
-            bucket_counts,
-        );
+        let v = terminal_bucket_value(TerminalKind::Fold { winner: 0 }, 2.0, 0, 0, bucket_counts);
         assert!((v - 2.0).abs() < 1e-6);
 
         // Same value regardless of bucket.
-        let v2 = terminal_bucket_value(
-            TerminalKind::Fold { winner: 0 },
-            2.0,
-            0,
-            3,
-            bucket_counts,
-        );
+        let v2 = terminal_bucket_value(TerminalKind::Fold { winner: 0 }, 2.0, 0, 3, bucket_counts);
         assert!((v - v2).abs() < 1e-6);
 
         // Player 0 loses fold: pot-only model gives 0.
-        let v3 = terminal_bucket_value(
-            TerminalKind::Fold { winner: 1 },
-            2.0,
-            0,
-            2,
-            bucket_counts,
-        );
+        let v3 = terminal_bucket_value(TerminalKind::Fold { winner: 1 }, 2.0, 0, 2, bucket_counts);
         assert!(v3.abs() < 1e-6);
     }
 
@@ -769,26 +758,14 @@ mod tests {
         // Pot-only: EV = equity * pot. With pot=2.0:
         let bucket_counts: [u16; 4] = [4, 4, 4, 4];
 
-        let v0 = terminal_bucket_value(
-            TerminalKind::Showdown,
-            2.0,
-            0,
-            0,
-            bucket_counts,
-        );
+        let v0 = terminal_bucket_value(TerminalKind::Showdown, 2.0, 0, 0, bucket_counts);
         let expected_0 = (0.125 * 2.0) as f32;
         assert!(
             (v0 - expected_0).abs() < 1e-5,
             "bucket 0: expected {expected_0}, got {v0}"
         );
 
-        let v3 = terminal_bucket_value(
-            TerminalKind::Showdown,
-            2.0,
-            0,
-            3,
-            bucket_counts,
-        );
+        let v3 = terminal_bucket_value(TerminalKind::Showdown, 2.0, 0, 3, bucket_counts);
         let expected_3 = (0.875 * 2.0) as f32;
         assert!(
             (v3 - expected_3).abs() < 1e-5,
@@ -826,7 +803,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![2],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             // 2: Chance (flop->turn)
             GameNode::Chance {
@@ -839,7 +816,7 @@ mod tests {
                 street: Street::Turn,
                 actions: vec![TreeAction::Check],
                 children: vec![4],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             // 4: P1 Turn (Check only)
             GameNode::Decision {
@@ -847,7 +824,7 @@ mod tests {
                 street: Street::Turn,
                 actions: vec![TreeAction::Check],
                 children: vec![5],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             // 5: Chance (turn->river)
             GameNode::Chance {
@@ -874,7 +851,12 @@ mod tests {
             },
         ];
 
-        GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 }
+        GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        }
     }
 
     /// Identity transition (each bucket maps 100% to same bucket on
@@ -893,11 +875,7 @@ mod tests {
             matrix: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
         };
         // Transition slots: [preflop->flop, flop->turn, turn->river]
-        let transitions: [Option<BucketTransition>; 3] = [
-            None,
-            Some(identity_2x2.clone()),
-            None,
-        ];
+        let transitions: [Option<BucketTransition>; 3] = [None, Some(identity_2x2.clone()), None];
 
         let with_transition =
             compute_cbvs_with_transitions(&strategy, &tree, bucket_counts, &transitions);
@@ -939,14 +917,14 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![1],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             GameNode::Decision {
                 player: 1,
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![2],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             GameNode::Chance {
                 next_street: Street::Turn,
@@ -958,7 +936,12 @@ mod tests {
                 stacks: [49.0, 49.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 };
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        };
         let bucket_counts: [u16; 4] = [2, 2, 2, 2];
         let storage = BlueprintStorage::new(&tree, bucket_counts);
         let strategy = BlueprintV2Strategy::from_storage(&storage, &tree);
@@ -978,11 +961,7 @@ mod tests {
         let transition = BucketTransition {
             matrix: vec![vec![0.8, 0.2], vec![0.3, 0.7]],
         };
-        let transitions: [Option<BucketTransition>; 3] = [
-            None,
-            Some(transition),
-            None,
-        ];
+        let transitions: [Option<BucketTransition>; 3] = [None, Some(transition), None];
 
         let [p0_cbvs, _] =
             compute_cbvs_with_transitions(&strategy, &tree, bucket_counts, &transitions);
@@ -1035,11 +1014,7 @@ mod tests {
         let flop_turn = BucketTransition {
             matrix: vec![vec![0.7, 0.3], vec![0.1, 0.9]],
         };
-        let transitions: [Option<BucketTransition>; 3] = [
-            None,
-            Some(flop_turn),
-            Some(turn_river),
-        ];
+        let transitions: [Option<BucketTransition>; 3] = [None, Some(flop_turn), Some(turn_river)];
 
         let [p0_cbvs, _] =
             compute_cbvs_with_transitions(&strategy, &tree, bucket_counts, &transitions);
@@ -1089,11 +1064,7 @@ mod tests {
         let transition = BucketTransition {
             matrix: vec![vec![0.8, 0.2], vec![0.2, 0.8]],
         };
-        let transitions: [Option<BucketTransition>; 3] = [
-            None,
-            Some(transition),
-            None,
-        ];
+        let transitions: [Option<BucketTransition>; 3] = [None, Some(transition), None];
 
         let [p0_cbvs, _] =
             compute_cbvs_with_transitions(&strategy, &tree, bucket_counts, &transitions);
@@ -1216,7 +1187,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![1],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             // 1: P1 Flop
             GameNode::Decision {
@@ -1224,7 +1195,7 @@ mod tests {
                 street: Street::Flop,
                 actions: vec![TreeAction::Check],
                 children: vec![2],
-            blueprint_decision_idx: None,
+                blueprint_decision_idx: None,
             },
             // 2: Chance (flop->turn)
             GameNode::Chance {
@@ -1238,7 +1209,12 @@ mod tests {
                 stacks: [49.0, 49.0],
             },
         ];
-        let tree = GameTree { nodes, root: 0, dealer: 0, starting_stack: 50.0 };
+        let tree = GameTree {
+            nodes,
+            root: 0,
+            dealer: 0,
+            starting_stack: 50.0,
+        };
         // 3 flop buckets, 2 turn buckets
         let bucket_counts: [u16; 4] = [3, 3, 2, 2];
         let storage = BlueprintStorage::new(&tree, bucket_counts);
@@ -1253,17 +1229,9 @@ mod tests {
         //   flop 1 -> [0.5, 0.5]  => 0.5*0.5 + 0.5*1.5 = 1.0
         //   flop 2 -> [0.1, 0.9]  => 0.1*0.5 + 0.9*1.5 = 1.4
         let transition = BucketTransition {
-            matrix: vec![
-                vec![0.9, 0.1],
-                vec![0.5, 0.5],
-                vec![0.1, 0.9],
-            ],
+            matrix: vec![vec![0.9, 0.1], vec![0.5, 0.5], vec![0.1, 0.9]],
         };
-        let transitions: [Option<BucketTransition>; 3] = [
-            None,
-            Some(transition),
-            None,
-        ];
+        let transitions: [Option<BucketTransition>; 3] = [None, Some(transition), None];
 
         let [p0_cbvs, _] =
             compute_cbvs_with_transitions(&strategy, &tree, bucket_counts, &transitions);

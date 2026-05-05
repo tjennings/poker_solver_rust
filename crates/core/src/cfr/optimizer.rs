@@ -419,9 +419,9 @@ mod tests {
             gamma: 2.0,
         };
         let regrets = vec![
-            AtomicI32::new(300),  // action 0
-            AtomicI32::new(100),  // action 1
-            AtomicI32::new(-50),  // action 2 (negative, excluded)
+            AtomicI32::new(300), // action 0
+            AtomicI32::new(100), // action 1
+            AtomicI32::new(-50), // action 2 (negative, excluded)
         ];
         let mut out = [0.0; 3];
         opt.current_strategy(&regrets, None, 0, 3, &mut out);
@@ -439,10 +439,7 @@ mod tests {
             beta: 0.0,
             gamma: 2.0,
         };
-        let regrets = vec![
-            AtomicI32::new(-100),
-            AtomicI32::new(-200),
-        ];
+        let regrets = vec![AtomicI32::new(-100), AtomicI32::new(-200)];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, None, 0, 2, &mut out);
         assert!((out[0] - 0.5).abs() < 0.01);
@@ -459,10 +456,10 @@ mod tests {
         };
         // Simulate a buffer with multiple nodes. Node at offset 2 has 2 actions.
         let regrets = vec![
-            AtomicI32::new(0),    // slot 0 (different node)
-            AtomicI32::new(0),    // slot 1 (different node)
-            AtomicI32::new(600),  // slot 2 = our node, action 0
-            AtomicI32::new(200),  // slot 3 = our node, action 1
+            AtomicI32::new(0),   // slot 0 (different node)
+            AtomicI32::new(0),   // slot 1 (different node)
+            AtomicI32::new(600), // slot 2 = our node, action 0
+            AtomicI32::new(200), // slot 3 = our node, action 1
         ];
         let mut out = [0.0; 2];
         opt.current_strategy(&regrets, None, 2, 2, &mut out);
@@ -639,7 +636,7 @@ mod tests {
         let preds = vec![
             AtomicI32::new(0),
             AtomicI32::new(0),
-            AtomicI32::new(200), // prediction for action 0
+            AtomicI32::new(200),  // prediction for action 0
             AtomicI32::new(-200), // prediction for action 1 (negative)
         ];
         let mut out = [0.0; 2];
@@ -659,16 +656,32 @@ mod tests {
         let opt = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
         opt.set_decay(0.5);
         let regrets = vec![AtomicI32::new(200), AtomicI32::new(100), AtomicI32::new(0)];
-        let preds = vec![AtomicI32::new(100), AtomicI32::new(-300), AtomicI32::new(50)];
+        let preds = vec![
+            AtomicI32::new(100),
+            AtomicI32::new(-300),
+            AtomicI32::new(50),
+        ];
         let mut out = [0.0; 3];
         opt.current_strategy(&regrets, Some(&preds), 0, 3, &mut out);
         // R_tilde[0] = max(0, 200 + 0.6 * 0.5 * 100) = max(0, 230) = 230
         // R_tilde[1] = max(0, 100 + 0.6 * 0.5 * (-300)) = max(0, 10) = 10
         // R_tilde[2] = max(0, 0 + 0.6 * 0.5 * 50) = max(0, 15) = 15
         // sum = 255
-        assert!((out[0] - 230.0 / 255.0).abs() < 0.01, "action 0: got {}", out[0]);
-        assert!((out[1] - 10.0 / 255.0).abs() < 0.01, "action 1: got {}", out[1]);
-        assert!((out[2] - 15.0 / 255.0).abs() < 0.01, "action 2: got {}", out[2]);
+        assert!(
+            (out[0] - 230.0 / 255.0).abs() < 0.01,
+            "action 0: got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 10.0 / 255.0).abs() < 0.01,
+            "action 1: got {}",
+            out[1]
+        );
+        assert!(
+            (out[2] - 15.0 / 255.0).abs() < 0.01,
+            "action 2: got {}",
+            out[2]
+        );
     }
 
     #[test]
@@ -676,8 +689,16 @@ mod tests {
         use super::*;
         let brcfr = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
         brcfr.set_decay(0.0);
-        let regrets = vec![AtomicI32::new(300), AtomicI32::new(100), AtomicI32::new(-50)];
-        let preds = vec![AtomicI32::new(999), AtomicI32::new(-999), AtomicI32::new(999)];
+        let regrets = vec![
+            AtomicI32::new(300),
+            AtomicI32::new(100),
+            AtomicI32::new(-50),
+        ];
+        let preds = vec![
+            AtomicI32::new(999),
+            AtomicI32::new(-999),
+            AtomicI32::new(999),
+        ];
         let mut out_brcfr = [0.0; 3];
         brcfr.current_strategy(&regrets, Some(&preds), 0, 3, &mut out_brcfr);
         // With decay=0, predictions are ignored => standard RM+: 300/400, 100/400, 0
@@ -720,11 +741,20 @@ mod tests {
     fn brcfr_set_decay_updates_value() {
         use super::*;
         let opt = BrcfrPlusOptimizer::new(1.5, 2.0, 0.6);
-        assert!((opt.decay() - 0.0).abs() < f64::EPSILON, "initial decay should be 0.0");
+        assert!(
+            (opt.decay() - 0.0).abs() < f64::EPSILON,
+            "initial decay should be 0.0"
+        );
         opt.set_decay(0.75);
-        assert!((opt.decay() - 0.75).abs() < f64::EPSILON, "decay should be 0.75 after set");
+        assert!(
+            (opt.decay() - 0.75).abs() < f64::EPSILON,
+            "decay should be 0.75 after set"
+        );
         opt.set_decay(0.0);
-        assert!((opt.decay() - 0.0).abs() < f64::EPSILON, "decay should be 0.0 after reset");
+        assert!(
+            (opt.decay() - 0.0).abs() < f64::EPSILON,
+            "decay should be 0.0 after reset"
+        );
     }
 
     #[test]
@@ -735,7 +765,10 @@ mod tests {
         let trait_ref: &dyn CfrOptimizer = &opt;
         trait_ref.set_decay(0.5);
         // Verify the decay updated
-        assert!((opt.decay() - 0.5).abs() < f64::EPSILON, "trait set_decay should update value");
+        assert!(
+            (opt.decay() - 0.5).abs() < f64::EPSILON,
+            "trait set_decay should update value"
+        );
     }
 
     // --- Strategy sums i64 tests ---

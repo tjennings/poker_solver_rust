@@ -136,8 +136,7 @@ struct TuiWrapper {
 ///
 /// Returns `BlueprintTuiConfig::default()` when the key is absent.
 pub fn parse_tui_config(yaml: &str) -> BlueprintTuiConfig {
-    let wrapper: TuiWrapper =
-        serde_yaml::from_str(yaml).unwrap_or(TuiWrapper { tui: None });
+    let wrapper: TuiWrapper = serde_yaml::from_str(yaml).unwrap_or(TuiWrapper { tui: None });
     wrapper.tui.unwrap_or_default()
 }
 
@@ -196,11 +195,10 @@ tui:
         assert!(cfg.scenarios.is_empty());
         assert!(!cfg.random_scenario.enabled);
         assert_eq!(cfg.random_scenario.hold_minutes, 3);
-        assert_eq!(cfg.random_scenario.pool, vec![
-            StreetLabel::Preflop,
-            StreetLabel::Flop,
-            StreetLabel::Turn,
-        ]);
+        assert_eq!(
+            cfg.random_scenario.pool,
+            vec![StreetLabel::Preflop, StreetLabel::Flop, StreetLabel::Turn,]
+        );
     }
 
     #[timed_test(10)]

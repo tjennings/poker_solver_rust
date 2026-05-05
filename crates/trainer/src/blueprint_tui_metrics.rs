@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
@@ -189,7 +189,10 @@ impl BlueprintTuiMetrics {
 
     /// Store a refreshed strategy grid for a scenario.
     pub fn update_scenario_grid(&self, idx: usize, grid: [[CellStrategy; 13]; 13]) {
-        let mut grids = self.strategy_grids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut grids = self
+            .strategy_grids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if idx < grids.len() {
             grids[idx] = Some(grid);
         }
@@ -197,19 +200,28 @@ impl BlueprintTuiMetrics {
 
     /// Store updated audit snapshots for the TUI to pick up.
     pub fn update_regret_audits(&self, snapshots: Vec<AuditSnapshot>) {
-        let mut data = self.regret_audit_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut data = self
+            .regret_audit_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *data = Some(snapshots);
     }
 
     /// Take the latest audit snapshots (returns None if none pending).
     pub fn take_regret_audits(&self) -> Option<Vec<AuditSnapshot>> {
-        let mut data = self.regret_audit_snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut data = self
+            .regret_audit_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         data.take()
     }
 
     /// Push a strategy delta sample into the sparkline history.
     pub fn push_strategy_delta(&self, delta: f64) {
-        let mut hist = self.strategy_delta_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hist = self
+            .strategy_delta_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hist.push(delta);
     }
 
@@ -221,31 +233,46 @@ impl BlueprintTuiMetrics {
 
     /// Push a min-regret sample into the sparkline history.
     pub fn push_min_regret(&self, val: f64) {
-        let mut hist = self.min_regret_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hist = self
+            .min_regret_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hist.push(val);
     }
 
     /// Push a max-regret sample into the sparkline history.
     pub fn push_max_regret(&self, val: f64) {
-        let mut hist = self.max_regret_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hist = self
+            .max_regret_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hist.push(val);
     }
 
     /// Push an average positive regret sample into the sparkline history.
     pub fn push_avg_pos_regret(&self, val: f64) {
-        let mut hist = self.avg_pos_regret_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hist = self
+            .avg_pos_regret_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hist.push(val);
     }
 
     /// Push a leaf movement sample into the sparkline history.
     pub fn push_leaf_movement(&self, pct: f64) {
-        let mut hist = self.leaf_movement_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hist = self
+            .leaf_movement_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hist.push(pct);
     }
 
     /// Push an exploitability sample into the sparkline history.
     pub fn push_exploitability(&self, val: f64) {
-        let mut hist = self.exploitability_history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hist = self
+            .exploitability_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hist.push(val);
     }
 
@@ -278,14 +305,20 @@ impl BlueprintTuiMetrics {
 
     /// Replace the stored exploitable spots with a new set from the latest BR pass.
     pub fn set_exploitable_spots(&self, spots: Vec<ExploitableSpot>) {
-        *self.exploitable_spots.lock().unwrap_or_else(|e| e.into_inner()) = spots;
+        *self
+            .exploitable_spots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = spots;
     }
 
     /// Signal the start of an exploitability/BR pass with the given total sample count.
     pub fn start_exploitability_pass(&self, total: u64) {
         self.exploitability_progress.store(0, Ordering::Relaxed);
         self.exploitability_total.store(total, Ordering::Relaxed);
-        let mut start = self.exploitability_start_time.lock().unwrap_or_else(|e| e.into_inner());
+        let mut start = self
+            .exploitability_start_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *start = Some(Instant::now());
     }
 
@@ -298,7 +331,10 @@ impl BlueprintTuiMetrics {
     pub fn finish_exploitability_pass(&self) {
         self.exploitability_total.store(0, Ordering::Relaxed);
         self.exploitability_progress.store(0, Ordering::Relaxed);
-        let mut start = self.exploitability_start_time.lock().unwrap_or_else(|e| e.into_inner());
+        let mut start = self
+            .exploitability_start_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *start = None;
     }
 }
@@ -445,19 +481,17 @@ mod tests {
     #[timed_test(10)]
     fn regret_audit_snapshot_exchange() {
         let m = BlueprintTuiMetrics::new(None, None);
-        let snapshot = vec![
-            crate::blueprint_tui_audit::AuditSnapshot {
-                regrets: vec![1.0, -2.0, 3.0],
-                deltas: vec![0.5, -0.1, 0.2],
-                trends: vec![
-                    crate::blueprint_tui_audit::Trend::Up,
-                    crate::blueprint_tui_audit::Trend::Down,
-                    crate::blueprint_tui_audit::Trend::Flat,
-                ],
-                strategy: vec![0.0, 0.25, 0.75],
-                avg_strategy: vec![0.0, 0.20, 0.80],
-            },
-        ];
+        let snapshot = vec![crate::blueprint_tui_audit::AuditSnapshot {
+            regrets: vec![1.0, -2.0, 3.0],
+            deltas: vec![0.5, -0.1, 0.2],
+            trends: vec![
+                crate::blueprint_tui_audit::Trend::Up,
+                crate::blueprint_tui_audit::Trend::Down,
+                crate::blueprint_tui_audit::Trend::Flat,
+            ],
+            strategy: vec![0.0, 0.25, 0.75],
+            avg_strategy: vec![0.0, 0.20, 0.80],
+        }];
         m.update_regret_audits(snapshot.clone());
         let taken = m.take_regret_audits();
         assert!(taken.is_some());
@@ -558,8 +592,8 @@ mod tests {
 
     #[timed_test(10)]
     fn set_exploitable_spots_stores_spots() {
-        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
         use poker_solver_core::blueprint_v2::Street;
+        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
 
         let m = BlueprintTuiMetrics::new(None, None);
         let spots = vec![
@@ -589,8 +623,8 @@ mod tests {
 
     #[timed_test(10)]
     fn set_exploitable_spots_replaces_previous() {
-        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
         use poker_solver_core::blueprint_v2::Street;
+        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
 
         let m = BlueprintTuiMetrics::new(None, None);
         let spots1 = vec![ExploitableSpot {

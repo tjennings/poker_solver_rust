@@ -11,8 +11,6 @@ use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_COMBOS, NUM_RANKS};
 use range_solver::card::{card_pair_to_index, index_to_card_pair};
 
 #[cfg(not(feature = "onnx"))]
-use std::sync::Mutex;
-#[cfg(not(feature = "onnx"))]
 use crate::model::boundary_net::BoundaryNet;
 #[cfg(not(feature = "onnx"))]
 use burn::backend::NdArray;
@@ -22,6 +20,8 @@ use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 #[cfg(not(feature = "onnx"))]
 use burn::tensor::{Tensor, TensorData};
+#[cfg(not(feature = "onnx"))]
+use std::sync::Mutex;
 
 /// Encode inputs for boundary inference from raw game state.
 pub fn encode_boundary_inference_input(
@@ -71,18 +71,14 @@ fn build_river_batch_inputs(
     eff_stack: f32,
     player: u8,
 ) -> (Vec<u8>, Vec<f32>) {
-    let valid_rivers: Vec<u8> = (0u8..52)
-        .filter(|r| !board.contains(r))
-        .collect();
+    let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !board.contains(r)).collect();
     let n_rivers = valid_rivers.len();
     let mut flat_input = Vec::with_capacity(n_rivers * INPUT_SIZE);
     for &river in &valid_rivers {
         let mut board_5 = board.to_vec();
         board_5.push(river);
         let (oop_r, ip_r) = blocker_adjust_ranges(oop_1326, ip_1326, river);
-        let row = encode_boundary_inference_input(
-            &oop_r, &ip_r, &board_5, pot, eff_stack, player,
-        );
+        let row = encode_boundary_inference_input(&oop_r, &ip_r, &board_5, pot, eff_stack, player);
         flat_input.extend_from_slice(&row);
     }
     (valid_rivers, flat_input)
@@ -97,7 +93,9 @@ fn accumulate_river_cfvs(valid_rivers: &[u8], all_outputs: &[f32]) -> Vec<f32> {
         let offset = row_idx * NUM_COMBOS;
         for combo_idx in 0..NUM_COMBOS {
             let (c1, c2) = index_to_card_pair(combo_idx);
-            if c1 == river || c2 == river { continue; }
+            if c1 == river || c2 == river {
+                continue;
+            }
             cfv_sum[combo_idx] += all_outputs[offset + combo_idx];
             cfv_cnt[combo_idx] += 1;
         }
@@ -153,13 +151,19 @@ impl NeuralBoundaryEvaluator {
         board: Vec<u8>,
         private_cards: [Vec<(u8, u8)>; 2],
     ) -> Self {
-        Self { model: Mutex::new(model), board, private_cards }
+        Self {
+            model: Mutex::new(model),
+            board,
+            private_cards,
+        }
     }
 }
 
 #[cfg(not(feature = "onnx"))]
 impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
-    fn num_continuations(&self) -> usize { 1 }
+    fn num_continuations(&self) -> usize {
+        1
+    }
 
     fn compute_cfvs(
         &self,
@@ -192,7 +196,7 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
         let oop_cfvs = self.forward_for_player(0, pot, remaining_stack, oop_reach, ip_reach);
-        let ip_cfvs  = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
+        let ip_cfvs = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
         (oop_cfvs, ip_cfvs)
     }
 }
@@ -231,8 +235,21 @@ impl NeuralBoundaryEvaluator {
         // feeding a 4-card (turn) board is OOD. For turn boundaries, average
         // the net's output over all valid river cards.
         let normalized_1326 = match self.board.len() {
-            5 => self.burn_forward(&oop_range_1326, &ip_range_1326, &self.board, pot_f32, eff_stack_f32, player as u8),
-            4 => self.burn_river_enumerated(&oop_range_1326, &ip_range_1326, pot_f32, eff_stack_f32, player as u8),
+            5 => self.burn_forward(
+                &oop_range_1326,
+                &ip_range_1326,
+                &self.board,
+                pot_f32,
+                eff_stack_f32,
+                player as u8,
+            ),
+            4 => self.burn_river_enumerated(
+                &oop_range_1326,
+                &ip_range_1326,
+                pot_f32,
+                eff_stack_f32,
+                player as u8,
+            ),
             n => panic!("NeuralBoundaryEvaluator: unsupported board length {n} (expected 4 or 5)"),
         };
 
@@ -248,13 +265,20 @@ impl NeuralBoundaryEvaluator {
     }
 
     /// Single forward pass over a given 5-card board.
-    fn burn_forward(&self, oop_1326: &[f32], ip_1326: &[f32], board: &[u8], pot: f32, eff_stack: f32, player: u8) -> Vec<f32> {
-        let input = encode_boundary_inference_input(oop_1326, ip_1326, board, pot, eff_stack, player);
+    fn burn_forward(
+        &self,
+        oop_1326: &[f32],
+        ip_1326: &[f32],
+        board: &[u8],
+        pot: f32,
+        eff_stack: f32,
+        player: u8,
+    ) -> Vec<f32> {
+        let input =
+            encode_boundary_inference_input(oop_1326, ip_1326, board, pot, eff_stack, player);
         let device = Default::default();
-        let tensor = Tensor::<NdArray, 2>::from_data(
-            TensorData::new(input, [1, INPUT_SIZE]),
-            &device,
-        );
+        let tensor =
+            Tensor::<NdArray, 2>::from_data(TensorData::new(input, [1, INPUT_SIZE]), &device);
         let model = self.model.lock().unwrap();
         let output = model.forward(tensor);
         drop(model);
@@ -265,7 +289,14 @@ impl NeuralBoundaryEvaluator {
     /// adjust ranges per river, run a single batched forward pass for all
     /// rivers, and average the 1326-combo CFVs (per-combo, counting only
     /// rivers that don't block the combo).
-    fn burn_river_enumerated(&self, oop_1326: &[f32], ip_1326: &[f32], pot: f32, eff_stack: f32, player: u8) -> Vec<f32> {
+    fn burn_river_enumerated(
+        &self,
+        oop_1326: &[f32],
+        ip_1326: &[f32],
+        pot: f32,
+        eff_stack: f32,
+        player: u8,
+    ) -> Vec<f32> {
         let (valid_rivers, flat_input) =
             build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, player);
         let n_rivers = valid_rivers.len();
@@ -298,8 +329,8 @@ pub fn load_neural_boundary_evaluator(
     let config_path = model_dir.join("config.yaml");
     let yaml = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("read {}: {e}", config_path.display()))?;
-    let cfg: crate::config::CfvnetConfig = serde_yaml::from_str(&yaml)
-        .map_err(|e| format!("parse {}: {e}", config_path.display()))?;
+    let cfg: crate::config::CfvnetConfig =
+        serde_yaml::from_str(&yaml).map_err(|e| format!("parse {}: {e}", config_path.display()))?;
 
     let device = Default::default();
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
@@ -339,7 +370,9 @@ pub struct NeuralBoundaryEvaluator {
 
 #[cfg(feature = "onnx")]
 impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
-    fn num_continuations(&self) -> usize { 1 }
+    fn num_continuations(&self) -> usize {
+        1
+    }
 
     fn compute_cfvs(
         &self,
@@ -370,7 +403,7 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
         let oop_cfvs = self.forward_for_player(0, pot, remaining_stack, oop_reach, ip_reach);
-        let ip_cfvs  = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
+        let ip_cfvs = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
         (oop_cfvs, ip_cfvs)
     }
 }
@@ -403,9 +436,24 @@ impl NeuralBoundaryEvaluator {
         let eff_stack_f32 = remaining_stack as f32;
 
         let normalized_1326 = match self.board.len() {
-            5 => self.onnx_forward(&oop_range_1326, &ip_range_1326, &self.board, pot_f32, eff_stack_f32, player as u8),
-            4 => self.onnx_river_enumerated(&oop_range_1326, &ip_range_1326, pot_f32, eff_stack_f32, player as u8),
-            n => panic!("NeuralBoundaryEvaluator (onnx): unsupported board length {n} (expected 4 or 5)"),
+            5 => self.onnx_forward(
+                &oop_range_1326,
+                &ip_range_1326,
+                &self.board,
+                pot_f32,
+                eff_stack_f32,
+                player as u8,
+            ),
+            4 => self.onnx_river_enumerated(
+                &oop_range_1326,
+                &ip_range_1326,
+                pot_f32,
+                eff_stack_f32,
+                player as u8,
+            ),
+            n => panic!(
+                "NeuralBoundaryEvaluator (onnx): unsupported board length {n} (expected 4 or 5)"
+            ),
         };
 
         // Unit conversion: target = cfv_halfpot * pot / (pot + eff_stack)
@@ -424,12 +472,21 @@ impl NeuralBoundaryEvaluator {
         cfvs
     }
 
-    fn onnx_forward(&self, oop_1326: &[f32], ip_1326: &[f32], board: &[u8], pot: f32, eff_stack: f32, player: u8) -> Vec<f32> {
-        let input_vec = encode_boundary_inference_input(oop_1326, ip_1326, board, pot, eff_stack, player);
-        let input_tensor = ort::value::Tensor::from_array(
-            ([1_i64, INPUT_SIZE as i64], input_vec),
-        ).expect("ort tensor creation");
-        let outputs = self.session
+    fn onnx_forward(
+        &self,
+        oop_1326: &[f32],
+        ip_1326: &[f32],
+        board: &[u8],
+        pot: f32,
+        eff_stack: f32,
+        player: u8,
+    ) -> Vec<f32> {
+        let input_vec =
+            encode_boundary_inference_input(oop_1326, ip_1326, board, pot, eff_stack, player);
+        let input_tensor = ort::value::Tensor::from_array(([1_i64, INPUT_SIZE as i64], input_vec))
+            .expect("ort tensor creation");
+        let outputs = self
+            .session
             .run(ort::inputs![input_tensor].expect("ort inputs"))
             .expect("ort session run");
         let output_view = outputs[0]
@@ -442,16 +499,21 @@ impl NeuralBoundaryEvaluator {
     /// adjust ranges per river, run a single batched session.run for all
     /// rivers, and average the 1326-combo CFVs (per-combo, counting only
     /// rivers that don't block the combo).
-    fn onnx_river_enumerated(&self, oop_1326: &[f32], ip_1326: &[f32], pot: f32, eff_stack: f32, player: u8) -> Vec<f32> {
+    fn onnx_river_enumerated(
+        &self,
+        oop_1326: &[f32],
+        ip_1326: &[f32],
+        pot: f32,
+        eff_stack: f32,
+        player: u8,
+    ) -> Vec<f32> {
         let (valid_rivers, flat_input) =
             build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, player);
         let n_rivers = valid_rivers.len();
 
-        let input_tensor = ort::value::Tensor::from_array((
-            [n_rivers as i64, INPUT_SIZE as i64],
-            flat_input,
-        ))
-        .expect("ort tensor creation");
+        let input_tensor =
+            ort::value::Tensor::from_array(([n_rivers as i64, INPUT_SIZE as i64], flat_input))
+                .expect("ort tensor creation");
         let outputs = self
             .session
             .run(ort::inputs![input_tensor].expect("ort inputs"))
@@ -474,7 +536,11 @@ pub fn load_neural_boundary_evaluator(
     private_cards: [Vec<(u8, u8)>; 2],
 ) -> Result<NeuralBoundaryEvaluator, String> {
     let session = load_shared_onnx_session(model_path)?;
-    Ok(NeuralBoundaryEvaluator { session, board, private_cards })
+    Ok(NeuralBoundaryEvaluator {
+        session,
+        board,
+        private_cards,
+    })
 }
 
 /// Load an ONNX session from a model file, returning it wrapped in `Arc`.
@@ -507,7 +573,11 @@ pub fn neural_boundary_evaluator_from_shared(
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
 ) -> NeuralBoundaryEvaluator {
-    NeuralBoundaryEvaluator { session, board, private_cards }
+    NeuralBoundaryEvaluator {
+        session,
+        board,
+        private_cards,
+    }
 }
 
 #[cfg(test)]
@@ -533,7 +603,10 @@ mod tests {
             );
             match result {
                 Err(err) => {
-                    assert!(err.contains("ort load"), "error should mention ort load, got: {err}");
+                    assert!(
+                        err.contains("ort load"),
+                        "error should mention ort load, got: {err}"
+                    );
                 }
                 Ok(_) => panic!("loading from non-existent path should fail"),
             }
@@ -567,13 +640,8 @@ mod tests {
             // Uses an ignored gate since it requires a real ONNX model file.
             fn _assert_from_shared_compiles(session: Arc<ort::session::Session>) {
                 let board = vec![0u8, 4, 8, 12];
-                let private_cards = [
-                    vec![(1u8, 2u8), (1, 3)],
-                    vec![(5u8, 6u8), (5, 7)],
-                ];
-                let eval = neural_boundary_evaluator_from_shared(
-                    session, board, private_cards,
-                );
+                let private_cards = [vec![(1u8, 2u8), (1, 3)], vec![(5u8, 6u8), (5, 7)]];
+                let eval = neural_boundary_evaluator_from_shared(session, board, private_cards);
                 // Verify it implements BoundaryEvaluator
                 fn _check<T: range_solver::game::BoundaryEvaluator>(_: &T) {}
                 _check(&eval);
@@ -586,15 +654,14 @@ mod tests {
             use range_solver::game::BoundaryEvaluator;
 
             let model_path = PathBuf::from(
-                "../../local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx"
+                "../../local_data/models/cfvnet_river_py_v2/checkpoint_epoch675.onnx",
             );
             if !model_path.exists() {
                 eprintln!("skipping: ONNX model not found at {}", model_path.display());
                 return;
             }
 
-            let session = load_shared_onnx_session(&model_path)
-                .expect("load shared session");
+            let session = load_shared_onnx_session(&model_path).expect("load shared session");
             assert_eq!(Arc::strong_count(&session), 1);
 
             // Create two evaluators sharing the same session (different boards)
@@ -603,31 +670,51 @@ mod tests {
 
             // Generate non-conflicting private cards for board_a
             let private_cards_a: [Vec<(u8, u8)>; 2] = [
-                (1..=20).step_by(2).map(|i| (i as u8, (i + 1) as u8))
-                    .filter(|&(c1, c2)| ![0, 4, 8, 12].contains(&c1) && ![0, 4, 8, 12].contains(&c2))
+                (1..=20)
+                    .step_by(2)
+                    .map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| {
+                        ![0, 4, 8, 12].contains(&c1) && ![0, 4, 8, 12].contains(&c2)
+                    })
                     .take(5)
                     .collect(),
-                (21..=40).step_by(2).map(|i| (i as u8, (i + 1) as u8))
-                    .filter(|&(c1, c2)| ![0, 4, 8, 12].contains(&c1) && ![0, 4, 8, 12].contains(&c2))
+                (21..=40)
+                    .step_by(2)
+                    .map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| {
+                        ![0, 4, 8, 12].contains(&c1) && ![0, 4, 8, 12].contains(&c2)
+                    })
                     .take(5)
                     .collect(),
             ];
             let private_cards_b: [Vec<(u8, u8)>; 2] = [
-                (1..=20).step_by(2).map(|i| (i as u8, (i + 1) as u8))
-                    .filter(|&(c1, c2)| ![0, 4, 8, 16].contains(&c1) && ![0, 4, 8, 16].contains(&c2))
+                (1..=20)
+                    .step_by(2)
+                    .map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| {
+                        ![0, 4, 8, 16].contains(&c1) && ![0, 4, 8, 16].contains(&c2)
+                    })
                     .take(5)
                     .collect(),
-                (21..=40).step_by(2).map(|i| (i as u8, (i + 1) as u8))
-                    .filter(|&(c1, c2)| ![0, 4, 8, 16].contains(&c1) && ![0, 4, 8, 16].contains(&c2))
+                (21..=40)
+                    .step_by(2)
+                    .map(|i| (i as u8, (i + 1) as u8))
+                    .filter(|&(c1, c2)| {
+                        ![0, 4, 8, 16].contains(&c1) && ![0, 4, 8, 16].contains(&c2)
+                    })
                     .take(5)
                     .collect(),
             ];
 
             let eval_a = neural_boundary_evaluator_from_shared(
-                Arc::clone(&session), board_a, private_cards_a.clone(),
+                Arc::clone(&session),
+                board_a,
+                private_cards_a.clone(),
             );
             let eval_b = neural_boundary_evaluator_from_shared(
-                Arc::clone(&session), board_b, private_cards_b.clone(),
+                Arc::clone(&session),
+                board_b,
+                private_cards_b.clone(),
             );
             assert_eq!(Arc::strong_count(&session), 3);
 
@@ -635,7 +722,11 @@ mod tests {
             let num_hands_p0 = private_cards_a[0].len();
             let opponent_reach = vec![1.0_f32; private_cards_a[1].len()];
             let cfvs = eval_a.compute_cfvs(0, 200, 100.0, &opponent_reach, num_hands_p0, 0);
-            assert_eq!(cfvs.len(), num_hands_p0, "CFV count must match player 0 hands");
+            assert_eq!(
+                cfvs.len(),
+                num_hands_p0,
+                "CFV count must match player 0 hands"
+            );
 
             // All CFVs should be finite
             for &v in &cfvs {
@@ -670,7 +761,12 @@ mod tests {
         let effective_stack = 150.0_f32;
         let player = 0u8;
         let input = encode_boundary_inference_input(
-            &oop_range, &ip_range, &board, pot, effective_stack, player,
+            &oop_range,
+            &ip_range,
+            &board,
+            pot,
+            effective_stack,
+            player,
         );
         assert_eq!(input.len(), INPUT_SIZE);
         assert!((input[POT_INDEX] - 0.4).abs() < 1e-6);
@@ -680,8 +776,8 @@ mod tests {
     #[cfg(not(feature = "onnx"))]
     #[test]
     fn neural_evaluator_returns_correct_cfv_count() {
-        use burn::backend::NdArray;
         use crate::model::boundary_net::BoundaryNet;
+        use burn::backend::NdArray;
         use range_solver::game::BoundaryEvaluator;
 
         let device = Default::default();
@@ -707,20 +803,33 @@ mod tests {
         // compute_cfvs panics by design (net was trained on both realistic
         // ranges; uniform-hero fallback produced OOD inputs).
         let oop_reach = vec![0.5_f32; private_cards_p0.len()];
-        let ip_reach  = vec![0.5_f32; private_cards_p1.len()];
+        let ip_reach = vec![0.5_f32; private_cards_p1.len()];
         let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach,
-            private_cards_p0.len(), private_cards_p1.len(), 0,
+            100,
+            150.0,
+            &oop_reach,
+            &ip_reach,
+            private_cards_p0.len(),
+            private_cards_p1.len(),
+            0,
         );
-        assert_eq!(oop_cfvs.len(), private_cards_p0.len(), "OOP CFV count should match p0 hand count");
-        assert_eq!(ip_cfvs.len(),  private_cards_p1.len(), "IP CFV count should match p1 hand count");
+        assert_eq!(
+            oop_cfvs.len(),
+            private_cards_p0.len(),
+            "OOP CFV count should match p0 hand count"
+        );
+        assert_eq!(
+            ip_cfvs.len(),
+            private_cards_p1.len(),
+            "IP CFV count should match p1 hand count"
+        );
     }
 
     #[cfg(not(feature = "onnx"))]
     #[test]
     fn burn_river_enumerated_produces_finite_averaged_cfvs() {
-        use burn::backend::NdArray;
         use crate::model::boundary_net::BoundaryNet;
+        use burn::backend::NdArray;
         use range_solver::game::BoundaryEvaluator;
 
         let device = Default::default();
@@ -739,10 +848,15 @@ mod tests {
         );
 
         let oop_reach = vec![0.5_f32; private_cards_p0.len()];
-        let ip_reach  = vec![0.5_f32; private_cards_p1.len()];
+        let ip_reach = vec![0.5_f32; private_cards_p1.len()];
         let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach,
-            private_cards_p0.len(), private_cards_p1.len(), 0,
+            100,
+            150.0,
+            &oop_reach,
+            &ip_reach,
+            private_cards_p0.len(),
+            private_cards_p1.len(),
+            0,
         );
         assert_eq!(oop_cfvs.len(), private_cards_p0.len());
         assert_eq!(ip_cfvs.len(), private_cards_p1.len());
@@ -754,8 +868,8 @@ mod tests {
     #[cfg(not(feature = "onnx"))]
     #[test]
     fn burn_river_enumerated_matches_sequential_baseline() {
-        use burn::backend::NdArray;
         use crate::model::boundary_net::BoundaryNet;
+        use burn::backend::NdArray;
 
         let device = Default::default();
         let model = BoundaryNet::<NdArray>::new(&device, 2, 64);
@@ -777,20 +891,26 @@ mod tests {
         let mut cfv_sum = vec![0.0_f32; NUM_COMBOS];
         let mut cfv_cnt = vec![0_u32; NUM_COMBOS];
         for river in 0u8..52 {
-            if board.contains(&river) { continue; }
+            if board.contains(&river) {
+                continue;
+            }
             let mut board_5 = board.clone();
             board_5.push(river);
             let (oop_r, ip_r) = blocker_adjust_ranges(&oop_1326, &ip_1326, river);
             let out = evaluator.burn_forward(&oop_r, &ip_r, &board_5, 100.0, 150.0, 0);
             for (combo_idx, &v) in out.iter().enumerate() {
                 let (c1, c2) = index_to_card_pair(combo_idx);
-                if c1 == river || c2 == river { continue; }
+                if c1 == river || c2 == river {
+                    continue;
+                }
                 cfv_sum[combo_idx] += v;
                 cfv_cnt[combo_idx] += 1;
             }
         }
         for i in 0..NUM_COMBOS {
-            if cfv_cnt[i] > 0 { cfv_sum[i] /= cfv_cnt[i] as f32; }
+            if cfv_cnt[i] > 0 {
+                cfv_sum[i] /= cfv_cnt[i] as f32;
+            }
         }
 
         // Compare: batched must match sequential exactly (same math, same model)
@@ -798,7 +918,8 @@ mod tests {
             assert!(
                 (result[i] - cfv_sum[i]).abs() < 1e-5,
                 "Mismatch at combo {i}: batched={} sequential={}",
-                result[i], cfv_sum[i]
+                result[i],
+                cfv_sum[i]
             );
         }
     }
@@ -806,8 +927,8 @@ mod tests {
     #[cfg(not(feature = "onnx"))]
     #[test]
     fn neural_evaluator_handles_zero_opponent_reach() {
-        use burn::backend::NdArray;
         use crate::model::boundary_net::BoundaryNet;
+        use burn::backend::NdArray;
         use range_solver::game::BoundaryEvaluator;
 
         let device = Default::default();
@@ -826,12 +947,17 @@ mod tests {
         // With compute_cfvs_both both reach vectors are passed through;
         // assert shape only (net may extrapolate on zero-range inputs).
         let zero_oop = vec![0.0_f32; private_cards_p0.len()];
-        let zero_ip  = vec![0.0_f32; private_cards_p1.len()];
+        let zero_ip = vec![0.0_f32; private_cards_p1.len()];
         let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
-            100, 150.0, &zero_oop, &zero_ip,
-            private_cards_p0.len(), private_cards_p1.len(), 0,
+            100,
+            150.0,
+            &zero_oop,
+            &zero_ip,
+            private_cards_p0.len(),
+            private_cards_p1.len(),
+            0,
         );
         assert_eq!(oop_cfvs.len(), private_cards_p0.len());
-        assert_eq!(ip_cfvs.len(),  private_cards_p1.len());
+        assert_eq!(ip_cfvs.len(), private_cards_p1.len());
     }
 }

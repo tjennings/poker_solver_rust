@@ -7,8 +7,8 @@ use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card;
 use range_solver::card::card_pair_to_index;
 
-use crate::config::CfvnetConfig;
 use super::game_tree::u8_to_rs_card;
+use crate::config::CfvnetConfig;
 use crate::eval::river_net_evaluator::RiverNetEvaluator;
 use crate::model::network::{CfvNet, INPUT_SIZE};
 
@@ -39,8 +39,8 @@ impl NeuralNetEvaluator {
         let (hidden_layers, hidden_size) = if river_config_path.exists() {
             let yaml = std::fs::read_to_string(&river_config_path)
                 .map_err(|e| format!("read river config: {e}"))?;
-            let river_cfg: CfvnetConfig = serde_yaml::from_str(&yaml)
-                .map_err(|e| format!("parse river config: {e}"))?;
+            let river_cfg: CfvnetConfig =
+                serde_yaml::from_str(&yaml).map_err(|e| format!("parse river config: {e}"))?;
             eprintln!(
                 "[domain] river model architecture: {}x{} (from {})",
                 river_cfg.training.hidden_layers,

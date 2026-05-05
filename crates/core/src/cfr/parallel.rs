@@ -15,7 +15,13 @@ pub trait ParallelCfr: Sync {
 
     /// Traverse one hand pair (both hero positions), accumulating
     /// regret deltas into `regret_delta` and strategy deltas into `strategy_delta`.
-    fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16);
+    fn traverse_pair(
+        &self,
+        regret_delta: &mut [f64],
+        strategy_delta: &mut [f64],
+        hero: u16,
+        opponent: u16,
+    );
 }
 
 /// Parallel fold+collect over hand pairs. Returns merged `(regret_delta, strategy_delta)`.
@@ -25,10 +31,7 @@ pub trait ParallelCfr: Sync {
 /// merged sequentially. This avoids the O(chunks) identity allocations
 /// that `reduce()` requires, cutting allocations to O(threads).
 /// Results are mathematically identical to sequential traversal.
-pub fn parallel_traverse<T: ParallelCfr>(
-    ctx: &T,
-    pairs: &[(u16, u16)],
-) -> (Vec<f64>, Vec<f64>) {
+pub fn parallel_traverse<T: ParallelCfr>(ctx: &T, pairs: &[(u16, u16)]) -> (Vec<f64>, Vec<f64>) {
     let buf_size = ctx.buffer_size();
     let partitions: Vec<(Vec<f64>, Vec<f64>)> = pairs
         .par_iter()
@@ -118,17 +121,15 @@ pub fn parallel_traverse_pooled<T: ParallelCfr>(
     let n = pool.len();
     let chunk_size = pairs.len().div_ceil(n);
 
-    pool.par_iter_mut()
-        .enumerate()
-        .for_each(|(i, (dr, ds))| {
-            dr.fill(0.0);
-            ds.fill(0.0);
-            let start = i * chunk_size;
-            let end = (start + chunk_size).min(pairs.len());
-            for &(h1, h2) in &pairs[start..end] {
-                ctx.traverse_pair(dr, ds, h1, h2);
-            }
-        });
+    pool.par_iter_mut().enumerate().for_each(|(i, (dr, ds))| {
+        dr.fill(0.0);
+        ds.fill(0.0);
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(pairs.len());
+        for &(h1, h2) in &pairs[start..end] {
+            ctx.traverse_pair(dr, ds, h1, h2);
+        }
+    });
 }
 
 /// Element-wise `dst[i] += src[i]`.
@@ -152,7 +153,13 @@ mod tests {
             2
         }
 
-        fn traverse_pair(&self, regret_delta: &mut [f64], strategy_delta: &mut [f64], hero: u16, opponent: u16) {
+        fn traverse_pair(
+            &self,
+            regret_delta: &mut [f64],
+            strategy_delta: &mut [f64],
+            hero: u16,
+            opponent: u16,
+        ) {
             regret_delta[0] += f64::from(hero) + f64::from(opponent);
             strategy_delta[0] += f64::from(hero) * f64::from(opponent);
         }
@@ -241,9 +248,8 @@ mod tests {
             MockCfr.traverse_pair(&mut exp_dr, &mut exp_ds, h1, h2);
         }
 
-        let mut pool: Vec<(Vec<f64>, Vec<f64>)> = (0..4)
-            .map(|_| (vec![0.0f64; 2], vec![0.0f64; 2]))
-            .collect();
+        let mut pool: Vec<(Vec<f64>, Vec<f64>)> =
+            (0..4).map(|_| (vec![0.0f64; 2], vec![0.0f64; 2])).collect();
         parallel_traverse_pooled(&MockCfr, &pairs, &mut pool);
 
         let mut dr = vec![0.0f64; 2];
@@ -253,15 +259,24 @@ mod tests {
             add_into(&mut ds, pds);
         }
 
-        assert!((dr[0] - exp_dr[0]).abs() < 1e-9, "dr mismatch: {} vs {}", dr[0], exp_dr[0]);
-        assert!((ds[0] - exp_ds[0]).abs() < 1e-9, "ds mismatch: {} vs {}", ds[0], exp_ds[0]);
+        assert!(
+            (dr[0] - exp_dr[0]).abs() < 1e-9,
+            "dr mismatch: {} vs {}",
+            dr[0],
+            exp_dr[0]
+        );
+        assert!(
+            (ds[0] - exp_ds[0]).abs() < 1e-9,
+            "ds mismatch: {} vs {}",
+            ds[0],
+            exp_ds[0]
+        );
     }
 
     #[timed_test]
     fn parallel_traverse_pooled_empty_pairs() {
-        let mut pool: Vec<(Vec<f64>, Vec<f64>)> = (0..2)
-            .map(|_| (vec![1.0f64; 2], vec![1.0f64; 2]))
-            .collect();
+        let mut pool: Vec<(Vec<f64>, Vec<f64>)> =
+            (0..2).map(|_| (vec![1.0f64; 2], vec![1.0f64; 2])).collect();
         parallel_traverse_pooled(&MockCfr, &[], &mut pool);
         // Pool should be zeroed even with no pairs
         for (dr, ds) in &pool {

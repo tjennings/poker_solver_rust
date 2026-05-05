@@ -1,6 +1,6 @@
 //! Terminal evaluation: launch fold_eval and showdown_eval CUDA kernels.
 
-use crate::gpu::{grid_size, CfrKernels, GpuSolverState, BLOCK_SIZE};
+use crate::gpu::{BLOCK_SIZE, CfrKernels, GpuSolverState, grid_size};
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 

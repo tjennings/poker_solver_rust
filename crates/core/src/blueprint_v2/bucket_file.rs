@@ -195,7 +195,8 @@ impl BucketFile {
             )
         })?;
         let bucket_count = u16::from_le_bytes([header_buf[6], header_buf[7]]);
-        let board_count = u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]);
+        let board_count =
+            u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]);
         let combos_per_board = u16::from_le_bytes([header_buf[12], header_buf[13]]);
 
         // Read board table for v2+.
@@ -228,7 +229,11 @@ impl BucketFile {
             version,
         };
 
-        Ok(Self { header, boards, buckets })
+        Ok(Self {
+            header,
+            boards,
+            buckets,
+        })
     }
 
     /// Load a bucket file from disk.
@@ -261,14 +266,13 @@ impl BucketFile {
         let idx = board_idx as usize * self.header.combos_per_board as usize + combo_idx as usize;
         self.buckets[idx]
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use rs_poker::core::{Card, Suit, Value};
+    use std::io::Cursor;
 
     /// Helper: create a bucket file with deterministic data.
     fn make_test_file(boards: u32, combos: u16, buckets_k: u16) -> BucketFile {
@@ -279,9 +283,8 @@ mod tests {
             buckets.push((i % buckets_k as usize) as u16);
         }
         // Generate dummy packed boards for each board index.
-        let board_entries: Vec<PackedBoard> = (0..boards)
-            .map(|i| PackedBoard(u64::from(i)))
-            .collect();
+        let board_entries: Vec<PackedBoard> =
+            (0..boards).map(|i| PackedBoard(u64::from(i))).collect();
         BucketFile {
             header: BucketFileHeader {
                 street: Street::Flop,
@@ -339,7 +342,10 @@ mod tests {
         assert_eq!(loaded.header.street, original.header.street);
         assert_eq!(loaded.header.bucket_count, original.header.bucket_count);
         assert_eq!(loaded.header.board_count, original.header.board_count);
-        assert_eq!(loaded.header.combos_per_board, original.header.combos_per_board);
+        assert_eq!(
+            loaded.header.combos_per_board,
+            original.header.combos_per_board
+        );
         assert_eq!(loaded.buckets, original.buckets);
     }
 

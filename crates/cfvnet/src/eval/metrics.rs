@@ -25,11 +25,7 @@ pub fn mean_absolute_error(pred: &[f32], actual: &[f32], mask: &[bool]) -> f64 {
         }
     }
 
-    if count == 0 {
-        0.0
-    } else {
-        sum / count as f64
-    }
+    if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
 /// Maximum absolute error over valid (unmasked) entries.

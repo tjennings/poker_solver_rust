@@ -8,9 +8,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::full_depth_solver::rs_poker_card_to_id;
+use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::hands::all_hands;
 use range_solver::card::card_pair_to_index;
@@ -110,7 +110,11 @@ pub fn compute_preflop_paths(
     );
 
     // Sort by frequency descending.
-    paths.sort_by(|a, b| b.frequency.partial_cmp(&a.frequency).unwrap_or(std::cmp::Ordering::Equal));
+    paths.sort_by(|a, b| {
+        b.frequency
+            .partial_cmp(&a.frequency)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     PrecomputedRanges { paths }
 }
@@ -208,10 +212,8 @@ fn walk_preflop(
                     let p = probs.get(action_idx).copied().unwrap_or(0.0) as f64;
 
                     for (c0, c1) in hand.combos() {
-                        let ci = card_pair_to_index(
-                            rs_poker_card_to_id(c0),
-                            rs_poker_card_to_id(c1),
-                        );
+                        let ci =
+                            card_pair_to_index(rs_poker_card_to_id(c0), rs_poker_card_to_id(c1));
                         weights[ci] *= p;
                         action_freq_sum += p;
                         combo_count += 1;
@@ -305,6 +307,9 @@ mod tests {
                 common_count += 1;
             }
         }
-        assert!(common_count > 900, "common should be sampled ~99% of the time, got {common_count}");
+        assert!(
+            common_count > 900,
+            "common should be sampled ~99% of the time, got {common_count}"
+        );
     }
 }

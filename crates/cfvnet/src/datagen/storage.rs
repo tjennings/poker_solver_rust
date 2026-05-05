@@ -17,7 +17,7 @@ pub const fn record_size(board_size: usize) -> usize {
     + NUM_COMBOS * 4  // oop_range
     + NUM_COMBOS * 4  // ip_range
     + NUM_COMBOS * 4  // cfvs
-    + NUM_COMBOS      // valid_mask
+    + NUM_COMBOS // valid_mask
 }
 
 /// One training sample: a single player's perspective of a solved subgame.

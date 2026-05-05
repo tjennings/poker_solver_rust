@@ -41,20 +41,14 @@ impl MpGameConfig {
 
     fn validate_players(&self) -> Result<(), String> {
         if self.num_players < 2 || self.num_players > 8 {
-            return Err(format!(
-                "num_players must be 2-8, got {}",
-                self.num_players
-            ));
+            return Err(format!("num_players must be 2-8, got {}", self.num_players));
         }
         Ok(())
     }
 
     fn validate_stack_depth(&self) -> Result<(), String> {
         if self.stack_depth <= 0.0 {
-            return Err(format!(
-                "stack_depth must be > 0, got {}",
-                self.stack_depth
-            ));
+            return Err(format!("stack_depth must be > 0, got {}", self.stack_depth));
         }
         Ok(())
     }
@@ -68,10 +62,7 @@ impl MpGameConfig {
                 ));
             }
             if blind.amount <= 0.0 {
-                return Err(format!(
-                    "blind amount must be > 0, got {}",
-                    blind.amount
-                ));
+                return Err(format!("blind amount must be > 0, got {}", blind.amount));
             }
         }
         Ok(())
@@ -379,8 +370,7 @@ snapshots:
   output_dir: "/tmp/hu"
 "#;
 
-        let cfg: BlueprintMpConfig =
-            serde_yaml::from_str(yaml).expect("failed to parse HU config");
+        let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("failed to parse HU config");
 
         assert_eq!(cfg.game.name, "Heads Up");
         assert_eq!(cfg.game.num_players, 2);
@@ -462,8 +452,16 @@ snapshots:
             num_players: 9,
             stack_depth: 100.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -477,9 +475,11 @@ snapshots:
             name: "Solo".into(),
             num_players: 1,
             stack_depth: 100.0,
-            blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-            ],
+            blinds: vec![ForcedBet {
+                seat: 0,
+                kind: ForcedBetKind::SmallBlind,
+                amount: 1.0,
+            }],
             rake_rate: 0.0,
             rake_cap: 0.0,
         };
@@ -493,9 +493,21 @@ snapshots:
             num_players: 6,
             stack_depth: 200.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BbAnte, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BbAnte,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -521,8 +533,16 @@ snapshots:
             num_players: 2,
             stack_depth: 50.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -537,8 +557,16 @@ snapshots:
             num_players: 8,
             stack_depth: 200.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -553,8 +581,16 @@ snapshots:
             num_players: 2,
             stack_depth: 0.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -569,8 +605,16 @@ snapshots:
             num_players: 2,
             stack_depth: 100.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 5, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -585,8 +629,16 @@ snapshots:
             num_players: 2,
             stack_depth: 100.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 0.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 0.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -638,11 +690,8 @@ output_dir: "/tmp/out"
             ("bb_ante", ForcedBetKind::BbAnte),
             ("straddle", ForcedBetKind::Straddle),
         ] {
-            let yaml = format!(
-                "seat: 0\ntype: {yaml_kind}\namount: 1.0"
-            );
-            let bet: ForcedBet =
-                serde_yaml::from_str(&yaml).expect("failed to parse forced bet");
+            let yaml = format!("seat: 0\ntype: {yaml_kind}\namount: 1.0");
+            let bet: ForcedBet = serde_yaml::from_str(&yaml).expect("failed to parse forced bet");
             assert_eq!(bet.kind, expected, "mismatch for {yaml_kind}");
         }
     }

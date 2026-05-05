@@ -10,8 +10,8 @@ use rand_chacha::ChaCha8Rng;
 use crate::blueprint_sampler::deal_hand;
 use crate::data_buffer::BufferRecord;
 use crate::generate::pbs_to_buffer_record;
-use crate::pbs::{Pbs, NUM_COMBOS};
-use crate::solver::{solve_river_pbs, SolveConfig};
+use crate::pbs::{NUM_COMBOS, Pbs};
+use crate::solver::{SolveConfig, solve_river_pbs};
 
 /// Compute masked mean squared error between predicted and actual CFVs.
 ///
@@ -194,10 +194,7 @@ pub fn format_report(report: &ValidationReport) -> String {
         "Validation Report ({} records)\n",
         report.total_records
     ));
-    out.push_str(&format!(
-        "  Overall MSE: {:.6}\n",
-        report.overall_mse
-    ));
+    out.push_str(&format!("  Overall MSE: {:.6}\n", report.overall_mse));
 
     if !report.per_street.is_empty() {
         out.push_str("  Per-street:\n");
@@ -224,10 +221,7 @@ mod tests {
 
         let mse = compute_mse(&predicted, &actual, &mask);
         // (0.1^2 + 0.2^2 + 0.2^2) / 3 = (0.01 + 0.04 + 0.04) / 3 = 0.03
-        assert!(
-            (mse - 0.03).abs() < 1e-5,
-            "expected ~0.03, got {mse}"
-        );
+        assert!((mse - 0.03).abs() < 1e-5, "expected ~0.03, got {mse}");
     }
 
     #[test]
@@ -238,10 +232,7 @@ mod tests {
 
         let mse = compute_mse(&predicted, &actual, &mask);
         // Only first 3 count: (0.01 + 0.04 + 0.04) / 3 = 0.03
-        assert!(
-            (mse - 0.03).abs() < 1e-5,
-            "expected ~0.03, got {mse}"
-        );
+        assert!((mse - 0.03).abs() < 1e-5, "expected ~0.03, got {mse}");
     }
 
     #[test]
@@ -292,10 +283,7 @@ mod tests {
         actual2[0] = 3.5;
         mask2[0] = 1;
 
-        let predictions = vec![
-            (pred1, actual1, mask1, 5_u8),
-            (pred2, actual2, mask2, 5_u8),
-        ];
+        let predictions = vec![(pred1, actual1, mask1, 5_u8), (pred2, actual2, mask2, 5_u8)];
 
         let report = validate_predictions(&predictions);
 
@@ -348,8 +336,16 @@ mod tests {
         assert_eq!(report.per_street.len(), 2);
 
         // Find river and turn entries
-        let river_entry = report.per_street.iter().find(|e| e.0 == Street::River).unwrap();
-        let turn_entry = report.per_street.iter().find(|e| e.0 == Street::Turn).unwrap();
+        let river_entry = report
+            .per_street
+            .iter()
+            .find(|e| e.0 == Street::River)
+            .unwrap();
+        let turn_entry = report
+            .per_street
+            .iter()
+            .find(|e| e.0 == Street::Turn)
+            .unwrap();
 
         // River: MSE = 0.0 (exact match)
         assert_eq!(river_entry.1, 0.0);
@@ -364,10 +360,7 @@ mod tests {
     fn test_format_report() {
         let report = ValidationReport {
             overall_mse: 0.0042,
-            per_street: vec![
-                (Street::River, 0.003, 100),
-                (Street::Turn, 0.005, 50),
-            ],
+            per_street: vec![(Street::River, 0.003, 100), (Street::Turn, 0.005, 50)],
             total_records: 150,
         };
 
@@ -381,14 +374,8 @@ mod tests {
             formatted.contains("0.004200"),
             "should contain overall MSE: got:\n{formatted}"
         );
-        assert!(
-            formatted.contains("River"),
-            "should contain River street"
-        );
-        assert!(
-            formatted.contains("Turn"),
-            "should contain Turn street"
-        );
+        assert!(formatted.contains("River"), "should contain River street");
+        assert!(formatted.contains("Turn"), "should contain Turn street");
         assert!(
             formatted.contains("Per-street"),
             "should contain per-street header"
@@ -424,10 +411,7 @@ mod tests {
 
             // Should have some non-zero CFVs
             let has_nonzero = rec.cfvs.iter().any(|&v| v != 0.0);
-            assert!(
-                has_nonzero,
-                "validation record should have non-zero CFVs"
-            );
+            assert!(has_nonzero, "validation record should have non-zero CFVs");
 
             // Game value should be finite
             assert!(
@@ -438,10 +422,7 @@ mod tests {
 
             // Valid mask should have some valid combos
             let valid_count: usize = rec.valid_mask.iter().map(|&m| m as usize).sum();
-            assert!(
-                valid_count > 0,
-                "should have some valid combos in mask"
-            );
+            assert!(valid_count > 0, "should have some valid combos in mask");
         }
     }
 }

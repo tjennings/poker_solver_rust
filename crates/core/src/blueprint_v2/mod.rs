@@ -1,22 +1,22 @@
 pub mod bucket_file;
-pub mod continuation;
-pub mod centroid_file;
-pub mod per_flop_bucket_file;
 pub mod bundle;
 pub mod cbv;
 pub mod cbv_compute;
+pub mod centroid_file;
 pub mod cluster_diagnostics;
 pub mod cluster_pipeline;
 pub mod clustering;
 pub mod config;
+pub mod continuation;
 pub mod equity_cache;
 pub mod exploitable_spots;
 pub mod full_depth_solver;
 pub mod game_tree;
 pub mod mccfr;
+pub mod per_flop_bucket_file;
 
-pub mod storage;
 pub mod leaf_evaluator;
+pub mod storage;
 pub mod subgame;
 pub mod subgame_cfr;
 pub mod trainer;
@@ -24,7 +24,9 @@ pub mod trainer;
 // Re-export subgame types at module level for convenience.
 pub use leaf_evaluator::LeafEvaluator;
 pub use subgame::SubgameConfig;
-pub use subgame_cfr::{SubgameHands, SubgameStrategy, compute_combo_equities, build_boundary_mapping};
+pub use subgame_cfr::{
+    SubgameHands, SubgameStrategy, build_boundary_mapping, compute_combo_equities,
+};
 
 use serde::{Deserialize, Serialize};
 

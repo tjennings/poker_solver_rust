@@ -12,9 +12,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::agent::AgentConfig;
-use poker_solver_core::simulation::{
-    RuleBasedAgentGenerator, SimResult, run_simulation,
-};
+use poker_solver_core::simulation::{run_simulation, RuleBasedAgentGenerator, SimResult};
 
 use crate::exploration::list_blueprints_core;
 
@@ -344,7 +342,10 @@ fn build_agent_generator(path: &str) -> Result<(Box<dyn AgentGenerator>, Vec<f32
     if path.ends_with(".toml") {
         let config = AgentConfig::load(&path_buf)
             .map_err(|e| format!("Failed to load agent config: {e}"))?;
-        Ok((Box::new(RuleBasedAgentGenerator::new(Arc::new(config))), vec![]))
+        Ok((
+            Box::new(RuleBasedAgentGenerator::new(Arc::new(config))),
+            vec![],
+        ))
     } else {
         Err(format!(
             "Unsupported strategy source: {path}. Only .toml agent configs and built-in agents are supported."
@@ -478,4 +479,3 @@ mod tests {
         assert!(json.contains("\"mbbh\":50"));
     }
 }
-

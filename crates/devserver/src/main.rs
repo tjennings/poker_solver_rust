@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{State as AxumState, WebSocketUpgrade, ws::Message},
+    extract::{ws::Message, State as AxumState, WebSocketUpgrade},
     http::{HeaderValue, Method},
     response::IntoResponse,
     routing::{get, post},
@@ -133,7 +133,6 @@ struct PostflopCacheParams {
     prior_actions: Vec<Vec<usize>>,
 }
 
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GamePlayActionParams {
@@ -221,7 +220,8 @@ async fn handle_load_blueprint_v2(
     Extension(postflop): Extension<Arc<PostflopState>>,
     Json(params): Json<LoadBlueprintParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let info = poker_solver_tauri::load_blueprint_v2_core(&state, params.path, params.snapshot).await;
+    let info =
+        poker_solver_tauri::load_blueprint_v2_core(&state, params.path, params.snapshot).await;
     if info.is_ok() {
         poker_solver_tauri::populate_cbv_context(&state, &postflop);
     }
@@ -251,13 +251,25 @@ async fn handle_blueprint_propagate_ranges(
     Extension(postflop): Extension<Arc<PostflopState>>,
     Json(params): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let board: Vec<String> = serde_json::from_value(params["board"].clone())
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("Invalid board: {e}")))?;
+    let board: Vec<String> = serde_json::from_value(params["board"].clone()).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Invalid board: {e}"),
+        )
+    })?;
     let action_history: Vec<String> = serde_json::from_value(params["action_history"].clone())
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("Invalid action_history: {e}")))?;
-    result_to_response(
-        poker_solver_tauri::blueprint_propagate_ranges(&state, &postflop, &board, &action_history)
-    )
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("Invalid action_history: {e}"),
+            )
+        })?;
+    result_to_response(poker_solver_tauri::blueprint_propagate_ranges(
+        &state,
+        &postflop,
+        &board,
+        &action_history,
+    ))
 }
 
 async fn handle_get_available_actions(
@@ -280,7 +292,10 @@ async fn handle_canonicalize_board(
     AxumState(state): AxumState<AppState>,
     Json(params): Json<CardsParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::canonicalize_board_core(&state, params.cards))
+    result_to_response(poker_solver_tauri::canonicalize_board_core(
+        &state,
+        params.cards,
+    ))
 }
 
 async fn handle_start_bucket_computation(
@@ -330,9 +345,7 @@ async fn handle_get_preflop_ranges(
 // Handlers — sync core functions (no params)
 // ---------------------------------------------------------------------------
 
-async fn handle_is_bundle_loaded(
-    AxumState(state): AxumState<AppState>,
-) -> Json<serde_json::Value> {
+async fn handle_is_bundle_loaded(AxumState(state): AxumState<AppState>) -> Json<serde_json::Value> {
     to_json_value(poker_solver_tauri::is_bundle_loaded_core(&state))
 }
 
@@ -346,15 +359,17 @@ async fn handle_is_board_cached(
     AxumState(state): AxumState<AppState>,
     Json(params): Json<BoardParams>,
 ) -> Json<serde_json::Value> {
-    to_json_value(poker_solver_tauri::is_board_cached_core(&state, params.board))
+    to_json_value(poker_solver_tauri::is_board_cached_core(
+        &state,
+        params.board,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Handler — no state
 // ---------------------------------------------------------------------------
 
-async fn handle_list_agents(
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+async fn handle_list_agents() -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     result_to_response(poker_solver_tauri::list_agents())
 }
 
@@ -610,14 +625,21 @@ async fn handle_game_new(
     Extension(postflop): Extension<Arc<PostflopState>>,
     Extension(session_state): Extension<Arc<GameSessionState>>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_new_core(&state, &postflop, &session_state))
+    result_to_response(poker_solver_tauri::game_new_core(
+        &state,
+        &postflop,
+        &session_state,
+    ))
 }
 
 async fn handle_game_get_state(
     Extension(session_state): Extension<Arc<GameSessionState>>,
     Json(params): Json<GameGetStateParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_get_state_core(&session_state, params.source))
+    result_to_response(poker_solver_tauri::game_get_state_core(
+        &session_state,
+        params.source,
+    ))
 }
 
 async fn handle_game_play_action(
@@ -645,7 +667,10 @@ async fn handle_game_back(
     Extension(session_state): Extension<Arc<GameSessionState>>,
     Json(params): Json<GameBackParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_back_core(&session_state, params.source))
+    result_to_response(poker_solver_tauri::game_back_core(
+        &session_state,
+        params.source,
+    ))
 }
 
 async fn handle_game_solve(
@@ -671,7 +696,10 @@ async fn handle_game_cancel_solve(
     Extension(session_state): Extension<Arc<GameSessionState>>,
     Json(params): Json<GameCancelSolveParams>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    result_to_response(poker_solver_tauri::game_cancel_solve_core(&session_state, params.mode))
+    result_to_response(poker_solver_tauri::game_cancel_solve_core(
+        &session_state,
+        params.mode,
+    ))
 }
 
 async fn handle_game_encode_spot(
@@ -712,7 +740,10 @@ async fn main() {
         .route("/api/load_bundle", post(handle_load_bundle))
         .route("/api/load_blueprint_v2", post(handle_load_blueprint_v2))
         .route("/api/get_strategy_matrix", post(handle_get_strategy_matrix))
-        .route("/api/blueprint_propagate_ranges_cmd", post(handle_blueprint_propagate_ranges))
+        .route(
+            "/api/blueprint_propagate_ranges_cmd",
+            post(handle_blueprint_propagate_ranges),
+        )
         .route(
             "/api/get_available_actions",
             post(handle_get_available_actions),
@@ -734,10 +765,7 @@ async fn main() {
         .route("/api/list_snapshots", post(handle_list_snapshots))
         .route("/api/get_combo_classes", post(handle_get_combo_classes))
         .route("/api/get_hand_equity", post(handle_get_hand_equity))
-        .route(
-            "/api/get_preflop_ranges",
-            post(handle_get_preflop_ranges),
-        )
+        .route("/api/get_preflop_ranges", post(handle_get_preflop_ranges))
         // Simulation endpoints
         .route(
             "/api/list_strategy_sources",
@@ -751,10 +779,7 @@ async fn main() {
         )
         .route("/ws/events", get(handle_ws_events))
         // Postflop explorer endpoints
-        .route(
-            "/api/postflop_set_config",
-            post(handle_postflop_set_config),
-        )
+        .route("/api/postflop_set_config", post(handle_postflop_set_config))
         .route(
             "/api/postflop_solve_street",
             post(handle_postflop_solve_street),
@@ -818,9 +843,7 @@ async fn main() {
 
     println!("devserver listening on http://0.0.0.0:3001");
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    axum::serve(listener, app).await.expect("server error");
 }
 
 #[cfg(test)]

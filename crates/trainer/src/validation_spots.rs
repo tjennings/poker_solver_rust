@@ -127,21 +127,43 @@ spots:
         // Integration test: ensure the shipped validation_spots.yaml parses correctly
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let yaml_path = manifest_dir
-            .parent().unwrap()  // crates/
-            .parent().unwrap()  // repo root
+            .parent()
+            .unwrap() // crates/
+            .parent()
+            .unwrap() // repo root
             .join("sample_configurations/validation_spots.yaml");
-        let file = ValidationSpotsFile::load(&yaml_path)
-            .expect("validation_spots.yaml should parse");
-        assert!(file.spots.len() >= 15, "expected at least 15 spots, got {}", file.spots.len());
+        let file =
+            ValidationSpotsFile::load(&yaml_path).expect("validation_spots.yaml should parse");
+        assert!(
+            file.spots.len() >= 15,
+            "expected at least 15 spots, got {}",
+            file.spots.len()
+        );
         // Verify all spots have required fields with non-empty values
         for spot in &file.spots {
             assert!(!spot.name.is_empty(), "spot name must not be empty");
-            assert!(spot.board.len() >= 3 && spot.board.len() <= 5,
-                "spot '{}' board must have 3-5 cards, got {}", spot.name, spot.board.len());
-            assert!(!spot.oop_range.is_empty(), "spot '{}' oop_range must not be empty", spot.name);
-            assert!(!spot.ip_range.is_empty(), "spot '{}' ip_range must not be empty", spot.name);
+            assert!(
+                spot.board.len() >= 3 && spot.board.len() <= 5,
+                "spot '{}' board must have 3-5 cards, got {}",
+                spot.name,
+                spot.board.len()
+            );
+            assert!(
+                !spot.oop_range.is_empty(),
+                "spot '{}' oop_range must not be empty",
+                spot.name
+            );
+            assert!(
+                !spot.ip_range.is_empty(),
+                "spot '{}' ip_range must not be empty",
+                spot.name
+            );
             assert!(spot.pot > 0.0, "spot '{}' pot must be positive", spot.name);
-            assert!(spot.effective_stack > 0.0, "spot '{}' stack must be positive", spot.name);
+            assert!(
+                spot.effective_stack > 0.0,
+                "spot '{}' stack must be positive",
+                spot.name
+            );
         }
     }
 

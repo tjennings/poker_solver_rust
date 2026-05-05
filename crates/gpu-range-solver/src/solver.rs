@@ -1,13 +1,15 @@
 //! DCFR iteration loop using cudarc CUDA kernel launches.
-#![allow(clippy::too_many_arguments, clippy::needless_range_loop, clippy::type_complexity)]
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::type_complexity
+)]
 
-use crate::extract::{
-    decompose_at_chance, NodeType, TerminalData, TreeTopology,
-};
-use crate::gpu::{launch_cfg, CfrKernels, GpuMegaState, GpuSolverState, MegaKernel, BLOCK_SIZE};
+use crate::extract::{NodeType, TerminalData, TreeTopology, decompose_at_chance};
+use crate::gpu::{BLOCK_SIZE, CfrKernels, GpuMegaState, GpuSolverState, MegaKernel, launch_cfg};
 use crate::terminal::{
-    launch_fold_eval, launch_showdown_eval, upload_fold_data, upload_showdown_data, FoldGpuData,
-    ShowdownGpuData,
+    FoldGpuData, ShowdownGpuData, launch_fold_eval, launch_showdown_eval, upload_fold_data,
+    upload_showdown_data,
 };
 use cudarc::driver::{CudaContext, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
@@ -305,7 +307,14 @@ fn compute_exploitability_gpu(
         // Best-response backward pass
         for depth in (0..=state.max_depth).rev() {
             evaluate_terminals_at_depth(
-                stream, kernels, state, topo, term, &term_gpu[player], depth, player,
+                stream,
+                kernels,
+                state,
+                topo,
+                term,
+                &term_gpu[player],
+                depth,
+                player,
             )?;
 
             let count = state.level_edge_count[depth];
@@ -428,8 +437,7 @@ fn extract_root_strategy(
         }
         if total > 1e-30 {
             for a in 0..n_actions {
-                result[a * num_hands + h] =
-                    strategy_sum_host[(start + a) * num_hands + h] / total;
+                result[a * num_hands + h] = strategy_sum_host[(start + a) * num_hands + h] / total;
             }
         } else {
             let uniform = 1.0 / n_actions as f32;
@@ -454,8 +462,7 @@ pub fn gpu_solve_cudarc(
     let stream = ctx.default_stream();
     let kernels = CfrKernels::compile(&ctx)?;
 
-    let mut state =
-        GpuSolverState::new(&ctx, &stream, topo.num_nodes, topo.num_edges, num_hands)?;
+    let mut state = GpuSolverState::new(&ctx, &stream, topo.num_nodes, topo.num_edges, num_hands)?;
     prepare_topology(topo, &stream, &mut state)?;
 
     let term_gpu = upload_terminal_data(&stream, topo, term)?;
@@ -566,7 +573,14 @@ pub fn gpu_solve_cudarc(
             // Backward pass: level by level (reverse)
             for depth in (0..=state.max_depth).rev() {
                 evaluate_terminals_at_depth(
-                    &stream, &kernels, &mut state, topo, term, &term_gpu[player], depth, player,
+                    &stream,
+                    &kernels,
+                    &mut state,
+                    topo,
+                    term,
+                    &term_gpu[player],
+                    depth,
+                    player,
                 )?;
 
                 let count = state.level_edge_count[depth];
@@ -691,7 +705,14 @@ pub fn build_sorted_topology(
         .map(|&e| topo.node_num_actions[topo.edge_parent[e]] as f32)
         .collect();
 
-    (parent_i32, child_i32, player_i32, ape, level_starts_i32, level_counts_i32)
+    (
+        parent_i32,
+        child_i32,
+        player_i32,
+        ape,
+        level_starts_i32,
+        level_counts_i32,
+    )
 }
 
 /// Build flat terminal data arrays for the mega-kernel.
@@ -722,7 +743,11 @@ pub fn build_mega_terminal_data(
 ) -> MegaTerminalData {
     // Fold data
     let fold_node_ids: Vec<i32> = topo.fold_nodes.iter().map(|&n| n as i32).collect();
-    let fold_depths: Vec<i32> = topo.fold_nodes.iter().map(|&n| topo.node_depth[n] as i32).collect();
+    let fold_depths: Vec<i32> = topo
+        .fold_nodes
+        .iter()
+        .map(|&n| topo.node_depth[n] as i32)
+        .collect();
 
     let mut fold_payoffs_p0 = Vec::with_capacity(term.fold_payoffs.len());
     let mut fold_payoffs_p1 = Vec::with_capacity(term.fold_payoffs.len());
@@ -745,7 +770,11 @@ pub fn build_mega_terminal_data(
 
     // Showdown data
     let showdown_node_ids: Vec<i32> = topo.showdown_nodes.iter().map(|&n| n as i32).collect();
-    let showdown_depths: Vec<i32> = topo.showdown_nodes.iter().map(|&n| topo.node_depth[n] as i32).collect();
+    let showdown_depths: Vec<i32> = topo
+        .showdown_nodes
+        .iter()
+        .map(|&n| topo.node_depth[n] as i32)
+        .collect();
 
     let mut showdown_outcomes_p0 = Vec::new();
     let mut showdown_outcomes_p1 = Vec::new();
@@ -798,7 +827,7 @@ pub fn build_mega_terminal_data(
         // [num_p0, num_p1, num_opp0 (=num_ip), num_opp1 (=num_oop)]
         showdown_num_player.push(num_oop as i32);
         showdown_num_player.push(num_ip as i32);
-        showdown_num_player.push(num_ip as i32);  // opp for p0
+        showdown_num_player.push(num_ip as i32); // opp for p0
         showdown_num_player.push(num_oop as i32); // opp for p1
     }
 
@@ -920,7 +949,13 @@ pub fn gpu_solve_mega(
 
     let batch_size = 1usize; // River: B=1
 
-    let mut state = GpuMegaState::new(&stream, batch_size, topo.num_nodes, topo.num_edges, num_hands)?;
+    let mut state = GpuMegaState::new(
+        &stream,
+        batch_size,
+        topo.num_nodes,
+        topo.num_edges,
+        num_hands,
+    )?;
 
     // Build and upload sorted topology
     let (parent_i32, child_i32, player_i32, ape, level_starts_i32, level_counts_i32) =
@@ -1001,8 +1036,7 @@ fn extract_root_strategy_mega(
         }
         if total > 1e-30 {
             for a in 0..n_actions {
-                result[a * num_hands + h] =
-                    strategy_sum_host[(start + a) * num_hands + h] / total;
+                result[a * num_hands + h] = strategy_sum_host[(start + a) * num_hands + h] / total;
             }
         } else {
             let uniform = 1.0 / n_actions as f32;
@@ -1360,23 +1394,47 @@ pub fn gpu_solve_turn_decomposed(
 
     // === Pass 1: Solve all river subtrees with B = num_runouts ===
     let mut river_state = GpuMegaState::new(
-        &stream, num_runouts, river_topo.num_nodes, river_topo.num_edges, num_hands,
+        &stream,
+        num_runouts,
+        river_topo.num_nodes,
+        river_topo.num_edges,
+        num_hands,
     )?;
 
     let (rp, rc, rpl, rape, rls, rlc) = build_sorted_topology(river_topo);
     river_state.upload_topology(
-        &stream, &rp, &rc, &rpl, &rape, &rls, &rlc, river_topo.max_depth,
+        &stream,
+        &rp,
+        &rc,
+        &rpl,
+        &rape,
+        &rls,
+        &rlc,
+        river_topo.max_depth,
     )?;
 
     let river_mtd = build_batched_river_terminal_data(
-        game, river_topo, &decomp.river_cards, initial_weights, num_hands,
+        game,
+        river_topo,
+        &decomp.river_cards,
+        initial_weights,
+        num_hands,
     );
     upload_mega_terminal(&stream, &mut river_state, &river_mtd)?;
 
     launch_mega_solve(
-        &stream, &mega, &ctx, &mut river_state,
-        num_runouts, river_topo.num_nodes, river_topo.num_edges, num_hands,
-        river_topo.max_depth, config.max_iterations, num_hands_p0, num_hands_p1,
+        &stream,
+        &mega,
+        &ctx,
+        &mut river_state,
+        num_runouts,
+        river_topo.num_nodes,
+        river_topo.num_edges,
+        num_hands,
+        river_topo.max_depth,
+        config.max_iterations,
+        num_hands_p0,
+        num_hands_p1,
     )?;
 
     // River solve complete. Now we need the average strategy from the river solve
@@ -1399,15 +1457,29 @@ pub fn gpu_solve_turn_decomposed(
     upload_mega_terminal(&stream, &mut state, &mtd)?;
 
     launch_mega_solve(
-        &stream, &mega, &ctx, &mut state,
-        1, topo.num_nodes, topo.num_edges, num_hands,
-        topo.max_depth, config.max_iterations,
-        term.hand_cards[0].len(), term.hand_cards[1].len(),
+        &stream,
+        &mega,
+        &ctx,
+        &mut state,
+        1,
+        topo.num_nodes,
+        topo.num_edges,
+        num_hands,
+        topo.max_depth,
+        config.max_iterations,
+        term.hand_cards[0].len(),
+        term.hand_cards[1].len(),
     )?;
 
     let root_strategy = extract_root_strategy_mega(&stream, &state, topo, num_hands)?;
     let exploitability = compute_exploitability_after_mega(
-        &ctx, &stream, &state, topo, term, initial_weights, num_hands,
+        &ctx,
+        &stream,
+        &state,
+        topo,
+        term,
+        initial_weights,
+        num_hands,
     )?;
 
     Ok(crate::GpuSolveResult {
@@ -1430,9 +1502,7 @@ pub fn gpu_solve_hand_parallel(
     initial_weights: &[Vec<f32>; 2],
     num_hands: usize,
 ) -> Result<crate::GpuSolveResult, Box<dyn std::error::Error>> {
-    use crate::gpu::{
-        compute_hand_parallel_shared_mem, GpuHandParallelState, HandParallelKernel,
-    };
+    use crate::gpu::{GpuHandParallelState, HandParallelKernel, compute_hand_parallel_shared_mem};
 
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -1561,12 +1631,17 @@ pub fn gpu_solve_hand_parallel(
     stream.synchronize()?;
 
     // Extract root strategy from strategy_sum
-    let root_strategy =
-        extract_root_strategy_hand_parallel(&stream, &state, topo, num_hands)?;
+    let root_strategy = extract_root_strategy_hand_parallel(&stream, &state, topo, num_hands)?;
 
     // Compute exploitability using legacy kernels
     let exploitability = compute_exploitability_after_hand_parallel(
-        &ctx, &stream, &state, topo, term, initial_weights, num_hands,
+        &ctx,
+        &stream,
+        &state,
+        topo,
+        term,
+        initial_weights,
+        num_hands,
     )?;
 
     Ok(crate::GpuSolveResult {
@@ -1606,8 +1681,7 @@ fn extract_root_strategy_hand_parallel(
         }
         if total > 1e-30 {
             for a in 0..n_actions {
-                result[a * num_hands + h] =
-                    strategy_sum_host[(start + a) * num_hands + h] / total;
+                result[a * num_hands + h] = strategy_sum_host[(start + a) * num_hands + h] / total;
             }
         } else {
             let uniform = 1.0 / n_actions as f32;
@@ -1723,7 +1797,7 @@ mod tests {
     use crate::extract::{extract_terminal_data, extract_topology};
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, CardConfig};
+    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
     use range_solver::interface::Game;
 
     fn make_turn_game() -> range_solver::PostFlopGame {
@@ -1790,18 +1864,23 @@ mod tests {
             target_exploitability: 0.0,
             print_progress: false,
         };
-        let result = gpu_solve_turn_decomposed(
-            &game, &topo, &term, &config, &initial_weights, num_hands,
-        )
-        .unwrap();
+        let result =
+            gpu_solve_turn_decomposed(&game, &topo, &term, &config, &initial_weights, num_hands)
+                .unwrap();
 
-        assert!(result.exploitability.is_finite(), "exploitability must be finite");
+        assert!(
+            result.exploitability.is_finite(),
+            "exploitability must be finite"
+        );
         assert!(
             result.exploitability < 20.0,
             "decomposed turn solve should converge below 20.0, got {}",
             result.exploitability
         );
-        assert!(!result.root_strategy.is_empty(), "root_strategy must not be empty");
+        assert!(
+            !result.root_strategy.is_empty(),
+            "root_strategy must not be empty"
+        );
     }
 
     #[test]
@@ -1822,10 +1901,9 @@ mod tests {
             print_progress: false,
         };
         let legacy = gpu_solve_cudarc(&topo, &term, &config, &initial_weights, num_hands).unwrap();
-        let decomposed = gpu_solve_turn_decomposed(
-            &game, &topo, &term, &config, &initial_weights, num_hands,
-        )
-        .unwrap();
+        let decomposed =
+            gpu_solve_turn_decomposed(&game, &topo, &term, &config, &initial_weights, num_hands)
+                .unwrap();
 
         let ratio = if legacy.exploitability > 0.001 {
             decomposed.exploitability / legacy.exploitability
@@ -1835,7 +1913,9 @@ mod tests {
         assert!(
             ratio < 5.0 && ratio > 0.2,
             "decomposed turn exploitability ({}) should be within 5x of legacy ({}), ratio={}",
-            decomposed.exploitability, legacy.exploitability, ratio
+            decomposed.exploitability,
+            legacy.exploitability,
+            ratio
         );
     }
 
@@ -1858,18 +1938,22 @@ mod tests {
             target_exploitability: 0.0,
             print_progress: false,
         };
-        let result = gpu_solve_hand_parallel(
-            &topo, &term, &config, &initial_weights, num_hands,
-        )
-        .unwrap();
+        let result =
+            gpu_solve_hand_parallel(&topo, &term, &config, &initial_weights, num_hands).unwrap();
 
-        assert!(result.exploitability.is_finite(), "exploitability must be finite");
+        assert!(
+            result.exploitability.is_finite(),
+            "exploitability must be finite"
+        );
         assert!(
             result.exploitability.abs() < 0.01,
             "hand-parallel river solve should converge near 0, got {}",
             result.exploitability
         );
-        assert!(!result.root_strategy.is_empty(), "root_strategy must not be empty");
+        assert!(
+            !result.root_strategy.is_empty(),
+            "root_strategy must not be empty"
+        );
     }
 
     #[test]
@@ -1891,13 +1975,16 @@ mod tests {
         };
 
         let mega = gpu_solve_mega(&topo, &term, &config, &initial_weights, num_hands).unwrap();
-        let hp = gpu_solve_hand_parallel(&topo, &term, &config, &initial_weights, num_hands).unwrap();
+        let hp =
+            gpu_solve_hand_parallel(&topo, &term, &config, &initial_weights, num_hands).unwrap();
 
         let diff = (mega.exploitability - hp.exploitability).abs();
         assert!(
             diff < 0.01,
             "hand-parallel ({}) should match mega-kernel ({}) within 0.01, diff={}",
-            hp.exploitability, mega.exploitability, diff
+            hp.exploitability,
+            mega.exploitability,
+            diff
         );
     }
 
@@ -1920,15 +2007,27 @@ mod tests {
             print_progress: false,
         };
 
-        let hp = gpu_solve_hand_parallel(&topo, &term, &config, &initial_weights, num_hands).unwrap();
+        let hp =
+            gpu_solve_hand_parallel(&topo, &term, &config, &initial_weights, num_hands).unwrap();
         let mega = gpu_solve_mega(&topo, &term, &config, &initial_weights, num_hands).unwrap();
 
         // After 1 iteration, root strategy should be identical (uniform 0.5 for both)
         assert_eq!(hp.root_strategy.len(), mega.root_strategy.len());
-        for (i, (&hp_s, &mega_s)) in hp.root_strategy.iter().zip(mega.root_strategy.iter()).enumerate() {
+        for (i, (&hp_s, &mega_s)) in hp
+            .root_strategy
+            .iter()
+            .zip(mega.root_strategy.iter())
+            .enumerate()
+        {
             let diff = (hp_s - mega_s).abs();
-            assert!(diff < 0.001,
-                "root_strategy[{}] HP={} MEGA={} diff={}", i, hp_s, mega_s, diff);
+            assert!(
+                diff < 0.001,
+                "root_strategy[{}] HP={} MEGA={} diff={}",
+                i,
+                hp_s,
+                mega_s,
+                diff
+            );
         }
     }
 
@@ -1949,11 +2048,12 @@ mod tests {
             target_exploitability: 0.0,
             print_progress: false,
         };
-        let result = gpu_solve_hand_parallel(
-            &topo, &term, &config, &initial_weights, num_hands,
-        )
-        .unwrap();
-        assert!(!result.root_strategy.is_empty(), "root_strategy must not be empty after 1 iter");
+        let result =
+            gpu_solve_hand_parallel(&topo, &term, &config, &initial_weights, num_hands).unwrap();
+        assert!(
+            !result.root_strategy.is_empty(),
+            "root_strategy must not be empty after 1 iter"
+        );
     }
 
     #[test]
@@ -1981,7 +2081,9 @@ mod tests {
         assert!(
             diff < 0.01,
             "mega exploitability ({}) should match legacy ({}) within 0.01, diff={}",
-            mega.exploitability, legacy.exploitability, diff
+            mega.exploitability,
+            legacy.exploitability,
+            diff
         );
     }
 }

@@ -146,9 +146,7 @@ mod tests {
     #[test]
     fn solve_strategy_is_clone() {
         let eval: Arc<dyn BoundaryEvaluator> = Arc::new(MockEvaluator);
-        let strategy = SolveStrategy::DepthLimited {
-            evaluator: eval,
-        };
+        let strategy = SolveStrategy::DepthLimited { evaluator: eval };
         let cloned = strategy.clone();
         // Both should exist without issue.
         let _a = strategy;
@@ -203,13 +201,12 @@ mod tests {
         let batch = eval.evaluate_batch(&refs);
 
         for (i, (ind, bat)) in individual.iter().zip(batch.iter()).enumerate() {
-            assert_eq!(
-                ind.len(),
-                bat.len(),
-                "game {i}: boundary count mismatch"
-            );
+            assert_eq!(ind.len(), bat.len(), "game {i}: boundary count mismatch");
             for (j, (a, b)) in ind.iter().zip(bat.iter()).enumerate() {
-                assert_eq!(a.ordinal, b.ordinal, "game {i} boundary {j}: ordinal mismatch");
+                assert_eq!(
+                    a.ordinal, b.ordinal,
+                    "game {i} boundary {j}: ordinal mismatch"
+                );
                 assert_eq!(a.player, b.player, "game {i} boundary {j}: player mismatch");
                 assert_eq!(a.cfvs, b.cfvs, "game {i} boundary {j}: cfvs mismatch");
             }

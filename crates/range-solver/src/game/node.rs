@@ -234,9 +234,7 @@ impl GameNode for PostFlopNode {
     fn cfvalues_ip(&self) -> &[f32] {
         // SAFETY: `storage3` points into `PostFlopGame::storage_ip`. `num_elements_ip` is
         // the correct length for this slice, set during tree construction.
-        unsafe {
-            slice::from_raw_parts(self.storage3 as *const f32, self.num_elements_ip as usize)
-        }
+        unsafe { slice::from_raw_parts(self.storage3 as *const f32, self.num_elements_ip as usize) }
     }
 
     #[inline]
@@ -302,9 +300,7 @@ impl GameNode for PostFlopNode {
     #[inline]
     fn cfvalues_ip_compressed(&self) -> &[i16] {
         // SAFETY: Compressed IP cfvalues in `storage3`.
-        unsafe {
-            slice::from_raw_parts(self.storage3 as *const i16, self.num_elements_ip as usize)
-        }
+        unsafe { slice::from_raw_parts(self.storage3 as *const i16, self.num_elements_ip as usize) }
     }
 
     #[inline]

@@ -4,8 +4,8 @@
 // street boundaries, converts to BufferRecords, and appends to the
 // disk buffer for later CFV solving.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
@@ -18,10 +18,10 @@ use rayon::prelude::*;
 use crate::blueprint_sampler::{deal_hand, play_hand};
 use crate::config::RebelConfig;
 use crate::data_buffer::{BufferRecord, DiskBuffer};
-use crate::pbs::{Pbs, NUM_COMBOS};
+use crate::pbs::{NUM_COMBOS, Pbs};
 use crate::solver::{
-    boundary_requests, prepare_game, set_boundaries, solve_depth_limited_pbs, solve_prepared,
-    solve_river_pbs, SolveConfig,
+    SolveConfig, boundary_requests, prepare_game, set_boundaries, solve_depth_limited_pbs,
+    solve_prepared, solve_river_pbs,
 };
 use poker_solver_core::blueprint_v2::LeafEvaluator;
 
@@ -91,7 +91,7 @@ pub fn generate_pbs(
     let pb = indicatif::ProgressBar::new(num_hands as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
-            "{msg} [{bar:40}] {pos}/{len} ({per_sec}, eta {eta})"
+            "{msg} [{bar:40}] {pos}/{len} ({per_sec}, eta {eta})",
         )
         .unwrap()
         .progress_chars("=> "),
@@ -186,7 +186,7 @@ pub fn solve_buffer_records(
     let pb = indicatif::ProgressBar::new(total as u64);
     pb.set_style(
         indicatif::ProgressStyle::with_template(
-            "{msg} [{bar:40}] {pos}/{len} ({per_sec}, eta {eta})"
+            "{msg} [{bar:40}] {pos}/{len} ({per_sec}, eta {eta})",
         )
         .unwrap()
         .progress_chars("=> "),
@@ -346,10 +346,7 @@ fn fractions_to_bet_size_options(
 
     // OOP: fractions[0] = bets, fractions[1] = raises
     let build_one = |bet_fracs: &[f64], raise_fracs: &[f64]| {
-        let mut bets: Vec<BetSize> = bet_fracs
-            .iter()
-            .map(|&f| BetSize::PotRelative(f))
-            .collect();
+        let mut bets: Vec<BetSize> = bet_fracs.iter().map(|&f| BetSize::PotRelative(f)).collect();
         bets.push(BetSize::AllIn);
         bets.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -673,7 +670,7 @@ mod tests {
 
         // Create a few river PBSs with uniform reach and write to buffer
         let boards = vec![
-            vec![0, 4, 8, 12, 16],  // 2c,3c,4c,5c,6c
+            vec![0, 4, 8, 12, 16],   // 2c,3c,4c,5c,6c
             vec![51, 46, 40, 25, 7], // As,Kh,Qd,8d,3s
         ];
 
@@ -711,7 +708,8 @@ mod tests {
             assert!(
                 rec.game_value.is_finite(),
                 "record {} game_value should be finite, got {}",
-                i, rec.game_value
+                i,
+                rec.game_value
             );
         }
     }

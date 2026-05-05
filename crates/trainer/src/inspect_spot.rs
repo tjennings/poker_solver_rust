@@ -9,10 +9,10 @@ use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_tauri::{GameMatrixCell, GameSession, GameState};
-use poker_solver_tauri::postflop::CbvContext;
 #[cfg(test)]
 use poker_solver_tauri::GameAction;
+use poker_solver_tauri::postflop::CbvContext;
+use poker_solver_tauri::{GameMatrixCell, GameSession, GameState};
 
 /// Load a blueprint bundle and return the components needed for a GameSession.
 ///
@@ -20,9 +20,19 @@ use poker_solver_tauri::GameAction;
 /// Tauri async or State wrappers.
 fn load_blueprint(
     config_path: &Path,
-) -> Result<(BlueprintV2Config, BlueprintV2Strategy, V2GameTree, Vec<u32>, Option<Arc<CbvContext>>, Option<Vec<[[f64; 169]; 2]>>), String> {
-    let yaml = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config: {e}"))?;
+) -> Result<
+    (
+        BlueprintV2Config,
+        BlueprintV2Strategy,
+        V2GameTree,
+        Vec<u32>,
+        Option<Arc<CbvContext>>,
+        Option<Vec<[[f64; 169]; 2]>>,
+    ),
+    String,
+> {
+    let yaml =
+        std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {e}"))?;
     let config: BlueprintV2Config =
         serde_yaml::from_str(&yaml).map_err(|e| format!("Failed to parse config: {e}"))?;
 
@@ -37,7 +47,12 @@ fn load_blueprint(
     } else {
         // Look for the latest snapshot directory
         let mut snapshots: Vec<_> = std::fs::read_dir(&output_dir)
-            .map_err(|e| format!("Cannot read output directory '{}': {e}", output_dir.display()))?
+            .map_err(|e| {
+                format!(
+                    "Cannot read output directory '{}': {e}",
+                    output_dir.display()
+                )
+            })?
             .filter_map(Result::ok)
             .filter(|e| {
                 e.file_name()
@@ -52,7 +67,7 @@ fn load_blueprint(
                 return Err(format!(
                     "No strategy.bin found in output directory '{}'",
                     output_dir.display()
-                ))
+                ));
             }
         }
     };
@@ -77,32 +92,47 @@ fn load_blueprint(
     // Load hand_ev.bin if available.
     let hand_evs = {
         let candidates = [
-            strat_path.parent().unwrap_or(Path::new(".")).join("hand_ev.bin"),
+            strat_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("hand_ev.bin"),
             output_dir.join("hand_ev.bin"),
             output_dir.join("final/hand_ev.bin"),
         ];
         let mut found = None;
         for c in &candidates {
-            if c.exists() { found = Some(c.clone()); break; }
+            if c.exists() {
+                found = Some(c.clone());
+                break;
+            }
         }
         // Check latest snapshot
         if found.is_none() {
             if let Ok(entries) = std::fs::read_dir(&output_dir) {
                 let mut snaps: Vec<_> = entries
                     .filter_map(Result::ok)
-                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("snapshot_")))
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("snapshot_"))
+                    })
                     .collect();
                 snaps.sort_by_key(|e| e.file_name());
                 if let Some(last) = snaps.last() {
                     let p = last.path().join("hand_ev.bin");
-                    if p.exists() { found = Some(p); }
+                    if p.exists() {
+                        found = Some(p);
+                    }
                 }
             }
         }
         if let Some(path) = found {
             match poker_solver_tauri::load_hand_ev_bin(&path, decision_nodes) {
                 Ok(evs) => {
-                    eprintln!("[inspect] loaded hand_ev.bin ({} decision nodes)", evs.len());
+                    eprintln!(
+                        "[inspect] loaded hand_ev.bin ({} decision nodes)",
+                        evs.len()
+                    );
                     Some(evs)
                 }
                 Err(e) => {
@@ -141,7 +171,15 @@ fn load_blueprint(
             config.clustering.river.buckets,
         ];
         let mut bucket_files: [Option<BucketFile>; 4] = [None, None, None, None];
-        for (i, name) in ["preflop.buckets", "flop.buckets", "turn.buckets", "river.buckets"].iter().enumerate() {
+        for (i, name) in [
+            "preflop.buckets",
+            "flop.buckets",
+            "turn.buckets",
+            "river.buckets",
+        ]
+        .iter()
+        .enumerate()
+        {
             let path = cluster_dir.join(name);
             if path.exists() {
                 match BucketFile::load(&path) {
@@ -169,7 +207,11 @@ fn load_blueprint(
         } else {
             // Try bundle root
             let alt = bundle_dir.join("cbv_p0.bin");
-            if alt.exists() { CbvTable::load(&alt).ok() } else { None }
+            if alt.exists() {
+                CbvTable::load(&alt).ok()
+            } else {
+                None
+            }
         };
 
         if let Some(cbv_table) = cbv_table {
@@ -182,7 +224,11 @@ fn load_blueprint(
         } else {
             // No CBV table, but still build CbvContext with a dummy for strategy lookups
             // The CbvContext is needed for postflop matrix building even without CBV boundaries
-            let dummy_cbv = CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] };
+            let dummy_cbv = CbvTable {
+                values: vec![],
+                node_offsets: vec![],
+                buckets_per_node: vec![],
+            };
             Some(Arc::new(CbvContext {
                 cbv_table: dummy_cbv,
                 abstract_tree: tree.clone(),
@@ -246,8 +292,7 @@ fn format_report(spot: &str, state: &GameState) -> String {
 
         // Sort by EV descending (best hands first)
         hands.sort_by(|a, b| {
-            b.ev
-                .unwrap_or(f32::NEG_INFINITY)
+            b.ev.unwrap_or(f32::NEG_INFINITY)
                 .partial_cmp(&a.ev.unwrap_or(f32::NEG_INFINITY))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -280,13 +325,7 @@ fn format_report(spot: &str, state: &GameState) -> String {
             for (ai, action) in actions.iter().enumerate() {
                 let action_weight: f32 = hands
                     .iter()
-                    .map(|c| {
-                        c.probabilities
-                            .get(ai)
-                            .copied()
-                            .unwrap_or(0.0)
-                            * c.weight
-                    })
+                    .map(|c| c.probabilities.get(ai).copied().unwrap_or(0.0) * c.weight)
                     .sum::<f32>();
                 let pct = action_weight / total_weight * 100.0;
                 out.push_str(&format!("{:<8} {:>5.1}% of range\n", action.label, pct));
@@ -326,16 +365,13 @@ pub fn run(config_path: &Path, spot: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn make_mock_state(
-        actions: Vec<GameAction>,
-        cells: Vec<GameMatrixCell>,
-    ) -> GameState {
+    fn make_mock_state(actions: Vec<GameAction>, cells: Vec<GameMatrixCell>) -> GameState {
         use poker_solver_tauri::{GameMatrix, GameState};
         GameState {
             street: "Flop".to_string(),
             position: "BB".to_string(),
             board: vec!["Td".to_string(), "9d".to_string(), "6h".to_string()],
-            pot: 8,     // 4BB in half-BB chips
+            pot: 8, // 4BB in half-BB chips
             stacks: [96, 96],
             matrix: Some(GameMatrix {
                 cells: vec![vec![cells[0].clone()], vec![cells[1].clone()]],
@@ -353,8 +389,16 @@ mod tests {
     fn format_report_shows_spot_header() {
         let state = make_mock_state(
             vec![
-                GameAction { id: "0".into(), label: "Fold".into(), action_type: "fold".into() },
-                GameAction { id: "1".into(), label: "Call".into(), action_type: "call".into() },
+                GameAction {
+                    id: "0".into(),
+                    label: "Fold".into(),
+                    action_type: "fold".into(),
+                },
+                GameAction {
+                    id: "1".into(),
+                    label: "Call".into(),
+                    action_type: "call".into(),
+                },
             ],
             vec![
                 GameMatrixCell {
@@ -392,8 +436,16 @@ mod tests {
     fn format_report_hands_sorted_by_ev_descending() {
         let state = make_mock_state(
             vec![
-                GameAction { id: "0".into(), label: "Fold".into(), action_type: "fold".into() },
-                GameAction { id: "1".into(), label: "Call".into(), action_type: "call".into() },
+                GameAction {
+                    id: "0".into(),
+                    label: "Fold".into(),
+                    action_type: "fold".into(),
+                },
+                GameAction {
+                    id: "1".into(),
+                    label: "Call".into(),
+                    action_type: "call".into(),
+                },
             ],
             vec![
                 GameMatrixCell {
@@ -432,8 +484,16 @@ mod tests {
     fn format_report_shows_action_summary() {
         let state = make_mock_state(
             vec![
-                GameAction { id: "0".into(), label: "Fold".into(), action_type: "fold".into() },
-                GameAction { id: "1".into(), label: "Call".into(), action_type: "call".into() },
+                GameAction {
+                    id: "0".into(),
+                    label: "Fold".into(),
+                    action_type: "fold".into(),
+                },
+                GameAction {
+                    id: "1".into(),
+                    label: "Call".into(),
+                    action_type: "call".into(),
+                },
             ],
             vec![
                 GameMatrixCell {
@@ -513,8 +573,16 @@ mod tests {
         // Expected: Fold 50%, Call 50%
         let state = make_mock_state(
             vec![
-                GameAction { id: "0".into(), label: "Fold".into(), action_type: "fold".into() },
-                GameAction { id: "1".into(), label: "Call".into(), action_type: "call".into() },
+                GameAction {
+                    id: "0".into(),
+                    label: "Fold".into(),
+                    action_type: "fold".into(),
+                },
+                GameAction {
+                    id: "1".into(),
+                    label: "Call".into(),
+                    action_type: "call".into(),
+                },
             ],
             vec![
                 GameMatrixCell {
@@ -548,9 +616,11 @@ mod tests {
     #[test]
     fn format_report_skips_zero_combo_hands() {
         let state = make_mock_state(
-            vec![
-                GameAction { id: "0".into(), label: "Fold".into(), action_type: "fold".into() },
-            ],
+            vec![GameAction {
+                id: "0".into(),
+                label: "Fold".into(),
+                action_type: "fold".into(),
+            }],
             vec![
                 GameMatrixCell {
                     hand: "AA".into(),
@@ -567,7 +637,7 @@ mod tests {
                     suited: false,
                     pair: true,
                     probabilities: vec![1.0],
-                    combo_count: 0,  // blocked
+                    combo_count: 0, // blocked
                     weight: 0.0,
                     ev: None,
                     combos: vec![],

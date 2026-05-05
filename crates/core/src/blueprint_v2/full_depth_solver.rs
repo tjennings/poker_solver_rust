@@ -249,9 +249,8 @@ pub fn solve_full_depth(
     };
 
     let tree = ActionTree::new(tree_config).map_err(FullDepthError::ConfigError)?;
-    let mut game =
-        range_solver::PostFlopGame::with_config(card_config, tree)
-            .map_err(FullDepthError::ConfigError)?;
+    let mut game = range_solver::PostFlopGame::with_config(card_config, tree)
+        .map_err(FullDepthError::ConfigError)?;
 
     game.allocate_memory(false);
 

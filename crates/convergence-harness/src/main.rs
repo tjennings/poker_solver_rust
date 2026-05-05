@@ -162,8 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Load baseline for head-to-head EV computation during run
             let loaded_baseline = baseline::Baseline::load(baseline_path).ok();
-            let result =
-                harness::run_mccfr_solver_from_config(&cfg, loaded_baseline.as_ref())?;
+            let result = harness::run_mccfr_solver_from_config(&cfg, loaded_baseline.as_ref())?;
 
             // Save results
             let result_dir = std::path::Path::new(&output_dir);
@@ -195,10 +194,7 @@ mod tests {
     #[test]
     fn parse_generate_baseline_requires_config() {
         let result = Cli::try_parse_from(["convergence-harness", "generate-baseline"]);
-        assert!(
-            result.is_err(),
-            "generate-baseline should require --config"
-        );
+        assert!(result.is_err(), "generate-baseline should require --config");
     }
 
     #[test]
@@ -419,12 +415,7 @@ mod tests {
 
     #[test]
     fn parse_run_solver_defaults() {
-        let cli = Cli::parse_from([
-            "convergence-harness",
-            "run-solver",
-            "--config",
-            "test.yaml",
-        ]);
+        let cli = Cli::parse_from(["convergence-harness", "run-solver", "--config", "test.yaml"]);
         match cli.command {
             Commands::RunSolver {
                 config,

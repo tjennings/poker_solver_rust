@@ -7,33 +7,33 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
-use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use poker_solver_core::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::GameTree as V2GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::Street;
 
 use poker_solver_tauri::gadget;
 use poker_solver_tauri::postflop::CbvContext;
 use poker_solver_tauri::{
-    build_solve_game, build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
-    seed_solver_with_blueprint, validate_cfvnet_boundary_cut, BoundaryKind, GameSession,
-    StreetBoundaryConfig, StreetBoundaryMode,
+    BoundaryKind, GameSession, StreetBoundaryConfig, StreetBoundaryMode, build_solve_game,
+    build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
+    seed_solver_with_blueprint, validate_cfvnet_boundary_cut,
 };
 
 use range_solver::card::card_to_string;
 use range_solver::game::BoundaryEvaluator;
 use range_solver::interface::Game;
 use range_solver::{
-    cfvalues_after_history_with_reach, compute_current_ev, compute_exploitability, finalize,
-    root_action_cfvalues, root_regrets, solve_step, Action, PostFlopGame,
+    Action, PostFlopGame, cfvalues_after_history_with_reach, compute_current_ev,
+    compute_exploitability, finalize, root_action_cfvalues, root_regrets, solve_step,
 };
 
 use crate::boundary_trace::{
-    assemble_full_spot, build_boundary_spot_paths, build_preceding_decision_map,
-    capture_boundary_traces, BoundaryTracer,
+    BoundaryTracer, assemble_full_spot, build_boundary_spot_paths, build_preceding_decision_map,
+    capture_boundary_traces,
 };
 
 // ---------------------------------------------------------------------------
@@ -203,11 +203,7 @@ pub fn check_unit_mismatch(all_stats: &[BoundaryCfvStats]) -> Vec<String> {
         .iter()
         .map(|s| {
             let m = s.mean.abs().max(s.stddev.abs()) as f64;
-            if m < 1e-10 {
-                1e-10
-            } else {
-                m
-            }
+            if m < 1e-10 { 1e-10 } else { m }
         })
         .collect();
     if magnitudes.len() < 2 {
@@ -235,11 +231,7 @@ pub fn check_bias_divergence(bias_stats: &[&BoundaryCfvStats], bias_names: &[&st
     }
     let base_mag = {
         let m = bias_stats[0].mean.abs().max(bias_stats[0].stddev.abs()) as f64;
-        if m < 1e-10 {
-            1e-10
-        } else {
-            m
-        }
+        if m < 1e-10 { 1e-10 } else { m }
     };
     for i in 1..bias_stats.len() {
         let mag = bias_stats[i].mean.abs().max(bias_stats[i].stddev.abs()) as f64;
@@ -2835,7 +2827,7 @@ mod tests {
     use super::*;
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, CardConfig};
+    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
 
     fn make_depth_limited_flop_game() -> PostFlopGame {
         let oop_range: range_solver::range::Range = "AA,KK,QQ".parse().unwrap();

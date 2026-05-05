@@ -367,24 +367,56 @@ inference:
         assert_eq!(config.seed.num_hands, roundtripped.seed.num_hands);
         assert_eq!(config.seed.seed, roundtripped.seed.seed);
         assert_eq!(config.seed.threads, roundtripped.seed.threads);
-        assert_eq!(config.seed.solver_iterations, roundtripped.seed.solver_iterations);
-        assert!((config.seed.target_exploitability - roundtripped.seed.target_exploitability).abs() < 1e-6);
+        assert_eq!(
+            config.seed.solver_iterations,
+            roundtripped.seed.solver_iterations
+        );
+        assert!(
+            (config.seed.target_exploitability - roundtripped.seed.target_exploitability).abs()
+                < 1e-6
+        );
         assert_eq!(config.seed.bet_sizes.flop, roundtripped.seed.bet_sizes.flop);
         assert_eq!(config.seed.bet_sizes.turn, roundtripped.seed.bet_sizes.turn);
-        assert_eq!(config.seed.bet_sizes.river, roundtripped.seed.bet_sizes.river);
-        assert_eq!(config.training.hidden_layers, roundtripped.training.hidden_layers);
-        assert_eq!(config.training.hidden_size, roundtripped.training.hidden_size);
+        assert_eq!(
+            config.seed.bet_sizes.river,
+            roundtripped.seed.bet_sizes.river
+        );
+        assert_eq!(
+            config.training.hidden_layers,
+            roundtripped.training.hidden_layers
+        );
+        assert_eq!(
+            config.training.hidden_size,
+            roundtripped.training.hidden_size
+        );
         assert_eq!(config.training.batch_size, roundtripped.training.batch_size);
         assert_eq!(config.training.epochs, roundtripped.training.epochs);
         assert!((config.training.learning_rate - roundtripped.training.learning_rate).abs() < 1e-9);
         assert!((config.training.huber_delta - roundtripped.training.huber_delta).abs() < 1e-9);
         assert_eq!(config.buffer.max_records, roundtripped.buffer.max_records);
         assert_eq!(config.buffer.path, roundtripped.buffer.path);
-        assert_eq!(config.inference.batch_size, roundtripped.inference.batch_size);
-        assert_eq!(config.inference.batch_timeout_us, roundtripped.inference.batch_timeout_us);
-        assert_eq!(config.inference.train_every_n_solves, roundtripped.inference.train_every_n_solves);
-        assert_eq!(config.inference.train_batch_size, roundtripped.inference.train_batch_size);
-        assert_eq!(config.inference.replay_capacity, roundtripped.inference.replay_capacity);
-        assert!((config.inference.learning_rate - roundtripped.inference.learning_rate).abs() < 1e-9);
+        assert_eq!(
+            config.inference.batch_size,
+            roundtripped.inference.batch_size
+        );
+        assert_eq!(
+            config.inference.batch_timeout_us,
+            roundtripped.inference.batch_timeout_us
+        );
+        assert_eq!(
+            config.inference.train_every_n_solves,
+            roundtripped.inference.train_every_n_solves
+        );
+        assert_eq!(
+            config.inference.train_batch_size,
+            roundtripped.inference.train_batch_size
+        );
+        assert_eq!(
+            config.inference.replay_capacity,
+            roundtripped.inference.replay_capacity
+        );
+        assert!(
+            (config.inference.learning_rate - roundtripped.inference.learning_rate).abs() < 1e-9
+        );
     }
 }

@@ -14,15 +14,15 @@
 //! containing their request completes. [`InferenceHandle::notify_solve_complete`]
 //! increments the solve counter so the server knows when to train.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Tensor, TensorData};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use cfvnet::model::network::{CfvNet, INPUT_SIZE, OUTPUT_SIZE};
 
@@ -100,7 +100,10 @@ impl InferenceHandle {
         request_tx: Sender<InferenceRequest>,
         solve_counter: Arc<AtomicUsize>,
     ) -> Self {
-        Self { request_tx, solve_counter }
+        Self {
+            request_tx,
+            solve_counter,
+        }
     }
 
     /// Notify the server that one subgame solve completed.
@@ -326,10 +329,7 @@ fn maybe_train<B: AutodiffBackend>(
         TensorData::new(flat_range, [n, OUTPUT_SIZE]),
         device,
     );
-    let gv_inner = Tensor::<B::InnerBackend, 1>::from_data(
-        TensorData::new(flat_gv, [n]),
-        device,
-    );
+    let gv_inner = Tensor::<B::InnerBackend, 1>::from_data(TensorData::new(flat_gv, [n]), device);
     let input = Tensor::<B, 2>::from_inner(input_inner);
     let target = Tensor::<B, 2>::from_inner(target_inner);
     let mask = Tensor::<B, 2>::from_inner(mask_inner);
@@ -341,9 +341,8 @@ fn maybe_train<B: AutodiffBackend>(
 
     // Masked Huber loss + auxiliary game-value consistency loss.
     let loss = cfvnet::model::loss::cfvnet_loss(
-        predicted, target, mask, range, game_value,
-        1.0,  // huber_delta
-        1.0,  // aux_weight
+        predicted, target, mask, range, game_value, 1.0, // huber_delta
+        1.0, // aux_weight
     );
 
     // Read loss value for logging.
@@ -364,14 +363,17 @@ fn maybe_train<B: AutodiffBackend>(
     // Checkpoint model periodically.
     if let Some(ref dir) = config.checkpoint_dir {
         if *train_step_count % config.checkpoint_every_n_steps == 0 {
-            let recorder = burn::record::NamedMpkGzFileRecorder::<
-                burn::record::FullPrecisionSettings,
-            >::new();
+            let recorder =
+                burn::record::NamedMpkGzFileRecorder::<burn::record::FullPrecisionSettings>::new();
             let path = dir.join(format!("checkpoint_step{}", train_step_count));
             if let Err(e) = model.clone().save_file(&path, &recorder) {
                 eprintln!("  Warning: failed to save checkpoint: {e}");
             } else {
-                eprintln!("  [checkpoint] saved step {} to {}", train_step_count, path.display());
+                eprintln!(
+                    "  [checkpoint] saved step {} to {}",
+                    train_step_count,
+                    path.display()
+                );
             }
             // Also save as "model" (latest)
             let latest = dir.join("model");
@@ -410,7 +412,7 @@ mod tests {
             train_every_n_solves: 50,
             train_batch_size: 512,
             learning_rate: 1e-3,
-                ..Default::default()
+            ..Default::default()
         };
         assert_eq!(config.batch_size, 256);
         assert_eq!(config.batch_timeout_us, 100);
@@ -457,7 +459,9 @@ mod tests {
 
         // Shutdown.
         shutdown.store(true, Ordering::Relaxed);
-        server_thread.join().expect("server thread should not panic");
+        server_thread
+            .join()
+            .expect("server thread should not panic");
     }
 
     #[test]
@@ -508,7 +512,9 @@ mod tests {
 
         // Shutdown.
         shutdown.store(true, Ordering::Relaxed);
-        server_thread.join().expect("server thread should not panic");
+        server_thread
+            .join()
+            .expect("server thread should not panic");
     }
 
     #[test]
@@ -542,7 +548,7 @@ mod tests {
             train_every_n_solves: 2,
             train_batch_size: 4,
             learning_rate: 1e-3,
-                ..Default::default()
+            ..Default::default()
         };
         let replay_buffer = ReplayBuffer::new(100);
         // Fill replay buffer with enough entries.
@@ -568,7 +574,10 @@ mod tests {
             &mut last_train_at,
             &mut train_step_count,
         );
-        assert_eq!(last_train_at, 5, "last_train_at should update to current solve count");
+        assert_eq!(
+            last_train_at, 5,
+            "last_train_at should update to current solve count"
+        );
     }
 
     #[test]
@@ -586,7 +595,7 @@ mod tests {
             train_every_n_solves: 10,
             train_batch_size: 4,
             learning_rate: 1e-3,
-                ..Default::default()
+            ..Default::default()
         };
         let replay_buffer = ReplayBuffer::new(100);
         for i in 0..10 {
@@ -629,7 +638,7 @@ mod tests {
             train_every_n_solves: 1,
             train_batch_size: 100,
             learning_rate: 1e-3,
-                ..Default::default()
+            ..Default::default()
         };
         let replay_buffer = ReplayBuffer::new(1000);
         // Only 5 entries, but train_batch_size requires 100.
@@ -654,7 +663,10 @@ mod tests {
             &mut last_train_at,
             &mut train_step_count,
         );
-        assert_eq!(last_train_at, 0, "should not train with insufficient buffer");
+        assert_eq!(
+            last_train_at, 0,
+            "should not train with insufficient buffer"
+        );
     }
 
     #[test]
@@ -684,7 +696,9 @@ mod tests {
 
         // Immediately signal shutdown without sending any requests.
         shutdown.store(true, Ordering::Relaxed);
-        server_thread.join().expect("server should shut down cleanly");
+        server_thread
+            .join()
+            .expect("server should shut down cleanly");
     }
 
     #[test]
@@ -727,7 +741,9 @@ mod tests {
         );
 
         shutdown.store(true, Ordering::Relaxed);
-        server_thread.join().expect("server thread should not panic");
+        server_thread
+            .join()
+            .expect("server thread should not panic");
     }
 
     #[test]
@@ -773,8 +789,8 @@ mod tests {
         // Get initial prediction before any training.
         let input = vec![0.05_f32; INPUT_SIZE];
         let result_before = handle.evaluate(input.clone());
-        let mse_before: f32 = result_before.iter().map(|v| v * v).sum::<f32>()
-            / result_before.len() as f32;
+        let mse_before: f32 =
+            result_before.iter().map(|v| v * v).sum::<f32>() / result_before.len() as f32;
 
         // Trigger several training steps by notifying solve completions.
         for _ in 0..20 {
@@ -788,8 +804,8 @@ mod tests {
 
         // Get prediction after training.
         let result_after = handle.evaluate(input);
-        let mse_after: f32 = result_after.iter().map(|v| v * v).sum::<f32>()
-            / result_after.len() as f32;
+        let mse_after: f32 =
+            result_after.iter().map(|v| v * v).sum::<f32>() / result_after.len() as f32;
 
         // Training towards zero targets should reduce the MSE.
         assert!(
@@ -798,6 +814,8 @@ mod tests {
         );
 
         shutdown.store(true, Ordering::Relaxed);
-        server_thread.join().expect("server thread should not panic");
+        server_thread
+            .join()
+            .expect("server thread should not panic");
     }
 }

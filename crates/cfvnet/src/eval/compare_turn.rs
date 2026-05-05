@@ -15,14 +15,14 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
 use range_solver::bet_size::{BetSize, BetSizeOptions};
-use range_solver::card::{card_pair_to_index, CardConfig, NOT_DEALT};
+use range_solver::card::{CardConfig, NOT_DEALT, card_pair_to_index};
 use range_solver::game::{BoundaryEvaluator, PostFlopGame};
 use range_solver::range::Range as RsRange;
 use range_solver::solve;
 
 use crate::config::CfvnetConfig;
 use crate::datagen::range_gen::NUM_COMBOS;
-use crate::datagen::sampler::{sample_situation, Situation};
+use crate::datagen::sampler::{Situation, sample_situation};
 use crate::eval::compare::{ComparisonSummary, SpotResult};
 use crate::eval::metrics::compute_prediction_metrics;
 use crate::eval::river_net_evaluator::build_input;
@@ -188,9 +188,8 @@ impl BoundaryEvaluator for NetBoundaryEvaluator {
                 continue;
             }
 
-            let river_board: [u8; 5] = [
-                board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
-            ];
+            let river_board: [u8; 5] =
+                [board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8];
 
             // Filter out combos that conflict with the river card.
             let mut oop_filtered = *oop_1326;
@@ -391,8 +390,14 @@ fn compare_single_net(
     river_model: CfvNet<B>,
     river_device: <B as burn::tensor::backend::Backend>::Device,
 ) -> (f64, f64, f64, SpotResult) {
-    let (actual, valid_mask) =
-        solve_and_extract_net(sit, bet_sizes, solver_iterations, river_model, river_device, 0);
+    let (actual, valid_mask) = solve_and_extract_net(
+        sit,
+        bet_sizes,
+        solver_iterations,
+        river_model,
+        river_device,
+        0,
+    );
     let predicted = predict_with_model(model, device, sit, 0);
 
     let mask_bool: Vec<bool> = valid_mask.to_vec();
@@ -693,13 +698,8 @@ pub fn run_turn_comparison_exact_with_model(
             continue;
         }
 
-        let result = compare_single_exact(
-            turn_model,
-            &device,
-            &sit,
-            &bet_sizes_vec,
-            solver_iterations,
-        );
+        let result =
+            compare_single_exact(turn_model, &device, &sit, &bet_sizes_vec, solver_iterations);
         results.push(result);
     }
 
@@ -713,7 +713,9 @@ pub fn run_turn_comparison_exact_with_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BetSizeConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig};
+    use crate::config::{
+        BetSizeConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig,
+    };
 
     fn test_config() -> CfvnetConfig {
         CfvnetConfig {
@@ -752,12 +754,14 @@ mod tests {
         let river_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
         let summary =
-            run_turn_comparison_net_with_models(&config, &turn_model, &river_model, 1, 42)
-                .unwrap();
+            run_turn_comparison_net_with_models(&config, &turn_model, &river_model, 1, 42).unwrap();
 
         assert_eq!(summary.num_spots, 1);
         assert!(summary.mean_mae.is_finite(), "mean_mae not finite");
-        assert!(summary.mean_max_error.is_finite(), "mean_max_error not finite");
+        assert!(
+            summary.mean_max_error.is_finite(),
+            "mean_max_error not finite"
+        );
         assert!(summary.mean_mbb.is_finite(), "mean_mbb not finite");
         assert!(summary.worst_mae.is_finite(), "worst_mae not finite");
         assert!(summary.worst_mbb.is_finite(), "worst_mbb not finite");
@@ -774,12 +778,14 @@ mod tests {
 
         let turn_model = CfvNet::<B>::new(&device, 1, 8, INPUT_SIZE);
 
-        let summary =
-            run_turn_comparison_exact_with_model(&config, &turn_model, 1, 42, 2).unwrap();
+        let summary = run_turn_comparison_exact_with_model(&config, &turn_model, 1, 42, 2).unwrap();
 
         assert_eq!(summary.num_spots, 1);
         assert!(summary.mean_mae.is_finite(), "mean_mae not finite");
-        assert!(summary.mean_max_error.is_finite(), "mean_max_error not finite");
+        assert!(
+            summary.mean_max_error.is_finite(),
+            "mean_max_error not finite"
+        );
         assert!(summary.mean_mbb.is_finite(), "mean_mbb not finite");
     }
 
@@ -799,17 +805,13 @@ mod tests {
         let turn_path = turn_dir.path().join("model");
         let river_path = river_dir.path().join("model");
 
-        turn_model
-            .clone()
-            .save_file(&turn_path, &recorder)
-            .unwrap();
+        turn_model.clone().save_file(&turn_path, &recorder).unwrap();
         river_model
             .clone()
             .save_file(&river_path, &recorder)
             .unwrap();
 
-        let summary =
-            run_turn_comparison_net(&config, &turn_path, &river_path, 1, 42).unwrap();
+        let summary = run_turn_comparison_net(&config, &turn_path, &river_path, 1, 42).unwrap();
 
         assert_eq!(summary.num_spots, 1);
         assert!(summary.mean_mae.is_finite());
@@ -835,8 +837,7 @@ mod tests {
             .load_file(&turn_path, &recorder, &device)
             .unwrap();
 
-        let summary =
-            run_turn_comparison_exact_with_model(&config, &loaded, 1, 42, 2).unwrap();
+        let summary = run_turn_comparison_exact_with_model(&config, &loaded, 1, 42, 2).unwrap();
 
         assert_eq!(summary.num_spots, 1);
         assert!(summary.mean_mae.is_finite());
@@ -902,8 +903,7 @@ mod tests {
         let bet_sizes_f64 = parse_bet_sizes(&config.game.bet_sizes.flat());
         let bet_sizes_vec = vec![bet_sizes_f64];
 
-        let (cfvs, valid) =
-            solve_and_extract_net(&sit, &bet_sizes_vec, 10, river_model, device, 0);
+        let (cfvs, valid) = solve_and_extract_net(&sit, &bet_sizes_vec, 10, river_model, device, 0);
 
         // At least some combos should be valid
         let valid_count = valid.iter().filter(|&&v| v).count();

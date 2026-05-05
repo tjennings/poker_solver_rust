@@ -245,8 +245,7 @@ impl PostFlopGame {
                         action_index = repr_index as usize;
                         if is_turn {
                             if let Action::Chance(repr_card) = actions[repr_index as usize] {
-                                self.turn_swapped_suit =
-                                    Some((action_card & 3, repr_card & 3));
+                                self.turn_swapped_suit = Some((action_card & 3, repr_card & 3));
                             }
                             self.turn_swap = Some(action_card & 3);
                         } else {
@@ -317,8 +316,7 @@ impl PostFlopGame {
                         Action::Bet(a) | Action::Raise(a) | Action::AllIn(a) => a,
                         _ => 0,
                     };
-                    let to_call =
-                        self.total_bet_amount[player ^ 1] - self.total_bet_amount[player];
+                    let to_call = self.total_bet_amount[player ^ 1] - self.total_bet_amount[player];
                     self.total_bet_amount[player] += amount - prev_bet_amount + to_call;
                 }
                 _ => {}
@@ -739,8 +737,7 @@ impl PostFlopGame {
         ret.chunks_exact_mut(num_hands)
             .enumerate()
             .for_each(|(action, r)| {
-                let is_fold =
-                    have_actions && self.node().play(action).prev_action == Action::Fold;
+                let is_fold = have_actions && self.node().play(action).prev_action == Action::Fold;
                 self.apply_swap(r, player, false);
                 r.iter_mut()
                     .zip(self.weights[player].iter())
@@ -750,8 +747,7 @@ impl PostFlopGame {
                             *v = 0.0;
                         } else {
                             *v *= normalizer * (w_raw / w_normalized);
-                            *v += starting_pot as f32 * 0.5
-                                + (self.node().amount + bias) as f32;
+                            *v += starting_pot as f32 * 0.5 + (self.node().amount + bias) as f32;
                         }
                     });
             });
@@ -1046,10 +1042,7 @@ mod tests {
 
         let equity_oop = game.equity(0);
         for &e in &equity_oop {
-            assert!(
-                e >= -0.01 && e <= 1.01,
-                "equity out of range: {e}"
-            );
+            assert!(e >= -0.01 && e <= 1.01, "equity out of range: {e}");
         }
     }
 
@@ -1067,9 +1060,7 @@ mod tests {
 
         // Verify each hand's strategy sums to 1
         for h in 0..num_hands {
-            let sum: f32 = (0..num_actions)
-                .map(|a| strategy[a * num_hands + h])
-                .sum();
+            let sum: f32 = (0..num_actions).map(|a| strategy[a * num_hands + h]).sum();
             assert!(
                 (sum - 1.0).abs() < 1e-4,
                 "strategy for hand {h} sums to {sum}"
@@ -1316,7 +1307,10 @@ mod tests {
         });
 
         // Should have visited at least the root.
-        assert!(nodes_visited >= 1, "should visit at least the root decision node");
+        assert!(
+            nodes_visited >= 1,
+            "should visit at least the root decision node"
+        );
 
         // Navigate to a child (play action 0 = fold/check) and check IP's strategy.
         game.play(0);

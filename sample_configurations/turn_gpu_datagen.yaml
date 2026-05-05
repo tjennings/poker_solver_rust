@@ -30,11 +30,13 @@ datagen:
   num_samples: 10000000
   backend: "gpu"
   pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
-  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 50.0]]
-  solver_iterations: 300
-  leaf_eval_interval: 50
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 20.0]]
+  solver_iterations: 500
+  target_exploitability: 5.0
+  leaf_eval_interval: 100
   bet_size_fuzz: 0.15
   threads: 12
+  gpu_batch_size: 128
 
 training:
   hidden_layers: 7

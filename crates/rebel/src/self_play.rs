@@ -20,14 +20,14 @@ use rayon::prelude::*;
 
 use crate::blueprint_sampler::{deal_hand, play_preflop_under_blueprint};
 use crate::inference_server::InferenceHandle;
-use crate::pbs::{combo_index, Pbs, NUM_COMBOS};
+use crate::pbs::{NUM_COMBOS, Pbs, combo_index};
 use crate::replay_buffer::{ReplayBuffer, ReplayEntry};
-use crate::solver::{solve_depth_limited_pbs, SolveConfig, SolveResult};
+use crate::solver::{SolveConfig, SolveResult, solve_depth_limited_pbs};
 use cfvnet::model::network::INPUT_SIZE;
+use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card as RsPokerCard;
 
 /// A training example from self-play: a PBS and its computed CFVs.
@@ -270,11 +270,7 @@ fn board_card_count(street: Street) -> usize {
 }
 
 /// The sequence of postflop streets (preflop is handled by blueprint).
-const STREET_ORDER: [Street; 3] = [
-    Street::Flop,
-    Street::Turn,
-    Street::River,
-];
+const STREET_ORDER: [Street; 3] = [Street::Flop, Street::Turn, Street::River];
 
 /// Play one hand via self-play with subgame solving at each street boundary.
 ///
@@ -307,8 +303,13 @@ pub fn play_self_play_hand<R: Rng>(
 
     // --- Play preflop under blueprint policy ---
     let preflop_result = match play_preflop_under_blueprint(
-        strategy, tree, buckets, &deal,
-        sp_config.initial_stack, sp_config.small_blind, sp_config.big_blind,
+        strategy,
+        tree,
+        buckets,
+        &deal,
+        sp_config.initial_stack,
+        sp_config.small_blind,
+        sp_config.big_blind,
         rng,
     ) {
         Some(r) => r,
@@ -498,74 +499,86 @@ pub fn self_play_training_loop(
     let hands_done = std::sync::atomic::AtomicUsize::new(0);
     let start = std::time::Instant::now();
 
-    eprintln!("Starting self-play: {} hands, {} CFR iters/solve, parallel workers",
-        sp_config.num_hands, sp_config.cfr_iterations);
+    eprintln!(
+        "Starting self-play: {} hands, {} CFR iters/solve, parallel workers",
+        sp_config.num_hands, sp_config.cfr_iterations
+    );
 
     // Parallel self-play: each thread gets its own RNG seeded deterministically.
     // All threads share the inference handle (which batches GPU calls).
-    (0..sp_config.num_hands).into_par_iter().for_each(|hand_idx| {
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
-            sp_config.seed.wrapping_add(hand_idx as u64),
-        );
-
-        let examples = play_self_play_hand(
-            handle, solve_config, sp_config,
-            strategy, tree, buckets,
-            &mut rng,
-        );
-
-        // Push each training example to the replay buffer (one entry per player).
-        for example in &examples {
-            for player in 0..2u8 {
-                let input = build_training_input(&example.pbs, player);
-                let target = example.cfvs[player as usize].to_vec();
-
-                // Build mask: 1.0 for non-blocked combos
-                let mask: Vec<f32> = example.pbs.reach_probs[0]
-                    .iter()
-                    .zip(example.pbs.reach_probs[1].iter())
-                    .map(|(&r0, &r1)| if r0 > 0.0 || r1 > 0.0 { 1.0 } else { 0.0 })
-                    .collect();
-
-                // Acting player's normalized range
-                let reach = &example.pbs.reach_probs[player as usize];
-                let reach_sum: f32 = reach.iter().sum();
-                let range: Vec<f32> = if reach_sum > 0.0 {
-                    reach.iter().map(|&r| r / reach_sum).collect()
-                } else {
-                    reach.to_vec()
-                };
-
-                // Game value: weighted sum of range * cfvs
-                let game_value: f32 = range.iter()
-                    .zip(target.iter())
-                    .map(|(&r, &c)| r * c)
-                    .sum();
-
-                replay_buffer.push(ReplayEntry { input, target, mask, range, game_value });
-            }
-        }
-        handle.notify_solve_complete();
-        total_examples.fetch_add(examples.len(), std::sync::atomic::Ordering::Relaxed);
-        let done = hands_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-
-        // Progress logging every hand (self-play hands are slow).
-        if done % 1 == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let rate = done as f64 / elapsed;
-            let remaining = (sp_config.num_hands - done) as f64 / rate;
-            let examples_so_far = total_examples.load(std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
-                "Self-play: {}/{} hands, {} examples, {:.1} hands/s, buffer={}, eta {:.0}s",
-                done,
-                sp_config.num_hands,
-                examples_so_far,
-                rate,
-                replay_buffer.len(),
-                remaining,
+    (0..sp_config.num_hands)
+        .into_par_iter()
+        .for_each(|hand_idx| {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(
+                sp_config.seed.wrapping_add(hand_idx as u64),
             );
-        }
-    });
+
+            let examples = play_self_play_hand(
+                handle,
+                solve_config,
+                sp_config,
+                strategy,
+                tree,
+                buckets,
+                &mut rng,
+            );
+
+            // Push each training example to the replay buffer (one entry per player).
+            for example in &examples {
+                for player in 0..2u8 {
+                    let input = build_training_input(&example.pbs, player);
+                    let target = example.cfvs[player as usize].to_vec();
+
+                    // Build mask: 1.0 for non-blocked combos
+                    let mask: Vec<f32> = example.pbs.reach_probs[0]
+                        .iter()
+                        .zip(example.pbs.reach_probs[1].iter())
+                        .map(|(&r0, &r1)| if r0 > 0.0 || r1 > 0.0 { 1.0 } else { 0.0 })
+                        .collect();
+
+                    // Acting player's normalized range
+                    let reach = &example.pbs.reach_probs[player as usize];
+                    let reach_sum: f32 = reach.iter().sum();
+                    let range: Vec<f32> = if reach_sum > 0.0 {
+                        reach.iter().map(|&r| r / reach_sum).collect()
+                    } else {
+                        reach.to_vec()
+                    };
+
+                    // Game value: weighted sum of range * cfvs
+                    let game_value: f32 =
+                        range.iter().zip(target.iter()).map(|(&r, &c)| r * c).sum();
+
+                    replay_buffer.push(ReplayEntry {
+                        input,
+                        target,
+                        mask,
+                        range,
+                        game_value,
+                    });
+                }
+            }
+            handle.notify_solve_complete();
+            total_examples.fetch_add(examples.len(), std::sync::atomic::Ordering::Relaxed);
+            let done = hands_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+            // Progress logging every hand (self-play hands are slow).
+            if done % 1 == 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = done as f64 / elapsed;
+                let remaining = (sp_config.num_hands - done) as f64 / rate;
+                let examples_so_far = total_examples.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "Self-play: {}/{} hands, {} examples, {:.1} hands/s, buffer={}, eta {:.0}s",
+                    done,
+                    sp_config.num_hands,
+                    examples_so_far,
+                    rate,
+                    replay_buffer.len(),
+                    remaining,
+                );
+            }
+        });
 
     total_examples.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -674,8 +687,14 @@ mod tests {
 
         // Reach should be unchanged when all CFVs are equal.
         for i in 0..NUM_COMBOS {
-            assert_eq!(reach[0][i], 1.0, "OOP reach should be unchanged at combo {i}");
-            assert_eq!(reach[1][i], 1.0, "IP reach should be unchanged at combo {i}");
+            assert_eq!(
+                reach[0][i], 1.0,
+                "OOP reach should be unchanged at combo {i}"
+            );
+            assert_eq!(
+                reach[1][i], 1.0,
+                "IP reach should be unchanged at combo {i}"
+            );
         }
     }
 
@@ -765,7 +784,11 @@ mod tests {
         let board = vec![0, 4, 8, 12, 16]; // 2c, 3c, 4c, 5c, 6c
         let pbs = Pbs::new_uniform(board, 100, 200);
         let input = build_training_input(&pbs, 0);
-        assert_eq!(input.len(), INPUT_SIZE, "input should be {INPUT_SIZE} floats");
+        assert_eq!(
+            input.len(),
+            INPUT_SIZE,
+            "input should be {INPUT_SIZE} floats"
+        );
     }
 
     #[test]
@@ -805,7 +828,8 @@ mod tests {
                 0.0
             };
             assert_eq!(
-                input[board_start + card], expected,
+                input[board_start + card],
+                expected,
                 "board one-hot mismatch at card {card}"
             );
         }
@@ -822,7 +846,8 @@ mod tests {
         for rank in 0..13usize {
             let expected = if rank <= 2 { 1.0 } else { 0.0 };
             assert_eq!(
-                input[rank_start + rank], expected,
+                input[rank_start + rank],
+                expected,
                 "rank presence mismatch at rank {rank}"
             );
         }
@@ -863,10 +888,7 @@ mod tests {
 
         // Combo containing card 0 (2c, which is on the board) should be 0.
         let blocked_idx = combo_index(0, 1);
-        assert_eq!(
-            input[blocked_idx], 0.0,
-            "blocked combo should have 0 reach"
-        );
+        assert_eq!(input[blocked_idx], 0.0, "blocked combo should have 0 reach");
     }
 
     // -----------------------------------------------------------------------

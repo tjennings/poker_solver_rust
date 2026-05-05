@@ -5,8 +5,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::extract::{NodeType, TerminalData, TreeTopology};
-use crate::gpu::{compute_hand_parallel_shared_mem, GpuHandParallelState, HandParallelKernel};
-use crate::solver::{build_mega_terminal_data, build_sorted_topology, upload_or_dummy_f32, upload_or_dummy_i32};
+use crate::gpu::{GpuHandParallelState, HandParallelKernel, compute_hand_parallel_shared_mem};
+use crate::solver::{
+    build_mega_terminal_data, build_sorted_topology, upload_or_dummy_f32, upload_or_dummy_i32,
+};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
@@ -170,10 +172,7 @@ impl GpuBatchSolver {
         let d_actions_per_node = stream.clone_htod(&actions_per_node)?;
 
         // Build terminal data using a dummy initial_weights (fold/card data doesn't depend on it)
-        let dummy_weights: [Vec<f32>; 2] = [
-            vec![1.0f32; num_hands],
-            vec![1.0f32; num_hands],
-        ];
+        let dummy_weights: [Vec<f32>; 2] = [vec![1.0f32; num_hands], vec![1.0f32; num_hands]];
         let mtd = build_mega_terminal_data(topo, term, &dummy_weights, num_hands);
 
         // Upload fold data (constant across batches)
@@ -388,11 +387,9 @@ impl GpuBatchSolver {
         for (b, spec) in specs.iter().enumerate() {
             let base = b * num_folds;
             let src_len = spec.fold_payoffs_p0.len().min(num_folds);
-            batched_fold_p0[base..base + src_len]
-                .copy_from_slice(&spec.fold_payoffs_p0[..src_len]);
+            batched_fold_p0[base..base + src_len].copy_from_slice(&spec.fold_payoffs_p0[..src_len]);
             let src_len = spec.fold_payoffs_p1.len().min(num_folds);
-            batched_fold_p1[base..base + src_len]
-                .copy_from_slice(&spec.fold_payoffs_p1[..src_len]);
+            batched_fold_p1[base..base + src_len].copy_from_slice(&spec.fold_payoffs_p1[..src_len]);
         }
         let d_fold_p0 = upload_or_dummy_f32(&self.stream, &batched_fold_p0)?;
         let d_fold_p1 = upload_or_dummy_f32(&self.stream, &batched_fold_p1)?;
@@ -453,7 +450,10 @@ impl GpuBatchSolver {
                  Tree: num_edges={}, num_nodes={}, max_depth={}. \
                  Either shrink the dynamic smem layout or call \
                  set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES).",
-                self.shared_mem_bytes, self.num_edges, self.num_nodes, self.max_depth
+                self.shared_mem_bytes,
+                self.num_edges,
+                self.num_nodes,
+                self.max_depth
             );
         }
 
@@ -724,15 +724,14 @@ fn forward_walk_reach(
                 NodeType::Player { player: acting } => {
                     for a in 0..n_actions {
                         let sorted_i = sorted_start + a;
-                        let child =
-                            topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
+                        let child = topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
                         for hand in 0..h {
                             let parent_reach = reach[node_id * h + hand];
                             if acting == player {
-                                reach[child * h + hand] =
-                                    parent_reach * setup.avg_strategy[sorted_i * h + hand];
-                            } else {
                                 reach[child * h + hand] += parent_reach;
+                            } else {
+                                reach[child * h + hand] +=
+                                    parent_reach * setup.avg_strategy[sorted_i * h + hand];
                             }
                         }
                     }
@@ -740,8 +739,7 @@ fn forward_walk_reach(
                 NodeType::Chance => {
                     for a in 0..n_actions {
                         let sorted_i = sorted_start + a;
-                        let child =
-                            topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
+                        let child = topo.edge_child[setup.original_edge_for_sorted[sorted_i]];
                         for hand in 0..h {
                             reach[child * h + hand] += reach[node_id * h + hand];
                         }
@@ -899,9 +897,9 @@ pub fn compute_evs_from_strategy_sum(
                             for hand in 0..h {
                                 if acting == player {
                                     // Player's own action: weight by strategy
-                                    cfv[node_id * h + hand] +=
-                                        setup.avg_strategy[sorted_i * h + hand]
-                                            * cfv[child * h + hand];
+                                    cfv[node_id * h + hand] += setup.avg_strategy
+                                        [sorted_i * h + hand]
+                                        * cfv[child * h + hand];
                                 } else {
                                     // Opponent's action: sum all children
                                     cfv[node_id * h + hand] += cfv[child * h + hand];
@@ -937,7 +935,7 @@ mod tests {
     use crate::extract::{extract_terminal_data, extract_topology};
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, CardConfig};
+    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
 
     fn make_river_game() -> range_solver::PostFlopGame {
         let oop_range = "AA,KK,QQ,AKs".parse().unwrap();
@@ -957,10 +955,62 @@ mod tests {
             ..Default::default()
         };
         let action_tree = ActionTree::new(tree_config).unwrap();
-        let mut game =
-            range_solver::PostFlopGame::with_config(card_config, action_tree).unwrap();
+        let mut game = range_solver::PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
         game
+    }
+
+    #[test]
+    fn compute_reach_at_nodes_uses_opponent_reach() {
+        use super::*;
+        use crate::extract::{NodeType, TreeTopology};
+
+        let topo = TreeTopology {
+            num_nodes: 5,
+            num_edges: 4,
+            node_type: vec![
+                NodeType::Player { player: 0 },
+                NodeType::Player { player: 1 },
+                NodeType::Showdown,
+                NodeType::Showdown,
+                NodeType::Showdown,
+            ],
+            node_depth: vec![0, 1, 1, 2, 2],
+            node_arena_index: vec![0; 5],
+            node_amount: vec![0; 5],
+            node_turn: vec![255; 5],
+            node_river: vec![255; 5],
+            node_num_actions: vec![2, 2, 0, 0, 0],
+            edge_parent: vec![0, 0, 1, 1],
+            edge_child: vec![1, 2, 3, 4],
+            edge_action_index: vec![0, 1, 0, 1],
+            max_depth: 2,
+            level_nodes: vec![vec![0], vec![1, 2], vec![3, 4]],
+            level_edges: vec![vec![], vec![0, 1], vec![2, 3]],
+            fold_nodes: vec![],
+            showdown_nodes: vec![2, 3, 4],
+            chance_nodes: vec![],
+            player_nodes: [vec![0], vec![1]],
+        };
+
+        // One hand, edges are sorted by parent depth: root actions then node-1 actions.
+        let strategy_sum = vec![0.25, 0.75, 0.20, 0.80];
+        let initial_weights = [vec![0.60], vec![0.40]];
+        let reach = compute_reach_at_nodes(&topo, &strategy_sum, &initial_weights, 1, &[1, 2, 3, 4]);
+
+        // For P0 traversal, reach is P1/opponent reach: P0 actions do not
+        // attenuate it, P1 actions do.
+        assert!((reach[0][0] - 0.40).abs() < 1e-6);
+        assert!((reach[0][1] - 0.40).abs() < 1e-6);
+        assert!((reach[0][2] - 0.08).abs() < 1e-6);
+        assert!((reach[0][3] - 0.32).abs() < 1e-6);
+
+        // For P1 traversal, reach is P0/opponent reach: P0 actions do
+        // attenuate it, P1 actions do not.
+        assert!((reach[1][0] - 0.15).abs() < 1e-6);
+        assert!((reach[1][1] - 0.45).abs() < 1e-6);
+        assert!((reach[1][2] - 0.15).abs() < 1e-6);
+        assert!((reach[1][3] - 0.15).abs() < 1e-6);
     }
 
     #[test]
@@ -973,7 +1023,11 @@ mod tests {
         let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
 
         let solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100);
-        assert!(solver.is_ok(), "GpuBatchSolver::new failed: {:?}", solver.err());
+        assert!(
+            solver.is_ok(),
+            "GpuBatchSolver::new failed: {:?}",
+            solver.err()
+        );
     }
 
     #[test]
@@ -1017,7 +1071,10 @@ mod tests {
         for r in &results {
             assert_eq!(r.strategy_sum.len(), topo.num_edges * num_hands);
             let total: f32 = r.strategy_sum.iter().map(|x| x.abs()).sum();
-            assert!(total > 0.0, "each subgame should have non-zero strategy_sum");
+            assert!(
+                total > 0.0,
+                "each subgame should have non-zero strategy_sum"
+            );
         }
     }
 
@@ -1160,7 +1217,11 @@ mod tests {
         // All EVs should be finite
         for p in 0..2 {
             for h in 0..num_hands {
-                assert!(evs[p][h].is_finite(), "EV[{p}][{h}] is not finite: {}", evs[p][h]);
+                assert!(
+                    evs[p][h].is_finite(),
+                    "EV[{p}][{h}] is not finite: {}",
+                    evs[p][h]
+                );
             }
         }
     }
@@ -1188,7 +1249,10 @@ mod tests {
         let incremental = solver2.extract_results().unwrap();
 
         assert_eq!(baseline.len(), incremental.len());
-        assert_eq!(baseline[0].strategy_sum.len(), incremental[0].strategy_sum.len());
+        assert_eq!(
+            baseline[0].strategy_sum.len(),
+            incremental[0].strategy_sum.len()
+        );
 
         // strategy_sum must match within 1e-4
         for (i, (b, inc)) in baseline[0]
@@ -1209,7 +1273,7 @@ mod tests {
     #[ignore = "requires CUDA/NVRTC runtime libraries"]
     fn turn_leaf_injection_incremental() {
         use super::*;
-        use crate::extract::{extract_terminal_data, extract_topology, NodeType};
+        use crate::extract::{NodeType, extract_terminal_data, extract_topology};
 
         // Use a river game and pick some internal nodes as "leaf injection" targets
         // to verify the machinery works end-to-end.
@@ -1242,7 +1306,9 @@ mod tests {
         let num_leaves = leaf_node_ids.len();
 
         let mut solver = GpuBatchSolver::new(&topo, &term, 4, num_hands, 100).unwrap();
-        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths).unwrap();
+        solver
+            .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+            .unwrap();
 
         let spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
         solver.prepare_batch(&[spec]).unwrap();
@@ -1281,7 +1347,9 @@ mod tests {
 
         let leaf_node_ids = vec![1i32, 2];
         let leaf_depths = vec![1i32, 1];
-        solver.set_leaf_injection(&leaf_node_ids, &leaf_depths).unwrap();
+        solver
+            .set_leaf_injection(&leaf_node_ids, &leaf_depths)
+            .unwrap();
 
         assert_eq!(solver.num_leaves, 2);
     }
@@ -1375,8 +1443,7 @@ mod tests {
             ..Default::default()
         };
         let action_tree = ActionTree::new(tree_config).unwrap();
-        let mut game =
-            range_solver::PostFlopGame::with_config(card_config, action_tree).unwrap();
+        let mut game = range_solver::PostFlopGame::with_config(card_config, action_tree).unwrap();
         game.allocate_memory(false);
         game
     }
@@ -1637,8 +1704,7 @@ mod tests {
             }
         }
 
-        let mut solver =
-            GpuBatchSolver::new(&topo, &term, batch_size, num_hands, 100).unwrap();
+        let mut solver = GpuBatchSolver::new(&topo, &term, batch_size, num_hands, 100).unwrap();
         solver
             .set_leaf_injection(&leaf_node_ids, &leaf_depths)
             .unwrap();
@@ -1697,8 +1763,7 @@ mod tests {
         );
         // Use every showdown node as a leaf injection point so all terminal
         // values come from injection.
-        let leaf_node_ids: Vec<i32> =
-            topo.showdown_nodes.iter().map(|&n| n as i32).collect();
+        let leaf_node_ids: Vec<i32> = topo.showdown_nodes.iter().map(|&n| n as i32).collect();
         let leaf_depths: Vec<i32> = topo
             .showdown_nodes
             .iter()
@@ -1720,8 +1785,7 @@ mod tests {
         // Two specs in the batch, each with distinct leaf CFV values so we can
         // prove per-batch slot indexing is correct.
         let batch_size = 2;
-        let specs: Vec<SubgameSpec> =
-            (0..batch_size).map(|_| spec_none.clone()).collect();
+        let specs: Vec<SubgameSpec> = (0..batch_size).map(|_| spec_none.clone()).collect();
 
         // Distinct per-batch leaf CFVs to force different strategies.
         let per_game = num_leaves * num_hands;
@@ -1739,8 +1803,7 @@ mod tests {
             }
         }
 
-        let mut solver =
-            GpuBatchSolver::new(&topo, &term, batch_size, num_hands, 100).unwrap();
+        let mut solver = GpuBatchSolver::new(&topo, &term, batch_size, num_hands, 100).unwrap();
         solver
             .set_leaf_injection(&leaf_node_ids, &leaf_depths)
             .unwrap();
@@ -1795,8 +1858,7 @@ mod tests {
         let term = extract_terminal_data(&game, &topo);
         let num_hands = game.private_cards(0).len().max(game.private_cards(1).len());
 
-        let mut solver =
-            GpuBatchSolver::new(&topo, &term, 2, num_hands, 10).unwrap();
+        let mut solver = GpuBatchSolver::new(&topo, &term, 2, num_hands, 10).unwrap();
 
         let base_spec = SubgameSpec::from_game(&game, &topo, &term, num_hands);
         let spec_none = SubgameSpec {
@@ -1811,5 +1873,4 @@ mod tests {
         // Mixed batch must panic in debug.
         solver.prepare_batch(&[spec_none, spec_some]).unwrap();
     }
-
 }

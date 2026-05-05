@@ -60,10 +60,7 @@ pub(crate) fn mul_slice_scalar_uninit(dst: &mut [MaybeUninit<f32>], src: &[f32],
 }
 
 #[inline]
-pub(crate) fn sum_slices_uninit<'a>(
-    dst: &'a mut [MaybeUninit<f32>],
-    src: &[f32],
-) -> &'a mut [f32] {
+pub(crate) fn sum_slices_uninit<'a>(dst: &'a mut [MaybeUninit<f32>], src: &[f32]) -> &'a mut [f32] {
     let len = dst.len();
     dst.iter_mut().zip(src).for_each(|(d, s)| {
         d.write(*s);
@@ -125,10 +122,7 @@ pub(crate) fn fma_slices_uninit<'a>(
 }
 
 #[inline]
-pub(crate) fn max_slices_uninit<'a>(
-    dst: &'a mut [MaybeUninit<f32>],
-    src: &[f32],
-) -> &'a mut [f32] {
+pub(crate) fn max_slices_uninit<'a>(dst: &'a mut [MaybeUninit<f32>], src: &[f32]) -> &'a mut [f32] {
     let len = dst.len();
     dst.iter_mut().zip(src).for_each(|(d, s)| {
         d.write(*s);

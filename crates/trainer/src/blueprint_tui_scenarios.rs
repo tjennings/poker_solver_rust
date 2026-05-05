@@ -3,9 +3,9 @@
 
 use rand::seq::SliceRandom;
 
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
-use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::poker::{self, Card, full_deck};
 
 use crate::blueprint_tui_widgets::CellStrategy;
@@ -145,21 +145,25 @@ pub fn extract_strategy_grid(
             let bucket = if street_idx == 0 {
                 // Preflop: canonical hand index mod bucket count.
                 let hand = poker_solver_core::hands::CanonicalHand::from_matrix_position(
-                    row as usize, col as usize,
-                ).expect("valid 13x13 matrix position");
+                    row as usize,
+                    col as usize,
+                )
+                .expect("valid 13x13 matrix position");
                 (hand.index() as u16) % num_buckets
             } else {
                 // Postflop: equity-based bucketing matching the solver.
                 let hand = poker_solver_core::hands::CanonicalHand::from_matrix_position(
-                    row as usize, col as usize,
-                ).expect("valid 13x13 matrix position");
-                let combo = hand.combos().into_iter().find(|(c1, c2)| {
-                    !board.contains(c1) && !board.contains(c2)
-                });
+                    row as usize,
+                    col as usize,
+                )
+                .expect("valid 13x13 matrix position");
+                let combo = hand
+                    .combos()
+                    .into_iter()
+                    .find(|(c1, c2)| !board.contains(c1) && !board.contains(c2));
                 if let Some((c1, c2)) = combo {
-                    let equity = poker_solver_core::showdown_equity::compute_equity(
-                        [c1, c2], board,
-                    );
+                    let equity =
+                        poker_solver_core::showdown_equity::compute_equity([c1, c2], board);
                     ((equity * f64::from(num_buckets)) as u16).min(num_buckets - 1)
                 } else {
                     0 // hand fully blocked by board
@@ -175,8 +179,10 @@ pub fn extract_strategy_grid(
 
             let ev = hand_evs.map(|evs| {
                 let hand = poker_solver_core::hands::CanonicalHand::from_matrix_position(
-                    row as usize, col as usize,
-                ).expect("valid 13x13 matrix position");
+                    row as usize,
+                    col as usize,
+                )
+                .expect("valid 13x13 matrix position");
                 evs[hand.index()] as f32
             });
 
@@ -199,11 +205,7 @@ pub fn decision_nodes_at_street(tree: &GameTree, street: Street) -> Vec<u32> {
         .enumerate()
         .filter_map(|(i, node)| {
             if let GameNode::Decision { street: s, .. } = node {
-                if *s == street {
-                    Some(i as u32)
-                } else {
-                    None
-                }
+                if *s == street { Some(i as u32) } else { None }
             } else {
                 None
             }
@@ -217,9 +219,7 @@ pub fn decision_nodes_at_street(tree: &GameTree, street: Street) -> Vec<u32> {
 /// e.g. "SB r2.5→call | Flop Ah 7s 2d".
 pub fn random_scenario_name(tree: &GameTree, node_idx: u32, board_display: &str) -> String {
     let player_name = match &tree.nodes[node_idx as usize] {
-        GameNode::Decision { player, .. } => {
-            tree.position_label(*player)
-        }
+        GameNode::Decision { player, .. } => tree.position_label(*player),
         _ => return "Random".to_string(),
     };
 
@@ -263,7 +263,9 @@ fn dfs_path(tree: &GameTree, current: u32, target: u32, path: &mut Vec<TreeActio
         return true;
     }
     match &tree.nodes[current as usize] {
-        GameNode::Decision { actions, children, .. } => {
+        GameNode::Decision {
+            actions, children, ..
+        } => {
             for (action, &child) in actions.iter().zip(children.iter()) {
                 path.push(*action);
                 if dfs_path(tree, child, target, path) {
@@ -367,11 +369,7 @@ mod tests {
 
     #[timed_test(10)]
     fn match_action_by_label_finds_actions() {
-        let actions = vec![
-            TreeAction::Fold,
-            TreeAction::Call,
-            TreeAction::Raise(10.0),
-        ];
+        let actions = vec![TreeAction::Fold, TreeAction::Call, TreeAction::Raise(10.0)];
         assert_eq!(match_action_by_label("fold", &actions), Some(0));
         assert_eq!(match_action_by_label("call", &actions), Some(1));
         assert_eq!(match_action_by_label("5bb", &actions), Some(2));

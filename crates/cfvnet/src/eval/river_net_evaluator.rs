@@ -154,7 +154,11 @@ where
         ip_range: &[f64],
         traverser: u8,
     ) -> Vec<f64> {
-        assert_eq!(board.len(), 4, "RiverNetEvaluator requires a 4-card turn board");
+        assert_eq!(
+            board.len(),
+            4,
+            "RiverNetEvaluator requires a 4-card turn board"
+        );
         assert_eq!(combos.len(), oop_range.len());
         assert_eq!(combos.len(), ip_range.len());
 
@@ -183,9 +187,8 @@ where
                 continue;
             }
 
-            let river_board_u8: [u8; 5] = [
-                board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
-            ];
+            let river_board_u8: [u8; 5] =
+                [board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8];
 
             let mut oop_1326 = [0.0_f32; OUTPUT_SIZE];
             let mut ip_1326 = [0.0_f32; OUTPUT_SIZE];
@@ -294,9 +297,8 @@ where
                 continue;
             }
 
-            let river_board_u8: [u8; 5] = [
-                board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
-            ];
+            let river_board_u8: [u8; 5] =
+                [board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8];
 
             let mut oop_1326 = [0.0_f32; OUTPUT_SIZE];
             let mut ip_1326 = [0.0_f32; OUTPUT_SIZE];
@@ -396,9 +398,7 @@ where
         let board_u8: Vec<u8> = board.iter().map(|c| rs_card_to_u8(*c)).collect();
 
         // Valid river cards (shared across all requests).
-        let valid_rivers: Vec<u8> = (0u8..52)
-            .filter(|r| !board_u8.contains(r))
-            .collect();
+        let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !board_u8.contains(r)).collect();
         let rivers_per_request = valid_rivers.len();
 
         // Per-river combo validity masks (shared across requests).
@@ -418,9 +418,8 @@ where
 
         for &(pot, effective_stack, traverser) in requests {
             for (ri, &river_u8) in valid_rivers.iter().enumerate() {
-                let river_board_u8: [u8; 5] = [
-                    board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8,
-                ];
+                let river_board_u8: [u8; 5] =
+                    [board_u8[0], board_u8[1], board_u8[2], board_u8[3], river_u8];
 
                 let mut oop_1326 = [0.0_f32; OUTPUT_SIZE];
                 let mut ip_1326 = [0.0_f32; OUTPUT_SIZE];
@@ -580,10 +579,8 @@ mod tests {
         let oop_range = vec![1.0 / n as f64; n];
         let ip_range = vec![1.0 / n as f64; n];
 
-        let oop_result =
-            evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
-        let ip_result =
-            evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 1);
+        let oop_result = evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
+        let ip_result = evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 1);
 
         assert_eq!(oop_result.len(), n);
         assert_eq!(ip_result.len(), n);
@@ -594,7 +591,10 @@ mod tests {
             .zip(ip_result.iter())
             .map(|(a, b)| (a - b).abs())
             .sum();
-        assert!(diff > 1e-10, "OOP and IP results should differ, diff={diff}");
+        assert!(
+            diff > 1e-10,
+            "OOP and IP results should differ, diff={diff}"
+        );
     }
 
     #[test]
@@ -631,8 +631,7 @@ mod tests {
         let oop_range = vec![1.0 / n as f64; n];
         let ip_range = vec![1.0 / n as f64; n];
 
-        let shared_result =
-            shared.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
+        let shared_result = shared.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
         let seq_result =
             sequential.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
 

@@ -12,11 +12,11 @@
 
 use rand::Rng;
 
+use super::MAX_PLAYERS;
 use super::game_tree::{MpGameNode, MpGameTree, TerminalKind};
 use super::storage::{MpStorage, REGRET_SCALE, STRATEGY_SCALE};
 use super::terminal::{resolve_fold, resolve_showdown};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat};
-use super::MAX_PLAYERS;
 use crate::blueprint_mp::types::Deal;
 use crate::poker::{Card, FlatDeck, Hand, Rank, Rankable};
 
@@ -95,12 +95,29 @@ pub fn traverse_external(
             contributions,
             ..
         } => {
-            let v = terminal_value(kind, contributions, deal, traverser, tree.num_players, rake_rate, rake_cap);
+            let v = terminal_value(
+                kind,
+                contributions,
+                deal,
+                traverser,
+                tree.num_players,
+                rake_rate,
+                rake_cap,
+            );
             (v, PruneStats::default())
         }
-        MpGameNode::Chance { child, .. } => {
-            traverse_external(tree, storage, deal, traverser, *child, rng, rake_rate, rake_cap, prune, prune_threshold)
-        }
+        MpGameNode::Chance { child, .. } => traverse_external(
+            tree,
+            storage,
+            deal,
+            traverser,
+            *child,
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
+        ),
         MpGameNode::Decision {
             seat,
             street,
@@ -110,15 +127,35 @@ pub fn traverse_external(
             let bucket = deal.buckets[seat.index() as usize][street.index()].0;
             if *seat == traverser {
                 traverse_traverser(
-                    tree, storage, deal, traverser, node_idx, bucket,
-                    children, actions.len(), rng, rake_rate, rake_cap,
-                    prune, prune_threshold,
+                    tree,
+                    storage,
+                    deal,
+                    traverser,
+                    node_idx,
+                    bucket,
+                    children,
+                    actions.len(),
+                    rng,
+                    rake_rate,
+                    rake_cap,
+                    prune,
+                    prune_threshold,
                 )
             } else {
                 traverse_opponent(
-                    tree, storage, deal, traverser, node_idx, bucket,
-                    children, actions.len(), rng, rake_rate, rake_cap,
-                    prune, prune_threshold,
+                    tree,
+                    storage,
+                    deal,
+                    traverser,
+                    node_idx,
+                    bucket,
+                    children,
+                    actions.len(),
+                    rng,
+                    rake_rate,
+                    rake_cap,
+                    prune,
+                    prune_threshold,
                 )
             }
         }
@@ -151,19 +188,46 @@ fn traverse_traverser(
     let mut stats = PruneStats::default();
 
     for a in 0..num_actions {
-        if should_prune_action(tree, storage, prune, prune_threshold, children[a], node_idx, bucket, a, &mut stats) {
+        if should_prune_action(
+            tree,
+            storage,
+            prune,
+            prune_threshold,
+            children[a],
+            node_idx,
+            bucket,
+            a,
+            &mut stats,
+        ) {
             pruned[a] = true;
             continue;
         }
         let (v, child_stats) = traverse_external(
-            tree, storage, deal, traverser, children[a], rng, rake_rate, rake_cap, prune, prune_threshold,
+            tree,
+            storage,
+            deal,
+            traverser,
+            children[a],
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
         );
         values[a] = v;
         node_value += strategy[a] * v;
         stats.merge(child_stats);
     }
 
-    update_regrets_with_pruning(storage, node_idx, bucket, num_actions, &values, &pruned, node_value);
+    update_regrets_with_pruning(
+        storage,
+        node_idx,
+        bucket,
+        num_actions,
+        &values,
+        &pruned,
+        node_value,
+    );
     update_traverser_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
     (node_value, stats)
 }
@@ -258,8 +322,16 @@ fn traverse_opponent(
     storage.add_strategy_sum(node_idx, bucket, sampled, delta);
 
     traverse_external(
-        tree, storage, deal, traverser, children[sampled], rng, rake_rate, rake_cap,
-        prune, prune_threshold,
+        tree,
+        storage,
+        deal,
+        traverser,
+        children[sampled],
+        rng,
+        rake_rate,
+        rake_cap,
+        prune,
+        prune_threshold,
     )
 }
 
@@ -297,7 +369,12 @@ pub fn terminal_value(
         TerminalKind::Showdown { active } => {
             let hand_ranks = rank_active_hands(deal, *active, num_players);
             let payoffs = resolve_showdown(
-                contributions, &hand_ranks, *active, num_players, rake_rate, rake_cap,
+                contributions,
+                &hand_ranks,
+                *active,
+                num_players,
+                rake_rate,
+                rake_cap,
             );
             payoffs[traverser.index() as usize].0
         }
@@ -504,7 +581,10 @@ mod tests {
             .regrets
             .iter()
             .any(|r| r.load(std::sync::atomic::Ordering::Relaxed) != 0);
-        assert!(any_nonzero, "at least one regret should be non-zero after traversal");
+        assert!(
+            any_nonzero,
+            "at least one regret should be non-zero after traversal"
+        );
     }
 
     #[timed_test]
@@ -565,14 +645,30 @@ mod tests {
         let deal = sample_deal(2, &mut rng);
         let dwb = trivial_buckets(&deal, [10, 10, 10, 10]);
 
-        let value = terminal_value(&kind, &contributions, &dwb, Seat::from_raw(0), 2, 0.0, Chips::ZERO);
+        let value = terminal_value(
+            &kind,
+            &contributions,
+            &dwb,
+            Seat::from_raw(0),
+            2,
+            0.0,
+            Chips::ZERO,
+        );
         assert!(
             (value - (-1.0)).abs() < 1e-10,
             "P0 should lose 1.0 on fold, got {value}"
         );
 
         // P1 should win 1.0 net
-        let value_p1 = terminal_value(&kind, &contributions, &dwb, Seat::from_raw(1), 2, 0.0, Chips::ZERO);
+        let value_p1 = terminal_value(
+            &kind,
+            &contributions,
+            &dwb,
+            Seat::from_raw(1),
+            2,
+            0.0,
+            Chips::ZERO,
+        );
         assert!(
             (value_p1 - 1.0).abs() < 1e-10,
             "P1 should win 1.0 on fold, got {value_p1}"
@@ -611,7 +707,10 @@ mod tests {
             .strategy_sums
             .iter()
             .any(|s| s.load(std::sync::atomic::Ordering::Relaxed) != 0);
-        assert!(any_nonzero, "after 100 iters, strategy sums should be non-zero");
+        assert!(
+            any_nonzero,
+            "after 100 iters, strategy sums should be non-zero"
+        );
     }
 
     #[timed_test]
@@ -635,7 +734,10 @@ mod tests {
             false,
             0,
         );
-        assert!(value.is_finite(), "traverse should return finite value, got {value}");
+        assert!(
+            value.is_finite(),
+            "traverse should return finite value, got {value}"
+        );
     }
 
     #[timed_test]
@@ -680,10 +782,21 @@ mod tests {
         let deal = sample_deal(2, &mut rng);
         let dwb = trivial_buckets(&deal, bucket_counts);
         let (_val, stats) = traverse_external(
-            &tree, &storage, &dwb, Seat::from_raw(0),
-            tree.root, &mut rng, 0.0, Chips::ZERO, true, -100,
+            &tree,
+            &storage,
+            &dwb,
+            Seat::from_raw(0),
+            tree.root,
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            true,
+            -100,
         );
-        assert!(stats.hits > 0, "pruning should skip negative-regret actions");
+        assert!(
+            stats.hits > 0,
+            "pruning should skip negative-regret actions"
+        );
     }
 
     #[timed_test]
@@ -698,8 +811,16 @@ mod tests {
         let deal = sample_deal(2, &mut rng);
         let dwb = trivial_buckets(&deal, bucket_counts);
         let (_val, stats) = traverse_external(
-            &tree, &storage, &dwb, Seat::from_raw(0),
-            tree.root, &mut rng, 0.0, Chips::ZERO, false, -100,
+            &tree,
+            &storage,
+            &dwb,
+            Seat::from_raw(0),
+            tree.root,
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            -100,
         );
         assert_eq!(stats.hits, 0, "no pruning when prune=false");
     }
@@ -718,12 +839,23 @@ mod tests {
         let deal = sample_deal(2, &mut rng);
         let dwb = trivial_buckets(&deal, bucket_counts);
         let (val, _stats) = traverse_external(
-            &tree, &storage, &dwb, Seat::from_raw(0),
-            tree.root, &mut rng, 0.0, Chips::ZERO, true, -100,
+            &tree,
+            &storage,
+            &dwb,
+            Seat::from_raw(0),
+            tree.root,
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            true,
+            -100,
         );
         // If fold was pruned, traversal would have no explored actions
         // and return 0.0 or fail. A finite value means folds were explored.
-        assert!(val.is_finite(), "traversal must still reach terminals via folds");
+        assert!(
+            val.is_finite(),
+            "traversal must still reach terminals via folds"
+        );
     }
 
     fn first_decision_node(tree: &MpGameTree) -> u32 {
@@ -733,13 +865,12 @@ mod tests {
             .expect("tree should have a decision node") as u32
     }
 
-    fn set_all_regrets_negative(
-        tree: &MpGameTree,
-        storage: &MpStorage,
-        bucket_counts: [u16; 4],
-    ) {
+    fn set_all_regrets_negative(tree: &MpGameTree, storage: &MpStorage, bucket_counts: [u16; 4]) {
         for (i, node) in tree.nodes.iter().enumerate() {
-            if let MpGameNode::Decision { actions, street, .. } = node {
+            if let MpGameNode::Decision {
+                actions, street, ..
+            } = node
+            {
                 let bkts = bucket_counts[street.index()];
                 for bucket in 0..bkts {
                     for a in 0..actions.len() {

@@ -70,11 +70,7 @@ mod tests {
                 max_iterations: 20,
                 ..Default::default()
             };
-            let mut solver = Solver::new(
-                game,
-                &solver_config,
-                strategy.clone(),
-            );
+            let mut solver = Solver::new(game, &solver_config, strategy.clone());
             let solved = loop {
                 match solver.step() {
                     None => continue,
@@ -124,11 +120,7 @@ mod tests {
                 max_iterations: 10,
                 ..Default::default()
             };
-            let mut solver = Solver::new(
-                game,
-                &solver_config,
-                strategy.clone(),
-            );
+            let mut solver = Solver::new(game, &solver_config, strategy.clone());
             let solved = loop {
                 match solver.step() {
                     None => continue,

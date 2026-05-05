@@ -10,8 +10,8 @@
     clippy::too_many_arguments
 )]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Global prune counters — accumulated per batch, read+reset by TUI bridge.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -21,12 +21,12 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
+use super::MAX_PLAYERS;
 use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
 use super::game_tree::MpGameTree;
 use super::mccfr::{sample_deal, traverse_external};
 use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
-use super::MAX_PLAYERS;
 use crate::blueprint_v2::mccfr::AllBuckets;
 use crate::blueprint_v2::trainer::load_bucket_files;
 
@@ -132,9 +132,17 @@ fn training_loop(
 
         let prune = should_prune(meta_iter, config, &mut rng);
         run_batch(
-            tree, storage, all_buckets, num_players, bucket_counts,
-            rake_rate, rake_cap, batch, meta_iter,
-            prune, scaled_threshold,
+            tree,
+            storage,
+            all_buckets,
+            num_players,
+            bucket_counts,
+            rake_rate,
+            rake_cap,
+            batch,
+            meta_iter,
+            prune,
+            scaled_threshold,
         );
         meta_iter += batch;
         iterations.store(meta_iter, Ordering::Relaxed);
@@ -180,21 +188,34 @@ fn run_batch(
     let batch_stats: PruneStats = (0..batch_size)
         .into_par_iter()
         .map(|i| {
-            let seed = base_iter.wrapping_add(i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let seed = base_iter
+                .wrapping_add(i)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut rng = SmallRng::seed_from_u64(seed);
             let deal = sample_deal(num_players, &mut rng);
             let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
             let mut local = PruneStats::default();
             for traverser in 0..num_players {
                 let (_, stats) = traverse_external(
-                    tree, storage, &buckets, Seat::from_raw(traverser),
-                    tree.root, &mut rng, rake_rate, rake_cap, prune, prune_threshold,
+                    tree,
+                    storage,
+                    &buckets,
+                    Seat::from_raw(traverser),
+                    tree.root,
+                    &mut rng,
+                    rake_rate,
+                    rake_cap,
+                    prune,
+                    prune_threshold,
                 );
                 local.merge(stats);
             }
             local
         })
-        .reduce(PruneStats::default, |mut a, b| { a.merge(b); a });
+        .reduce(PruneStats::default, |mut a, b| {
+            a.merge(b);
+            a
+        });
     PRUNE_HITS.fetch_add(batch_stats.hits, Ordering::Relaxed);
     PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
 }
@@ -239,22 +260,30 @@ fn strategy_discount_factor(epoch: u64, gamma: f64) -> f64 {
 }
 
 /// Compute bucket assignments for a deal using real clustering when available.
-fn compute_deal_buckets(deal: &Deal, all_buckets: &AllBuckets, bucket_counts: [u16; 4]) -> DealWithBuckets {
+fn compute_deal_buckets(
+    deal: &Deal,
+    all_buckets: &AllBuckets,
+    bucket_counts: [u16; 4],
+) -> DealWithBuckets {
     use crate::blueprint_v2::Street as V2Street;
-    let streets = [V2Street::Preflop, V2Street::Flop, V2Street::Turn, V2Street::River];
-    let board_slices: [&[crate::poker::Card]; 4] = [
-        &[],
-        &deal.board[..3],
-        &deal.board[..4],
-        &deal.board[..5],
+    let streets = [
+        V2Street::Preflop,
+        V2Street::Flop,
+        V2Street::Turn,
+        V2Street::River,
     ];
+    let board_slices: [&[crate::poker::Card]; 4] =
+        [&[], &deal.board[..3], &deal.board[..4], &deal.board[..5]];
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
     for p in 0..deal.num_players as usize {
         for (s, (&street, board)) in streets.iter().zip(board_slices.iter()).enumerate() {
             buckets[p][s] = Bucket(all_buckets.get_bucket(street, deal.hole_cards[p], board));
         }
     }
-    DealWithBuckets { deal: deal.clone(), buckets }
+    DealWithBuckets {
+        deal: deal.clone(),
+        buckets,
+    }
 }
 
 /// Trivial fallback bucketing (for tests without cluster files).
@@ -631,8 +660,14 @@ mod tests {
         apply_dcfr_discount(&storage, 100, &config);
 
         let after = storage.get_regret(first_decision_node(&tree), 0, 0);
-        assert!(after < 1000, "positive regret should be discounted, got {after}");
-        assert!(after > 0, "positive regret should stay positive, got {after}");
+        assert!(
+            after < 1000,
+            "positive regret should be discounted, got {after}"
+        );
+        assert!(
+            after > 0,
+            "positive regret should stay positive, got {after}"
+        );
     }
 
     #[timed_test]
@@ -647,7 +682,10 @@ mod tests {
         apply_dcfr_discount(&storage, 100, &config);
 
         let after = storage.get_strategy_sum(node, 0, 0);
-        assert!(after < 10_000, "strategy sum should be discounted, got {after}");
+        assert!(
+            after < 10_000,
+            "strategy sum should be discounted, got {after}"
+        );
         assert!(after > 0, "strategy sum should stay positive, got {after}");
     }
 
@@ -663,7 +701,10 @@ mod tests {
         apply_dcfr_discount(&storage, 100, &config);
 
         let after = storage.get_regret(node, 0, 0);
-        assert!(after > -500, "negative regret should be discounted toward zero");
+        assert!(
+            after > -500,
+            "negative regret should be discounted toward zero"
+        );
         assert!(after <= 0, "negative regret should stay non-positive");
     }
 
@@ -676,7 +717,19 @@ mod tests {
         let storage = MpStorage::new(&tree, bucket_counts);
 
         let ab = test_all_buckets(bucket_counts);
-        run_batch(&tree, &storage, &ab, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
+        run_batch(
+            &tree,
+            &storage,
+            &ab,
+            2,
+            bucket_counts,
+            0.0,
+            Chips::ZERO,
+            20,
+            0,
+            false,
+            0,
+        );
 
         let any_nonzero = storage
             .regrets
@@ -692,13 +745,28 @@ mod tests {
         let storage = MpStorage::new(&tree, bucket_counts);
 
         let ab = test_all_buckets(bucket_counts);
-        run_batch(&tree, &storage, &ab, 2, bucket_counts, 0.0, Chips::ZERO, 20, 0, false, 0);
+        run_batch(
+            &tree,
+            &storage,
+            &ab,
+            2,
+            bucket_counts,
+            0.0,
+            Chips::ZERO,
+            20,
+            0,
+            false,
+            0,
+        );
 
         let any_nonzero = storage
             .strategy_sums
             .iter()
             .any(|s| s.load(Ordering::Relaxed) != 0);
-        assert!(any_nonzero, "run_batch should produce non-zero strategy sums");
+        assert!(
+            any_nonzero,
+            "run_batch should produce non-zero strategy sums"
+        );
     }
 
     #[timed_test]
@@ -708,13 +776,28 @@ mod tests {
         let storage = MpStorage::new(&tree, bucket_counts);
 
         let ab = test_all_buckets(bucket_counts);
-        run_batch(&tree, &storage, &ab, 3, bucket_counts, 0.0, Chips::ZERO, 10, 0, false, 0);
+        run_batch(
+            &tree,
+            &storage,
+            &ab,
+            3,
+            bucket_counts,
+            0.0,
+            Chips::ZERO,
+            10,
+            0,
+            false,
+            0,
+        );
 
         let any_nonzero = storage
             .regrets
             .iter()
             .any(|r| r.load(Ordering::Relaxed) != 0);
-        assert!(any_nonzero, "3-player run_batch should produce non-zero regrets");
+        assert!(
+            any_nonzero,
+            "3-player run_batch should produce non-zero regrets"
+        );
     }
 
     // -- iteration count edge cases --

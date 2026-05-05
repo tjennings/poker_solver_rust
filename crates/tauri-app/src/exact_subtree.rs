@@ -5,16 +5,16 @@
 //! diagnostic/eval tool — performance is not a concern, correctness is paramount.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use range_solver::action_tree::{ActionTree, TreeConfig};
 use range_solver::card::{CardConfig, NOT_DEALT};
 use range_solver::range::Range;
-use range_solver::{root_cfvalues_with_reach, BoardState, PostFlopGame};
 #[cfg(test)]
-use range_solver::{solve_step, finalize};
+use range_solver::{finalize, solve_step};
+use range_solver::{root_cfvalues_with_reach, BoardState, PostFlopGame};
 
 /// Default number of DCFR iterations for the exact subtree solve.
 const DEFAULT_SOLVE_ITERS: u32 = 500;
@@ -80,12 +80,7 @@ impl SubtreeExactEvaluator {
 /// subtree solve: pot, remaining stack, and both reach vectors. Reach values
 /// are rounded to 3 decimals; remaining_stack is rounded to 1 decimal
 /// (chip-level precision).
-fn cache_key(
-    pot: i32,
-    remaining_stack: f64,
-    oop_reach: &[f32],
-    ip_reach: &[f32],
-) -> u64 {
+fn cache_key(pot: i32, remaining_stack: f64, oop_reach: &[f32], ip_reach: &[f32]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     pot.hash(&mut hasher);
@@ -187,39 +182,35 @@ fn solve_subtree(
     }
 
     let half_pot = pot as f64 / 2.0;
-    let num_combos = num_combinations_from_private_cards(
-        &game_private_cards[0],
-        &game_private_cards[1],
-    );
+    let num_combos =
+        num_combinations_from_private_cards(&game_private_cards[0], &game_private_cards[1]);
 
     // Remap parent reach to subtree hand ordering for cfreach_adj.
-    let sub_oop_reach = remap_reach_to_subtree(
-        oop_reach, private_cards, &game_private_cards[0], 0,
-    );
-    let sub_ip_reach = remap_reach_to_subtree(
-        ip_reach, private_cards, &game_private_cards[1], 1,
-    );
+    let sub_oop_reach = remap_reach_to_subtree(oop_reach, private_cards, &game_private_cards[0], 0);
+    let sub_ip_reach = remap_reach_to_subtree(ip_reach, private_cards, &game_private_cards[1], 1);
 
     // Convert cfvalues to bcfv format:
     // bcfv[h] = cfv[h] * N / (half_pot * cfreach_adj[h])
     let oop_bcfv = cfv_to_bcfv(
-        &oop_raw, &game_private_cards[0],
-        &game_private_cards[1], &sub_ip_reach,
-        half_pot, num_combos,
+        &oop_raw,
+        &game_private_cards[0],
+        &game_private_cards[1],
+        &sub_ip_reach,
+        half_pot,
+        num_combos,
     );
     let ip_bcfv = cfv_to_bcfv(
-        &ip_raw, &game_private_cards[1],
-        &game_private_cards[0], &sub_oop_reach,
-        half_pot, num_combos,
+        &ip_raw,
+        &game_private_cards[1],
+        &game_private_cards[0],
+        &sub_oop_reach,
+        half_pot,
+        num_combos,
     );
 
     // Remap from subtree ordering to parent ordering
-    let oop_out = remap_cfvs_to_parent(
-        &oop_bcfv, &game_private_cards[0], &private_cards[0],
-    );
-    let ip_out = remap_cfvs_to_parent(
-        &ip_bcfv, &game_private_cards[1], &private_cards[1],
-    );
+    let oop_out = remap_cfvs_to_parent(&oop_bcfv, &game_private_cards[0], &private_cards[0]);
+    let ip_out = remap_cfvs_to_parent(&ip_bcfv, &game_private_cards[1], &private_cards[1]);
     (oop_out, ip_out)
 }
 
@@ -255,12 +246,8 @@ fn solve_subtree_raw(
         return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
     }
 
-    let oop_out = remap_cfvs_to_parent(
-        &oop_raw, &game_private_cards[0], &private_cards[0],
-    );
-    let ip_out = remap_cfvs_to_parent(
-        &ip_raw, &game_private_cards[1], &private_cards[1],
-    );
+    let oop_out = remap_cfvs_to_parent(&oop_raw, &game_private_cards[0], &private_cards[0]);
+    let ip_out = remap_cfvs_to_parent(&ip_raw, &game_private_cards[1], &private_cards[1]);
     (oop_out, ip_out)
 }
 
@@ -283,8 +270,7 @@ fn solve_subtree_raw_inner(
 
     let card_config = build_card_config(board, private_cards, parent_weights);
     let initial_state = board_state_from_len(board.len());
-    let effective_stack =
-        (pot / 2).saturating_add(remaining_stack.round() as i32);
+    let effective_stack = (pot / 2).saturating_add(remaining_stack.round() as i32);
 
     let tree_config = TreeConfig {
         initial_state,
@@ -295,8 +281,8 @@ fn solve_subtree_raw_inner(
         ..Default::default()
     };
 
-    let tree = ActionTree::new(tree_config)
-        .unwrap_or_else(|e| panic!("subtree ActionTree failed: {e}"));
+    let tree =
+        ActionTree::new(tree_config).unwrap_or_else(|e| panic!("subtree ActionTree failed: {e}"));
     let mut game = PostFlopGame::with_config(card_config, tree)
         .unwrap_or_else(|e| panic!("subtree PostFlopGame failed: {e}"));
     game.allocate_memory(false);
@@ -304,12 +290,8 @@ fn solve_subtree_raw_inner(
     range_solver::solve(&mut game, solve_iters, target_exploitability, false);
 
     // Remap parent reach to subtree hand ordering
-    let sub_oop_reach = remap_reach_to_subtree(
-        oop_reach, private_cards, game.private_cards(0), 0,
-    );
-    let sub_ip_reach = remap_reach_to_subtree(
-        ip_reach, private_cards, game.private_cards(1), 1,
-    );
+    let sub_oop_reach = remap_reach_to_subtree(oop_reach, private_cards, game.private_cards(0), 0);
+    let sub_ip_reach = remap_reach_to_subtree(ip_reach, private_cards, game.private_cards(1), 1);
 
     // Compute cfvalues using actual boundary reach
     let oop_cfv = root_cfvalues_with_reach(&game, 0, &sub_ip_reach);
@@ -325,10 +307,7 @@ fn solve_subtree_raw_inner(
     )
 }
 
-fn num_combinations_from_private_cards(
-    oop_cards: &[(u8, u8)],
-    ip_cards: &[(u8, u8)],
-) -> f64 {
+fn num_combinations_from_private_cards(oop_cards: &[(u8, u8)], ip_cards: &[(u8, u8)]) -> f64 {
     let mut n = 0.0;
     for &(o1, o2) in oop_cards {
         for &(i1, i2) in ip_cards {
@@ -400,8 +379,7 @@ fn remap_reach_to_subtree(
     player: usize,
 ) -> Vec<f32> {
     let parent_cards = &parent_private_cards[player];
-    let mut map: HashMap<(u8, u8), f32> =
-        HashMap::with_capacity(parent_cards.len());
+    let mut map: HashMap<(u8, u8), f32> = HashMap::with_capacity(parent_cards.len());
     for (i, &(c1, c2)) in parent_cards.iter().enumerate() {
         let key = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
         let r = parent_reach.get(i).copied().unwrap_or(0.0);
@@ -422,8 +400,7 @@ fn remap_cfvs_to_parent(
     subtree_cards: &[(u8, u8)],
     parent_cards: &[(u8, u8)],
 ) -> Vec<f32> {
-    let mut map: HashMap<(u8, u8), f32> =
-        HashMap::with_capacity(subtree_cards.len());
+    let mut map: HashMap<(u8, u8), f32> = HashMap::with_capacity(subtree_cards.len());
     for (i, &(c1, c2)) in subtree_cards.iter().enumerate() {
         let key = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
         let cfv = subtree_cfvs.get(i).copied().unwrap_or(0.0);
@@ -470,10 +447,19 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
             (num_opp, num_hands)
         };
         let (oop_cfvs, ip_cfvs) = self.compute_cfvs_both(
-            pot, remaining_stack, &oop_reach, &ip_reach,
-            num_oop, num_ip, 0,
+            pot,
+            remaining_stack,
+            &oop_reach,
+            &ip_reach,
+            num_oop,
+            num_ip,
+            0,
         );
-        if player == 0 { oop_cfvs } else { ip_cfvs }
+        if player == 0 {
+            oop_cfvs
+        } else {
+            ip_cfvs
+        }
     }
 
     fn compute_cfvs_both(
@@ -564,7 +550,11 @@ fn log_progress(n_calls: u64, _was_miss: bool) {
     let hits = GLOBAL_CACHE_HITS.load(Ordering::Relaxed);
     let solve_ms = GLOBAL_SOLVE_SECS.load(Ordering::Relaxed);
     let misses = n_calls.saturating_sub(hits);
-    let hit_pct = if n_calls > 0 { (hits * 100) / n_calls } else { 0 };
+    let hit_pct = if n_calls > 0 {
+        (hits * 100) / n_calls
+    } else {
+        0
+    };
     let avg_solve_ms = if misses > 0 { solve_ms / misses } else { 0 };
     eprintln!(
         "[exact_subtree] {n_calls} calls | hits={hits} ({hit_pct}%) | misses={misses} | avg solve {avg_solve_ms}ms"
@@ -574,11 +564,11 @@ fn log_progress(n_calls: u64, _was_miss: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::flop_from_str;
     use range_solver::game::BoundaryEvaluator;
     use range_solver::interface::Game;
+    use std::sync::Arc;
 
     /// Helper: build a SubtreeExactEvaluator for a river-boundary spot.
     /// AA,KK,QQ vs TT,99,88 on 7h 5d 2c 3s 9h (balanced equities).
@@ -608,7 +598,8 @@ mod tests {
             [oop_hands.clone(), ip_hands.clone()],
             [oop_weights, ip_weights],
             tree_config,
-        ).with_solve_iters(solve_iters)
+        )
+        .with_solve_iters(solve_iters)
     }
 
     #[test]
@@ -621,9 +612,8 @@ mod tests {
 
         let oop_reach = vec![1.0f32; num_oop];
         let ip_reach = vec![1.0f32; num_ip];
-        let (oop_cfvs, ip_cfvs) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let (oop_cfvs, ip_cfvs) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
         assert_eq!(oop_cfvs.len(), num_oop);
         assert_eq!(ip_cfvs.len(), num_ip);
     }
@@ -635,9 +625,8 @@ mod tests {
         let num_ip = eval.private_cards[1].len();
         let oop_reach = vec![1.0f32; num_oop];
         let ip_reach = vec![1.0f32; num_ip];
-        let (oop_cfvs, ip_cfvs) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let (oop_cfvs, ip_cfvs) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
         for &v in &oop_cfvs {
             assert!(v.is_finite(), "OOP CFV should be finite, got {v}");
         }
@@ -653,9 +642,8 @@ mod tests {
         let num_ip = eval.private_cards[1].len();
         let oop_reach = vec![1.0f32; num_oop];
         let ip_reach = vec![1.0f32; num_ip];
-        let (oop_cfvs, ip_cfvs) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let (oop_cfvs, ip_cfvs) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
 
         let oop_positive = oop_cfvs.iter().filter(|&&v| v > 0.0).count();
         assert!(
@@ -677,12 +665,10 @@ mod tests {
         let oop_reach = vec![1.0f32; num_oop];
         let ip_reach = vec![1.0f32; num_ip];
 
-        let (oop1, ip1) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
-        let (oop2, ip2) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let (oop1, ip1) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
+        let (oop2, ip2) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
         assert_eq!(oop1, oop2, "cached OOP CFVs should match");
         assert_eq!(ip1, ip2, "cached IP CFVs should match");
     }
@@ -702,12 +688,27 @@ mod tests {
         }
 
         let (oop1, _) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach_full, &ip_reach_full, num_oop, num_ip, 0,
+            100,
+            150.0,
+            &oop_reach_full,
+            &ip_reach_full,
+            num_oop,
+            num_ip,
+            0,
         );
         let (oop2, _) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach_full, &ip_reach_half, num_oop, num_ip, 0,
+            100,
+            150.0,
+            &oop_reach_full,
+            &ip_reach_half,
+            num_oop,
+            num_ip,
+            0,
         );
-        assert_ne!(oop1, oop2, "different reaches should produce different CFVs");
+        assert_ne!(
+            oop1, oop2,
+            "different reaches should produce different CFVs"
+        );
     }
 
     #[test]
@@ -762,8 +763,7 @@ mod tests {
 
     #[test]
     fn with_target_exploitability_sets_field() {
-        let eval = make_river_evaluator(50)
-            .with_target_exploitability(1.5);
+        let eval = make_river_evaluator(50).with_target_exploitability(1.5);
         assert!(
             (eval.target_exploitability - 1.5).abs() < 1e-6,
             "target_exploitability should be 1.5, got {}",
@@ -786,10 +786,8 @@ mod tests {
     /// should finish much faster than one with target=0.0.
     #[test]
     fn loose_target_exploitability_exits_early() {
-        let eval_loose = make_river_evaluator(200)
-            .with_target_exploitability(1000.0);
-        let eval_tight = make_river_evaluator(200)
-            .with_target_exploitability(0.0);
+        let eval_loose = make_river_evaluator(200).with_target_exploitability(1000.0);
+        let eval_tight = make_river_evaluator(200).with_target_exploitability(0.0);
 
         let num_oop = eval_loose.private_cards[0].len();
         let num_ip = eval_loose.private_cards[1].len();
@@ -798,20 +796,14 @@ mod tests {
 
         // Loose target should be significantly faster
         let t0 = Instant::now();
-        let _ = eval_loose.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let _ = eval_loose.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
         let loose_ms = t0.elapsed().as_millis();
 
         let t1 = Instant::now();
-        let _ = eval_tight.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let _ = eval_tight.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
         let tight_ms = t1.elapsed().as_millis();
 
-        eprintln!(
-            "[test] loose target: {loose_ms}ms, tight target: {tight_ms}ms"
-        );
+        eprintln!("[test] loose target: {loose_ms}ms, tight target: {tight_ms}ms");
 
         // The loose solve should take less than half the time of the tight
         // solve (it exits at iteration ~5 when exploitability < 1000 mbb).
@@ -829,12 +821,9 @@ mod tests {
         let oop_reach = vec![1.0f32; num_oop];
         let ip_reach = vec![1.0f32; num_ip];
 
-        let oop_single = eval.compute_cfvs(
-            0, 100, 150.0, &ip_reach, num_oop, 0,
-        );
-        let (oop_both, _) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let oop_single = eval.compute_cfvs(0, 100, 150.0, &ip_reach, num_oop, 0);
+        let (oop_both, _) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
         assert_eq!(oop_single, oop_both, "single-player should match both");
     }
 
@@ -847,13 +836,10 @@ mod tests {
         let ip_reach = vec![1.0f32; num_ip];
 
         let (raw_oop, raw_ip) = eval
-            .compute_raw_cfvs_both(
-                100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-            )
+            .compute_raw_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0)
             .expect("exact_subtree should provide raw boundary CFVs");
-        let (legacy_oop, legacy_ip) = eval.compute_cfvs_both(
-            100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0,
-        );
+        let (legacy_oop, legacy_ip) =
+            eval.compute_cfvs_both(100, 150.0, &oop_reach, &ip_reach, num_oop, num_ip, 0);
 
         assert_eq!(raw_oop.len(), num_oop);
         assert_eq!(raw_ip.len(), num_ip);
@@ -891,7 +877,11 @@ mod tests {
         let (oop_hands, oop_weights) = oop_range.get_hands_weights(board_mask);
         let (ip_hands, ip_weights) = ip_range.get_hands_weights(board_mask);
 
-        let card_config = build_card_config(&board, &[oop_hands.clone(), ip_hands.clone()], &[oop_weights, ip_weights]);
+        let card_config = build_card_config(
+            &board,
+            &[oop_hands.clone(), ip_hands.clone()],
+            &[oop_weights, ip_weights],
+        );
 
         let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
         let tree_config = TreeConfig {
@@ -928,10 +918,14 @@ mod tests {
         let oop_cfv = root_cfvalues_with_reach(&game, 0, &ip_reach);
         let ip_cfv = root_cfvalues_with_reach(&game, 1, &oop_reach);
 
-        let oop_ev: f64 = oop_cfv.iter().zip(oop_reach.iter())
+        let oop_ev: f64 = oop_cfv
+            .iter()
+            .zip(oop_reach.iter())
             .map(|(&c, &r)| c as f64 * r as f64)
             .sum();
-        let ip_ev: f64 = ip_cfv.iter().zip(ip_reach.iter())
+        let ip_ev: f64 = ip_cfv
+            .iter()
+            .zip(ip_reach.iter())
             .map(|(&c, &r)| c as f64 * r as f64)
             .sum();
 
@@ -944,7 +938,10 @@ mod tests {
 
         // Also check via the library's compute_current_ev
         let [ev0, ev1] = range_solver::compute_current_ev(&game);
-        eprintln!("  compute_current_ev:   [{ev0:.6}, {ev1:.6}], sum={:.6}", ev0 as f64 + ev1 as f64);
+        eprintln!(
+            "  compute_current_ev:   [{ev0:.6}, {ev1:.6}], sum={:.6}",
+            ev0 as f64 + ev1 as f64
+        );
 
         assert!(
             sum.abs() < 0.1,
@@ -984,33 +981,38 @@ mod tests {
 
         // Convert to bcfv
         let oop_bcfv = cfv_to_bcfv(
-            &oop_cfv, &oop_cards, &ip_cards, &ip_reach,
-            half_pot, num_combos,
+            &oop_cfv, &oop_cards, &ip_cards, &ip_reach, half_pot, num_combos,
         );
         let ip_bcfv = cfv_to_bcfv(
-            &ip_cfv, &ip_cards, &oop_cards, &oop_reach,
-            half_pot, num_combos,
+            &ip_cfv, &ip_cards, &oop_cards, &oop_reach, half_pot, num_combos,
         );
 
         // Print per-hand details
         eprintln!("  OOP hands (AA,KK,QQ — should be POSITIVE bcfv):");
         for (i, &(c1, c2)) in oop_cards.iter().enumerate() {
             let adj = cfreach_adj(c1, c2, &ip_cards, &ip_reach);
-            eprintln!("    hand {i} ({c1},{c2}): cfv={:.6}, bcfv={:.6}, adj={adj:.4}",
-                oop_cfv[i], oop_bcfv[i]);
+            eprintln!(
+                "    hand {i} ({c1},{c2}): cfv={:.6}, bcfv={:.6}, adj={adj:.4}",
+                oop_cfv[i], oop_bcfv[i]
+            );
         }
         eprintln!("  IP hands (TT,99,88):");
         for (i, &(c1, c2)) in ip_cards.iter().enumerate() {
             let adj = cfreach_adj(c1, c2, &oop_cards, &oop_reach);
-            eprintln!("    hand {i} ({c1},{c2}): cfv={:.6}, bcfv={:.6}, adj={adj:.4}",
-                ip_cfv[i], ip_bcfv[i]);
+            eprintln!(
+                "    hand {i} ({c1},{c2}): cfv={:.6}, bcfv={:.6}, adj={adj:.4}",
+                ip_cfv[i], ip_bcfv[i]
+            );
         }
 
         // Check sign: AA,KK,QQ should have positive bcfv (they dominate TT,88 and
         // only lose to 99 which made a set). Most OOP hands should be positive.
         let oop_positive = oop_bcfv.iter().filter(|&&v| v > 0.0).count();
         let oop_negative = oop_bcfv.iter().filter(|&&v| v < 0.0).count();
-        eprintln!("  OOP bcfv: {oop_positive} positive, {oop_negative} negative (of {})", oop_cards.len());
+        eprintln!(
+            "  OOP bcfv: {oop_positive} positive, {oop_negative} negative (of {})",
+            oop_cards.len()
+        );
 
         // Reconstruct cfvalues from bcfv and check round-trip
         let scale = half_pot / num_combos;
@@ -1038,7 +1040,10 @@ mod tests {
             ip_recon_ev += recon * ip_reach[h] as f64;
         }
 
-        eprintln!("  Reconstructed EVs: oop={oop_recon_ev:.6}, ip={ip_recon_ev:.6}, sum={:.6}", oop_recon_ev + ip_recon_ev);
+        eprintln!(
+            "  Reconstructed EVs: oop={oop_recon_ev:.6}, ip={ip_recon_ev:.6}, sum={:.6}",
+            oop_recon_ev + ip_recon_ev
+        );
 
         // SIGN CHECK: If most OOP bcfv values are negative, we have a sign flip
         assert!(
@@ -1069,15 +1074,26 @@ mod tests {
         let half_pot = 50.0;
         let num_combos = 10.0;
 
-        let bcfv = cfv_to_bcfv(&cfv, &hero_cards, &opp_cards, &opp_reach, half_pot, num_combos);
+        let bcfv = cfv_to_bcfv(
+            &cfv,
+            &hero_cards,
+            &opp_cards,
+            &opp_reach,
+            half_pot,
+            num_combos,
+        );
 
         let expected = 2.0 * 10.0 / (50.0 * 1.5);
         eprintln!("=== Test A3: cfv_to_bcfv unit ===");
-        eprintln!("  cfv=2.0, expected bcfv={expected:.6}, got bcfv={:.6}", bcfv[0]);
+        eprintln!(
+            "  cfv=2.0, expected bcfv={expected:.6}, got bcfv={:.6}",
+            bcfv[0]
+        );
 
         assert!(
             (bcfv[0] as f64 - expected).abs() < 1e-4,
-            "cfv_to_bcfv arithmetic wrong: expected {expected:.6}, got {:.6}", bcfv[0]
+            "cfv_to_bcfv arithmetic wrong: expected {expected:.6}, got {:.6}",
+            bcfv[0]
         );
 
         // Now verify the round-trip:
@@ -1113,12 +1129,10 @@ mod tests {
         let num_combos = game.num_combinations();
 
         let oop_bcfv = cfv_to_bcfv(
-            &oop_cfv, &oop_cards, &ip_cards, &ip_reach,
-            half_pot, num_combos,
+            &oop_cfv, &oop_cards, &ip_cards, &ip_reach, half_pot, num_combos,
         );
         let ip_bcfv = cfv_to_bcfv(
-            &ip_cfv, &ip_cards, &oop_cards, &oop_reach,
-            half_pot, num_combos,
+            &ip_cfv, &ip_cards, &oop_cards, &oop_reach, half_pot, num_combos,
         );
 
         eprintln!("=== Test B: Per-hand sign parity ===");
@@ -1166,13 +1180,21 @@ mod tests {
         let eval_oop_reach = vec![1.0f32; eval.private_cards[0].len()];
         let eval_ip_reach = vec![1.0f32; eval.private_cards[1].len()];
         let (eval_oop_bcfv, eval_ip_bcfv) = eval.compute_cfvs_both(
-            100, 150.0, &eval_oop_reach, &eval_ip_reach,
-            eval.private_cards[0].len(), eval.private_cards[1].len(), 0,
+            100,
+            150.0,
+            &eval_oop_reach,
+            &eval_ip_reach,
+            eval.private_cards[0].len(),
+            eval.private_cards[1].len(),
+            0,
         );
 
         eprintln!("  Evaluator bcfv vs direct bcfv (OOP):");
         for (i, &(c1, c2)) in eval.private_cards[0].iter().enumerate() {
-            eprintln!("    hand {i} ({c1},{c2}): eval_bcfv={:.6}", eval_oop_bcfv[i]);
+            eprintln!(
+                "    hand {i} ({c1},{c2}): eval_bcfv={:.6}",
+                eval_oop_bcfv[i]
+            );
         }
 
         // Overall EV comparison
@@ -1237,13 +1259,20 @@ mod tests {
         let parent_tree = ActionTree::new(tree_config).unwrap();
         let parent_game = PostFlopGame::with_config(parent_card_config, parent_tree).unwrap();
         let parent_num_combos = parent_game.num_combinations();
-        let parent_num_hands = [parent_game.num_private_hands(0), parent_game.num_private_hands(1)];
+        let parent_num_hands = [
+            parent_game.num_private_hands(0),
+            parent_game.num_private_hands(1),
+        ];
 
         eprintln!("=== Test C: num_combinations mismatch ===");
-        eprintln!("  Subtree: num_combos={subtree_num_combos}, hands=[{}, {}]",
-            subtree_num_hands[0], subtree_num_hands[1]);
-        eprintln!("  Parent:  num_combos={parent_num_combos}, hands=[{}, {}]",
-            parent_num_hands[0], parent_num_hands[1]);
+        eprintln!(
+            "  Subtree: num_combos={subtree_num_combos}, hands=[{}, {}]",
+            subtree_num_hands[0], subtree_num_hands[1]
+        );
+        eprintln!(
+            "  Parent:  num_combos={parent_num_combos}, hands=[{}, {}]",
+            parent_num_hands[0], parent_num_hands[1]
+        );
 
         let ratio = subtree_num_combos / parent_num_combos;
         eprintln!("  Ratio (subtree/parent): {ratio:.6}");
@@ -1345,7 +1374,8 @@ mod tests {
                 [oop_hands.clone(), ip_hands.clone()],
                 [oop_weights.clone(), ip_weights.clone()],
                 tree_config_lim.clone(),
-            ).with_solve_iters(500);
+            )
+            .with_solve_iters(500);
             per_boundary.push(Arc::new(eval));
         }
         game_lim.per_boundary_evaluators = per_boundary;
@@ -1381,7 +1411,11 @@ mod tests {
             }
         }
         eprintln!("  Sign flips: {sign_flips} / {total}");
-        eprintln!("  EV diff: oop={:.6}, ip={:.6}", (lim_ev0 - full_ev0).abs(), (lim_ev1 - full_ev1).abs());
+        eprintln!(
+            "  EV diff: oop={:.6}, ip={:.6}",
+            (lim_ev0 - full_ev0).abs(),
+            (lim_ev1 - full_ev1).abs()
+        );
 
         // The EVs should be reasonably close (same game, same solver)
         // Tolerance is generous because depth-limited may converge differently

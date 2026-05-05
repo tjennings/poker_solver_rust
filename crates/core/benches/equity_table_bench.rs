@@ -1,6 +1,6 @@
 //! Benchmark for `compute_equity_table` to track optimization impact.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use poker_solver_core::poker::{Card, Suit, Value};
 use poker_solver_core::preflop::postflop_exhaustive::compute_equity_table;

@@ -20,8 +20,8 @@ pub struct GpuBoundaryEvaluator {
 /// Request for boundary evaluation at a set of river boundary nodes.
 pub struct BoundaryEvalRequest {
     pub board: [u8; 4],
-    pub pot: f32,
-    pub effective_stack: f32,
+    pub pots: Vec<f32>,
+    pub effective_stacks: Vec<f32>,
     pub oop_reach: Vec<f32>,
     pub ip_reach: Vec<f32>,
     pub num_boundaries: usize,
@@ -45,6 +45,29 @@ fn zero_conflicting_hands(reach: &mut [f32], card: u8) {
             }
         }
     }
+}
+
+fn reach_adjustments_by_hand(reach: &[f32], hand_cards: &[(u8, u8)]) -> Vec<f32> {
+    let mut total = 0.0_f64;
+    let mut card_reach = [0.0_f64; 52];
+    for (idx, &(c0, c1)) in hand_cards.iter().enumerate() {
+        let r = f64::from(reach.get(idx).copied().unwrap_or(0.0));
+        if r == 0.0 {
+            continue;
+        }
+        total += r;
+        card_reach[c0 as usize] += r;
+        card_reach[c1 as usize] += r;
+    }
+
+    hand_cards
+        .iter()
+        .enumerate()
+        .map(|(idx, &(c0, c1))| {
+            let same = f64::from(reach.get(idx).copied().unwrap_or(0.0));
+            (total + same - card_reach[c0 as usize] - card_reach[c1 as usize]).max(0.0) as f32
+        })
+        .collect()
 }
 
 impl GpuBoundaryEvaluator {
@@ -80,11 +103,9 @@ impl GpuBoundaryEvaluator {
             input.len()
         );
 
-        let input_tensor = ort::value::Tensor::from_array((
-            [num_rows as i64, INPUT_SIZE as i64],
-            input,
-        ))
-        .map_err(|e| format!("ort tensor creation: {e}"))?;
+        let input_tensor =
+            ort::value::Tensor::from_array(([num_rows as i64, INPUT_SIZE as i64], input))
+                .map_err(|e| format!("ort tensor creation: {e}"))?;
 
         let outputs = self
             .session
@@ -121,49 +142,45 @@ pub fn evaluate_boundaries_batched(
     let mut all_inputs: Vec<f32> = Vec::new();
     let mut total_rows: usize = 0;
 
-    // Track valid rivers and precomputed opponent weights per boundary for reduction.
+    // Track valid rivers per request for output reduction.
     struct BoundaryMeta {
         valid_rivers: Vec<u8>,
-        // Per-boundary: opponent reach sum per river, for reach-weighted averaging.
-        // ip_weights[bi][ri] = sum of IP reach for hands not conflicting with river ri.
-        ip_weights: Vec<Vec<f64>>,
-        oop_weights: Vec<Vec<f64>>,
     }
     let mut request_meta: Vec<BoundaryMeta> = Vec::with_capacity(requests.len());
 
     for req in requests {
-        let valid_rivers: Vec<u8> = (0u8..52)
-            .filter(|r| !req.board.contains(r))
-            .collect();
+        if req.pots.len() != req.num_boundaries {
+            return Err(format!(
+                "BoundaryEvalRequest has {} pots for {} boundaries",
+                req.pots.len(),
+                req.num_boundaries
+            ));
+        }
+        if req.effective_stacks.len() != req.num_boundaries {
+            return Err(format!(
+                "BoundaryEvalRequest has {} effective_stacks for {} boundaries",
+                req.effective_stacks.len(),
+                req.num_boundaries
+            ));
+        }
 
-        let mut ip_weights = Vec::with_capacity(req.num_boundaries);
-        let mut oop_weights = Vec::with_capacity(req.num_boundaries);
+        let valid_rivers: Vec<u8> = (0u8..52).filter(|r| !req.board.contains(r)).collect();
 
         for bi in 0..req.num_boundaries {
             let oop_base = &req.oop_reach[bi * NUM_COMBOS..(bi + 1) * NUM_COMBOS];
             let ip_base = &req.ip_reach[bi * NUM_COMBOS..(bi + 1) * NUM_COMBOS];
-
-            // Precompute opponent weights per river (reused in reduction).
-            let bi_ip_w: Vec<f64> = valid_rivers
-                .iter()
-                .map(|&river| {
-                    let mut ip_copy = ip_base.to_vec();
-                    zero_conflicting_hands(&mut ip_copy, river);
-                    ip_copy.iter().map(|&v| f64::from(v)).sum()
-                })
-                .collect();
-            let bi_oop_w: Vec<f64> = valid_rivers
-                .iter()
-                .map(|&river| {
-                    let mut oop_copy = oop_base.to_vec();
-                    zero_conflicting_hands(&mut oop_copy, river);
-                    oop_copy.iter().map(|&v| f64::from(v)).sum()
-                })
-                .collect();
+            let pot = req.pots[bi];
+            let effective_stack = req.effective_stacks[bi];
 
             for player in 0u8..2 {
-                for (ri, &river) in valid_rivers.iter().enumerate() {
-                    let board5 = [req.board[0], req.board[1], req.board[2], req.board[3], river];
+                for &river in &valid_rivers {
+                    let board5 = [
+                        req.board[0],
+                        req.board[1],
+                        req.board[2],
+                        req.board[3],
+                        river,
+                    ];
 
                     // Use already-zeroed ranges via weights, but we still need the
                     // full zeroed vectors for the NN input encoding.
@@ -173,24 +190,20 @@ pub fn evaluate_boundaries_batched(
                     zero_conflicting_hands(&mut ip, river);
 
                     let input = encode_boundary_inference_input(
-                        &oop, &ip, &board5, req.pot, req.effective_stack, player,
+                        &oop,
+                        &ip,
+                        &board5,
+                        pot,
+                        effective_stack,
+                        player,
                     );
                     all_inputs.extend_from_slice(&input);
                     total_rows += 1;
-
-                    let _ = ri; // used for weight indexing in reduction
                 }
             }
-
-            ip_weights.push(bi_ip_w);
-            oop_weights.push(bi_oop_w);
         }
 
-        request_meta.push(BoundaryMeta {
-            valid_rivers,
-            ip_weights,
-            oop_weights,
-        });
+        request_meta.push(BoundaryMeta { valid_rivers });
     }
 
     // Single batched inference call.
@@ -226,53 +239,71 @@ pub fn evaluate_boundaries_batched(
             let num_rivers = meta.valid_rivers.len();
             let row_base = row_offsets[req_idx];
 
-            let mut leaf_cfv_p0: Vec<f32> =
-                Vec::with_capacity(req.num_boundaries * num_hands);
-            let mut leaf_cfv_p1: Vec<f32> =
-                Vec::with_capacity(req.num_boundaries * num_hands);
+            let mut leaf_cfv_p0: Vec<f32> = Vec::with_capacity(req.num_boundaries * num_hands);
+            let mut leaf_cfv_p1: Vec<f32> = Vec::with_capacity(req.num_boundaries * num_hands);
 
             for bi in 0..req.num_boundaries {
                 let p0_row_start = row_base + bi * num_rivers * 2;
                 let p1_row_start = p0_row_start + num_rivers;
-
-                let denorm = f64::from(req.pot + req.effective_stack);
+                let oop_base = &req.oop_reach[bi * NUM_COMBOS..(bi + 1) * NUM_COMBOS];
+                let ip_base = &req.ip_reach[bi * NUM_COMBOS..(bi + 1) * NUM_COMBOS];
+                let pot = req.pots[bi];
+                let effective_stack = req.effective_stacks[bi];
+                let scale = if pot > 0.0 {
+                    f64::from(pot + effective_stack) / f64::from(pot)
+                } else {
+                    0.0
+                };
+                let half_pot = f64::from(pot) * 0.5;
+                let bcfv_bound = if half_pot > 0.0 {
+                    1.0 + f64::from(effective_stack).max(0.0) / half_pot
+                } else {
+                    0.0
+                };
+                let p0_reach_adj = reach_adjustments_by_hand(ip_base, hand_cards);
+                let p1_reach_adj = reach_adjustments_by_hand(oop_base, hand_cards);
 
                 for (hi, &combo_idx) in hand_combo_indices.iter().enumerate() {
                     let (c0, c1) = hand_cards[hi];
 
-                    // Player 0: opponent is IP.
-                    let mut cfv_sum_p0 = 0.0_f64;
-                    let mut weight_sum_p0 = 0.0_f64;
+                    // Player 0: simple river-average bcfv, then convert to the
+                    // raw reach-integrated chip CFV expected by GPU leaf injection.
+                    let mut bcfv_sum_p0 = 0.0_f64;
+                    let mut count_p0 = 0_u32;
                     for (ri, &river) in meta.valid_rivers.iter().enumerate() {
                         if c0 == river || c1 == river {
                             continue;
                         }
                         let row = p0_row_start + ri;
                         let net_val = f64::from(all_outputs[row * NUM_COMBOS + combo_idx]);
-                        cfv_sum_p0 += meta.ip_weights[bi][ri] * net_val;
-                        weight_sum_p0 += meta.ip_weights[bi][ri];
+                        bcfv_sum_p0 += net_val * scale;
+                        count_p0 += 1;
                     }
-                    let cfv_p0 = if weight_sum_p0 > 0.0 {
-                        (cfv_sum_p0 / weight_sum_p0) * denorm
+                    let cfv_p0 = if count_p0 > 0 {
+                        let bcfv =
+                            (bcfv_sum_p0 / f64::from(count_p0)).clamp(-bcfv_bound, bcfv_bound);
+                        bcfv * half_pot * f64::from(p0_reach_adj[hi])
                     } else {
                         0.0
                     };
                     leaf_cfv_p0.push(cfv_p0 as f32);
 
-                    // Player 1: opponent is OOP.
-                    let mut cfv_sum_p1 = 0.0_f64;
-                    let mut weight_sum_p1 = 0.0_f64;
+                    // Player 1: same contract, opponent is OOP.
+                    let mut bcfv_sum_p1 = 0.0_f64;
+                    let mut count_p1 = 0_u32;
                     for (ri, &river) in meta.valid_rivers.iter().enumerate() {
                         if c0 == river || c1 == river {
                             continue;
                         }
                         let row = p1_row_start + ri;
                         let net_val = f64::from(all_outputs[row * NUM_COMBOS + combo_idx]);
-                        cfv_sum_p1 += meta.oop_weights[bi][ri] * net_val;
-                        weight_sum_p1 += meta.oop_weights[bi][ri];
+                        bcfv_sum_p1 += net_val * scale;
+                        count_p1 += 1;
                     }
-                    let cfv_p1 = if weight_sum_p1 > 0.0 {
-                        (cfv_sum_p1 / weight_sum_p1) * denorm
+                    let cfv_p1 = if count_p1 > 0 {
+                        let bcfv =
+                            (bcfv_sum_p1 / f64::from(count_p1)).clamp(-bcfv_bound, bcfv_bound);
+                        bcfv * half_pot * f64::from(p1_reach_adj[hi])
                     } else {
                         0.0
                     };
@@ -343,13 +374,10 @@ mod tests {
             return;
         }
 
-        let evaluator = GpuBoundaryEvaluator::load(model_path)
-            .expect("failed to load model");
+        let evaluator = GpuBoundaryEvaluator::load(model_path).expect("failed to load model");
 
         let input = vec![0.0_f32; INPUT_SIZE];
-        let output = evaluator
-            .infer_batch(input, 1)
-            .expect("inference failed");
+        let output = evaluator.infer_batch(input, 1).expect("inference failed");
 
         assert_eq!(output.len(), NUM_COMBOS, "output should have 1326 values");
         for (i, &v) in output.iter().enumerate() {
@@ -364,8 +392,7 @@ mod tests {
             return;
         }
 
-        let evaluator = GpuBoundaryEvaluator::load(model_path)
-            .expect("failed to load model");
+        let evaluator = GpuBoundaryEvaluator::load(model_path).expect("failed to load model");
 
         // Board: As Kh Qd Jc (cards 48, 42, 33, 24).
         let board = [48u8, 42, 33, 24];
@@ -381,8 +408,8 @@ mod tests {
 
         let request = BoundaryEvalRequest {
             board,
-            pot: 100.0,
-            effective_stack: 200.0,
+            pots: vec![100.0],
+            effective_stacks: vec![200.0],
             oop_reach,
             ip_reach,
             num_boundaries: 1,
@@ -411,8 +438,7 @@ mod tests {
             return;
         }
 
-        let evaluator = GpuBoundaryEvaluator::load(model_path)
-            .expect("failed to load model");
+        let evaluator = GpuBoundaryEvaluator::load(model_path).expect("failed to load model");
 
         let board = [0u8, 4, 8, 12];
 
@@ -428,8 +454,8 @@ mod tests {
 
         let request = BoundaryEvalRequest {
             board,
-            pot: 50.0,
-            effective_stack: 100.0,
+            pots: vec![50.0; num_boundaries],
+            effective_stacks: vec![100.0; num_boundaries],
             oop_reach,
             ip_reach,
             num_boundaries,

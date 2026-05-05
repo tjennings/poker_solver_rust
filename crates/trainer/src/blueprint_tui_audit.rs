@@ -3,9 +3,9 @@
 
 use std::collections::VecDeque;
 
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
-use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{self, Card};
 use poker_solver_core::showdown_equity::compute_equity;
@@ -76,10 +76,7 @@ fn error_audit(name: &str, msg: String, trend_window: usize) -> ResolvedRegretAu
 /// If the string is 4 characters, parse as a specific combo (e.g. "Ts9s").
 /// Otherwise, parse as a canonical hand (e.g. "AKo") and pick the first
 /// combo not blocked by the board.
-fn parse_hand(
-    hand_str: &str,
-    board: &[Card],
-) -> Result<(Card, Card, CanonicalHand), String> {
+fn parse_hand(hand_str: &str, board: &[Card]) -> Result<(Card, Card, CanonicalHand), String> {
     let hand_str = hand_str.trim();
     if hand_str.len() == 4 {
         // Specific combo like "Ts9s"
@@ -94,8 +91,8 @@ fn parse_hand(
         Ok((c1, c2, canonical))
     } else {
         // Canonical hand like "AKo"
-        let canonical = CanonicalHand::parse(hand_str)
-            .map_err(|e| format!("bad hand '{hand_str}': {e}"))?;
+        let canonical =
+            CanonicalHand::parse(hand_str).map_err(|e| format!("bad hand '{hand_str}': {e}"))?;
         let combo = canonical
             .combos()
             .into_iter()
@@ -205,7 +202,7 @@ pub fn resolve_regret_audit(
                 name,
                 format!("spot '{spot}' does not resolve to a decision node"),
                 trend_window,
-            )
+            );
         }
     };
 
@@ -234,20 +231,17 @@ pub fn resolve_regret_audit(
     };
 
     // 5. Compute bucket trail
-    let bucket_trail = compute_bucket_trail(
-        canonical,
-        c1,
-        c2,
-        &board,
-        street,
-        &storage.bucket_counts,
-    );
+    let bucket_trail =
+        compute_bucket_trail(canonical, c1, c2, &board, street, &storage.bucket_counts);
 
     // 6. Build action labels and read initial regrets
     let num_actions = actions.len();
     let action_labels: Vec<String> = actions.iter().map(format_tree_action).collect();
     let regrets: Vec<f64> = (0..num_actions)
-        .map(|a| storage.get_regret(node_idx, bucket, a) as f64 / poker_solver_core::blueprint_v2::storage::REGRET_SCALE)
+        .map(|a| {
+            storage.get_regret(node_idx, bucket, a) as f64
+                / poker_solver_core::blueprint_v2::storage::REGRET_SCALE
+        })
         .collect();
     let avg_strategy = storage.average_strategy(node_idx, bucket);
 
@@ -361,7 +355,13 @@ mod tests {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
         let audit = resolve_regret_audit(
-            &tree, &storage, "AKo SB open", "", "AKo", PlayerLabel::Sb, 10,
+            &tree,
+            &storage,
+            "AKo SB open",
+            "",
+            "AKo",
+            PlayerLabel::Sb,
+            10,
         );
         assert!(audit.error.is_none(), "got: {:?}", audit.error);
         assert_eq!(audit.node_idx, tree.root);
@@ -378,7 +378,13 @@ mod tests {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
         let audit = resolve_regret_audit(
-            &tree, &storage, "bad", "sb:999bb", "AKo", PlayerLabel::Sb, 10,
+            &tree,
+            &storage,
+            "bad",
+            "sb:999bb",
+            "AKo",
+            PlayerLabel::Sb,
+            10,
         );
         assert!(audit.error.is_some());
     }
@@ -387,9 +393,7 @@ mod tests {
     fn resolve_invalid_hand_returns_error() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let audit = resolve_regret_audit(
-            &tree, &storage, "bad", "", "ZZo", PlayerLabel::Sb, 10,
-        );
+        let audit = resolve_regret_audit(&tree, &storage, "bad", "", "ZZo", PlayerLabel::Sb, 10);
         assert!(audit.error.is_some());
     }
 
@@ -397,9 +401,8 @@ mod tests {
     fn tick_updates_regrets_and_deltas() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let mut audit = resolve_regret_audit(
-            &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10,
-        );
+        let mut audit =
+            resolve_regret_audit(&tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10);
         assert!(audit.error.is_none());
         // All regrets start at zero
         for &r in &audit.regrets {
@@ -419,9 +422,8 @@ mod tests {
     fn strategy_from_regrets() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let mut audit = resolve_regret_audit(
-            &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10,
-        );
+        let mut audit =
+            resolve_regret_audit(&tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10);
         assert!(audit.error.is_none());
         let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         storage.add_regret(audit.node_idx, audit.bucket, 0, 0);
@@ -438,9 +440,7 @@ mod tests {
     fn trend_detection() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let mut audit = resolve_regret_audit(
-            &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 3,
-        );
+        let mut audit = resolve_regret_audit(&tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 3);
         assert!(audit.error.is_none());
         let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         for _ in 0..3 {
@@ -455,9 +455,8 @@ mod tests {
     fn snapshot_captures_state() {
         let tree = toy_tree();
         let storage = BlueprintStorage::new(&tree, [169, 200, 200, 200]);
-        let mut audit = resolve_regret_audit(
-            &tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10,
-        );
+        let mut audit =
+            resolve_regret_audit(&tree, &storage, "AKo", "", "AKo", PlayerLabel::Sb, 10);
         let scale = poker_solver_core::blueprint_v2::storage::REGRET_SCALE as i32;
         storage.add_regret(audit.node_idx, audit.bucket, 0, 100 * scale);
         audit.tick(&storage);

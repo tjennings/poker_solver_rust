@@ -69,9 +69,7 @@ impl Hand {
         // INVARIANT: evaluate_internal() always produces a value present in
         // HAND_TABLE. The table is sorted and covers all 4824 distinct
         // 7-card hand equivalence classes.
-        HAND_TABLE
-            .binary_search(&self.evaluate_internal())
-            .unwrap() as u16
+        HAND_TABLE.binary_search(&self.evaluate_internal()).unwrap() as u16
     }
 
     fn evaluate_internal(&self) -> i32 {
@@ -437,12 +435,12 @@ mod tests {
         }
 
         assert!(appeared.iter().all(|&x| x));
-        assert_eq!(counter[8], 41584);    // straight flush
-        assert_eq!(counter[7], 224848);   // four of a kind
-        assert_eq!(counter[6], 3473184);  // full house
-        assert_eq!(counter[5], 4047644);  // flush
-        assert_eq!(counter[4], 6180020);  // straight
-        assert_eq!(counter[3], 6461620);  // three of a kind
+        assert_eq!(counter[8], 41584); // straight flush
+        assert_eq!(counter[7], 224848); // four of a kind
+        assert_eq!(counter[6], 3473184); // full house
+        assert_eq!(counter[5], 4047644); // flush
+        assert_eq!(counter[4], 6180020); // straight
+        assert_eq!(counter[3], 6461620); // three of a kind
         assert_eq!(counter[2], 31433400); // two pair
         assert_eq!(counter[1], 58627800); // one pair
         assert_eq!(counter[0], 23294460); // high card

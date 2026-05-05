@@ -126,9 +126,7 @@ pub fn generate_rsp_range_with_strengths<R: Rng>(
     rng: &mut R,
 ) -> [f32; NUM_COMBOS] {
     // Collect valid (non-blocked) combo indices, sorted by ascending strength.
-    let mut valid: Vec<usize> = (0..NUM_COMBOS)
-        .filter(|&i| strengths[i] > 0)
-        .collect();
+    let mut valid: Vec<usize> = (0..NUM_COMBOS).filter(|&i| strengths[i] > 0).collect();
     valid.sort_by_key(|&i| strengths[i]);
 
     let mut range = [0.0f32; NUM_COMBOS];
@@ -273,8 +271,7 @@ fn keep_n_msb(mut x: i32, n: i32) -> i32 {
 #[inline]
 fn find_straight(rankset: i32) -> i32 {
     const WHEEL: i32 = 0b1_0000_0000_1111;
-    let is_straight =
-        rankset & (rankset << 1) & (rankset << 2) & (rankset << 3) & (rankset << 4);
+    let is_straight = rankset & (rankset << 1) & (rankset << 2) & (rankset << 3) & (rankset << 4);
     if is_straight != 0 {
         keep_n_msb(is_straight, 1)
     } else if (rankset & WHEEL) == WHEEL {
@@ -418,7 +415,10 @@ mod tests {
             .collect();
         assert!(!non_blocked.is_empty());
         for &i in &non_blocked {
-            assert!(strengths[i] > 0, "valid combo {i} should have positive strength");
+            assert!(
+                strengths[i] > 0,
+                "valid combo {i} should have positive strength"
+            );
         }
     }
 

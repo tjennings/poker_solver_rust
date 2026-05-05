@@ -56,7 +56,9 @@ pub trait LeafEvaluator {
         requests
             .iter()
             .map(|&(pot, eff_stack, traverser)| {
-                self.evaluate(combos, board, pot, eff_stack, oop_range, ip_range, traverser)
+                self.evaluate(
+                    combos, board, pot, eff_stack, oop_range, ip_range, traverser,
+                )
             })
             .collect()
     }

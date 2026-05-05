@@ -1,9 +1,7 @@
 use burn::{
     module::Module,
-    nn::{
-        BatchNorm, BatchNormConfig, Linear, LinearConfig, PRelu, PReluConfig,
-    },
-    tensor::{backend::Backend, Tensor},
+    nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig, PRelu, PReluConfig},
+    tensor::{Tensor, backend::Backend},
 };
 
 /// Number of hole-card combinations (52 choose 2).
@@ -120,8 +118,7 @@ mod tests {
         let device = Default::default();
         let model = CfvNet::<TestBackend>::new(&device, 7, 500, INPUT_SIZE);
         let batch_size = 4;
-        let input =
-            Tensor::<TestBackend, 2>::zeros([batch_size, INPUT_SIZE], &device);
+        let input = Tensor::<TestBackend, 2>::zeros([batch_size, INPUT_SIZE], &device);
         let output = model.forward(input);
         assert_eq!(output.dims(), [batch_size, OUTPUT_SIZE]);
     }

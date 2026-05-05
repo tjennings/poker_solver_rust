@@ -139,7 +139,9 @@ pub fn compute_equity_matrix(combos: &[[Card; 2]], board: &[Card]) -> Vec<Vec<f6
     let start = std::time::Instant::now();
     eprintln!(
         "[equity matrix] {} combos, {} board cards, {} runouts — enumerating all-in equity",
-        n, board.len(), runouts.len()
+        n,
+        board.len(),
+        runouts.len()
     );
 
     // Accumulate wins/losses/ties per combo pair across all runouts.
@@ -330,10 +332,7 @@ pub fn compute_combo_equities(
 /// Panics if any subgame action has no match in the abstract tree, or if a
 /// `DepthBoundary` doesn't correspond to a `Chance` node.
 #[must_use]
-pub fn build_boundary_mapping(
-    subgame_tree: &GameTree,
-    abstract_tree: &GameTree,
-) -> Vec<usize> {
+pub fn build_boundary_mapping(subgame_tree: &GameTree, abstract_tree: &GameTree) -> Vec<usize> {
     // Precompute chance node ordinals in the abstract tree.
     let mut chance_ordinals = vec![usize::MAX; abstract_tree.nodes.len()];
     let mut ord = 0;
@@ -428,27 +427,39 @@ fn walk_trees_lockstep(
             // tree, so we match what exists and skip abstract-only actions.
             for (sub_a_idx, sub_action) in sub_actions.iter().enumerate() {
                 let abs_a_idx = match sub_action {
-                    TreeAction::Fold => abs_actions.iter().position(|a| matches!(a, TreeAction::Fold)),
-                    TreeAction::Check => abs_actions.iter().position(|a| matches!(a, TreeAction::Check)),
+                    TreeAction::Fold => abs_actions
+                        .iter()
+                        .position(|a| matches!(a, TreeAction::Fold)),
+                    TreeAction::Check => abs_actions
+                        .iter()
+                        .position(|a| matches!(a, TreeAction::Check)),
                     // Call and AllIn are interchangeable — calling can be all-in
                     // in one tree but not the other due to different unit scaling.
-                    TreeAction::Call => abs_actions.iter().position(|a| matches!(a, TreeAction::Call | TreeAction::AllIn)),
-                    TreeAction::AllIn => abs_actions.iter().position(|a| matches!(a, TreeAction::AllIn | TreeAction::Call)),
+                    TreeAction::Call => abs_actions
+                        .iter()
+                        .position(|a| matches!(a, TreeAction::Call | TreeAction::AllIn)),
+                    TreeAction::AllIn => abs_actions
+                        .iter()
+                        .position(|a| matches!(a, TreeAction::AllIn | TreeAction::Call)),
                     TreeAction::Bet(_) | TreeAction::Raise(_) => {
                         let sub_sized_idx = sub_actions[..sub_a_idx]
                             .iter()
                             .filter(|a| matches!(a, TreeAction::Bet(_) | TreeAction::Raise(_)))
                             .count();
-                        abs_actions.iter().enumerate()
+                        abs_actions
+                            .iter()
+                            .enumerate()
                             .filter(|(_, a)| matches!(a, TreeAction::Bet(_) | TreeAction::Raise(_)))
                             .nth(sub_sized_idx)
                             .map(|(i, _)| i)
                     }
                 };
-                let abs_a_idx = abs_a_idx.unwrap_or_else(|| panic!(
-                    "no matching action for {sub_action:?} in abstract tree at node {abs_idx}: \
+                let abs_a_idx = abs_a_idx.unwrap_or_else(|| {
+                    panic!(
+                        "no matching action for {sub_action:?} in abstract tree at node {abs_idx}: \
                      sub={sub_actions:?} abs={abs_actions:?}"
-                ));
+                    )
+                });
                 walk_trees_lockstep(
                     sub,
                     abs,
@@ -465,14 +476,20 @@ fn walk_trees_lockstep(
         // in the full-depth tree). Walk the Call/AllIn child against the
         // Chance node; the Fold child leads to a terminal (no boundaries).
         (
-            GameNode::Decision { actions: sub_actions, children: sub_children, .. },
+            GameNode::Decision {
+                actions: sub_actions,
+                children: sub_children,
+                ..
+            },
             GameNode::Chance { .. },
         ) => {
             for (sub_a_idx, sub_action) in sub_actions.iter().enumerate() {
                 match sub_action {
                     TreeAction::Call | TreeAction::AllIn => {
                         walk_trees_lockstep(
-                            sub, abs, chance_ordinals,
+                            sub,
+                            abs,
+                            chance_ordinals,
                             sub_children[sub_a_idx] as usize,
                             abs_idx, // stay at same abstract Chance node
                             mapping,
@@ -495,7 +512,6 @@ fn walk_trees_lockstep(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -503,8 +519,8 @@ fn walk_trees_lockstep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::poker::{Card, Suit, Value};
     use crate::blueprint_v2::Street;
+    use crate::poker::{Card, Suit, Value};
     use test_macros::timed_test;
 
     fn river_board() -> Vec<Card> {

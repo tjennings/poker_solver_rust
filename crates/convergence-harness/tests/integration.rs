@@ -1,8 +1,8 @@
 use convergence_harness::baseline::Baseline;
 use convergence_harness::game::FlopPokerConfig;
 use convergence_harness::harness;
-use convergence_harness::solvers::mccfr::{compute_mccfr_exploitability, MccfrSolver};
 use convergence_harness::solver_trait::ConvergenceSolver;
+use convergence_harness::solvers::mccfr::{compute_mccfr_exploitability, MccfrSolver};
 
 /// Full end-to-end pipeline test: generate baseline with minimal config,
 /// save to disk, load back, and verify all artifacts.
@@ -103,12 +103,23 @@ fn test_mccfr_pipeline_end_to_end() {
 
     // 3. Compute exploitability (flop_idx=0 for single-flop solver)
     let expl = compute_mccfr_exploitability(&solver, &config, 0).unwrap();
-    assert!(expl > 0.0, "Exploitability should be positive, got {}", expl);
-    assert!(expl.is_finite(), "Exploitability should be finite, got {}", expl);
+    assert!(
+        expl > 0.0,
+        "Exploitability should be positive, got {}",
+        expl
+    );
+    assert!(
+        expl.is_finite(),
+        "Exploitability should be finite, got {}",
+        expl
+    );
 
     // 4. Extract strategy
     let strategy = solver.average_strategy();
-    assert!(!strategy.is_empty(), "Strategy should not be empty after MCCFR training");
+    assert!(
+        !strategy.is_empty(),
+        "Strategy should not be empty after MCCFR training"
+    );
 }
 
 /// Test run_mccfr_solver produces a Baseline with convergence data and can
@@ -117,7 +128,8 @@ fn test_mccfr_pipeline_end_to_end() {
 #[ignore = "slow end-to-end convergence harness pipeline"]
 fn test_run_mccfr_solver_produces_baseline() {
     let checkpoints = vec![1000, 3000, 5000];
-    let result = convergence_harness::harness::run_mccfr_solver(5000, &checkpoints, None, 10, 10).unwrap();
+    let result =
+        convergence_harness::harness::run_mccfr_solver(5000, &checkpoints, None, 10, 10).unwrap();
 
     // Should have convergence samples at each checkpoint
     assert!(
@@ -139,15 +151,15 @@ fn test_run_mccfr_solver_produces_baseline() {
     );
 
     // Strategy should be non-empty
-    assert!(
-        !result.strategy.is_empty(),
-        "Strategy should not be empty"
-    );
+    assert!(!result.strategy.is_empty(), "Strategy should not be empty");
 
     // Should round-trip through save/load
     let dir = tempfile::TempDir::new().unwrap();
     result.save(dir.path()).unwrap();
     let loaded = Baseline::load(dir.path()).unwrap();
     assert_eq!(loaded.summary.solver_name, result.summary.solver_name);
-    assert_eq!(loaded.summary.total_iterations, result.summary.total_iterations);
+    assert_eq!(
+        loaded.summary.total_iterations,
+        result.summary.total_iterations
+    );
 }

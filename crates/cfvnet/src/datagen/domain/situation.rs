@@ -19,9 +19,12 @@ impl RangeSource {
     pub fn from_config(config: &DatagenConfig) -> Result<Self, String> {
         if let Some(ref bp_path) = config.blueprint_path {
             let path = Path::new(bp_path);
-            let ranges = PrecomputedRanges::load(path)
-                .map_err(|e| format!("load blueprint ranges: {e}"))?;
-            eprintln!("[SituationGenerator] loaded {} blueprint paths from {bp_path}", ranges.paths.len());
+            let ranges =
+                PrecomputedRanges::load(path).map_err(|e| format!("load blueprint ranges: {e}"))?;
+            eprintln!(
+                "[SituationGenerator] loaded {} blueprint paths from {bp_path}",
+                ranges.paths.len()
+            );
             Ok(RangeSource::Blueprint(ranges))
         } else {
             Ok(RangeSource::Rsp)
@@ -72,15 +75,19 @@ impl Iterator for SituationGenerator {
         while self.remaining > 0 {
             self.remaining -= 1;
             let sit = match &self.range_source {
-                RangeSource::Rsp => {
-                    sample_situation(&self.config, self.initial_stack, self.board_size, &mut self.rng)
-                }
-                RangeSource::Blueprint(precomputed) => {
-                    sample_situation_with_blueprint(
-                        &self.config, self.initial_stack, self.board_size,
-                        precomputed, &mut self.rng,
-                    )
-                }
+                RangeSource::Rsp => sample_situation(
+                    &self.config,
+                    self.initial_stack,
+                    self.board_size,
+                    &mut self.rng,
+                ),
+                RangeSource::Blueprint(precomputed) => sample_situation_with_blueprint(
+                    &self.config,
+                    self.initial_stack,
+                    self.board_size,
+                    precomputed,
+                    &mut self.rng,
+                ),
             };
             if sit.effective_stack > 0 {
                 return Some(sit);
@@ -149,8 +156,8 @@ mod tests {
         let config = DatagenConfig::default();
         let mut sit_gen = SituationGenerator::new(&config, 200, 4, 42, 1);
         let _first = sit_gen.next(); // consume the one item (or skip degenerate)
-        // After count is exhausted, should always return None
-        // (may return None on first call too if degenerate)
+                                     // After count is exhausted, should always return None
+                                     // (may return None on first call too if degenerate)
         for _ in 0..5 {
             assert!(sit_gen.next().is_none());
         }

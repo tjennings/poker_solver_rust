@@ -6,8 +6,7 @@
 
 use poker_solver_core::blueprint_v2::{
     bundle::{self, BlueprintV2Strategy},
-    cluster_diagnostics,
-    cluster_pipeline,
+    cluster_diagnostics, cluster_pipeline,
     config::*,
     trainer::BlueprintTrainer,
 };
@@ -27,10 +26,30 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-            preflop: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
-            flop: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
-            turn: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
-            river: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
+            preflop: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
+            flop: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
+            turn: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
+            river: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
             seed: 42,
             kmeans_iterations: 10,
             cfvnet_river_data: None,
@@ -150,8 +169,8 @@ fn blueprint_v2_e2e_pipeline() {
     }
 
     // ── 2. Cluster diagnostics ──────────────────────────────────────────
-    let reports = cluster_diagnostics::diagnose_cluster_dir(&cluster_dir)
-        .expect("diagnose clusters");
+    let reports =
+        cluster_diagnostics::diagnose_cluster_dir(&cluster_dir).expect("diagnose clusters");
     assert_eq!(reports.len(), 4, "should have reports for all 4 streets");
     for report in &reports {
         assert!(report.bucket_count > 0, "bucket count should be positive");
@@ -170,7 +189,11 @@ fn blueprint_v2_e2e_pipeline() {
 
     // After training, some regrets should be non-zero.
     assert!(
-        trainer.storage.regrets.iter().any(|r| r.load(std::sync::atomic::Ordering::Relaxed) != 0),
+        trainer
+            .storage
+            .regrets
+            .iter()
+            .any(|r| r.load(std::sync::atomic::Ordering::Relaxed) != 0),
         "regrets should be updated after training"
     );
 
@@ -228,8 +251,8 @@ fn blueprint_v2_e2e_pipeline() {
     );
 
     // Round-trip the strategy through save/load.
-    let loaded = BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin"))
-        .expect("load strategy");
+    let loaded =
+        BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin")).expect("load strategy");
     assert_eq!(
         loaded.action_probs.len(),
         strategy.action_probs.len(),
@@ -265,8 +288,7 @@ fn blueprint_v2_e2e_pipeline() {
         "config round-trip: stack_depth mismatch"
     );
     assert_eq!(
-        loaded_config.clustering.river.buckets,
-        config.clustering.river.buckets,
+        loaded_config.clustering.river.buckets, config.clustering.river.buckets,
         "config round-trip: river buckets mismatch"
     );
 }
@@ -291,10 +313,30 @@ fn brcfr_plus_converges_small_game() {
         },
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-            preflop: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
-            flop: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
-            turn: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
-            river: StreetClusterConfig { buckets: 5, delta_bins: None, expected_delta: false, sample_boards: None },
+            preflop: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
+            flop: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
+            turn: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
+            river: StreetClusterConfig {
+                buckets: 5,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+            },
             seed: 42,
             kmeans_iterations: 10,
             cfvnet_river_data: None,
@@ -356,10 +398,7 @@ fn brcfr_plus_converges_small_game() {
         "exploitability should be reasonable: got {exploit}"
     );
 
-    let preds = trainer
-        .storage
-        .predictions()
-        .expect("predictions enabled");
+    let preds = trainer.storage.predictions().expect("predictions enabled");
     let any_nonzero = preds
         .iter()
         .any(|a| a.load(std::sync::atomic::Ordering::Relaxed) != 0);

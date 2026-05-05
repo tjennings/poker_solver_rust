@@ -54,8 +54,7 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
     );
 
     // Open output file once, write incrementally across chunks.
-    let file =
-        std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
+    let file = std::fs::File::create(output_path).map_err(|e| format!("create output: {e}"))?;
     let mut writer = BufWriter::new(file);
 
     // Build thread pool once if multi-threaded.
@@ -80,7 +79,12 @@ pub fn generate_training_data(config: &CfvnetConfig, output_path: &Path) -> Resu
         // Generate situations sequentially for determinism.
         let situations: Vec<_> = (0..chunk_len)
             .map(|_| {
-                sample_situation(&config.datagen, config.game.initial_stack, board_size, &mut rng)
+                sample_situation(
+                    &config.datagen,
+                    config.game.initial_stack,
+                    board_size,
+                    &mut rng,
+                )
             })
             .collect();
 
@@ -185,7 +189,9 @@ fn bool_mask_to_u8(mask: &[bool; NUM_COMBOS]) -> [u8; NUM_COMBOS] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BetSizeConfig, CfvnetConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig};
+    use crate::config::{
+        BetSizeConfig, CfvnetConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig,
+    };
     use crate::datagen::storage;
     use tempfile::NamedTempFile;
 
@@ -235,7 +241,10 @@ mod tests {
         for i in 0..count {
             let rec = storage::read_record(&mut file).unwrap();
             assert!(rec.pot > 0.0, "record {i} has non-positive pot");
-            assert!(rec.effective_stack > 0.0, "record {i} has non-positive stack");
+            assert!(
+                rec.effective_stack > 0.0,
+                "record {i} has non-positive stack"
+            );
             assert!(rec.player <= 1, "record {i} invalid player {}", rec.player);
         }
     }

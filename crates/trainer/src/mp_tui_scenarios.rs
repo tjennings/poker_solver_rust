@@ -13,11 +13,7 @@ use crate::blueprint_tui_widgets::{CellStrategy, HandGridState};
 
 /// Walk the MP game tree following a position-aware spot string.
 /// Returns (node_idx, board_cards) or None if any action fails to match.
-pub fn resolve_mp_spot(
-    tree: &MpGameTree,
-    spot: &str,
-    num_players: u8,
-) -> Option<(u32, Vec<Card>)> {
+pub fn resolve_mp_spot(tree: &MpGameTree, spot: &str, num_players: u8) -> Option<(u32, Vec<Card>)> {
     let spot = spot.trim();
     if spot.is_empty() {
         return Some((tree.root, vec![]));
@@ -90,7 +86,11 @@ fn match_action_label_mp(label: &str, actions: &[TreeAction]) -> Option<usize> {
 fn find_closest_sized_action(actions: &[TreeAction], target_chips: f64) -> Option<usize> {
     let (idx, chips) = closest_sized_to(actions, target_chips)?;
     let diff = (chips - target_chips).abs();
-    if diff <= target_chips * 0.2 + 1.0 { Some(idx) } else { None }
+    if diff <= target_chips * 0.2 + 1.0 {
+        Some(idx)
+    } else {
+        None
+    }
 }
 
 /// Find the closest Lead/Raise by multiplier label. Without game-state
@@ -137,11 +137,23 @@ pub fn extract_mp_grid(
 ) -> HandGridState {
     let mut cells: [[CellStrategy; 13]; 13] =
         std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
-    if let MpGameNode::Decision { ref actions, street, .. } = tree.nodes[node_idx as usize] {
+    if let MpGameNode::Decision {
+        ref actions,
+        street,
+        ..
+    } = tree.nodes[node_idx as usize]
+    {
         let num_actions = actions.len();
         let bucket_count = storage.bucket_counts[street.index()] as usize;
         let labels: Vec<String> = actions.iter().map(format_mp_action).collect();
-        fill_grid_cells(&mut cells, storage, node_idx, num_actions, bucket_count, &labels);
+        fill_grid_cells(
+            &mut cells,
+            storage,
+            node_idx,
+            num_actions,
+            bucket_count,
+            &labels,
+        );
     }
     HandGridState {
         cells,
@@ -214,20 +226,40 @@ fn position_to_seat(name: &str, num_players: u8) -> Option<u8> {
         "sb" => Some(n - 2),
         "bb" => Some(n - 1),
         "btn" | "bu" => {
-            if n >= 3 { Some(n - 3) } else { None }
+            if n >= 3 {
+                Some(n - 3)
+            } else {
+                None
+            }
         }
         "co" => {
-            if n >= 4 { Some(n - 4) } else { None }
+            if n >= 4 {
+                Some(n - 4)
+            } else {
+                None
+            }
         }
         "hj" => {
-            if n >= 5 { Some(n - 5) } else { None }
+            if n >= 5 {
+                Some(n - 5)
+            } else {
+                None
+            }
         }
         "utg" => Some(0),
         "utg1" | "utg+1" => {
-            if n >= 7 { Some(1) } else { None }
+            if n >= 7 {
+                Some(1)
+            } else {
+                None
+            }
         }
         "utg2" | "utg+2" => {
-            if n >= 8 { Some(2) } else { None }
+            if n >= 8 {
+                Some(2)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -251,8 +283,16 @@ mod tests {
             num_players: 6,
             stack_depth: 200.0,
             blinds: vec![
-                ForcedBet { seat: 4, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 5, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 4,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -316,11 +356,7 @@ mod tests {
     fn resolve_full_fold_sequence() {
         // 4 folds (UTG, HJ, CO, BTN) leave SB and BB active.
         let tree = test_6p_tree();
-        let result = resolve_mp_spot(
-            &tree,
-            "utg:fold,hj:fold,co:fold,btn:fold",
-            6,
-        );
+        let result = resolve_mp_spot(&tree, "utg:fold,hj:fold,co:fold,btn:fold", 6);
         assert!(result.is_some());
         let (idx, _) = result.unwrap();
         if let MpGameNode::Decision { seat, .. } = &tree.nodes[idx as usize] {
@@ -361,11 +397,7 @@ mod tests {
     #[timed_test]
     fn match_action_bb_label() {
         // 5bb = 10 chips (5 * 2), should match Lead(10.0)
-        let actions = vec![
-            TreeAction::Fold,
-            TreeAction::Call,
-            TreeAction::Lead(10.0),
-        ];
+        let actions = vec![TreeAction::Fold, TreeAction::Call, TreeAction::Lead(10.0)];
         assert_eq!(match_action_label_mp("5bb", &actions), Some(2));
     }
 
@@ -512,8 +544,16 @@ mod tests {
             num_players: 2,
             stack_depth: 100.0,
             blinds: vec![
-                ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-                ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
             ],
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -557,9 +597,10 @@ mod tests {
         let grid = extract_mp_grid(&tree, &storage, tree.root, 0, "root");
         // Root is a decision node with fold/call/raise/all-in,
         // so every cell should have actions (uniform strategy from fresh storage).
-        let has_actions = grid.cells.iter().any(|row| {
-            row.iter().any(|cell| !cell.actions.is_empty())
-        });
+        let has_actions = grid
+            .cells
+            .iter()
+            .any(|row| row.iter().any(|cell| !cell.actions.is_empty()));
         assert!(has_actions, "at least some cells should have actions");
     }
 
@@ -596,7 +637,9 @@ mod tests {
         };
         let expected_labels: Vec<String> = actions.iter().map(format_mp_action).collect();
         // Cell [0][0] (AA) should have the same action labels
-        let cell_labels: Vec<&str> = grid.cells[0][0].actions.iter()
+        let cell_labels: Vec<&str> = grid.cells[0][0]
+            .actions
+            .iter()
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(cell_labels.len(), expected_labels.len());
@@ -635,9 +678,11 @@ mod tests {
         let tree = MpGameTree::build(&game, &action);
         let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
         // Find a terminal node index
-        let terminal_idx = tree.nodes.iter().position(|n| {
-            matches!(n, MpGameNode::Terminal { .. })
-        }).unwrap() as u32;
+        let terminal_idx = tree
+            .nodes
+            .iter()
+            .position(|n| matches!(n, MpGameNode::Terminal { .. }))
+            .unwrap() as u32;
         let grid = extract_mp_grid(&tree, &storage, terminal_idx, 0, "terminal");
         // All cells should be empty since this is not a decision node
         for row in &grid.cells {

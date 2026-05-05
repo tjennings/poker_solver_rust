@@ -11,10 +11,10 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::datagen::storage::{read_record, TrainingRecord};
+use crate::datagen::storage::{TrainingRecord, read_record};
 use crate::model::boundary_dataset::encode_boundary_record;
-use crate::model::loss::{weighted_cfvnet_loss, weighted_cfvnet_loss_components};
 use crate::model::boundary_net::BoundaryNet;
+use crate::model::loss::{weighted_cfvnet_loss, weighted_cfvnet_loss_components};
 use crate::model::network::{INPUT_SIZE, OUTPUT_SIZE};
 
 /// Configuration for the BoundaryNet training loop.
@@ -170,11 +170,20 @@ fn compute_val_loss<B: AutodiffBackend>(
         let b_mask = val_tensors.mask.clone().narrow(0, batch_start, len);
         let b_range = val_tensors.range.clone().narrow(0, batch_start, len);
         let b_gv = val_tensors.game_value.clone().narrow(0, batch_start, len);
-        let b_sw = val_tensors.sample_weight.clone().narrow(0, batch_start, len);
+        let b_sw = val_tensors
+            .sample_weight
+            .clone()
+            .narrow(0, batch_start, len);
 
         let pred = valid_model.forward(b_input);
         let (h, a) = weighted_cfvnet_loss_components(
-            pred, b_target, b_mask, b_range, b_gv, b_sw, config.huber_delta,
+            pred,
+            b_target,
+            b_mask,
+            b_range,
+            b_gv,
+            b_sw,
+            config.huber_delta,
         );
 
         total_huber += h;
@@ -183,7 +192,11 @@ fn compute_val_loss<B: AutodiffBackend>(
     }
 
     if batch_count == 0 {
-        ValLossResult { combined: 0.0, huber: 0.0, aux: 0.0 }
+        ValLossResult {
+            combined: 0.0,
+            huber: 0.0,
+            aux: 0.0,
+        }
     } else {
         let n = batch_count as f64;
         let huber = total_huber / n;
@@ -416,7 +429,10 @@ fn load_validation_set(files: &[PathBuf], val_count: usize) -> Option<PreEncoded
     if val_count == 0 || files.is_empty() {
         return None;
     }
-    eprintln!("Loading {val_count} validation records (sampled across {} files)...", files.len());
+    eprintln!(
+        "Loading {val_count} validation records (sampled across {} files)...",
+        files.len()
+    );
 
     let per_file = (val_count / files.len()).max(1);
     let mut val_records = Vec::with_capacity(val_count);
@@ -447,7 +463,10 @@ fn load_validation_set(files: &[PathBuf], val_count: usize) -> Option<PreEncoded
     }
 
     let actual_val = val_records.len();
-    eprintln!("Loaded {actual_val} validation records from {} files ({per_file} per file)", actual_val.min(files.len()));
+    eprintln!(
+        "Loaded {actual_val} validation records from {} files ({per_file} per file)",
+        actual_val.min(files.len())
+    );
     Some(PreEncoded::from_records(&val_records))
 }
 
@@ -557,7 +576,9 @@ pub fn train_boundary<B: AutodiffBackend>(
     let (mut model, start_epoch) = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new()
-        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(config.grad_clip_norm as f32)))
+        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(
+            config.grad_clip_norm as f32,
+        )))
         .init::<B, BoundaryNet<B>>();
 
     let files = collect_data_files(data_path).unwrap_or_else(|e| {
@@ -666,7 +687,12 @@ pub fn train_boundary<B: AutodiffBackend>(
                 epoch_loss = final_loss as f64;
             }
 
-            let lr = cosine_lr(config.learning_rate, config.lr_min, global_step, total_steps);
+            let lr = cosine_lr(
+                config.learning_rate,
+                config.lr_min,
+                global_step,
+                total_steps,
+            );
             let grads = loss.backward();
             let grads_params = GradientsParams::from_grads(grads, &model);
             model = optim.step(lr, model, grads_params);
@@ -728,8 +754,8 @@ pub fn train_boundary<B: AutodiffBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datagen::storage::{TrainingRecord, write_record};
     use burn::backend::{Autodiff, NdArray};
-    use crate::datagen::storage::{write_record, TrainingRecord};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
