@@ -10,8 +10,8 @@ use poker_solver_tauri::{ExplorationState, PreflopRanges};
 /// Resolve the blueprint directory from the environment or fall back to a
 /// well-known relative path. Returns `None` if the directory does not exist.
 fn blueprint_dir() -> Option<String> {
-    let dir = std::env::var("BLUEPRINT_TEST_DIR")
-        .unwrap_or_else(|_| "../../blueprints".to_string());
+    let dir =
+        std::env::var("BLUEPRINT_TEST_DIR").unwrap_or_else(|_| "../../blueprints".to_string());
 
     if std::path::Path::new(&dir).exists() {
         Some(dir)
@@ -56,9 +56,10 @@ async fn test_load_strategy_and_get_preflop_ranges() {
     // --- Step 1: Load the blueprint ---
     let state = ExplorationState::default();
 
-    let bundle_info = poker_solver_tauri::load_blueprint_v2_core(&state, blueprint_path.clone(), None)
-        .await
-        .unwrap_or_else(|e| panic!("load_blueprint_v2_core failed for {blueprint_path}: {e}"));
+    let bundle_info =
+        poker_solver_tauri::load_blueprint_v2_core(&state, blueprint_path.clone(), None)
+            .await
+            .unwrap_or_else(|e| panic!("load_blueprint_v2_core failed for {blueprint_path}: {e}"));
 
     assert!(
         bundle_info.stack_depth > 0,
@@ -75,9 +76,9 @@ async fn test_load_strategy_and_get_preflop_ranges() {
     // Try "c" (call/check) first — SB limps. This should always be valid in
     // standard HU preflop trees where SB acts first with fold/call/raise.
     let history_to_try: &[&[&str]] = &[
-        &["c", "c"],       // SB limps, BB checks → both reach flop
-        &["c"],            // SB limps (single action)
-        &["r:0", "c"],     // SB raises (smallest), BB calls
+        &["c", "c"],   // SB limps, BB checks → both reach flop
+        &["c"],        // SB limps (single action)
+        &["r:0", "c"], // SB raises (smallest), BB calls
     ];
 
     let mut found_valid = false;
@@ -92,10 +93,7 @@ async fn test_load_strategy_and_get_preflop_ranges() {
                 break;
             }
             Err(e) => {
-                eprintln!(
-                    "History {:?} not valid for this tree: {}",
-                    actions, e
-                );
+                eprintln!("History {:?} not valid for this tree: {}", actions, e);
             }
         }
     }

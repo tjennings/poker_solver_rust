@@ -6,7 +6,11 @@ pub fn regret_match_into(regrets: &[f64], out: &mut Vec<f64>) {
 
     out.clear();
     if positive_sum > 0.0 {
-        out.extend(regrets.iter().map(|&r| if r > 0.0 { r / positive_sum } else { 0.0 }));
+        out.extend(
+            regrets
+                .iter()
+                .map(|&r| if r > 0.0 { r / positive_sum } else { 0.0 }),
+        );
     } else {
         #[allow(clippy::cast_precision_loss)]
         let uniform = 1.0 / regrets.len() as f64;

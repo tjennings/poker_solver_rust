@@ -20,8 +20,8 @@ use poker_solver_core::blueprint_v2::game_tree::{
 use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
 
 use range_solver::card::{card_to_string, NOT_DEALT};
-use range_solver::{PostFlopGame, solve_step, finalize, compute_exploitability};
 use range_solver::interface::Game;
+use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,9 @@ use serde::Deserialize;
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum StreetBoundaryMode {
     Exact,
-    Cfvnet { model_path: String },
+    Cfvnet {
+        model_path: String,
+    },
     /// Cut here and solve the downstream subtree exactly (full CFR).
     ExactSubtree,
 }
@@ -83,13 +85,8 @@ pub fn resolve_street_boundary(
             (Street::Turn, &config.turn),
             (Street::River, &config.river),
         ],
-        Street::Turn => &[
-            (Street::Turn, &config.turn),
-            (Street::River, &config.river),
-        ],
-        Street::River => &[
-            (Street::River, &config.river),
-        ],
+        Street::Turn => &[(Street::Turn, &config.turn), (Street::River, &config.river)],
+        Street::River => &[(Street::River, &config.river)],
         Street::Preflop => return None, // preflop solve not supported
     };
 
@@ -128,11 +125,11 @@ pub fn validate_cfvnet_boundary_cut(
 }
 
 use crate::exploration::{
-    board_for_street_slice, blueprint_sizes_to_range_solver, build_canonical_to_combo_map,
+    blueprint_sizes_to_range_solver, board_for_street_slice, build_canonical_to_combo_map,
     canonical_hand_index_from_ranks, hand_label_from_matrix, parse_board, pot_at_v2_node,
     ActionInfo, BucketLookup, RANKS,
 };
-use crate::postflop::{CbvContext, RolloutLeafEvaluator, parse_rs_poker_card};
+use crate::postflop::{parse_rs_poker_card, CbvContext, RolloutLeafEvaluator};
 
 // ---------------------------------------------------------------------------
 // Types returned to the frontend
@@ -177,7 +174,7 @@ pub struct ComboDetail {
     pub probabilities: Vec<f32>, // one per action
     pub weight: f32,             // reaching probability for this combo
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bucket: Option<u16>,     // strategy bucket ID (postflop only)
+    pub bucket: Option<u16>, // strategy bucket ID (postflop only)
 }
 
 /// A single cell in the 13x13 strategy matrix.
@@ -446,10 +443,7 @@ impl GameSession {
                     position: String::new(),
                     board: self.board.clone(),
                     pot: *pot as i32,
-                    stacks: [
-                        stacks[bb_idx] as i32,
-                        stacks[sb_idx] as i32,
-                    ],
+                    stacks: [stacks[bb_idx] as i32, stacks[sb_idx] as i32],
                     matrix: None,
                     actions: vec![],
                     action_history: self.action_history.clone(),
@@ -490,12 +484,7 @@ impl GameSession {
 
                 let game_actions = build_game_actions(actions);
                 let matrix = if decision_idx != u32::MAX {
-                    Some(self.build_matrix(
-                        decision_idx as usize,
-                        *player,
-                        *street,
-                        &game_actions,
-                    ))
+                    Some(self.build_matrix(decision_idx as usize, *player, *street, &game_actions))
                 } else {
                     None
                 };
@@ -601,13 +590,13 @@ impl GameSession {
 
                 // Compute weight: average reaching probability across combos for this hand.
                 let combo_indices = &combo_map[hand_idx];
-                let (weight_sum, weight_count) = combo_indices.iter().fold(
-                    (0.0f32, 0usize),
-                    |(sum, count), &ci| {
-                        // For postflop, filter out board-blocked combos.
-                        (sum + self.weights[weight_idx][ci], count + 1)
-                    },
-                );
+                let (weight_sum, weight_count) =
+                    combo_indices
+                        .iter()
+                        .fold((0.0f32, 0usize), |(sum, count), &ci| {
+                            // For postflop, filter out board-blocked combos.
+                            (sum + self.weights[weight_idx][ci], count + 1)
+                        });
                 let weight = if weight_count > 0 {
                     weight_sum / weight_count as f32
                 } else {
@@ -628,7 +617,11 @@ impl GameSession {
 
                 // Build per-combo details.
                 let combos = self.build_combo_details(
-                    combo_indices, weight_idx, decision_idx, street, actions.len(),
+                    combo_indices,
+                    weight_idx,
+                    decision_idx,
+                    street,
+                    actions.len(),
                     &board_cards,
                 );
 
@@ -670,7 +663,11 @@ impl GameSession {
 
                 let (c1_raw, c2_raw) = index_to_card_pair(ci);
                 // Show high card first: rank = id / 4, higher rank = higher id.
-                let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 { (c1_raw, c2_raw) } else { (c2_raw, c1_raw) };
+                let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 {
+                    (c1_raw, c2_raw)
+                } else {
+                    (c2_raw, c1_raw)
+                };
                 let s1 = card_to_string(c1).unwrap_or_default();
                 let s2 = card_to_string(c2).unwrap_or_default();
 
@@ -693,7 +690,9 @@ impl GameSession {
                     let board_slice = board_for_street_slice(board, street);
                     let rs_c1 = crate::exploration::range_solver_to_rs_card(c1);
                     let rs_c2 = crate::exploration::range_solver_to_rs_card(c2);
-                    let bucket = ctx.all_buckets.get_bucket(street, [rs_c1, rs_c2], board_slice);
+                    let bucket = ctx
+                        .all_buckets
+                        .get_bucket(street, [rs_c1, rs_c2], board_slice);
                     let strategy_probs = ctx.strategy.get_action_probs(decision_idx, bucket);
                     let probs = (0..num_actions)
                         .map(|i| strategy_probs.get(i).copied().unwrap_or(0.0))
@@ -780,9 +779,9 @@ impl GameSession {
             V2GameNode::Chance { .. } => {
                 // Determine target card count BEFORE pushing (based on current board).
                 let cards_needed = match self.board.len() {
-                    0..=2 => 3,  // flop needs 3 total
-                    3 => 4,      // turn needs 4 total
-                    4 => 5,      // river needs 5 total
+                    0..=2 => 3, // flop needs 3 total
+                    3 => 4,     // turn needs 4 total
+                    4 => 5,     // river needs 5 total
                     _ => self.board.len() + 1,
                 };
 
@@ -1022,9 +1021,7 @@ impl GameSession {
                 for action_str in actions {
                     let action_str = action_str.trim();
                     let (pos, label) = action_str.split_once(':').ok_or_else(|| {
-                        format!(
-                            "Invalid action format: '{action_str}'. Expected 'position:label'"
-                        )
+                        format!("Invalid action format: '{action_str}'. Expected 'position:label'")
                     })?;
 
                     // Get current state to find matching action
@@ -1052,9 +1049,7 @@ impl GameSession {
                             let available: Vec<String> = state
                                 .actions
                                 .iter()
-                                .map(|a| {
-                                    format!("{}:{}", position, a.label.to_lowercase())
-                                })
+                                .map(|a| format!("{}:{}", position, a.label.to_lowercase()))
                                 .collect();
                             return Err(format!(
                                 "Action '{}:{}' not found. Available: {}",
@@ -1257,8 +1252,7 @@ pub fn build_solve_game_parts(
 
     let oop_range =
         Range::from_raw_data(oop_weights).map_err(|e| format!("Bad OOP weights: {e}"))?;
-    let ip_range =
-        Range::from_raw_data(ip_weights).map_err(|e| format!("Bad IP weights: {e}"))?;
+    let ip_range = Range::from_raw_data(ip_weights).map_err(|e| format!("Bad IP weights: {e}"))?;
 
     let (bet_str, raise_str) = format_bet_sizes_for_solve(bet_sizes);
     let oop_sizes = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
@@ -1313,8 +1307,14 @@ pub fn build_solve_game(
     depth_limit_override: Option<u8>,
 ) -> Result<PostFlopGame, String> {
     let (card_config, action_tree) = build_solve_game_parts(
-        board, oop_weights, ip_weights, pot, effective_stack,
-        bet_sizes, exact, depth_limit_override,
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        bet_sizes,
+        exact,
+        depth_limit_override,
     )?;
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
@@ -1343,29 +1343,50 @@ fn build_gadget_tree_game_for_solve(
     solve_iters: u32,
     target_exp: f32,
 ) -> Result<PostFlopGame, String> {
-    let ctx = cbv_ctx.as_ref().ok_or(
-        "enable_gadget=true but no CbvContext loaded (blueprint must include CBV tables)",
-    )?;
+    let ctx = cbv_ctx
+        .as_ref()
+        .ok_or("enable_gadget=true but no CbvContext loaded (blueprint must include CBV tables)")?;
 
-    let board_u8: Vec<u8> = board.iter()
+    let board_u8: Vec<u8> = board
+        .iter()
         .map(|s| parse_rs_poker_card(s).expect("board card must parse"))
         .map(|c| crate::exploration::rs_card_to_range_solver(c))
         .collect();
 
     // Build inner boundary evaluator for cfvnet ordinals 0..N.
     let inner_evaluator = build_inner_evaluator_for_solve(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, depth_limit,
-        &board_u8, boundary_cut, solve_iters, target_exp,
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        depth_limit,
+        &board_u8,
+        boundary_cut,
+        solve_iters,
+        target_exp,
     )?;
 
     // Build gadget game via A2 per-boundary injection.
     let (card_config, action_tree) = build_solve_game_parts(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        false,
+        depth_limit,
     )?;
     eprintln!("[solve] gadget-tree (A2): BlueprintCbvOptOut (per-boundary pot)");
     crate::gadget::make_per_boundary_gadget_game(
-        card_config, action_tree, ctx, current_node_idx,
-        &board_u8, inner_evaluator,
+        card_config,
+        action_tree,
+        ctx,
+        current_node_idx,
+        &board_u8,
+        inner_evaluator,
     )
 }
 
@@ -1385,7 +1406,14 @@ fn build_inner_evaluator_for_solve(
     target_exp: f32,
 ) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
     let (tmp_cc, tmp_at) = build_solve_game_parts(
-        board, oop_w, ip_w, pot, eff_stack, bet_sizes, false, depth_limit,
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        false,
+        depth_limit,
     )?;
     let tmp_game = PostFlopGame::with_config(tmp_cc, tmp_at)
         .map_err(|e| format!("Failed to build temp game: {e}"))?;
@@ -1400,36 +1428,36 @@ fn build_inner_evaluator_for_solve(
     ];
     drop(tmp_game);
 
-    let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> =
-        match boundary_cut {
-            Some((_, BoundaryKind::ExactSubtree)) | None => {
-                Arc::new(crate::exact_subtree::SubtreeExactEvaluator::new(
-                    board_u8.to_vec(),
-                    private_cards,
-                    initial_weights,
-                    tree_cfg,
-                ).with_solve_iters(solve_iters)
-                 .with_target_exploitability(target_exp))
-            }
-            Some((_, BoundaryKind::Cfvnet(model_path))) => {
-                let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
-                    std::path::Path::new(model_path),
-                ).map_err(|e| format!("ONNX session load failed: {e}"))?;
-                Arc::new(cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+    let evaluator: Arc<dyn range_solver::game::BoundaryEvaluator> = match boundary_cut {
+        Some((_, BoundaryKind::ExactSubtree)) | None => Arc::new(
+            crate::exact_subtree::SubtreeExactEvaluator::new(
+                board_u8.to_vec(),
+                private_cards,
+                initial_weights,
+                tree_cfg,
+            )
+            .with_solve_iters(solve_iters)
+            .with_target_exploitability(target_exp),
+        ),
+        Some((_, BoundaryKind::Cfvnet(model_path))) => {
+            let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
+                std::path::Path::new(model_path),
+            )
+            .map_err(|e| format!("ONNX session load failed: {e}"))?;
+            Arc::new(
+                cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
                     session,
                     board_u8.to_vec(),
                     private_cards,
-                ))
-            }
-        };
+                ),
+            )
+        }
+    };
     Ok(evaluator)
 }
 
 /// Convert a range-solver `Action` to a `GameAction`.
-fn range_solver_action_to_game_action(
-    action: &range_solver::Action,
-    idx: usize,
-) -> GameAction {
+fn range_solver_action_to_game_action(action: &range_solver::Action, idx: usize) -> GameAction {
     let (label, action_type) = match action {
         range_solver::Action::Fold => ("Fold".to_string(), "fold"),
         range_solver::Action::Check => ("Check".to_string(), "check"),
@@ -1503,7 +1531,11 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
             probs.push(prob);
         }
 
-        let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 { (c1_raw, c2_raw) } else { (c2_raw, c1_raw) };
+        let (c1, c2) = if c1_raw / 4 >= c2_raw / 4 {
+            (c1_raw, c2_raw)
+        } else {
+            (c2_raw, c1_raw)
+        };
         let s1 = card_to_string(c1).unwrap_or_default();
         let s2 = card_to_string(c2).unwrap_or_default();
         combo_details[row][col].push(ComboDetail {
@@ -1636,7 +1668,9 @@ pub struct SolveBoundaryEvaluator {
 }
 
 impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
-    fn num_continuations(&self) -> usize { 4 }
+    fn num_continuations(&self) -> usize {
+        4
+    }
 
     fn compute_cfvs(
         &self,
@@ -1664,8 +1698,14 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
                     let mut ev_sum = 0.0f64;
                     let mut weight_sum = 0.0f64;
                     for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
-                        let w = if j < opponent_reach.len() { opponent_reach[j] as f64 } else { 0.0 };
-                        if w <= 0.0 { continue; }
+                        let w = if j < opponent_reach.len() {
+                            opponent_reach[j] as f64
+                        } else {
+                            0.0
+                        };
+                        if w <= 0.0 {
+                            continue;
+                        }
                         let rs_o1 = crate::exploration::range_solver_to_rs_card(o1);
                         let rs_o2 = crate::exploration::range_solver_to_rs_card(o2);
                         // Skip card overlaps
@@ -1676,7 +1716,9 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
                             continue;
                         }
                         let eq = poker_solver_core::showdown_equity::compute_matchup_equity(
-                            [rs_h1, rs_h2], [rs_o1, rs_o2], &self.board_cards,
+                            [rs_h1, rs_h2],
+                            [rs_o1, rs_o2],
+                            &self.board_cards,
                         );
                         ev_sum += eq * w;
                         weight_sum += w;
@@ -1727,7 +1769,11 @@ impl range_solver::game::BoundaryEvaluator for SolveBoundaryEvaluator {
             eval.call_counter = Arc::clone(&rollout.call_counter);
             let requests = vec![(pot as f64, 0.0, player as u8)];
             let results = eval.evaluate_boundaries(
-                &self.combos, &self.board_cards, &hero_combo_reach, &opp_combo_reach, &requests,
+                &self.combos,
+                &self.board_cards,
+                &hero_combo_reach,
+                &opp_combo_reach,
+                &requests,
             );
             let combo_cfvs = results.into_iter().next().unwrap_or_default();
 
@@ -1771,7 +1817,10 @@ pub fn game_new_core(
 /// - `None` or `"blueprint"`: return blueprint data only, skip solve overlay.
 /// - `"subgame"`: overlay from `subgame_solve`.
 /// - `"exact"`: overlay from `exact_solve`.
-pub fn game_get_state_core(session_state: &GameSessionState, source: Option<String>) -> Result<GameState, String> {
+pub fn game_get_state_core(
+    session_state: &GameSessionState,
+    source: Option<String>,
+) -> Result<GameState, String> {
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
     let mut state = session.get_state();
@@ -1824,7 +1873,6 @@ pub fn game_get_state_core(session_state: &GameSessionState, source: Option<Stri
                 state.position = position.clone();
             }
         }
-
     }
 
     Ok(state)
@@ -1909,7 +1957,10 @@ pub fn game_deal_card_core(
 /// solve state entirely.
 ///
 /// `source` selects which solve cache to navigate within.
-pub fn game_back_core(session_state: &GameSessionState, source: Option<String>) -> Result<GameState, String> {
+pub fn game_back_core(
+    session_state: &GameSessionState,
+    source: Option<String>,
+) -> Result<GameState, String> {
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.back()?;
@@ -1973,7 +2024,18 @@ pub fn game_solve_core(
     }
 
     // Read session state under lock, clone what the thread needs
-    let (board, oop_w, ip_w, pot, eff_stack, bet_sizes, cbv_ctx, current_node_idx, position_label, root_street) = {
+    let (
+        board,
+        oop_w,
+        ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        cbv_ctx,
+        current_node_idx,
+        position_label,
+        root_street,
+    ) = {
         let guard = session_state.session.read();
         let session = guard.as_ref().ok_or("No game session active")?;
 
@@ -2006,7 +2068,18 @@ pub fn game_solve_core(
         let position = session.position_label(player).to_string();
         let current_node = session.node_idx;
 
-        (board, oop_w, ip_w, pot, eff_stack, sizes.clone(), cbv_ctx, current_node, position, street)
+        (
+            board,
+            oop_w,
+            ip_w,
+            pot,
+            eff_stack,
+            sizes.clone(),
+            cbv_ctx,
+            current_node,
+            position,
+            street,
+        )
     };
 
     // Resolve StreetBoundaryConfig to (depth_limit, model_path)
@@ -2052,9 +2125,8 @@ pub fn game_solve_core(
     // running the other mode.
     let trace_config = {
         let boundaries = trace_boundaries.filter(|s| !s.trim().is_empty());
-        let raw_dir = std::path::PathBuf::from(
-            trace_dir.unwrap_or_else(|| "./local_data/logs".to_string()),
-        );
+        let raw_dir =
+            std::path::PathBuf::from(trace_dir.unwrap_or_else(|| "./local_data/logs".to_string()));
         let base = if raw_dir.is_absolute() {
             raw_dir
         } else {
@@ -2106,15 +2178,22 @@ pub fn game_solve_core(
         // cut is active, build via make_per_boundary_gadget_game which
         // injects per-boundary gadget subtrees. game.root() remains the
         // real subgame root.
-        let gadget_tree_active = gadget_enabled
-            && boundary_cut.is_some()
-            && cbv_ctx.is_some();
+        let gadget_tree_active = gadget_enabled && boundary_cut.is_some() && cbv_ctx.is_some();
 
         let mut game = if gadget_tree_active {
             match build_gadget_tree_game_for_solve(
-                &board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes,
-                depth_limit_override, &cbv_ctx, current_node_idx, &boundary_cut,
-                max_iters, target_exp,
+                &board_clone,
+                &oop_w,
+                &ip_w,
+                pot,
+                eff_stack,
+                &bet_sizes,
+                depth_limit_override,
+                &cbv_ctx,
+                current_node_idx,
+                &boundary_cut,
+                max_iters,
+                target_exp,
             ) {
                 Ok(g) => g,
                 Err(e) => {
@@ -2131,8 +2210,14 @@ pub fn game_solve_core(
                 eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
             }
             match build_solve_game(
-                &board_clone, &oop_w, &ip_w, pot, eff_stack, &bet_sizes,
-                build_exact, depth_limit_override,
+                &board_clone,
+                &oop_w,
+                &ip_w,
+                pot,
+                eff_stack,
+                &bet_sizes,
+                build_exact,
+                depth_limit_override,
             ) {
                 Ok(g) => g,
                 Err(e) => {
@@ -2188,13 +2273,15 @@ pub fn game_solve_core(
         } else {
             eprintln!(
                 "[solve] depth_limit: {:?}, boundary nodes: {n_boundaries}, per_boundary: {}",
-                depth_limit_override, game.per_boundary_evaluators.len(),
+                depth_limit_override,
+                game.per_boundary_evaluators.len(),
             );
         }
         eprintln!("[solve] pot={pot}, eff_stack={eff_stack}, board={board_clone:?}");
         eprintln!(
             "[solve] OOP hands: {}, IP hands: {}",
-            game.private_cards(0).len(), game.private_cards(1).len(),
+            game.private_cards(0).len(),
+            game.private_cards(1).len(),
         );
         eprintln!("[solve] memory: {:.1} MB", mem_est as f64 / 1_048_576.0);
 
@@ -2236,9 +2323,9 @@ pub fn game_solve_core(
                 None
             }
         });
-        let preceding_map = tracer.as_ref().map(|_| {
-            crate::boundary_trace::build_preceding_decision_map(&game)
-        });
+        let preceding_map = tracer
+            .as_ref()
+            .map(|_| crate::boundary_trace::build_preceding_decision_map(&game));
 
         // Initial matrix snapshot
         let matrix = build_solve_matrix(&mut game, None);
@@ -2260,7 +2347,11 @@ pub fn game_solve_core(
 
             // Update DCFR discount params for boundary continuation regrets.
             {
-                let nearest_pow4 = if t == 0 { 0 } else { 1u32 << ((t.leading_zeros() ^ 31) & !1) };
+                let nearest_pow4 = if t == 0 {
+                    0
+                } else {
+                    1u32 << ((t.leading_zeros() ^ 31) & !1)
+                };
                 let t_alpha = (t as i32 - 1).max(0) as f64;
                 let t_gamma = (t - nearest_pow4) as f64;
                 let pow_alpha = t_alpha * t_alpha.sqrt();
@@ -2292,7 +2383,9 @@ pub fn game_solve_core(
 
                 if is_exact {
                     let exp = compute_exploitability(&game);
-                    ss_clone.exploitability_bits.store(exp.to_bits(), Ordering::Relaxed);
+                    ss_clone
+                        .exploitability_bits
+                        .store(exp.to_bits(), Ordering::Relaxed);
                     if exp.is_finite() && exp > 0.0 && exp <= target_exp {
                         eprintln!(
                             "[solve] exact converged: iter={t} exploitability={exp:.3} <= target={target_exp}"
@@ -2348,7 +2441,10 @@ pub fn game_solve_core(
         // Build solve cache for all decision nodes in the solved tree.
         game.back_to_root();
         let solve_cache = build_solve_cache(&mut game);
-        eprintln!("[solve] cached {} decision nodes for subgame navigation", solve_cache.len());
+        eprintln!(
+            "[solve] cached {} decision nodes for subgame navigation",
+            solve_cache.len()
+        );
         *ss_clone.solve_cache.write() = solve_cache;
         *ss_clone.solve_path.write() = vec![];
 
@@ -2405,15 +2501,13 @@ fn setup_neural_boundaries(
         );
         let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
-            Some(provider) => Arc::new(
-                crate::gadget::GadgetEvaluator::new(
-                    inner,
-                    Arc::clone(provider),
-                    ordinal,
-                    board_4,
-                    private_cards_pair,
-                ),
-            ),
+            Some(provider) => Arc::new(crate::gadget::GadgetEvaluator::new(
+                inner,
+                Arc::clone(provider),
+                ordinal,
+                board_4,
+                private_cards_pair,
+            )),
             None => inner,
         };
         per_boundary.push(wrapped);
@@ -2421,9 +2515,7 @@ fn setup_neural_boundaries(
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
-    eprintln!(
-        "[solve] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",
-    );
+    eprintln!("[solve] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",);
 }
 
 /// Wire per-boundary `SubtreeExactEvaluator`s into the game's
@@ -2463,28 +2555,25 @@ fn setup_exact_subtree_boundaries_with_gadget(
                 private_cards.clone(),
                 initial_weights.clone(),
                 bet_sizes.clone(),
-            ).with_solve_iters(solve_iters)
-             .with_target_exploitability(target_exp),
+            )
+            .with_solve_iters(solve_iters)
+            .with_target_exploitability(target_exp),
         );
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
-            Some(provider) => Arc::new(
-                crate::gadget::GadgetEvaluator::new(
-                    eval,
-                    Arc::clone(provider),
-                    ordinal,
-                    board.clone(),
-                    private_cards.clone(),
-                ),
-            ),
+            Some(provider) => Arc::new(crate::gadget::GadgetEvaluator::new(
+                eval,
+                Arc::clone(provider),
+                ordinal,
+                board.clone(),
+                private_cards.clone(),
+            )),
             None => eval,
         };
         per_boundary.push(wrapped);
     }
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
-    eprintln!(
-        "[solve] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}"
-    );
+    eprintln!("[solve] exact-subtree mode: {n_boundaries} boundaries (full CFR){gadget_label}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2570,7 +2659,10 @@ pub fn game_solve(
     )
 }
 
-pub fn game_cancel_solve_core(session_state: &GameSessionState, mode: Option<String>) -> Result<(), String> {
+pub fn game_cancel_solve_core(
+    session_state: &GameSessionState,
+    mode: Option<String>,
+) -> Result<(), String> {
     session_state
         .solve_for(&mode)
         .cancel
@@ -3021,7 +3113,10 @@ mod tests {
         assert!(!ss.solving.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!ss.cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(ss.max_iterations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            ss.max_iterations.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert!(ss.matrix_snapshot.read().is_none());
         assert!(ss.solve_actions.read().is_empty());
         assert!(ss.solve_position.read().is_empty());
@@ -3031,14 +3126,22 @@ mod tests {
     fn game_session_state_has_dual_solve_states() {
         let gss = GameSessionState::default();
         // Both subgame_solve and exact_solve should exist and default to not solving
-        assert!(!gss.subgame_solve.solving.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(!gss.exact_solve.solving.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .subgame_solve
+            .solving
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .exact_solve
+            .solving
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
     fn solve_for_returns_subgame_by_default() {
         let gss = GameSessionState::default();
-        gss.subgame_solve.iteration.store(42, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(42, std::sync::atomic::Ordering::Relaxed);
         let ss = gss.solve_for(&None);
         assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 42);
     }
@@ -3046,7 +3149,9 @@ mod tests {
     #[test]
     fn solve_for_returns_subgame_for_subgame_mode() {
         let gss = GameSessionState::default();
-        gss.subgame_solve.iteration.store(77, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(77, std::sync::atomic::Ordering::Relaxed);
         let ss = gss.solve_for(&Some("subgame".to_string()));
         assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 77);
     }
@@ -3054,7 +3159,9 @@ mod tests {
     #[test]
     fn solve_for_returns_exact_for_exact_mode() {
         let gss = GameSessionState::default();
-        gss.exact_solve.iteration.store(99, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve
+            .iteration
+            .store(99, std::sync::atomic::Ordering::Relaxed);
         let ss = gss.solve_for(&Some("exact".to_string()));
         assert_eq!(ss.iteration.load(std::sync::atomic::Ordering::Relaxed), 99);
     }
@@ -3070,9 +3177,15 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate active solve on subgame
-        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.iteration.store(50, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .max_iterations
+            .store(200, std::sync::atomic::Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         // source=None means blueprint, should skip solve overlay
@@ -3091,10 +3204,18 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate active solve
-        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.iteration.store(50, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.exploitability_bits.store(5.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .max_iterations
+            .store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .exploitability_bits
+            .store(5.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
@@ -3113,9 +3234,15 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate active solve on exact
-        gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
-        gss.exact_solve.iteration.store(75, std::sync::atomic::Ordering::Relaxed);
-        gss.exact_solve.max_iterations.store(300, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve
+            .iteration
+            .store(75, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve
+            .max_iterations
+            .store(300, std::sync::atomic::Ordering::Relaxed);
         *gss.exact_solve.solve_start.write() = Some(std::time::Instant::now());
 
         // source="exact" should read from exact_solve
@@ -3132,10 +3259,18 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate completed solve
-        gss.subgame_solve.solving.store(false, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.iteration.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.exploitability_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .max_iterations
+            .store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .exploitability_bits
+            .store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
@@ -3151,9 +3286,15 @@ mod tests {
         *gss.session.write() = Some(session);
 
         // Simulate solve with matrix snapshot
-        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.iteration.store(10, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.max_iterations.store(100, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(10, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .max_iterations
+            .store(100, std::sync::atomic::Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         // Create a dummy matrix snapshot
@@ -3168,12 +3309,18 @@ mod tests {
                 ev: None,
                 combos: vec![],
             }]],
-            actions: vec![GameAction { id: "0".to_string(), label: "Check".to_string(), action_type: "check".to_string() }],
+            actions: vec![GameAction {
+                id: "0".to_string(),
+                label: "Check".to_string(),
+                action_type: "check".to_string(),
+            }],
         };
         *gss.subgame_solve.matrix_snapshot.write() = Some(dummy_matrix);
 
         let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
-        let matrix = state.matrix.expect("matrix should be overridden by solve snapshot");
+        let matrix = state
+            .matrix
+            .expect("matrix should be overridden by solve snapshot");
         assert_eq!(matrix.cells[0][0].hand, "TEST");
     }
 
@@ -3195,7 +3342,9 @@ mod tests {
     #[test]
     fn game_solve_core_rejects_no_session() {
         let gss = GameSessionState::default();
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(
+            &gss, None, None, None, None, None, None, None, None, None, None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
     }
@@ -3205,10 +3354,14 @@ mod tests {
         let gss = GameSessionState::default();
         let session = make_decision_session();
         *gss.session.write() = Some(session);
-        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Default mode (subgame) should reject when subgame is already solving
-        let result = game_solve_core(&gss, None, None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(
+            &gss, None, None, None, None, None, None, None, None, None, None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -3218,10 +3371,24 @@ mod tests {
         let gss = GameSessionState::default();
         let session = make_decision_session();
         *gss.session.write() = Some(session);
-        gss.exact_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.exact_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should reject when exact is already solving
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(
+            &gss,
+            Some("exact".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already in progress"));
     }
@@ -3232,12 +3399,26 @@ mod tests {
         let session = make_decision_session();
         *gss.session.write() = Some(session);
         // Subgame is already solving
-        gss.subgame_solve.solving.store(true, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Exact mode should NOT be rejected (different mode)
         // It will still fail because it's a preflop node, but the error
         // should NOT be "already in progress"
-        let result = game_solve_core(&gss, Some("exact".to_string()), None, None, None, None, None, None, None, None, None);
+        let result = game_solve_core(
+            &gss,
+            Some("exact".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(!result.unwrap_err().contains("already in progress"));
     }
@@ -3247,7 +3428,17 @@ mod tests {
         let gss = GameSessionState::default();
         // Should reject (no session) but must accept the enable_gadget parameter
         let result = game_solve_core(
-            &gss, None, None, None, None, None, None, None, None, None, Some(true),
+            &gss,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No game session"));
@@ -3260,21 +3451,39 @@ mod tests {
     #[test]
     fn cancel_solve_sets_cancel_flag_subgame() {
         let gss = GameSessionState::default();
-        assert!(!gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .subgame_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         game_cancel_solve_core(&gss, None).unwrap();
-        assert!(gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(gss
+            .subgame_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         // exact_solve should be unaffected
-        assert!(!gss.exact_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .exact_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
     fn cancel_solve_sets_cancel_flag_exact() {
         let gss = GameSessionState::default();
-        assert!(!gss.exact_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .exact_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         game_cancel_solve_core(&gss, Some("exact".to_string())).unwrap();
-        assert!(gss.exact_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(gss
+            .exact_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         // subgame_solve should be unaffected
-        assert!(!gss.subgame_solve.cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .subgame_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // -------------------------------------------------------------------
@@ -3294,7 +3503,12 @@ mod tests {
 
     #[test]
     fn parse_solve_board_turn() {
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string(), "Js".to_string()];
+        let board = vec![
+            "Ah".to_string(),
+            "Kd".to_string(),
+            "Qc".to_string(),
+            "Js".to_string(),
+        ];
         let (_flop, turn, river, state) = parse_solve_board(&board).unwrap();
         assert_eq!(state, range_solver::BoardState::Turn);
         assert!(turn < 52);
@@ -3303,7 +3517,13 @@ mod tests {
 
     #[test]
     fn parse_solve_board_river() {
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string(), "Js".to_string(), "Ts".to_string()];
+        let board = vec![
+            "Ah".to_string(),
+            "Kd".to_string(),
+            "Qc".to_string(),
+            "Js".to_string(),
+            "Ts".to_string(),
+        ];
         let (_flop, _turn, river, state) = parse_solve_board(&board).unwrap();
         assert_eq!(state, range_solver::BoardState::River);
         assert!(river < 52);
@@ -3363,7 +3583,8 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, None).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, None).unwrap();
         // Flop solve with depth_limit=Some(0) should have boundary nodes
         assert!(game.num_boundary_nodes() > 0);
     }
@@ -3374,7 +3595,8 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true, None).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true, None).unwrap();
         // Exact solve with depth_limit=None should have no boundary nodes
         assert_eq!(game.num_boundary_nodes(), 0);
     }
@@ -3386,7 +3608,8 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(1)).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(1)).unwrap();
         // With depth_limit=1, there should still be boundary nodes (at turn->river)
         assert!(game.num_boundary_nodes() > 0);
     }
@@ -3398,7 +3621,8 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(2)).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(2)).unwrap();
         // depth_limit=2 from flop = full solve, no boundaries
         assert_eq!(game.num_boundary_nodes(), 0);
     }
@@ -3409,7 +3633,8 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, None).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, None).unwrap();
         // Should have boundary nodes (same as depth_limit=0)
         assert!(game.num_boundary_nodes() > 0);
     }
@@ -3420,7 +3645,8 @@ mod tests {
         let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true, Some(0)).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, true, Some(0)).unwrap();
         // Exact mode ignores depth_limit_override
         assert_eq!(game.num_boundary_nodes(), 0);
     }
@@ -3428,10 +3654,17 @@ mod tests {
     #[test]
     fn build_solve_game_river_ignores_depth_limit_override() {
         // River solve should always use depth_limit=None regardless of override
-        let board = vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string(), "7s".to_string(), "2h".to_string()];
+        let board = vec![
+            "Ah".to_string(),
+            "Kd".to_string(),
+            "Qc".to_string(),
+            "7s".to_string(),
+            "2h".to_string(),
+        ];
         let weights = vec![1.0f32; 1326];
         let sizes = vec![vec![0.5, 1.0]];
-        let game = build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(0)).unwrap();
+        let game =
+            build_solve_game(&board, &weights, &weights, 20, 90, &sizes, false, Some(0)).unwrap();
         // River solve has no boundaries regardless of depth_limit_override
         assert_eq!(game.num_boundary_nodes(), 0);
     }
@@ -3463,16 +3696,32 @@ mod tests {
     fn game_new_resets_solve_state() {
         let gss = GameSessionState::default();
         // Simulate prior solve
-        gss.subgame_solve.iteration.store(100, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.max_iterations.store(200, std::sync::atomic::Ordering::Relaxed);
-        gss.subgame_solve.solving.store(false, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .iteration
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .max_iterations
+            .store(200, std::sync::atomic::Ordering::Relaxed);
+        gss.subgame_solve
+            .solving
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         // game_new_core needs ExplorationState and PostflopState, but
         // we can test the reset by calling reset_solve_state directly
         gss.subgame_solve.reset();
 
-        assert_eq!(gss.subgame_solve.iteration.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(gss.subgame_solve.max_iterations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            gss.subgame_solve
+                .iteration
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            gss.subgame_solve
+                .max_iterations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert!(gss.subgame_solve.matrix_snapshot.read().is_none());
     }
 
@@ -3483,10 +3732,10 @@ mod tests {
     #[test]
     fn build_solve_matrix_from_postflop_game() {
         // Build a tiny PostFlopGame and verify matrix extraction
-        use range_solver::{PostFlopGame, ActionTree, CardConfig, TreeConfig, BoardState};
+        use range_solver::bet_size::BetSizeOptions;
         use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::range::Range;
-        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
         let oop_range: Range = "AA".parse().unwrap();
         let ip_range: Range = "KK".parse().unwrap();
@@ -3909,7 +4158,9 @@ mod tests {
     #[test]
     fn load_spot_flop_actions_after_board() {
         let mut session = make_multi_street_session();
-        session.load_spot("sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb").unwrap();
+        session
+            .load_spot("sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb")
+            .unwrap();
         assert_eq!(session.action_history.len(), 4);
         assert_eq!(session.board.len(), 3);
         assert_eq!(session.action_history[2].label, "Check");
@@ -4183,7 +4434,11 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// Helper to create a dummy CachedSolveNode with a recognizable hand label.
-    fn make_cached_node(hand_label: &str, action_labels: &[&str], position: &str) -> CachedSolveNode {
+    fn make_cached_node(
+        hand_label: &str,
+        action_labels: &[&str],
+        position: &str,
+    ) -> CachedSolveNode {
         let actions: Vec<GameAction> = action_labels
             .iter()
             .enumerate()
@@ -4224,8 +4479,12 @@ mod tests {
     fn solve_state_reset_clears_cache_and_path() {
         let ss = SolveState::default();
         // Populate cache and path
-        ss.solve_cache.write().insert(vec![], make_cached_node("ROOT", &["Check", "Bet"], "OOP"));
-        ss.solve_cache.write().insert(vec![0], make_cached_node("CHILD0", &["Fold", "Call"], "IP"));
+        ss.solve_cache
+            .write()
+            .insert(vec![], make_cached_node("ROOT", &["Check", "Bet"], "OOP"));
+        ss.solve_cache
+            .write()
+            .insert(vec![0], make_cached_node("CHILD0", &["Fold", "Call"], "IP"));
         ss.solve_path.write().push(0);
 
         assert!(!ss.solve_cache.read().is_empty());
@@ -4246,8 +4505,14 @@ mod tests {
         // Populate solve cache: root and one child
         let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
         let child_node = make_cached_node("CHILD", &["Check", "Fold"], "SB");
-        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
-        gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], root_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], child_node);
         // Mark solve as completed so iteration > 0
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
@@ -4269,7 +4534,10 @@ mod tests {
 
         // Populate solve cache with only root (no children cached)
         let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
-        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], root_node);
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action "1" (Call) -- path [1] not in cache, should reset
@@ -4291,8 +4559,14 @@ mod tests {
         // Instead, pre-populate cache and navigate within it:
         let root_node = make_cached_node("ROOT", &["Fold", "Call"], "BB");
         let child_node = make_cached_node("CHILD", &["Check", "Fold"], "SB");
-        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
-        gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], root_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], child_node);
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         // Play action to get to child (within solved tree)
@@ -4326,7 +4600,10 @@ mod tests {
 
         // Set up solve cache at this position (the solve root is the current node)
         let root_node = make_cached_node("SOLVE_ROOT", &["Check", "Fold"], "SB");
-        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], root_node);
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
         // Path is empty (at solve root)
 
@@ -4345,13 +4622,21 @@ mod tests {
         // Set up completed solve with cache
         gss.subgame_solve.solving.store(false, Ordering::Relaxed);
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
-        gss.subgame_solve.max_iterations.store(100, Ordering::Relaxed);
+        gss.subgame_solve
+            .max_iterations
+            .store(100, Ordering::Relaxed);
         *gss.subgame_solve.solve_start.write() = Some(std::time::Instant::now());
 
         let root_node = make_cached_node("CACHE_ROOT", &["Fold", "Call"], "BB");
         let child_node = make_cached_node("CACHE_CHILD", &["Check", "Fold"], "SB");
-        gss.subgame_solve.solve_cache.write().insert(vec![], root_node);
-        gss.subgame_solve.solve_cache.write().insert(vec![1], child_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![], root_node);
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![1], child_node);
 
         // At solve root (empty path), should serve root cache
         let state = game_get_state_core(&gss, Some("subgame".to_string())).unwrap();
@@ -4367,10 +4652,10 @@ mod tests {
 
     #[test]
     fn build_solve_cache_contains_root_and_children() {
-        use range_solver::{PostFlopGame, ActionTree, CardConfig, TreeConfig, BoardState};
+        use range_solver::bet_size::BetSizeOptions;
         use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::range::Range;
-        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
         let oop_range: Range = "AA".parse().unwrap();
         let ip_range: Range = "KK".parse().unwrap();
@@ -4405,21 +4690,28 @@ mod tests {
 
         let cache = build_solve_cache(&mut game);
         // Root should be present
-        assert!(cache.contains_key(&vec![]), "cache should contain root entry");
+        assert!(
+            cache.contains_key(&vec![]),
+            "cache should contain root entry"
+        );
         // Root should have actions
         assert!(!cache[&vec![]].actions.is_empty());
         // Root should have a 13x13 matrix
         assert_eq!(cache[&vec![]].matrix.cells.len(), 13);
         // Should have more than just root (children for each action at root)
-        assert!(cache.len() > 1, "cache should contain child entries too, got {}", cache.len());
+        assert!(
+            cache.len() > 1,
+            "cache should contain child entries too, got {}",
+            cache.len()
+        );
     }
 
     #[test]
     fn build_solve_matrix_at_current_works_without_back_to_root() {
-        use range_solver::{PostFlopGame, ActionTree, CardConfig, TreeConfig, BoardState};
+        use range_solver::bet_size::BetSizeOptions;
         use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::range::Range;
-        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
         let oop_range: Range = "AA".parse().unwrap();
         let ip_range: Range = "KK".parse().unwrap();
@@ -4491,7 +4783,10 @@ mod tests {
             },
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((1, BoundaryKind::Cfvnet("/models/river.onnx".to_string()))));
+        assert_eq!(
+            result,
+            Some((1, BoundaryKind::Cfvnet("/models/river.onnx".to_string())))
+        );
     }
 
     #[test]
@@ -4506,7 +4801,10 @@ mod tests {
             river: StreetBoundaryMode::Exact,
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string()))));
+        assert_eq!(
+            result,
+            Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string())))
+        );
     }
 
     #[test]
@@ -4556,7 +4854,10 @@ mod tests {
         };
         // First non-exact wins: turn cut at depth 0 from flop root.
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string()))));
+        assert_eq!(
+            result,
+            Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string())))
+        );
     }
 
     #[test]
@@ -4570,7 +4871,10 @@ mod tests {
         };
         // From turn root: near tree = turn, cut before river = depth=0.
         let result = resolve_street_boundary(&config, Street::Turn);
-        assert_eq!(result, Some((0, BoundaryKind::Cfvnet("/models/river.onnx".to_string()))));
+        assert_eq!(
+            result,
+            Some((0, BoundaryKind::Cfvnet("/models/river.onnx".to_string())))
+        );
     }
 
     #[test]

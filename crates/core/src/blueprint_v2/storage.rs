@@ -12,8 +12,8 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use super::game_tree::{GameNode, GameTree};
 use crate::cfr::optimizer::CfrOptimizer;
@@ -136,7 +136,11 @@ impl BlueprintStorage {
     /// When `use_baselines` is `true`, allocates a zeroed baseline buffer
     /// with the same layout as regrets.
     #[must_use]
-    pub fn new_with_baselines(tree: &GameTree, bucket_counts: [u16; 4], use_baselines: bool) -> Self {
+    pub fn new_with_baselines(
+        tree: &GameTree,
+        bucket_counts: [u16; 4],
+        use_baselines: bool,
+    ) -> Self {
         let mut storage = Self::new(tree, bucket_counts);
         if use_baselines {
             let total = storage.regrets.len();
@@ -213,11 +217,13 @@ impl BlueprintStorage {
             // to avoid overflow with i32 range.
             atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(old.saturating_add(delta))
-            }).ok();
+            })
+            .ok();
         } else {
             atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(old.saturating_add(delta).max(self.regret_floor))
-            }).ok();
+            })
+            .ok();
         }
     }
 
@@ -270,9 +276,9 @@ impl BlueprintStorage {
     #[inline]
     #[must_use]
     pub fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
-        self.predictions
-            .as_ref()
-            .map_or(0, |p| p[self.slot_index(node_idx, bucket, action)].load(Ordering::Relaxed))
+        self.predictions.as_ref().map_or(0, |p| {
+            p[self.slot_index(node_idx, bucket, action)].load(Ordering::Relaxed)
+        })
     }
 
     /// Write a prediction value for a (node, bucket, action) slot.
@@ -799,8 +805,7 @@ mod tests {
         let path = dir.path().join("storage.bin");
         storage.save_regrets(&path).expect("save");
 
-        let loaded =
-            BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
+        let loaded = BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
 
         assert_eq!(loaded.get_regret(node_idx, 5, 0), 42);
         assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), 999);
@@ -859,8 +864,14 @@ mod tests {
         let storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
         let snap = storage.snapshot_strategy_sums();
         let (delta, pct) = storage.strategy_delta(&snap);
-        assert!((delta - 0.0).abs() < 1e-10, "identical snapshots → delta 0, got {delta}");
-        assert!((pct - 0.0).abs() < 1e-10, "identical snapshots → pct_moving 0, got {pct}");
+        assert!(
+            (delta - 0.0).abs() < 1e-10,
+            "identical snapshots → delta 0, got {delta}"
+        );
+        assert!(
+            (pct - 0.0).abs() < 1e-10,
+            "identical snapshots → pct_moving 0, got {pct}"
+        );
     }
 
     #[test]
@@ -881,7 +892,10 @@ mod tests {
         storage.add_strategy_sum(node_idx, 0, 0, 1000);
 
         let (delta, _pct) = storage.strategy_delta(&snap);
-        assert!(delta > 0.0, "changed strategy should have delta > 0, got {delta}");
+        assert!(
+            delta > 0.0,
+            "changed strategy should have delta > 0, got {delta}"
+        );
     }
 
     // --- Baseline buffer tests ---
@@ -936,7 +950,10 @@ mod tests {
         // old = 0.0, alpha = 0.5, value = 10.0 => new = 5.0
         storage.update_baseline(node_idx, 0, 0, 10.0, 0.5);
         let b = storage.get_baseline(node_idx, 0, 0);
-        assert!((b - 5.0).abs() < 0.01, "expected ~5.0 after EMA update, got {b}");
+        assert!(
+            (b - 5.0).abs() < 0.01,
+            "expected ~5.0 after EMA update, got {b}"
+        );
     }
 
     #[test]
@@ -958,7 +975,10 @@ mod tests {
         // Update 3: new = 1900 * 0.9 + 10000 * 0.1 = 2710
         storage.update_baseline(node_idx, 0, 0, 10000.0, alpha);
         let b = storage.get_baseline(node_idx, 0, 0);
-        assert!((b - 2710.0).abs() < 2.0, "expected ~2710 after 3 EMA updates, got {b}");
+        assert!(
+            (b - 2710.0).abs() < 2.0,
+            "expected ~2710 after 3 EMA updates, got {b}"
+        );
     }
 
     #[test]
@@ -976,8 +996,14 @@ mod tests {
             storage.update_baseline(node_idx, 0, 1, 20.0, 1.0);
             let b0 = storage.get_baseline(node_idx, 0, 0);
             let b1 = storage.get_baseline(node_idx, 0, 1);
-            assert!((b0 - 10.0).abs() < 0.01, "action 0 baseline: expected ~10.0, got {b0}");
-            assert!((b1 - 20.0).abs() < 0.01, "action 1 baseline: expected ~20.0, got {b1}");
+            assert!(
+                (b0 - 10.0).abs() < 0.01,
+                "action 0 baseline: expected ~10.0, got {b0}"
+            );
+            assert!(
+                (b1 - 20.0).abs() < 0.01,
+                "action 1 baseline: expected ~20.0, got {b1}"
+            );
         }
     }
 
@@ -994,8 +1020,14 @@ mod tests {
         storage.update_baseline(node_idx, 1, 0, 30.0, 1.0);
         let b0 = storage.get_baseline(node_idx, 0, 0);
         let b1 = storage.get_baseline(node_idx, 1, 0);
-        assert!((b0 - 10.0).abs() < 0.01, "bucket 0: expected ~10.0, got {b0}");
-        assert!((b1 - 30.0).abs() < 0.01, "bucket 1: expected ~30.0, got {b1}");
+        assert!(
+            (b0 - 10.0).abs() < 0.01,
+            "bucket 0: expected ~10.0, got {b0}"
+        );
+        assert!(
+            (b1 - 30.0).abs() < 0.01,
+            "bucket 1: expected ~30.0, got {b1}"
+        );
     }
 
     #[test]
@@ -1010,10 +1042,16 @@ mod tests {
         // Baselines are stored as raw integer chip units; use integer values.
         storage.update_baseline(node_idx, 0, 0, 75.0, 1.0);
         let b = storage.get_baseline(node_idx, 0, 0);
-        assert!((b - 75.0).abs() < 1.0, "alpha=1 should fully replace: expected 75, got {b}");
+        assert!(
+            (b - 75.0).abs() < 1.0,
+            "alpha=1 should fully replace: expected 75, got {b}"
+        );
         storage.update_baseline(node_idx, 0, 0, -30.0, 1.0);
         let b = storage.get_baseline(node_idx, 0, 0);
-        assert!((b - (-30.0)).abs() < 1.0, "alpha=1 second update: expected -30, got {b}");
+        assert!(
+            (b - (-30.0)).abs() < 1.0,
+            "alpha=1 second update: expected -30, got {b}"
+        );
     }
 
     #[test]
@@ -1028,7 +1066,10 @@ mod tests {
         storage.update_baseline(node_idx, 0, 0, 5.0, 1.0);
         storage.update_baseline(node_idx, 0, 0, 99.0, 0.0);
         let b = storage.get_baseline(node_idx, 0, 0);
-        assert!((b - 5.0).abs() < 0.01, "alpha=0 should keep old: expected 5.0, got {b}");
+        assert!(
+            (b - 5.0).abs() < 0.01,
+            "alpha=0 should keep old: expected 5.0, got {b}"
+        );
     }
 
     // --- Prediction buffer tests ---
@@ -1045,7 +1086,10 @@ mod tests {
         let tree = toy_tree();
         let mut storage = BlueprintStorage::new(&tree, [50, 50, 50, 50]);
         storage.enable_predictions();
-        let preds = storage.predictions.as_ref().expect("predictions should be Some");
+        let preds = storage
+            .predictions
+            .as_ref()
+            .expect("predictions should be Some");
         assert_eq!(preds.len(), storage.regrets.len());
         assert!(preds.iter().all(|a| a.load(Ordering::Relaxed) == 0));
     }
@@ -1222,8 +1266,7 @@ mod tests {
         let path = dir.path().join("storage.bin");
         storage.save_regrets(&path).expect("save");
 
-        let loaded =
-            BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
+        let loaded = BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
 
         assert_eq!(loaded.get_regret(node_idx, 5, 0), val);
         assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), 999);
@@ -1246,11 +1289,19 @@ mod tests {
         storage.lock_predictions();
         // Write should be silently ignored.
         storage.set_prediction(node_idx, 0, 0, 999);
-        assert_eq!(storage.get_prediction(node_idx, 0, 0), 42, "locked buffer should not change");
+        assert_eq!(
+            storage.get_prediction(node_idx, 0, 0),
+            42,
+            "locked buffer should not change"
+        );
         // Unlock.
         storage.unlock_predictions();
         storage.set_prediction(node_idx, 0, 0, 999);
-        assert_eq!(storage.get_prediction(node_idx, 0, 0), 999, "unlocked buffer should update");
+        assert_eq!(
+            storage.get_prediction(node_idx, 0, 0),
+            999,
+            "unlocked buffer should update"
+        );
     }
 
     #[test]
@@ -1451,8 +1502,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("storage.bin");
         storage.save_regrets(&path).expect("save");
-        let loaded =
-            BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
+        let loaded = BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
         assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), large_val);
         assert_eq!(loaded.get_regret(node_idx, 5, 0), 42);
     }

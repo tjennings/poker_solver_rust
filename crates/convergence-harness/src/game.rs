@@ -54,13 +54,15 @@ impl Default for FlopPokerConfig {
 pub fn build_flop_poker_game_with_config(config: &FlopPokerConfig) -> Result<PostFlopGame, String> {
     let card_config = CardConfig {
         range: [Range::ones(), Range::ones()],
-        flop: flop_from_str(&config.flop).map_err(|e| format!("Invalid flop '{}': {}", config.flop, e))?,
+        flop: flop_from_str(&config.flop)
+            .map_err(|e| format!("Invalid flop '{}': {}", config.flop, e))?,
         turn: NOT_DEALT,
         river: NOT_DEALT,
     };
 
-    let bet_sizes = BetSizeOptions::try_from((config.bet_sizes.as_str(), config.raise_sizes.as_str()))
-        .map_err(|e| format!("Invalid bet sizes: {e}"))?;
+    let bet_sizes =
+        BetSizeOptions::try_from((config.bet_sizes.as_str(), config.raise_sizes.as_str()))
+            .map_err(|e| format!("Invalid bet sizes: {e}"))?;
 
     let tree_config = TreeConfig {
         initial_state: BoardState::Flop,

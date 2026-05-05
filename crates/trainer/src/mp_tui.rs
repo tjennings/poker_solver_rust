@@ -1,7 +1,7 @@
 //! N-player TUI application with tiled 6-up grid layout and pagination.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use ratatui::prelude::*;
@@ -10,7 +10,9 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline};
 use crate::blueprint_tui_config::TelemetryConfig;
 use crate::blueprint_tui_metrics::BlueprintTuiMetrics;
 use crate::blueprint_tui_widgets::HandGridState;
-use crate::mp_tui_widgets::{compact_grid_height, compact_grid_width, compute_grids_per_row, CompactGridWidget};
+use crate::mp_tui_widgets::{
+    CompactGridWidget, compact_grid_height, compact_grid_width, compute_grids_per_row,
+};
 
 /// Maximum grids displayed per page.
 pub const GRIDS_PER_PAGE: usize = 6;
@@ -127,15 +129,15 @@ impl MpTuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // iterations
-                Constraint::Length(1),  // progress gauge
-                Constraint::Length(1),  // runtime + ETA
-                Constraint::Length(2),  // throughput sparkline
-                Constraint::Length(2),  // strategy delta sparkline
-                Constraint::Length(2),  // max pos regret sparkline
-                Constraint::Length(2),  // max neg regret sparkline
-                Constraint::Length(2),  // avg pos regret sparkline
-                Constraint::Length(2),  // prune % sparkline
+                Constraint::Length(1), // iterations
+                Constraint::Length(1), // progress gauge
+                Constraint::Length(1), // runtime + ETA
+                Constraint::Length(2), // throughput sparkline
+                Constraint::Length(2), // strategy delta sparkline
+                Constraint::Length(2), // max pos regret sparkline
+                Constraint::Length(2), // max neg regret sparkline
+                Constraint::Length(2), // avg pos regret sparkline
+                Constraint::Length(2), // prune % sparkline
                 Constraint::Min(0),
             ])
             .split(area);
@@ -153,7 +155,10 @@ impl MpTuiApp {
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
         let current = self.metrics.iterations.load(Ordering::Relaxed);
         let text = match self.metrics.target_iterations {
-            Some(t) => format!("Iterations: {current} / {t}  ({} players)", self.num_players),
+            Some(t) => format!(
+                "Iterations: {current} / {t}  ({} players)",
+                self.num_players
+            ),
             None => format!("Iterations: {current}  ({} players)", self.num_players),
         };
         let p = Paragraph::new(text).style(Style::default().fg(Color::White).bold());
@@ -178,7 +183,10 @@ impl MpTuiApp {
 
     fn render_throughput(&self, frame: &mut Frame, area: Rect) {
         let current = self.iter_per_sec_history.last().copied().unwrap_or(0);
-        let title = format!("Throughput: {current} it/s  (peak {})", self.peak_iter_per_sec);
+        let title = format!(
+            "Throughput: {current} it/s  (peak {})",
+            self.peak_iter_per_sec
+        );
         let sparkline = Sparkline::default()
             .block(Block::default().title(title).borders(Borders::NONE))
             .data(&self.iter_per_sec_history)
@@ -187,7 +195,9 @@ impl MpTuiApp {
     }
 
     fn render_delta_sparkline(&self, frame: &mut Frame, area: Rect) {
-        let latest = self.delta_history.last()
+        let latest = self
+            .delta_history
+            .last()
             .map(|&v| v as f64 / 10000.0)
             .unwrap_or(0.0);
         let title = format!("Strategy delta: {latest:.6}");
@@ -199,7 +209,9 @@ impl MpTuiApp {
     }
 
     fn render_max_regret(&self, frame: &mut Frame, area: Rect) {
-        let latest = self.max_regret_history.last()
+        let latest = self
+            .max_regret_history
+            .last()
             .map(|&v| v as f64 / 1000.0)
             .unwrap_or(0.0);
         let title = format!("Max pos regret: {latest:.1}");
@@ -211,7 +223,9 @@ impl MpTuiApp {
     }
 
     fn render_min_regret(&self, frame: &mut Frame, area: Rect) {
-        let latest = self.min_regret_history.last()
+        let latest = self
+            .min_regret_history
+            .last()
             .map(|&v| v as f64 / 1000.0)
             .unwrap_or(0.0);
         let title = format!("Max neg regret: -{latest:.1}");
@@ -223,7 +237,9 @@ impl MpTuiApp {
     }
 
     fn render_avg_pos_regret(&self, frame: &mut Frame, area: Rect) {
-        let latest = self.avg_pos_regret_history.last()
+        let latest = self
+            .avg_pos_regret_history
+            .last()
             .map(|&v| v as f64 / 1_000_000_000.0)
             .unwrap_or(0.0);
         let title = format!("Avg pos regret: {latest:.2e}");
@@ -235,7 +251,9 @@ impl MpTuiApp {
     }
 
     fn render_prune_sparkline(&self, frame: &mut Frame, area: Rect) {
-        let latest = self.prune_history.last()
+        let latest = self
+            .prune_history
+            .last()
             .map(|&v| v as f64 / 10.0)
             .unwrap_or(0.0);
         let title = format!("Traversals pruned: {latest:.1}%");
@@ -266,7 +284,9 @@ impl MpTuiApp {
             let row = i as u16 / cols;
             let rect = Rect::new(area.x + col * gw, area.y + row * gh, gw, gh);
             if rect.bottom() <= area.bottom() {
-                let widget = CompactGridWidget { state: &scenario.grid };
+                let widget = CompactGridWidget {
+                    state: &scenario.grid,
+                };
                 frame.render_widget(&widget, rect);
             }
         }
@@ -279,9 +299,7 @@ impl MpTuiApp {
         } else {
             String::new()
         };
-        let text = format!(
-            "[p]ause [s]napshot \u{2190}/\u{2192} page [q]uit{page_indicator}"
-        );
+        let text = format!("[p]ause [s]napshot \u{2190}/\u{2192} page [q]uit{page_indicator}");
         let p = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, area);
     }
@@ -291,7 +309,9 @@ impl MpTuiApp {
 
 impl MpTuiApp {
     fn tick_delta_history(&mut self, sparkline_max: usize) {
-        let mut hist = self.metrics.strategy_delta_history
+        let mut hist = self
+            .metrics
+            .strategy_delta_history
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for &v in hist.iter() {
@@ -301,22 +321,42 @@ impl MpTuiApp {
     }
 
     fn tick_regret_sparklines(&mut self, sparkline_max: usize) {
-        drain_scaled(&self.metrics.max_regret_history, &mut self.max_regret_history, 1000.0, sparkline_max);
-        drain_scaled_abs(&self.metrics.min_regret_history, &mut self.min_regret_history, 1000.0, sparkline_max);
-        drain_scaled(&self.metrics.avg_pos_regret_history, &mut self.avg_pos_regret_history, 1_000_000_000.0, sparkline_max);
-        drain_scaled(&self.metrics.prune_history, &mut self.prune_history, 10.0, sparkline_max);
+        drain_scaled(
+            &self.metrics.max_regret_history,
+            &mut self.max_regret_history,
+            1000.0,
+            sparkline_max,
+        );
+        drain_scaled_abs(
+            &self.metrics.min_regret_history,
+            &mut self.min_regret_history,
+            1000.0,
+            sparkline_max,
+        );
+        drain_scaled(
+            &self.metrics.avg_pos_regret_history,
+            &mut self.avg_pos_regret_history,
+            1_000_000_000.0,
+            sparkline_max,
+        );
+        drain_scaled(
+            &self.metrics.prune_history,
+            &mut self.prune_history,
+            10.0,
+            sparkline_max,
+        );
     }
 
     fn tick_grids(&mut self) {
-        let mut grids = self.metrics.strategy_grids
+        let mut grids = self
+            .metrics
+            .strategy_grids
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for (i, grid_opt) in grids.iter_mut().enumerate() {
             if let Some(new_grid) = grid_opt.take() {
                 if i < self.scenarios.len() {
-                    let old = std::mem::replace(
-                        &mut self.scenarios[i].grid.cells, new_grid,
-                    );
+                    let old = std::mem::replace(&mut self.scenarios[i].grid.cells, new_grid);
                     self.scenarios[i].grid.prev_cells = Some(old);
                     self.scenarios[i].grid.iteration_at_snapshot =
                         self.metrics.iterations.load(Ordering::Relaxed);
@@ -404,9 +444,16 @@ fn scan_regret_chunk(chunk: &[std::sync::atomic::AtomicI16]) -> (i16, i16, i64, 
     let mut pc: u64 = 0;
     for atom in chunk {
         let v = atom.load(Ordering::Relaxed);
-        if v > mx { mx = v; }
-        if v < mn { mn = v; }
-        if v > 0 { ps += v as i64; pc += 1; }
+        if v > mx {
+            mx = v;
+        }
+        if v < mn {
+            mn = v;
+        }
+        if v > 0 {
+            ps += v as i64;
+            pc += 1;
+        }
     }
     (mx, mn, ps, pc)
 }
@@ -414,10 +461,18 @@ fn scan_regret_chunk(chunk: &[std::sync::atomic::AtomicI16]) -> (i16, i16, i64, 
 fn compute_progress_ratio(metrics: &BlueprintTuiMetrics) -> f64 {
     if let Some(t) = metrics.target_iterations {
         let current = metrics.iterations.load(Ordering::Relaxed);
-        if t > 0 { current as f64 / t as f64 } else { 0.0 }
+        if t > 0 {
+            current as f64 / t as f64
+        } else {
+            0.0
+        }
     } else if let Some(minutes) = metrics.time_limit_minutes {
         let elapsed = metrics.elapsed_secs();
-        if minutes > 0 { elapsed / (minutes as f64 * 60.0) } else { 0.0 }
+        if minutes > 0 {
+            elapsed / (minutes as f64 * 60.0)
+        } else {
+            0.0
+        }
     } else {
         0.0
     }
@@ -435,7 +490,11 @@ pub fn run_mp_tui(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         if let Err(e) = run_mp_tui_inner(
-            metrics, scenarios, telemetry_config, refresh_interval, num_players,
+            metrics,
+            scenarios,
+            telemetry_config,
+            refresh_interval,
+            num_players,
         ) {
             eprintln!("MP TUI error: {e}");
         }
@@ -451,7 +510,7 @@ fn run_mp_tui_inner(
 ) -> std::io::Result<()> {
     use crossterm::execute;
     use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
     use ratatui::backend::CrosstermBackend;
 
@@ -461,7 +520,10 @@ fn run_mp_tui_inner(
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut app = MpTuiApp::new(
-        Arc::clone(&metrics), scenarios, telemetry_config, num_players,
+        Arc::clone(&metrics),
+        scenarios,
+        telemetry_config,
+        num_players,
     );
     run_event_loop(&mut app, &metrics, &mut terminal, refresh_interval)?;
     disable_raw_mode()?;
@@ -514,7 +576,11 @@ pub fn page_count(total: usize, per_page: usize) -> usize {
 pub fn page_slice<T>(items: &[T], page: usize, per_page: usize) -> &[T] {
     let start = page * per_page;
     let end = (start + per_page).min(items.len());
-    if start >= items.len() { &[] } else { &items[start..end] }
+    if start >= items.len() {
+        &[]
+    } else {
+        &items[start..end]
+    }
 }
 
 #[cfg(test)]
@@ -679,13 +745,12 @@ mod tests {
 
     #[timed_test]
     fn tick_refreshes_grid_from_metrics() {
-        use std::sync::atomic::Ordering;
         use crate::blueprint_tui_widgets::CellStrategy;
+        use std::sync::atomic::Ordering;
         let mut app = test_app(2);
         app.metrics.iterations.store(500, Ordering::Relaxed);
-        let mut grid: [[CellStrategy; 13]; 13] = std::array::from_fn(|_| {
-            std::array::from_fn(|_| CellStrategy::default())
-        });
+        let mut grid: [[CellStrategy; 13]; 13] =
+            std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
         grid[0][0] = CellStrategy {
             actions: vec![("fold".into(), 1.0)],
             ev: None,
@@ -817,10 +882,12 @@ mod tests {
         let app = test_app(2);
         let backend = TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            // The render method uses Constraint::Length(19) for metrics
-            app.render(frame);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                // The render method uses Constraint::Length(19) for metrics
+                app.render(frame);
+            })
+            .unwrap();
         // If we got here without panic, the 19-row layout worked.
         // Also verify the total area was used.
         let size = terminal.size().unwrap();
@@ -848,9 +915,9 @@ mod tests {
     #[timed_test]
     fn push_regret_telemetry_max_positive() {
         use std::sync::atomic::AtomicI16;
-        let metrics = std::sync::Arc::new(
-            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
-        );
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            None, None,
+        ));
         // scale=20, so 100 raw = 5.0 chip value
         let regrets = [AtomicI16::new(100), AtomicI16::new(-60), AtomicI16::new(40)];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
@@ -862,10 +929,14 @@ mod tests {
     #[timed_test]
     fn push_regret_telemetry_min_negative() {
         use std::sync::atomic::AtomicI16;
-        let metrics = std::sync::Arc::new(
-            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
-        );
-        let regrets = [AtomicI16::new(100), AtomicI16::new(-140), AtomicI16::new(40)];
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            None, None,
+        ));
+        let regrets = [
+            AtomicI16::new(100),
+            AtomicI16::new(-140),
+            AtomicI16::new(40),
+        ];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let hist = metrics.min_regret_history.lock().unwrap();
         assert_eq!(hist.len(), 1);
@@ -875,9 +946,9 @@ mod tests {
     #[timed_test]
     fn push_regret_telemetry_avg_positive() {
         use std::sync::atomic::AtomicI16;
-        let metrics = std::sync::Arc::new(
-            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
-        );
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            None, None,
+        ));
         // Two positive: 100 and 40, scale=20 -> 5.0 and 2.0 -> avg=3.5
         let regrets = [AtomicI16::new(100), AtomicI16::new(-60), AtomicI16::new(40)];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
@@ -888,9 +959,9 @@ mod tests {
 
     #[timed_test]
     fn push_regret_telemetry_empty_regrets() {
-        let metrics = std::sync::Arc::new(
-            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
-        );
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            None, None,
+        ));
         let regrets: [std::sync::atomic::AtomicI16; 0] = [];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let max_hist = metrics.max_regret_history.lock().unwrap();
@@ -900,9 +971,9 @@ mod tests {
     #[timed_test]
     fn push_regret_telemetry_all_negative() {
         use std::sync::atomic::AtomicI16;
-        let metrics = std::sync::Arc::new(
-            crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None),
-        );
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            None, None,
+        ));
         let regrets = [AtomicI16::new(-1000), AtomicI16::new(-2000)];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let hist = metrics.avg_pos_regret_history.lock().unwrap();
@@ -911,10 +982,10 @@ mod tests {
     }
 
     fn test_app(num_scenarios: usize) -> super::MpTuiApp {
-        use std::sync::Arc;
         use crate::blueprint_tui_config::TelemetryConfig;
         use crate::blueprint_tui_metrics::BlueprintTuiMetrics;
         use crate::blueprint_tui_widgets::HandGridState;
+        use std::sync::Arc;
 
         let metrics = Arc::new(BlueprintTuiMetrics::new(Some(1000), None));
         let scenarios: Vec<super::ResolvedMpScenario> = (0..num_scenarios)
@@ -922,9 +993,7 @@ mod tests {
                 name: format!("Scenario {i}"),
                 node_idx: i as u32,
                 grid: HandGridState {
-                    cells: std::array::from_fn(|_| {
-                        std::array::from_fn(|_| Default::default())
-                    }),
+                    cells: std::array::from_fn(|_| std::array::from_fn(|_| Default::default())),
                     prev_cells: None,
                     scenario_name: format!("Scenario {i}"),
                     action_path: vec![],
@@ -936,11 +1005,6 @@ mod tests {
                 },
             })
             .collect();
-        super::MpTuiApp::new(
-            metrics,
-            scenarios,
-            TelemetryConfig::default(),
-            6,
-        )
+        super::MpTuiApp::new(metrics, scenarios, TelemetryConfig::default(), 6)
     }
 }

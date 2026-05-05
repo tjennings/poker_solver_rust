@@ -1,9 +1,9 @@
 //! Extracts PostFlopGame tree topology into flat arrays for GPU tensor creation.
 
+use range_solver::PostFlopGame;
 use range_solver::action_tree::{PLAYER_FOLD_FLAG, PLAYER_MASK};
 use range_solver::card::card_pair_to_index;
 use range_solver::interface::GameNode;
-use range_solver::PostFlopGame;
 use std::collections::VecDeque;
 
 /// Classification of a node in the game tree.
@@ -96,7 +96,9 @@ pub fn extract_topology(game: &PostFlopGame) -> TreeTopology {
 
             let ntype = if is_fold {
                 let folded = (flags & PLAYER_MASK) as usize;
-                NodeType::Fold { folded_player: folded }
+                NodeType::Fold {
+                    folded_player: folded,
+                }
             } else if is_terminal {
                 NodeType::Showdown
             } else if is_chance {
@@ -107,7 +109,13 @@ pub fn extract_topology(game: &PostFlopGame) -> TreeTopology {
             };
 
             let n_actions = if is_terminal { 0 } else { node.num_actions() };
-            (ntype, n_actions, node.bet_amount(), node.turn_card(), node.river_card())
+            (
+                ntype,
+                n_actions,
+                node.bet_amount(),
+                node.turn_card(),
+                node.river_card(),
+            )
         };
 
         node_type.push(ntype);
@@ -146,8 +154,8 @@ pub fn extract_topology(game: &PostFlopGame) -> TreeTopology {
             let arena_idx = node_arena_index[node_id];
             let children = game.child_indices(arena_idx);
             for &child_arena in &children {
-                edge_child[edge_idx] = arena_to_node[child_arena]
-                    .expect("child must have been visited");
+                edge_child[edge_idx] =
+                    arena_to_node[child_arena].expect("child must have been visited");
                 edge_idx += 1;
             }
         }
@@ -469,8 +477,8 @@ pub fn decompose_at_chance(topo: &TreeTopology) -> ChanceDecomposition {
                 .unwrap();
             for e in 0..topo.num_edges {
                 if topo.edge_parent[e] == old_id {
-                    r_edge_child[ei] = river_old_to_new[topo.edge_child[e]]
-                        .expect("river child must be mapped");
+                    r_edge_child[ei] =
+                        river_old_to_new[topo.edge_child[e]].expect("river child must be mapped");
                     ei += 1;
                 }
             }
@@ -601,8 +609,8 @@ pub fn decompose_at_chance(topo: &TreeTopology) -> ChanceDecomposition {
                 .unwrap();
             for e in 0..topo.num_edges {
                 if topo.edge_parent[e] == old_id {
-                    t_edge_child[tei] = turn_old_to_new[topo.edge_child[e]]
-                        .expect("turn child must be mapped");
+                    t_edge_child[tei] =
+                        turn_old_to_new[topo.edge_child[e]].expect("turn child must be mapped");
                     tei += 1;
                 }
             }
@@ -666,10 +674,10 @@ pub fn decompose_at_chance(topo: &TreeTopology) -> ChanceDecomposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use range_solver::PostFlopGame;
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, CardConfig};
-    use range_solver::PostFlopGame;
+    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
 
     fn make_river_game() -> PostFlopGame {
         let oop_range = "AA,KK,QQ,AKs".parse().unwrap();
@@ -762,7 +770,10 @@ mod tests {
         let topo = extract_topology(&game);
 
         assert!(!topo.fold_nodes.is_empty(), "should have fold nodes");
-        assert!(!topo.showdown_nodes.is_empty(), "should have showdown nodes");
+        assert!(
+            !topo.showdown_nodes.is_empty(),
+            "should have showdown nodes"
+        );
     }
 
     #[test]
@@ -926,14 +937,8 @@ mod tests {
         let topo = extract_topology(&game);
         let term = extract_terminal_data(&game, &topo);
 
-        assert_eq!(
-            term.same_hand_index[0].len(),
-            game.same_hand_index(0).len()
-        );
-        assert_eq!(
-            term.same_hand_index[1].len(),
-            game.same_hand_index(1).len()
-        );
+        assert_eq!(term.same_hand_index[0].len(), game.same_hand_index(0).len());
+        assert_eq!(term.same_hand_index[1].len(), game.same_hand_index(1).len());
     }
 
     #[test]
@@ -997,10 +1002,14 @@ mod tests {
         let term = extract_terminal_data(&game, &topo);
 
         // At least one showdown should have some non-zero outcomes
-        let has_nonzero = term.showdown_outcomes.iter().any(|sd| {
-            sd.outcome_matrix_p0.iter().any(|&v| v != 0.0)
-        });
-        assert!(has_nonzero, "at least one showdown should have non-zero outcomes");
+        let has_nonzero = term
+            .showdown_outcomes
+            .iter()
+            .any(|sd| sd.outcome_matrix_p0.iter().any(|&v| v != 0.0));
+        assert!(
+            has_nonzero,
+            "at least one showdown should have non-zero outcomes"
+        );
     }
 
     #[test]
@@ -1057,14 +1066,20 @@ mod tests {
         let decomp = decompose_at_chance(&topo);
 
         // Turn subtree: root to chance nodes (chance nodes become leaves)
-        assert!(decomp.turn_topo.num_nodes > 0, "turn subtree must have nodes");
+        assert!(
+            decomp.turn_topo.num_nodes > 0,
+            "turn subtree must have nodes"
+        );
         assert!(
             decomp.turn_topo.chance_nodes.is_empty(),
             "turn subtree should have no chance nodes (they become terminals)"
         );
 
         // River subtree: below chance (same topology for all runouts)
-        assert!(decomp.river_topo.num_nodes > 0, "river subtree must have nodes");
+        assert!(
+            decomp.river_topo.num_nodes > 0,
+            "river subtree must have nodes"
+        );
         assert!(
             decomp.river_topo.chance_nodes.is_empty(),
             "river subtree should have no chance nodes"
@@ -1085,7 +1100,8 @@ mod tests {
         let decomp = decompose_at_chance(&topo);
 
         assert!(
-            !decomp.river_topo.fold_nodes.is_empty() || !decomp.river_topo.showdown_nodes.is_empty(),
+            !decomp.river_topo.fold_nodes.is_empty()
+                || !decomp.river_topo.showdown_nodes.is_empty(),
             "river subtree must have terminal nodes"
         );
     }

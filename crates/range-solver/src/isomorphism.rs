@@ -8,11 +8,11 @@ use crate::game::SwapList;
 /// data to skip redundant chance outcomes and copy strategies from
 /// canonical representatives.
 pub(crate) type IsomorphismData = (
-    Vec<u8>,          // isomorphism_ref_turn
-    Vec<Card>,        // isomorphism_card_turn
-    [SwapList; 4],    // isomorphism_swap_turn  (indexed by suit)
-    Vec<Vec<u8>>,     // isomorphism_ref_river  (indexed by turn card)
-    [Vec<Card>; 4],   // isomorphism_card_river (indexed by turn suit)
+    Vec<u8>,            // isomorphism_ref_turn
+    Vec<Card>,          // isomorphism_card_turn
+    [SwapList; 4],      // isomorphism_swap_turn  (indexed by suit)
+    Vec<Vec<u8>>,       // isomorphism_ref_river  (indexed by turn card)
+    [Vec<Card>; 4],     // isomorphism_card_river (indexed by turn suit)
     [[SwapList; 4]; 4], // isomorphism_swap_river (indexed by [turn suit][river suit])
 );
 
@@ -99,9 +99,7 @@ impl CardConfig {
         // Step 4: River isomorphism — per turn card.
         if self.river == NOT_DEALT {
             for turn in 0u8..52 {
-                if (1 << turn) & flop_mask != 0
-                    || (self.turn != NOT_DEALT && self.turn != turn)
-                {
+                if (1 << turn) & flop_mask != 0 || (self.turn != NOT_DEALT && self.turn != turn) {
                     continue;
                 }
 
@@ -116,8 +114,7 @@ impl CardConfig {
                         if (flop_rankset[suit1 as usize] == flop_rankset[suit2 as usize]
                             || self.turn != NOT_DEALT)
                             && turn_rankset[suit1 as usize] == turn_rankset[suit2 as usize]
-                            && suit_isomorphism[suit1 as usize]
-                                == suit_isomorphism[suit2 as usize]
+                            && suit_isomorphism[suit1 as usize] == suit_isomorphism[suit2 as usize]
                         {
                             isomorphic_suit[suit1 as usize] = Some(suit2);
                             isomorphism_swap_internal(
@@ -256,9 +253,8 @@ mod tests {
             river,
         };
 
-        let mut board_mask: u64 = (1 << card_config.flop[0])
-            | (1 << card_config.flop[1])
-            | (1 << card_config.flop[2]);
+        let mut board_mask: u64 =
+            (1 << card_config.flop[0]) | (1 << card_config.flop[1]) | (1 << card_config.flop[2]);
         if turn != NOT_DEALT {
             board_mask |= 1 << turn;
         }
@@ -461,10 +457,7 @@ mod tests {
         for suit_swaps in &swap_turn {
             for player_swaps in suit_swaps {
                 for &(a, b) in player_swaps {
-                    assert!(
-                        a < b,
-                        "Swap pair should have a < b, got ({a}, {b})"
-                    );
+                    assert!(a < b, "Swap pair should have a < b, got ({a}, {b})");
                 }
             }
         }

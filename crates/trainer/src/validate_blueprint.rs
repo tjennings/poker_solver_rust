@@ -45,7 +45,8 @@ pub fn compute_strategy_l2_distance(
     for h in 0..num_hands {
         let mut sq_sum = 0.0_f64;
         for a in 0..num_actions {
-            let diff = f64::from(exact[a * num_hands + h]) - f64::from(blueprint[a * num_hands + h]);
+            let diff =
+                f64::from(exact[a * num_hands + h]) - f64::from(blueprint[a * num_hands + h]);
             sq_sum += diff * diff;
         }
         total_l2 += sq_sum.sqrt();
@@ -55,9 +56,7 @@ pub fn compute_strategy_l2_distance(
 
 /// Solve a validation spot using the range solver with default settings
 /// (1000 iterations, 0.5% target exploitability).
-pub fn solve_spot(
-    spot: &ValidationSpot,
-) -> Result<SolveSpotResult, Box<dyn std::error::Error>> {
+pub fn solve_spot(spot: &ValidationSpot) -> Result<SolveSpotResult, Box<dyn std::error::Error>> {
     solve_spot_with_params(spot, 1000, 0.005)
 }
 
@@ -70,9 +69,9 @@ pub fn solve_spot_with_params(
 ) -> Result<SolveSpotResult, Box<dyn std::error::Error>> {
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, CardConfig, NOT_DEALT};
+    use range_solver::card::{CardConfig, NOT_DEALT, card_from_str, flop_from_str};
     use range_solver::range::Range;
-    use range_solver::{solve, PostFlopGame};
+    use range_solver::{PostFlopGame, solve};
 
     // Parse ranges
     let oop_range: Range = spot
@@ -113,9 +112,8 @@ pub fn solve_spot_with_params(
     };
 
     // Default bet sizes: 33%, 67%, 100%
-    let bet_sizes =
-        BetSizeOptions::try_from(("33%,67%,100%", "33%,67%,100%"))
-            .map_err(|e| format!("Invalid bet sizes: {e}"))?;
+    let bet_sizes = BetSizeOptions::try_from(("33%,67%,100%", "33%,67%,100%"))
+        .map_err(|e| format!("Invalid bet sizes: {e}"))?;
 
     let card_config = CardConfig {
         range: [oop_range, ip_range],
@@ -137,8 +135,8 @@ pub fn solve_spot_with_params(
         ..Default::default()
     };
 
-    let action_tree = ActionTree::new(tree_config)
-        .map_err(|e| format!("Failed to build action tree: {e}"))?;
+    let action_tree =
+        ActionTree::new(tree_config).map_err(|e| format!("Failed to build action tree: {e}"))?;
 
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
@@ -222,10 +220,7 @@ mod tests {
         let dist = compute_strategy_l2_distance(&exact, &blueprint, 1, 3);
         // diffs: 0.2, 0.1, 0.3 => L2 per hand: 0.2, 0.1, 0.3
         // avg = (0.2+0.1+0.3)/3 = 0.2
-        assert!(
-            (dist - 0.2).abs() < 1e-6,
-            "expected 0.2, got {dist}"
-        );
+        assert!((dist - 0.2).abs() < 1e-6, "expected 0.2, got {dist}");
     }
 
     #[test]

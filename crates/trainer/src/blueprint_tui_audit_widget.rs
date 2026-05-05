@@ -92,7 +92,14 @@ impl Widget for &AuditPanelWidget<'_> {
             meta_ref.name,
             spot_suffix,
         );
-        buf.set_string(x, y, &title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        buf.set_string(
+            x,
+            y,
+            &title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
         y += 1;
 
         let idx = self.state.active_tab;
@@ -167,7 +174,12 @@ impl Widget for &AuditPanelWidget<'_> {
             let trend = snap.trends.get(i).copied().unwrap_or(Trend::Flat);
 
             // Action label (white)
-            buf.set_string(x, y, format!("{truncated:<12}"), Style::default().fg(Color::White));
+            buf.set_string(
+                x,
+                y,
+                format!("{truncated:<12}"),
+                Style::default().fg(Color::White),
+            );
 
             // Regret value (colored)
             let regret_color = if regret > 0.0 {

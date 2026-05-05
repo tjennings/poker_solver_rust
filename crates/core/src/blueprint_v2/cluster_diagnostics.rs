@@ -13,13 +13,13 @@ use rayon::prelude::*;
 
 use crate::poker::Card;
 
+use super::Street;
 use super::bucket_file::BucketFile;
 use super::centroid_file::CentroidFile;
 use super::cluster_pipeline::{
     build_deck, canonical_key, compute_board_equities, enumerate_combos, sample_boards,
     sample_n_card_boards,
 };
-use super::Street;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::showdown_equity;
@@ -114,9 +114,7 @@ impl ClusterReport {
 /// # Errors
 ///
 /// Returns an error if any existing `.buckets` file cannot be loaded.
-pub fn diagnose_cluster_dir(
-    dir: &Path,
-) -> Result<Vec<ClusterReport>, Box<dyn std::error::Error>> {
+pub fn diagnose_cluster_dir(dir: &Path) -> Result<Vec<ClusterReport>, Box<dyn std::error::Error>> {
     let mut reports = Vec::new();
 
     for street_name in &["river", "turn", "flop", "preflop"] {
@@ -203,7 +201,11 @@ impl EquityAuditReport {
 /// * `num_sample_boards` — How many boards to sample for equity computation.
 /// * `seed` — RNG seed for board sampling.
 #[must_use]
-pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64) -> EquityAuditReport {
+pub fn audit_bucket_equity(
+    bf: &BucketFile,
+    num_sample_boards: usize,
+    seed: u64,
+) -> EquityAuditReport {
     let deck = build_deck();
     let combos = enumerate_combos(&deck);
     let bucket_count = bf.header.bucket_count;
@@ -317,12 +319,11 @@ pub fn audit_bucket_equity(bf: &BucketFile, num_sample_boards: usize, seed: u64)
         0.0
     } else {
         #[allow(clippy::cast_precision_loss)]
-        { non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64 }
+        {
+            non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64
+        }
     };
-    let max_std = non_empty
-        .iter()
-        .map(|b| b.std_dev)
-        .fold(0.0_f64, f64::max);
+    let max_std = non_empty.iter().map(|b| b.std_dev).fold(0.0_f64, f64::max);
 
     let street_name = format!("{:?}", bf.header.street);
 
@@ -402,8 +403,12 @@ impl TransitionConsistencyReport {
         let non_empty: Vec<_> = self.buckets.iter().filter(|b| b.count > 0).collect();
         let mut s = format!(
             "{} → {}: {} buckets, {} sample boards\n  Within-bucket EMD: mean={:.4}, max={:.4} (normalized)",
-            self.from_street, self.to_street, non_empty.len(), self.sample_boards,
-            self.mean_emd, self.max_emd,
+            self.from_street,
+            self.to_street,
+            non_empty.len(),
+            self.sample_boards,
+            self.mean_emd,
+            self.max_emd,
         );
         if let Some(between) = self.mean_between_emd {
             let _ = write!(s, "\n  Between-centroid EMD: mean={between:.4}");
@@ -422,8 +427,12 @@ impl TransitionConsistencyReport {
             let _ = write!(
                 s,
                 "\n    bucket {:>3}: n={:<6} emd={:.4}  max_emd={:.4}  distinct={:<4} entropy={:.2}",
-                b.bucket_id, b.count, b.mean_emd_to_centroid, b.max_emd_to_centroid,
-                b.distinct_turn_buckets, b.transition_entropy,
+                b.bucket_id,
+                b.count,
+                b.mean_emd_to_centroid,
+                b.max_emd_to_centroid,
+                b.distinct_turn_buckets,
+                b.transition_entropy,
             );
         }
         s
@@ -487,7 +496,8 @@ pub fn audit_transition_consistency(
             }
 
             #[allow(clippy::cast_possible_truncation)]
-            let current_bucket = current_bf.get_bucket(current_board_idx, combo_idx as u16) as usize;
+            let current_bucket =
+                current_bf.get_bucket(current_board_idx, combo_idx as u16) as usize;
             if current_bucket >= current_k {
                 continue;
             }
@@ -505,7 +515,8 @@ pub fn audit_transition_consistency(
                 let mut next_board: Vec<Card> = board.clone();
                 next_board.push(next_card);
 
-                if let Some(next_board_idx) = canonicalize_and_lookup_slice(&next_board, &next_map) {
+                if let Some(next_board_idx) = canonicalize_and_lookup_slice(&next_board, &next_map)
+                {
                     #[allow(clippy::cast_possible_truncation)]
                     let next_bucket = next_bf.get_bucket(next_board_idx, combo_idx as u16) as usize;
                     if next_bucket < next_k {
@@ -556,11 +567,12 @@ pub fn audit_transition_consistency(
 
             // EMD from each histogram to centroid, normalized by (K-1)
             #[allow(clippy::cast_precision_loss)]
-            let norm = if next_k > 1 { 1.0 / (next_k as f64 - 1.0) } else { 1.0 };
-            let emds: Vec<f64> = hists
-                .iter()
-                .map(|h| emd_1d(h, &centroid) * norm)
-                .collect();
+            let norm = if next_k > 1 {
+                1.0 / (next_k as f64 - 1.0)
+            } else {
+                1.0
+            };
+            let emds: Vec<f64> = hists.iter().map(|h| emd_1d(h, &centroid) * norm).collect();
             #[allow(clippy::cast_precision_loss)]
             let mean_emd = emds.iter().sum::<f64>() / emds.len() as f64;
             let max_emd = emds.iter().fold(0.0_f64, |a, &b| a.max(b));
@@ -590,7 +602,13 @@ pub fn audit_transition_consistency(
         0.0
     } else {
         #[allow(clippy::cast_precision_loss)]
-        { non_empty.iter().map(|b| b.mean_emd_to_centroid).sum::<f64>() / non_empty.len() as f64 }
+        {
+            non_empty
+                .iter()
+                .map(|b| b.mean_emd_to_centroid)
+                .sum::<f64>()
+                / non_empty.len() as f64
+        }
     };
     let max_emd = non_empty
         .iter()
@@ -603,7 +621,11 @@ pub fn audit_transition_consistency(
     let (mean_between_emd, separation_ratio) = if let Some(cf) = centroid_file {
         if cf.centroids().len() >= 2 {
             let between = mean_pairwise_centroid_emd(cf.centroids());
-            let ratio = if mean_emd > 0.0 { between / mean_emd } else { f64::INFINITY };
+            let ratio = if mean_emd > 0.0 {
+                between / mean_emd
+            } else {
+                f64::INFINITY
+            };
             (Some(between), Some(ratio))
         } else {
             (None, None)
@@ -655,7 +677,11 @@ pub fn mean_pairwise_centroid_emd(centroids: &[Vec<f64>]) -> f64 {
     }
     let dim = centroids[0].len();
     #[allow(clippy::cast_precision_loss)]
-    let norm = if dim > 1 { 1.0 / (dim as f64 - 1.0) } else { 1.0 };
+    let norm = if dim > 1 {
+        1.0 / (dim as f64 - 1.0)
+    } else {
+        1.0
+    };
     let mut total = 0.0_f64;
     let mut count = 0_usize;
     for i in 0..k {
@@ -817,12 +843,24 @@ impl CentroidEmdReport {
         use std::fmt::Write;
         let mut s = format!(
             "Centroid EMD: {} buckets, {} pairs\n  min={:.4}, max={:.4}, mean={:.4}\n  Closest pairs:",
-            self.num_buckets, self.pairwise_emd.len(), self.min_emd, self.max_emd, self.mean_emd,
+            self.num_buckets,
+            self.pairwise_emd.len(),
+            self.min_emd,
+            self.max_emd,
+            self.mean_emd,
         );
         let mut sorted: Vec<_> = self.pairwise_emd.iter().collect();
-        sorted.sort_by(|a, b| a.emd.partial_cmp(&b.emd).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            a.emd
+                .partial_cmp(&b.emd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for pair in sorted.iter().take(5) {
-            let _ = write!(s, "\n    bucket {} <-> {}: EMD={:.4}", pair.bucket_a, pair.bucket_b, pair.emd);
+            let _ = write!(
+                s,
+                "\n    bucket {} <-> {}: EMD={:.4}",
+                pair.bucket_a, pair.bucket_b, pair.emd
+            );
         }
         s
     }
@@ -912,9 +950,8 @@ pub fn audit_cfvnet_buckets(
     progress: impl Fn(f64),
 ) -> Result<EquityAuditReport, Box<dyn std::error::Error>> {
     use super::cluster_pipeline::{
-        build_cfvnet_to_core_combo_map, cfvnet_card_to_core, canonical_key,
-        collect_bin_files, read_cfv_as_equity, record_size_for_board,
-        CFVNET_RIVER_RECORD_SIZE, CFV_FIELD_OFFSET,
+        CFV_FIELD_OFFSET, CFVNET_RIVER_RECORD_SIZE, build_cfvnet_to_core_combo_map, canonical_key,
+        cfvnet_card_to_core, collect_bin_files, read_cfv_as_equity, record_size_for_board,
     };
 
     let combo_map = build_cfvnet_to_core_combo_map();
@@ -960,12 +997,17 @@ pub fn audit_cfvnet_buckets(
                     if data[mask_offset + i] != 0 {
                         let equity = read_cfv_as_equity(&data, cfv_offset, i);
                         let core_combo = combo_map[i] as usize;
-                        let bucket = bf.buckets[board_idx as usize * combos_per_board + core_combo] as usize;
+                        let bucket =
+                            bf.buckets[board_idx as usize * combos_per_board + core_combo] as usize;
                         if bucket < bucket_count {
                             sum[bucket] += equity;
                             sq_sum[bucket] += equity * equity;
-                            if equity < min_eq[bucket] { min_eq[bucket] = equity; }
-                            if equity > max_eq[bucket] { max_eq[bucket] = equity; }
+                            if equity < min_eq[bucket] {
+                                min_eq[bucket] = equity;
+                            }
+                            if equity > max_eq[bucket] {
+                                max_eq[bucket] = equity;
+                            }
                             count[bucket] += 1;
                         }
                     }
@@ -1047,9 +1089,9 @@ pub fn diagnose_per_flop_dir(
     dir: &Path,
     sample_count: usize,
 ) -> Result<PerFlopReport, Box<dyn std::error::Error>> {
+    use super::per_flop_bucket_file::PerFlopBucketFile;
     use rand::prelude::*;
     use rand::rngs::StdRng;
-    use super::per_flop_bucket_file::PerFlopBucketFile;
 
     let mut flop_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -1132,9 +1174,9 @@ pub fn audit_per_flop_equity(
     num_river_samples_per_turn: usize,
     seed: u64,
 ) -> Result<EquityAuditReport, Box<dyn std::error::Error>> {
+    use super::per_flop_bucket_file::PerFlopBucketFile;
     use rand::prelude::*;
     use rand::rngs::StdRng;
-    use super::per_flop_bucket_file::PerFlopBucketFile;
 
     let mut flop_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -1242,10 +1284,7 @@ pub fn audit_per_flop_equity(
     } else {
         non_empty.iter().map(|b| b.std_dev).sum::<f64>() / non_empty.len() as f64
     };
-    let max_std = non_empty
-        .iter()
-        .map(|b| b.std_dev)
-        .fold(0.0_f64, f64::max);
+    let max_std = non_empty.iter().map(|b| b.std_dev).fold(0.0_f64, f64::max);
 
     let sample_boards = equity_bucket_pairs.len();
 
@@ -1275,7 +1314,9 @@ impl BucketHandSample {
         let board_str: Vec<String> = self.board_cards.iter().map(|c| format!("{c}")).collect();
         format!(
             "  [{} {}] on [{}]",
-            self.hole_cards[0], self.hole_cards[1], board_str.join(" "),
+            self.hole_cards[0],
+            self.hole_cards[1],
+            board_str.join(" "),
         )
     }
 }
@@ -1390,13 +1431,11 @@ pub fn adjusted_rand_index(a: &[u16], b: &[u16], seed: u64) -> Option<f64> {
     let mut fn_ = 0_u64; // different in A, same in B
     let mut tn = 0_u64; // different in A, different in B
 
-    let mut classify = |i: usize, j: usize| {
-        match (a[i] == a[j], b[i] == b[j]) {
-            (true, true) => tp += 1,
-            (true, false) => fp += 1,
-            (false, true) => fn_ += 1,
-            (false, false) => tn += 1,
-        }
+    let mut classify = |i: usize, j: usize| match (a[i] == a[j], b[i] == b[j]) {
+        (true, true) => tp += 1,
+        (true, false) => fp += 1,
+        (false, true) => fn_ += 1,
+        (false, false) => tn += 1,
     };
 
     let total_pairs = n * (n - 1) / 2;
@@ -1469,13 +1508,29 @@ fn format_equity_histogram(ea: &EquityAuditReport, eb: &EquityAuditReport) -> St
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(s, "\n  Equity histogram (buckets per equity bin):");
-    let _ = writeln!(s, "  {:<16} {:<10} {:<10}", "Equity Range", "Dir A", "Dir B");
+    let _ = writeln!(
+        s,
+        "  {:<16} {:<10} {:<10}",
+        "Equity Range", "Dir A", "Dir B"
+    );
     for bin in 0..10 {
         let lo = bin as f64 * 0.1;
         let hi = lo + 0.1;
-        let count_a = ea.buckets.iter().filter(|b| b.count > 0 && b.mean_equity >= lo && b.mean_equity < hi).count();
-        let count_b = eb.buckets.iter().filter(|b| b.count > 0 && b.mean_equity >= lo && b.mean_equity < hi).count();
-        let _ = writeln!(s, "  [{:.1}, {:.1})       {:<10} {:<10}", lo, hi, count_a, count_b);
+        let count_a = ea
+            .buckets
+            .iter()
+            .filter(|b| b.count > 0 && b.mean_equity >= lo && b.mean_equity < hi)
+            .count();
+        let count_b = eb
+            .buckets
+            .iter()
+            .filter(|b| b.count > 0 && b.mean_equity >= lo && b.mean_equity < hi)
+            .count();
+        let _ = writeln!(
+            s,
+            "  [{:.1}, {:.1})       {:<10} {:<10}",
+            lo, hi, count_a, count_b
+        );
     }
     s
 }
@@ -1488,52 +1543,59 @@ impl ClusterDiffReport {
         let mut s = format!("=== Cluster Diff: {} ===\n", self.street);
         let _ = writeln!(s, "{:<28} {:<16} {:<16}", "", "Dir A", "Dir B");
         let _ = writeln!(
-            s, "{:<28} {:<16} {:<16}",
+            s,
+            "{:<28} {:<16} {:<16}",
             "Bucket count:", self.size_a.bucket_count, self.size_b.bucket_count
         );
 
         // Bucket size stats
         let _ = writeln!(
-            s, "{:<28} {:<16.1} {:<16.1}",
+            s,
+            "{:<28} {:<16.1} {:<16.1}",
             "Bucket size std:", self.size_a.size_stats.std_dev, self.size_b.size_stats.std_dev
         );
         let empty_a = self.size_a.bucket_sizes.iter().filter(|&&c| c == 0).count();
         let empty_b = self.size_b.bucket_sizes.iter().filter(|&&c| c == 0).count();
         let _ = writeln!(
-            s, "{:<28} {:<16} {:<16}",
+            s,
+            "{:<28} {:<16} {:<16}",
             "Empty buckets:", empty_a, empty_b
         );
 
         // Equity quality (if audited)
         if let (Some(ea), Some(eb)) = (&self.equity_a, &self.equity_b) {
             let pct = if ea.mean_intra_bucket_std > 0.0 {
-                (eb.mean_intra_bucket_std - ea.mean_intra_bucket_std)
-                    / ea.mean_intra_bucket_std
+                (eb.mean_intra_bucket_std - ea.mean_intra_bucket_std) / ea.mean_intra_bucket_std
                     * 100.0
             } else {
                 0.0
             };
             let _ = writeln!(
-                s, "{:<28} {:<16.4} {:<12.4} ({:+.1}%)",
+                s,
+                "{:<28} {:<16.4} {:<12.4} ({:+.1}%)",
                 "Mean intra-bkt std:", ea.mean_intra_bucket_std, eb.mean_intra_bucket_std, pct
             );
             let pct_max = if ea.max_intra_bucket_std > 0.0 {
-                (eb.max_intra_bucket_std - ea.max_intra_bucket_std)
-                    / ea.max_intra_bucket_std
+                (eb.max_intra_bucket_std - ea.max_intra_bucket_std) / ea.max_intra_bucket_std
                     * 100.0
             } else {
                 0.0
             };
             let _ = writeln!(
-                s, "{:<28} {:<16.4} {:<12.4} ({:+.1}%)",
+                s,
+                "{:<28} {:<16.4} {:<12.4} ({:+.1}%)",
                 "Max intra-bkt std:", ea.max_intra_bucket_std, eb.max_intra_bucket_std, pct_max
             );
         }
 
         // ARI
         match self.ari {
-            Some(ari) => { let _ = writeln!(s, "{:<28} {:.3}", "Adjusted Rand Index:", ari); }
-            None => { let _ = writeln!(s, "{:<28} N/A", "Adjusted Rand Index:"); }
+            Some(ari) => {
+                let _ = writeln!(s, "{:<28} {:.3}", "Adjusted Rand Index:", ari);
+            }
+            None => {
+                let _ = writeln!(s, "{:<28} N/A", "Adjusted Rand Index:");
+            }
         }
 
         // Verbose: equity histogram comparison
@@ -1572,10 +1634,7 @@ pub fn diff_bucket_files(
         "board count mismatch: {} vs {}",
         a.header.board_count, b.header.board_count
     );
-    assert_eq!(
-        a.header.street, b.header.street,
-        "street mismatch"
-    );
+    assert_eq!(a.header.street, b.header.street, "street mismatch");
 
     let size_a = ClusterReport::from_bucket_file(a);
     let size_b = ClusterReport::from_bucket_file(b);
@@ -1607,8 +1666,8 @@ pub fn diff_bucket_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
     use crate::blueprint_v2::Street;
+    use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
 
     fn make_test_bucket_file(bucket_count: u16, buckets: Vec<u16>) -> BucketFile {
         #[allow(clippy::cast_possible_truncation)]
@@ -1668,14 +1727,22 @@ mod tests {
     fn transition_matrix_basic() {
         let river = BucketFile {
             header: BucketFileHeader {
-                street: Street::River, bucket_count: 3, board_count: 1, combos_per_board: 4, version: 2,
+                street: Street::River,
+                bucket_count: 3,
+                board_count: 1,
+                combos_per_board: 4,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 1, 2, 0],
         };
         let turn = BucketFile {
             header: BucketFileHeader {
-                street: Street::Turn, bucket_count: 2, board_count: 1, combos_per_board: 4, version: 2,
+                street: Street::Turn,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 4,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 0, 1, 1],
@@ -1697,14 +1764,22 @@ mod tests {
     fn transition_matrix_summary_format() {
         let a = BucketFile {
             header: BucketFileHeader {
-                street: Street::Turn, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+                street: Street::Turn,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 2,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 1],
         };
         let b = BucketFile {
             header: BucketFileHeader {
-                street: Street::River, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+                street: Street::River,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 2,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 1],
@@ -1722,14 +1797,22 @@ mod tests {
         // Preflop has 1 board, flop has 2 boards: tests the fan-out branch.
         let preflop = BucketFile {
             header: BucketFileHeader {
-                street: Street::Preflop, bucket_count: 2, board_count: 1, combos_per_board: 3, version: 2,
+                street: Street::Preflop,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 3,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 0, 1],
         };
         let flop = BucketFile {
             header: BucketFileHeader {
-                street: Street::Flop, bucket_count: 2, board_count: 2, combos_per_board: 3, version: 2,
+                street: Street::Flop,
+                bucket_count: 2,
+                board_count: 2,
+                combos_per_board: 3,
+                version: 2,
             },
             boards: vec![PackedBoard(0), PackedBoard(1)],
             // board0: combos -> [0, 1, 0], board1: combos -> [1, 0, 1]
@@ -1751,14 +1834,22 @@ mod tests {
         // One bucket has no entries, should show 0 not percentage.
         let from = BucketFile {
             header: BucketFileHeader {
-                street: Street::Turn, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+                street: Street::Turn,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 2,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 0], // bucket 1 is empty
         };
         let to = BucketFile {
             header: BucketFileHeader {
-                street: Street::River, bucket_count: 2, board_count: 1, combos_per_board: 2, version: 2,
+                street: Street::River,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: 2,
+                version: 2,
             },
             boards: vec![PackedBoard(0)],
             buckets: vec![0, 1],
@@ -1826,10 +1917,7 @@ mod tests {
 
     #[test]
     fn centroid_emd_summary_format() {
-        let features = vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-        ];
+        let features = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let assignments: Vec<u16> = vec![0, 1];
         let report = centroid_emd_report(&features, &assignments, 2);
         let s = report.summary();
@@ -1899,7 +1987,8 @@ mod tests {
                 river_cards_per_turn: vec![river_cards],
                 river_buckets_per_turn: vec![vec![i; 1326]],
             };
-            pf.save(&dir.path().join(format!("flop_{i:04}.buckets"))).unwrap();
+            pf.save(&dir.path().join(format!("flop_{i:04}.buckets")))
+                .unwrap();
         }
         let report = diagnose_per_flop_dir(dir.path(), 10).unwrap();
         assert_eq!(report.total_flop_files, 3);
@@ -1932,7 +2021,8 @@ mod tests {
                 river_cards_per_turn: vec![vec![Card::new(Value::Ten, Suit::Club)]],
                 river_buckets_per_turn: vec![vec![0; 1326]],
             };
-            pf.save(&dir.path().join(format!("flop_{i:04}.buckets"))).unwrap();
+            pf.save(&dir.path().join(format!("flop_{i:04}.buckets")))
+                .unwrap();
         }
         let report = diagnose_per_flop_dir(dir.path(), 5).unwrap();
         assert_eq!(report.total_flop_files, 20);
@@ -1993,10 +2083,7 @@ mod tests {
     fn centroid_separation_ratio() {
         // Two centroids far apart should give high separation.
         // Centroid 0: mass at bucket 0. Centroid 1: mass at bucket 2.
-        let centroids = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 0.0, 1.0],
-        ];
+        let centroids = vec![vec![1.0, 0.0, 0.0], vec![0.0, 0.0, 1.0]];
         let between = mean_pairwise_centroid_emd(&centroids);
         // EMD between [1,0,0] and [0,0,1] on 3 buckets: CDF diffs = [1.0, 1.0], sum = 2.0
         // Normalized by (3-1) = 2: 2.0 / 2.0 = 1.0
@@ -2006,10 +2093,7 @@ mod tests {
     #[test]
     fn centroid_separation_close() {
         // Two adjacent centroids should give low separation.
-        let centroids = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-        ];
+        let centroids = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
         let between = mean_pairwise_centroid_emd(&centroids);
         // EMD = 1.0, normalized by 2 = 0.5
         assert!((between - 0.5).abs() < 1e-10);
@@ -2024,25 +2108,32 @@ mod tests {
             bucket_count: 2,
             child_bucket_count: 100,
             sample_boards: 10,
-            buckets: vec![
-                BucketTransitionStats {
-                    bucket_id: 0,
-                    count: 5,
-                    mean_emd_to_centroid: 0.048,
-                    max_emd_to_centroid: 0.22,
-                    distinct_turn_buckets: 10,
-                    transition_entropy: 3.0,
-                },
-            ],
+            buckets: vec![BucketTransitionStats {
+                bucket_id: 0,
+                count: 5,
+                mean_emd_to_centroid: 0.048,
+                max_emd_to_centroid: 0.22,
+                distinct_turn_buckets: 10,
+                transition_entropy: 3.0,
+            }],
             mean_emd: 0.048,
             max_emd: 0.22,
             mean_between_emd: Some(0.185),
             separation_ratio: Some(3.85),
         };
         let s = report.summary();
-        assert!(s.contains("(normalized)"), "summary missing '(normalized)': {s}");
-        assert!(s.contains("Between-centroid EMD"), "summary missing between-centroid: {s}");
-        assert!(s.contains("Separation ratio"), "summary missing separation ratio: {s}");
+        assert!(
+            s.contains("(normalized)"),
+            "summary missing '(normalized)': {s}"
+        );
+        assert!(
+            s.contains("Between-centroid EMD"),
+            "summary missing between-centroid: {s}"
+        );
+        assert!(
+            s.contains("Separation ratio"),
+            "summary missing separation ratio: {s}"
+        );
         assert!(s.contains("3.85"), "summary missing ratio value: {s}");
     }
 
@@ -2061,8 +2152,14 @@ mod tests {
             separation_ratio: None,
         };
         let s = report.summary();
-        assert!(!s.contains("Between-centroid"), "should not show between-centroid when None: {s}");
-        assert!(!s.contains("Separation ratio"), "should not show separation ratio when None: {s}");
+        assert!(
+            !s.contains("Between-centroid"),
+            "should not show between-centroid when None: {s}"
+        );
+        assert!(
+            !s.contains("Separation ratio"),
+            "should not show separation ratio when None: {s}"
+        );
     }
 
     #[test]
@@ -2153,8 +2250,22 @@ mod tests {
             bucket_count: 2,
             sample_boards: 10,
             buckets: vec![
-                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.15, std_dev: 0.01, min_equity: 0.1, max_equity: 0.2 },
-                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.85, std_dev: 0.01, min_equity: 0.8, max_equity: 0.9 },
+                BucketEquityStats {
+                    bucket_id: 0,
+                    count: 5,
+                    mean_equity: 0.15,
+                    std_dev: 0.01,
+                    min_equity: 0.1,
+                    max_equity: 0.2,
+                },
+                BucketEquityStats {
+                    bucket_id: 1,
+                    count: 5,
+                    mean_equity: 0.85,
+                    std_dev: 0.01,
+                    min_equity: 0.8,
+                    max_equity: 0.9,
+                },
             ],
             mean_intra_bucket_std: 0.01,
             max_intra_bucket_std: 0.01,
@@ -2164,17 +2275,43 @@ mod tests {
             bucket_count: 2,
             sample_boards: 10,
             buckets: vec![
-                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.25, std_dev: 0.01, min_equity: 0.2, max_equity: 0.3 },
-                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.75, std_dev: 0.01, min_equity: 0.7, max_equity: 0.8 },
+                BucketEquityStats {
+                    bucket_id: 0,
+                    count: 5,
+                    mean_equity: 0.25,
+                    std_dev: 0.01,
+                    min_equity: 0.2,
+                    max_equity: 0.3,
+                },
+                BucketEquityStats {
+                    bucket_id: 1,
+                    count: 5,
+                    mean_equity: 0.75,
+                    std_dev: 0.01,
+                    min_equity: 0.7,
+                    max_equity: 0.8,
+                },
             ],
             mean_intra_bucket_std: 0.01,
             max_intra_bucket_std: 0.01,
         };
         let hist = format_equity_histogram(&ea, &eb);
-        assert!(hist.contains("Equity histogram"), "should contain header: {hist}");
-        assert!(hist.contains("[0.1, 0.2)"), "should contain bin range: {hist}");
-        assert!(hist.contains("Dir A"), "should contain Dir A column: {hist}");
-        assert!(hist.contains("Dir B"), "should contain Dir B column: {hist}");
+        assert!(
+            hist.contains("Equity histogram"),
+            "should contain header: {hist}"
+        );
+        assert!(
+            hist.contains("[0.1, 0.2)"),
+            "should contain bin range: {hist}"
+        );
+        assert!(
+            hist.contains("Dir A"),
+            "should contain Dir A column: {hist}"
+        );
+        assert!(
+            hist.contains("Dir B"),
+            "should contain Dir B column: {hist}"
+        );
     }
 
     #[test]
@@ -2185,8 +2322,22 @@ mod tests {
             bucket_count: 2,
             sample_boards: 10,
             buckets: vec![
-                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.05, std_dev: 0.01, min_equity: 0.0, max_equity: 0.1 },
-                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.95, std_dev: 0.01, min_equity: 0.9, max_equity: 1.0 },
+                BucketEquityStats {
+                    bucket_id: 0,
+                    count: 5,
+                    mean_equity: 0.05,
+                    std_dev: 0.01,
+                    min_equity: 0.0,
+                    max_equity: 0.1,
+                },
+                BucketEquityStats {
+                    bucket_id: 1,
+                    count: 5,
+                    mean_equity: 0.95,
+                    std_dev: 0.01,
+                    min_equity: 0.9,
+                    max_equity: 1.0,
+                },
             ],
             mean_intra_bucket_std: 0.01,
             max_intra_bucket_std: 0.01,
@@ -2197,8 +2348,22 @@ mod tests {
             bucket_count: 2,
             sample_boards: 10,
             buckets: vec![
-                BucketEquityStats { bucket_id: 0, count: 5, mean_equity: 0.45, std_dev: 0.01, min_equity: 0.4, max_equity: 0.5 },
-                BucketEquityStats { bucket_id: 1, count: 5, mean_equity: 0.46, std_dev: 0.01, min_equity: 0.4, max_equity: 0.5 },
+                BucketEquityStats {
+                    bucket_id: 0,
+                    count: 5,
+                    mean_equity: 0.45,
+                    std_dev: 0.01,
+                    min_equity: 0.4,
+                    max_equity: 0.5,
+                },
+                BucketEquityStats {
+                    bucket_id: 1,
+                    count: 5,
+                    mean_equity: 0.46,
+                    std_dev: 0.01,
+                    min_equity: 0.4,
+                    max_equity: 0.5,
+                },
             ],
             mean_intra_bucket_std: 0.01,
             max_intra_bucket_std: 0.01,
@@ -2206,7 +2371,10 @@ mod tests {
         let hist = format_equity_histogram(&ea, &eb);
         // [0.0, 0.1) should have 1 in Dir A and 0 in Dir B
         // [0.4, 0.5) should have 0 in Dir A and 2 in Dir B
-        assert!(hist.contains("[0.0, 0.1)"), "should contain first bin: {hist}");
+        assert!(
+            hist.contains("[0.0, 0.1)"),
+            "should contain first bin: {hist}"
+        );
     }
 
     #[test]
@@ -2218,7 +2386,10 @@ mod tests {
         // doesn't include the histogram, and test format_equity_histogram directly.
         let report = diff_bucket_files(&a, &b, 0, 42);
         let non_verbose = report.summary(false);
-        assert!(!non_verbose.contains("Equity histogram"), "non-verbose should not have histogram");
+        assert!(
+            !non_verbose.contains("Equity histogram"),
+            "non-verbose should not have histogram"
+        );
     }
 
     #[test]

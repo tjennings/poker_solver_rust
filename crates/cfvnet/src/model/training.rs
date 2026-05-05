@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use crate::datagen::storage::{read_record, TrainingRecord};
+use crate::datagen::storage::{TrainingRecord, read_record};
 use crate::model::dataset::encode_record;
 use crate::model::loss::cfvnet_loss;
 use crate::model::network::{CfvNet, INPUT_SIZE, OUTPUT_SIZE};
@@ -66,10 +66,7 @@ impl PreEncoded {
         let n = records.len();
         let in_size = INPUT_SIZE;
 
-        let items: Vec<_> = records
-            .iter()
-            .map(encode_record)
-            .collect();
+        let items: Vec<_> = records.iter().map(encode_record).collect();
 
         // Flatten into contiguous arrays.
         let mut input = Vec::with_capacity(n * in_size);
@@ -86,7 +83,15 @@ impl PreEncoded {
             game_value.push(item.game_value);
         }
 
-        Self { input, target, mask, range, game_value, in_size, len: n }
+        Self {
+            input,
+            target,
+            mask,
+            range,
+            game_value,
+            in_size,
+            len: n,
+        }
     }
 
     /// Create tensors on `device`, consuming the pre-encoded data.
@@ -153,7 +158,15 @@ fn compute_val_loss<B: AutodiffBackend>(
         let b_gv = val_tensors.game_value.clone().narrow(0, batch_start, len);
 
         let pred = valid_model.forward(b_input);
-        let loss = cfvnet_loss(pred, b_target, b_mask, b_range, b_gv, config.huber_delta, config.aux_loss_weight);
+        let loss = cfvnet_loss(
+            pred,
+            b_target,
+            b_mask,
+            b_range,
+            b_gv,
+            config.huber_delta,
+            config.aux_loss_weight,
+        );
 
         // INVARIANT: loss is shape [1], so to_vec always has exactly one element.
         let val: f32 = loss.into_data().to_vec::<f32>().unwrap()[0];
@@ -161,24 +174,23 @@ fn compute_val_loss<B: AutodiffBackend>(
         batch_count += 1;
     }
 
-    if batch_count == 0 { 0.0 } else { total_loss / batch_count as f64 }
+    if batch_count == 0 {
+        0.0
+    } else {
+        total_loss / batch_count as f64
+    }
 }
 
 /// Save the model to `dir/name` using NamedMpkGz format.
 ///
 /// Logs a warning on failure instead of panicking so training can continue.
-fn save_model<B: AutodiffBackend>(
-    model: &CfvNet<B>,
-    dir: &std::path::Path,
-    name: &str,
-) {
+fn save_model<B: AutodiffBackend>(model: &CfvNet<B>, dir: &std::path::Path, name: &str) {
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let path = dir.join(name);
     if let Err(e) = model.clone().save_file(path, &recorder) {
         eprintln!("Warning: failed to save model '{}': {}", name, e);
     }
 }
-
 
 /// Streaming record reader that reads from a sequence of files, filling
 /// buffers up to a requested chunk size. Handles file boundaries transparently.
@@ -299,7 +311,6 @@ impl StreamingReader {
 
         records
     }
-
 }
 
 /// Collect sorted file paths from a path (file or directory).
@@ -353,7 +364,9 @@ fn load_or_create_model<B: AutodiffBackend>(
     output_dir: Option<&Path>,
     device: &B::Device,
 ) -> (CfvNet<B>, usize) {
-    let Some(dir) = output_dir else { return (model, 0) };
+    let Some(dir) = output_dir else {
+        return (model, 0);
+    };
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
 
     // Scan for checkpoint_epochN.mpk.gz and find the highest N.
@@ -402,14 +415,14 @@ fn load_or_create_model<B: AutodiffBackend>(
 }
 
 /// Load validation records and return them pre-encoded.
-fn load_validation_set(
-    files: &[PathBuf],
-    val_count: usize,
-) -> Option<PreEncoded> {
+fn load_validation_set(files: &[PathBuf], val_count: usize) -> Option<PreEncoded> {
     if val_count == 0 || files.is_empty() {
         return None;
     }
-    eprintln!("Loading {val_count} validation records (sampled across {} files)...", files.len());
+    eprintln!(
+        "Loading {val_count} validation records (sampled across {} files)...",
+        files.len()
+    );
 
     let per_file = (val_count / files.len()).max(1);
     let mut val_records = Vec::with_capacity(val_count);
@@ -440,7 +453,10 @@ fn load_validation_set(
     }
 
     let actual_val = val_records.len();
-    eprintln!("Loaded {actual_val} validation records from {} files ({per_file} per file)", actual_val.min(files.len()));
+    eprintln!(
+        "Loaded {actual_val} validation records from {} files ({per_file} per file)",
+        actual_val.min(files.len())
+    );
     Some(PreEncoded::from_records(&val_records))
 }
 
@@ -570,7 +586,9 @@ pub fn train<B: AutodiffBackend>(
     let (mut model, start_epoch) = load_or_create_model(model, output_dir, device);
 
     let mut optim = AdamConfig::new()
-        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(config.grad_clip_norm as f32)))
+        .with_grad_clipping(Some(burn::grad_clipping::GradientClippingConfig::Norm(
+            config.grad_clip_norm as f32,
+        )))
         .init::<B, CfvNet<B>>();
 
     let files = collect_data_files(data_path).unwrap_or_else(|e| {
@@ -584,11 +602,12 @@ pub fn train<B: AutodiffBackend>(
 
     if total_records == 0 {
         eprintln!("No training records found.");
-        return TrainResult { final_train_loss: f32::MAX };
+        return TrainResult {
+            final_train_loss: f32::MAX,
+        };
     }
 
-    let val_count = ((total_records as f64 * config.validation_split) as usize)
-        .min(total_records);
+    let val_count = ((total_records as f64 * config.validation_split) as usize).min(total_records);
     let val_encoded = load_validation_set(&files, val_count);
 
     // Pre-upload validation tensors to GPU once (avoids per-epoch re-upload leak).
@@ -605,21 +624,25 @@ pub fn train<B: AutodiffBackend>(
     let total_steps = steps_per_epoch * config.epochs;
 
     if start_epoch >= config.epochs {
-        eprintln!("Already completed {start_epoch}/{} epochs, nothing to do.", config.epochs);
-        return TrainResult { final_train_loss: f32::MAX };
+        eprintln!(
+            "Already completed {start_epoch}/{} epochs, nothing to do.",
+            config.epochs
+        );
+        return TrainResult {
+            final_train_loss: f32::MAX,
+        };
     }
 
     let remaining_epochs = config.epochs - start_epoch;
     eprintln!(
         "Training: epochs {}-{} ({remaining_epochs} remaining) x {} steps/epoch = {} total steps",
-        start_epoch + 1, config.epochs, steps_per_epoch, total_steps
+        start_epoch + 1,
+        config.epochs,
+        steps_per_epoch,
+        total_steps
     );
 
-    let (data_rx, loader_threads) = spawn_dataloader_thread(
-        &files,
-        config,
-        val_count,
-    );
+    let (data_rx, loader_threads) = spawn_dataloader_thread(&files, config, val_count);
 
     // Spawn GPU upload thread to overlap CPU->GPU transfer with compute.
     let gpu_prefetch = config.gpu_prefetch.max(1);
@@ -675,7 +698,12 @@ pub fn train<B: AutodiffBackend>(
                 epoch_loss = final_loss as f64;
             }
 
-            let lr = cosine_lr(config.learning_rate, config.lr_min, global_step, total_steps);
+            let lr = cosine_lr(
+                config.learning_rate,
+                config.lr_min,
+                global_step,
+                total_steps,
+            );
             let grads = loss.backward();
             let grads_params = GradientsParams::from_grads(grads, &model);
             model = optim.step(lr, model, grads_params);
@@ -693,7 +721,8 @@ pub fn train<B: AutodiffBackend>(
 
         let mut summary = format!(
             "{}/{} lr={lr_now:.2e} train={epoch_loss:.6}",
-            epoch + 1, config.epochs,
+            epoch + 1,
+            config.epochs,
         );
 
         // Validation loss at epoch boundary.
@@ -729,7 +758,9 @@ pub fn train<B: AutodiffBackend>(
         save_model(&model, dir, "model");
     }
 
-    TrainResult { final_train_loss: final_loss }
+    TrainResult {
+        final_train_loss: final_loss,
+    }
 }
 
 #[cfg(test)]
@@ -919,17 +950,29 @@ mod tests {
     #[test]
     fn cosine_lr_boundaries() {
         let lr = cosine_lr(0.01, 0.001, 0, 100);
-        assert!((lr - 0.01).abs() < 1e-9, "at step 0, lr should be lr_max, got {lr}");
+        assert!(
+            (lr - 0.01).abs() < 1e-9,
+            "at step 0, lr should be lr_max, got {lr}"
+        );
 
         let lr = cosine_lr(0.01, 0.001, 100, 100);
-        assert!((lr - 0.001).abs() < 1e-9, "at final step, lr should be lr_min, got {lr}");
+        assert!(
+            (lr - 0.001).abs() < 1e-9,
+            "at final step, lr should be lr_min, got {lr}"
+        );
 
         let lr_mid = cosine_lr(0.01, 0.001, 50, 100);
-        assert!(lr_mid > 0.001 && lr_mid < 0.01, "mid lr should be between min and max, got {lr_mid}");
+        assert!(
+            lr_mid > 0.001 && lr_mid < 0.01,
+            "mid lr should be between min and max, got {lr_mid}"
+        );
 
         // Midpoint of cosine = (lr_max + lr_min) / 2
         let expected_mid = (0.01 + 0.001) / 2.0;
-        assert!((lr_mid - expected_mid).abs() < 1e-9, "mid lr should be {expected_mid}, got {lr_mid}");
+        assert!(
+            (lr_mid - expected_mid).abs() < 1e-9,
+            "mid lr should be {expected_mid}, got {lr_mid}"
+        );
     }
 
     #[test]
@@ -1068,16 +1111,15 @@ mod tests {
             ..default_test_config()
         };
 
-        let (rx, handles) = spawn_dataloader_thread(
-            &[empty_path],
-            &config,
-            0,
-        );
+        let (rx, handles) = spawn_dataloader_thread(&[empty_path], &config, 0);
 
         // The reader thread should stop after seeing empty buffer,
         // cascading close through the encoder, causing recv() to return Err.
         let result = rx.recv();
-        assert!(result.is_err(), "expected channel to close after empty reads");
+        assert!(
+            result.is_err(),
+            "expected channel to close after empty reads"
+        );
 
         // Both threads should have exited cleanly (no panic).
         for handle in handles {
@@ -1160,11 +1202,7 @@ mod tests {
             ..default_test_config()
         };
 
-        let (rx, handles) = spawn_dataloader_thread(
-            &[file.path().to_path_buf()],
-            &config,
-            0,
-        );
+        let (rx, handles) = spawn_dataloader_thread(&[file.path().to_path_buf()], &config, 0);
 
         // One epoch = ceil(64 / 8) = 8 batches.
         // Receive two epochs worth (16 batches).
@@ -1180,12 +1218,14 @@ mod tests {
             }
         }
         assert_eq!(total_batches, 16, "should receive 16 batches for 2 epochs");
-        assert_eq!(total_records, 128, "should receive 64 records per epoch x 2");
+        assert_eq!(
+            total_records, 128,
+            "should receive 64 records per epoch x 2"
+        );
 
         drop(rx);
         for handle in handles {
             handle.join().expect("thread should not panic");
         }
     }
-
 }

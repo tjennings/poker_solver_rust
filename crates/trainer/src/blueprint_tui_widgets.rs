@@ -100,8 +100,8 @@ pub fn action_color_ranked(name: &str, rank: usize, total_bets: usize) -> Color 
         };
         // t=0 → darkest (largest bet), t=1 → lightest (smallest bet)
         let r = (140.0 + 115.0 * t) as u8; // 140 → 255
-        let g = (30.0 + 90.0 * t) as u8;   // 30 → 120
-        let b = (30.0 + 70.0 * t) as u8;   // 30 → 100
+        let g = (30.0 + 90.0 * t) as u8; // 30 → 120
+        let b = (30.0 + 70.0 * t) as u8; // 30 → 100
         return Color::Rgb(r, g, b);
     }
     if lower == "all-in" || lower == "allin" {
@@ -141,11 +141,22 @@ impl Widget for &HandGridWidget<'_> {
         }
 
         // ── Title row ────────────────────────────────────────────────
-        let spot = self.state.action_path.first().map(String::as_str).unwrap_or("");
+        let spot = self
+            .state
+            .action_path
+            .first()
+            .map(String::as_str)
+            .unwrap_or("");
         let title = if spot.is_empty() {
-            format!(" {} | {} ", self.state.scenario_name, self.state.street_label)
+            format!(
+                " {} | {} ",
+                self.state.scenario_name, self.state.street_label
+            )
         } else {
-            format!(" {}({}) | {} ", self.state.scenario_name, spot, self.state.street_label)
+            format!(
+                " {}({}) | {} ",
+                self.state.scenario_name, spot, self.state.street_label
+            )
         };
         buf.set_string(area.x, area.y, &title, Style::default().bold());
 
@@ -156,9 +167,9 @@ impl Widget for &HandGridWidget<'_> {
         let grid_x0 = area.x;
         let grid_y0 = area.y + 1;
         for r in 0..13u16 {
-            let y0 = grid_y0 + r * cell_h;       // color bar row 1
-            let y1 = y0 + 1;                      // color bar row 2
-            let y2 = y0 + 2;                      // hand label row
+            let y0 = grid_y0 + r * cell_h; // color bar row 1
+            let y1 = y0 + 1; // color bar row 2
+            let y2 = y0 + 2; // hand label row
             if y0 >= area.y + area.height {
                 break;
             }
@@ -200,9 +211,8 @@ impl Widget for &HandGridWidget<'_> {
 
                 // Row 2: hand label + EV (black bg) + remainder = color bar
                 if y2 < area.y + area.height {
-                    let hand_name =
-                        CanonicalHand::from_matrix_position(r as usize, c as usize)
-                            .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
+                    let hand_name = CanonicalHand::from_matrix_position(r as usize, c as usize)
+                        .map_or_else(|| "   ".to_string(), |h| format!("{h}"));
                     let hand_label = if let Some(ev) = cell.ev {
                         // Convert chips to BB for display
                         let ev_bb = ev / 2.0;
@@ -213,8 +223,7 @@ impl Widget for &HandGridWidget<'_> {
                         hand_name
                     };
                     let label_len = hand_label.len().min(content_w as usize);
-                    let label_style =
-                        Style::default().bg(Color::Rgb(0, 0, 0)).fg(Color::White);
+                    let label_style = Style::default().bg(Color::Rgb(0, 0, 0)).fg(Color::White);
                     buf.set_string(x, y2, &hand_label[..label_len], label_style);
 
                     // Fill remainder with the color bar pattern
@@ -229,7 +238,12 @@ impl Widget for &HandGridWidget<'_> {
                             // Render full color bar then we already wrote the label
                             // over the first chars — just render the tail portion.
                             render_color_bar_offset(
-                                buf, x, y2, content_w, &cell.actions, remainder_start,
+                                buf,
+                                x,
+                                y2,
+                                content_w,
+                                &cell.actions,
+                                remainder_start,
                             );
                         }
                     }
@@ -241,11 +255,7 @@ impl Widget for &HandGridWidget<'_> {
         // ── Footer ──────────────────────────────────────────────────
         let footer_y = grid_y0 + 13 * cell_h;
         if footer_y < area.y + area.height {
-            let board = self
-                .state
-                .board_display
-                .as_deref()
-                .unwrap_or("--");
+            let board = self.state.board_display.as_deref().unwrap_or("--");
             let cluster = self
                 .state
                 .cluster_id
@@ -346,15 +356,18 @@ fn render_color_bar(buf: &mut Buffer, x: u16, y: u16, w: u16, actions: &[(String
     let bet_ranks: Vec<Option<(usize, usize)>> = {
         let total_bets = sorted.iter().filter(|(n, _)| is_bet_or_raise(n)).count();
         let mut rank = 0;
-        sorted.iter().map(|(n, _)| {
-            if is_bet_or_raise(n) {
-                let r = rank;
-                rank += 1;
-                Some((r, total_bets))
-            } else {
-                None
-            }
-        }).collect()
+        sorted
+            .iter()
+            .map(|(n, _)| {
+                if is_bet_or_raise(n) {
+                    let r = rank;
+                    rank += 1;
+                    Some((r, total_bets))
+                } else {
+                    None
+                }
+            })
+            .collect()
     };
 
     let mut col = 0_u16;
@@ -478,9 +491,8 @@ mod tests {
     fn mock_grid_state() -> HandGridState {
         // INVARIANT: Default::default() for [[CellStrategy; 13]; 13] gives
         // empty action vecs in every cell.
-        let cells: [[CellStrategy; 13]; 13] = std::array::from_fn(|_| {
-            std::array::from_fn(|_| CellStrategy::default())
-        });
+        let cells: [[CellStrategy; 13]; 13] =
+            std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
         let mut state = HandGridState {
             cells,
             prev_cells: None,
@@ -546,17 +558,11 @@ mod tests {
     #[timed_test(10)]
     fn convergence_stable() {
         let current = CellStrategy {
-            actions: vec![
-                ("fold".to_string(), 0.50),
-                ("call".to_string(), 0.50),
-            ],
+            actions: vec![("fold".to_string(), 0.50), ("call".to_string(), 0.50)],
             ev: None,
         };
         let previous = CellStrategy {
-            actions: vec![
-                ("fold".to_string(), 0.51),
-                ("call".to_string(), 0.49),
-            ],
+            actions: vec![("fold".to_string(), 0.51), ("call".to_string(), 0.49)],
             ev: None,
         };
         assert!(current.is_converged(&previous, 0.05));
@@ -565,17 +571,11 @@ mod tests {
     #[timed_test(10)]
     fn convergence_moving() {
         let current = CellStrategy {
-            actions: vec![
-                ("fold".to_string(), 0.70),
-                ("call".to_string(), 0.30),
-            ],
+            actions: vec![("fold".to_string(), 0.70), ("call".to_string(), 0.30)],
             ev: None,
         };
         let previous = CellStrategy {
-            actions: vec![
-                ("fold".to_string(), 0.40),
-                ("call".to_string(), 0.60),
-            ],
+            actions: vec![("fold".to_string(), 0.40), ("call".to_string(), 0.60)],
             ev: None,
         };
         assert!(!current.is_converged(&previous, 0.05));
@@ -630,7 +630,14 @@ mod tests {
         let mut content = String::new();
         for y in 0..area.height {
             for x in 0..area.width {
-                content.push(buf.cell((x, y)).unwrap().symbol().chars().next().unwrap_or(' '));
+                content.push(
+                    buf.cell((x, y))
+                        .unwrap()
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' '),
+                );
             }
         }
         assert!(

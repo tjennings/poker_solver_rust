@@ -6,8 +6,8 @@ pub mod solver;
 pub mod terminal;
 
 pub use batch::{
-    compute_evs_from_strategy_sum, compute_reach_at_nodes, GpuBatchSolver, SubgameResult,
-    SubgameSpec,
+    GpuBatchSolver, SubgameResult, SubgameSpec, compute_evs_from_strategy_sum,
+    compute_reach_at_nodes,
 };
 
 /// Configuration for the GPU range solver.
@@ -91,7 +91,7 @@ mod tests {
     use super::*;
     use range_solver::action_tree::{ActionTree, BoardState, TreeConfig};
     use range_solver::bet_size::BetSizeOptions;
-    use range_solver::card::{card_from_str, flop_from_str, CardConfig};
+    use range_solver::card::{CardConfig, card_from_str, flop_from_str};
 
     fn make_river_game() -> range_solver::PostFlopGame {
         let oop_range = "AA,KK,QQ,AKs".parse().unwrap();
@@ -128,16 +128,29 @@ mod tests {
 
         let result = gpu_solve_game(&game, &config);
 
-        assert!(result.exploitability > -1e-4, "exploitability must be >= ~0, got {}", result.exploitability);
-        assert!(result.exploitability.is_finite(), "exploitability must be finite");
+        assert!(
+            result.exploitability > -1e-4,
+            "exploitability must be >= ~0, got {}",
+            result.exploitability
+        );
+        assert!(
+            result.exploitability.is_finite(),
+            "exploitability must be finite"
+        );
         assert!(
             result.exploitability < 1.0,
             "exploitability should converge below 1.0 after 500 iterations, got {}",
             result.exploitability
         );
         assert!(result.iterations_run > 0, "must run at least 1 iteration");
-        assert!(result.iterations_run <= 500, "must not exceed max_iterations");
-        assert!(!result.root_strategy.is_empty(), "root_strategy must not be empty");
+        assert!(
+            result.iterations_run <= 500,
+            "must not exceed max_iterations"
+        );
+        assert!(
+            !result.root_strategy.is_empty(),
+            "root_strategy must not be empty"
+        );
     }
 
     fn make_turn_game() -> range_solver::PostFlopGame {
@@ -176,15 +189,26 @@ mod tests {
 
         let result = gpu_solve_game(&game, &config);
 
-        assert!(result.exploitability.is_finite(), "exploitability must be finite, got {}", result.exploitability);
-        assert!(result.exploitability > -1.0, "exploitability must be >= ~0, got {}", result.exploitability);
+        assert!(
+            result.exploitability.is_finite(),
+            "exploitability must be finite, got {}",
+            result.exploitability
+        );
+        assert!(
+            result.exploitability > -1.0,
+            "exploitability must be >= ~0, got {}",
+            result.exploitability
+        );
         assert!(
             result.exploitability < 10.0,
             "exploitability should converge below 10.0 after 30 iterations on turn game, got {}",
             result.exploitability
         );
         assert!(result.iterations_run > 0, "must run at least 1 iteration");
-        assert!(!result.root_strategy.is_empty(), "root_strategy must not be empty");
+        assert!(
+            !result.root_strategy.is_empty(),
+            "root_strategy must not be empty"
+        );
     }
 
     #[test]
@@ -210,7 +234,8 @@ mod tests {
         assert!(
             ratio < 5.0,
             "GPU exploitability ({}) should be within 5x of CPU ({})",
-            gpu_result.exploitability, cpu_expl
+            gpu_result.exploitability,
+            cpu_expl
         );
     }
 
@@ -244,7 +269,9 @@ mod tests {
         assert!(
             diff < 0.01,
             "GPU ({}) and CPU ({}) exploitability should be close, diff={}",
-            gpu_result.exploitability, cpu_expl, diff
+            gpu_result.exploitability,
+            cpu_expl,
+            diff
         );
     }
 
@@ -263,8 +290,13 @@ mod tests {
         ];
 
         // The root strategy should be non-empty after 1 iteration
-        let config_1 = GpuSolverConfig { max_iterations: 1, target_exploitability: 0.0, print_progress: false };
-        let r = solver::gpu_solve_mega(&topo, &term, &config_1, &initial_weights, num_hands).unwrap();
+        let config_1 = GpuSolverConfig {
+            max_iterations: 1,
+            target_exploitability: 0.0,
+            print_progress: false,
+        };
+        let r =
+            solver::gpu_solve_mega(&topo, &term, &config_1, &initial_weights, num_hands).unwrap();
         assert!(!r.root_strategy.is_empty(), "mega root_strategy empty");
     }
 
@@ -301,9 +333,13 @@ mod tests {
         assert!(
             ratio < 5.0,
             "mega-kernel turn ({}) should be within 5x of CPU ({})",
-            gpu_result.exploitability, cpu_expl
+            gpu_result.exploitability,
+            cpu_expl
         );
-        assert!(!gpu_result.root_strategy.is_empty(), "root_strategy must not be empty");
+        assert!(
+            !gpu_result.root_strategy.is_empty(),
+            "root_strategy must not be empty"
+        );
     }
 
     #[test]
@@ -334,8 +370,13 @@ mod tests {
         assert!(
             diff < 0.01,
             "mega-kernel ({}) and CPU ({}) exploitability should be close, diff={}",
-            gpu_result.exploitability, cpu_expl, diff
+            gpu_result.exploitability,
+            cpu_expl,
+            diff
         );
-        assert!(!gpu_result.root_strategy.is_empty(), "root_strategy must not be empty");
+        assert!(
+            !gpu_result.root_strategy.is_empty(),
+            "root_strategy must not be empty"
+        );
     }
 }

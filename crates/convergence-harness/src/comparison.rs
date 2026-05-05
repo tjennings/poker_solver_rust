@@ -55,10 +55,7 @@ pub fn l1_strategy_distance(
 
 /// Compute combo EV differences.
 /// Returns (per_node_max_abs_diff, overall_average_max_diff).
-pub fn combo_ev_diff(
-    baseline: &ComboEvMap,
-    candidate: &ComboEvMap,
-) -> (BTreeMap<u64, f64>, f64) {
+pub fn combo_ev_diff(baseline: &ComboEvMap, candidate: &ComboEvMap) -> (BTreeMap<u64, f64>, f64) {
     let mut per_node = BTreeMap::new();
     let mut total_max_diff = 0.0;
     let mut node_count = 0;
@@ -102,7 +99,10 @@ mod tests {
         strat.insert(0, vec![0.6, 0.4, 0.8, 0.4, 0.6, 0.2]);
 
         let (per_node, overall) = l1_strategy_distance(&strat, &strat, 3);
-        assert!(overall.abs() < 1e-9, "Identical strategies should have 0 L1 distance");
+        assert!(
+            overall.abs() < 1e-9,
+            "Identical strategies should have 0 L1 distance"
+        );
         assert!(per_node[&0].abs() < 1e-9);
     }
 

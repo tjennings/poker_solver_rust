@@ -10,11 +10,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use poker_solver_tauri::postflop::{build_rollout_evaluator, CbvContext, RolloutBenchContext};
+use poker_solver_tauri::postflop::{CbvContext, RolloutBenchContext, build_rollout_evaluator};
 use range_solver::range::Range;
 
 use crate::bench_rollout::{
-    find_first_flop_node, load_bundle, parse_board_cards, DEFAULT_IP_RANGE, DEFAULT_OOP_RANGE,
+    DEFAULT_IP_RANGE, DEFAULT_OOP_RANGE, find_first_flop_node, load_bundle, parse_board_cards,
 };
 
 /// Per-traverser comparison metrics between exhaustive and sampled CFVs.
@@ -106,11 +106,8 @@ pub fn aggregate_metrics(runs: &[DiffMetrics]) -> Option<AggregatedMetrics> {
         if values.len() < 2 {
             return 0.0;
         }
-        let variance = values
-            .iter()
-            .map(|v| (v - mean).powi(2))
-            .sum::<f64>()
-            / (values.len() - 1) as f64;
+        let variance =
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
         variance.sqrt()
     };
 
@@ -214,14 +211,26 @@ fn build_evaluator_pair(
     opponent_samples: Option<u32>,
 ) -> (RolloutBenchContext, RolloutBenchContext) {
     let mut exhaustive_ctx = build_rollout_evaluator(
-        board_cards, ctx, flop_node, pot_f, starting_stack,
-        Some(Arc::clone(counter)), Some(oop_range), Some(ip_range),
+        board_cards,
+        ctx,
+        flop_node,
+        pot_f,
+        starting_stack,
+        Some(Arc::clone(counter)),
+        Some(oop_range),
+        Some(ip_range),
     );
     exhaustive_ctx.evaluator.enumerate_decision_depth = u8::MAX;
 
     let mut sampled_ctx = build_rollout_evaluator(
-        board_cards, ctx, flop_node, pot_f, starting_stack,
-        Some(Arc::clone(counter)), Some(oop_range), Some(ip_range),
+        board_cards,
+        ctx,
+        flop_node,
+        pot_f,
+        starting_stack,
+        Some(Arc::clone(counter)),
+        Some(oop_range),
+        Some(ip_range),
     );
     if let Some(depth) = enumerate_depth {
         sampled_ctx.evaluator.enumerate_decision_depth = depth;
@@ -249,8 +258,7 @@ fn run_sampled_passes(
     let mut ip_runs: Vec<DiffMetrics> = Vec::with_capacity(num_runs);
 
     for run_idx in 0..num_runs {
-        let (s_oop, s_ip) =
-            run_rollout_pass(sampled_ctx, boundary_pot, boundary_invested);
+        let (s_oop, s_ip) = run_rollout_pass(sampled_ctx, boundary_pot, boundary_invested);
 
         let s_oop_pf: Vec<f64> = s_oop.iter().map(|&v| v / pot_f).collect();
         let s_ip_pf: Vec<f64> = s_ip.iter().map(|&v| v / pot_f).collect();
@@ -274,10 +282,8 @@ fn print_results(
     num_runs: usize,
     pass_threshold: f64,
 ) -> bool {
-    let (oop_report, oop_pass) =
-        format_traverser_report("OOP", oop_agg, num_runs, pass_threshold);
-    let (ip_report, ip_pass) =
-        format_traverser_report("IP", ip_agg, num_runs, pass_threshold);
+    let (oop_report, oop_pass) = format_traverser_report("OOP", oop_agg, num_runs, pass_threshold);
+    let (ip_report, ip_pass) = format_traverser_report("IP", ip_agg, num_runs, pass_threshold);
 
     println!("{oop_report}");
     println!();
@@ -296,28 +302,39 @@ fn print_results(
 /// runs multiple sampled passes, and reports diff metrics per traverser.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    bundle_dir: &Path, board_str: &str, pot: u32, stacks: u32,
-    num_runs: usize, pass_threshold: f64,
-    enumerate_depth: Option<u8>, opponent_samples: Option<u32>,
+    bundle_dir: &Path,
+    board_str: &str,
+    pot: u32,
+    stacks: u32,
+    num_runs: usize,
+    pass_threshold: f64,
+    enumerate_depth: Option<u8>,
+    opponent_samples: Option<u32>,
 ) -> Result<(), String> {
     let board_cards = parse_board_cards(board_str)?;
     if board_cards.len() != 3 {
-        return Err(format!("Validate requires a flop (3 cards), got {} cards", board_cards.len()));
+        return Err(format!(
+            "Validate requires a flop (3 cards), got {} cards",
+            board_cards.len()
+        ));
     }
 
     let (ctx, tree) = load_bundle(bundle_dir)?;
-    let flop_node = find_first_flop_node(&tree)
-        .ok_or("No flop decision node found in abstract tree")?;
+    let flop_node =
+        find_first_flop_node(&tree).ok_or("No flop decision node found in abstract tree")?;
     eprintln!("[validate] abstract flop node index: {flop_node}");
 
     let pot_f = f64::from(pot);
     let starting_stack = f64::from(stacks) + pot_f / 2.0;
-    let oop_range: Range = DEFAULT_OOP_RANGE.parse().map_err(|e| format!("Bad OOP range: {e}"))?;
-    let ip_range: Range = DEFAULT_IP_RANGE.parse().map_err(|e| format!("Bad IP range: {e}"))?;
+    let oop_range: Range = DEFAULT_OOP_RANGE
+        .parse()
+        .map_err(|e| format!("Bad OOP range: {e}"))?;
+    let ip_range: Range = DEFAULT_IP_RANGE
+        .parse()
+        .map_err(|e| format!("Bad IP range: {e}"))?;
 
-    let sampled_depth = enumerate_depth.unwrap_or(
-        poker_solver_core::blueprint_v2::continuation::SAMPLE_AFTER_DECISION_DEPTH,
-    );
+    let sampled_depth = enumerate_depth
+        .unwrap_or(poker_solver_core::blueprint_v2::continuation::SAMPLE_AFTER_DECISION_DEPTH);
     eprintln!(
         "[validate] board={board_str} pot={pot} stacks={stacks} runs={num_runs} \
          enumerate_depth={sampled_depth} opp_samples={}",
@@ -326,28 +343,45 @@ pub fn run(
 
     let counter = Arc::new(AtomicU64::new(0));
     let (exhaustive_ctx, sampled_ctx) = build_evaluator_pair(
-        &board_cards, &ctx, flop_node, pot_f, starting_stack,
-        &counter, &oop_range, &ip_range, enumerate_depth, opponent_samples,
+        &board_cards,
+        &ctx,
+        flop_node,
+        pot_f,
+        starting_stack,
+        &counter,
+        &oop_range,
+        &ip_range,
+        enumerate_depth,
+        opponent_samples,
     );
 
     let boundary_pot = pot_f;
     let boundary_invested = [pot_f / 2.0, pot_f / 2.0];
-    eprintln!("[validate] {} combos, running exhaustive baseline...", exhaustive_ctx.combos.len());
+    eprintln!(
+        "[validate] {} combos, running exhaustive baseline...",
+        exhaustive_ctx.combos.len()
+    );
     let (ex_oop, ex_ip) = run_rollout_pass(&exhaustive_ctx, boundary_pot, boundary_invested);
     eprintln!("[validate] exhaustive done, running {num_runs} sampled passes...");
 
     let ex_oop_pf: Vec<f64> = ex_oop.iter().map(|&v| v / pot_f).collect();
     let ex_ip_pf: Vec<f64> = ex_ip.iter().map(|&v| v / pot_f).collect();
     let (oop_runs, ip_runs) = run_sampled_passes(
-        num_runs, &sampled_ctx, &ex_oop_pf, &ex_ip_pf,
-        &exhaustive_ctx.oop_range, &exhaustive_ctx.ip_range,
-        pot_f, boundary_pot, boundary_invested,
+        num_runs,
+        &sampled_ctx,
+        &ex_oop_pf,
+        &ex_ip_pf,
+        &exhaustive_ctx.oop_range,
+        &exhaustive_ctx.ip_range,
+        pot_f,
+        boundary_pot,
+        boundary_invested,
     );
 
-    let oop_agg = aggregate_metrics(&oop_runs)
-        .ok_or("No OOP metrics computed (all combos zero weight?)")?;
-    let ip_agg = aggregate_metrics(&ip_runs)
-        .ok_or("No IP metrics computed (all combos zero weight?)")?;
+    let oop_agg =
+        aggregate_metrics(&oop_runs).ok_or("No OOP metrics computed (all combos zero weight?)")?;
+    let ip_agg =
+        aggregate_metrics(&ip_runs).ok_or("No IP metrics computed (all combos zero weight?)")?;
     print_results(&oop_agg, &ip_agg, num_runs, pass_threshold);
     Ok(())
 }
@@ -513,13 +547,9 @@ mod tests {
             stddev_l2_diff: 0.005,
             nonzero_combos: 100,
         };
-        let (report, passed) =
-            format_traverser_report("OOP", &agg, 5, 0.02);
+        let (report, passed) = format_traverser_report("OOP", &agg, 5, 0.02);
         assert!(passed);
-        assert!(
-            report.contains("PASS"),
-            "report should say PASS: {report}"
-        );
+        assert!(report.contains("PASS"), "report should say PASS: {report}");
         assert!(report.contains("OOP traverser"));
     }
 
@@ -534,13 +564,9 @@ mod tests {
             stddev_l2_diff: 0.01,
             nonzero_combos: 100,
         };
-        let (report, passed) =
-            format_traverser_report("IP", &agg, 5, 0.02);
+        let (report, passed) = format_traverser_report("IP", &agg, 5, 0.02);
         assert!(!passed);
-        assert!(
-            report.contains("FAIL"),
-            "report should say FAIL: {report}"
-        );
+        assert!(report.contains("FAIL"), "report should say FAIL: {report}");
         assert!(report.contains("IP traverser"));
     }
 
@@ -555,8 +581,7 @@ mod tests {
             stddev_l2_diff: 0.006,
             nonzero_combos: 50,
         };
-        let (report, _) =
-            format_traverser_report("OOP", &agg, 3, 0.02);
+        let (report, _) = format_traverser_report("OOP", &agg, 3, 0.02);
         assert!(
             report.contains("max_abs_diff"),
             "missing max_abs_diff: {report}"
@@ -565,21 +590,12 @@ mod tests {
             report.contains("mean_abs_diff"),
             "missing mean_abs_diff: {report}"
         );
-        assert!(
-            report.contains("L2 diff"),
-            "missing L2 diff: {report}"
-        );
+        assert!(report.contains("L2 diff"), "missing L2 diff: {report}");
         assert!(
             report.contains("pass criterion"),
             "missing criterion: {report}"
         );
-        assert!(
-            report.contains("mbb/hand"),
-            "missing mbb/hand: {report}"
-        );
-        assert!(
-            report.contains("50"),
-            "missing nonzero combos: {report}"
-        );
+        assert!(report.contains("mbb/hand"), "missing mbb/hand: {report}");
+        assert!(report.contains("50"), "missing nonzero combos: {report}");
     }
 }

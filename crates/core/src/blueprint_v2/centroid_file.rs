@@ -141,8 +141,7 @@ impl CentroidFile {
             .chunks_exact(8)
             .map(|chunk| {
                 f64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                    chunk[4], chunk[5], chunk[6], chunk[7],
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
                 ])
             })
             .collect();
@@ -166,10 +165,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir failed");
         let path = dir.path().join("test.cen");
 
-        let centroids = vec![
-            vec![1.0_f64, 2.0, 3.0],
-            vec![4.0, 5.0, 6.0],
-        ];
+        let centroids = vec![vec![1.0_f64, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
         let original = CentroidFile::new(Street::Turn, centroids.clone());
 
         assert_eq!(original.street(), Street::Turn);
@@ -191,11 +187,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir failed");
         let path = dir.path().join("scalar.cen");
 
-        let centroids = vec![
-            vec![0.5_f64],
-            vec![1.5],
-            vec![2.5],
-        ];
+        let centroids = vec![vec![0.5_f64], vec![1.5], vec![2.5]];
         let original = CentroidFile::new(Street::River, centroids.clone());
 
         original.save(&path).expect("save failed");

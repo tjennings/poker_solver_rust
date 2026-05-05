@@ -98,7 +98,8 @@ impl BlueprintV2Strategy {
                 for bucket in 0..buckets {
                     let avg = if purify_threshold > 0.0 {
                         let raw = storage.average_strategy(i as u32, bucket);
-                        let purified = storage.purified_average_strategy(i as u32, bucket, purify_threshold);
+                        let purified =
+                            storage.purified_average_strategy(i as u32, bucket, purify_threshold);
                         for (r, p) in raw.iter().zip(purified.iter()) {
                             total_count += 1;
                             if *r > 0.0 && *p == 0.0 {
@@ -159,8 +160,7 @@ impl BlueprintV2Strategy {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let file = std::fs::File::create(path)?;
         let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, self)
-            .map_err(|e| io::Error::other(e.to_string()))
+        bincode::serialize_into(writer, self).map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Deserialize a strategy from a binary file.
@@ -237,11 +237,8 @@ impl BlueprintV2Strategy {
         node_street_indices: Vec<u8>,
         bucket_counts: [u16; 4],
     ) -> Self {
-        let node_offsets = compute_node_offsets(
-            &node_action_counts,
-            &node_street_indices,
-            bucket_counts,
-        );
+        let node_offsets =
+            compute_node_offsets(&node_action_counts, &node_street_indices, bucket_counts);
         Self {
             action_probs,
             node_action_counts,
@@ -298,8 +295,7 @@ pub fn save_snapshot(
 /// cannot be written.
 pub fn save_config(dir: &Path, config: &BlueprintV2Config) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let yaml =
-        serde_yaml::to_string(config).map_err(|e| io::Error::other(e.to_string()))?;
+    let yaml = serde_yaml::to_string(config).map_err(|e| io::Error::other(e.to_string()))?;
     std::fs::write(dir.join("config.yaml"), yaml)
 }
 
@@ -311,8 +307,7 @@ pub fn save_config(dir: &Path, config: &BlueprintV2Config) -> io::Result<()> {
 /// Returns `Err` if the file cannot be read or contains invalid YAML.
 pub fn load_config(dir: &Path) -> io::Result<BlueprintV2Config> {
     let yaml = std::fs::read_to_string(dir.join("config.yaml"))?;
-    serde_yaml::from_str(&yaml)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_yaml::from_str(&yaml).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
@@ -345,10 +340,7 @@ mod tests {
 
         // Fresh storage produces uniform distributions: all probs in [0, 1].
         for &p in &strategy.action_probs {
-            assert!(
-                (0.0..=1.0).contains(&p),
-                "invalid probability: {p}"
-            );
+            assert!((0.0..=1.0).contains(&p), "invalid probability: {p}");
         }
     }
 
@@ -367,11 +359,7 @@ mod tests {
         assert_eq!(loaded.node_action_counts, strategy.node_action_counts);
         assert_eq!(loaded.bucket_counts, strategy.bucket_counts);
 
-        for (a, b) in strategy
-            .action_probs
-            .iter()
-            .zip(loaded.action_probs.iter())
-        {
+        for (a, b) in strategy.action_probs.iter().zip(loaded.action_probs.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
     }
@@ -386,8 +374,7 @@ mod tests {
         let snapshot_dir = dir.path().join("snapshot_0000");
 
         let metadata = r#"{"iteration": 100, "elapsed_minutes": 5}"#;
-        save_snapshot(&snapshot_dir, &strategy, &storage, metadata)
-            .expect("save snapshot");
+        save_snapshot(&snapshot_dir, &strategy, &storage, metadata).expect("save snapshot");
 
         assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
@@ -409,10 +396,30 @@ mod tests {
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 50, delta_bins: None, expected_delta: false, sample_boards: None },
-                flop: StreetClusterConfig { buckets: 50, delta_bins: None, expected_delta: false, sample_boards: None },
-                turn: StreetClusterConfig { buckets: 50, delta_bins: None, expected_delta: false, sample_boards: None },
-                river: StreetClusterConfig { buckets: 50, delta_bins: None, expected_delta: false, sample_boards: None },
+                preflop: StreetClusterConfig {
+                    buckets: 50,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                flop: StreetClusterConfig {
+                    buckets: 50,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                turn: StreetClusterConfig {
+                    buckets: 50,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                river: StreetClusterConfig {
+                    buckets: 50,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
                 seed: 42,
                 kmeans_iterations: 50,
                 cfvnet_river_data: None,
@@ -450,9 +457,9 @@ mod tests {
                 use_baselines: false,
                 baseline_alpha: 0.01,
                 prune_streets: None,
-            regret_floor: None,
-            exploitability_interval_minutes: 0,
-            exploitability_samples: 100_000,
+                regret_floor: None,
+                exploitability_interval_minutes: 0,
+                exploitability_samples: 100_000,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 60,
@@ -466,9 +473,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         save_config(dir.path(), &config).expect("save config");
         let loaded = load_config(dir.path()).expect("load config");
-        assert!(
-            (loaded.game.stack_depth - 20.0).abs() < f64::EPSILON
-        );
+        assert!((loaded.game.stack_depth - 20.0).abs() < f64::EPSILON);
         assert_eq!(loaded.clustering.river.buckets, 50);
     }
 }

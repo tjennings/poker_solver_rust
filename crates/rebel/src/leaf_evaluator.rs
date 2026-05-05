@@ -64,8 +64,21 @@ pub fn build_boundary_input(
 ) -> Vec<f32> {
     // If the board has exactly 5 cards, delegate to the existing build_input.
     if board_u8.len() == 5 {
-        let board_arr: [u8; 5] = [board_u8[0], board_u8[1], board_u8[2], board_u8[3], board_u8[4]];
-        return build_input(oop_1326, ip_1326, &board_arr, pot, effective_stack, traverser);
+        let board_arr: [u8; 5] = [
+            board_u8[0],
+            board_u8[1],
+            board_u8[2],
+            board_u8[3],
+            board_u8[4],
+        ];
+        return build_input(
+            oop_1326,
+            ip_1326,
+            &board_arr,
+            pot,
+            effective_stack,
+            traverser,
+        );
     }
 
     let mut input = Vec::with_capacity(INPUT_SIZE);
@@ -142,8 +155,14 @@ where
         }
 
         // Build input vector.
-        let input_vec =
-            build_boundary_input(&oop_1326, &ip_1326, &board_u8, pot, effective_stack, traverser);
+        let input_vec = build_boundary_input(
+            &oop_1326,
+            &ip_1326,
+            &board_u8,
+            pot,
+            effective_stack,
+            traverser,
+        );
 
         // Forward pass.
         let model = self.model.lock().unwrap();
@@ -290,13 +309,16 @@ mod tests {
         let ip_1326 = [0.0_f32; OUTPUT_SIZE];
         // Flop (3 cards)
         let input = build_boundary_input(&oop_1326, &ip_1326, &[0, 5, 10], 100.0, 200.0, 0);
-        assert_eq!(input.len(), INPUT_SIZE, "input must be exactly 2720 elements");
+        assert_eq!(
+            input.len(),
+            INPUT_SIZE,
+            "input must be exactly 2720 elements"
+        );
         // Turn (4 cards)
         let input = build_boundary_input(&oop_1326, &ip_1326, &[0, 5, 10, 16], 100.0, 200.0, 0);
         assert_eq!(input.len(), INPUT_SIZE);
         // River (5 cards)
-        let input =
-            build_boundary_input(&oop_1326, &ip_1326, &[0, 5, 10, 16, 20], 100.0, 200.0, 0);
+        let input = build_boundary_input(&oop_1326, &ip_1326, &[0, 5, 10, 16, 20], 100.0, 200.0, 0);
         assert_eq!(input.len(), INPUT_SIZE);
     }
 
@@ -341,10 +363,7 @@ mod tests {
             (input[2652 + 10] - 1.0).abs() < 1e-6,
             "card 10 should be 1.0"
         );
-        assert!(
-            input[2652 + 1].abs() < 1e-6,
-            "non-board card should be 0.0"
-        );
+        assert!(input[2652 + 1].abs() < 1e-6, "non-board card should be 0.0");
         assert!(
             input[2652 + 51].abs() < 1e-6,
             "non-board card should be 0.0"
@@ -364,10 +383,7 @@ mod tests {
             (input[2704 + 2] - 1.0).abs() < 1e-6,
             "rank 2 should be present"
         );
-        assert!(
-            input[2704 + 3].abs() < 1e-6,
-            "rank 3 should not be present"
-        );
+        assert!(input[2704 + 3].abs() < 1e-6, "rank 3 should not be present");
         assert!(
             input[2704 + 12].abs() < 1e-6,
             "rank 12 should not be present"
@@ -494,10 +510,8 @@ mod tests {
         let oop_range = vec![1.0 / n as f64; n];
         let ip_range = vec![1.0 / n as f64; n];
 
-        let oop_result =
-            evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
-        let ip_result =
-            evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 1);
+        let oop_result = evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 0);
+        let ip_result = evaluator.evaluate(combos, &board, 100.0, 200.0, &oop_range, &ip_range, 1);
 
         assert_eq!(oop_result.len(), n);
         assert_eq!(ip_result.len(), n);
@@ -526,7 +540,11 @@ mod tests {
         let oop_range = vec![1.0 / n as f64; n];
         let ip_range = vec![1.0 / n as f64; n];
 
-        let requests = vec![(100.0, 200.0, 0u8), (150.0, 175.0, 1u8), (200.0, 100.0, 0u8)];
+        let requests = vec![
+            (100.0, 200.0, 0u8),
+            (150.0, 175.0, 1u8),
+            (200.0, 100.0, 0u8),
+        ];
 
         let results =
             evaluator.evaluate_boundaries(combos, &board, &oop_range, &ip_range, &requests);
@@ -551,10 +569,7 @@ mod tests {
     fn test_evaluate_boundaries_matches_individual() {
         let device: <TestBackend as Backend>::Device = Default::default();
         let model = CfvNet::<TestBackend>::new(&device, 1, 8, INPUT_SIZE);
-        let evaluator = RebelLeafEvaluator::from_shared(
-            Arc::new(Mutex::new(model)),
-            device,
-        );
+        let evaluator = RebelLeafEvaluator::from_shared(Arc::new(Mutex::new(model)), device);
 
         let board = test_turn_board();
         let hands = SubgameHands::enumerate(&board);
@@ -571,8 +586,9 @@ mod tests {
 
         // Individual evaluations.
         for (req_idx, &(pot, eff_stack, traverser)) in requests.iter().enumerate() {
-            let individual =
-                evaluator.evaluate(combos, &board, pot, eff_stack, &oop_range, &ip_range, traverser);
+            let individual = evaluator.evaluate(
+                combos, &board, pot, eff_stack, &oop_range, &ip_range, traverser,
+            );
 
             for (i, (batch_v, ind_v)) in batch_results[req_idx]
                 .iter()

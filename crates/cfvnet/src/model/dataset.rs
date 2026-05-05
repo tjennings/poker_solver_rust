@@ -2,17 +2,17 @@ use std::io::BufReader;
 use std::path::Path;
 
 use crate::datagen::sampler::Situation;
-use crate::datagen::storage::{read_record, TrainingRecord};
+use crate::datagen::storage::{TrainingRecord, read_record};
 use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_RANKS};
 
 /// A single training item with encoded input, target CFVs, mask, range, and game value.
 #[derive(Debug, Clone)]
 pub struct CfvItem {
-    pub input: Vec<f32>,      // length INPUT_SIZE (2720)
-    pub target: Vec<f32>,     // length OUTPUT_SIZE (1326) — target CFVs
-    pub mask: Vec<f32>,       // length OUTPUT_SIZE — 1.0 valid, 0.0 masked
-    pub range: Vec<f32>,      // length OUTPUT_SIZE — player's range for aux loss
-    pub game_value: f32,      // scalar game value for aux loss
+    pub input: Vec<f32>,  // length INPUT_SIZE (2720)
+    pub target: Vec<f32>, // length OUTPUT_SIZE (1326) — target CFVs
+    pub mask: Vec<f32>,   // length OUTPUT_SIZE — 1.0 valid, 0.0 masked
+    pub range: Vec<f32>,  // length OUTPUT_SIZE — player's range for aux loss
+    pub game_value: f32,  // scalar game value for aux loss
 }
 
 /// Dataset that loads binary training records from disk.
@@ -178,7 +178,9 @@ pub(crate) fn encode_record(rec: &TrainingRecord) -> CfvItem {
 
     let target = rec.cfvs.to_vec();
 
-    let mask: Vec<f32> = rec.valid_mask.iter()
+    let mask: Vec<f32> = rec
+        .valid_mask
+        .iter()
         .map(|&v| if v != 0 { 1.0 } else { 0.0 })
         .collect();
 
@@ -275,19 +277,40 @@ mod tests {
         // Card 8 should be 1.0 at index 2652+8
         assert!((item.input[2652 + 8] - 1.0).abs() < 1e-6, "card 8 one-hot");
         // Card 12 should be 1.0 at index 2652+12
-        assert!((item.input[2652 + 12] - 1.0).abs() < 1e-6, "card 12 one-hot");
+        assert!(
+            (item.input[2652 + 12] - 1.0).abs() < 1e-6,
+            "card 12 one-hot"
+        );
         // Card 16 should be 1.0 at index 2652+16
-        assert!((item.input[2652 + 16] - 1.0).abs() < 1e-6, "card 16 one-hot");
+        assert!(
+            (item.input[2652 + 16] - 1.0).abs() < 1e-6,
+            "card 16 one-hot"
+        );
         // A non-board card should be 0.0
-        assert!((item.input[2652 + 1]).abs() < 1e-6, "non-board card should be 0");
+        assert!(
+            (item.input[2652 + 1]).abs() < 1e-6,
+            "non-board card should be 0"
+        );
         // Rank presence vector starts at 2652 + 52 = 2704
         // Board cards are 0, 4, 8, 12, 16 → ranks 0/4=0, 4/4=1, 8/4=2, 12/4=3, 16/4=4
         let rp_start = 2652 + 52; // 2704
         assert!((item.input[rp_start] - 1.0).abs() < 1e-6, "rank 0 present");
-        assert!((item.input[rp_start + 1] - 1.0).abs() < 1e-6, "rank 1 present");
-        assert!((item.input[rp_start + 2] - 1.0).abs() < 1e-6, "rank 2 present");
-        assert!((item.input[rp_start + 3] - 1.0).abs() < 1e-6, "rank 3 present");
-        assert!((item.input[rp_start + 4] - 1.0).abs() < 1e-6, "rank 4 present");
+        assert!(
+            (item.input[rp_start + 1] - 1.0).abs() < 1e-6,
+            "rank 1 present"
+        );
+        assert!(
+            (item.input[rp_start + 2] - 1.0).abs() < 1e-6,
+            "rank 2 present"
+        );
+        assert!(
+            (item.input[rp_start + 3] - 1.0).abs() < 1e-6,
+            "rank 3 present"
+        );
+        assert!(
+            (item.input[rp_start + 4] - 1.0).abs() < 1e-6,
+            "rank 4 present"
+        );
         assert!((item.input[rp_start + 5]).abs() < 1e-6, "rank 5 absent");
         assert!((item.input[rp_start + 12]).abs() < 1e-6, "rank 12 absent");
         // Pot at POT_INDEX = 2717: 100 / 400 = 0.25
@@ -315,8 +338,14 @@ mod tests {
         assert!((item.input[2652] - 1.0).abs() < 1e-6, "card 0 one-hot");
         assert!((item.input[2652 + 4] - 1.0).abs() < 1e-6, "card 4 one-hot");
         assert!((item.input[2652 + 8] - 1.0).abs() < 1e-6, "card 8 one-hot");
-        assert!((item.input[2652 + 12] - 1.0).abs() < 1e-6, "card 12 one-hot");
-        assert!((item.input[2652 + 16] - 1.0).abs() < 1e-6, "card 16 one-hot");
+        assert!(
+            (item.input[2652 + 12] - 1.0).abs() < 1e-6,
+            "card 12 one-hot"
+        );
+        assert!(
+            (item.input[2652 + 16] - 1.0).abs() < 1e-6,
+            "card 16 one-hot"
+        );
         // Pot at POT_INDEX = 2717
         assert!((item.input[POT_INDEX] - 0.25).abs() < 1e-6);
     }

@@ -14,15 +14,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use burn::backend::{wgpu::Wgpu, Autodiff, NdArray};
+use burn::backend::{Autodiff, NdArray, wgpu::Wgpu};
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
 
 use cfvnet::model::network::{CfvNet, INPUT_SIZE};
-use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
-use poker_solver_core::blueprint_v2::Street;
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 
 use crate::config::RebelConfig;
 use crate::data_buffer::DiskBuffer;
@@ -245,8 +245,7 @@ impl OfflineSeeder {
         }
 
         // Clean up temp file.
-        let temp_path =
-            PathBuf::from(&self.config.output_dir).join(format!("temp_{street:?}.bin"));
+        let temp_path = PathBuf::from(&self.config.output_dir).join(format!("temp_{street:?}.bin"));
         let _ = std::fs::remove_file(temp_path);
 
         let pbs_for_street = street_records;
@@ -284,21 +283,16 @@ impl OfflineSeeder {
             // When we receive a type-erased &dyn LeafEvaluator, we cannot prove
             // Sync at compile time. So we use a wrapper for the non-river case.
             let solved = if street == Street::River {
-                solve_buffer_records(
-                    buffer,
-                    &solve_config,
-                    None,
-                    self.config.seed.threads,
-                )
+                solve_buffer_records(buffer, &solve_config, None, self.config.seed.threads)
             } else {
                 // The evaluator is created from RebelLeafEvaluator<NdArray> which is
                 // Send+Sync, but type-erased to Box<dyn LeafEvaluator>. We need to
                 // solve single-threaded or wrap for sync access.
                 // Use a SyncEvaluatorWrapper to make the &dyn LeafEvaluator usable
                 // in the parallel solver.
-                let sync_eval = SyncEvaluatorWrapper(evaluator.expect(
-                    "non-river street requires an evaluator",
-                ));
+                let sync_eval = SyncEvaluatorWrapper(
+                    evaluator.expect("non-river street requires an evaluator"),
+                );
                 solve_buffer_records(
                     buffer,
                     &solve_config,
@@ -330,11 +324,7 @@ impl OfflineSeeder {
     /// Train (or retrain) the value net on all accumulated training data.
     ///
     /// Uses the NdArray (CPU) backend. Returns the final training loss.
-    fn train_model(
-        &self,
-        data_path: &Path,
-        output_dir: &Path,
-    ) -> Result<f32, String> {
+    fn train_model(&self, data_path: &Path, output_dir: &Path) -> Result<f32, String> {
         let train_config = build_train_config(&self.config.training);
 
         eprintln!(
@@ -358,7 +348,10 @@ impl OfflineSeeder {
             Some(output_dir),
         );
 
-        eprintln!("Training complete. Final loss: {:.6}", result.final_train_loss);
+        eprintln!(
+            "Training complete. Final loss: {:.6}",
+            result.final_train_loss
+        );
         Ok(result.final_train_loss)
     }
 
@@ -428,7 +421,15 @@ impl poker_solver_core::blueprint_v2::LeafEvaluator for SyncEvaluatorWrapper<'_>
         ip_range: &[f64],
         traverser: u8,
     ) -> Vec<f64> {
-        self.0.evaluate(combos, board, pot, effective_stack, oop_range, ip_range, traverser)
+        self.0.evaluate(
+            combos,
+            board,
+            pot,
+            effective_stack,
+            oop_range,
+            ip_range,
+            traverser,
+        )
     }
 
     fn evaluate_boundaries(
@@ -439,7 +440,8 @@ impl poker_solver_core::blueprint_v2::LeafEvaluator for SyncEvaluatorWrapper<'_>
         ip_range: &[f64],
         requests: &[(f64, f64, u8)],
     ) -> Vec<Vec<f64>> {
-        self.0.evaluate_boundaries(combos, board, oop_range, ip_range, requests)
+        self.0
+            .evaluate_boundaries(combos, board, oop_range, ip_range, requests)
     }
 }
 

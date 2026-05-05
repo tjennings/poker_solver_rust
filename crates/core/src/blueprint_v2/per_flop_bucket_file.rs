@@ -232,10 +232,7 @@ mod tests {
             turn_cards: turn_cards.clone(),
             turn_buckets: vec![0u16; 2 * COMBOS],
             river_cards_per_turn: river_cards_per_turn.clone(),
-            river_buckets_per_turn: vec![
-                vec![0u16; 3 * COMBOS],
-                vec![0u16; 3 * COMBOS],
-            ],
+            river_buckets_per_turn: vec![vec![0u16; 3 * COMBOS], vec![0u16; 3 * COMBOS]],
         };
 
         let mut buf = Vec::new();
@@ -334,13 +331,17 @@ mod tests {
         let mut turn_buckets = vec![0u16; COMBOS];
         for i in 0..COMBOS {
             #[allow(clippy::cast_possible_truncation)]
-            { turn_buckets[i] = (i % 10) as u16; }
+            {
+                turn_buckets[i] = (i % 10) as u16;
+            }
         }
 
         let mut river_buckets = vec![0u16; COMBOS];
         for i in 0..COMBOS {
             #[allow(clippy::cast_possible_truncation)]
-            { river_buckets[i] = (i % 8) as u16; }
+            {
+                river_buckets[i] = (i % 8) as u16;
+            }
         }
 
         let pf = PerFlopBucketFile {

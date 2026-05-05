@@ -705,76 +705,76 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let metrics_for_random = Arc::clone(&metrics);
                     let pool = tui_config.random_scenario.pool.clone();
                     trainer.on_random_scenario = Some(Box::new(move |storage, tree, hand_evs| {
-                            use poker_solver_core::blueprint_v2::game_tree::GameNode;
+                        use poker_solver_core::blueprint_v2::game_tree::GameNode;
                         use rand::seq::IndexedRandom;
-                            let mut rng = rand::rng();
+                        let mut rng = rand::rng();
 
-                            let Some(street_label) = pool.choose(&mut rng) else {
-                                return;
-                            };
-                            let street = match street_label {
-                                blueprint_tui_config::StreetLabel::Preflop => {
-                                    poker_solver_core::blueprint_v2::Street::Preflop
-                                }
-                                blueprint_tui_config::StreetLabel::Flop => {
-                                    poker_solver_core::blueprint_v2::Street::Flop
-                                }
-                                blueprint_tui_config::StreetLabel::Turn => {
-                                    poker_solver_core::blueprint_v2::Street::Turn
-                                }
-                                blueprint_tui_config::StreetLabel::River => {
-                                    poker_solver_core::blueprint_v2::Street::River
-                                }
-                            };
+                        let Some(street_label) = pool.choose(&mut rng) else {
+                            return;
+                        };
+                        let street = match street_label {
+                            blueprint_tui_config::StreetLabel::Preflop => {
+                                poker_solver_core::blueprint_v2::Street::Preflop
+                            }
+                            blueprint_tui_config::StreetLabel::Flop => {
+                                poker_solver_core::blueprint_v2::Street::Flop
+                            }
+                            blueprint_tui_config::StreetLabel::Turn => {
+                                poker_solver_core::blueprint_v2::Street::Turn
+                            }
+                            blueprint_tui_config::StreetLabel::River => {
+                                poker_solver_core::blueprint_v2::Street::River
+                            }
+                        };
 
-                            let candidates =
-                                blueprint_tui_scenarios::decision_nodes_at_street(tree, street);
-                            let Some(&node_idx) = candidates.choose(&mut rng) else {
-                                return;
-                            };
+                        let candidates =
+                            blueprint_tui_scenarios::decision_nodes_at_street(tree, street);
+                        let Some(&node_idx) = candidates.choose(&mut rng) else {
+                            return;
+                        };
 
-                            // Select the correct position's EVs based on the node's player.
-                            let player = match &tree.nodes[node_idx as usize] {
-                                GameNode::Decision { player, .. } => *player as usize,
-                                _ => 0,
-                            };
-                            let node_hand_evs = &hand_evs[player];
+                        // Select the correct position's EVs based on the node's player.
+                        let player = match &tree.nodes[node_idx as usize] {
+                            GameNode::Decision { player, .. } => *player as usize,
+                            _ => 0,
+                        };
+                        let node_hand_evs = &hand_evs[player];
 
                         let board = blueprint_tui_scenarios::random_board(street, &mut rng);
-                            let board_display = if board.is_empty() {
-                                String::new()
-                            } else {
-                                board
-                                    .iter()
-                                    .map(|c| format!("{c}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            };
+                        let board_display = if board.is_empty() {
+                            String::new()
+                        } else {
+                            board
+                                .iter()
+                                .map(|c| format!("{c}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
 
-                            let grid = blueprint_tui_scenarios::extract_strategy_grid(
+                        let grid = blueprint_tui_scenarios::extract_strategy_grid(
                             tree,
                             storage,
                             node_idx,
                             &board,
                             Some(node_hand_evs),
-                            );
+                        );
 
-                            let name = blueprint_tui_scenarios::random_scenario_name(
+                        let name = blueprint_tui_scenarios::random_scenario_name(
                             tree,
                             node_idx,
                             &board_display,
-                            );
+                        );
 
-                            let street_label_str = format!("{street:?}");
+                        let street_label_str = format!("{street:?}");
 
-                            metrics_for_random.update_random_scenario(
+                        metrics_for_random.update_random_scenario(
                             name,
                             node_idx,
                             grid,
                             board_display,
                             street_label_str,
-                            );
-                        }));
+                        );
+                    }));
                 }
 
                 trainer.tui_active = true;
@@ -820,12 +820,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let per_flop_config =
                     poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig {
-                    flop_buckets: bp_config.clustering.flop.buckets,
-                    turn_buckets: pf_cfg.turn_buckets,
-                    river_buckets: pf_cfg.river_buckets,
-                    kmeans_iterations: bp_config.clustering.kmeans_iterations,
-                    seed: bp_config.clustering.seed,
-                };
+                        flop_buckets: bp_config.clustering.flop.buckets,
+                        turn_buckets: pf_cfg.turn_buckets,
+                        river_buckets: pf_cfg.river_buckets,
+                        kmeans_iterations: bp_config.clustering.kmeans_iterations,
+                        seed: bp_config.clustering.seed,
+                    };
 
                 let num_flops = 1755_u64; // canonical flop count
 
@@ -845,11 +845,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let bar_style = ProgressStyle::with_template(
                     "  {msg:>30} {bar:30.white/black} {pos}/{len} ETA {eta}",
                 )
-                    .unwrap()
-                    .progress_chars("##-");
+                .unwrap()
+                .progress_chars("##-");
                 let spinner_style =
                     ProgressStyle::with_template("  {msg:>30} {spinner:.cyan} {elapsed_precise}")
-                    .unwrap();
+                        .unwrap();
                 let thread_bars: Vec<ProgressBar> = (0..thread_count)
                     .map(|_| {
                         let bar = mp.add(ProgressBar::new(100));
@@ -965,8 +965,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ProgressStyle::with_template(
                             "  {msg:>12} {bar:40.white/black} {pos}/{len}",
                         )
-                            .unwrap()
-                            .progress_chars("##-"),
+                        .unwrap()
+                        .progress_chars("##-"),
                     );
 
                     let current_street = std::sync::Mutex::new(String::new());
@@ -1033,10 +1033,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("\nEquity audit ({audit_boards} sample boards per street)...");
                 let audit_reports =
                     poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cluster_dir(
-                    &cluster_dir,
-                    audit_boards,
-                    42,
-                )?;
+                        &cluster_dir,
+                        audit_boards,
+                        42,
+                    )?;
                 for report in &audit_reports {
                     eprintln!("\n{}", report.summary());
                 }
@@ -1050,11 +1050,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let bf = BucketFile::load(&river_path)?;
                     let report =
                         poker_solver_core::blueprint_v2::cluster_diagnostics::audit_cfvnet_buckets(
-                        cfvnet_dir,
-                        &bf,
-                        10,
-                        |p| eprint!("\r  progress: {:.0}%", p * 100.0),
-                    )?;
+                            cfvnet_dir,
+                            &bf,
+                            10,
+                            |p| eprint!("\r  progress: {:.0}%", p * 100.0),
+                        )?;
                     eprintln!("\r                    ");
                     eprintln!("{}", report.summary());
                 }
@@ -1479,26 +1479,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 |mode: &str,
                  model: Option<String>,
                  street: &str|
-                -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
-                match mode {
-                    "exact" => Ok(poker_solver_tauri::StreetBoundaryMode::Exact),
-                    "cfvnet" => {
-                        let path = model.ok_or_else(|| {
+                 -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
+                    match mode {
+                        "exact" => Ok(poker_solver_tauri::StreetBoundaryMode::Exact),
+                        "cfvnet" => {
+                            let path = model.ok_or_else(|| {
                                 format!(
                                     "--{street}-model is required when --{street}-boundary=cfvnet"
                                 )
-                        })?;
-                        Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet { model_path: path })
-                    }
-                    "exact_subtree" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
+                            })?;
+                            Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet { model_path: path })
+                        }
+                        "exact_subtree" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
                         "exact_oracle" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
-                    other => Err(format!(
-                        "invalid --{street}-boundary value '{other}': \
+                        other => Err(format!(
+                            "invalid --{street}-boundary value '{other}': \
                          expected 'exact', 'cfvnet', 'exact_subtree', or 'exact_oracle'"
                         )
                         .into()),
-                }
-            };
+                    }
+                };
             let oracle_boundary_flags = [
                 flop_boundary == "exact_oracle",
                 turn_boundary == "exact_oracle",
@@ -1671,7 +1671,7 @@ fn run_rebel_seed(config_path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let buffer = if buffer_path.exists() {
         let buf =
             rebel::data_buffer::DiskBuffer::open(&buffer_path, rebel_config.buffer.max_records)
-            .map_err(|e| format!("Failed to open buffer: {e}"))?;
+                .map_err(|e| format!("Failed to open buffer: {e}"))?;
         eprintln!(
             "Resuming from existing buffer: {} records at {}",
             buf.len(),
@@ -2023,9 +2023,9 @@ fn run_rebel_eval(
             eprintln!("Generating held-out validation set...");
             let solve_config = rebel::generate::build_solve_config(&rebel_config.seed);
             let val_records = rebel::validation::generate_validation_set(
-                100,  // 100 validation examples
+                100, // 100 validation examples
                 &solve_config,
-                rebel_config.seed.seed + 999999,  // different seed from training
+                rebel_config.seed.seed + 999999, // different seed from training
             );
             eprintln!("Generated {} validation records", val_records.len());
 
@@ -2756,7 +2756,7 @@ mod tests {
             Some("3s"),
             100,
             100,
-            10,  // low iterations for speed
+            10,   // low iterations for speed
             10.0, // high target so it stops fast
             "100%",
             "",

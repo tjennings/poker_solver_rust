@@ -46,7 +46,8 @@ pub fn compute_equity(hole: [Card; 2], board: &[Card]) -> f64 {
 /// Returns a value in [0.0, 1.0].
 #[must_use]
 pub fn compute_matchup_equity(hero: [Card; 2], opponent: [Card; 2], board: &[Card]) -> f64 {
-    let dead: arrayvec::ArrayVec<Card, 9> = board.iter()
+    let dead: arrayvec::ArrayVec<Card, 9> = board
+        .iter()
         .chain(hero.iter())
         .chain(opponent.iter())
         .copied()
@@ -86,7 +87,9 @@ pub fn compute_matchup_equity(hero: [Card; 2], opponent: [Card; 2], board: &[Car
             }
             total += 1;
         }
-        if total == 0 { return 0.5; }
+        if total == 0 {
+            return 0.5;
+        }
         (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total)
     } else {
         // Flop → turn+river: enumerate 2 cards
@@ -106,7 +109,9 @@ pub fn compute_matchup_equity(hero: [Card; 2], opponent: [Card; 2], board: &[Car
                 total += 1;
             }
         }
-        if total == 0 { return 0.5; }
+        if total == 0 {
+            return 0.5;
+        }
         (f64::from(wins) + f64::from(ties) * 0.5) / f64::from(total)
     }
 }
@@ -320,13 +325,13 @@ mod tests {
         // Weakest to strongest
         let hands = [
             [card(Four, Heart), card(Six, Club)],      // high card
-            [card(Three, Heart), card(Five, Club)],     // pair of 3s
-            [card(Nine, Spade), card(Four, Club)],      // pair of 9s
-            [card(King, Heart), card(Four, Club)],      // pair of Ks
-            [card(Seven, Heart), card(Nine, Club)],     // two pair 9s and 7s
-            [card(King, Spade), card(Seven, Diamond)],  // two pair Ks and 7s
-            [card(King, Club), card(Nine, Diamond)],    // two pair Ks and 9s
-            [card(Three, Club), card(Three, Diamond)],  // trips 3s
+            [card(Three, Heart), card(Five, Club)],    // pair of 3s
+            [card(Nine, Spade), card(Four, Club)],     // pair of 9s
+            [card(King, Heart), card(Four, Club)],     // pair of Ks
+            [card(Seven, Heart), card(Nine, Club)],    // two pair 9s and 7s
+            [card(King, Spade), card(Seven, Diamond)], // two pair Ks and 7s
+            [card(King, Club), card(Nine, Diamond)],   // two pair Ks and 9s
+            [card(Three, Club), card(Three, Diamond)], // trips 3s
         ];
 
         let ordinals: Vec<u32> = hands
@@ -356,14 +361,8 @@ mod tests {
             card(Nine, Heart),
             card(Two, Diamond),
         ];
-        let high_card = rank_to_ordinal(rank_hand(
-            [card(Ace, Heart), card(Jack, Club)],
-            &board,
-        ));
-        let low_pair = rank_to_ordinal(rank_hand(
-            [card(Two, Heart), card(Two, Club)],
-            &board,
-        ));
+        let high_card = rank_to_ordinal(rank_hand([card(Ace, Heart), card(Jack, Club)], &board));
+        let low_pair = rank_to_ordinal(rank_hand([card(Two, Heart), card(Two, Club)], &board));
         assert!(high_card < low_pair, "any pair should beat any high card");
     }
 

@@ -13,14 +13,16 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
-use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
-use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
+use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
+use poker_solver_core::blueprint_v2::game_tree::{
+    GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
+};
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::game_tree::{GameNode as V2GameNode, GameTree as V2GameTree, TreeAction};
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::hand_class::classify;
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value};
@@ -278,9 +280,9 @@ impl Default for ExplorationPosition {
         Self {
             board: vec![],
             history: vec![],
-            pot: 3,        // SB + BB posted (internal units)
+            pot: 3,                 // SB + BB posted (internal units)
             stacks: vec![199, 198], // 100BB default: SB posted 1, BB posted 2
-            to_act: 0,    // SB acts first preflop
+            to_act: 0,              // SB acts first preflop
             num_players: 2,
             active_players: vec![true, true],
         }
@@ -354,78 +356,76 @@ pub async fn load_blueprint_v2_core(
     snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
-    let (config, strategy, cbv_table, snapshot_name, strat_dir) = tokio::task::spawn_blocking(move || {
-        let cfg = v2_bundle::load_config(&dir)
-            .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
+    let (config, strategy, cbv_table, snapshot_name, strat_dir) =
+        tokio::task::spawn_blocking(move || {
+            let cfg = v2_bundle::load_config(&dir)
+                .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
-        // Determine strategy path. If a specific snapshot is requested, use it.
-        // Otherwise: final/ -> root -> latest snapshot.
-        let strat_path = if let Some(ref snap_name) = snapshot {
-            let snap_dir = dir.join(snap_name);
-            if !snap_dir.join("strategy.bin").exists() {
-                return Err(format!("No strategy.bin in {snap_name}"));
-            }
-            snap_dir.join("strategy.bin")
-        } else if dir.join("final/strategy.bin").exists() {
-            dir.join("final/strategy.bin")
-        } else if dir.join("strategy.bin").exists() {
-            dir.join("strategy.bin")
-        } else {
-            // Auto-detect latest snapshot.
-            let mut snapshots: Vec<_> = std::fs::read_dir(&dir)
-                .map_err(|e| format!("Cannot read directory: {e}"))?
-                .filter_map(Result::ok)
-                .filter(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with("snapshot_"))
-                })
-                .collect();
-            snapshots.sort_by_key(|e| e.file_name());
-            match snapshots.last() {
-                Some(entry) => entry.path().join("strategy.bin"),
-                None => {
-                    return Err(
-                        "No strategy.bin found in bundle directory".to_string()
-                    )
+            // Determine strategy path. If a specific snapshot is requested, use it.
+            // Otherwise: final/ -> root -> latest snapshot.
+            let strat_path = if let Some(ref snap_name) = snapshot {
+                let snap_dir = dir.join(snap_name);
+                if !snap_dir.join("strategy.bin").exists() {
+                    return Err(format!("No strategy.bin in {snap_name}"));
                 }
-            }
-        };
+                snap_dir.join("strategy.bin")
+            } else if dir.join("final/strategy.bin").exists() {
+                dir.join("final/strategy.bin")
+            } else if dir.join("strategy.bin").exists() {
+                dir.join("strategy.bin")
+            } else {
+                // Auto-detect latest snapshot.
+                let mut snapshots: Vec<_> = std::fs::read_dir(&dir)
+                    .map_err(|e| format!("Cannot read directory: {e}"))?
+                    .filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("snapshot_"))
+                    })
+                    .collect();
+                snapshots.sort_by_key(|e| e.file_name());
+                match snapshots.last() {
+                    Some(entry) => entry.path().join("strategy.bin"),
+                    None => return Err("No strategy.bin found in bundle directory".to_string()),
+                }
+            };
 
-        let strat = BlueprintV2Strategy::load(&strat_path)
-            .map_err(|e| format!("Failed to load strategy.bin: {e}"))?;
+            let strat = BlueprintV2Strategy::load(&strat_path)
+                .map_err(|e| format!("Failed to load strategy.bin: {e}"))?;
 
-        // Load CBV table (player 0) if present. Search the same directory as
-        // strategy.bin, then the bundle root, then the latest snapshot.
-        let strat_dir = strat_path.parent().unwrap_or(&dir);
-        let cbv_dir = if strat_dir.join("cbv_p0.bin").exists() {
-            strat_dir.to_path_buf()
-        } else if dir.join("cbv_p0.bin").exists() {
-            dir.clone()
-        } else {
-            dir.clone() // fallback; will check existence below
-        };
+            // Load CBV table (player 0) if present. Search the same directory as
+            // strategy.bin, then the bundle root, then the latest snapshot.
+            let strat_dir = strat_path.parent().unwrap_or(&dir);
+            let cbv_dir = if strat_dir.join("cbv_p0.bin").exists() {
+                strat_dir.to_path_buf()
+            } else if dir.join("cbv_p0.bin").exists() {
+                dir.clone()
+            } else {
+                dir.clone() // fallback; will check existence below
+            };
 
-        let cbv_table = if cbv_dir.join("cbv_p0.bin").exists() {
-            let p0 = CbvTable::load(&cbv_dir.join("cbv_p0.bin"))
-                .map_err(|e| format!("Failed to load cbv_p0.bin: {e}"))?;
-            Some(p0)
-        } else {
-            None
-        };
+            let cbv_table = if cbv_dir.join("cbv_p0.bin").exists() {
+                let p0 = CbvTable::load(&cbv_dir.join("cbv_p0.bin"))
+                    .map_err(|e| format!("Failed to load cbv_p0.bin: {e}"))?;
+                Some(p0)
+            } else {
+                None
+            };
 
-        // Extract snapshot name from strategy path (e.g. "snapshot_1234")
-        let snapshot_name = strat_path.parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .filter(|n| n.starts_with("snapshot_"))
-            .map(String::from);
+            // Extract snapshot name from strategy path (e.g. "snapshot_1234")
+            let snapshot_name = strat_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .filter(|n| n.starts_with("snapshot_"))
+                .map(String::from);
 
-        let strat_dir_owned = strat_dir.to_path_buf();
-        Ok::<_, String>((cfg, strat, cbv_table, snapshot_name, strat_dir_owned))
-    })
-    .await
-    .map_err(|e| format!("Load task panicked: {e}"))??;
+            let strat_dir_owned = strat_dir.to_path_buf();
+            Ok::<_, String>((cfg, strat, cbv_table, snapshot_name, strat_dir_owned))
+        })
+        .await
+        .map_err(|e| format!("Load task panicked: {e}"))??;
 
     let aa = &config.action_abstraction;
     let tree = V2GameTree::build_with_options(
@@ -475,19 +475,28 @@ pub async fn load_blueprint_v2_core(
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 let mut snapshots: Vec<_> = entries
                     .filter_map(Result::ok)
-                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("snapshot_")))
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with("snapshot_"))
+                    })
                     .collect();
                 snapshots.sort_by_key(|e| e.file_name());
                 if let Some(last) = snapshots.last() {
                     let path = last.path().join("hand_ev.bin");
-                    if path.exists() { found = Some(path); }
+                    if path.exists() {
+                        found = Some(path);
+                    }
                 }
             }
         }
         if let Some(path) = found {
             match load_hand_ev_bin(&path, decision_nodes) {
                 Ok(evs) => {
-                    eprintln!("[explorer] loaded hand_ev.bin ({} decision nodes)", evs.len());
+                    eprintln!(
+                        "[explorer] loaded hand_ev.bin ({} decision nodes)",
+                        evs.len()
+                    );
                     Some(evs)
                 }
                 Err(e) => {
@@ -512,7 +521,9 @@ pub async fn load_blueprint_v2_core(
             // point to a snapshot subdir, so walk up to find config.yaml.
             let mut d = PathBuf::from(&dir_path);
             while !d.join("config.yaml").exists() {
-                if !d.pop() { break; }
+                if !d.pop() {
+                    break;
+                }
             }
             d
         },
@@ -571,7 +582,10 @@ pub fn populate_cbv_context(
     // For distribution, symlink or copy the cluster output into the bundle root.
     let cluster_dir = if bundle_dir.join("buckets").exists() {
         bundle_dir.join("buckets")
-    } else if bundle_dir.parent().is_some_and(|p| p.join("buckets").exists()) {
+    } else if bundle_dir
+        .parent()
+        .is_some_and(|p| p.join("buckets").exists())
+    {
         bundle_dir.parent().unwrap().join("buckets")
     } else {
         eprintln!(
@@ -640,8 +654,8 @@ pub fn populate_cbv_context(
 /// Returns a sorted list of discovered blueprints with metadata.
 pub fn list_blueprints_core(dir: String) -> Result<Vec<BlueprintListEntry>, String> {
     let base = PathBuf::from(&dir);
-    let entries = std::fs::read_dir(&base)
-        .map_err(|e| format!("Failed to read directory {dir}: {e}"))?;
+    let entries =
+        std::fs::read_dir(&base).map_err(|e| format!("Failed to read directory {dir}: {e}"))?;
 
     let mut blueprints = Vec::new();
 
@@ -702,19 +716,21 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
             .unwrap_or(false);
 
     // Find the latest snapshot directory name.
-    let latest_snapshot = std::fs::read_dir(dir)
-        .ok()
-        .and_then(|rd| {
-            let mut snaps: Vec<String> = rd
-                .filter_map(Result::ok)
-                .filter_map(|e| {
-                    let n = e.file_name().to_str()?.to_string();
-                    if n.starts_with("snapshot_") { Some(n) } else { None }
-                })
-                .collect();
-            snaps.sort();
-            snaps.pop()
-        });
+    let latest_snapshot = std::fs::read_dir(dir).ok().and_then(|rd| {
+        let mut snaps: Vec<String> = rd
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let n = e.file_name().to_str()?.to_string();
+                if n.starts_with("snapshot_") {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        snaps.sort();
+        snaps.pop()
+    });
 
     Some(BlueprintListEntry {
         name,
@@ -748,14 +764,17 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
             let has_strategy = snap_dir.join("strategy.bin").exists();
 
             // Try to read metadata.json for iteration count and elapsed time.
-            let (iterations, elapsed_minutes) = std::fs::read_to_string(snap_dir.join("metadata.json"))
-                .ok()
-                .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
-                .map(|json| (
-                    json.get("iteration").and_then(|v| v.as_u64()),
-                    json.get("elapsed_minutes").and_then(|v| v.as_u64()),
-                ))
-                .unwrap_or((None, None));
+            let (iterations, elapsed_minutes) =
+                std::fs::read_to_string(snap_dir.join("metadata.json"))
+                    .ok()
+                    .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+                    .map(|json| {
+                        (
+                            json.get("iteration").and_then(|v| v.as_u64()),
+                            json.get("elapsed_minutes").and_then(|v| v.as_u64()),
+                        )
+                    })
+                    .unwrap_or((None, None));
 
             Some(SnapshotEntry {
                 name,
@@ -801,8 +820,13 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
         .map(|d| format_depth(d))
         .unwrap_or_else(|| bet_str.clone());
 
-    let add_allin =
-        |s: String| if s.is_empty() { "a".to_string() } else { format!("{s},a") };
+    let add_allin = |s: String| {
+        if s.is_empty() {
+            "a".to_string()
+        } else {
+            format!("{s},a")
+        }
+    };
 
     (add_allin(bet_str), add_allin(raise_str))
 }
@@ -836,10 +860,16 @@ pub fn get_strategy_matrix_core(
             ..
         } => {
             let cbv_guard = postflop_state.map(|ps| ps.cbv_context.read());
-            let cbv_ref = cbv_guard
-                .as_ref()
-                .and_then(|g| g.as_deref());
-            get_strategy_matrix_v2(config, strategy, tree, decision_map, &position, cbv_ref, hand_evs.as_deref())
+            let cbv_ref = cbv_guard.as_ref().and_then(|g| g.as_deref());
+            get_strategy_matrix_v2(
+                config,
+                strategy,
+                tree,
+                decision_map,
+                &position,
+                cbv_ref,
+                hand_evs.as_deref(),
+            )
         }
     }
 }
@@ -853,7 +883,13 @@ pub fn get_strategy_matrix(
     threshold: Option<f32>,
     street_histories: Option<Vec<Vec<String>>>,
 ) -> Result<StrategyMatrix, String> {
-    get_strategy_matrix_core(&state, position, threshold, street_histories, Some(&postflop_state))
+    get_strategy_matrix_core(
+        &state,
+        position,
+        threshold,
+        street_histories,
+        Some(&postflop_state),
+    )
 }
 
 fn get_strategy_matrix_agent(
@@ -939,10 +975,7 @@ struct V2WalkState {
 ///
 /// Action strings: `"f"` fold, `"c"` call/check, `"r:{idx}"` raise by
 /// action index, `"r:A"` all-in.
-fn walk_v2_tree(
-    tree: &V2GameTree,
-    history: &[String],
-) -> Result<V2WalkState, String> {
+fn walk_v2_tree(tree: &V2GameTree, history: &[String]) -> Result<V2WalkState, String> {
     let mut node_idx = tree.root;
 
     for action_str in history {
@@ -973,13 +1006,12 @@ fn walk_v2_tree(
             }
         };
 
-        let child_pos = find_v2_action_position(action_str, actions)
-            .ok_or_else(|| {
-                format!(
-                    "Action '{action_str}' not available at node {node_idx}. \
+        let child_pos = find_v2_action_position(action_str, actions).ok_or_else(|| {
+            format!(
+                "Action '{action_str}' not available at node {node_idx}. \
                      Available: {actions:?}"
-                )
-            })?;
+            )
+        })?;
 
         node_idx = children[child_pos];
 
@@ -1006,9 +1038,7 @@ fn walk_v2_tree(
 /// For terminal and chance nodes, returns zeros for to_call.
 fn v2_node_state(tree: &V2GameTree, node_idx: u32) -> (u8, f64, [f64; 2], f64) {
     match &tree.nodes[node_idx as usize] {
-        V2GameNode::Decision {
-            player, ..
-        } => {
+        V2GameNode::Decision { player, .. } => {
             // Walk up to find invested amounts from the nearest terminal child
             // or from root state. For simplicity in the explorer, recompute
             // from the tree structure: invested amounts are tracked in terminals.
@@ -1056,11 +1086,7 @@ fn v2_actions_at_node(tree: &V2GameTree, node_idx: u32) -> Vec<ActionInfo> {
 /// street rather than total invested across all streets.
 /// Use `0.0` for preflop where invested starts at the blind.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn v2_action_info(
-    action: &TreeAction,
-    idx: usize,
-    invested_offset: f64,
-) -> ActionInfo {
+pub(crate) fn v2_action_info(action: &TreeAction, idx: usize, invested_offset: f64) -> ActionInfo {
     let id = idx.to_string();
     match action {
         TreeAction::Fold => ActionInfo {
@@ -1142,7 +1168,10 @@ fn get_strategy_matrix_v2(
             }
 
             if let V2GameNode::Decision {
-                player, actions, children, street,
+                player,
+                actions,
+                children,
+                street,
                 ..
             } = &tree.nodes[node_idx as usize]
             {
@@ -1170,12 +1199,12 @@ fn get_strategy_matrix_v2(
                                 } else {
                                     (hand_idx % num_buckets_preflop) as u16
                                 };
-                                let probs =
-                                    strategy.get_action_probs(dec_idx as usize, bucket);
+                                let probs = strategy.get_action_probs(dec_idx as usize, bucket);
                                 let p = probs.get(action_pos).copied().unwrap_or(0.0);
                                 *r *= p;
                             }
-                        } else if let (Some(ctx), Some(board)) = (cbv_context, board_cards.as_ref()) {
+                        } else if let (Some(ctx), Some(board)) = (cbv_context, board_cards.as_ref())
+                        {
                             // Postflop with bucket data: for each canonical hand,
                             // enumerate combos, look up each combo's bucket,
                             // get the action probability, and average.
@@ -1191,8 +1220,11 @@ fn get_strategy_matrix_v2(
                             for (hand_idx, r) in reach.iter_mut().enumerate() {
                                 if let Some(hand) = CanonicalHand::from_index(hand_idx) {
                                     let avg_p = avg_action_prob_for_hand(
-                                        &hand, board_slice, *street,
-                                        &lookup, action_pos,
+                                        &hand,
+                                        board_slice,
+                                        *street,
+                                        &lookup,
+                                        action_pos,
                                     );
                                     *r *= avg_p;
                                 }
@@ -1231,10 +1263,7 @@ fn get_strategy_matrix_v2(
         .unwrap_or(u32::MAX);
 
     if decision_idx == u32::MAX {
-        return Err(format!(
-            "Node {} is not a decision node",
-            walk.node_idx
-        ));
+        return Err(format!("Node {} is not a decision node", walk.node_idx));
     }
 
     // Determine the street from the node (single match).
@@ -1266,12 +1295,16 @@ fn get_strategy_matrix_v2(
             position.board.len(),
         ));
     }
-    let num_buckets = strategy.bucket_counts[
-        strategy.node_street_indices[decision_idx as usize] as usize
-    ] as usize;
+    let num_buckets = strategy.bucket_counts
+        [strategy.node_street_indices[decision_idx as usize] as usize]
+        as usize;
 
     // Reuse board_cards parsed above for postflop bucket lookups.
-    let board = if !is_preflop { board_cards.as_ref() } else { None };
+    let board = if !is_preflop {
+        board_cards.as_ref()
+    } else {
+        None
+    };
 
     let ranks = RANKS;
     let mut cells = Vec::with_capacity(13);
@@ -1307,10 +1340,7 @@ fn get_strategy_matrix_v2(
                     strategy: &ctx.strategy,
                     decision_idx: decision_idx as usize,
                 };
-                postflop_cell_probs(
-                    rank1, rank2, suited, board, street_enum,
-                    &lookup, &actions,
-                )
+                postflop_cell_probs(rank1, rank2, suited, board, street_enum, &lookup, &actions)
             } else {
                 panic!(
                     "Postflop strategy matrix requested but CbvContext is missing. \
@@ -1363,7 +1393,11 @@ fn get_strategy_matrix_v2(
         actions,
         street: street_name.to_string(),
         pot,
-        stack: if position.to_act == 0 { stack_p1 } else { stack_p2 },
+        stack: if position.to_act == 0 {
+            stack_p1
+        } else {
+            stack_p2
+        },
         to_call,
         stack_p1,
         stack_p2,
@@ -1408,7 +1442,10 @@ pub fn blueprint_propagate_ranges(
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
     let StrategySource::BlueprintV2 {
-        strategy, tree, decision_map, ..
+        strategy,
+        tree,
+        decision_map,
+        ..
     } = source
     else {
         return Err("Blueprint range propagation requires a BlueprintV2 source".to_string());
@@ -1423,22 +1460,24 @@ pub fn blueprint_propagate_ranges(
 
     // Start from current filtered weights (set by preflop explorer).
     let config = postflop.config.read().clone();
-    let mut oop_weights: Vec<f32> = postflop
-        .filtered_oop_weights
-        .read()
-        .clone()
-        .unwrap_or_else(|| {
-            let range: Range = config.oop_range.parse().unwrap_or_default();
-            range.raw_data().to_vec()
-        });
-    let mut ip_weights: Vec<f32> = postflop
-        .filtered_ip_weights
-        .read()
-        .clone()
-        .unwrap_or_else(|| {
-            let range: Range = config.ip_range.parse().unwrap_or_default();
-            range.raw_data().to_vec()
-        });
+    let mut oop_weights: Vec<f32> =
+        postflop
+            .filtered_oop_weights
+            .read()
+            .clone()
+            .unwrap_or_else(|| {
+                let range: Range = config.oop_range.parse().unwrap_or_default();
+                range.raw_data().to_vec()
+            });
+    let mut ip_weights: Vec<f32> =
+        postflop
+            .filtered_ip_weights
+            .read()
+            .clone()
+            .unwrap_or_else(|| {
+                let range: Range = config.ip_range.parse().unwrap_or_default();
+                range.raw_data().to_vec()
+            });
 
     // Walk the abstract tree through the action history.
     let mut node_idx = tree.root;
@@ -1449,9 +1488,13 @@ pub fn blueprint_propagate_ranges(
         }
 
         let (player, street, actions, children) = match &tree.nodes[node_idx as usize] {
-            V2GameNode::Decision { player, street, actions, children, .. } => {
-                (*player, *street, actions, children)
-            }
+            V2GameNode::Decision {
+                player,
+                street,
+                actions,
+                children,
+                ..
+            } => (*player, *street, actions, children),
             _ => break,
         };
 
@@ -1672,9 +1715,11 @@ pub fn get_available_actions_core(
             let walk = walk_v2_tree(tree, &position.history)?;
             Ok(v2_actions_at_node(tree, walk.node_idx))
         }
-        StrategySource::Agent(agent) => {
-            Ok(get_actions_for_position(agent.game.stack_depth, &agent.game.bet_sizes, &position))
-        }
+        StrategySource::Agent(agent) => Ok(get_actions_for_position(
+            agent.game.stack_depth,
+            &agent.game.bet_sizes,
+            &position,
+        )),
     }
 }
 
@@ -1885,7 +1930,10 @@ pub fn canonicalize_board_core(
     state: &ExplorationState,
     cards: Vec<String>,
 ) -> Result<CanonicalizeResult, String> {
-    let parsed: Vec<Card> = cards.iter().map(|s| parse_card(s)).collect::<Result<_, _>>()?;
+    let parsed: Vec<Card> = cards
+        .iter()
+        .map(|s| parse_card(s))
+        .collect::<Result<_, _>>()?;
 
     if parsed.len() == 3 {
         // Flop: establish canonical mapping
@@ -2121,13 +2169,17 @@ fn value_to_char(v: Value) -> char {
 
 /// Load per-node hand EVs from hand_ev.bin (FullTreeEvTracker format).
 /// Returns `Vec<[[f64; 169]; 2]>` indexed by decision node index.
-pub fn load_hand_ev_bin(path: &Path, _expected_nodes: usize) -> Result<Vec<[[f64; 169]; 2]>, String> {
+pub fn load_hand_ev_bin(
+    path: &Path,
+    _expected_nodes: usize,
+) -> Result<Vec<[[f64; 169]; 2]>, String> {
     use std::io::Read;
     let mut f = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| format!("Cannot open: {e}"))?
+        std::fs::File::open(path).map_err(|e| format!("Cannot open: {e}"))?,
     );
     let mut buf4 = [0u8; 4];
-    f.read_exact(&mut buf4).map_err(|e| format!("Read error: {e}"))?;
+    f.read_exact(&mut buf4)
+        .map_err(|e| format!("Read error: {e}"))?;
     let num_nodes = u32::from_le_bytes(buf4) as usize;
 
     let mut result = vec![[[0.0f64; 169]; 2]; num_nodes];
@@ -2135,15 +2187,13 @@ pub fn load_hand_ev_bin(path: &Path, _expected_nodes: usize) -> Result<Vec<[[f64
     for node_idx in 0..num_nodes {
         for player in 0..2 {
             for hand in 0..169 {
-                f.read_exact(&mut buf8).map_err(|e| format!("Read error: {e}"))?;
+                f.read_exact(&mut buf8)
+                    .map_err(|e| format!("Read error: {e}"))?;
                 let sum = i64::from_le_bytes(buf8) as f64 / 1000.0;
-                f.read_exact(&mut buf8).map_err(|e| format!("Read error: {e}"))?;
+                f.read_exact(&mut buf8)
+                    .map_err(|e| format!("Read error: {e}"))?;
                 let count = u64::from_le_bytes(buf8);
-                result[node_idx][player][hand] = if count > 0 {
-                    sum / count as f64
-                } else {
-                    0.0
-                };
+                result[node_idx][player][hand] = if count > 0 { sum / count as f64 } else { 0.0 };
             }
         }
     }
@@ -2219,7 +2269,11 @@ fn get_actions_for_position(
     let mut actions = Vec::new();
     let pos_state = compute_position_state(bet_sizes, position);
     let to_call = pos_state.to_call;
-    let stack = position.stacks.get(position.to_act as usize).copied().unwrap_or(0);
+    let stack = position
+        .stacks
+        .get(position.to_act as usize)
+        .copied()
+        .unwrap_or(0);
 
     // Fold if facing a bet
     if to_call > 0 {
@@ -2259,7 +2313,11 @@ fn get_actions_for_position(
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let size = (f64::from(position.pot) * f64::from(fraction)).round() as u32;
             let capped = size.min(effective_stack);
-            let display_total = if to_call == 0 { capped } else { to_call + capped };
+            let display_total = if to_call == 0 {
+                capped
+            } else {
+                to_call + capped
+            };
 
             actions.push(ActionInfo {
                 id: format!("{action_type}:{idx}"),
@@ -2289,7 +2347,11 @@ fn get_actions_for_position(
 /// Ensures `1.0` → `"1.0"` (not `"1"`).
 fn bet_size_key(fraction: f32) -> String {
     let s = format!("{fraction}");
-    if s.contains('.') { s } else { format!("{fraction:.1}") }
+    if s.contains('.') {
+        s
+    } else {
+        format!("{fraction:.1}")
+    }
 }
 
 /// Replayed position state — pot, stacks, and to-call at the current node.
@@ -2480,7 +2542,11 @@ fn raw_action_freq(freq: &FrequencyMap, action: &ActionInfo, raise_count: usize)
 }
 
 /// Redistribute frequency from removed actions to remaining actions proportionally.
-fn redistribute(probs: &mut [f32], actions: &[ActionInfo], is_removed: impl Fn(&ActionInfo) -> bool) {
+fn redistribute(
+    probs: &mut [f32],
+    actions: &[ActionInfo],
+    is_removed: impl Fn(&ActionInfo) -> bool,
+) {
     let removed_sum: f32 = probs
         .iter()
         .zip(actions.iter())
@@ -2800,9 +2866,7 @@ pub fn get_preflop_ranges_core(
                         ..
                     } => (*player, actions, children),
                     _ => {
-                        return Err(format!(
-                            "Expected decision after chance at node {node_idx}"
-                        ));
+                        return Err(format!("Expected decision after chance at node {node_idx}"));
                     }
                 }
             }
@@ -2864,10 +2928,7 @@ pub fn get_preflop_ranges_core(
     let stack_depth = config.game.stack_depth;
     // Approximate remaining stacks from pot.
     let each_invested = pot / 2.0;
-    let remaining = [
-        stack_depth - each_invested,
-        stack_depth - each_invested,
-    ];
+    let remaining = [stack_depth - each_invested, stack_depth - each_invested];
     let effective_stack = remaining[0].min(remaining[1]);
 
     // Build flop bet size strings from the config.
@@ -2881,10 +2942,14 @@ pub fn get_preflop_ranges_core(
     // Zero out negligible weights (CFR never outputs exact 0, so threshold needed).
     let threshold = 0.005;
     for w in oop_weights.iter_mut() {
-        if *w < threshold { *w = 0.0; }
+        if *w < threshold {
+            *w = 0.0;
+        }
     }
     for w in ip_weights.iter_mut() {
-        if *w < threshold { *w = 0.0; }
+        if *w < threshold {
+            *w = 0.0;
+        }
     }
 
     // Expand 169 → 1326.
@@ -3225,10 +3290,30 @@ mod tests {
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::default(),
-                preflop: StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None },
-                flop: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
-                turn: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
-                river: StreetClusterConfig { buckets: 10, delta_bins: None, expected_delta: false, sample_boards: None },
+                preflop: StreetClusterConfig {
+                    buckets: 169,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                flop: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                turn: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                river: StreetClusterConfig {
+                    buckets: 10,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
                 seed: 42,
                 kmeans_iterations: 10,
                 cfvnet_river_data: None,
@@ -3266,9 +3351,9 @@ mod tests {
                 use_baselines: false,
                 baseline_alpha: 0.01,
                 prune_streets: None,
-            regret_floor: None,
-            exploitability_interval_minutes: 0,
-            exploitability_samples: 100_000,
+                regret_floor: None,
+                exploitability_interval_minutes: 0,
+                exploitability_samples: 100_000,
             },
             snapshots: SnapshotConfig {
                 warmup_minutes: 1,
@@ -3308,7 +3393,11 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         crate::postflop::CbvContext {
-            cbv_table: CbvTable { values: vec![], node_offsets: vec![], buckets_per_node: vec![] },
+            cbv_table: CbvTable {
+                values: vec![],
+                node_offsets: vec![],
+                buckets_per_node: vec![],
+            },
             abstract_tree: tree.clone(),
             all_buckets: Arc::new(all_buckets),
             strategy: Arc::new(cbv_strategy),
@@ -3351,13 +3440,7 @@ mod tests {
 
         let position = ExplorationPosition::default();
         // No bundle loaded, should return an error
-        let result = get_strategy_matrix_core(
-            &state,
-            position,
-            None,
-            None,
-            Some(&postflop_state),
-        );
+        let result = get_strategy_matrix_core(&state, position, None, None, Some(&postflop_state));
         assert!(result.is_err(), "Should fail because no bundle is loaded");
     }
 
@@ -3366,8 +3449,18 @@ mod tests {
         let (strategy, _) = build_minimal_postflop_strategy();
         let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
         let actions = vec![
-            ActionInfo { id: "0".into(), label: "Check".into(), action_type: "check".into(), size_key: None },
-            ActionInfo { id: "1".into(), label: "Bet".into(), action_type: "bet".into(), size_key: None },
+            ActionInfo {
+                id: "0".into(),
+                label: "Check".into(),
+                action_type: "check".into(),
+                size_key: None,
+            },
+            ActionInfo {
+                id: "1".into(),
+                label: "Bet".into(),
+                action_type: "bet".into(),
+                size_key: None,
+            },
         ];
 
         // Board contains all 4 aces — any AA combo is fully blocked
@@ -3384,15 +3477,20 @@ mod tests {
             strategy: &strategy,
             decision_idx: 1, // flop node
         };
-        let probs = postflop_cell_probs(
-            'A', 'A', false, &board, Street::River,
-            &lookup, &actions,
-        );
+        let probs = postflop_cell_probs('A', 'A', false, &board, Street::River, &lookup, &actions);
 
         // All AA combos blocked by board — zero probability (hand impossible)
         assert_eq!(probs.len(), 2);
-        assert!((probs[0].probability).abs() < 0.01, "expected 0.0, got {}", probs[0].probability);
-        assert!((probs[1].probability).abs() < 0.01, "expected 0.0, got {}", probs[1].probability);
+        assert!(
+            (probs[0].probability).abs() < 0.01,
+            "expected 0.0, got {}",
+            probs[0].probability
+        );
+        assert!(
+            (probs[1].probability).abs() < 0.01,
+            "expected 0.0, got {}",
+            probs[1].probability
+        );
     }
 
     #[timed_test]
@@ -3487,12 +3585,14 @@ mod tests {
                 assert!(
                     (p0 - 0.3).abs() < 0.01,
                     "Expected fold=0.3, got {} for hand {}",
-                    p0, cell.hand
+                    p0,
+                    cell.hand
                 );
                 assert!(
                     (p1 - 0.7).abs() < 0.01,
                     "Expected call=0.7, got {} for hand {}",
-                    p1, cell.hand
+                    p1,
+                    cell.hand
                 );
             }
         }
@@ -3518,12 +3618,12 @@ mod tests {
             strategy: &strategy,
             decision_idx: 1,
         };
-        let p = avg_action_prob_for_hand(
-            &hand, &board, Street::River,
-            &lookup, 0,
-        );
+        let p = avg_action_prob_for_hand(&hand, &board, Street::River, &lookup, 0);
 
-        assert!(p.abs() < f32::EPSILON, "Expected 0.0 for fully blocked hand, got {p}");
+        assert!(
+            p.abs() < f32::EPSILON,
+            "Expected 0.0 for fully blocked hand, got {p}"
+        );
     }
 
     #[timed_test]
@@ -3570,8 +3670,18 @@ mod tests {
         let (strategy, _) = build_minimal_postflop_strategy();
         let all_buckets = AllBuckets::new([169, 10, 10, 10], [None, None, None, None]);
         let actions = vec![
-            ActionInfo { id: "0".into(), label: "Check".into(), action_type: "check".into(), size_key: None },
-            ActionInfo { id: "1".into(), label: "Bet".into(), action_type: "bet".into(), size_key: None },
+            ActionInfo {
+                id: "0".into(),
+                label: "Check".into(),
+                action_type: "check".into(),
+                size_key: None,
+            },
+            ActionInfo {
+                id: "1".into(),
+                label: "Bet".into(),
+                action_type: "bet".into(),
+                size_key: None,
+            },
         ];
 
         // Board with 3 cards (flop) -- KsKhKd blocks all KK combos
@@ -3586,10 +3696,7 @@ mod tests {
             strategy: &strategy,
             decision_idx: 1,
         };
-        let probs = postflop_cell_probs(
-            'K', 'K', false, &board, Street::Flop,
-            &lookup, &actions,
-        );
+        let probs = postflop_cell_probs('K', 'K', false, &board, Street::Flop, &lookup, &actions);
 
         // Only 1 KK combo remains (Kc isn't on the board) -- but KK needs 2 kings,
         // and we only have 1 unblocked king. So all KK combos are blocked.
@@ -3598,7 +3705,10 @@ mod tests {
         // X is not on board... but all other Ks are on board. So only if both cards are Kc
         // which is impossible. All 6 combos are blocked.
         assert_eq!(probs.len(), 2);
-        assert!((probs[0].probability).abs() < 0.01, "expected 0.0 for all-blocked KK");
+        assert!(
+            (probs[0].probability).abs() < 0.01,
+            "expected 0.0 for all-blocked KK"
+        );
     }
 
     #[timed_test]
@@ -3620,10 +3730,7 @@ mod tests {
             strategy: &strategy,
             decision_idx: 1,
         };
-        let p = avg_action_prob_for_hand(
-            &hand, &board, Street::Flop,
-            &lookup, 0,
-        );
+        let p = avg_action_prob_for_hand(&hand, &board, Street::Flop, &lookup, 0);
 
         // All AA combos blocked (3 aces on board block all 6 AA combos
         // since each combo needs 2 aces from 4, but 3 are on board)
@@ -3648,9 +3755,7 @@ mod tests {
             decision_idx: 0, // preflop node
         };
 
-        let (sum_probs, count) = bucket_probs_for_hand(
-            &hand, &board, Street::Preflop, &lookup,
-        );
+        let (sum_probs, count) = bucket_probs_for_hand(&hand, &board, Street::Preflop, &lookup);
 
         // KQs has 4 combos, none blocked by empty board
         assert_eq!(count, 4, "Expected 4 unblocked KQs combos");
@@ -3658,7 +3763,10 @@ mod tests {
         assert_eq!(sum_probs.len(), 2, "Expected 2 actions in sum_probs");
         // Average should equal sum / count and be in [0,1]
         let avg = sum_probs[0] / count as f32;
-        assert!(avg >= 0.0 && avg <= 1.0, "Average prob should be in [0,1], got {avg}");
+        assert!(
+            avg >= 0.0 && avg <= 1.0,
+            "Average prob should be in [0,1], got {avg}"
+        );
     }
 
     #[timed_test]
@@ -3682,14 +3790,15 @@ mod tests {
             decision_idx: 1,
         };
 
-        let (sum_probs, count) = bucket_probs_for_hand(
-            &hand, &board, Street::River, &lookup,
-        );
+        let (sum_probs, count) = bucket_probs_for_hand(&hand, &board, Street::River, &lookup);
 
         assert_eq!(count, 0, "All combos should be blocked");
         // sum_probs should be all zeros
         for p in &sum_probs {
-            assert!(p.abs() < f32::EPSILON, "Expected 0.0 in sum_probs when all blocked");
+            assert!(
+                p.abs() < f32::EPSILON,
+                "Expected 0.0 in sum_probs when all blocked"
+            );
         }
     }
 
@@ -3829,11 +3938,7 @@ mod tests {
         std::fs::create_dir(&snap).unwrap();
         std::fs::write(snap.join("strategy.bin"), b"fake").unwrap();
         // metadata.json with only iteration, no elapsed_minutes
-        std::fs::write(
-            snap.join("metadata.json"),
-            r#"{"iteration": 1000}"#,
-        )
-        .unwrap();
+        std::fs::write(snap.join("metadata.json"), r#"{"iteration": 1000}"#).unwrap();
 
         let result = list_snapshots_core(tmp.path().to_string_lossy().to_string()).unwrap();
         assert_eq!(result.len(), 1);
@@ -3893,7 +3998,10 @@ mod tests {
         // Two bets that previously both rounded to "1bb" must produce distinct labels.
         let info_a = v2_action_info(&TreeAction::Bet(2.0), 0, 0.0);
         let info_b = v2_action_info(&TreeAction::Bet(2.64), 1, 0.0);
-        assert_ne!(info_a.label, info_b.label, "distinct bet amounts must have distinct labels");
+        assert_ne!(
+            info_a.label, info_b.label,
+            "distinct bet amounts must have distinct labels"
+        );
     }
 
     #[timed_test]

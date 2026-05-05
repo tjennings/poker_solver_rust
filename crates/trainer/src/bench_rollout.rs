@@ -7,19 +7,17 @@
 //! Does **not** run DCFR — this benchmarks the rollout path only.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
-use poker_solver_core::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use poker_solver_core::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::Street;
-use poker_solver_tauri::postflop::{
-    build_rollout_evaluator, CbvContext, RolloutBenchContext,
-};
+use poker_solver_tauri::postflop::{CbvContext, RolloutBenchContext, build_rollout_evaluator};
 use range_solver::range::Range;
 
 /// Default OOP range for bench/validate scenarios.
@@ -127,11 +125,8 @@ pub(crate) fn find_first_flop_node(tree: &GameTree) -> Option<u32> {
 /// Load a blueprint bundle and construct the `CbvContext` needed for rollout.
 ///
 /// Reuses the loading pattern from `inspect_spot::load_blueprint`.
-pub(crate) fn load_bundle(
-    bundle_dir: &Path,
-) -> Result<(Arc<CbvContext>, GameTree), String> {
-    let config = load_config(bundle_dir)
-        .map_err(|e| format!("Failed to load config.yaml: {e}"))?;
+pub(crate) fn load_bundle(bundle_dir: &Path) -> Result<(Arc<CbvContext>, GameTree), String> {
+    let config = load_config(bundle_dir).map_err(|e| format!("Failed to load config.yaml: {e}"))?;
 
     // Find strategy.bin
     let strat_path = if bundle_dir.join("final/strategy.bin").exists() {
@@ -154,7 +149,7 @@ pub(crate) fn load_bundle(
                 return Err(format!(
                     "No strategy.bin found in '{}'",
                     bundle_dir.display()
-                ))
+                ));
             }
         }
     };
@@ -267,8 +262,14 @@ fn build_bench_scenario(
         .map_err(|e| format!("Bad IP range: {e}"))?;
 
     let mut bench_ctx = build_rollout_evaluator(
-        board_cards, ctx, flop_node, pot_f, starting_stack,
-        Some(Arc::clone(counter)), Some(&oop_range), Some(&ip_range),
+        board_cards,
+        ctx,
+        flop_node,
+        pot_f,
+        starting_stack,
+        Some(Arc::clone(counter)),
+        Some(&oop_range),
+        Some(&ip_range),
     );
     if let Some(depth) = enumerate_depth {
         bench_ctx.evaluator.enumerate_decision_depth = depth;
@@ -304,8 +305,8 @@ pub fn run(
     }
 
     let (ctx, tree) = load_bundle(bundle_dir)?;
-    let flop_node = find_first_flop_node(&tree)
-        .ok_or("No flop decision node found in abstract tree")?;
+    let flop_node =
+        find_first_flop_node(&tree).ok_or("No flop decision node found in abstract tree")?;
     eprintln!("[bench] abstract flop node index: {flop_node}");
 
     let pot_f = f64::from(pot);
@@ -314,8 +315,14 @@ pub fn run(
 
     let counter = Arc::new(AtomicU64::new(0));
     let bench_ctx = build_bench_scenario(
-        &board_cards, &ctx, flop_node, pot_f, starting_stack,
-        &counter, enumerate_depth, opponent_samples,
+        &board_cards,
+        &ctx,
+        flop_node,
+        pot_f,
+        starting_stack,
+        &counter,
+        enumerate_depth,
+        opponent_samples,
     )?;
 
     eprintln!(
@@ -368,7 +375,10 @@ mod tests {
     #[test]
     fn format_result_shows_elapsed_hands_and_rate() {
         let output = format_result(12.5, 50, 125_000, 10_000.0);
-        assert!(output.contains("12.5s elapsed"), "missing elapsed: {output}");
+        assert!(
+            output.contains("12.5s elapsed"),
+            "missing elapsed: {output}"
+        );
         assert!(output.contains("125000 hands"), "missing hands: {output}");
         assert!(output.contains("10000 hands/s"), "missing rate: {output}");
     }
@@ -382,10 +392,7 @@ mod tests {
             output.contains("500.0 ms/call"),
             "missing ms/call: {output}"
         );
-        assert!(
-            output.contains("2.00 calls/s"),
-            "missing calls/s: {output}"
-        );
+        assert!(output.contains("2.00 calls/s"), "missing calls/s: {output}");
     }
 
     #[test]
@@ -421,10 +428,7 @@ mod tests {
             output.contains("2000.0 ms/call"),
             "missing ms/call: {output}"
         );
-        assert!(
-            output.contains("0.50 calls/s"),
-            "missing calls/s: {output}"
-        );
+        assert!(output.contains("0.50 calls/s"), "missing calls/s: {output}");
     }
 
     #[test]
@@ -462,7 +466,9 @@ mod tests {
     #[test]
     fn find_first_flop_node_in_standard_tree() {
         let tree = GameTree::build(
-            100.0, 1.0, 2.0,
+            100.0,
+            1.0,
+            2.0,
             &[vec!["5bb".to_string()]],
             &[vec![0.5]],
             &[vec![0.5]],

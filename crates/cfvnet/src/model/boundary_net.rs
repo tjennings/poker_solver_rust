@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{backend::Backend, Tensor},
+    tensor::{Tensor, backend::Backend},
 };
 
 use super::network::{HiddenBlock, INPUT_SIZE, OUTPUT_SIZE};

@@ -54,7 +54,11 @@ impl PlayerSet {
     #[must_use]
     pub fn all(num_players: u8) -> Self {
         debug_assert!(num_players as usize <= MAX_PLAYERS);
-        if num_players >= 8 { Self(0xFF) } else { Self((1u8 << num_players) - 1) }
+        if num_players >= 8 {
+            Self(0xFF)
+        } else {
+            Self((1u8 << num_players) - 1)
+        }
     }
 
     /// Whether the set contains the given seat.
@@ -455,20 +459,11 @@ mod tests {
         ps.insert(Seat::from_raw(4));
 
         // Next after seat 0 should be seat 2
-        assert_eq!(
-            ps.next_after(Seat::from_raw(0), 6),
-            Some(Seat::from_raw(2))
-        );
+        assert_eq!(ps.next_after(Seat::from_raw(0), 6), Some(Seat::from_raw(2)));
         // Next after seat 2 should be seat 4
-        assert_eq!(
-            ps.next_after(Seat::from_raw(2), 6),
-            Some(Seat::from_raw(4))
-        );
+        assert_eq!(ps.next_after(Seat::from_raw(2), 6), Some(Seat::from_raw(4)));
         // Next after seat 4 should wrap to seat 0
-        assert_eq!(
-            ps.next_after(Seat::from_raw(4), 6),
-            Some(Seat::from_raw(0))
-        );
+        assert_eq!(ps.next_after(Seat::from_raw(4), 6), Some(Seat::from_raw(0)));
     }
 
     #[timed_test]

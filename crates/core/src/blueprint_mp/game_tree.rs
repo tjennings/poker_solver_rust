@@ -5,9 +5,9 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+use super::MAX_PLAYERS;
 use super::config::{ForcedBetKind, MpActionAbstractionConfig, MpGameConfig};
 use super::types::{Chips, PlayerSet, Seat, Street};
-use super::MAX_PLAYERS;
 
 /// Tolerance for comparing bet sizes (in chips).
 const SIZE_EPSILON: f64 = 0.01;
@@ -152,13 +152,19 @@ enum RaiseSizes<'a> {
 }
 
 fn get_depth_or_last<T>(depths: &[Vec<T>], idx: usize) -> &[T] {
-    depths.get(idx).or_else(|| depths.last()).map_or(&[], Vec::as_slice)
+    depths
+        .get(idx)
+        .or_else(|| depths.last())
+        .map_or(&[], Vec::as_slice)
 }
 
 // ── Internal: YAML parsing helpers ──────────────────────────────────
 
 fn parse_preflop_values(values: &[serde_yaml::Value]) -> Vec<PreflopSize> {
-    values.iter().map(|v| PreflopSize::parse(&yaml_to_string(v))).collect()
+    values
+        .iter()
+        .map(|v| PreflopSize::parse(&yaml_to_string(v)))
+        .collect()
 }
 
 fn parse_preflop_raise_depths(depths: &[Vec<serde_yaml::Value>]) -> Vec<Vec<PreflopSize>> {
@@ -228,12 +234,24 @@ impl MpGameTree {
         };
         let root = builder.build_node(&state);
         let nodes = builder.nodes;
-        let decision_count = nodes.iter().filter(|n| matches!(n, MpGameNode::Decision { .. })).count();
-        let chance_count = nodes.iter().filter(|n| matches!(n, MpGameNode::Chance { .. })).count();
-        let terminal_count = nodes.iter().filter(|n| matches!(n, MpGameNode::Terminal { .. })).count();
+        let decision_count = nodes
+            .iter()
+            .filter(|n| matches!(n, MpGameNode::Decision { .. }))
+            .count();
+        let chance_count = nodes
+            .iter()
+            .filter(|n| matches!(n, MpGameNode::Chance { .. }))
+            .count();
+        let terminal_count = nodes
+            .iter()
+            .filter(|n| matches!(n, MpGameNode::Terminal { .. }))
+            .count();
         eprintln!(
             "  MP Tree: {} nodes ({} decision, {} chance, {} terminal)",
-            nodes.len(), decision_count, chance_count, terminal_count,
+            nodes.len(),
+            decision_count,
+            chance_count,
+            terminal_count,
         );
         Self {
             nodes,
@@ -304,11 +322,7 @@ impl BuildState {
     }
 }
 
-fn find_preflop_first_to_act(
-    num_players: u8,
-    bb_seat: u8,
-    straddle_seat: Option<u8>,
-) -> Seat {
+fn find_preflop_first_to_act(num_players: u8, bb_seat: u8, straddle_seat: Option<u8>) -> Seat {
     let after = straddle_seat.unwrap_or(bb_seat);
     let next = (after + 1) % num_players;
     Seat::new(next, num_players)
@@ -369,11 +383,7 @@ fn add_check_or_call(state: &BuildState, actions: &mut Vec<TreeAction>) {
     }
 }
 
-fn add_sized_actions(
-    config: &TreeBuildConfig,
-    state: &BuildState,
-    actions: &mut Vec<TreeAction>,
-) {
+fn add_sized_actions(config: &TreeBuildConfig, state: &BuildState, actions: &mut Vec<TreeAction>) {
     let depth = state.raise_count as usize;
     if depth >= config.max_raise_depths(state.street) {
         return;
@@ -396,7 +406,11 @@ fn add_sized_actions(
         } else {
             depth
         };
-        add_raise_sizes(state, config.raise_sizes_at_depth(state.street, raise_depth), actions);
+        add_raise_sizes(
+            state,
+            config.raise_sizes_at_depth(state.street, raise_depth),
+            actions,
+        );
     }
 }
 
@@ -565,7 +579,11 @@ fn next_active_non_allin(state: &BuildState, after: Seat) -> Option<Seat> {
 }
 
 fn count_active_non_allin(state: &BuildState) -> u8 {
-    state.active.iter().filter(|s| !state.all_in.contains(*s)).count() as u8
+    state
+        .active
+        .iter()
+        .filter(|s| !state.all_in.contains(*s))
+        .count() as u8
 }
 
 fn is_bb_facing_limps(state: &BuildState, seat: Seat) -> bool {
@@ -586,7 +604,11 @@ fn is_round_closed(state: &BuildState) -> bool {
         if !state.acted_since_aggression.contains(seat) {
             return false;
         }
-        if (state.street_bets[seat.index() as usize] - current_max).0.abs() >= SIZE_EPSILON {
+        if (state.street_bets[seat.index() as usize] - current_max)
+            .0
+            .abs()
+            >= SIZE_EPSILON
+        {
             return false;
         }
     }
@@ -638,7 +660,10 @@ impl TreeBuilder<'_> {
 
         let actions = generate_actions(self.config, &state);
         let node_idx = self.push_placeholder();
-        let children: Vec<u32> = actions.iter().map(|a| self.build_child(&state, *a)).collect();
+        let children: Vec<u32> = actions
+            .iter()
+            .map(|a| self.build_child(&state, *a))
+            .collect();
 
         self.nodes[node_idx as usize] = MpGameNode::Decision {
             seat,
@@ -652,7 +677,9 @@ impl TreeBuilder<'_> {
     fn push_placeholder(&mut self) -> u32 {
         let idx = self.nodes.len() as u32;
         self.nodes.push(MpGameNode::Terminal {
-            kind: TerminalKind::Showdown { active: PlayerSet::empty() },
+            kind: TerminalKind::Showdown {
+                active: PlayerSet::empty(),
+            },
             pot: Chips::ZERO,
             contributions: [Chips::ZERO; MAX_PLAYERS],
         });
@@ -748,8 +775,8 @@ impl TreeBuilder<'_> {
         let idx = seat.index() as usize;
         let remaining = state.stacks[idx];
         let raise_to = state.street_bets[idx] + remaining;
-        let is_call_allin = state.facing_bet
-            && raise_to <= max_street_bet(state) + Chips(SIZE_EPSILON);
+        let is_call_allin =
+            state.facing_bet && raise_to <= max_street_bet(state) + Chips(SIZE_EPSILON);
 
         let mut next = state.clone();
         next.stacks[idx] = Chips::ZERO;
@@ -789,12 +816,8 @@ impl TreeBuilder<'_> {
         let should_runout = count_active_non_allin(state) <= 1;
 
         match state.street.next() {
-            Some(next_street) if !should_runout => {
-                self.make_chance_node(state, next_street)
-            }
-            Some(next_street) if should_runout => {
-                self.make_runout_chain(state, next_street)
-            }
+            Some(next_street) if !should_runout => self.make_chance_node(state, next_street),
+            Some(next_street) if should_runout => self.make_runout_chain(state, next_street),
             _ => self.make_terminal_showdown(state),
         }
     }
@@ -832,7 +855,9 @@ impl TreeBuilder<'_> {
     fn make_terminal_showdown(&mut self, state: &BuildState) -> u32 {
         let idx = self.nodes.len() as u32;
         self.nodes.push(MpGameNode::Terminal {
-            kind: TerminalKind::Showdown { active: state.active },
+            kind: TerminalKind::Showdown {
+                active: state.active,
+            },
             pot: state.pot,
             contributions: state.contributions,
         });
@@ -982,7 +1007,10 @@ mod tests {
                 }
             )
         });
-        assert!(has_chance, "Two checks should produce a Chance node to flop");
+        assert!(
+            has_chance,
+            "Two checks should produce a Chance node to flop"
+        );
     }
 
     #[timed_test]
@@ -1035,7 +1063,13 @@ mod tests {
                     .unwrap();
                 let terminal = &tree.nodes[c2[fold_idx2] as usize];
                 assert!(
-                    matches!(terminal, MpGameNode::Terminal { kind: TerminalKind::LastStanding { .. }, .. }),
+                    matches!(
+                        terminal,
+                        MpGameNode::Terminal {
+                            kind: TerminalKind::LastStanding { .. },
+                            ..
+                        }
+                    ),
                     "Two folds in 3-player should be LastStanding terminal"
                 );
             } else {
@@ -1074,7 +1108,13 @@ mod tests {
                     .expect("BB should have Check");
                 let after_check = &tree.nodes[bb_children[check_idx] as usize];
                 assert!(
-                    matches!(after_check, MpGameNode::Chance { next_street: Street::Flop, .. }),
+                    matches!(
+                        after_check,
+                        MpGameNode::Chance {
+                            next_street: Street::Flop,
+                            ..
+                        }
+                    ),
                     "SB call + BB check should advance to flop"
                 );
             } else {
@@ -1341,8 +1381,16 @@ mod tests {
     #[timed_test]
     fn try_add_sized_action_skips_allin_equivalent() {
         let state = BuildState {
-            stacks: [Chips(10.0), Chips(100.0), Chips::ZERO, Chips::ZERO,
-                     Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO],
+            stacks: [
+                Chips(10.0),
+                Chips(100.0),
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+            ],
             street_bets: [Chips::ZERO; MAX_PLAYERS],
             contributions: [Chips::ZERO; MAX_PLAYERS],
             active: PlayerSet::all(2),
@@ -1368,8 +1416,16 @@ mod tests {
     #[timed_test]
     fn try_add_sized_action_adds_valid_size() {
         let state = BuildState {
-            stacks: [Chips(100.0), Chips(100.0), Chips::ZERO, Chips::ZERO,
-                     Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO],
+            stacks: [
+                Chips(100.0),
+                Chips(100.0),
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+            ],
             street_bets: [Chips::ZERO; MAX_PLAYERS],
             contributions: [Chips::ZERO; MAX_PLAYERS],
             active: PlayerSet::all(2),
@@ -1395,8 +1451,16 @@ mod tests {
     #[timed_test]
     fn try_add_sized_action_skips_duplicate() {
         let state = BuildState {
-            stacks: [Chips(100.0), Chips(100.0), Chips::ZERO, Chips::ZERO,
-                     Chips::ZERO, Chips::ZERO, Chips::ZERO, Chips::ZERO],
+            stacks: [
+                Chips(100.0),
+                Chips(100.0),
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+                Chips::ZERO,
+            ],
             street_bets: [Chips::ZERO; MAX_PLAYERS],
             contributions: [Chips::ZERO; MAX_PLAYERS],
             active: PlayerSet::all(2),
@@ -1421,9 +1485,21 @@ mod tests {
     #[timed_test]
     fn straddle_config_builds_tree_without_panic() {
         let blinds = vec![
-            ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-            ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
-            ForcedBet { seat: 2, kind: ForcedBetKind::Straddle, amount: 4.0 },
+            ForcedBet {
+                seat: 0,
+                kind: ForcedBetKind::SmallBlind,
+                amount: 1.0,
+            },
+            ForcedBet {
+                seat: 1,
+                kind: ForcedBetKind::BigBlind,
+                amount: 2.0,
+            },
+            ForcedBet {
+                seat: 2,
+                kind: ForcedBetKind::Straddle,
+                amount: 4.0,
+            },
         ];
         let game = MpGameConfig {
             name: "straddle-test".into(),
@@ -1433,7 +1509,10 @@ mod tests {
             rake_rate: 0.0,
             rake_cap: 0.0,
         };
-        let empty = MpStreetSizes { lead: vec![], raise: vec![] };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
         let action = MpActionAbstractionConfig {
             preflop: empty.clone(),
             flop: empty.clone(),
@@ -1443,7 +1522,11 @@ mod tests {
         let tree = MpGameTree::build(&game, &action);
         // With straddle at seat 2, first to act should be seat 3
         if let MpGameNode::Decision { seat, .. } = &tree.nodes[tree.root as usize] {
-            assert_eq!(seat.index(), 3, "First to act with straddle should be seat 3");
+            assert_eq!(
+                seat.index(),
+                3,
+                "First to act with straddle should be seat 3"
+            );
         } else {
             panic!("Root should be Decision");
         }

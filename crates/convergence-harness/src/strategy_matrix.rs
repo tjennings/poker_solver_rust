@@ -60,7 +60,7 @@ fn cell_label(row: usize, col: usize) -> String {
 /// Map an Action to an RGB color tuple.
 fn action_color(action: &Action, pot: i32) -> (u8, u8, u8) {
     match action {
-        Action::AllIn(_) => (255, 193, 7),    // gold
+        Action::AllIn(_) => (255, 193, 7), // gold
         Action::Raise(amt) | Action::Bet(amt) => {
             let frac = if pot > 0 {
                 *amt as f32 / pot as f32
@@ -80,7 +80,7 @@ fn action_color(action: &Action, pot: i32) -> (u8, u8, u8) {
         Action::Call => (76, 175, 80),  // green
         Action::Check => (76, 175, 80), // green
         Action::Fold => (68, 114, 196), // blue
-        _ => (80, 80, 80),             // grey for None/Chance
+        _ => (80, 80, 80),              // grey for None/Chance
     }
 }
 
@@ -150,7 +150,9 @@ fn render_cell(policy: &[(Action, f32)], label: &str, pot: i32) -> String {
         let cols = if i == sorted.len() - 1 {
             half_cols.saturating_sub(used)
         } else {
-            (frac * half_cols as f32).round().min((half_cols - used) as f32) as usize
+            (frac * half_cols as f32)
+                .round()
+                .min((half_cols - used) as f32) as usize
         };
         if cols > 0 {
             alloc.push((*action, cols));
@@ -193,10 +195,7 @@ fn render_cell(policy: &[(Action, f32)], label: &str, pot: i32) -> String {
                 "\x1b[97m"
             };
             let ch = label_char.unwrap_or(' ');
-            out.push_str(&format!(
-                "\x1b[48;2;{};{};{}m{}{}\x1b[0m",
-                r, g, b, fg, ch
-            ));
+            out.push_str(&format!("\x1b[48;2;{};{};{}m{}{}\x1b[0m", r, g, b, fg, ch));
         } else if let Some(ch) = label_char {
             let (r, g, b) = left;
             let fg = if luminance(r, g, b) > 128.0 {
@@ -204,10 +203,7 @@ fn render_cell(policy: &[(Action, f32)], label: &str, pot: i32) -> String {
             } else {
                 "\x1b[97m"
             };
-            out.push_str(&format!(
-                "\x1b[48;2;{};{};{}m{}{}\x1b[0m",
-                r, g, b, fg, ch
-            ));
+            out.push_str(&format!("\x1b[48;2;{};{};{}m{}{}\x1b[0m", r, g, b, fg, ch));
         } else {
             let (lr, lg, lb) = left;
             let (rr, rg, rb) = right;
@@ -247,14 +243,17 @@ pub fn print_strategy_matrix(game: &PostFlopGame, player: usize) {
     }
 
     let flop = game.card_config().flop;
-    let flop_str = flop.iter()
+    let flop_str = flop
+        .iter()
         .map(|&c| card_to_string(c).unwrap_or_else(|_| "??".into()))
         .collect::<Vec<_>>()
         .join(" ");
 
-    eprintln!("\n  {} Strategy Matrix — Flop: [{}]",
+    eprintln!(
+        "\n  {} Strategy Matrix — Flop: [{}]",
         if player == 0 { "OOP (SB)" } else { "IP (BB)" },
-        flop_str);
+        flop_str
+    );
     eprintln!();
 
     for (row, grid_row) in grid.iter().enumerate() {
@@ -306,10 +305,7 @@ pub fn print_strategy_matrix(game: &PostFlopGame, player: usize) {
                 "\x1b[97m"
             };
             let lbl = action_label(action, pot);
-            eprint!(
-                "\x1b[48;2;{};{};{}m{} {:^5} \x1b[0m ",
-                r, g, b, fg, lbl
-            );
+            eprint!("\x1b[48;2;{};{};{}m{} {:^5} \x1b[0m ", r, g, b, fg, lbl);
         }
         eprintln!();
     }

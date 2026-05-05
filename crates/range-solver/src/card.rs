@@ -111,8 +111,7 @@ impl CardConfig {
                     && (self.river == NOT_DEALT || board1 == self.river || board2 == self.river)
                 {
                     let index = card_pair_to_index(board1, board2);
-                    ret_river[index] =
-                        Self::valid_indices_internal(private_cards, board1, board2);
+                    ret_river[index] = Self::valid_indices_internal(private_cards, board1, board2);
                 }
             }
         }
@@ -120,11 +119,7 @@ impl CardConfig {
         (ret_flop, ret_turn, ret_river)
     }
 
-    fn valid_indices_internal(
-        private_cards: &PrivateCards,
-        board1: Card,
-        board2: Card,
-    ) -> Indices {
+    fn valid_indices_internal(private_cards: &PrivateCards, board1: Card, board2: Card) -> Indices {
         let mut ret = [
             Vec::with_capacity(private_cards[0].len()),
             Vec::with_capacity(private_cards[1].len()),

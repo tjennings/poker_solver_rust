@@ -35,19 +35,18 @@ use rayon::prelude::*;
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
 use crate::hands::CanonicalHand;
-use crate::poker::{Card, Suit, Value, ALL_SUITS, ALL_VALUES};
+use crate::poker::{ALL_SUITS, ALL_VALUES, Card, Suit, Value};
 use crate::showdown_equity::rank_hand;
 
+use super::Street;
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
 use super::centroid_file::CentroidFile;
 use super::clustering::{
-    compute_centroid_ev, compute_centroid_gaps, elkan_emd_weighted_u8, fast_kmeans_1d,
-    kmeans_1d, nearest_centroid_1d, nearest_centroid_u8, nearest_centroid_u8_weighted,
-    sort_centroids_by_ev,
+    compute_centroid_ev, compute_centroid_gaps, elkan_emd_weighted_u8, fast_kmeans_1d, kmeans_1d,
+    nearest_centroid_1d, nearest_centroid_u8, nearest_centroid_u8_weighted, sort_centroids_by_ev,
 };
 use super::config::ClusteringConfig;
 use super::per_flop_bucket_file::PerFlopBucketFile;
-use super::Street;
 
 /// Number of sample 5-card boards for river clustering when no explicit count
 /// is provided.
@@ -147,7 +146,13 @@ pub fn cluster_turn_with_boards(
                     if cards_overlap(*combo, board) {
                         return None;
                     }
-                    Some(build_bucket_histogram_u8(*combo, board, &deck, river_buckets, &board_map))
+                    Some(build_bucket_histogram_u8(
+                        *combo,
+                        board,
+                        &deck,
+                        river_buckets,
+                        &board_map,
+                    ))
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
@@ -219,15 +224,15 @@ fn build_bucket_histogram_u8(
     let mut histogram = vec![0_u16; num_buckets];
     let mut extended = Vec::with_capacity(board.len() + 1);
     extended.extend_from_slice(board);
-    extended.push(Card::new(crate::poker::Value::Two, crate::poker::Suit::Club)); // placeholder
+    extended.push(Card::new(
+        crate::poker::Value::Two,
+        crate::poker::Suit::Club,
+    )); // placeholder
 
     let ci = combo_index(combo[0], combo[1]);
 
     for &next_card in deck {
-        if board.contains(&next_card)
-            || next_card == combo[0]
-            || next_card == combo[1]
-        {
+        if board.contains(&next_card) || next_card == combo[0] || next_card == combo[1] {
             continue;
         }
 
@@ -241,7 +246,6 @@ fn build_bucket_histogram_u8(
 
     histogram.iter().map(|&c| c.min(255) as u8).collect()
 }
-
 
 // ---------------------------------------------------------------------------
 // Flop clustering
@@ -273,7 +277,13 @@ pub fn cluster_flop_with_boards(
                     if cards_overlap(*combo, board) {
                         return None;
                     }
-                    Some(build_bucket_histogram_u8(*combo, board, &deck, turn_buckets, &board_map))
+                    Some(build_bucket_histogram_u8(
+                        *combo,
+                        board,
+                        &deck,
+                        turn_buckets,
+                        &board_map,
+                    ))
                 })
                 .collect();
             #[allow(clippy::cast_precision_loss)]
@@ -377,21 +387,15 @@ pub fn cluster_river_exhaustive(
         }
     }
 
-    let (_labels, mut centroids) = fast_kmeans_1d(
-        &sample_vals,
-        bucket_count as usize,
-        kmeans_iterations,
-        seed,
-    );
+    let (_labels, mut centroids) =
+        fast_kmeans_1d(&sample_vals, bucket_count as usize, kmeans_iterations, seed);
     // Sort centroids ascending so bucket IDs are ordered by equity.
     centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     progress("k-means", 1.0);
 
     // Build CentroidFile with scalar centroids (1-D).
-    let centroid_file = CentroidFile::new(
-        Street::River,
-        centroids.iter().map(|&c| vec![c]).collect(),
-    );
+    let centroid_file =
+        CentroidFile::new(Street::River, centroids.iter().map(|&c| vec![c]).collect());
 
     // Phase 2: Enumerate ALL canonical rivers and assign each combo to nearest centroid.
     let num_boards = all_canonical.len();
@@ -481,7 +485,11 @@ fn cluster_histogram_exhaustive<const N: usize>(
                         return None;
                     }
                     Some(build_bucket_histogram_u8(
-                        *combo, board, &deck, prior_buckets, &board_map,
+                        *combo,
+                        board,
+                        &deck,
+                        prior_buckets,
+                        &board_map,
                     ))
                 })
                 .collect();
@@ -534,7 +542,11 @@ fn cluster_histogram_exhaustive<const N: usize>(
                         return 0; // placeholder for overlapping cards
                     }
                     let hist = build_bucket_histogram_u8(
-                        *combo, &wb.cards, &deck, prior_buckets, &board_map,
+                        *combo,
+                        &wb.cards,
+                        &deck,
+                        prior_buckets,
+                        &board_map,
                     );
                     if child_centroid_gaps.is_empty() {
                         nearest_centroid_u8(&hist, &sorted_centroids)
@@ -687,7 +699,8 @@ const HISTOGRAM_BINS: usize = 10_000;
 /// `board_size`(1) + board(5) + pot(4) + stack(4) + player(1) +
 /// `game_value`(4) + `oop_range`(5304) + `ip_range`(5304) + cfvs(5304) +
 /// `valid_mask`(1326).
-pub(crate) const CFVNET_RIVER_RECORD_SIZE: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326;
+pub(crate) const CFVNET_RIVER_RECORD_SIZE: usize =
+    1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326;
 
 /// Cluster river situations using pre-solved cfvnet training records.
 ///
@@ -712,7 +725,8 @@ pub fn cluster_river_from_cfvnet(
     let bin_files = collect_bin_files(data_dir)?;
 
     // ---- Pass 1: build histogram + collect unique boards --------------------
-    let (histogram, board_set) = cfvnet_pass1_histogram(&bin_files, &|p| progress("histograms", p))?;
+    let (histogram, board_set) =
+        cfvnet_pass1_histogram(&bin_files, &|p| progress("histograms", p))?;
 
     // ---- Pass 2: k-means on histogram bins ---------------------------------
     let centroids = cfvnet_pass2_centroids(&histogram, bucket_count, kmeans_iterations);
@@ -785,7 +799,9 @@ pub fn cluster_river_from_cfvnet(
 pub(crate) const CFV_FIELD_OFFSET: usize = 1 + 5 + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4;
 
 /// Collect all `*.bin` files from a directory.
-pub(crate) fn collect_bin_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+pub(crate) fn collect_bin_files(
+    dir: &Path,
+) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
     let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
@@ -800,13 +816,23 @@ pub(crate) fn collect_bin_files(dir: &Path) -> Result<Vec<std::path::PathBuf>, B
 /// Read a single CFV float from binary data and convert to equity.
 pub(crate) fn read_cfv_as_equity(data: &[u8], cfv_offset: usize, combo_idx: usize) -> f64 {
     let start = cfv_offset + combo_idx * 4;
-    let cfv = f32::from_le_bytes([data[start], data[start + 1], data[start + 2], data[start + 3]]);
+    let cfv = f32::from_le_bytes([
+        data[start],
+        data[start + 1],
+        data[start + 2],
+        data[start + 3],
+    ]);
     cfv_to_equity(cfv)
 }
 
 /// Pass 1: stream all river records, build a histogram of equity values,
 /// and collect unique canonical boards.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::type_complexity)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::type_complexity
+)]
 fn cfvnet_pass1_histogram(
     bin_files: &[std::path::PathBuf],
     progress: &impl Fn(f64),
@@ -827,7 +853,9 @@ fn cfvnet_pass1_histogram(
                 .map(|i| cfvnet_card_to_core(data[offset + 1 + i]))
                 .collect();
             let packed = canonical_key(&board_cards);
-            board_set.entry(packed).or_insert_with(|| board_cards.clone());
+            board_set
+                .entry(packed)
+                .or_insert_with(|| board_cards.clone());
 
             let cfv_offset = offset + CFV_FIELD_OFFSET;
             let mask_offset = cfv_offset + 1326 * 4;
@@ -854,7 +882,11 @@ fn cfvnet_pass1_histogram(
 /// Pass 2: run weighted 1-D k-means on histogram bin midpoints and extract
 /// sorted centroids.
 #[allow(clippy::cast_precision_loss)]
-fn cfvnet_pass2_centroids(histogram: &[u64], bucket_count: u16, kmeans_iterations: u32) -> Vec<f64> {
+fn cfvnet_pass2_centroids(
+    histogram: &[u64],
+    bucket_count: u16,
+    kmeans_iterations: u32,
+) -> Vec<f64> {
     let mut bin_midpoints: Vec<f64> = Vec::new();
     let mut bin_weights: Vec<f64> = Vec::new();
     for (i, &count) in histogram.iter().enumerate() {
@@ -1008,7 +1040,11 @@ struct TurnRiverData {
 ///   3. Cluster the combo histograms into `turn_bucket_count` turn buckets.
 ///
 /// Returns a [`PerFlopBucketFile`] with all assignments.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines
+)]
 pub fn cluster_single_flop(
     flop: [Card; 3],
     turn_bucket_count: u16,
@@ -1022,11 +1058,7 @@ pub fn cluster_single_flop(
     let num_combos = combos.len(); // 1326
 
     // Enumerate turn cards: all cards not on the flop.
-    let turn_cards: Vec<Card> = deck
-        .iter()
-        .copied()
-        .filter(|c| !flop.contains(c))
-        .collect();
+    let turn_cards: Vec<Card> = deck.iter().copied().filter(|c| !flop.contains(c)).collect();
     let num_turns = turn_cards.len();
 
     // ---- Phase 1: River clustering per turn ----
@@ -1085,9 +1117,7 @@ pub fn cluster_single_flop(
                 } else {
                     let mut hist = vec![0u16; river_k];
                     for ri in 0..num_rivers {
-                        if river_cards[ri] == combos[ci][0]
-                            || river_cards[ri] == combos[ci][1]
-                        {
+                        if river_cards[ri] == combos[ci][0] || river_cards[ri] == combos[ci][1] {
                             continue;
                         }
                         let bucket = river_buckets[ri * num_combos + ci];
@@ -1135,7 +1165,14 @@ pub fn cluster_single_flop(
     let (turn_labels, _) = if all_features.is_empty() {
         (vec![], vec![])
     } else {
-        elkan_emd_weighted_u8(&all_features, &all_weights, turn_k, kmeans_iterations, seed, |_, _| {})
+        elkan_emd_weighted_u8(
+            &all_features,
+            &all_weights,
+            turn_k,
+            kmeans_iterations,
+            seed,
+            |_, _| {},
+        )
     };
     progress("turn-kmeans", 1, 1);
 
@@ -1219,37 +1256,47 @@ pub fn run_per_flop_pipeline(
     let already_done: usize = per_flop_paths.iter().filter(|p| p.exists()).count();
     let completed = std::sync::atomic::AtomicUsize::new(already_done);
     if already_done > 0 {
-        progress("resume", &format!("skipping {already_done} completed flops"), already_done as f64 / num_flops as f64);
+        progress(
+            "resume",
+            &format!("skipping {already_done} completed flops"),
+            already_done as f64 / num_flops as f64,
+        );
     }
 
-    flops
-        .par_iter()
-        .enumerate()
-        .for_each(|(i, wb)| {
-            // Skip if already computed (resume support).
-            if per_flop_paths[i].exists() {
-                return;
-            }
+    flops.par_iter().enumerate().for_each(|(i, wb)| {
+        // Skip if already computed (resume support).
+        if per_flop_paths[i].exists() {
+            return;
+        }
 
-            let flop_label = format!(
-                "{i:04} [{}]",
-                wb.cards.iter().map(|c| format!("{c}")).collect::<Vec<_>>().join("")
-            );
-            let pf = cluster_single_flop(
-                wb.cards,
-                config.turn_buckets,
-                config.river_buckets,
-                config.kmeans_iterations,
-                config.seed.wrapping_add(i as u64),
-                |phase, pos, total| {
-                    progress(&flop_label, &format!("{phase} {pos}/{total}"), pos as f64 / total as f64);
-                },
-            );
-            pf.save(&per_flop_paths[i]).expect("failed to save per-flop bucket file");
-            let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            #[allow(clippy::cast_precision_loss)]
-            progress("done", &flop_label, done as f64 / num_flops as f64);
-        });
+        let flop_label = format!(
+            "{i:04} [{}]",
+            wb.cards
+                .iter()
+                .map(|c| format!("{c}"))
+                .collect::<Vec<_>>()
+                .join("")
+        );
+        let pf = cluster_single_flop(
+            wb.cards,
+            config.turn_buckets,
+            config.river_buckets,
+            config.kmeans_iterations,
+            config.seed.wrapping_add(i as u64),
+            |phase, pos, total| {
+                progress(
+                    &flop_label,
+                    &format!("{phase} {pos}/{total}"),
+                    pos as f64 / total as f64,
+                );
+            },
+        );
+        pf.save(&per_flop_paths[i])
+            .expect("failed to save per-flop bucket file");
+        let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        progress("done", &flop_label, done as f64 / num_flops as f64);
+    });
 
     // 3. Global flop clustering: build histograms over per-flop turn buckets.
     progress("flop-clustering", "building-histograms", 0.0);
@@ -1298,7 +1345,14 @@ pub fn run_per_flop_pipeline(
     let (flop_labels, _) = if all_features.is_empty() {
         (vec![], vec![])
     } else {
-        elkan_emd_weighted_u8(&all_features, &all_weights, flop_k, config.kmeans_iterations, config.seed, |_, _| {})
+        elkan_emd_weighted_u8(
+            &all_features,
+            &all_weights,
+            flop_k,
+            config.kmeans_iterations,
+            config.seed,
+            |_, _| {},
+        )
     };
     progress("flop-clustering", "k-means", 1.0);
 
@@ -1437,12 +1491,7 @@ pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
                     if flop.cards.contains(&card) {
                         continue;
                     }
-                    let board_vec = vec![
-                        flop.cards[0],
-                        flop.cards[1],
-                        flop.cards[2],
-                        card,
-                    ];
+                    let board_vec = vec![flop.cards[0], flop.cards[1], flop.cards[2], card];
                     // INVARIANT: 4-card boards are always valid for canonicalization
                     let canonical = CanonicalBoard::from_cards(&board_vec)
                         .expect("4-card board is always valid");
@@ -1451,8 +1500,7 @@ pub fn enumerate_canonical_turns() -> Vec<WeightedBoard<4>> {
                     map.entry(key)
                         .and_modify(|(w, _)| *w += flop.weight)
                         .or_insert_with(|| {
-                            let cards: [Card; 4] =
-                                [sorted[0], sorted[1], sorted[2], sorted[3]];
+                            let cards: [Card; 4] = [sorted[0], sorted[1], sorted[2], sorted[3]];
                             (flop.weight, cards)
                         });
                 }
@@ -1663,15 +1711,16 @@ pub(crate) fn compute_board_equities(board: [Card; 5], combos: &[[Card; 2]]) -> 
     let mut blocked: Vec<bool> = Vec::with_capacity(combos.len());
 
     for &combo in combos {
-        let mask = (1u64 << card_to_deck_index(combo[0]))
-            | (1u64 << card_to_deck_index(combo[1]));
+        let mask = (1u64 << card_to_deck_index(combo[0])) | (1u64 << card_to_deck_index(combo[1]));
         combo_masks.push(mask);
         if mask & board_mask != 0 {
             blocked.push(true);
             ranks.push(0);
         } else {
             blocked.push(false);
-            ranks.push(crate::showdown_equity::rank_to_ordinal(rank_hand(combo, &board)));
+            ranks.push(crate::showdown_equity::rank_to_ordinal(rank_hand(
+                combo, &board,
+            )));
         }
     }
 
@@ -1878,10 +1927,7 @@ mod tests {
 
         // All valid equities should be in [0, 1].
         for eq in equities.iter().flatten() {
-            assert!(
-                (0.0..=1.0).contains(eq),
-                "equity out of range: {eq}"
-            );
+            assert!((0.0..=1.0).contains(eq), "equity out of range: {eq}");
         }
     }
 
@@ -1973,7 +2019,6 @@ mod tests {
         let board = [deck[2], deck[5], deck[10], deck[15]];
         assert!(!cards_overlap(combo, &board));
     }
-
 
     #[test]
     #[ignore] // slow: equity enumeration in debug mode
@@ -2126,10 +2171,7 @@ mod tests {
         let buckets: Vec<u16> = (0..total)
             .map(|_| rng.random_range(0..bucket_count) as u16)
             .collect();
-        let packed_boards: Vec<PackedBoard> = boards
-            .iter()
-            .map(|b| canonical_key(b))
-            .collect();
+        let packed_boards: Vec<PackedBoard> = boards.iter().map(|b| canonical_key(b)).collect();
         BucketFile {
             header: BucketFileHeader {
                 street: Street::Flop,
@@ -2155,8 +2197,7 @@ mod tests {
             assert!(b < 169, "bucket {b} out of range");
         }
         // All 169 canonical hands should be represented
-        let unique: std::collections::HashSet<u16> =
-            preflop.buckets.iter().copied().collect();
+        let unique: std::collections::HashSet<u16> = preflop.buckets.iter().copied().collect();
         assert_eq!(unique.len(), 169, "expected exactly 169 unique buckets");
     }
 
@@ -2294,7 +2335,11 @@ mod tests {
     fn canonical_rivers_reasonable_count() {
         let rivers = enumerate_canonical_rivers();
         assert!(rivers.len() > 500_000, "too few rivers: {}", rivers.len());
-        assert!(rivers.len() < 1_000_000, "too many rivers: {}", rivers.len());
+        assert!(
+            rivers.len() < 1_000_000,
+            "too many rivers: {}",
+            rivers.len()
+        );
         let total_weight: u64 = rivers.iter().map(|r| u64::from(r.weight)).sum();
         assert_eq!(total_weight, 22100 * 49 * 48);
     }
@@ -2309,7 +2354,13 @@ mod tests {
         // Build a river BucketFile for a single 5-card board (turn_board + deck[2]).
         // We'll assign all combos to bucket 0 except a few to bucket 1.
         let river_card = deck[2];
-        let river_board_cards = [turn_board[0], turn_board[1], turn_board[2], turn_board[3], river_card];
+        let river_board_cards = [
+            turn_board[0],
+            turn_board[1],
+            turn_board[2],
+            turn_board[3],
+            river_card,
+        ];
         let packed = canonical_key(&river_board_cards);
 
         let mut river_buckets_data = vec![0_u16; 1326];
@@ -2335,13 +2386,20 @@ mod tests {
         assert!(combo[0] != river_card && combo[1] != river_card);
 
         let hist = build_bucket_histogram_u8(combo, &turn_board, &deck, &river_bf, &board_map);
-        assert_eq!(hist.len(), 2, "histogram length should match river bucket_count");
+        assert_eq!(
+            hist.len(),
+            2,
+            "histogram length should match river bucket_count"
+        );
 
         // Total should be the number of river cards that don't overlap with combo/board
         // and whose resulting 5-card board is in the board_map.
         // Only deck[2] forms a board in the map, so total should be at most 1.
         let total: u32 = hist.iter().map(|&c| u32::from(c)).sum();
-        assert!(total <= 46, "total counts should not exceed river card count");
+        assert!(
+            total <= 46,
+            "total counts should not exceed river card count"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2368,7 +2426,12 @@ mod tests {
         );
         // Each turn should have river cards
         for (i, river_cards) in pf.river_cards_per_turn.iter().enumerate() {
-            assert!(river_cards.len() >= 40, "turn {} has too few rivers: {}", i, river_cards.len());
+            assert!(
+                river_cards.len() >= 40,
+                "turn {} has too few rivers: {}",
+                i,
+                river_cards.len()
+            );
         }
         // Verify bucket range
         for &b in &pf.turn_buckets {
@@ -2381,7 +2444,10 @@ mod tests {
             }
         }
         // Verify sizes match
-        assert_eq!(pf.turn_buckets.len(), pf.turn_cards.len() * TOTAL_COMBOS as usize);
+        assert_eq!(
+            pf.turn_buckets.len(),
+            pf.turn_cards.len() * TOTAL_COMBOS as usize
+        );
         for (ti, river_cards) in pf.river_cards_per_turn.iter().enumerate() {
             assert_eq!(
                 pf.river_buckets_per_turn[ti].len(),
@@ -2424,7 +2490,10 @@ mod tests {
         let mut sorted: Vec<u16> = map.to_vec();
         sorted.sort_unstable();
         let expected: Vec<u16> = (0..1326).collect();
-        assert_eq!(sorted, expected, "combo map must be a permutation of 0..1326");
+        assert_eq!(
+            sorted, expected,
+            "combo map must be a permutation of 0..1326"
+        );
     }
 
     #[test]
@@ -2437,19 +2506,19 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
 
         for player in 0u8..2 {
-            f.write_all(&[5u8]).unwrap();                    // board_size
-            f.write_all(&[0, 4, 8, 12, 16]).unwrap();        // board: 2c 3c 4c 5c 6c
-            f.write_all(&100.0_f32.to_le_bytes()).unwrap();   // pot
-            f.write_all(&200.0_f32.to_le_bytes()).unwrap();   // stack
-            f.write_all(&[player]).unwrap();                   // player
-            f.write_all(&0.0_f32.to_le_bytes()).unwrap();     // game_value
-            f.write_all(&[0u8; 1326 * 4]).unwrap();           // oop_range
-            f.write_all(&[0u8; 1326 * 4]).unwrap();           // ip_range
+            f.write_all(&[5u8]).unwrap(); // board_size
+            f.write_all(&[0, 4, 8, 12, 16]).unwrap(); // board: 2c 3c 4c 5c 6c
+            f.write_all(&100.0_f32.to_le_bytes()).unwrap(); // pot
+            f.write_all(&200.0_f32.to_le_bytes()).unwrap(); // stack
+            f.write_all(&[player]).unwrap(); // player
+            f.write_all(&0.0_f32.to_le_bytes()).unwrap(); // game_value
+            f.write_all(&[0u8; 1326 * 4]).unwrap(); // oop_range
+            f.write_all(&[0u8; 1326 * 4]).unwrap(); // ip_range
             for i in 0..1326 {
                 let cfv = -1.0 + 2.0 * (i as f32 / 1325.0);
                 f.write_all(&cfv.to_le_bytes()).unwrap();
             }
-            f.write_all(&[1u8; 1326]).unwrap();               // valid_mask: all valid
+            f.write_all(&[1u8; 1326]).unwrap(); // valid_mask: all valid
         }
         drop(f);
 
@@ -2580,7 +2649,10 @@ mod tests {
         };
         let stages = std::sync::Mutex::new(Vec::new());
         run_per_flop_pipeline(&config, output_dir.path(), Some(2), |stage, phase, _p| {
-            stages.lock().unwrap().push((stage.to_string(), phase.to_string()));
+            stages
+                .lock()
+                .unwrap()
+                .push((stage.to_string(), phase.to_string()));
         })
         .unwrap();
         let stages = stages.into_inner().unwrap();
@@ -2615,7 +2687,16 @@ mod tests {
     fn cluster_turn_exhaustive_accepts_centroid_evs_and_gaps() {
         // Verify the new signature compiles: takes centroid EVs and gaps,
         // returns (BucketFile, CentroidFile).
-        let _: fn(&BucketFile, u16, u32, u64, usize, &[f64], &[f64], fn(&str, f64)) -> (BucketFile, CentroidFile) =
+        let _: fn(
+            &BucketFile,
+            u16,
+            u32,
+            u64,
+            usize,
+            &[f64],
+            &[f64],
+            fn(&str, f64),
+        ) -> (BucketFile, CentroidFile) =
             |a, b, c, d, e, f, g, h| cluster_turn_exhaustive(a, b, c, d, e, f, g, h);
     }
 
@@ -2623,7 +2704,16 @@ mod tests {
     fn cluster_flop_exhaustive_accepts_centroid_evs_and_gaps() {
         // Verify the new signature compiles: takes centroid EVs and gaps,
         // returns (BucketFile, CentroidFile).
-        let _: fn(&BucketFile, u16, u32, u64, usize, &[f64], &[f64], fn(&str, f64)) -> (BucketFile, CentroidFile) =
+        let _: fn(
+            &BucketFile,
+            u16,
+            u32,
+            u64,
+            usize,
+            &[f64],
+            &[f64],
+            fn(&str, f64),
+        ) -> (BucketFile, CentroidFile) =
             |a, b, c, d, e, f, g, h| cluster_flop_exhaustive(a, b, c, d, e, f, g, h);
     }
 
@@ -2642,6 +2732,4 @@ mod tests {
         // Should not have flop_0002.buckets
         assert!(!output_dir.path().join("flop_0002.buckets").exists());
     }
-
-
 }

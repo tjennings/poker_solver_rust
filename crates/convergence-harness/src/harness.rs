@@ -6,9 +6,7 @@ use crate::evaluator;
 use crate::game::{build_flop_poker_game_with_config, FlopPokerConfig};
 use crate::solver_trait::ConvergenceSolver;
 use crate::solvers::exhaustive::ExhaustiveSolver;
-use crate::solvers::mccfr::{
-    compute_head_to_head_ev, flop_str_to_core_cards, MccfrSolver,
-};
+use crate::solvers::mccfr::{compute_head_to_head_ev, flop_str_to_core_cards, MccfrSolver};
 use crate::strategy_matrix;
 
 /// Determines how often to sample exploitability.
@@ -32,7 +30,12 @@ pub fn generate_baseline_with_config(
     max_iterations: u32,
     target_exploitability: f32,
 ) -> Result<Baseline, Box<dyn std::error::Error>> {
-    generate_baseline_with_config_and_checkpoints(config, max_iterations, target_exploitability, None)
+    generate_baseline_with_config_and_checkpoints(
+        config,
+        max_iterations,
+        target_exploitability,
+        None,
+    )
 }
 
 /// Run the exhaustive solver with explicit checkpoint iterations.
@@ -155,7 +158,12 @@ pub fn generate_baseline_from_config(
     let checkpoints: Vec<u64> = cfg.mccfr.checkpoints.clone();
 
     for (flop_idx, flop_str) in cfg.game.flops.iter().enumerate() {
-        println!("\n--- Solving flop {}/{}: {} ---", flop_idx + 1, cfg.game.flops.len(), flop_str);
+        println!(
+            "\n--- Solving flop {}/{}: {} ---",
+            flop_idx + 1,
+            cfg.game.flops.len(),
+            flop_str
+        );
         let flop_config = FlopPokerConfig::from_game_def(&cfg.game, flop_str);
 
         let baseline = generate_baseline_with_config_and_checkpoints(
@@ -220,7 +228,8 @@ fn compute_multi_flop_h2h(
     let mut total_ip = 0.0;
     let n = configs.len();
 
-    for (flop_idx, (config, baseline)) in configs.iter().zip(per_flop_baselines.iter()).enumerate() {
+    for (flop_idx, (config, baseline)) in configs.iter().zip(per_flop_baselines.iter()).enumerate()
+    {
         let (oop, ip, _avg) = compute_head_to_head_ev(solver, baseline, config, flop_idx)?;
         total_oop += oop;
         total_ip += ip;
@@ -303,7 +312,9 @@ pub fn run_mccfr_solver(
                         });
                         eprintln!(
                             "checkpoint: {} iterations, h2h error: {}, elapsed = {:.1}s",
-                            current_iter, e, elapsed as f64 / 1000.0
+                            current_iter,
+                            e,
+                            elapsed as f64 / 1000.0
                         );
                     }
                 }
@@ -315,7 +326,8 @@ pub fn run_mccfr_solver(
                 });
                 eprintln!(
                     "checkpoint: {} iterations, elapsed = {:.1}s",
-                    current_iter, elapsed as f64 / 1000.0
+                    current_iter,
+                    elapsed as f64 / 1000.0
                 );
             }
 
@@ -324,17 +336,14 @@ pub fn run_mccfr_solver(
     }
 
     let total_time = start.elapsed().as_millis() as u64;
-    let final_h2h = convergence_curve
-        .last()
-        .map_or(0.0, |s| s.exploitability);
+    let final_h2h = convergence_curve.last().map_or(0.0, |s| s.exploitability);
 
     // Print strategy matrix
     let mut game = build_flop_poker_game_with_config(&config)?;
     game.allocate_memory(false);
 
     // Lock the MCCFR strategy into the range-solver game for visualization
-    let bp_flop_root =
-        crate::solvers::mccfr::find_flop_root(solver.tree());
+    let bp_flop_root = crate::solvers::mccfr::find_flop_root(solver.tree());
     let mut history: Vec<usize> = Vec::new();
     let mut board_cards = (None, None);
     crate::solvers::mccfr::lock_strategy_recursive(
@@ -415,7 +424,10 @@ pub fn run_mccfr_solver_from_config(
     let per_flop_baselines: Option<Vec<Baseline>> = if baseline.is_some() {
         let mut baselines = Vec::new();
         for (flop_idx, flop_config) in configs.iter().enumerate() {
-            eprintln!("Building per-flop baseline for flop {} ({})...", flop_idx, cfg.game.flops[flop_idx]);
+            eprintln!(
+                "Building per-flop baseline for flop {} ({})...",
+                flop_idx, cfg.game.flops[flop_idx]
+            );
             let bl = generate_baseline_with_config_and_checkpoints(
                 flop_config,
                 cfg.baseline.max_iterations,
@@ -471,7 +483,9 @@ pub fn run_mccfr_solver_from_config(
                         });
                         eprintln!(
                             "checkpoint: {} iterations, h2h error: {}, elapsed = {:.1}s",
-                            current_iter, e, elapsed as f64 / 1000.0
+                            current_iter,
+                            e,
+                            elapsed as f64 / 1000.0
                         );
                     }
                 }
@@ -483,7 +497,8 @@ pub fn run_mccfr_solver_from_config(
                 });
                 eprintln!(
                     "checkpoint: {} iterations, elapsed = {:.1}s",
-                    current_iter, elapsed as f64 / 1000.0
+                    current_iter,
+                    elapsed as f64 / 1000.0
                 );
             }
 
@@ -492,9 +507,7 @@ pub fn run_mccfr_solver_from_config(
     }
 
     let total_time = start.elapsed().as_millis() as u64;
-    let final_h2h = convergence_curve
-        .last()
-        .map_or(0.0, |s| s.exploitability);
+    let final_h2h = convergence_curve.last().map_or(0.0, |s| s.exploitability);
 
     // Extract strategy
     let strategy = solver.average_strategy();

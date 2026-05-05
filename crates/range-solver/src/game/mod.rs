@@ -19,7 +19,9 @@ use std::sync::Arc;
 /// reach at the boundary, and the player being evaluated.
 pub trait BoundaryEvaluator: Send + Sync {
     /// Number of continuation strategies at each boundary. Default: 1 (legacy).
-    fn num_continuations(&self) -> usize { 1 }
+    fn num_continuations(&self) -> usize {
+        1
+    }
 
     /// Compute per-hand CFVs at a depth boundary for a specific continuation.
     ///
@@ -75,8 +77,22 @@ pub trait BoundaryEvaluator: Send + Sync {
         num_ip: usize,
         continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        let oop = self.compute_cfvs(0, pot, remaining_stack, ip_reach, num_oop, continuation_index);
-        let ip = self.compute_cfvs(1, pot, remaining_stack, oop_reach, num_ip, continuation_index);
+        let oop = self.compute_cfvs(
+            0,
+            pot,
+            remaining_stack,
+            ip_reach,
+            num_oop,
+            continuation_index,
+        );
+        let ip = self.compute_cfvs(
+            1,
+            pot,
+            remaining_stack,
+            oop_reach,
+            num_ip,
+            continuation_index,
+        );
         (oop, ip)
     }
 }
@@ -331,10 +347,7 @@ impl PostFlopGame {
     /// Both strategy and cfvalues use action-major layout:
     /// `[action_0 for all hands, action_1 for all hands]` where action 0 is
     /// Terminate and action 1 is Follow.
-    pub fn gadget_decision_diagnostic(
-        &self,
-        gadget_node_idx: usize,
-    ) -> Vec<(f32, f32, f32, f32)> {
+    pub fn gadget_decision_diagnostic(&self, gadget_node_idx: usize) -> Vec<(f32, f32, f32, f32)> {
         assert!(
             self.state >= State::Solved,
             "gadget_decision_diagnostic requires a solved game"
@@ -359,7 +372,7 @@ impl PostFlopGame {
 
         (0..num_hands)
             .map(|h| {
-                let v_t = cfv[h];             // action 0 (Terminate), hand h
+                let v_t = cfv[h]; // action 0 (Terminate), hand h
                 let v_f = cfv[num_hands + h]; // action 1 (Follow), hand h
                 let s_t = strategy[h];
                 let s_f = strategy[num_hands + h];
@@ -551,8 +564,13 @@ mod tests {
         struct MockEval;
         impl BoundaryEvaluator for MockEval {
             fn compute_cfvs(
-                &self, player: usize, _pot: i32, _rs: f64,
-                _opp: &[f32], num_hands: usize, _ci: usize,
+                &self,
+                player: usize,
+                _pot: i32,
+                _rs: f64,
+                _opp: &[f32],
+                num_hands: usize,
+                _ci: usize,
             ) -> Vec<f32> {
                 vec![player as f32; num_hands]
             }

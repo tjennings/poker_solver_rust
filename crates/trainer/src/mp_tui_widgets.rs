@@ -26,7 +26,9 @@ pub fn compute_grids_per_row(terminal_width: u16, grid_width: u16) -> u16 {
     (terminal_width / grid_width).max(1)
 }
 
-const RANKS: [char; 13] = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+const RANKS: [char; 13] = [
+    'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
+];
 const HALF_BLOCK: &str = "\u{2590}";
 
 // ---- Aggression ranking ----
@@ -142,7 +144,11 @@ impl Widget for &CompactGridWidget<'_> {
 fn render_title(buf: &mut Buffer, area: Rect, name: &str) {
     let style = Style::default().add_modifier(Modifier::BOLD);
     let max_len = area.width as usize;
-    let display = if name.len() > max_len { &name[..max_len] } else { name };
+    let display = if name.len() > max_len {
+        &name[..max_len]
+    } else {
+        name
+    };
     buf.set_string(area.x, area.y, display, style);
 }
 
@@ -155,7 +161,12 @@ fn render_header(buf: &mut Buffer, area: Rect) {
         if x >= area.x + area.width {
             break;
         }
-        buf.set_string(x, y, &format!(" {rank}  ")[..COMPACT_CELL_W as usize], style);
+        buf.set_string(
+            x,
+            y,
+            &format!(" {rank}  ")[..COMPACT_CELL_W as usize],
+            style,
+        );
     }
 }
 
@@ -301,10 +312,7 @@ mod tests {
 
     #[timed_test]
     fn rank_actions_raises_before_bets() {
-        let actions = vec![
-            ("bet 50%".into(), 0.5_f32),
-            ("raise 100%".into(), 0.5),
-        ];
+        let actions = vec![("bet 50%".into(), 0.5_f32), ("raise 100%".into(), 0.5)];
         let ranked = rank_actions(&actions);
         // raise > bet in aggression
         assert!(ranked[0].0.starts_with("raise"));
@@ -313,10 +321,7 @@ mod tests {
 
     #[timed_test]
     fn rank_actions_check_before_fold() {
-        let actions = vec![
-            ("fold".into(), 0.5_f32),
-            ("check".into(), 0.5),
-        ];
+        let actions = vec![("fold".into(), 0.5_f32), ("check".into(), 0.5)];
         let ranked = rank_actions(&actions);
         assert_eq!(ranked[0].0, "check");
         assert_eq!(ranked[1].0, "fold");
@@ -342,7 +347,12 @@ mod tests {
         let mut title_row = String::new();
         for x in 0..area.width {
             title_row.push(
-                buf.cell((x, 0)).unwrap().symbol().chars().next().unwrap_or(' '),
+                buf.cell((x, 0))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
             );
         }
         assert!(
@@ -362,7 +372,12 @@ mod tests {
         let mut header_row = String::new();
         for x in 0..area.width {
             header_row.push(
-                buf.cell((x, 1)).unwrap().symbol().chars().next().unwrap_or(' '),
+                buf.cell((x, 1))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
             );
         }
         assert!(
@@ -380,9 +395,21 @@ mod tests {
         (&widget).render(area, &mut buf);
 
         // Row labels start at y=2 (after title+header), x=0
-        let first_label = buf.cell((0, 2)).unwrap().symbol().chars().next().unwrap_or(' ');
+        let first_label = buf
+            .cell((0, 2))
+            .unwrap()
+            .symbol()
+            .chars()
+            .next()
+            .unwrap_or(' ');
         assert_eq!(first_label, 'A', "first row label should be 'A'");
-        let last_label = buf.cell((0, 14)).unwrap().symbol().chars().next().unwrap_or(' ');
+        let last_label = buf
+            .cell((0, 14))
+            .unwrap()
+            .symbol()
+            .chars()
+            .next()
+            .unwrap_or(' ');
         assert_eq!(last_label, '2', "last row label should be '2'");
     }
 
@@ -414,13 +441,15 @@ mod tests {
                 found_half_block = true;
             }
         }
-        assert!(found_half_block, "cell with actions should contain half-block chars");
+        assert!(
+            found_half_block,
+            "cell with actions should contain half-block chars"
+        );
     }
 
     fn mock_compact_state() -> HandGridState {
-        let cells: [[CellStrategy; 13]; 13] = std::array::from_fn(|_| {
-            std::array::from_fn(|_| CellStrategy::default())
-        });
+        let cells: [[CellStrategy; 13]; 13] =
+            std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
         let mut state = HandGridState {
             cells,
             prev_cells: None,

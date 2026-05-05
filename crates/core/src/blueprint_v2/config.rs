@@ -450,7 +450,10 @@ snapshots:
         assert_eq!(cfg.clustering.river.buckets, 200);
         // Defaults
         assert_eq!(cfg.clustering.seed, default_seed());
-        assert_eq!(cfg.clustering.kmeans_iterations, default_kmeans_iterations());
+        assert_eq!(
+            cfg.clustering.kmeans_iterations,
+            default_kmeans_iterations()
+        );
 
         // Action abstraction
         assert_eq!(cfg.action_abstraction.preflop.len(), 2);
@@ -463,7 +466,10 @@ snapshots:
         assert_eq!(cfg.training.time_limit_minutes, None);
         assert_eq!(cfg.training.lcfr_warmup_iterations, 5_000_000);
         // Defaults
-        assert_eq!(cfg.training.lcfr_discount_interval, default_discount_interval());
+        assert_eq!(
+            cfg.training.lcfr_discount_interval,
+            default_discount_interval()
+        );
         assert_eq!(cfg.training.prune_after_iterations, default_prune_after());
         assert_eq!(cfg.training.prune_threshold, default_prune_threshold());
         assert!((cfg.training.prune_explore_pct - default_prune_explore()).abs() < f64::EPSILON);
@@ -499,10 +505,30 @@ snapshots:
             },
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
-                preflop: StreetClusterConfig { buckets: 169, delta_bins: None, expected_delta: false, sample_boards: None },
-                flop: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false, sample_boards: None },
-                turn: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false, sample_boards: None },
-                river: StreetClusterConfig { buckets: 500, delta_bins: None, expected_delta: false, sample_boards: None },
+                preflop: StreetClusterConfig {
+                    buckets: 169,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                flop: StreetClusterConfig {
+                    buckets: 500,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                turn: StreetClusterConfig {
+                    buckets: 500,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
+                river: StreetClusterConfig {
+                    buckets: 500,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                },
                 seed: 123,
                 kmeans_iterations: 50,
                 cfvnet_river_data: None,
@@ -570,11 +596,20 @@ snapshots:
         assert_eq!(restored.clustering.flop.buckets, 500);
 
         // Action abstraction
-        assert_eq!(restored.action_abstraction.preflop, original.action_abstraction.preflop);
-        assert_eq!(restored.action_abstraction.river, original.action_abstraction.river);
+        assert_eq!(
+            restored.action_abstraction.preflop,
+            original.action_abstraction.preflop
+        );
+        assert_eq!(
+            restored.action_abstraction.river,
+            original.action_abstraction.river
+        );
 
         // Training
-        assert_eq!(restored.training.cluster_path, Some("/data/clusters".to_owned()));
+        assert_eq!(
+            restored.training.cluster_path,
+            Some("/data/clusters".to_owned())
+        );
         assert_eq!(restored.training.iterations, None);
         assert_eq!(restored.training.time_limit_minutes, Some(720));
         assert_eq!(restored.training.prune_threshold, 0);
@@ -641,7 +676,11 @@ snapshots:
         ));
 
         // per_flop section parsed
-        let pf = cfg.clustering.per_flop.as_ref().expect("per_flop should be Some");
+        let pf = cfg
+            .clustering
+            .per_flop
+            .as_ref()
+            .expect("per_flop should be Some");
         assert_eq!(pf.turn_buckets, 200);
         assert_eq!(pf.river_buckets, 200);
 
@@ -812,8 +851,7 @@ snapshots:
   output_dir: "/tmp/snapshots"
 "#;
 
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         assert_eq!(cfg.training.optimizer, "dcfr");
         assert!((cfg.training.sapcfr_eta - 0.33).abs() < f64::EPSILON);
     }
@@ -904,8 +942,7 @@ snapshots:
   snapshot_every_minutes: 30
   output_dir: "/tmp/snapshots"
 "#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         // Baselines default to disabled with alpha = 0.01.
         assert!(!cfg.training.use_baselines);
         assert!((cfg.training.baseline_alpha - 0.01).abs() < f64::EPSILON);
@@ -952,8 +989,7 @@ snapshots:
   output_dir: "/tmp/snapshots"
 "#;
 
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         assert!(cfg.training.use_baselines);
         assert!((cfg.training.baseline_alpha - 0.05).abs() < f64::EPSILON);
     }
@@ -992,8 +1028,7 @@ snapshots:
   snapshot_every_minutes: 30
   output_dir: "/tmp/snapshots"
 "#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         assert_eq!(cfg.training.prune_street_mask(), [true; 4]);
     }
 
@@ -1032,8 +1067,7 @@ snapshots:
   snapshot_every_minutes: 30
   output_dir: "/tmp/snapshots"
 "#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         let mask = cfg.training.prune_street_mask();
         assert_eq!(mask, [false, true, true, true]);
     }
@@ -1073,8 +1107,7 @@ snapshots:
   snapshot_every_minutes: 30
   output_dir: "/tmp/snapshots"
 "#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         assert_eq!(cfg.training.prune_street_mask(), [false; 4]);
     }
 
@@ -1165,13 +1198,11 @@ snapshots:
   snapshot_every_minutes: 30
   output_dir: "/tmp/snapshots"
 "#;
-        let cfg: BlueprintV2Config =
-            serde_yaml::from_str(yaml).expect("failed to parse config");
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         let serialized = serde_yaml::to_string(&cfg).expect("failed to serialize");
         let restored: BlueprintV2Config =
             serde_yaml::from_str(&serialized).expect("failed to deserialize round-tripped");
         assert!(restored.training.use_baselines);
         assert!((restored.training.baseline_alpha - 0.02).abs() < f64::EPSILON);
     }
-
 }

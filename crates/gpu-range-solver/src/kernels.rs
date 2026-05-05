@@ -625,18 +625,27 @@ fn cuda_include_paths() -> Vec<String> {
         "/usr/local/cuda/include",
     ];
     for path in &candidates {
-        if std::path::Path::new(path).join("cooperative_groups.h").exists() {
+        if std::path::Path::new(path)
+            .join("cooperative_groups.h")
+            .exists()
+        {
             return vec![path.to_string()];
         }
     }
     // Fallback: try to find via CUDA_HOME env var
     if let Ok(cuda_home) = std::env::var("CUDA_HOME") {
         let p = format!("{cuda_home}/targets/x86_64-linux/include");
-        if std::path::Path::new(&p).join("cooperative_groups.h").exists() {
+        if std::path::Path::new(&p)
+            .join("cooperative_groups.h")
+            .exists()
+        {
             return vec![p];
         }
         let p = format!("{cuda_home}/include");
-        if std::path::Path::new(&p).join("cooperative_groups.h").exists() {
+        if std::path::Path::new(&p)
+            .join("cooperative_groups.h")
+            .exists()
+        {
             return vec![p];
         }
     }
@@ -1005,7 +1014,11 @@ mod tests {
             CFR_MEGA_KERNEL_SOURCE,
             mega_kernel_compile_opts(),
         );
-        assert!(ptx.is_ok(), "mega-kernel CUDA source must compile: {:?}", ptx.err());
+        assert!(
+            ptx.is_ok(),
+            "mega-kernel CUDA source must compile: {:?}",
+            ptx.err()
+        );
     }
 
     #[test]
@@ -1048,7 +1061,8 @@ mod tests {
     fn mega_kernel_source_has_dcfr_discount() {
         // Must compute alpha, beta, gamma inline
         assert!(
-            CFR_MEGA_KERNEL_SOURCE.contains("alpha") && CFR_MEGA_KERNEL_SOURCE.contains("beta")
+            CFR_MEGA_KERNEL_SOURCE.contains("alpha")
+                && CFR_MEGA_KERNEL_SOURCE.contains("beta")
                 && CFR_MEGA_KERNEL_SOURCE.contains("gamma"),
             "mega-kernel must compute DCFR discount params inline"
         );
@@ -1110,7 +1124,11 @@ mod tests {
             HAND_PARALLEL_KERNEL_SOURCE,
             hand_parallel_compile_opts(),
         );
-        assert!(ptx.is_ok(), "Hand-parallel kernel must compile: {:?}", ptx.err());
+        assert!(
+            ptx.is_ok(),
+            "Hand-parallel kernel must compile: {:?}",
+            ptx.err()
+        );
     }
 
     #[test]

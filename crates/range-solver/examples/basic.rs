@@ -1,6 +1,6 @@
-use range_solver::card::*;
 use range_solver::action_tree::*;
 use range_solver::bet_size::*;
+use range_solver::card::*;
 use range_solver::*;
 
 fn main() {

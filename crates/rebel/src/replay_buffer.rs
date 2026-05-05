@@ -6,11 +6,11 @@ use rand::Rng;
 /// A single training example: encoded PBS input and target CFVs.
 #[derive(Clone)]
 pub struct ReplayEntry {
-    pub input: Vec<f32>,   // 2720 elements
-    pub target: Vec<f32>,  // 1326 elements
-    pub mask: Vec<f32>,    // 1326 elements (1.0 = valid, 0.0 = board-blocked)
-    pub range: Vec<f32>,   // 1326 elements (acting player's normalized range)
-    pub game_value: f32,   // weighted sum of range * cfvs
+    pub input: Vec<f32>,  // 2720 elements
+    pub target: Vec<f32>, // 1326 elements
+    pub mask: Vec<f32>,   // 1326 elements (1.0 = valid, 0.0 = board-blocked)
+    pub range: Vec<f32>,  // 1326 elements (acting player's normalized range)
+    pub game_value: f32,  // weighted sum of range * cfvs
 }
 
 impl ReplayEntry {

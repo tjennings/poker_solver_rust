@@ -52,11 +52,7 @@ pub fn solve_situation(situation: &Situation, config: &SolveConfig) -> Result<So
 
     let card_config = CardConfig {
         range: [oop_range, ip_range],
-        flop: [
-            situation.board[0],
-            situation.board[1],
-            situation.board[2],
-        ],
+        flop: [situation.board[0], situation.board[1], situation.board[2]],
         turn: situation.board[3],
         river: situation.board[4],
     };
@@ -75,7 +71,12 @@ pub fn solve_situation(situation: &Situation, config: &SolveConfig) -> Result<So
     let mut game = PostFlopGame::with_config(card_config, action_tree)?;
     game.allocate_memory(false);
 
-    let exploitability = solve(&mut game, config.solver_iterations, config.target_exploitability.unwrap_or(-1.0), false);
+    let exploitability = solve(
+        &mut game,
+        config.solver_iterations,
+        config.target_exploitability.unwrap_or(-1.0),
+        false,
+    );
 
     game.cache_normalized_weights();
 
@@ -123,11 +124,7 @@ fn map_evs_to_combos(
 
 /// Compute weighted sum: sum(range[i] * ev[i]) for all combos.
 fn weighted_sum(range: &[f32; NUM_COMBOS], evs: &[f32; NUM_COMBOS]) -> f32 {
-    range
-        .iter()
-        .zip(evs.iter())
-        .map(|(&r, &e)| r * e)
-        .sum()
+    range.iter().zip(evs.iter()).map(|(&r, &e)| r * e).sum()
 }
 
 #[cfg(test)]
@@ -173,8 +170,7 @@ mod tests {
     }
 
     fn test_solve_config() -> SolveConfig {
-        let bet_sizes = BetSizeOptions::try_from(("50%,a", ""))
-            .expect("valid test bet sizes");
+        let bet_sizes = BetSizeOptions::try_from(("50%,a", "")).expect("valid test bet sizes");
         SolveConfig {
             bet_sizes,
             solver_iterations: 200,
@@ -228,11 +224,7 @@ mod tests {
         let result = solve_situation(&sit, &test_solve_config()).unwrap();
         for &ev in result.oop_evs.iter().chain(result.ip_evs.iter()) {
             if ev != 0.0 {
-                assert!(
-                    ev.abs() < 5.0,
-                    "EV {} seems too large for pot-relative",
-                    ev
-                );
+                assert!(ev.abs() < 5.0, "EV {} seems too large for pot-relative", ev);
             }
         }
     }
@@ -244,7 +236,10 @@ mod tests {
         config.solver_iterations = 500;
         config.target_exploitability = Some(0.005);
         let result = solve_situation(&sit, &config).unwrap();
-        assert!(result.oop_game_value.is_finite(), "OOP game value not finite");
+        assert!(
+            result.oop_game_value.is_finite(),
+            "OOP game value not finite"
+        );
         assert!(result.ip_game_value.is_finite(), "IP game value not finite");
     }
 }

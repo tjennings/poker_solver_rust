@@ -24,9 +24,9 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+use super::cluster_pipeline::{build_deck, enumerate_canonical_flops, enumerate_canonical_turns};
 use crate::poker::{Card, Suit, Value};
 use crate::showdown_equity::compute_equity;
-use super::cluster_pipeline::{build_deck, enumerate_canonical_flops, enumerate_canonical_turns};
 
 /// Cached equity and expected-next-equity for a single (hand, board) pair.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -102,11 +102,17 @@ fn valid_hands(board: &[Card]) -> Vec<[Card; 2]> {
     let deck = build_deck();
     let mut hands = Vec::new();
     for i in 0..deck.len() {
-        if board.iter().any(|b| b.value == deck[i].value && b.suit == deck[i].suit) {
+        if board
+            .iter()
+            .any(|b| b.value == deck[i].value && b.suit == deck[i].suit)
+        {
             continue;
         }
         for j in (i + 1)..deck.len() {
-            if board.iter().any(|b| b.value == deck[j].value && b.suit == deck[j].suit) {
+            if board
+                .iter()
+                .any(|b| b.value == deck[j].value && b.suit == deck[j].suit)
+            {
                 continue;
             }
             hands.push([deck[i], deck[j]]);
@@ -161,8 +167,7 @@ impl EquityDeltaCache {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let file = std::fs::File::create(path)?;
         let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, self)
-            .map_err(|e| io::Error::other(e.to_string()))
+        bincode::serialize_into(writer, self).map_err(|e| io::Error::other(e.to_string()))
     }
 
     /// Load cache from a binary file.
@@ -172,8 +177,7 @@ impl EquityDeltaCache {
     pub fn load(path: &Path) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
-        bincode::deserialize_from(reader)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::deserialize_from(reader).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Generate the full cache bottom-up: turn table first, then flop table.
@@ -212,8 +216,13 @@ impl EquityDeltaCache {
                     // Expected river equity: average over remaining cards.
                     let rem = remaining_cards(*hand, board);
                     let mut total_eq = 0.0f64;
-                    let mut board5 = [board[0], board[1], board[2], board[3],
-                                      Card::new(Value::Two, Suit::Spade)];
+                    let mut board5 = [
+                        board[0],
+                        board[1],
+                        board[2],
+                        board[3],
+                        Card::new(Value::Two, Suit::Spade),
+                    ];
                     for &river_card in &rem {
                         board5[4] = river_card;
                         total_eq += compute_equity(*hand, &board5);
@@ -225,7 +234,13 @@ impl EquityDeltaCache {
                     } as f32;
 
                     let key = pack_key(*hand, board);
-                    entries.push((key, CacheEntry { equity, expected_next_equity: expected }));
+                    entries.push((
+                        key,
+                        CacheEntry {
+                            equity,
+                            expected_next_equity: expected,
+                        },
+                    ));
                 }
 
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -276,8 +291,12 @@ impl EquityDeltaCache {
                     let rem = remaining_cards(*hand, board);
                     let mut total_eq = 0.0f64;
                     let mut count = 0u32;
-                    let mut board4 = [board[0], board[1], board[2],
-                                      Card::new(Value::Two, Suit::Spade)];
+                    let mut board4 = [
+                        board[0],
+                        board[1],
+                        board[2],
+                        Card::new(Value::Two, Suit::Spade),
+                    ];
 
                     for &turn_card in &rem {
                         board4[3] = turn_card;
@@ -302,7 +321,13 @@ impl EquityDeltaCache {
                     } as f32;
 
                     let key = pack_key(*hand, board);
-                    entries.push((key, CacheEntry { equity, expected_next_equity: expected }));
+                    entries.push((
+                        key,
+                        CacheEntry {
+                            equity,
+                            expected_next_equity: expected,
+                        },
+                    ));
                 }
 
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -399,10 +424,13 @@ mod tests {
 
         let mut turn = FxHashMap::default();
         let equity = compute_equity(hand, &board) as f32;
-        turn.insert(key, CacheEntry {
-            equity,
-            expected_next_equity: 0.5,
-        });
+        turn.insert(
+            key,
+            CacheEntry {
+                equity,
+                expected_next_equity: 0.5,
+            },
+        );
 
         let cache = EquityDeltaCache {
             turn,

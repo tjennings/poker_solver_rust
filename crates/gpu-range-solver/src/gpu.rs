@@ -393,7 +393,11 @@ mod tests {
     fn kernels_compile_and_load_all_functions() {
         let ctx = CudaContext::new(0).unwrap();
         let kernels = CfrKernels::compile(&ctx);
-        assert!(kernels.is_ok(), "kernel compilation failed: {:?}", kernels.err());
+        assert!(
+            kernels.is_ok(),
+            "kernel compilation failed: {:?}",
+            kernels.err()
+        );
     }
 
     #[test]
@@ -401,7 +405,11 @@ mod tests {
     fn mega_kernel_compiles_and_loads() {
         let ctx = CudaContext::new(0).unwrap();
         let kernel = MegaKernel::compile(&ctx);
-        assert!(kernel.is_ok(), "mega-kernel compilation failed: {:?}", kernel.err());
+        assert!(
+            kernel.is_ok(),
+            "mega-kernel compilation failed: {:?}",
+            kernel.err()
+        );
     }
 
     #[test]
@@ -410,7 +418,11 @@ mod tests {
         let ctx = CudaContext::new(0).unwrap();
         let kernel = MegaKernel::compile(&ctx).unwrap();
         let max_blocks = kernel.max_cooperative_blocks(BLOCK_SIZE);
-        assert!(max_blocks > 0, "max_cooperative_blocks must be > 0, got {}", max_blocks);
+        assert!(
+            max_blocks > 0,
+            "max_cooperative_blocks must be > 0, got {}",
+            max_blocks
+        );
     }
 
     #[test]
@@ -432,7 +444,11 @@ mod tests {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
         let state = GpuMegaState::new(&stream, 2, 5, 8, 3);
-        assert!(state.is_ok(), "batched state allocation failed: {:?}", state.err());
+        assert!(
+            state.is_ok(),
+            "batched state allocation failed: {:?}",
+            state.err()
+        );
         let state = state.unwrap();
         assert_eq!(state.batch_size, 2);
         assert_eq!(state.num_nodes, 5);
@@ -455,8 +471,14 @@ mod tests {
         let level_counts = vec![2i32];
 
         let result = state.upload_topology(
-            &stream, &parent, &child, &player, &ape,
-            &level_starts, &level_counts, 0,
+            &stream,
+            &parent,
+            &child,
+            &player,
+            &ape,
+            &level_starts,
+            &level_counts,
+            0,
         );
         assert!(result.is_ok());
         assert_eq!(state.max_depth, 0);
@@ -474,10 +496,8 @@ mod tests {
         let player = vec![0i32, 0];
         let ape = vec![2.0f32, 2.0];
 
-        let result = state.upload_topology(
-            &stream, &parent, &child, &player, &ape,
-            vec![0], vec![2], 0,
-        );
+        let result =
+            state.upload_topology(&stream, &parent, &child, &player, &ape, vec![0], vec![2], 0);
         assert!(result.is_ok());
         assert_eq!(state.max_depth, 0);
         assert_eq!(state.level_edge_start, vec![0]);
@@ -508,7 +528,11 @@ mod tests {
     fn hand_parallel_kernel_compiles_and_loads() {
         let ctx = CudaContext::new(0).unwrap();
         let kernel = HandParallelKernel::compile(&ctx);
-        assert!(kernel.is_ok(), "hand-parallel kernel compilation failed: {:?}", kernel.err());
+        assert!(
+            kernel.is_ok(),
+            "hand-parallel kernel compilation failed: {:?}",
+            kernel.err()
+        );
     }
 
     #[test]
@@ -517,7 +541,11 @@ mod tests {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
         let state = GpuHandParallelState::new(&stream, 4, 10, 15, 8);
-        assert!(state.is_ok(), "hand-parallel state allocation failed: {:?}", state.err());
+        assert!(
+            state.is_ok(),
+            "hand-parallel state allocation failed: {:?}",
+            state.err()
+        );
         let state = state.unwrap();
         assert_eq!(state.batch_size, 4);
         assert_eq!(state.num_nodes, 10);

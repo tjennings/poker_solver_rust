@@ -1,4 +1,4 @@
-use burn::tensor::{backend::Backend, Tensor};
+use burn::tensor::{Tensor, backend::Backend};
 
 /// Masked Huber loss over valid (unmasked) combos.
 ///
@@ -113,7 +113,13 @@ pub fn weighted_cfvnet_loss<B: Backend>(
     huber_delta: f64,
     aux_weight: f64,
 ) -> Tensor<B, 1> {
-    let huber = weighted_masked_huber_loss(pred.clone(), target, mask, sample_weight.clone(), huber_delta);
+    let huber = weighted_masked_huber_loss(
+        pred.clone(),
+        target,
+        mask,
+        sample_weight.clone(),
+        huber_delta,
+    );
     let aux = weighted_aux_loss(pred, range, game_value, sample_weight);
     huber + aux.mul_scalar(aux_weight)
 }
@@ -129,7 +135,13 @@ pub fn weighted_cfvnet_loss_components<B: Backend>(
     sample_weight: Tensor<B, 1>,
     huber_delta: f64,
 ) -> (f64, f64) {
-    let huber = weighted_masked_huber_loss(pred.clone(), target, mask, sample_weight.clone(), huber_delta);
+    let huber = weighted_masked_huber_loss(
+        pred.clone(),
+        target,
+        mask,
+        sample_weight.clone(),
+        huber_delta,
+    );
     let aux = weighted_aux_loss(pred, range, game_value, sample_weight);
     let h: f32 = huber.into_data().to_vec::<f32>().unwrap()[0];
     let a: f32 = aux.into_data().to_vec::<f32>().unwrap()[0];
@@ -175,10 +187,7 @@ mod tests {
         let loss = masked_huber_loss(pred, target, mask, 1.0);
         let val: f32 = loss.into_scalar();
         // expected = (0.125 + 1.5) / 2 = 0.8125
-        assert!(
-            (val - 0.8125).abs() < 1e-5,
-            "expected ~0.8125, got {val}"
-        );
+        assert!((val - 0.8125).abs() < 1e-5, "expected ~0.8125, got {val}");
     }
 
     #[test]

@@ -122,7 +122,8 @@ impl PostFlopGame {
                                 );
                             };
                         let pot = self.tree_config.starting_pot + 2 * node.amount;
-                        let remaining = (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
+                        let remaining =
+                            (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
                         let opp_reach = self.boundary_reach[reach_index].lock().unwrap().clone();
                         let opp_reach_ref = if opp_reach.is_empty() {
                             &self.initial_weights[opp]
@@ -131,7 +132,10 @@ impl PostFlopGame {
                         };
                         // Get the visiting player's own reach for compute_cfvs_both.
                         let player_reach_index = ordinal * 2 + player;
-                        let player_reach = self.boundary_reach[player_reach_index].lock().unwrap().clone();
+                        let player_reach = self.boundary_reach[player_reach_index]
+                            .lock()
+                            .unwrap()
+                            .clone();
                         let player_reach_ref = if player_reach.is_empty() {
                             &self.initial_weights[player]
                         } else {
@@ -147,8 +151,7 @@ impl PostFlopGame {
                         // Try raw CFV path first — values already integrated
                         // over opponent reach, bypass bcfv * payoff_scale * cfreach_adj.
                         if let Some((oop_raw, ip_raw)) = evaluator.compute_raw_cfvs_both(
-                            pot, remaining, oop_reach, ip_reach,
-                            num_oop, num_ip, 0,
+                            pot, remaining, oop_reach, ip_reach, num_oop, num_ip, 0,
                         ) {
                             let raw_cfvs = if player == 0 { oop_raw } else { ip_raw };
                             *self.boundary_cfvs[bcfv_index].lock().unwrap() = raw_cfvs;
@@ -157,8 +160,7 @@ impl PostFlopGame {
                             }
                         } else {
                             let (oop_cfvs, ip_cfvs) = evaluator.compute_cfvs_both(
-                                pot, remaining, oop_reach, ip_reach,
-                                num_oop, num_ip, 0,
+                                pot, remaining, oop_reach, ip_reach, num_oop, num_ip, 0,
                             );
                             *self.boundary_cfvs[ordinal * 2].lock().unwrap() = oop_cfvs;
                             *self.boundary_cfvs[ordinal * 2 + 1].lock().unwrap() = ip_cfvs;
@@ -167,13 +169,23 @@ impl PostFlopGame {
                 }
 
                 let bcfvs = self.boundary_cfvs[bcfv_index].lock().unwrap();
-                let is_raw = self.boundary_is_raw
+                let is_raw = self
+                    .boundary_is_raw
                     .get(ordinal)
                     .map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
                 if is_raw {
                     self.evaluate_boundary_raw(result, node, player, &bcfvs);
                 } else {
-                    self.evaluate_boundary_single(result, node, player, player_cards, opponent_cards, cfreach, &bcfvs, half_pot);
+                    self.evaluate_boundary_single(
+                        result,
+                        node,
+                        player,
+                        player_cards,
+                        opponent_cards,
+                        cfreach,
+                        &bcfvs,
+                        half_pot,
+                    );
                 }
                 return;
             }
@@ -265,12 +277,20 @@ impl PostFlopGame {
             // early noisy iterations don't contaminate the continuation choice.
             {
                 let mut regrets = self.boundary_cont_regrets[ordinal].lock().unwrap();
-                let alpha = self.boundary_discount_alpha.load(std::sync::atomic::Ordering::Relaxed);
-                let beta = self.boundary_discount_beta.load(std::sync::atomic::Ordering::Relaxed);
+                let alpha = self
+                    .boundary_discount_alpha
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let beta = self
+                    .boundary_discount_beta
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 for cont_k in 0..k {
                     // Discount existing regret (alpha for positive, beta for negative)
                     let r = regrets[cont_k];
-                    let d = if r >= 0.0 { f32::from_bits(alpha) } else { f32::from_bits(beta) };
+                    let d = if r >= 0.0 {
+                        f32::from_bits(alpha)
+                    } else {
+                        f32::from_bits(beta)
+                    };
                     regrets[cont_k] = r * d + (action_values[cont_k] - combined_value) as f32;
                 }
             }
@@ -278,7 +298,10 @@ impl PostFlopGame {
             // Update continuation cumulative strategy with gamma discounting.
             {
                 let mut strat = self.boundary_cont_strategy[ordinal].lock().unwrap();
-                let gamma = f32::from_bits(self.boundary_discount_gamma.load(std::sync::atomic::Ordering::Relaxed));
+                let gamma = f32::from_bits(
+                    self.boundary_discount_gamma
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
                 for cont_k in 0..k {
                     strat[cont_k] = strat[cont_k] * gamma + strategy[cont_k];
                 }
@@ -483,8 +506,7 @@ impl PostFlopGame {
                         }
 
                         while opponent_strength.get_unchecked(i).strength < strength {
-                            let opponent_index =
-                                opponent_strength.get_unchecked(i).index as usize;
+                            let opponent_index = opponent_strength.get_unchecked(i).index as usize;
                             let (c1, c2) = *opponent_cards.get_unchecked(opponent_index);
                             let cfreach_i = *cfreach.get_unchecked(opponent_index) as f64;
                             cfreach_sum_win += cfreach_i;
@@ -500,8 +522,7 @@ impl PostFlopGame {
                         }
 
                         while opponent_strength.get_unchecked(j).strength == strength {
-                            let opponent_index =
-                                opponent_strength.get_unchecked(j).index as usize;
+                            let opponent_index = opponent_strength.get_unchecked(j).index as usize;
                             let (c1, c2) = *opponent_cards.get_unchecked(opponent_index);
                             let cfreach_j = *cfreach.get_unchecked(opponent_index) as f64;
                             cfreach_sum_tie += cfreach_j;
@@ -598,8 +619,7 @@ impl PostFlopGame {
                     - *cfreach_minus.get_unchecked(c1 as usize)
                     - *cfreach_minus.get_unchecked(c2 as usize);
                 let bcfv = *bcfvs.get_unchecked(i as usize) as f64;
-                *result.get_unchecked_mut(i as usize) =
-                    (bcfv * payoff_scale * cfreach_adj) as f32;
+                *result.get_unchecked_mut(i as usize) = (bcfv * payoff_scale * cfreach_adj) as f32;
             }
         }
     }
@@ -648,10 +668,7 @@ mod tests {
     use std::mem::MaybeUninit;
 
     /// Helper: build a simple river game and allocate memory.
-    fn make_river_game(
-        rake_rate: f64,
-        rake_cap: f64,
-    ) -> PostFlopGame {
+    fn make_river_game(rake_rate: f64, rake_cap: f64) -> PostFlopGame {
         let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
         let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
         let card_config = CardConfig {
@@ -707,8 +724,7 @@ mod tests {
     fn test_fold_evaluation_oop_folds() {
         let game = make_river_game(0.0, 0.0);
         // Find a fold node where OOP folded.
-        let fold_idx = find_fold_node(&game, PLAYER_OOP)
-            .expect("should have an OOP fold terminal");
+        let fold_idx = find_fold_node(&game, PLAYER_OOP).expect("should have an OOP fold terminal");
         let node = game.node_arena[fold_idx].lock();
 
         let num_ip = game.num_private_hands(1);
@@ -733,8 +749,7 @@ mod tests {
         let num_oop = game.num_private_hands(0);
 
         // Find a fold node where IP folded.
-        let fold_idx = find_fold_node(&game, PLAYER_IP)
-            .expect("should have an IP fold terminal");
+        let fold_idx = find_fold_node(&game, PLAYER_IP).expect("should have an IP fold terminal");
         let node = game.node_arena[fold_idx].lock();
 
         // Evaluate from OOP's perspective (OOP wins when IP folds).
@@ -746,7 +761,10 @@ mod tests {
 
         // OOP should gain positive value when IP folds.
         let nonzero_count = values.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "some OOP hands should have nonzero value");
+        assert!(
+            nonzero_count > 0,
+            "some OOP hands should have nonzero value"
+        );
 
         for &v in &values {
             assert!(v >= 0.0, "OOP value should be >= 0 when IP folds, got {v}");
@@ -758,8 +776,7 @@ mod tests {
         let game = make_river_game(0.0, 0.0);
         let num_oop = game.num_private_hands(0);
 
-        let fold_idx = find_fold_node(&game, PLAYER_IP)
-            .expect("should have an IP fold terminal");
+        let fold_idx = find_fold_node(&game, PLAYER_IP).expect("should have an IP fold terminal");
         let node = game.node_arena[fold_idx].lock();
 
         // All-zero opponent reach should produce all-zero result.
@@ -778,8 +795,7 @@ mod tests {
         let game = make_river_game(0.0, 0.0);
         let num_oop = game.num_private_hands(0);
 
-        let sd_idx = find_showdown_node(&game)
-            .expect("should have a showdown terminal");
+        let sd_idx = find_showdown_node(&game).expect("should have a showdown terminal");
         let node = game.node_arena[sd_idx].lock();
 
         // Use uniform reach for the opponent.
@@ -799,11 +815,15 @@ mod tests {
 
         // Verify zero-sum: the sum of cfvalues (weighted by uniform reach) should
         // be close to zero when evaluated from both sides.
-        let mut result_ip: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); game.num_private_hands(1)];
+        let mut result_ip: Vec<MaybeUninit<f32>> =
+            vec![MaybeUninit::uninit(); game.num_private_hands(1)];
         let cfreach_oop: Vec<f32> = vec![1.0; num_oop];
         game.evaluate_internal(&mut result_ip, &node, 1, &cfreach_oop);
 
-        let values_ip: Vec<f32> = result_ip.iter().map(|v| unsafe { v.assume_init() }).collect();
+        let values_ip: Vec<f32> = result_ip
+            .iter()
+            .map(|v| unsafe { v.assume_init() })
+            .collect();
         let sum_oop: f64 = values.iter().map(|&v| v as f64).sum();
         let sum_ip: f64 = values_ip.iter().map(|&v| v as f64).sum();
 
@@ -821,8 +841,7 @@ mod tests {
         let game = make_river_game(0.05, 10.0);
         let num_oop = game.num_private_hands(0);
 
-        let sd_idx = find_showdown_node(&game)
-            .expect("should have a showdown terminal");
+        let sd_idx = find_showdown_node(&game).expect("should have a showdown terminal");
         let node = game.node_arena[sd_idx].lock();
 
         let cfreach_ip: Vec<f32> = vec![1.0; game.num_private_hands(1)];
@@ -845,8 +864,7 @@ mod tests {
         let game = make_river_game(0.05, 10.0);
         let num_oop = game.num_private_hands(0);
 
-        let fold_idx = find_fold_node(&game, PLAYER_IP)
-            .expect("should have an IP fold terminal");
+        let fold_idx = find_fold_node(&game, PLAYER_IP).expect("should have an IP fold terminal");
         let node = game.node_arena[fold_idx].lock();
 
         let cfreach_ip: Vec<f32> = vec![1.0; game.num_private_hands(1)];
@@ -860,12 +878,13 @@ mod tests {
 
         // Compare against a no-rake game.
         let game_no_rake = make_river_game(0.0, 0.0);
-        let fold_idx_nr = find_fold_node(&game_no_rake, PLAYER_IP)
-            .expect("should have an IP fold terminal");
+        let fold_idx_nr =
+            find_fold_node(&game_no_rake, PLAYER_IP).expect("should have an IP fold terminal");
         let node_nr = game_no_rake.node_arena[fold_idx_nr].lock();
 
         let cfreach_ip_nr: Vec<f32> = vec![1.0; game_no_rake.num_private_hands(1)];
-        let mut result_nr: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); game_no_rake.num_private_hands(0)];
+        let mut result_nr: Vec<MaybeUninit<f32>> =
+            vec![MaybeUninit::uninit(); game_no_rake.num_private_hands(0)];
         game_no_rake.evaluate_internal(&mut result_nr, &node_nr, 0, &cfreach_ip_nr);
 
         let values_nr: Vec<f32> = result_nr
@@ -980,7 +999,10 @@ mod tests {
         assert!(nonzero_count > 0, "some hands should have nonzero value");
 
         for &v in &values {
-            assert!(v >= 0.0, "positive boundary CFVs should produce non-negative values, got {v}");
+            assert!(
+                v >= 0.0,
+                "positive boundary CFVs should produce non-negative values, got {v}"
+            );
         }
     }
 
@@ -1044,9 +1066,14 @@ mod tests {
         // boundary_reach stores the opponent's (IP's) reach for player=0 traversal.
         let opp = 0 ^ 1; // = 1
         let stored_first = game.boundary_reach(ordinal, opp);
-        assert!(!stored_first.is_empty(), "first visit should populate boundary_reach");
-        assert!(stored_first.iter().all(|&v| (v - 1.0).abs() < 1e-6),
-            "first visit should store the uniform reach");
+        assert!(
+            !stored_first.is_empty(),
+            "first visit should populate boundary_reach"
+        );
+        assert!(
+            stored_first.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "first visit should store the uniform reach"
+        );
 
         // Second visit: evaluate with a DIFFERENT reach (all 0.5).
         let cfreach_second = vec![0.5f32; num_ip];
@@ -1056,9 +1083,12 @@ mod tests {
         let stored_second = game.boundary_reach(ordinal, opp);
         // The reach should now reflect the SECOND visit's values (0.5),
         // not be stuck on the first visit's values (1.0).
-        assert!(stored_second.iter().all(|&v| (v - 0.5).abs() < 1e-6),
+        assert!(
+            stored_second.iter().all(|&v| (v - 0.5).abs() < 1e-6),
             "second visit should overwrite boundary_reach with new values, \
-             got {:?}", &stored_second[..stored_second.len().min(5)]);
+             got {:?}",
+            &stored_second[..stored_second.len().min(5)]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1087,9 +1117,17 @@ mod tests {
     fn test_regret_match_k_one_positive_concentrates() {
         let regrets = vec![10.0, 0.0, 0.0, 0.0];
         let strategy = regret_match_k(&regrets, 4);
-        assert!((strategy[0] - 1.0).abs() < 1e-6, "expected 1.0, got {}", strategy[0]);
+        assert!(
+            (strategy[0] - 1.0).abs() < 1e-6,
+            "expected 1.0, got {}",
+            strategy[0]
+        );
         for i in 1..4 {
-            assert!((strategy[i]).abs() < 1e-6, "expected 0.0, got {}", strategy[i]);
+            assert!(
+                (strategy[i]).abs() < 1e-6,
+                "expected 0.0, got {}",
+                strategy[i]
+            );
         }
     }
 
@@ -1298,8 +1336,13 @@ mod tests {
             _num_hands: usize,
             _continuation_index: usize,
         ) -> Vec<f32> {
-            self.single_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let n = if player == 0 { self.num_oop } else { self.num_ip };
+            self.single_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = if player == 0 {
+                self.num_oop
+            } else {
+                self.num_ip
+            };
             vec![1.0; n]
         }
 
@@ -1313,7 +1356,8 @@ mod tests {
             _num_ip: usize,
             _continuation_index: usize,
         ) -> (Vec<f32>, Vec<f32>) {
-            self.both_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.both_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             (vec![1.0; self.num_oop], vec![1.0; self.num_ip])
         }
     }
@@ -1364,7 +1408,10 @@ mod tests {
         // Values should be populated (non-panic, non-empty).
         let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
         let nonzero = values.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero > 0, "should produce nonzero values from per-boundary evaluator");
+        assert!(
+            nonzero > 0,
+            "should produce nonzero values from per-boundary evaluator"
+        );
     }
 
     #[test]
@@ -1448,8 +1495,13 @@ mod tests {
             _num_hands: usize,
             _continuation_index: usize,
         ) -> Vec<f32> {
-            self.legacy_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let n = if player == 0 { self.num_oop } else { self.num_ip };
+            self.legacy_called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = if player == 0 {
+                self.num_oop
+            } else {
+                self.num_ip
+            };
             vec![0.0; n]
         }
 
@@ -1463,7 +1515,8 @@ mod tests {
             _num_ip: usize,
             _continuation_index: usize,
         ) -> (Vec<f32>, Vec<f32>) {
-            self.legacy_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.legacy_called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             (vec![0.0; self.num_oop], vec![0.0; self.num_ip])
         }
 
@@ -1477,7 +1530,8 @@ mod tests {
             _num_ip: usize,
             _continuation_index: usize,
         ) -> Option<(Vec<f32>, Vec<f32>)> {
-            self.raw_called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.raw_called
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Return known values: 5.0 for every OOP hand, -3.0 for every IP hand.
             Some((vec![5.0; self.num_oop], vec![-3.0; self.num_ip]))
         }
@@ -1518,10 +1572,17 @@ mod tests {
         let values: Vec<f32> = result.iter().map(|v| unsafe { v.assume_init() }).collect();
 
         // Raw CFV path should be used (not the legacy bcfv path).
-        let raw_calls = mocks[ordinal].raw_called.load(std::sync::atomic::Ordering::SeqCst);
-        let legacy_calls = mocks[ordinal].legacy_called.load(std::sync::atomic::Ordering::SeqCst);
+        let raw_calls = mocks[ordinal]
+            .raw_called
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let legacy_calls = mocks[ordinal]
+            .legacy_called
+            .load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(raw_calls, 1, "compute_raw_cfvs_both should be called once");
-        assert_eq!(legacy_calls, 0, "legacy compute_cfvs_both should NOT be called");
+        assert_eq!(
+            legacy_calls, 0,
+            "legacy compute_cfvs_both should NOT be called"
+        );
 
         // The raw values (5.0 per OOP hand) should be written directly.
         // In the raw path, result[h] = raw_cfv[h] — no payoff_scale * cfreach_adj.
@@ -1574,8 +1635,13 @@ mod tests {
         let mut result2: Vec<MaybeUninit<f32>> = vec![MaybeUninit::uninit(); num_oop];
         game.evaluate_internal(&mut result2, &node, 0, &cfreach_ip);
 
-        let raw_calls = mocks[ordinal].raw_called.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(raw_calls, 2, "compute_raw_cfvs_both should be called twice after clear");
+        let raw_calls = mocks[ordinal]
+            .raw_called
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            raw_calls, 2,
+            "compute_raw_cfvs_both should be called twice after clear"
+        );
     }
 
     struct ReachDependentRawCfvEvaluator {

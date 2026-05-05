@@ -17,7 +17,7 @@ use poker_solver_core::blueprint_v2::config::{
     SnapshotConfig, StreetClusterConfig, TrainingConfig,
 };
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
-use poker_solver_core::blueprint_v2::mccfr::{Deal, DealWithBuckets, traverse_external};
+use poker_solver_core::blueprint_v2::mccfr::{traverse_external, Deal, DealWithBuckets};
 use poker_solver_core::blueprint_v2::per_flop_bucket_file::PerFlopBucketFile;
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
@@ -285,18 +285,14 @@ fn lift_bucket_strategy_for_node(
 
     // For turn/river, precompute card indices once
     let turn_idx = if street == Street::Turn || street == Street::River {
-        per_flop.and_then(|pf| {
-            turn_card.and_then(|tc| pf.turn_cards.iter().position(|&c| c == tc))
-        })
+        per_flop.and_then(|pf| turn_card.and_then(|tc| pf.turn_cards.iter().position(|&c| c == tc)))
     } else {
         None
     };
     let river_idx = if street == Street::River {
         turn_idx.and_then(|ti| {
             per_flop.and_then(|pf| {
-                river_card.and_then(|rc| {
-                    pf.river_cards_per_turn[ti].iter().position(|&c| c == rc)
-                })
+                river_card.and_then(|rc| pf.river_cards_per_turn[ti].iter().position(|&c| c == rc))
             })
         })
     } else {
@@ -354,7 +350,10 @@ fn extract_lifted_strategies(
     let mut result = StrategyMap::new();
 
     for (idx, node) in tree.nodes.iter().enumerate() {
-        if let GameNode::Decision { actions, street, .. } = node {
+        if let GameNode::Decision {
+            actions, street, ..
+        } = node
+        {
             let num_actions = actions.len();
             // Note: for tree-level extraction we don't have specific board cards.
             // Turn/river nodes need board context which we don't have here.
@@ -389,7 +388,9 @@ pub fn find_flop_root(tree: &GameTree) -> u32 {
     let mut idx = tree.root;
     loop {
         match &tree.nodes[idx as usize] {
-            GameNode::Decision { street, children, .. } => {
+            GameNode::Decision {
+                street, children, ..
+            } => {
                 if *street != Street::Preflop {
                     return idx;
                 }
@@ -424,7 +425,9 @@ pub fn find_flop_root(tree: &GameTree) -> u32 {
 /// DFS helper to find the first Flop decision node reachable from `idx`.
 fn find_flop_root_dfs(tree: &GameTree, idx: u32) -> Option<u32> {
     match &tree.nodes[idx as usize] {
-        GameNode::Decision { street, children, .. } => {
+        GameNode::Decision {
+            street, children, ..
+        } => {
             if *street != Street::Preflop {
                 return Some(idx);
             }
@@ -520,7 +523,15 @@ pub fn lock_strategy_recursive(
 
                 history.push(card as usize);
                 game.play(card as usize);
-                lock_strategy_recursive(game, tree, storage, per_flop, bp_child, history, board_cards);
+                lock_strategy_recursive(
+                    game,
+                    tree,
+                    storage,
+                    per_flop,
+                    bp_child,
+                    history,
+                    board_cards,
+                );
                 history.pop();
                 *board_cards = prev;
                 crate::evaluator::navigate_back(game, history);
@@ -533,7 +544,10 @@ pub fn lock_strategy_recursive(
     let bp_node = &tree.nodes[bp_node_idx as usize];
     let (bp_street, bp_actions, bp_children) = match bp_node {
         GameNode::Decision {
-            street, actions, children, ..
+            street,
+            actions,
+            children,
+            ..
         } => (*street, actions, children),
         other => panic!(
             "Expected blueprint Decision node at idx {}, got {:?}",
@@ -572,7 +586,15 @@ pub fn lock_strategy_recursive(
     for (action_idx, &bp_child_idx) in bp_children.iter().enumerate() {
         history.push(action_idx);
         game.play(action_idx);
-        lock_strategy_recursive(game, tree, storage, per_flop, bp_child_idx, history, board_cards);
+        lock_strategy_recursive(
+            game,
+            tree,
+            storage,
+            per_flop,
+            bp_child_idx,
+            history,
+            board_cards,
+        );
         history.pop();
         crate::evaluator::navigate_back(game, history);
     }
@@ -757,8 +779,15 @@ fn lock_head_to_head_recursive(
                 history.push(card as usize);
                 game.play(card as usize);
                 lock_head_to_head_recursive(
-                    game, tree, storage, per_flop, baseline_strategy,
-                    bp_child, history, mccfr_player, board_cards,
+                    game,
+                    tree,
+                    storage,
+                    per_flop,
+                    baseline_strategy,
+                    bp_child,
+                    history,
+                    mccfr_player,
+                    board_cards,
                 );
                 history.pop();
                 *board_cards = prev;
@@ -772,7 +801,10 @@ fn lock_head_to_head_recursive(
     let bp_node = &tree.nodes[bp_node_idx as usize];
     let (bp_street, bp_actions, bp_children) = match bp_node {
         GameNode::Decision {
-            street, actions, children, ..
+            street,
+            actions,
+            children,
+            ..
         } => (*street, actions, children),
         other => panic!(
             "Expected blueprint Decision node at idx {}, got {:?}",
@@ -797,8 +829,14 @@ fn lock_head_to_head_recursive(
         // Lock MCCFR lifted strategy with street-aware bucket lookup
         let combos = game.private_cards(player);
         let strategy = lift_bucket_strategy_for_node(
-            storage, bp_node_idx, bp_street, num_actions, combos,
-            per_flop, board_cards.0, board_cards.1,
+            storage,
+            bp_node_idx,
+            bp_street,
+            num_actions,
+            combos,
+            per_flop,
+            board_cards.0,
+            board_cards.1,
         );
         game.lock_current_strategy(&strategy);
     } else {
@@ -814,8 +852,15 @@ fn lock_head_to_head_recursive(
         history.push(action_idx);
         game.play(action_idx);
         lock_head_to_head_recursive(
-            game, tree, storage, per_flop, baseline_strategy,
-            bp_child_idx, history, mccfr_player, board_cards,
+            game,
+            tree,
+            storage,
+            per_flop,
+            baseline_strategy,
+            bp_child_idx,
+            history,
+            mccfr_player,
+            board_cards,
         );
         history.pop();
         crate::evaluator::navigate_back(game, history);
@@ -848,12 +893,7 @@ impl MccfrSolver {
     /// `turn_buckets` and `river_buckets` control the granularity of the
     /// potential-aware clustering used for turn and river streets.
     pub fn new(config: FlopPokerConfig, turn_buckets: u16, river_buckets: u16) -> Self {
-        Self::new_multi_flop(
-            config,
-            &[flop_cards()],
-            turn_buckets,
-            river_buckets,
-        )
+        Self::new_multi_flop(config, &[flop_cards()], turn_buckets, river_buckets)
     }
 
     /// Create a new MCCFR solver with multiple flops.
@@ -997,7 +1037,12 @@ impl MccfrSolver {
             .turn_cards
             .iter()
             .position(|&c| c == turn_card)
-            .unwrap_or_else(|| panic!("Turn card {:?} not found in per-flop bucket file", turn_card));
+            .unwrap_or_else(|| {
+                panic!(
+                    "Turn card {:?} not found in per-flop bucket file",
+                    turn_card
+                )
+            });
         let river_idx = pf.river_cards_per_turn[turn_idx]
             .iter()
             .position(|&c| c == river_card)

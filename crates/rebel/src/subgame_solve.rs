@@ -10,16 +10,18 @@
 
 use crate::inference_server::InferenceHandle;
 use crate::leaf_evaluator::build_boundary_input;
-use crate::pbs::{Pbs, NUM_COMBOS};
+use crate::pbs::{NUM_COMBOS, Pbs};
 use crate::solver::SolveConfig;
 use cfvnet::model::network::OUTPUT_SIZE;
 use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card as RsPokerCard;
 use range_solver::{
+    CardConfig, PostFlopGame,
     action_tree::{ActionTree, BoardState, TreeConfig},
-    card::{card_pair_to_index, Card, NOT_DEALT},
+    card::{Card, NOT_DEALT, card_pair_to_index},
+    finalize,
     range::Range,
-    finalize, solve, solve_step, CardConfig, PostFlopGame,
+    solve, solve_step,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,9 +100,7 @@ pub fn solve_subgame(
         5 => solve_subgame_river(pbs, config),
         4 => solve_subgame_with_boundaries(pbs, config, evaluator, Street::Turn),
         3 => solve_subgame_with_boundaries(pbs, config, evaluator, Street::Flop),
-        n => Err(format!(
-            "subgame solving requires 3-5 board cards, got {n}"
-        )),
+        n => Err(format!("subgame solving requires 3-5 board cards, got {n}")),
     }
 }
 
@@ -179,11 +179,7 @@ pub fn solve_subgame_iterative(
 /// per-iteration ranges from the evolving strategy. Using the actual per-iteration
 /// reaches requires extracting reach probabilities through the tree at each
 /// iteration, which is a follow-up optimization.
-fn evaluate_boundaries_via_server(
-    game: &PostFlopGame,
-    pbs: &Pbs,
-    handle: &InferenceHandle,
-) {
+fn evaluate_boundaries_via_server(game: &PostFlopGame, pbs: &Pbs, handle: &InferenceHandle) {
     let n_boundary = game.num_boundary_nodes();
     let starting_pot = game.tree_config().starting_pot;
     let eff_stack = game.tree_config().effective_stack;
@@ -514,8 +510,7 @@ mod tests {
 
     /// Build a test solve config with reasonable defaults.
     fn test_solve_config() -> SolveConfig {
-        let bet_sizes =
-            BetSizeOptions::try_from(("50%,a", "")).expect("valid test bet sizes");
+        let bet_sizes = BetSizeOptions::try_from(("50%,a", "")).expect("valid test bet sizes");
         SolveConfig {
             bet_sizes,
             turn_bet_sizes: None,
@@ -646,7 +641,10 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked > 0, "expected to check at least one non-blocked combo");
+        assert!(
+            checked > 0,
+            "expected to check at least one non-blocked combo"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -677,10 +675,7 @@ mod tests {
         }
 
         // Strategy length should be correct
-        assert_eq!(
-            result.root_strategy.len(),
-            NUM_COMBOS * result.num_actions
-        );
+        assert_eq!(result.root_strategy.len(), NUM_COMBOS * result.num_actions);
 
         // Strategy should sum to ~1.0 for non-blocked combos
         for i in 0..NUM_COMBOS {
@@ -792,13 +787,13 @@ mod tests {
     fn test_solve_subgame_iterative_river() {
         // River PBSs have no boundaries, so iterative solver should produce
         // the same kind of results as the one-shot solver.
-        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         use burn::backend::{Autodiff, NdArray};
         use cfvnet::model::network::{CfvNet, INPUT_SIZE};
 
-        use crate::inference_server::{spawn_inference_server, InferenceServerConfig};
+        use crate::inference_server::{InferenceServerConfig, spawn_inference_server};
         use crate::replay_buffer::ReplayBuffer;
 
         type TestBackend = Autodiff<NdArray>;
@@ -831,10 +826,7 @@ mod tests {
 
         // Should produce valid results (same checks as river one-shot test).
         assert!(result.num_actions > 0);
-        assert_eq!(
-            result.root_strategy.len(),
-            NUM_COMBOS * result.num_actions,
-        );
+        assert_eq!(result.root_strategy.len(), NUM_COMBOS * result.num_actions,);
 
         // CFVs should be finite.
         for player in 0..2 {
@@ -855,14 +847,16 @@ mod tests {
         }
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        server_thread.join().expect("server thread should not panic");
+        server_thread
+            .join()
+            .expect("server thread should not panic");
     }
 
     #[test]
     fn test_solve_subgame_iterative_error_cases() {
         // Verify error handling without needing a real inference server.
-        use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
 
         let (tx, _rx) = crossbeam_channel::unbounded();
         let handle = InferenceHandle::new_for_test(tx, Arc::new(AtomicUsize::new(0)));
@@ -889,13 +883,13 @@ mod tests {
         // Requires a running inference server with a loaded CfvNet model.
         //
         // Run with: cargo test -p rebel subgame_solve::tests::test_solve_subgame_iterative_turn_integration -- --ignored
-        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         use burn::backend::{Autodiff, NdArray};
         use cfvnet::model::network::{CfvNet, INPUT_SIZE};
 
-        use crate::inference_server::{spawn_inference_server, InferenceServerConfig};
+        use crate::inference_server::{InferenceServerConfig, spawn_inference_server};
         use crate::replay_buffer::ReplayBuffer;
 
         type TestBackend = Autodiff<NdArray>;
@@ -954,6 +948,8 @@ mod tests {
         }
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        server_thread.join().expect("server thread should not panic");
+        server_thread
+            .join()
+            .expect("server thread should not panic");
     }
 }

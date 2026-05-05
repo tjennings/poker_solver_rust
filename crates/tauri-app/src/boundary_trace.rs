@@ -10,15 +10,17 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use range_solver::Action;
 use range_solver::card::index_to_card_pair;
 use range_solver::interface::{Game, GameNode};
+use range_solver::Action;
 
 // ---------------------------------------------------------------------------
 // Hand name formatting
 // ---------------------------------------------------------------------------
 
-const RANK_CHARS: [char; 13] = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+const RANK_CHARS: [char; 13] = [
+    '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A',
+];
 
 /// Map a card pair to a canonical hand name (e.g. "AA", "AKs", "72o").
 ///
@@ -93,7 +95,9 @@ fn aggregate_1326_by_hand(values: &[f32], threshold: f32) -> Vec<HandClassAgg> {
         } else {
             0.0
         };
-        mean_b.partial_cmp(&mean_a).unwrap_or(std::cmp::Ordering::Equal)
+        mean_b
+            .partial_cmp(&mean_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     aggs
@@ -110,7 +114,10 @@ pub fn format_range_as_hands(range_1326: &[f32]) -> String {
         .filter(|a| a.nonzero_combos > 0)
         .map(|a| {
             let mean = a.weight_sum / a.nonzero_combos as f64;
-            format!("{}:{}/{}:{:.2}", a.name, a.nonzero_combos, a.total_combos, mean)
+            format!(
+                "{}:{}/{}:{:.2}",
+                a.name, a.nonzero_combos, a.total_combos, mean
+            )
         })
         .collect();
     parts.join(" ")
@@ -345,10 +352,7 @@ pub fn expand_to_1326(
 }
 
 /// Build a 1326-element range vector from a player's initial weights.
-pub fn build_1326_range(
-    game: &range_solver::PostFlopGame,
-    player: usize,
-) -> Vec<f32> {
+pub fn build_1326_range(game: &range_solver::PostFlopGame, player: usize) -> Vec<f32> {
     expand_to_1326(game, player, game.initial_weights(player))
 }
 
@@ -406,7 +410,13 @@ pub fn extract_strategy_at_prev(
         .map(|(name, (total_w, weighted_probs))| {
             let probs: Vec<f32> = weighted_probs
                 .iter()
-                .map(|&wp| if total_w > 0.0 { (wp / total_w) as f32 } else { 0.0 })
+                .map(|&wp| {
+                    if total_w > 0.0 {
+                        (wp / total_w) as f32
+                    } else {
+                        0.0
+                    }
+                })
                 .collect();
             (name, total_w, probs)
         })
@@ -477,14 +487,11 @@ fn capture_boundary_traces_impl(
         let board_cards = &boards[ordinal];
         let board_str: String = board_cards
             .iter()
-            .map(|&c| {
-                range_solver::card::card_to_string(c).unwrap_or_else(|_| "??".to_string())
-            })
+            .map(|&c| range_solver::card::card_to_string(c).unwrap_or_else(|_| "??".to_string()))
             .collect();
 
         let pot = game.boundary_pot(ordinal);
-        let stack =
-            (game.tree_config().effective_stack as f64 - pot as f64 / 2.0).max(0.0);
+        let stack = (game.tree_config().effective_stack as f64 - pot as f64 / 2.0).max(0.0);
 
         let oop_reach = game.boundary_reach(ordinal, 0);
         let ip_reach = game.boundary_reach(ordinal, 1);
@@ -508,8 +515,8 @@ fn capture_boundary_traces_impl(
 
         let spot = spot_paths.and_then(|paths| paths.get(ordinal).cloned());
 
-        let strategy_at_prev = preceding_map
-            .and_then(|map| extract_strategy_at_prev(game, map, ordinal));
+        let strategy_at_prev =
+            preceding_map.and_then(|map| extract_strategy_at_prev(game, map, ordinal));
 
         let event = BoundaryTraceEvent {
             board: board_str,
@@ -567,7 +574,12 @@ impl TraceConfig {
             return None;
         }
         let iter_filter = TraceFilter::parse_iters(&self.iters_str, total_iters);
-        Some(BoundaryTracer::new(ord_filter, iter_filter, self.dir, skip_leading))
+        Some(BoundaryTracer::new(
+            ord_filter,
+            iter_filter,
+            self.dir,
+            skip_leading,
+        ))
     }
 }
 
@@ -701,11 +713,20 @@ pub fn format_trace_txt(iter: u32, boundary_ord: usize, event: &BoundaryTraceEve
 /// what the UI displays). Used for the one-shot capture after the solve loop
 /// exits. Per-iter captures inside the loop use `format_trace_txt` which
 /// shows the raw current-iter strategy (useful for convergence diagnostics).
-pub fn format_trace_txt_final(iter: u32, boundary_ord: usize, event: &BoundaryTraceEvent) -> String {
+pub fn format_trace_txt_final(
+    iter: u32,
+    boundary_ord: usize,
+    event: &BoundaryTraceEvent,
+) -> String {
     format_trace_txt_impl(iter, boundary_ord, event, true)
 }
 
-fn format_trace_txt_impl(iter: u32, boundary_ord: usize, event: &BoundaryTraceEvent, is_final: bool) -> String {
+fn format_trace_txt_impl(
+    iter: u32,
+    boundary_ord: usize,
+    event: &BoundaryTraceEvent,
+    is_final: bool,
+) -> String {
     let mut out = String::with_capacity(4096);
 
     // Header line
@@ -718,9 +739,7 @@ fn format_trace_txt_impl(iter: u32, boundary_ord: usize, event: &BoundaryTraceEv
     let _ = writeln!(
         out,
         "[iter={iter}{final_tag} boundary={boundary_ord} board={} pot={} stack={} spr={spr:.2}]",
-        event.board,
-        event.pot,
-        event.stack as i64,
+        event.board, event.pot, event.stack as i64,
     );
 
     // Spot line (only if present)
@@ -859,8 +878,7 @@ impl BoundaryTracer {
 
         let mut handles = self.handles.lock().expect("tracer lock poisoned");
         let writer = handles.entry(ord).or_insert_with(|| {
-            std::fs::create_dir_all(&self.trace_dir)
-                .expect("failed to create trace directory");
+            std::fs::create_dir_all(&self.trace_dir).expect("failed to create trace directory");
             let path = self.trace_dir.join(format!("boundary_{ord}.txt"));
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -886,9 +904,9 @@ mod tests {
     /// Build a turn-start game with depth_limit=1, so flop→turn chance
     /// creates depth boundary nodes (one per non-isomorphic turn card).
     fn make_depth_limited_turn_game() -> range_solver::PostFlopGame {
-        use range_solver::card::{card_from_str, flop_from_str, NOT_DEALT};
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::{CardConfig, ActionTree, TreeConfig, BoardState, PostFlopGame};
+        use range_solver::card::{card_from_str, flop_from_str, NOT_DEALT};
+        use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
         let oop_range: range_solver::range::Range = "AA,KK".parse().unwrap();
         let ip_range: range_solver::range::Range = "QQ,JJ".parse().unwrap();
@@ -1036,7 +1054,10 @@ mod tests {
             Action::Fold,
         ];
         let result = format_action_path_as_spot_suffix(&actions);
-        assert_eq!(result, "bb:check,sb:22bb,bb:call|7c|bb:check,sb:all-in,bb:fold");
+        assert_eq!(
+            result,
+            "bb:check,sb:22bb,bb:call|7c|bb:check,sb:all-in,bb:fold"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1148,7 +1169,12 @@ mod tests {
         let range = vec![1.0f32; 1326];
         let result = format_range_as_hands(&range);
         let entries: Vec<&str> = result.split_whitespace().collect();
-        assert_eq!(entries.len(), 169, "expected 169 hand classes, got {}", entries.len());
+        assert_eq!(
+            entries.len(),
+            169,
+            "expected 169 hand classes, got {}",
+            entries.len()
+        );
     }
 
     #[test]
@@ -1184,14 +1210,17 @@ mod tests {
     fn format_range_sorted_by_descending_weight() {
         let mut range = vec![0.5f32; 1326];
         use range_solver::card::card_pair_to_index;
-        let aa_pairs = [(48,49),(48,50),(48,51),(49,50),(49,51),(50,51)];
+        let aa_pairs = [(48, 49), (48, 50), (48, 51), (49, 50), (49, 51), (50, 51)];
         for (c1, c2) in &aa_pairs {
             range[card_pair_to_index(*c1, *c2)] = 1.0;
         }
         let result = format_range_as_hands(&range);
         let aa_pos = result.find("AA:").expect("AA not found");
         let kk_pos = result.find("KK:").expect("KK not found");
-        assert!(aa_pos < kk_pos, "AA ({aa_pos}) should appear before KK ({kk_pos})");
+        assert!(
+            aa_pos < kk_pos,
+            "AA ({aa_pos}) should appear before KK ({kk_pos})"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1376,7 +1405,9 @@ mod tests {
             board: "JdTh9dQc".to_string(),
             pot: 88,
             stack: 78.0,
-            spot: Some("sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c".to_string()),
+            spot: Some(
+                "sb:2bb,bb:10bb,sb:22bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c".to_string(),
+            ),
             oop_range_1326: vec![1.0; 1326],
             ip_range_1326: vec![0.5; 1326],
             oop_cfvs_1326: vec![5.0; 1326],
@@ -1408,7 +1439,8 @@ mod tests {
         let lines: Vec<&str> = txt.lines().collect();
         assert!(
             lines[1].starts_with("Spot: sb:2bb,bb:call|Jd9d7d|bb:check,sb:bet44%,bb:call|3c"),
-            "spot line mismatch: {}", lines[1]
+            "spot line mismatch: {}",
+            lines[1]
         );
     }
 
@@ -1469,7 +1501,11 @@ mod tests {
             strategy_at_prev: Some(StrategyAtPrevDecision {
                 node_idx: 1234,
                 player: 0,
-                actions: vec!["check".to_string(), "bet33%".to_string(), "allin".to_string()],
+                actions: vec![
+                    "check".to_string(),
+                    "bet33%".to_string(),
+                    "allin".to_string(),
+                ],
                 by_hand: vec![
                     ("AA".to_string(), vec![0.0, 0.30, 0.70]),
                     ("KK".to_string(), vec![0.20, 0.80, 0.00]),
@@ -1522,7 +1558,10 @@ mod tests {
             strategy_at_prev: None,
         };
         let txt = format_trace_txt(0, 0, &event);
-        assert!(!txt.contains("Spot:"), "should not have Spot line when None");
+        assert!(
+            !txt.contains("Spot:"),
+            "should not have Spot line when None"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1548,12 +1587,7 @@ mod tests {
     fn tracer_writes_txt_file() {
         let dir = std::env::temp_dir().join("boundary_trace_test_txt");
         let _ = std::fs::remove_dir_all(&dir);
-        let tracer = BoundaryTracer::new(
-            TraceFilter::All,
-            TraceFilter::All,
-            dir.clone(),
-            0,
-        );
+        let tracer = BoundaryTracer::new(TraceFilter::All, TraceFilter::All, dir.clone(), 0);
         let event = BoundaryTraceEvent {
             board: "Jd9d7dQc".to_string(),
             pot: 88,
@@ -1573,11 +1607,22 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         // Two records, each ending with "---\n"
         let separators: Vec<_> = content.match_indices("---").collect();
-        assert_eq!(separators.len(), 2, "expected 2 records, got {}", separators.len());
+        assert_eq!(
+            separators.len(),
+            2,
+            "expected 2 records, got {}",
+            separators.len()
+        );
 
         // First record should have iter=0, second iter=1
-        assert!(content.contains("[iter=0 boundary=42"), "first record header");
-        assert!(content.contains("[iter=1 boundary=42"), "second record header");
+        assert!(
+            content.contains("[iter=0 boundary=42"),
+            "first record header"
+        );
+        assert!(
+            content.contains("[iter=1 boundary=42"),
+            "second record header"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1620,10 +1665,8 @@ mod tests {
 
     #[test]
     fn tracer_skips_leading_ordinals() {
-        let dir = std::env::temp_dir().join(format!(
-            "gadget_tracer_skip_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gadget_tracer_skip_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::All,
@@ -1666,10 +1709,8 @@ mod tests {
 
     #[test]
     fn tracer_skip_zero_traces_all() {
-        let dir = std::env::temp_dir().join(format!(
-            "gadget_tracer_skip0_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gadget_tracer_skip0_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::All,

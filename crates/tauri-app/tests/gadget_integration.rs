@@ -51,7 +51,10 @@ fn per_boundary_gadget_game_root_is_real_subgame() {
 
     // Root is the REAL subgame root (OOP acts first in turn), not a gadget.
     let root = game.root();
-    assert!(!root.is_gadget(), "root should NOT be a gadget node under A2");
+    assert!(
+        !root.is_gadget(),
+        "root should NOT be a gadget node under A2"
+    );
     assert_eq!(root.acting_player(), 0, "OOP acts first at turn root");
     assert!(
         root.num_actions() > 2,

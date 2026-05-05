@@ -1,8 +1,8 @@
 use rand::Rng;
 
-use crate::config::DatagenConfig;
 use super::precompute_ranges::PrecomputedRanges;
 use super::range_gen::{compute_hand_strengths, generate_rsp_range_with_strengths, NUM_COMBOS};
+use crate::config::DatagenConfig;
 
 /// A single training situation before solving.
 #[derive(Debug, Clone)]
@@ -75,7 +75,11 @@ pub fn sample_situation_with_blueprint<R: Rng>(
     } else {
         let pot = sample_pot(&config.pot_intervals, rng);
         let max_stack = initial_stack - pot / 2;
-        let effective_stack = if max_stack < 5 { 5 } else { rng.gen_range(5..=max_stack) };
+        let effective_stack = if max_stack < 5 {
+            5
+        } else {
+            rng.gen_range(5..=max_stack)
+        };
         (pot, effective_stack)
     };
 
@@ -111,7 +115,10 @@ pub fn sample_situation_with_blueprint<R: Rng>(
 ///
 /// Panics if `num_cards` is greater than 5 or 52.
 pub fn sample_board<R: Rng>(num_cards: usize, rng: &mut R) -> [u8; 5] {
-    assert!(num_cards <= 5, "board cannot have more than 5 cards, got {num_cards}");
+    assert!(
+        num_cards <= 5,
+        "board cannot have more than 5 cards, got {num_cards}"
+    );
     let mut board = [0u8; 5];
     let mut used = [false; 52];
     for slot in board.iter_mut().take(num_cards) {
@@ -356,9 +363,8 @@ mod tests {
         let mut bucket_hits = vec![0u32; spr_intervals.len()];
 
         for _ in 0..1000 {
-            let (pot, stack) = sample_pot_stack_by_spr(
-                &pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng,
-            );
+            let (pot, stack) =
+                sample_pot_stack_by_spr(&pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng);
             let actual_spr = stack as f64 / pot as f64;
             for (i, [lo, hi]) in spr_intervals.iter().enumerate() {
                 if actual_spr >= *lo && actual_spr < *hi {
@@ -372,7 +378,8 @@ mod tests {
             assert!(
                 *hits > 0,
                 "SPR bucket {} ({:?}) got zero hits",
-                i, spr_intervals[i]
+                i,
+                spr_intervals[i]
             );
         }
     }
@@ -384,21 +391,20 @@ mod tests {
         let spr_intervals = test_spr_intervals();
 
         for _ in 0..500 {
-            let (pot, stack) = sample_pot_stack_by_spr(
-                &pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng,
-            );
+            let (pot, stack) =
+                sample_pot_stack_by_spr(&pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng);
             let max_stack = INITIAL_STACK - pot / 2;
 
             assert!(stack >= 5, "stack {} < 5", stack);
             assert!(
                 stack <= max_stack,
                 "stack {} > max_stack {} for pot {}",
-                stack, max_stack, pot
+                stack,
+                max_stack,
+                pot
             );
 
-            let in_some_pot_interval = pot_intervals
-                .iter()
-                .any(|[lo, hi]| pot >= *lo && pot < *hi);
+            let in_some_pot_interval = pot_intervals.iter().any(|[lo, hi]| pot >= *lo && pot < *hi);
             assert!(
                 in_some_pot_interval,
                 "pot {} not in any interval {:?}",
@@ -414,9 +420,8 @@ mod tests {
         let spr_intervals = test_spr_intervals();
 
         for _ in 0..500 {
-            let (pot, stack) = sample_pot_stack_by_spr(
-                &pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng,
-            );
+            let (pot, stack) =
+                sample_pot_stack_by_spr(&pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng);
             let actual_spr = stack as f64 / pot as f64;
             let in_some_spr_bucket = spr_intervals
                 .iter()
@@ -509,12 +514,15 @@ mod tests {
         let mut cell_hits = vec![vec![0u32; num_pot]; num_spr];
 
         for _ in 0..5000 {
-            let (pot, stack) = sample_pot_stack_by_spr(
-                &pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng,
-            );
+            let (pot, stack) =
+                sample_pot_stack_by_spr(&pot_intervals, &spr_intervals, INITIAL_STACK, &mut rng);
             let actual_spr = stack as f64 / pot as f64;
-            let spr_idx = spr_intervals.iter().position(|[lo, hi]| actual_spr >= *lo && actual_spr < *hi);
-            let pot_idx = pot_intervals.iter().position(|[lo, hi]| pot >= *lo && pot < *hi);
+            let spr_idx = spr_intervals
+                .iter()
+                .position(|[lo, hi]| actual_spr >= *lo && actual_spr < *hi);
+            let pot_idx = pot_intervals
+                .iter()
+                .position(|[lo, hi]| pot >= *lo && pot < *hi);
             if let (Some(si), Some(pi)) = (spr_idx, pot_idx) {
                 cell_hits[si][pi] += 1;
             }
@@ -532,7 +540,10 @@ mod tests {
             assert!(
                 count * 4 >= max_pot,
                 "pot bucket {} ({:?}) underrepresented: {} vs max {}",
-                pi, pot_intervals[pi], count, max_pot
+                pi,
+                pot_intervals[pi],
+                count,
+                max_pot
             );
         }
 
@@ -548,7 +559,10 @@ mod tests {
             assert!(
                 count * 4 >= max_spr,
                 "SPR bucket {} ({:?}) underrepresented: {} vs max {}",
-                si, spr_intervals[si], count, max_spr
+                si,
+                spr_intervals[si],
+                count,
+                max_spr
             );
         }
     }

@@ -218,7 +218,10 @@ fn append_random_suffix(path: &std::path::Path) -> PathBuf {
         })
         .collect();
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
     let new_name = format!("{stem}_{suffix}{ext}");
     path.with_file_name(new_name)
 }
@@ -264,7 +267,15 @@ fn main() {
             if let Some(ref o) = output {
                 ensure_parent_dir(o);
             }
-            cmd_generate(config, output, num_samples, threads, per_file, &backend, river_output);
+            cmd_generate(
+                config,
+                output,
+                num_samples,
+                threads,
+                per_file,
+                &backend,
+                river_output,
+            );
         }
         Commands::Train {
             config,
@@ -286,10 +297,7 @@ fn main() {
             river_model,
             num_spots,
         } => cmd_compare_net(model, river_model, num_spots),
-        Commands::CompareExact {
-            model,
-            num_spots,
-        } => cmd_compare_exact(model, num_spots),
+        Commands::CompareExact { model, num_spots } => cmd_compare_exact(model, num_spots),
         Commands::TrainBoundary {
             config,
             data,
@@ -300,18 +308,35 @@ fn main() {
             cmd_train_boundary(config, data, output, &backend);
         }
         Commands::EvalBoundary { model, data } => cmd_eval_boundary(model, data),
-        Commands::CompareBoundary { model, data, num_positions } => {
+        Commands::CompareBoundary {
+            model,
+            data,
+            num_positions,
+        } => {
             cmd_compare_boundary(&model, &data, num_positions);
         }
         Commands::DatagenEval { data } => cmd_datagen_eval(data),
-        Commands::BenchSolve { config, num_samples, threads } => {
+        Commands::BenchSolve {
+            config,
+            num_samples,
+            threads,
+        } => {
             cmd_bench_solve(config, num_samples, threads);
         }
-        Commands::DiagnoseBoundary { model, data, num_records, csv_out } => {
+        Commands::DiagnoseBoundary {
+            model,
+            data,
+            num_records,
+            csv_out,
+        } => {
             cmd_diagnose_boundary(model, data, num_records, csv_out);
         }
         Commands::InspectPreflopRanges { path } => cmd_inspect_preflop_ranges(path),
-        Commands::FilterPreflopRanges { input, output, label } => {
+        Commands::FilterPreflopRanges {
+            input,
+            output,
+            label,
+        } => {
             cmd_filter_preflop_ranges(input, output, label);
         }
         Commands::PrecomputeRanges {
@@ -322,7 +347,13 @@ fn main() {
             initial_stack,
         } => {
             ensure_parent_dir(&output);
-            cmd_precompute_ranges(blueprint, output, samples_per_bucket, &spr_boundaries, initial_stack);
+            cmd_precompute_ranges(
+                blueprint,
+                output,
+                samples_per_bucket,
+                &spr_boundaries,
+                initial_stack,
+            );
         }
     }
 }
@@ -343,7 +374,10 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
     // Create output directory and write config before training starts,
     // so the config is preserved even if training is interrupted.
     std::fs::create_dir_all(&output).unwrap_or_else(|e| {
-        eprintln!("failed to create output directory {}: {e}", output.display());
+        eprintln!(
+            "failed to create output directory {}: {e}",
+            output.display()
+        );
         std::process::exit(1);
     });
     let config_out = output.join("config.yaml");
@@ -377,11 +411,20 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
 
     match backend {
         "wgpu" => {
-            use burn::backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}};
+            use burn::backend::{
+                Autodiff,
+                wgpu::{Wgpu, WgpuDevice},
+            };
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
             println!("Using wgpu backend (Metal GPU on macOS)");
-            let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            let result = cfvnet::model::training::train::<B>(
+                &device,
+                &data,
+                board_cards,
+                &train_config,
+                Some(&output),
+            );
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         "ndarray" => {
@@ -389,7 +432,13 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             type B = Autodiff<NdArray>;
             let device = Default::default();
             println!("Using ndarray backend (CPU)");
-            let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            let result = cfvnet::model::training::train::<B>(
+                &device,
+                &data,
+                board_cards,
+                &train_config,
+                Some(&output),
+            );
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(feature = "cuda")]
@@ -398,12 +447,20 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
-            let result = cfvnet::model::training::train::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            let result = cfvnet::model::training::train::<B>(
+                &device,
+                &data,
+                board_cards,
+                &train_config,
+                Some(&output),
+            );
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(not(feature = "cuda"))]
         "cuda" => {
-            eprintln!("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release");
+            eprintln!(
+                "CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release"
+            );
             std::process::exit(1);
         }
         other => {
@@ -428,7 +485,10 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
 
     // Create output directory and write config before training starts.
     std::fs::create_dir_all(&output).unwrap_or_else(|e| {
-        eprintln!("failed to create output directory {}: {e}", output.display());
+        eprintln!(
+            "failed to create output directory {}: {e}",
+            output.display()
+        );
         std::process::exit(1);
     });
     let config_out = output.join("config.yaml");
@@ -462,11 +522,20 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
 
     match backend {
         "wgpu" => {
-            use burn::backend::{Autodiff, wgpu::{Wgpu, WgpuDevice}};
+            use burn::backend::{
+                Autodiff,
+                wgpu::{Wgpu, WgpuDevice},
+            };
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
             println!("Using wgpu backend (Metal GPU on macOS)");
-            let result = cfvnet::model::boundary_training::train_boundary::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            let result = cfvnet::model::boundary_training::train_boundary::<B>(
+                &device,
+                &data,
+                board_cards,
+                &train_config,
+                Some(&output),
+            );
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         "ndarray" => {
@@ -474,7 +543,13 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
             type B = Autodiff<NdArray>;
             let device = Default::default();
             println!("Using ndarray backend (CPU)");
-            let result = cfvnet::model::boundary_training::train_boundary::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            let result = cfvnet::model::boundary_training::train_boundary::<B>(
+                &device,
+                &data,
+                board_cards,
+                &train_config,
+                Some(&output),
+            );
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(feature = "cuda")]
@@ -483,12 +558,20 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
-            let result = cfvnet::model::boundary_training::train_boundary::<B>(&device, &data, board_cards, &train_config, Some(&output));
+            let result = cfvnet::model::boundary_training::train_boundary::<B>(
+                &device,
+                &data,
+                board_cards,
+                &train_config,
+                Some(&output),
+            );
             println!("Training complete. Final loss: {}", result.final_train_loss);
         }
         #[cfg(not(feature = "cuda"))]
         "cuda" => {
-            eprintln!("CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release");
+            eprintln!(
+                "CUDA backend not enabled. Rebuild with: cargo build -p cfvnet --features cuda --release"
+            );
             std::process::exit(1);
         }
         other => {
@@ -561,9 +644,7 @@ fn cmd_generate(
             "Generating {total} {street} training samples across {num_files} files ({chunk_size} per file)..."
         );
     } else {
-        println!(
-            "Generating {total} {street} training samples...",
-        );
+        println!("Generating {total} {street} training samples...",);
     }
 
     let base_seed = cfvnet::config::resolve_seed(cfg.datagen.seed);
@@ -591,7 +672,9 @@ fn cmd_generate(
         }
 
         let result = match street {
-            "turn" | "river" => cfvnet::datagen::domain::pipeline::DomainPipeline::run(&cfg, &file_output),
+            "turn" | "river" => {
+                cfvnet::datagen::domain::pipeline::DomainPipeline::run(&cfg, &file_output)
+            }
             _ => cfvnet::datagen::generate::generate_training_data(&cfg, &file_output),
         };
 
@@ -696,31 +779,31 @@ fn cmd_inspect_preflop_ranges(path: PathBuf) {
     });
 
     let total_freq: f64 = ranges.paths.iter().map(|p| p.frequency).sum();
-    println!("Loaded {} preflop paths from {}", ranges.paths.len(), path.display());
+    println!(
+        "Loaded {} preflop paths from {}",
+        ranges.paths.len(),
+        path.display()
+    );
     println!("Total frequency (sum): {total_freq:.6}\n");
 
     // Column headers
     println!(
         "{:<28} {:>10} {:>8} {:>8} {:>10} {:>10} {:>10} {:>10}",
-        "label", "freq", "oop_nz", "ip_nz",
-        "oop_ent", "ip_ent", "oop_top10", "ip_top10",
+        "label", "freq", "oop_nz", "ip_nz", "oop_ent", "ip_ent", "oop_top10", "ip_top10",
     );
     println!("{}", "-".repeat(100));
 
     for p in &ranges.paths {
         let (oop_ent, oop_top10) = range_shape(&p.oop_range);
         let (ip_ent, ip_top10) = range_shape(&p.ip_range);
-        let pct = if total_freq > 0.0 { p.frequency / total_freq * 100.0 } else { 0.0 };
+        let pct = if total_freq > 0.0 {
+            p.frequency / total_freq * 100.0
+        } else {
+            0.0
+        };
         println!(
             "{:<28} {:>10.4} {:>8} {:>8} {:>10.3} {:>10.3} {:>10.4} {:>10.4}",
-            p.label,
-            pct,
-            p.oop_nonzero,
-            p.ip_nonzero,
-            oop_ent,
-            ip_ent,
-            oop_top10,
-            ip_top10,
+            p.label, pct, p.oop_nonzero, p.ip_nonzero, oop_ent, ip_ent, oop_top10, ip_top10,
         );
     }
     println!("\nfreq column is % of total. oop_nz / ip_nz = non-zero combos (>0.01).");
@@ -733,7 +816,11 @@ fn cmd_filter_preflop_ranges(input: PathBuf, output: PathBuf, label: String) {
         eprintln!("failed to load {}: {e}", input.display());
         std::process::exit(1);
     });
-    let kept: Vec<_> = ranges.paths.into_iter().filter(|p| p.label == label).collect();
+    let kept: Vec<_> = ranges
+        .paths
+        .into_iter()
+        .filter(|p| p.label == label)
+        .collect();
     if kept.is_empty() {
         eprintln!("no paths match label '{label}' in {}", input.display());
         std::process::exit(1);
@@ -743,15 +830,27 @@ fn cmd_filter_preflop_ranges(input: PathBuf, output: PathBuf, label: String) {
         eprintln!("failed to save {}: {e}", output.display());
         std::process::exit(1);
     });
-    println!("Wrote {} path(s) matching '{label}' to {}", out.paths.len(), output.display());
+    println!(
+        "Wrote {} path(s) matching '{label}' to {}",
+        out.paths.len(),
+        output.display()
+    );
 }
 
 /// Returns (entropy_bits, top10_mass_frac) for a range vector.
 fn range_shape(range: &[f32]) -> (f64, f64) {
     let total: f64 = range.iter().map(|&v| v as f64).sum();
-    if total <= 0.0 { return (0.0, 0.0); }
-    let entropy = range.iter().map(|&v| v as f64).filter(|&v| v > 0.0)
-        .map(|v| { let p = v / total; -p * p.log2() })
+    if total <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let entropy = range
+        .iter()
+        .map(|&v| v as f64)
+        .filter(|&v| v > 0.0)
+        .map(|v| {
+            let p = v / total;
+            -p * p.log2()
+        })
         .sum::<f64>();
     let mut sorted: Vec<f64> = range.iter().map(|&v| v as f64).collect();
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
@@ -787,7 +886,11 @@ fn cmd_precompute_ranges(
         std::process::exit(1);
     });
 
-    println!("Saved {} preflop paths to {}", ranges.paths.len(), output.display());
+    println!(
+        "Saved {} preflop paths to {}",
+        ranges.paths.len(),
+        output.display()
+    );
     for path in &ranges.paths {
         println!(
             "  {:<40} freq={:.4}  OOP ~{} combos, IP ~{} combos",
@@ -814,12 +917,17 @@ fn cmd_evaluate(model_dir: PathBuf, data_path: PathBuf) {
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, INPUT_SIZE)
-        .load_file(&model_path, &recorder, &device)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load model from {}: {e}", model_path.display());
-            std::process::exit(1);
-        });
+    let model = CfvNet::<B>::new(
+        &device,
+        cfg.training.hidden_layers,
+        cfg.training.hidden_size,
+        INPUT_SIZE,
+    )
+    .load_file(&model_path, &recorder, &device)
+    .unwrap_or_else(|e| {
+        eprintln!("failed to load model from {}: {e}", model_path.display());
+        std::process::exit(1);
+    });
 
     let dataset = CfvDataset::from_file(&data_path, board_cards).unwrap_or_else(|e| {
         eprintln!("failed to load dataset: {e}");
@@ -877,7 +985,10 @@ fn infer_board_cards_from_data(data_path: &std::path::Path) -> usize {
     });
     let mut buf = [0u8; 1];
     std::io::Read::read_exact(&mut f, &mut buf).unwrap_or_else(|e| {
-        eprintln!("failed to read board_size from {}: {e}", data_path.display());
+        eprintln!(
+            "failed to read board_size from {}: {e}",
+            data_path.display()
+        );
         std::process::exit(1);
     });
     let board_cards = buf[0] as usize;
@@ -904,7 +1015,10 @@ fn cmd_eval_boundary_onnx(model_path: PathBuf, data_path: PathBuf) {
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
         .and_then(|b| b.commit_from_file(&model_path))
         .unwrap_or_else(|e| {
-            eprintln!("failed to load ONNX model from {}: {e}", model_path.display());
+            eprintln!(
+                "failed to load ONNX model from {}: {e}",
+                model_path.display()
+            );
             std::process::exit(1);
         });
 
@@ -937,10 +1051,9 @@ fn cmd_eval_boundary_onnx(model_path: PathBuf, data_path: PathBuf) {
         let item = encode_boundary_record(&rec);
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
 
-        let input_tensor = ort::value::Tensor::from_array(
-            ([1_i64, INPUT_SIZE as i64], item.input.clone()),
-        )
-        .expect("ort tensor creation");
+        let input_tensor =
+            ort::value::Tensor::from_array(([1_i64, INPUT_SIZE as i64], item.input.clone()))
+                .expect("ort tensor creation");
         let outputs = session
             .run(ort::inputs![input_tensor].expect("ort inputs"))
             .expect("ort session run");
@@ -1024,7 +1137,10 @@ fn cmd_diagnose_boundary_onnx(
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
         .and_then(|b| b.commit_from_file(&model_path))
         .unwrap_or_else(|e| {
-            eprintln!("failed to load ONNX model from {}: {e}", model_path.display());
+            eprintln!(
+                "failed to load ONNX model from {}: {e}",
+                model_path.display()
+            );
             std::process::exit(1);
         });
 
@@ -1086,10 +1202,9 @@ fn cmd_diagnose_boundary_onnx(
         let item = encode_boundary_record(&rec);
         let mask: Vec<bool> = item.mask.iter().map(|&v| v > 0.5).collect();
 
-        let input_tensor = ort::value::Tensor::from_array(
-            ([1_i64, INPUT_SIZE as i64], item.input.clone()),
-        )
-        .expect("ort tensor creation");
+        let input_tensor =
+            ort::value::Tensor::from_array(([1_i64, INPUT_SIZE as i64], item.input.clone()))
+                .expect("ort tensor creation");
         let outputs = session
             .run(ort::inputs![input_tensor].expect("ort inputs"))
             .expect("ort session run");
@@ -1136,7 +1251,11 @@ fn cmd_diagnose_boundary_onnx(
     println!("\n--- Per combo-index bin ({NUM_BINS} x ~{bin_size} combos) ---");
     for (i, deltas) in bin_deltas.iter_mut().enumerate() {
         let lo = i * bin_size;
-        let hi = if i == NUM_BINS - 1 { COMBOS } else { lo + bin_size };
+        let hi = if i == NUM_BINS - 1 {
+            COMBOS
+        } else {
+            lo + bin_size
+        };
         if deltas.is_empty() {
             println!("bin [{lo:04}..{hi:04}]: n=0");
             continue;
@@ -1151,9 +1270,7 @@ fn cmd_diagnose_boundary_onnx(
         .copied()
         .filter(|cat| cat_deltas.contains_key(cat))
         .collect();
-    cat_order.sort_by(|a, b| {
-        cat_deltas[b].len().cmp(&cat_deltas[a].len())
-    });
+    cat_order.sort_by(|a, b| cat_deltas[b].len().cmp(&cat_deltas[a].len()));
     for cat in &cat_order {
         let deltas = cat_deltas.get_mut(cat).unwrap();
         print_delta_stats(&format!("{:<14}", cat), deltas);
@@ -1222,12 +1339,16 @@ fn cmd_eval_boundary(model_dir: PathBuf, data_path: PathBuf) {
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = BoundaryNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size)
-        .load_file(&model_path, &recorder, &device)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load model from {}: {e}", model_path.display());
-            std::process::exit(1);
-        });
+    let model = BoundaryNet::<B>::new(
+        &device,
+        cfg.training.hidden_layers,
+        cfg.training.hidden_size,
+    )
+    .load_file(&model_path, &recorder, &device)
+    .unwrap_or_else(|e| {
+        eprintln!("failed to load model from {}: {e}", model_path.display());
+        std::process::exit(1);
+    });
 
     // Count records
     let rec_size = record_size(board_cards) as u64;
@@ -1311,12 +1432,22 @@ fn print_error_stats(label: &str, values: &mut [f64]) {
 
     println!(
         "{}: mean={:.6} std={:.4} p50={:.4} p90={:.4} p95={:.4} p99={:.4} max={:.4}  ({n} records)",
-        label, mean, std_dev, p(0.5), p(0.9), p(0.95), p(0.99),
+        label,
+        mean,
+        std_dev,
+        p(0.5),
+        p(0.9),
+        p(0.95),
+        p(0.99),
         values.last().unwrap_or(&0.0)
     );
 }
 
-fn cmd_compare_boundary(model_dir: &std::path::Path, data_path: &std::path::Path, num_positions: usize) {
+fn cmd_compare_boundary(
+    model_dir: &std::path::Path,
+    data_path: &std::path::Path,
+    num_positions: usize,
+) {
     use burn::backend::NdArray;
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
@@ -1334,12 +1465,16 @@ fn cmd_compare_boundary(model_dir: &std::path::Path, data_path: &std::path::Path
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(model_dir);
 
-    let model = BoundaryNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size)
-        .load_file(&model_path, &recorder, &device)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load model from {}: {e}", model_path.display());
-            std::process::exit(1);
-        });
+    let model = BoundaryNet::<B>::new(
+        &device,
+        cfg.training.hidden_layers,
+        cfg.training.hidden_size,
+    )
+    .load_file(&model_path, &recorder, &device)
+    .unwrap_or_else(|e| {
+        eprintln!("failed to load model from {}: {e}", model_path.display());
+        std::process::exit(1);
+    });
 
     let file = std::fs::File::open(data_path).unwrap_or_else(|e| {
         eprintln!("failed to open data file {}: {e}", data_path.display());
@@ -1428,11 +1563,7 @@ fn cmd_compare_boundary(model_dir: &std::path::Path, data_path: &std::path::Path
     }
 }
 
-fn cmd_compare(
-    model_dir: PathBuf,
-    num_spots: usize,
-    threads: Option<usize>,
-) {
+fn cmd_compare(model_dir: PathBuf, num_spots: usize, threads: Option<usize>) {
     use burn::backend::NdArray;
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkGzFileRecorder};
@@ -1448,12 +1579,17 @@ fn cmd_compare(
     let recorder = NamedMpkGzFileRecorder::<FullPrecisionSettings>::new();
     let model_path = resolve_model_path(&model_dir);
 
-    let model = CfvNet::<B>::new(&device, cfg.training.hidden_layers, cfg.training.hidden_size, INPUT_SIZE)
-        .load_file(&model_path, &recorder, &device)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to load model from {}: {e}", model_path.display());
-            std::process::exit(1);
-        });
+    let model = CfvNet::<B>::new(
+        &device,
+        cfg.training.hidden_layers,
+        cfg.training.hidden_size,
+        INPUT_SIZE,
+    )
+    .load_file(&model_path, &recorder, &device)
+    .unwrap_or_else(|e| {
+        eprintln!("failed to load model from {}: {e}", model_path.display());
+        std::process::exit(1);
+    });
 
     if let Some(t) = threads {
         rayon::ThreadPoolBuilder::new()
@@ -1464,15 +1600,19 @@ fn cmd_compare(
 
     println!("Comparing {num_spots} spots against exact solver...");
 
-    let summary = run_comparison(&cfg.game, &cfg.datagen, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed), |sit, _solve_result| {
-        let input_data = encode_situation_for_inference(sit, 0);
-        let input = Tensor::<B, 2>::from_data(
-            TensorData::new(input_data, [1, INPUT_SIZE]),
-            &device,
-        );
-        let pred = model.forward(input);
-        pred.into_data().to_vec::<f32>().unwrap()
-    })
+    let summary = run_comparison(
+        &cfg.game,
+        &cfg.datagen,
+        num_spots,
+        cfvnet::config::resolve_seed(cfg.datagen.seed),
+        |sit, _solve_result| {
+            let input_data = encode_situation_for_inference(sit, 0);
+            let input =
+                Tensor::<B, 2>::from_data(TensorData::new(input_data, [1, INPUT_SIZE]), &device);
+            let pred = model.forward(input);
+            pred.into_data().to_vec::<f32>().unwrap()
+        },
+    )
     .unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");
         std::process::exit(1);
@@ -1481,11 +1621,7 @@ fn cmd_compare(
     print_summary(&summary);
 }
 
-fn cmd_compare_net(
-    model_dir: PathBuf,
-    river_model_dir: PathBuf,
-    num_spots: usize,
-) {
+fn cmd_compare_net(model_dir: PathBuf, river_model_dir: PathBuf, num_spots: usize) {
     use cfvnet::eval::compare_turn::run_turn_comparison_net;
 
     let cfg = load_model_config(&model_dir);
@@ -1494,11 +1630,17 @@ fn cmd_compare_net(
 
     println!("Comparing {num_spots} turn spots against PostFlopGame + RiverNetEvaluator...");
 
-    let summary = run_turn_comparison_net(&cfg, &model_path, &river_path, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed))
-        .unwrap_or_else(|e| {
-            eprintln!("comparison failed: {e}");
-            std::process::exit(1);
-        });
+    let summary = run_turn_comparison_net(
+        &cfg,
+        &model_path,
+        &river_path,
+        num_spots,
+        cfvnet::config::resolve_seed(cfg.datagen.seed),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("comparison failed: {e}");
+        std::process::exit(1);
+    });
 
     print_summary(&summary);
 }
@@ -1511,7 +1653,13 @@ fn cmd_compare_exact(model_dir: PathBuf, num_spots: usize) {
 
     println!("Comparing {num_spots} turn spots against PostFlopGame + exact river evaluation...");
 
-    let summary = run_turn_comparison_exact(&cfg, &model_path, num_spots, cfvnet::config::resolve_seed(cfg.datagen.seed)).unwrap_or_else(|e| {
+    let summary = run_turn_comparison_exact(
+        &cfg,
+        &model_path,
+        num_spots,
+        cfvnet::config::resolve_seed(cfg.datagen.seed),
+    )
+    .unwrap_or_else(|e| {
         eprintln!("comparison failed: {e}");
         std::process::exit(1);
     });
@@ -1531,7 +1679,11 @@ fn cmd_datagen_eval(data: PathBuf) {
             })
             .filter_map(|entry| {
                 let entry = entry.ok()?;
-                if entry.file_type().ok()?.is_file() { Some(entry.path()) } else { None }
+                if entry.file_type().ok()?.is_file() {
+                    Some(entry.path())
+                } else {
+                    None
+                }
             })
             .collect();
         entries.sort();
@@ -1585,7 +1737,9 @@ fn cmd_datagen_eval(data: PathBuf) {
 
                     // Track board card IDs
                     for &c in &rec.board {
-                        if c > card_max { card_max = c; }
+                        if c > card_max {
+                            card_max = c;
+                        }
                     }
 
                     // CFV statistics (over valid entries only)
@@ -1594,8 +1748,12 @@ fn cmd_datagen_eval(data: PathBuf) {
                     for (i, &cfv) in rec.cfvs.iter().enumerate() {
                         if rec.valid_mask[i] != 0 {
                             let v = cfv as f64;
-                            if v < cfv_min { cfv_min = v; }
-                            if v > cfv_max { cfv_max = v; }
+                            if v < cfv_min {
+                                cfv_min = v;
+                            }
+                            if v > cfv_max {
+                                cfv_max = v;
+                            }
                         }
                     }
                     if cfv_min.is_finite() {
@@ -1613,7 +1771,9 @@ fn cmd_datagen_eval(data: PathBuf) {
                         for (i, &cfv) in rec.cfvs.iter().enumerate() {
                             if rec.valid_mask[i] != 0 {
                                 let norm = (cfv as f64) * pot_over_norm;
-                                if norm.abs() > norm_abs_max { norm_abs_max = norm.abs(); }
+                                if norm.abs() > norm_abs_max {
+                                    norm_abs_max = norm.abs();
+                                }
                             }
                         }
                         norm_target_abs_maxs.push(norm_abs_max);
@@ -1680,7 +1840,9 @@ fn cmd_datagen_eval(data: PathBuf) {
 
     // Extreme records
     if num_extreme_records > 0 {
-        println!("\nExtreme Records ({num_extreme_records} total, |norm_cfv|>5 or |norm_gv|>5 or total_stake<1):");
+        println!(
+            "\nExtreme Records ({num_extreme_records} total, |norm_cfv|>5 or |norm_gv|>5 or total_stake<1):"
+        );
         for ex in &extreme_examples {
             println!("{ex}");
         }
@@ -1695,9 +1857,14 @@ fn cmd_datagen_eval(data: PathBuf) {
     print_raw_frequency_histogram("Frequency by Pot Size", &pots);
     print_raw_frequency_histogram("Frequency by Game Value", &game_values);
     print_raw_frequency_histogram("Frequency by |CFV|_max", &cfv_abs_maxs);
-    print_raw_frequency_histogram("Frequency by |Normalized Target|_max", &norm_target_abs_maxs);
+    print_raw_frequency_histogram(
+        "Frequency by |Normalized Target|_max",
+        &norm_target_abs_maxs,
+    );
 
-    let sprs: Vec<f64> = pots.iter().zip(&stacks)
+    let sprs: Vec<f64> = pots
+        .iter()
+        .zip(&stacks)
         .filter(|(p, _)| **p > 0.0)
         .map(|(p, s)| *s / *p)
         .collect();
@@ -1707,8 +1874,14 @@ fn cmd_datagen_eval(data: PathBuf) {
     let oop_nonzero_mass = oop_totals.iter().filter(|&&t| t > 0.0).count();
     let ip_nonzero_mass = ip_totals.iter().filter(|&&t| t > 0.0).count();
     println!("\n=== Range Statistics ===\n");
-    println!("Records with nonzero OOP mass: {}/{}", oop_nonzero_mass, num_records);
-    println!("Records with nonzero IP mass:  {}/{}", ip_nonzero_mass, num_records);
+    println!(
+        "Records with nonzero OOP mass: {}/{}",
+        oop_nonzero_mass, num_records
+    );
+    println!(
+        "Records with nonzero IP mass:  {}/{}",
+        ip_nonzero_mass, num_records
+    );
 
     println!("\nOOP ranges (across {} records):", num_records);
     print_stats("  Density       ", &oop_densities);
@@ -1733,7 +1906,8 @@ fn range_stats(range: &[f32]) -> (f64, f64, f64, f64, f64) {
     let density = nonzero_count as f64 / range.len() as f64;
 
     let entropy = if total > 0.0 {
-        range.iter()
+        range
+            .iter()
             .filter(|&&v| v > 0.0)
             .map(|&v| {
                 let p = v as f64 / total;
@@ -1783,7 +1957,10 @@ fn print_stats(label: &str, values: &[f64]) {
     } else {
         (f64::NAN, f64::NAN, f64::NAN)
     };
-    println!("{label}: min={min:.4} p1={p1:.4} median={p50:.4} mean={mean:.4} p99={p99:.4} max={max:.4} (n={})", values.len());
+    println!(
+        "{label}: min={min:.4} p1={p1:.4} median={p50:.4} mean={mean:.4} p99={p99:.4} max={max:.4} (n={})",
+        values.len()
+    );
 }
 
 fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
@@ -1815,7 +1992,14 @@ fn print_raw_frequency_histogram(title: &str, values: &[f64]) {
         let hi = lo + bucket_width;
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
-        println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
+        println!(
+            "  {:>6.0}-{:<6.0} |{:<width$}| {}",
+            lo,
+            hi,
+            bar,
+            count,
+            width = BAR_WIDTH
+        );
     }
 }
 
@@ -1878,7 +2062,9 @@ fn print_spr_mbb_histogram(title: &str, spr_mbb: &[(f64, f64)]) {
         }
     }
 
-    let means: Vec<f64> = sums.iter().zip(&counts)
+    let means: Vec<f64> = sums
+        .iter()
+        .zip(&counts)
         .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
         .collect();
 
@@ -1894,9 +2080,19 @@ fn print_spr_mbb_histogram(title: &str, spr_mbb: &[(f64, f64)]) {
         let bar_len = ((mean / max_val) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         if count > 0 {
-            println!("  {label} |{:<width$}| {:.2} mBB  (n={})", bar, mean, count, width = BAR_WIDTH);
+            println!(
+                "  {label} |{:<width$}| {:.2} mBB  (n={})",
+                bar,
+                mean,
+                count,
+                width = BAR_WIDTH
+            );
         } else {
-            println!("  {label} |{:<width$}|              (n=0)", "", width = BAR_WIDTH);
+            println!(
+                "  {label} |{:<width$}|              (n=0)",
+                "",
+                width = BAR_WIDTH
+            );
         }
     }
 }
@@ -1937,13 +2133,22 @@ fn board_texture_tags(board: &[u8; 5], board_size: usize) -> Vec<&'static str> {
         let mut best = 0u8;
         let mut run = 0u8;
         for &c in &rank_counts {
-            if c > 0 { run += 1; best = best.max(run); } else { run = 0; }
+            if c > 0 {
+                run += 1;
+                best = best.max(run);
+            } else {
+                run = 0;
+            }
         }
         // Check ace-low: if ace present, count consecutive from rank 0.
         if rank_counts[12] > 0 {
             let mut wheel_run = 1u8; // ace counts as low
             for &c in &rank_counts[..12] {
-                if c > 0 { wheel_run += 1; } else { break; }
+                if c > 0 {
+                    wheel_run += 1;
+                } else {
+                    break;
+                }
             }
             best = best.max(wheel_run);
         }
@@ -1962,10 +2167,15 @@ fn board_texture_tags(board: &[u8; 5], board_size: usize) -> Vec<&'static str> {
     }
 
     // Straight textures (non-exclusive with suit textures).
-    if max_consec >= 4 { tags.push("4-straight   "); }
-    else if max_consec >= 3 { tags.push("3-straight   "); }
+    if max_consec >= 4 {
+        tags.push("4-straight   ");
+    } else if max_consec >= 3 {
+        tags.push("3-straight   ");
+    }
 
-    if paired { tags.push("Paired       "); }
+    if paired {
+        tags.push("Paired       ");
+    }
 
     // Dry: no flush draw (max suit < 3), no straight draw (max consec < 3), not paired.
     if max_suit < 3 && max_consec < 3 && !paired {
@@ -1993,10 +2203,14 @@ fn print_texture_histogram(spots: &[cfvnet::eval::compare::SpotResult]) {
         }
     }
 
-    let mae_means: Vec<f64> = mae_sums.iter().zip(&counts)
+    let mae_means: Vec<f64> = mae_sums
+        .iter()
+        .zip(&counts)
         .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
         .collect();
-    let mbb_means: Vec<f64> = mbb_sums.iter().zip(&counts)
+    let mbb_means: Vec<f64> = mbb_sums
+        .iter()
+        .zip(&counts)
         .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
         .collect();
 
@@ -2013,9 +2227,20 @@ fn print_texture_histogram(spots: &[cfvnet::eval::compare::SpotResult]) {
         let bar_len = ((mae / max_mae) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
         if count > 0 {
-            println!("  {label} |{:<width$}| MAE {:.4}  {:.0} mBB  (n={})", bar, mae, mbb, count, width = BAR_WIDTH);
+            println!(
+                "  {label} |{:<width$}| MAE {:.4}  {:.0} mBB  (n={})",
+                bar,
+                mae,
+                mbb,
+                count,
+                width = BAR_WIDTH
+            );
         } else {
-            println!("  {label} |{:<width$}|                          (n=0)", "", width = BAR_WIDTH);
+            println!(
+                "  {label} |{:<width$}|                          (n=0)",
+                "",
+                width = BAR_WIDTH
+            );
         }
     }
 }
@@ -2037,7 +2262,10 @@ fn load_model_config(model_path: &std::path::Path) -> cfvnet::config::CfvnetConf
         std::process::exit(1);
     });
     serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
-        eprintln!("failed to parse model config {}: {e}", config_path.display());
+        eprintln!(
+            "failed to parse model config {}: {e}",
+            config_path.display()
+        );
         std::process::exit(1);
     })
 }
@@ -2061,30 +2289,58 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
 
     println!("\nBest {} spots (by MAE):", top_n);
     for (i, spot) in sorted.iter().take(top_n).enumerate() {
-        println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
-            i + 1, format_board(&spot.board, spot.board_size),
-            spot.pot, spot.effective_stack, spot.mae, spot.mbb);
+        println!(
+            "  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
+            i + 1,
+            format_board(&spot.board, spot.board_size),
+            spot.pot,
+            spot.effective_stack,
+            spot.mae,
+            spot.mbb
+        );
     }
 
     println!("\nWorst {} spots (by MAE):", top_n);
     for (i, spot) in sorted.iter().rev().take(top_n).enumerate() {
-        println!("  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
-            i + 1, format_board(&spot.board, spot.board_size),
-            spot.pot, spot.effective_stack, spot.mae, spot.mbb);
+        println!(
+            "  {}. {}  Pot: {:<5} Stack: {:<5} MAE: {:.6}  mBB: {:.2}",
+            i + 1,
+            format_board(&spot.board, spot.board_size),
+            spot.pot,
+            spot.effective_stack,
+            spot.mae,
+            spot.mbb
+        );
     }
 
-    print_histogram("mBB Error by Stack Size", &summary.spots, |s| s.effective_stack as f64, |s| s.mbb);
-    print_histogram("mBB Error by Pot Size", &summary.spots, |s| s.pot as f64, |s| s.mbb);
-    print_frequency_histogram("Frequency by Stack Size", &summary.spots, |s| s.effective_stack as f64);
+    print_histogram(
+        "mBB Error by Stack Size",
+        &summary.spots,
+        |s| s.effective_stack as f64,
+        |s| s.mbb,
+    );
+    print_histogram(
+        "mBB Error by Pot Size",
+        &summary.spots,
+        |s| s.pot as f64,
+        |s| s.mbb,
+    );
+    print_frequency_histogram("Frequency by Stack Size", &summary.spots, |s| {
+        s.effective_stack as f64
+    });
     print_frequency_histogram("Frequency by Pot Size", &summary.spots, |s| s.pot as f64);
 
-    let sprs: Vec<f64> = summary.spots.iter()
+    let sprs: Vec<f64> = summary
+        .spots
+        .iter()
         .filter(|s| s.pot > 0)
         .map(|s| s.effective_stack as f64 / s.pot as f64)
         .collect();
     print_spr_frequency_histogram("Frequency by SPR", &sprs);
 
-    let spr_mbb: Vec<(f64, f64)> = summary.spots.iter()
+    let spr_mbb: Vec<(f64, f64)> = summary
+        .spots
+        .iter()
         .filter(|s| s.pot > 0)
         .map(|s| (s.effective_stack as f64 / s.pot as f64, s.mbb))
         .collect();
@@ -2093,8 +2349,12 @@ fn print_summary(summary: &cfvnet::eval::compare::ComparisonSummary) {
     print_texture_histogram(&summary.spots);
 }
 
-fn print_histogram<F, G>(title: &str, spots: &[cfvnet::eval::compare::SpotResult], key_fn: F, val_fn: G)
-where
+fn print_histogram<F, G>(
+    title: &str,
+    spots: &[cfvnet::eval::compare::SpotResult],
+    key_fn: F,
+    val_fn: G,
+) where
     F: Fn(&cfvnet::eval::compare::SpotResult) -> f64,
     G: Fn(&cfvnet::eval::compare::SpotResult) -> f64,
 {
@@ -2144,9 +2404,23 @@ where
         let bar: String = "█".repeat(bar_len);
         let count = bucket_counts[i];
         if count > 0 {
-            println!("  {:>6.0}-{:<6.0} |{:<width$}| {:.2} mBB  (n={})", lo, hi, bar, mean, count, width = BAR_WIDTH);
+            println!(
+                "  {:>6.0}-{:<6.0} |{:<width$}| {:.2} mBB  (n={})",
+                lo,
+                hi,
+                bar,
+                mean,
+                count,
+                width = BAR_WIDTH
+            );
         } else {
-            println!("  {:>6.0}-{:<6.0} |{:<width$}|              (n=0)", lo, hi, "", width = BAR_WIDTH);
+            println!(
+                "  {:>6.0}-{:<6.0} |{:<width$}|              (n=0)",
+                lo,
+                hi,
+                "",
+                width = BAR_WIDTH
+            );
         }
     }
 }
@@ -2190,7 +2464,14 @@ where
         let hi = lo + bucket_width;
         let bar_len = ((count as f64 / max_count as f64) * BAR_WIDTH as f64).round() as usize;
         let bar: String = "█".repeat(bar_len);
-        println!("  {:>6.0}-{:<6.0} |{:<width$}| {}", lo, hi, bar, count, width = BAR_WIDTH);
+        println!(
+            "  {:>6.0}-{:<6.0} |{:<width$}| {}",
+            lo,
+            hi,
+            bar,
+            count,
+            width = BAR_WIDTH
+        );
     }
 }
 
@@ -2290,7 +2571,9 @@ mod tests {
     #[test]
     fn is_onnx_model_detects_onnx_extension() {
         assert!(is_onnx_model(Path::new("model.onnx")));
-        assert!(is_onnx_model(Path::new("/some/path/checkpoint_epoch675.onnx")));
+        assert!(is_onnx_model(Path::new(
+            "/some/path/checkpoint_epoch675.onnx"
+        )));
     }
 
     #[test]
@@ -2360,7 +2643,10 @@ mod tests {
         let (density, entropy, top10, max_mean, total) = range_stats(&range);
         assert!((density - 1.0).abs() < 1e-9, "density={density}");
         let expected_entropy = (1326.0_f64).log2();
-        assert!((entropy - expected_entropy).abs() < 0.01, "entropy={entropy}");
+        assert!(
+            (entropy - expected_entropy).abs() < 0.01,
+            "entropy={entropy}"
+        );
         let expected_top10 = 10.0 / 1326.0;
         assert!((top10 - expected_top10).abs() < 1e-6, "top10={top10}");
         assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
@@ -2384,7 +2670,10 @@ mod tests {
         range[500] = 100.0;
         let (density, entropy, top10, max_mean, total) = range_stats(&range);
         let expected_density = 1.0 / 1326.0;
-        assert!((density - expected_density).abs() < 1e-9, "density={density}");
+        assert!(
+            (density - expected_density).abs() < 1e-9,
+            "density={density}"
+        );
         assert!((entropy).abs() < 1e-9, "entropy={entropy}");
         assert!((top10 - 1.0).abs() < 1e-9, "top10={top10}");
         assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
@@ -2400,10 +2689,16 @@ mod tests {
         }
         let (density, entropy, top10, max_mean, total) = range_stats(&range);
         let expected_density = 100.0 / 1326.0;
-        assert!((density - expected_density).abs() < 1e-6, "density={density}");
+        assert!(
+            (density - expected_density).abs() < 1e-6,
+            "density={density}"
+        );
         // Uniform over 100 entries: entropy = log2(100)
         let expected_entropy = (100.0_f64).log2();
-        assert!((entropy - expected_entropy).abs() < 0.01, "entropy={entropy}");
+        assert!(
+            (entropy - expected_entropy).abs() < 0.01,
+            "entropy={entropy}"
+        );
         // Top 10 of 100 uniform entries = 10/100 = 0.1
         let expected_top10 = 10.0 / 100.0;
         assert!((top10 - expected_top10).abs() < 1e-6, "top10={top10}");
@@ -2417,31 +2712,58 @@ mod tests {
         // rank: 2→0, 3→1, ..., A→12; suit: c→0, d→1, h→2, s→3
 
         // TwoPair: As Ks on board [Ah Kh 7c 2d 3s] → AA KK
-        assert_eq!(classify_made_hand(51, 47, &[50, 46, 20, 1, 7]), HandCategory::TwoPair);
+        assert_eq!(
+            classify_made_hand(51, 47, &[50, 46, 20, 1, 7]),
+            HandCategory::TwoPair
+        );
 
         // HighCard: Ah Ks on board [9c 7d 5h 3c 2d]
-        assert_eq!(classify_made_hand(50, 47, &[28, 21, 14, 4, 1]), HandCategory::HighCard);
+        assert_eq!(
+            classify_made_hand(50, 47, &[28, 21, 14, 4, 1]),
+            HandCategory::HighCard
+        );
 
         // Pair: As Kh on board [Ac 7h 5d 3c 2d] → pair of aces
-        assert_eq!(classify_made_hand(51, 46, &[48, 22, 13, 4, 1]), HandCategory::Pair);
+        assert_eq!(
+            classify_made_hand(51, 46, &[48, 22, 13, 4, 1]),
+            HandCategory::Pair
+        );
 
         // Trips: Ah Ad on board [As 7h 5c 2d 3s] → AAA
-        assert_eq!(classify_made_hand(50, 49, &[51, 22, 12, 1, 7]), HandCategory::Trips);
+        assert_eq!(
+            classify_made_hand(50, 49, &[51, 22, 12, 1, 7]),
+            HandCategory::Trips
+        );
 
         // Straight: 9h 8h on board [7c 6d 5s 2c 3d] → 9-high straight
-        assert_eq!(classify_made_hand(30, 26, &[20, 17, 15, 0, 5]), HandCategory::Straight);
+        assert_eq!(
+            classify_made_hand(30, 26, &[20, 17, 15, 0, 5]),
+            HandCategory::Straight
+        );
 
         // Flush: Ah Kh on board [Qh 9h 2h 3c 4d] → heart flush
-        assert_eq!(classify_made_hand(50, 46, &[42, 30, 2, 4, 9]), HandCategory::Flush);
+        assert_eq!(
+            classify_made_hand(50, 46, &[42, 30, 2, 4, 9]),
+            HandCategory::Flush
+        );
 
         // FullHouse: Ah Ad on board [As 7h 7c 2d 3s] → AAA 77
-        assert_eq!(classify_made_hand(50, 49, &[51, 22, 20, 1, 7]), HandCategory::FullHouse);
+        assert_eq!(
+            classify_made_hand(50, 49, &[51, 22, 20, 1, 7]),
+            HandCategory::FullHouse
+        );
 
         // Quads: Ah Ad on board [As Ac 7h 2d 3s] → AAAA
-        assert_eq!(classify_made_hand(50, 49, &[51, 48, 22, 1, 7]), HandCategory::Quads);
+        assert_eq!(
+            classify_made_hand(50, 49, &[51, 48, 22, 1, 7]),
+            HandCategory::Quads
+        );
 
         // StraightFlush: 9h 8h on board [7h 6h 5h 2c 3d] → 9-high straight flush
-        assert_eq!(classify_made_hand(30, 26, &[22, 18, 14, 0, 5]), HandCategory::StraightFlush);
+        assert_eq!(
+            classify_made_hand(30, 26, &[22, 18, 14, 0, 5]),
+            HandCategory::StraightFlush
+        );
     }
 
     #[test]
@@ -2455,12 +2777,18 @@ mod tests {
         }
         let (density, _entropy, top10, max_mean, total) = range_stats(&range);
         let expected_density = 10.0 / 1326.0;
-        assert!((density - expected_density).abs() < 1e-6, "density={density}");
+        assert!(
+            (density - expected_density).abs() < 1e-6,
+            "density={density}"
+        );
         // All 10 entries are in top 10, so top10 concentration = 1.0
         assert!((top10 - 1.0).abs() < 1e-6, "top10={top10}");
         // max/mean = 90 / (99/10) = 90/9.9 ~= 9.0909
         let expected_ratio = 90.0 / 9.9;
-        assert!((max_mean - expected_ratio).abs() < 0.001, "max_mean={max_mean}");
+        assert!(
+            (max_mean - expected_ratio).abs() < 0.001,
+            "max_mean={max_mean}"
+        );
         assert!((total - 99.0).abs() < 1e-6, "total={total}");
     }
 }

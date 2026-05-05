@@ -21,6 +21,23 @@ use super::writer::RecordWriter;
 /// Each thread builds games, solves them, and writes records through a shared writer.
 pub struct DomainPipeline;
 
+#[cfg(feature = "gpu-turn-datagen")]
+#[derive(Debug, Clone, Copy, Default)]
+struct GpuTurnBatchStats {
+    samples: usize,
+    avg_exploitability: f64,
+    max_exploitability: f64,
+    max_exploitability_ratio: f64,
+}
+
+#[cfg(feature = "gpu-turn-datagen")]
+#[derive(Debug, Clone, Copy, Default)]
+struct GpuTurnExploitability {
+    value: f64,
+    br0: f64,
+    br1: f64,
+}
+
 impl DomainPipeline {
     pub fn run(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
         #[cfg(feature = "gpu-datagen")]
@@ -38,8 +55,7 @@ impl DomainPipeline {
         let threads = config.datagen.threads.max(1);
 
         // Parse bet sizes from config.
-        let bet_sizes =
-            super::game_tree::parse_bet_sizes_all(&config.game.bet_sizes);
+        let bet_sizes = super::game_tree::parse_bet_sizes_all(&config.game.bet_sizes);
         if bet_sizes.is_empty() {
             return Err("no valid bet sizes".into());
         }
@@ -75,8 +91,8 @@ impl DomainPipeline {
             num_samples,
         )
         .with_range_source(range_source);
-        let builder = GameBuilder::new(bet_sizes, &strategy)
-            .with_fuzz(config.datagen.bet_size_fuzz);
+        let builder =
+            GameBuilder::new(bet_sizes, &strategy).with_fuzz(config.datagen.bet_size_fuzz);
         let solver_config = SolverConfig {
             max_iterations: config.datagen.solver_iterations,
             target_exploitability: config.datagen.target_exploitability,
@@ -92,9 +108,7 @@ impl DomainPipeline {
         let pb = Arc::new(ProgressBar::new(num_samples));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template(
-                    "{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}",
-                )
+                .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
                 .expect("valid template"),
         );
 
@@ -122,8 +136,7 @@ impl DomainPipeline {
 
                 s.spawn(move || {
                     range_solver::set_force_sequential(true);
-                    let mut rng =
-                        ChaCha8Rng::seed_from_u64(seed.wrapping_add(thread_idx as u64));
+                    let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(thread_idx as u64));
 
                     loop {
                         // Pull next situation from shared generator.
@@ -144,8 +157,7 @@ impl DomainPipeline {
                             }
                         };
 
-                        let mut solver =
-                            Solver::new(game, solver_config, strategy.clone());
+                        let mut solver = Solver::new(game, solver_config, strategy.clone());
                         let solved = loop {
                             match solver.step() {
                                 None => continue,
@@ -162,10 +174,7 @@ impl DomainPipeline {
                                 0.0
                             };
                             // Scale by 100 to preserve 2 decimal places in integer.
-                            exploit_sum.fetch_add(
-                                (mbb as f64 * 100.0) as u64,
-                                Ordering::Relaxed,
-                            );
+                            exploit_sum.fetch_add((mbb as f64 * 100.0) as u64, Ordering::Relaxed);
                             exploit_count.fetch_add(1, Ordering::Relaxed);
                         }
 
@@ -189,14 +198,11 @@ impl DomainPipeline {
                         // Update progress bar message.
                         let ec = exploit_count.load(Ordering::Relaxed);
                         let avg_exploit = if ec > 0 {
-                            (exploit_sum.load(Ordering::Relaxed) as f64 / 100.0)
-                                / ec as f64
+                            (exploit_sum.load(Ordering::Relaxed) as f64 / 100.0) / ec as f64
                         } else {
                             0.0
                         };
-                        pb.set_message(format!(
-                            "expl:{avg_exploit:.1} mbb/h  written:{wc}",
-                        ));
+                        pb.set_message(format!("expl:{avg_exploit:.1} mbb/h  written:{wc}",));
                     }
                 });
             }
@@ -230,11 +236,11 @@ impl DomainPipeline {
     /// True batching requires games with matching topology (same ranges/bet sizes).
     #[cfg(feature = "gpu-datagen")]
     fn run_gpu(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
-        use gpu_range_solver::extract::{extract_terminal_data, extract_topology};
-        use gpu_range_solver::{GpuBatchSolver, SubgameSpec, compute_evs_from_strategy_sum};
-        use range_solver::card::card_pair_to_index;
         use crate::datagen::range_gen::NUM_COMBOS;
         use crate::datagen::storage::TrainingRecord;
+        use gpu_range_solver::extract::{extract_terminal_data, extract_topology};
+        use gpu_range_solver::{compute_evs_from_strategy_sum, GpuBatchSolver, SubgameSpec};
+        use range_solver::card::card_pair_to_index;
 
         let num_samples = config.datagen.num_samples;
         let seed = crate::config::resolve_seed(config.datagen.seed);
@@ -268,8 +274,8 @@ impl DomainPipeline {
         )
         .with_range_source(range_source);
 
-        let builder = GameBuilder::new(bet_sizes, &strategy)
-            .with_fuzz(config.datagen.bet_size_fuzz);
+        let builder =
+            GameBuilder::new(bet_sizes, &strategy).with_fuzz(config.datagen.bet_size_fuzz);
 
         let writer = std::sync::Arc::new(std::sync::Mutex::new(
             super::writer::RecordWriter::create(output_path, config.datagen.per_file)?,
@@ -295,7 +301,10 @@ impl DomainPipeline {
 
             let topo = extract_topology(game.inner());
             let term = extract_terminal_data(game.inner(), &topo);
-            let num_hands = game.inner().private_cards(0).len()
+            let num_hands = game
+                .inner()
+                .private_cards(0)
+                .len()
                 .max(game.inner().private_cards(1).len());
 
             // CUDA blocks have max 1024 threads; fall back to CPU for large ranges
@@ -306,11 +315,8 @@ impl DomainPipeline {
                     target_exploitability: config.datagen.target_exploitability,
                     leaf_eval_interval: config.datagen.leaf_eval_interval,
                 };
-                let mut solver_obj = super::solver::Solver::new(
-                    game,
-                    &solver_config,
-                    strategy.clone(),
-                );
+                let mut solver_obj =
+                    super::solver::Solver::new(game, &solver_config, strategy.clone());
                 let solved = loop {
                     match solver_obj.step() {
                         None => continue,
@@ -328,14 +334,8 @@ impl DomainPipeline {
             }
 
             // Create a per-game GPU solver (topology varies per game with random ranges)
-            let mut solver = GpuBatchSolver::new(
-                &topo,
-                &term,
-                1,
-                num_hands,
-                max_iterations,
-            )
-            .map_err(|e| format!("GPU solver init failed: {e}"))?;
+            let mut solver = GpuBatchSolver::new(&topo, &term, 1, num_hands, max_iterations)
+                .map_err(|e| format!("GPU solver init failed: {e}"))?;
 
             let spec = SubgameSpec::from_game(game.inner(), &topo, &term, num_hands);
             let results = solver
@@ -455,6 +455,7 @@ impl DomainPipeline {
         let max_iterations = config.datagen.solver_iterations;
         let leaf_eval_interval = config.datagen.leaf_eval_interval.max(1);
         let batch_size = config.datagen.gpu_batch_size.unwrap_or(256).max(1);
+        let target_exploitability = config.datagen.target_exploitability;
 
         let bet_sizes = super::game_tree::parse_bet_sizes_all(&config.game.bet_sizes);
         if bet_sizes.is_empty() {
@@ -462,7 +463,10 @@ impl DomainPipeline {
         }
 
         // Unconditionally require BoundaryNet model.
-        let model_path = config.game.river_model_path.as_deref()
+        let model_path = config
+            .game
+            .river_model_path
+            .as_deref()
             .ok_or("river_model_path is required for GPU turn datagen")?;
         let evaluator = crate::datagen::gpu_boundary_eval::GpuBoundaryEvaluator::load(
             std::path::Path::new(model_path),
@@ -478,14 +482,26 @@ impl DomainPipeline {
             return Err("canonical turn tree has no boundary nodes".into());
         }
         let boundary_node_ids: Vec<usize> = topo.showdown_nodes.clone();
+        if std::env::var_os("CFVNET_GPU_TURN_TIMING").is_some() {
+            eprintln!(
+                "[gpu-turn] topology: nodes={} edges={} boundaries={} folds={} max_depth={} batch_size={} iterations={} leaf_eval_interval={}",
+                topo.num_nodes,
+                topo.num_edges,
+                boundary_node_ids.len(),
+                topo.fold_nodes.len(),
+                topo.max_depth,
+                batch_size,
+                max_iterations,
+                leaf_eval_interval,
+            );
+        }
 
         // Canonical TerminalData with the universal 1326-hand layout: every
         // `card_pair_to_index` slot is a hand, and card arrays enumerate all
         // 1326 pairs. Per-game board blockers are handled by zero weights in
         // `SubgameSpec.initial_weights`.
         let canonical_num_hands = crate::datagen::range_gen::NUM_COMBOS;
-        let canonical_term =
-            Self::build_canonical_turn_terminal_data(&topo, canonical_num_hands);
+        let canonical_term = Self::build_canonical_turn_terminal_data(&topo, canonical_num_hands);
         let canonical_hand_cards: Vec<(u8, u8)> = canonical_term.hand_cards[0].clone();
 
         // Create the GPU solver once with the canonical topology.
@@ -498,8 +514,7 @@ impl DomainPipeline {
         )
         .map_err(|e| format!("GPU solver init failed: {e}"))?;
 
-        let leaf_ids_i32: Vec<i32> =
-            boundary_node_ids.iter().map(|&id| id as i32).collect();
+        let leaf_ids_i32: Vec<i32> = boundary_node_ids.iter().map(|&id| id as i32).collect();
         let leaf_depths: Vec<i32> = boundary_node_ids
             .iter()
             .map(|&id| topo.node_depth[id] as i32)
@@ -526,16 +541,20 @@ impl DomainPipeline {
         let pb = indicatif::ProgressBar::new(num_samples);
         pb.set_style(
             indicatif::ProgressStyle::default_bar()
-                .template(
-                    "{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}",
-                )
+                .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
                 .expect("valid template"),
         );
 
         let start_time = std::time::Instant::now();
-        let mut batch_sits: Vec<crate::datagen::sampler::Situation> = Vec::with_capacity(batch_size);
+        let mut batch_sits: Vec<crate::datagen::sampler::Situation> =
+            Vec::with_capacity(batch_size);
         let mut batch_specs: Vec<gpu_range_solver::SubgameSpec> = Vec::with_capacity(batch_size);
         let mut last_log_count: u64 = 0;
+        let mut exploit_sum = 0.0_f64;
+        let mut exploit_count = 0_usize;
+        let mut exploit_max = 0.0_f64;
+        let mut exploit_ratio_max = 0.0_f64;
+        let bb = f64::from(initial_stack) / 100.0;
 
         for sit in &mut sit_gen {
             let spec = Self::build_turn_subgame_spec(&sit, &topo, canonical_num_hands);
@@ -543,7 +562,7 @@ impl DomainPipeline {
             batch_specs.push(spec);
 
             if batch_specs.len() >= batch_size {
-                Self::solve_and_write_batch(
+                let stats = Self::solve_and_write_batch(
                     &evaluator,
                     &mut solver,
                     &topo,
@@ -555,8 +574,26 @@ impl DomainPipeline {
                     &batch_specs,
                     &batch_sits,
                     &writer,
+                    target_exploitability,
                 )?;
+                exploit_sum += stats.avg_exploitability * stats.samples as f64;
+                exploit_count += stats.samples;
+                exploit_max = exploit_max.max(stats.max_exploitability);
+                exploit_ratio_max = exploit_ratio_max.max(stats.max_exploitability_ratio);
                 pb.inc(batch_sits.len() as u64);
+                if exploit_count > 0 {
+                    let avg_mbb = if bb > 0.0 {
+                        (exploit_sum / exploit_count as f64) / bb * 1000.0
+                    } else {
+                        0.0
+                    };
+                    let max_mbb = if bb > 0.0 {
+                        exploit_max / bb * 1000.0
+                    } else {
+                        0.0
+                    };
+                    pb.set_message(format!("expl:{avg_mbb:.1}mbb/h max:{max_mbb:.1}mbb/h",));
+                }
                 if pb.position() - last_log_count >= 1000 {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let throughput = if elapsed > 0.0 {
@@ -578,7 +615,7 @@ impl DomainPipeline {
 
         // Flush any remaining partial batch.
         if !batch_specs.is_empty() {
-            Self::solve_and_write_batch(
+            let stats = Self::solve_and_write_batch(
                 &evaluator,
                 &mut solver,
                 &topo,
@@ -590,8 +627,26 @@ impl DomainPipeline {
                 &batch_specs,
                 &batch_sits,
                 &writer,
+                target_exploitability,
             )?;
+            exploit_sum += stats.avg_exploitability * stats.samples as f64;
+            exploit_count += stats.samples;
+            exploit_max = exploit_max.max(stats.max_exploitability);
+            exploit_ratio_max = exploit_ratio_max.max(stats.max_exploitability_ratio);
             pb.inc(batch_sits.len() as u64);
+            if exploit_count > 0 {
+                let avg_mbb = if bb > 0.0 {
+                    (exploit_sum / exploit_count as f64) / bb * 1000.0
+                } else {
+                    0.0
+                };
+                let max_mbb = if bb > 0.0 {
+                    exploit_max / bb * 1000.0
+                } else {
+                    0.0
+                };
+                pb.set_message(format!("expl:{avg_mbb:.1}mbb/h max:{max_mbb:.1}mbb/h",));
+            }
         }
 
         let mut w = writer.lock().unwrap();
@@ -607,9 +662,20 @@ impl DomainPipeline {
             0.0
         };
         eprintln!(
-            "Wrote {total} GPU turn records to {} ({:.1} samples/sec)",
+            "Wrote {total} GPU turn records to {} ({:.1} samples/sec, avg exploitability {:.1} mbb/h, max {:.1} mbb/h, max target ratio {:.2})",
             output_path.display(),
-            throughput
+            throughput,
+            if exploit_count > 0 && bb > 0.0 {
+                (exploit_sum / exploit_count as f64) / bb * 1000.0
+            } else {
+                0.0
+            },
+            if bb > 0.0 {
+                exploit_max / bb * 1000.0
+            } else {
+                0.0
+            },
+            exploit_ratio_max,
         );
         Ok(())
     }
@@ -629,26 +695,34 @@ impl DomainPipeline {
         leaf_eval_interval: u32,
         specs: &[gpu_range_solver::SubgameSpec],
         sits: &[crate::datagen::sampler::Situation],
-        writer: &std::sync::Arc<
-            std::sync::Mutex<super::writer::RecordWriter>,
-        >,
-    ) -> Result<(), String> {
-        use gpu_range_solver::compute_evs_from_strategy_sum;
-
+        writer: &std::sync::Arc<std::sync::Mutex<super::writer::RecordWriter>>,
+        target_exploitability: Option<f32>,
+    ) -> Result<GpuTurnBatchStats, String> {
         debug_assert_eq!(specs.len(), sits.len());
         let batch_len = specs.len();
         if batch_len == 0 {
-            return Ok(());
+            return Ok(GpuTurnBatchStats::default());
         }
+
+        let timing = std::env::var_os("CFVNET_GPU_TURN_TIMING").is_some();
+        let batch_start = std::time::Instant::now();
+        let mut stage_start = batch_start;
+        let mut mid_extract_secs = 0.0_f64;
+        let mut mid_eval_secs = 0.0_f64;
+        let mut mid_update_secs = 0.0_f64;
+        let mut kernel_secs = 0.0_f64;
+        let mut mid_evals = 0_u32;
 
         solver
             .prepare_batch(specs)
             .map_err(|e| format!("prepare_batch failed: {e}"))?;
+        let prepare_secs = stage_start.elapsed().as_secs_f64();
 
         // Initial boundary evaluation: uniform strategy for each game in the
         // batch. Reach at each boundary is the forward-walk reach under a
         // uniform strategy (strategy_sum = zeros produces uniform avg strategy
         // in compute_reach_at_nodes).
+        stage_start = std::time::Instant::now();
         let initial_ss = vec![0.0_f32; topo.num_edges * num_hands];
         let batched_initial = Self::batch_boundary_leaf_cfvs(
             evaluator,
@@ -660,27 +734,33 @@ impl DomainPipeline {
             specs,
             sits,
         )?;
+        let initial_eval_secs = stage_start.elapsed().as_secs_f64();
+        stage_start = std::time::Instant::now();
         solver
             .update_leaf_cfvs(&batched_initial.0, &batched_initial.1)
             .map_err(|e| format!("initial update_leaf_cfvs failed: {e}"))?;
+        let initial_update_secs = stage_start.elapsed().as_secs_f64();
 
         // Iterative solve with periodic reach-based boundary re-eval.
         let mut iter = 0u32;
         while iter < max_iterations {
             let end = (iter + leaf_eval_interval).min(max_iterations);
+            stage_start = std::time::Instant::now();
             solver
                 .run_iterations(iter, end)
                 .map_err(|e| format!("run_iterations failed: {e}"))?;
+            kernel_secs += stage_start.elapsed().as_secs_f64();
             iter = end;
 
             if iter < max_iterations {
+                stage_start = std::time::Instant::now();
                 let mid_results = solver
                     .extract_results()
                     .map_err(|e| format!("mid-solve extract: {e}"))?;
-                let mid_strategy_sums: Vec<Vec<f32>> = mid_results
-                    .iter()
-                    .map(|r| r.strategy_sum.clone())
-                    .collect();
+                mid_extract_secs += stage_start.elapsed().as_secs_f64();
+                let mid_strategy_sums: Vec<Vec<f32>> =
+                    mid_results.iter().map(|r| r.strategy_sum.clone()).collect();
+                stage_start = std::time::Instant::now();
                 let batched_mid = Self::batch_boundary_leaf_cfvs(
                     evaluator,
                     topo,
@@ -691,47 +771,443 @@ impl DomainPipeline {
                     specs,
                     sits,
                 )?;
+                mid_eval_secs += stage_start.elapsed().as_secs_f64();
+                stage_start = std::time::Instant::now();
                 solver
                     .update_leaf_cfvs(&batched_mid.0, &batched_mid.1)
                     .map_err(|e| format!("mid update_leaf_cfvs failed: {e}"))?;
+                mid_update_secs += stage_start.elapsed().as_secs_f64();
+                mid_evals += 1;
             }
         }
 
         // Extract results and write records.
+        stage_start = std::time::Instant::now();
         let results = solver
             .extract_results()
             .map_err(|e| format!("extract_results failed: {e}"))?;
+        let final_extract_secs = stage_start.elapsed().as_secs_f64();
 
+        stage_start = std::time::Instant::now();
+        let final_strategy_sums: Vec<Vec<f32>> =
+            results.iter().map(|r| r.strategy_sum.clone()).collect();
+        let final_leaf = Self::batch_boundary_leaf_cfvs(
+            evaluator,
+            topo,
+            boundary_node_ids,
+            canonical_hand_cards,
+            num_hands,
+            &final_strategy_sums,
+            specs,
+            sits,
+        )?;
+        let final_leaf_eval_secs = stage_start.elapsed().as_secs_f64();
+
+        stage_start = std::time::Instant::now();
         let mut records_batch: Vec<crate::datagen::storage::TrainingRecord> =
             Vec::with_capacity(batch_len * 2);
+        let leaf_stride = boundary_node_ids.len() * num_hands;
+        let mut exploit_sum = 0.0_f64;
+        let mut exploit_max = 0.0_f64;
+        let mut exploit_ratio_max = 0.0_f64;
         for (b, result) in results.iter().enumerate() {
             let sit = &sits[b];
             let spec = &specs[b];
+            let leaf_start = b * leaf_stride;
+            let leaf_end = leaf_start + leaf_stride;
+            let leaf_p0 = &final_leaf.0[leaf_start..leaf_end];
+            let leaf_p1 = &final_leaf.1[leaf_start..leaf_end];
 
             // Build a per-situation TerminalData so that compute_evs_from_strategy_sum
             // uses this game's fold payoffs (in chip units) while reusing the
             // canonical 1326-hand card layout.
-            let per_sit_term = Self::build_per_sit_turn_terminal_data(
-                topo,
-                sit,
-                canonical_hand_cards,
-                num_hands,
-            );
+            let per_sit_term =
+                Self::build_per_sit_turn_terminal_data(topo, sit, canonical_hand_cards, num_hands);
 
-            let evs = compute_evs_from_strategy_sum(
+            let (evs, exploitability) = Self::compute_turn_evs_and_exploitability(
                 topo,
                 &per_sit_term,
                 &result.strategy_sum,
                 &spec.initial_weights,
                 num_hands,
+                leaf_p0,
+                leaf_p1,
             );
+            if exploitability.value.is_finite() {
+                exploit_sum += exploitability.value;
+                exploit_max = exploit_max.max(exploitability.value);
+                if let Some(target) = target_exploitability {
+                    let abs_target = f64::from(target) * f64::from(sit.pot);
+                    if abs_target > 0.0 {
+                        exploit_ratio_max =
+                            exploit_ratio_max.max(exploitability.value / abs_target);
+                    }
+                    if exploitability.value > abs_target {
+                        let (leaf_min, leaf_max, leaf_abs_max) =
+                            Self::slice_stats_f64_pair(leaf_p0, leaf_p1);
+                        return Err(format!(
+                            "GPU turn exploitability check failed for sample {b}: exploitability={:.6} chips exceeds target={abs_target:.6} chips (target_exploitability={target} * pot={}); pot={} stack={} spr={:.3} br0={:.6} br1={:.6} leaf_min={leaf_min:.6} leaf_max={leaf_max:.6} leaf_abs_max={leaf_abs_max:.6}",
+                            exploitability.value,
+                            sit.pot,
+                            sit.pot,
+                            sit.effective_stack,
+                            f64::from(sit.effective_stack) / f64::from(sit.pot.max(1)),
+                            exploitability.br0,
+                            exploitability.br1,
+                        ));
+                    }
+                }
+            }
 
             Self::append_turn_records(sit, &evs, &mut records_batch);
         }
 
         let mut w = writer.lock().unwrap();
         w.write(&records_batch)?;
-        Ok(())
+        let write_secs = stage_start.elapsed().as_secs_f64();
+        if timing {
+            let rows_per_eval = batch_len * boundary_node_ids.len() * 2 * 48;
+            eprintln!(
+                "[gpu-turn] batch={} rows/eval={} mid_evals={} total={:.3}s prepare={:.3}s initial_eval={:.3}s initial_update={:.3}s kernels={:.3}s mid_extract={:.3}s mid_eval={:.3}s mid_update={:.3}s final_extract={:.3}s final_leaf_eval={:.3}s ev_write={:.3}s avg_expl={:.4} max_expl={:.4} max_target_ratio={:.2}",
+                batch_len,
+                rows_per_eval,
+                mid_evals,
+                batch_start.elapsed().as_secs_f64(),
+                prepare_secs,
+                initial_eval_secs,
+                initial_update_secs,
+                kernel_secs,
+                mid_extract_secs,
+                mid_eval_secs,
+                mid_update_secs,
+                final_extract_secs,
+                final_leaf_eval_secs,
+                write_secs,
+                exploit_sum / batch_len as f64,
+                exploit_max,
+                exploit_ratio_max,
+            );
+        }
+        Ok(GpuTurnBatchStats {
+            samples: batch_len,
+            avg_exploitability: exploit_sum / batch_len as f64,
+            max_exploitability: exploit_max,
+            max_exploitability_ratio: exploit_ratio_max,
+        })
+    }
+
+    /// Reconstruct root EVs and exploitability from the final GPU strategy and
+    /// the same injected BoundaryNet leaf CFVs used by the turn solver.
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn compute_turn_evs_and_exploitability(
+        topo: &gpu_range_solver::extract::TreeTopology,
+        term: &gpu_range_solver::extract::TerminalData,
+        strategy_sum: &[f32],
+        initial_weights: &[Vec<f32>; 2],
+        num_hands: usize,
+        leaf_p0: &[f32],
+        leaf_p1: &[f32],
+    ) -> ([Vec<f32>; 2], GpuTurnExploitability) {
+        let setup = Self::build_gpu_turn_avg_strategy_setup(topo, strategy_sum, num_hands);
+        let evs = Self::compute_turn_root_values(
+            topo,
+            term,
+            &setup,
+            initial_weights,
+            num_hands,
+            leaf_p0,
+            leaf_p1,
+            false,
+        );
+        let br = Self::compute_turn_root_values(
+            topo,
+            term,
+            &setup,
+            initial_weights,
+            num_hands,
+            leaf_p0,
+            leaf_p1,
+            true,
+        );
+        let br0 = Self::weighted_sum_f64(&br[0], &initial_weights[0]);
+        let br1 = Self::weighted_sum_f64(&br[1], &initial_weights[1]);
+        let exploitability = GpuTurnExploitability {
+            value: 0.5 * (br0 + br1),
+            br0,
+            br1,
+        };
+        (evs, exploitability)
+    }
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn build_gpu_turn_avg_strategy_setup(
+        topo: &gpu_range_solver::extract::TreeTopology,
+        strategy_sum: &[f32],
+        num_hands: usize,
+    ) -> (Vec<f32>, Vec<usize>, Vec<usize>) {
+        let e = topo.num_edges;
+        let h = num_hands;
+
+        let mut edges_by_depth: Vec<Vec<usize>> = vec![Vec::new(); topo.max_depth + 1];
+        for edge in 0..e {
+            let parent_depth = topo.node_depth[topo.edge_parent[edge]];
+            edges_by_depth[parent_depth].push(edge);
+        }
+
+        let mut avg_strategy = vec![0.0_f32; e * h];
+        let mut sorted_idx = 0;
+        for depth_edges in &edges_by_depth {
+            let mut idx = 0;
+            while idx < depth_edges.len() {
+                let parent = topo.edge_parent[depth_edges[idx]];
+                let n_actions = topo.node_num_actions[parent];
+                let group_start = sorted_idx + idx;
+                for hand in 0..h {
+                    let mut total = 0.0_f32;
+                    for a in 0..n_actions {
+                        total += strategy_sum[(group_start + a) * h + hand].max(0.0);
+                    }
+                    if total > 1e-30 {
+                        for a in 0..n_actions {
+                            avg_strategy[(group_start + a) * h + hand] =
+                                strategy_sum[(group_start + a) * h + hand].max(0.0) / total;
+                        }
+                    } else {
+                        let uniform = 1.0 / n_actions as f32;
+                        for a in 0..n_actions {
+                            avg_strategy[(group_start + a) * h + hand] = uniform;
+                        }
+                    }
+                }
+                idx += n_actions;
+            }
+            sorted_idx += depth_edges.len();
+        }
+
+        let mut original_edge_for_sorted = Vec::with_capacity(e);
+        for depth_edges in &edges_by_depth {
+            original_edge_for_sorted.extend(depth_edges.iter().copied());
+        }
+
+        let mut node_first_sorted_edge = vec![usize::MAX; topo.num_nodes];
+        for (sorted_i, &orig_e) in original_edge_for_sorted.iter().enumerate() {
+            let parent = topo.edge_parent[orig_e];
+            if node_first_sorted_edge[parent] == usize::MAX {
+                node_first_sorted_edge[parent] = sorted_i;
+            }
+        }
+
+        (
+            avg_strategy,
+            original_edge_for_sorted,
+            node_first_sorted_edge,
+        )
+    }
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    #[allow(clippy::too_many_arguments)]
+    fn compute_turn_root_values(
+        topo: &gpu_range_solver::extract::TreeTopology,
+        term: &gpu_range_solver::extract::TerminalData,
+        setup: &(Vec<f32>, Vec<usize>, Vec<usize>),
+        initial_weights: &[Vec<f32>; 2],
+        num_hands: usize,
+        leaf_p0: &[f32],
+        leaf_p1: &[f32],
+        best_response: bool,
+    ) -> [Vec<f32>; 2] {
+        use gpu_range_solver::extract::NodeType;
+
+        let (avg_strategy, original_edge_for_sorted, node_first_sorted_edge) = setup;
+        let n = topo.num_nodes;
+        let h = num_hands;
+        let mut result = [vec![0.0_f32; h], vec![0.0_f32; h]];
+
+        for player in 0..2 {
+            let opp = player ^ 1;
+            let mut reach = vec![0.0_f32; n * h];
+            for hand in 0..initial_weights[opp].len().min(h) {
+                reach[hand] = initial_weights[opp][hand];
+            }
+
+            for depth in 0..=topo.max_depth {
+                for &node_id in &topo.level_nodes[depth] {
+                    let n_actions = topo.node_num_actions[node_id];
+                    if n_actions == 0 {
+                        continue;
+                    }
+                    let sorted_start = node_first_sorted_edge[node_id];
+                    if sorted_start == usize::MAX {
+                        continue;
+                    }
+                    match topo.node_type[node_id] {
+                        NodeType::Player { player: acting } => {
+                            for a in 0..n_actions {
+                                let sorted_i = sorted_start + a;
+                                let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                                for hand in 0..h {
+                                    let parent_reach = reach[node_id * h + hand];
+                                    if acting == player {
+                                        reach[child * h + hand] += parent_reach;
+                                    } else {
+                                        reach[child * h + hand] +=
+                                            parent_reach * avg_strategy[sorted_i * h + hand];
+                                    }
+                                }
+                            }
+                        }
+                        NodeType::Chance => {
+                            for a in 0..n_actions {
+                                let sorted_i = sorted_start + a;
+                                let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                                for hand in 0..h {
+                                    reach[child * h + hand] += reach[node_id * h + hand];
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut cfv = vec![0.0_f32; n * h];
+            for (fold_idx, &node_id) in topo.fold_nodes.iter().enumerate() {
+                let fd = &term.fold_payoffs[fold_idx];
+                let payoff = if fd.folded_player == opp {
+                    fd.amount_win as f32
+                } else {
+                    fd.amount_lose as f32
+                };
+                let player_cards = &term.hand_cards[player];
+                let opp_cards = &term.hand_cards[opp];
+
+                for h_p in 0..player_cards.len().min(h) {
+                    let (pc1, pc2) = player_cards[h_p];
+                    let pc_mask = (1_u64 << pc1) | (1_u64 << pc2);
+                    let mut opp_reach_sum = 0.0_f32;
+                    for h_o in 0..opp_cards.len().min(h) {
+                        let (oc1, oc2) = opp_cards[h_o];
+                        let oc_mask = (1_u64 << oc1) | (1_u64 << oc2);
+                        if pc_mask & oc_mask == 0 {
+                            opp_reach_sum += reach[node_id * h + h_o];
+                        }
+                    }
+                    cfv[node_id * h + h_p] = payoff * opp_reach_sum;
+                }
+            }
+
+            let leaf_values = if player == 0 { leaf_p0 } else { leaf_p1 };
+            for (leaf_idx, &node_id) in topo.showdown_nodes.iter().enumerate() {
+                let src = leaf_idx * h;
+                cfv[node_id * h..node_id * h + h].copy_from_slice(&leaf_values[src..src + h]);
+            }
+
+            for depth in (0..=topo.max_depth).rev() {
+                for &node_id in &topo.level_nodes[depth] {
+                    let n_actions = topo.node_num_actions[node_id];
+                    if n_actions == 0 {
+                        continue;
+                    }
+                    let sorted_start = node_first_sorted_edge[node_id];
+                    if sorted_start == usize::MAX {
+                        continue;
+                    }
+
+                    match topo.node_type[node_id] {
+                        NodeType::Player { player: acting }
+                            if best_response && acting == player =>
+                        {
+                            for hand in 0..h {
+                                let mut best = f32::NEG_INFINITY;
+                                for a in 0..n_actions {
+                                    let sorted_i = sorted_start + a;
+                                    let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                                    best = best.max(cfv[child * h + hand]);
+                                }
+                                cfv[node_id * h + hand] = best;
+                            }
+                        }
+                        NodeType::Player { player: acting } if acting == player => {
+                            for a in 0..n_actions {
+                                let sorted_i = sorted_start + a;
+                                let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                                for hand in 0..h {
+                                    cfv[node_id * h + hand] +=
+                                        avg_strategy[sorted_i * h + hand] * cfv[child * h + hand];
+                                }
+                            }
+                        }
+                        NodeType::Player { .. } | NodeType::Chance => {
+                            for a in 0..n_actions {
+                                let sorted_i = sorted_start + a;
+                                let child = topo.edge_child[original_edge_for_sorted[sorted_i]];
+                                for hand in 0..h {
+                                    cfv[node_id * h + hand] += cfv[child * h + hand];
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            result[player].copy_from_slice(&cfv[..h]);
+        }
+
+        result
+    }
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn weighted_sum_f64(values: &[f32], weights: &[f32]) -> f64 {
+        values
+            .iter()
+            .zip(weights.iter())
+            .map(|(&v, &w)| f64::from(v) * f64::from(w))
+            .sum()
+    }
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn slice_stats_f64_pair(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+        a.iter().chain(b.iter()).fold(
+            (f64::INFINITY, f64::NEG_INFINITY, 0.0_f64),
+            |(min_v, max_v, max_abs), &v| {
+                let v = f64::from(v);
+                (min_v.min(v), max_v.max(v), max_abs.max(v.abs()))
+            },
+        )
+    }
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn turn_boundary_stakes(
+        topo: &gpu_range_solver::extract::TreeTopology,
+        boundary_node_ids: &[usize],
+        sit: &crate::datagen::sampler::Situation,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let sit_pot = f64::from(sit.pot);
+        let mut pots = Vec::with_capacity(boundary_node_ids.len());
+        let mut effective_stacks = Vec::with_capacity(boundary_node_ids.len());
+
+        for &node_id in boundary_node_ids {
+            let amount = Self::scaled_capped_node_amount(topo, node_id, sit);
+            let boundary_pot = sit_pot + 2.0 * amount;
+            let remaining = (f64::from(sit.effective_stack) - amount).max(0.0);
+            pots.push(boundary_pot as f32);
+            effective_stacks.push(remaining as f32);
+        }
+
+        (pots, effective_stacks)
+    }
+
+    #[cfg(feature = "gpu-turn-datagen")]
+    fn scaled_capped_node_amount(
+        topo: &gpu_range_solver::extract::TreeTopology,
+        node_id: usize,
+        sit: &crate::datagen::sampler::Situation,
+    ) -> f64 {
+        let canonical_pot = 100.0_f64;
+        let pot_scale = f64::from(sit.pot) / canonical_pot;
+        let amount = f64::from(topo.node_amount[node_id]) * pot_scale;
+        amount.min(f64::from(sit.effective_stack)).max(0.0)
     }
 
     /// Compute per-game leaf CFVs at boundaries for an entire batch and pack
@@ -754,11 +1230,9 @@ impl DomainPipeline {
         specs: &[gpu_range_solver::SubgameSpec],
         sits: &[crate::datagen::sampler::Situation],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
-        use gpu_range_solver::compute_reach_at_nodes;
-        use crate::datagen::gpu_boundary_eval::{
-            evaluate_boundaries_batched, BoundaryEvalRequest,
-        };
+        use crate::datagen::gpu_boundary_eval::{evaluate_boundaries_batched, BoundaryEvalRequest};
         use crate::datagen::range_gen::NUM_COMBOS;
+        use gpu_range_solver::compute_reach_at_nodes;
 
         debug_assert_eq!(strategy_sums.len(), specs.len());
         debug_assert_eq!(strategy_sums.len(), sits.len());
@@ -807,16 +1281,13 @@ impl DomainPipeline {
                         .copy_from_slice(&reach[1][src_base..src_base + num_hands]);
                 }
 
-                let board_4: [u8; 4] = [
-                    sit.board[0],
-                    sit.board[1],
-                    sit.board[2],
-                    sit.board[3],
-                ];
+                let board_4: [u8; 4] = [sit.board[0], sit.board[1], sit.board[2], sit.board[3]];
+                let (pots, effective_stacks) =
+                    Self::turn_boundary_stakes(topo, boundary_node_ids, sit);
                 BoundaryEvalRequest {
                     board: board_4,
-                    pot: sit.pot as f32,
-                    effective_stack: sit.effective_stack as f32,
+                    pots,
+                    effective_stacks,
                     oop_reach: oop_reach_1326,
                     ip_reach: ip_reach_1326,
                     num_boundaries,
@@ -832,10 +1303,8 @@ impl DomainPipeline {
         // Copy per-sit results into the batched output buffers.
         for (b, result) in results.into_iter().enumerate() {
             let slot_start = b * slot_len;
-            batched_p0[slot_start..slot_start + slot_len]
-                .copy_from_slice(&result.leaf_cfv_p0);
-            batched_p1[slot_start..slot_start + slot_len]
-                .copy_from_slice(&result.leaf_cfv_p1);
+            batched_p0[slot_start..slot_start + slot_len].copy_from_slice(&result.leaf_cfv_p0);
+            batched_p1[slot_start..slot_start + slot_len].copy_from_slice(&result.leaf_cfv_p1);
         }
 
         Ok((batched_p0, batched_p1))
@@ -861,11 +1330,9 @@ impl DomainPipeline {
         specs: &[gpu_range_solver::SubgameSpec],
         sits: &[crate::datagen::sampler::Situation],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
-        use gpu_range_solver::compute_reach_at_nodes;
-        use crate::datagen::gpu_boundary_eval::{
-            evaluate_boundaries_batched, BoundaryEvalRequest,
-        };
+        use crate::datagen::gpu_boundary_eval::{evaluate_boundaries_batched, BoundaryEvalRequest};
         use crate::datagen::range_gen::NUM_COMBOS;
+        use gpu_range_solver::compute_reach_at_nodes;
 
         debug_assert_eq!(strategy_sums.len(), specs.len());
         debug_assert_eq!(strategy_sums.len(), sits.len());
@@ -900,29 +1367,22 @@ impl DomainPipeline {
                     .copy_from_slice(&reach[1][src_base..src_base + num_hands]);
             }
 
-            let board_4: [u8; 4] = [
-                sit.board[0],
-                sit.board[1],
-                sit.board[2],
-                sit.board[3],
-            ];
+            let board_4: [u8; 4] = [sit.board[0], sit.board[1], sit.board[2], sit.board[3]];
+            let (pots, effective_stacks) = Self::turn_boundary_stakes(topo, boundary_node_ids, sit);
             let request = BoundaryEvalRequest {
                 board: board_4,
-                pot: sit.pot as f32,
-                effective_stack: sit.effective_stack as f32,
+                pots,
+                effective_stacks,
                 oop_reach: oop_reach_1326,
                 ip_reach: ip_reach_1326,
                 num_boundaries,
             };
 
-            let results =
-                evaluate_boundaries_batched(evaluator, &[request], canonical_hand_cards)
-                    .map_err(|e| format!("boundary eval failed: {e}"))?;
+            let results = evaluate_boundaries_batched(evaluator, &[request], canonical_hand_cards)
+                .map_err(|e| format!("boundary eval failed: {e}"))?;
             let slot_start = b * slot_len;
-            batched_p0[slot_start..slot_start + slot_len]
-                .copy_from_slice(&results[0].leaf_cfv_p0);
-            batched_p1[slot_start..slot_start + slot_len]
-                .copy_from_slice(&results[0].leaf_cfv_p1);
+            batched_p0[slot_start..slot_start + slot_len].copy_from_slice(&results[0].leaf_cfv_p0);
+            batched_p1[slot_start..slot_start + slot_len].copy_from_slice(&results[0].leaf_cfv_p1);
         }
 
         Ok((batched_p0, batched_p1))
@@ -1007,16 +1467,13 @@ impl DomainPipeline {
     ) -> gpu_range_solver::extract::TerminalData {
         use gpu_range_solver::extract::{FoldData, NodeType, ShowdownData, TerminalData};
 
-        let canonical_pot = 100.0_f64;
         let sit_pot = f64::from(sit.pot);
-        let pot_scale = sit_pot / canonical_pot;
 
         let fold_payoffs: Vec<FoldData> = topo
             .fold_nodes
             .iter()
             .map(|&node_id| {
-                let canonical_amount = topo.node_amount[node_id] as f64;
-                let sit_amount = canonical_amount * pot_scale;
+                let sit_amount = Self::scaled_capped_node_amount(topo, node_id, sit);
                 let pot_at_fold = sit_pot + 2.0 * sit_amount;
                 let half_pot = 0.5 * pot_at_fold;
                 let folded_player = match topo.node_type[node_id] {
@@ -1089,16 +1546,13 @@ impl DomainPipeline {
         }
 
         // Per-game fold payoffs scaled from canonical pot=100 to sit.pot.
-        let canonical_pot = 100.0_f64;
         let sit_pot = f64::from(sit.pot);
-        let pot_scale = sit_pot / canonical_pot;
 
         let num_folds = topo.fold_nodes.len();
         let mut fold_payoffs_p0 = vec![0.0_f32; num_folds];
         let mut fold_payoffs_p1 = vec![0.0_f32; num_folds];
         for (i, &node_id) in topo.fold_nodes.iter().enumerate() {
-            let canonical_amount = topo.node_amount[node_id] as f64;
-            let sit_amount = canonical_amount * pot_scale;
+            let sit_amount = Self::scaled_capped_node_amount(topo, node_id, sit);
             let pot_at_fold = sit_pot + 2.0 * sit_amount;
             let half_pot = 0.5 * pot_at_fold;
             let win = half_pot as f32;
@@ -1607,7 +2061,10 @@ mod tests {
                 count += 1;
             }
             // Records come in OOP+IP pairs, so we expect 2 per sample.
-            assert_eq!(count, 12, "expected 12 records (6 samples x 2), got {count}");
+            assert_eq!(
+                count, 12,
+                "expected 12 records (6 samples x 2), got {count}"
+            );
         }
 
         /// Regression test for bean oox2: the canonical turn tree previously
@@ -1651,8 +2108,7 @@ mod tests {
                 .expect("GpuBatchSolver::new on canonical turn topology");
 
             // Use every boundary node as a leaf injection point (as production does).
-            let leaf_node_ids: Vec<i32> =
-                topo.showdown_nodes.iter().map(|&n| n as i32).collect();
+            let leaf_node_ids: Vec<i32> = topo.showdown_nodes.iter().map(|&n| n as i32).collect();
             let leaf_depths: Vec<i32> = topo
                 .showdown_nodes
                 .iter()
@@ -1786,8 +2242,7 @@ mod tests {
                 })
                 .collect();
 
-            let hand_cards: Vec<(u8, u8)> =
-                (0..num_hands).map(index_to_card_pair).collect();
+            let hand_cards: Vec<(u8, u8)> = (0..num_hands).map(index_to_card_pair).collect();
 
             let (batched_p0, batched_p1) = DomainPipeline::batch_boundary_leaf_cfvs(
                 &evaluator,
@@ -1917,8 +2372,7 @@ mod tests {
                 })
                 .collect();
 
-            let hand_cards: Vec<(u8, u8)> =
-                (0..num_hands).map(index_to_card_pair).collect();
+            let hand_cards: Vec<(u8, u8)> = (0..num_hands).map(index_to_card_pair).collect();
 
             let (batched_p0, batched_p1) = DomainPipeline::batch_boundary_leaf_cfvs(
                 &evaluator,

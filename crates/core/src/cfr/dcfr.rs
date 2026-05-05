@@ -131,8 +131,7 @@ impl DcfrParams {
     /// is past the warmup phase.
     #[must_use]
     pub fn should_discount(&self, iteration: u64) -> bool {
-        matches!(self.variant, CfrVariant::Dcfr | CfrVariant::Linear)
-            && iteration > self.warmup
+        matches!(self.variant, CfrVariant::Dcfr | CfrVariant::Linear) && iteration > self.warmup
     }
 
     /// Apply DCFR cumulative regret discounting to a raw slice.
@@ -279,8 +278,9 @@ mod tests {
 
     #[timed_test]
     fn should_floor_regrets_only_cfrplus() {
-        assert!(DcfrParams::from_config(CfrVariant::CfrPlus, 0.0, 0.0, 0.0, 0)
-            .should_floor_regrets());
+        assert!(
+            DcfrParams::from_config(CfrVariant::CfrPlus, 0.0, 0.0, 0.0, 0).should_floor_regrets()
+        );
         assert!(!DcfrParams::default().should_floor_regrets());
         assert!(!DcfrParams::vanilla().should_floor_regrets());
         assert!(!DcfrParams::linear().should_floor_regrets());

@@ -54,17 +54,26 @@ mod tests {
         // Combo 2 → bucket 1 (probs [0.4, 0.6])
         let mut reach = vec![1.0_f32, 1.0, 1.0];
         let combo_buckets: Vec<u16> = vec![0, 0, 1];
-        let action_probs_per_bucket = vec![
-            vec![0.7_f32, 0.3],
-            vec![0.4_f32, 0.6],
-        ];
+        let action_probs_per_bucket = vec![vec![0.7_f32, 0.3], vec![0.4_f32, 0.6]];
 
         // Take action 0
         update_reach(&mut reach, &combo_buckets, &action_probs_per_bucket, 0);
 
-        assert!((reach[0] - 0.7).abs() < 1e-6, "combo 0: expected 0.7, got {}", reach[0]);
-        assert!((reach[1] - 0.7).abs() < 1e-6, "combo 1: expected 0.7, got {}", reach[1]);
-        assert!((reach[2] - 0.4).abs() < 1e-6, "combo 2: expected 0.4, got {}", reach[2]);
+        assert!(
+            (reach[0] - 0.7).abs() < 1e-6,
+            "combo 0: expected 0.7, got {}",
+            reach[0]
+        );
+        assert!(
+            (reach[1] - 0.7).abs() < 1e-6,
+            "combo 1: expected 0.7, got {}",
+            reach[1]
+        );
+        assert!(
+            (reach[2] - 0.4).abs() < 1e-6,
+            "combo 2: expected 0.4, got {}",
+            reach[2]
+        );
     }
 
     #[test]
@@ -72,16 +81,25 @@ mod tests {
         // Combo with reach=0.0 stays 0.0 after update
         let mut reach = vec![1.0_f32, 0.0, 1.0];
         let combo_buckets: Vec<u16> = vec![0, 0, 1];
-        let action_probs_per_bucket = vec![
-            vec![0.7_f32, 0.3],
-            vec![0.4_f32, 0.6],
-        ];
+        let action_probs_per_bucket = vec![vec![0.7_f32, 0.3], vec![0.4_f32, 0.6]];
 
         update_reach(&mut reach, &combo_buckets, &action_probs_per_bucket, 0);
 
-        assert!((reach[0] - 0.7).abs() < 1e-6, "combo 0: expected 0.7, got {}", reach[0]);
-        assert_eq!(reach[1], 0.0, "combo 1: expected 0.0 (blocked), got {}", reach[1]);
-        assert!((reach[2] - 0.4).abs() < 1e-6, "combo 2: expected 0.4, got {}", reach[2]);
+        assert!(
+            (reach[0] - 0.7).abs() < 1e-6,
+            "combo 0: expected 0.7, got {}",
+            reach[0]
+        );
+        assert_eq!(
+            reach[1], 0.0,
+            "combo 1: expected 0.0 (blocked), got {}",
+            reach[1]
+        );
+        assert!(
+            (reach[2] - 0.4).abs() < 1e-6,
+            "combo 2: expected 0.4, got {}",
+            reach[2]
+        );
     }
 
     #[test]
@@ -91,20 +109,33 @@ mod tests {
         // Combo 1 (bucket 1, probs [0.3, 0.7]): action 0 then action 1 → 0.3 * 0.7 = 0.21
         let mut reach = vec![1.0_f32, 1.0];
         let combo_buckets: Vec<u16> = vec![0, 1];
-        let action_probs_per_bucket = vec![
-            vec![0.8_f32, 0.2],
-            vec![0.3_f32, 0.7],
-        ];
+        let action_probs_per_bucket = vec![vec![0.8_f32, 0.2], vec![0.3_f32, 0.7]];
 
         // First update: action 0
         update_reach(&mut reach, &combo_buckets, &action_probs_per_bucket, 0);
-        assert!((reach[0] - 0.8).abs() < 1e-6, "after action 0, combo 0: expected 0.8, got {}", reach[0]);
-        assert!((reach[1] - 0.3).abs() < 1e-6, "after action 0, combo 1: expected 0.3, got {}", reach[1]);
+        assert!(
+            (reach[0] - 0.8).abs() < 1e-6,
+            "after action 0, combo 0: expected 0.8, got {}",
+            reach[0]
+        );
+        assert!(
+            (reach[1] - 0.3).abs() < 1e-6,
+            "after action 0, combo 1: expected 0.3, got {}",
+            reach[1]
+        );
 
         // Second update: action 1
         update_reach(&mut reach, &combo_buckets, &action_probs_per_bucket, 1);
-        assert!((reach[0] - 0.16).abs() < 1e-6, "after action 1, combo 0: expected 0.16, got {}", reach[0]);
-        assert!((reach[1] - 0.21).abs() < 1e-5, "after action 1, combo 1: expected 0.21, got {}", reach[1]);
+        assert!(
+            (reach[0] - 0.16).abs() < 1e-6,
+            "after action 1, combo 0: expected 0.16, got {}",
+            reach[0]
+        );
+        assert!(
+            (reach[1] - 0.21).abs() < 1e-5,
+            "after action 1, combo 1: expected 0.21, got {}",
+            reach[1]
+        );
     }
 
     #[test]
@@ -147,8 +178,12 @@ mod tests {
         let mut rng1 = ChaCha8Rng::seed_from_u64(123);
         let mut rng2 = ChaCha8Rng::seed_from_u64(123);
 
-        let samples1: Vec<usize> = (0..100).map(|_| sample_action(&action_probs, &mut rng1)).collect();
-        let samples2: Vec<usize> = (0..100).map(|_| sample_action(&action_probs, &mut rng2)).collect();
+        let samples1: Vec<usize> = (0..100)
+            .map(|_| sample_action(&action_probs, &mut rng1))
+            .collect();
+        let samples2: Vec<usize> = (0..100)
+            .map(|_| sample_action(&action_probs, &mut rng2))
+            .collect();
 
         assert_eq!(samples1, samples2, "same seed must produce same sequence");
     }

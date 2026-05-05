@@ -9,15 +9,16 @@
 // - Turn/Flop PBSs (4/3 cards): depth-limited solving with a LeafEvaluator
 //   providing CFVs at street boundaries.
 
-use crate::pbs::{Pbs, NUM_COMBOS};
+use crate::pbs::{NUM_COMBOS, Pbs};
 use poker_solver_core::blueprint_v2::LeafEvaluator;
 use poker_solver_core::poker::Card as RsPokerCard;
 use range_solver::{
+    CardConfig, PostFlopGame,
     action_tree::{ActionTree, BoardState, TreeConfig},
     bet_size::BetSizeOptions,
-    card::{card_pair_to_index, Card, NOT_DEALT},
+    card::{Card, NOT_DEALT, card_pair_to_index},
     range::Range,
-    solve, CardConfig, PostFlopGame,
+    solve,
 };
 
 /// Configuration for the range-solver wrapper used in ReBeL subgame solving.
@@ -108,8 +109,12 @@ pub fn solve_river_pbs(pbs: &Pbs, config: &SolveConfig) -> Result<SolveResult, S
     let mut game = PostFlopGame::with_config(card_config, action_tree)?;
     game.allocate_memory(false);
 
-    let exploitability =
-        solve(&mut game, config.solver_iterations, config.target_exploitability, false);
+    let exploitability = solve(
+        &mut game,
+        config.solver_iterations,
+        config.target_exploitability,
+        false,
+    );
 
     // Must cache normalized weights before calling expected_values().
     game.cache_normalized_weights();
@@ -254,10 +259,7 @@ pub struct PreparedGame {
 
 /// Prepare a depth-limited game for solving (build tree, allocate memory).
 /// Does NOT evaluate boundaries — call `set_boundaries` or batch-evaluate separately.
-pub fn prepare_game(
-    pbs: &Pbs,
-    config: &SolveConfig,
-) -> Result<PreparedGame, String> {
+pub fn prepare_game(pbs: &Pbs, config: &SolveConfig) -> Result<PreparedGame, String> {
     if pbs.pot <= 0 {
         return Err("pot must be positive for solver".into());
     }
@@ -350,9 +352,7 @@ pub fn prepare_game(
 /// Collect boundary evaluation requests from a prepared game.
 /// Returns (board_cards_rs, combos_rs, oop_range, ip_range, requests) per player.
 /// Empty if the game has no boundary nodes (e.g., river).
-pub fn boundary_requests(
-    prepared: &PreparedGame,
-) -> Vec<BoundaryRequest> {
+pub fn boundary_requests(prepared: &PreparedGame) -> Vec<BoundaryRequest> {
     let game = &prepared.game;
     let pbs = &prepared.pbs;
     let n_boundary = game.num_boundary_nodes();
@@ -413,10 +413,7 @@ pub struct BoundaryRequest {
 /// Set boundary CFVs on a prepared game from pre-computed evaluations.
 /// `cfvs_per_player` should have one entry per player (0=OOP, 1=IP),
 /// each containing one Vec<f64> per boundary node.
-pub fn set_boundaries(
-    prepared: &mut PreparedGame,
-    cfvs_per_player: &[Vec<Vec<f64>>; 2],
-) {
+pub fn set_boundaries(prepared: &mut PreparedGame, cfvs_per_player: &[Vec<Vec<f64>>; 2]) {
     for player in 0..2 {
         for (ordinal, cfvs) in cfvs_per_player[player].iter().enumerate() {
             let cfvs_f32: Vec<f32> = cfvs.iter().map(|&v| v as f32).collect();
@@ -475,11 +472,8 @@ fn solve_with_boundaries(
 
     if n_boundary > 0 {
         // Convert PBS board to rs_poker Card format for the evaluator.
-        let board_cards: Vec<RsPokerCard> = pbs
-            .board
-            .iter()
-            .map(|&c| u8_to_rs_poker_card(c))
-            .collect();
+        let board_cards: Vec<RsPokerCard> =
+            pbs.board.iter().map(|&c| u8_to_rs_poker_card(c)).collect();
 
         let starting_pot = game.tree_config().starting_pot;
         let eff_stack = game.tree_config().effective_stack;
@@ -641,8 +635,7 @@ mod tests {
 
     /// Build a test solve config with reasonable defaults.
     fn test_solve_config() -> SolveConfig {
-        let bet_sizes =
-            BetSizeOptions::try_from(("50%,a", "")).expect("valid test bet sizes");
+        let bet_sizes = BetSizeOptions::try_from(("50%,a", "")).expect("valid test bet sizes");
         SolveConfig {
             bet_sizes,
             turn_bet_sizes: None,
@@ -706,11 +699,7 @@ mod tests {
 
         // Expected: 10*1 + 20*1 + 30*2 = 90.0 (plain weighted sum, no normalization)
         let gv = weighted_game_value(&cfvs, &reach);
-        assert!(
-            (gv - 90.0).abs() < 1e-4,
-            "expected 90.0, got {}",
-            gv
-        );
+        assert!((gv - 90.0).abs() < 1e-4, "expected 90.0, got {}", gv);
     }
 
     #[test]
@@ -804,10 +793,7 @@ mod tests {
             result.oop_game_value.is_finite(),
             "OOP game value not finite"
         );
-        assert!(
-            result.ip_game_value.is_finite(),
-            "IP game value not finite"
-        );
+        assert!(result.ip_game_value.is_finite(), "IP game value not finite");
         assert!(
             result.exploitability >= 0.0,
             "exploitability should be non-negative"
@@ -817,8 +803,14 @@ mod tests {
         // (at least verify they're not trivially zero)
         let oop_has_values = result.oop_cfvs.iter().any(|&v| v != 0.0);
         let ip_has_values = result.ip_cfvs.iter().any(|&v| v != 0.0);
-        assert!(oop_has_values, "expected non-zero OOP CFVs with asymmetric reach");
-        assert!(ip_has_values, "expected non-zero IP CFVs with asymmetric reach");
+        assert!(
+            oop_has_values,
+            "expected non-zero OOP CFVs with asymmetric reach"
+        );
+        assert!(
+            ip_has_values,
+            "expected non-zero IP CFVs with asymmetric reach"
+        );
     }
 
     #[test]

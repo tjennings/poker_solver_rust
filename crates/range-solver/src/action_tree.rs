@@ -646,9 +646,10 @@ impl ActionTree {
             // info.street_transitions counts transitions that have already happened.
             // This chance node represents a new transition, so block it if
             // street_transitions >= depth_limit.
-            let depth_limit_hit = self.config.depth_limit.is_some_and(|limit| {
-                info.street_transitions >= limit
-            });
+            let depth_limit_hit = self
+                .config
+                .depth_limit
+                .is_some_and(|limit| info.street_transitions >= limit);
 
             if depth_limit_hit {
                 // Convert this chance node to a depth boundary terminal.
@@ -668,15 +669,14 @@ impl ActionTree {
             // whether the *next* transition (turn->river) would also exceed the depth
             // limit. After processing this chance, street_transitions will be
             // info.street_transitions + 1.
-            let second_transition_blocked = self.config.depth_limit.is_some_and(|limit| {
-                info.street_transitions + 1 >= limit
-            });
+            let second_transition_blocked = self
+                .config
+                .depth_limit
+                .is_some_and(|limit| info.street_transitions + 1 >= limit);
 
             let next_player = match (info.allin_flag, node.board_state) {
                 (false, _) => PLAYER_OOP,
-                (true, BoardState::Flop) if second_transition_blocked => {
-                    PLAYER_DEPTH_BOUNDARY_FLAG
-                }
+                (true, BoardState::Flop) if second_transition_blocked => PLAYER_DEPTH_BOUNDARY_FLAG,
                 (true, BoardState::Flop) => PLAYER_CHANCE_FLAG | PLAYER_CHANCE,
                 (true, _) => PLAYER_TERMINAL_FLAG,
             };
@@ -720,8 +720,7 @@ impl ActionTree {
 
         let spr_after_call = opponent_stack as f64 / pot as f64;
         let compute_geometric = |num_streets: i32, max_ratio: f64| {
-            let ratio =
-                ((2.0 * spr_after_call + 1.0).powf(1.0 / num_streets as f64) - 1.0) / 2.0;
+            let ratio = ((2.0 * spr_after_call + 1.0).powf(1.0 / num_streets as f64) - 1.0) / 2.0;
             (pot as f64 * ratio.min(max_ratio)).round() as i32
         };
 
@@ -892,9 +891,10 @@ impl ActionTree {
         // merge bet actions with close amounts
         actions = merge_bet_actions(actions, pot, prev_amount, self.config.merging_threshold);
 
-        let depth_limit_reached = self.config.depth_limit.is_some_and(|limit| {
-            info.street_transitions >= limit
-        });
+        let depth_limit_reached = self
+            .config
+            .depth_limit
+            .is_some_and(|limit| info.street_transitions >= limit);
 
         let player_after_call = match node.board_state {
             BoardState::River => PLAYER_TERMINAL_FLAG,
@@ -1006,8 +1006,7 @@ impl ActionTree {
             return Err(format!("Action already exists: {action:?}"));
         }
 
-        let is_bet_action =
-            matches!(action, Action::Bet(_) | Action::Raise(_) | Action::AllIn(_));
+        let is_bet_action = matches!(action, Action::Bet(_) | Action::Raise(_) | Action::AllIn(_));
         if info.allin_flag && is_bet_action {
             return Err(format!("Bet action after all-in: {action:?}"));
         }
@@ -1061,9 +1060,10 @@ impl ActionTree {
             };
         }
 
-        let depth_limit_reached = self.config.depth_limit.is_some_and(|limit| {
-            info.street_transitions >= limit
-        });
+        let depth_limit_reached = self
+            .config
+            .depth_limit
+            .is_some_and(|limit| info.street_transitions >= limit);
 
         let player_after_call = match node.board_state {
             BoardState::River => PLAYER_TERMINAL_FLAG,
@@ -1187,10 +1187,7 @@ impl ActionTree {
 ///
 /// `initial_state` determines the starting street offset so that nodes are
 /// placed in the correct slot even when depth-limiting removes later streets.
-pub(crate) fn count_num_action_nodes(
-    node: &ActionTreeNode,
-    initial_state: BoardState,
-) -> [u64; 3] {
+pub(crate) fn count_num_action_nodes(node: &ActionTreeNode, initial_state: BoardState) -> [u64; 3] {
     let street_offset = initial_state as usize;
     let mut ret = [0, 0, 0];
     count_num_action_nodes_recursive(node, street_offset, &mut ret);

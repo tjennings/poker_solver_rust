@@ -169,9 +169,7 @@ impl ElkanBounds {
     /// 2. upper <= lower\[j\] -> skip
     /// 3. upper <= d(assigned, j) / 2 -> skip
     fn has_shifted(&self, pairwise: &[Vec<f32>], j: usize) -> bool {
-        self.j != j
-            && self.error > self.lower[j]
-            && self.error > 0.5 * pairwise[self.j][j]
+        self.j != j && self.error > self.lower[j] && self.error > 0.5 * pairwise[self.j][j]
     }
 
     /// Direct assignment (for initialization).
@@ -542,7 +540,8 @@ pub fn kmeans_1d_weighted(
     }
 
     // Final assignment pass (parallel).
-    let assignments = data.par_iter()
+    let assignments = data
+        .par_iter()
         .map(|&val| nearest_centroid_1d(val, &centroids))
         .collect();
     (assignments, centroids)
@@ -1167,8 +1166,8 @@ pub fn fast_kmeans(
     for f in features {
         flat.extend_from_slice(f);
     }
-    let data = Array2::from_shape_vec((n, dim), flat)
-        .expect("shape mismatch building Array2 for k-means");
+    let data =
+        Array2::from_shape_vec((n, dim), flat).expect("shape mismatch building Array2 for k-means");
 
     // Configure and run.
     let config = fastkmeans_rs::KMeansConfig::new(k)
@@ -1186,9 +1185,7 @@ pub fn fast_kmeans(
 
     // Extract centroids.
     let centroids_arr = km.centroids().expect("centroids not set after fit");
-    let centroid_vecs: Vec<Vec<f32>> = (0..k)
-        .map(|i| centroids_arr.row(i).to_vec())
-        .collect();
+    let centroid_vecs: Vec<Vec<f32>> = (0..k).map(|i| centroids_arr.row(i).to_vec()).collect();
 
     (label_vec, centroid_vecs)
 }
@@ -1199,12 +1196,7 @@ pub fn fast_kmeans(
 /// and returns labels + centroids as `f64`.
 #[allow(clippy::cast_possible_truncation)]
 #[must_use]
-pub fn fast_kmeans_1d(
-    data: &[f64],
-    k: usize,
-    max_iters: u32,
-    seed: u64,
-) -> (Vec<u16>, Vec<f64>) {
+pub fn fast_kmeans_1d(data: &[f64], k: usize, max_iters: u32, seed: u64) -> (Vec<u16>, Vec<f64>) {
     let features: Vec<Vec<f32>> = data.iter().map(|&v| vec![v as f32]).collect();
     let (labels, centroids) = fast_kmeans(&features, k, max_iters, seed);
     let centroid_vals: Vec<f64> = centroids.iter().map(|c| f64::from(c[0])).collect();
@@ -1299,7 +1291,10 @@ mod tests {
         for c in &centroids {
             assert_eq!(c.len(), 4);
             let sum: f64 = c.iter().sum();
-            assert!((sum - 1.0).abs() < 0.01, "centroid should sum to ~1.0, got {sum}");
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "centroid should sum to ~1.0, got {sum}"
+            );
         }
     }
 
@@ -1307,10 +1302,7 @@ mod tests {
     fn nearest_centroid_u8_is_accessible() {
         // Verify nearest_centroid_u8 is pub(crate) by calling it directly.
         let point = vec![36, 4, 0, 0];
-        let centroids = vec![
-            vec![0.9, 0.1, 0.0, 0.0],
-            vec![0.0, 0.0, 0.1, 0.9],
-        ];
+        let centroids = vec![vec![0.9, 0.1, 0.0, 0.0], vec![0.0, 0.0, 0.1, 0.9]];
         let idx = nearest_centroid_u8(&point, &centroids);
         assert_eq!(idx, 0); // point is close to first centroid
     }
@@ -1383,10 +1375,7 @@ mod tests {
 
     #[test]
     fn test_kmeans_1d_basic() {
-        let data: Vec<f64> = (0..50)
-            .map(|_| 0.1)
-            .chain((0..50).map(|_| 0.9))
-            .collect();
+        let data: Vec<f64> = (0..50).map(|_| 0.1).chain((0..50).map(|_| 0.9)).collect();
         let assignments = kmeans_1d(&data, 2, 100);
         assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
         assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
@@ -1459,7 +1448,8 @@ mod tests {
             data.push(vec![0, 0, 4, 36]);
             weights.push(1.0);
         }
-        let (assignments, _centroids) = kmeans_emd_weighted_u8(&data, &weights, 2, 100, 42, |_, _| {});
+        let (assignments, _centroids) =
+            kmeans_emd_weighted_u8(&data, &weights, 2, 100, 42, |_, _| {});
         assert!(assignments[0..50].iter().all(|&a| a == assignments[0]));
         assert!(assignments[50..100].iter().all(|&a| a == assignments[50]));
         assert_ne!(assignments[0], assignments[50]);
@@ -1481,7 +1471,8 @@ mod tests {
             data.push(vec![0, 0, 0, 10, 36]);
             weights.push(1.0);
         }
-        let (assignments, _centroids) = kmeans_emd_weighted_u8(&data, &weights, 3, 100, 42, |_, _| {});
+        let (assignments, _centroids) =
+            kmeans_emd_weighted_u8(&data, &weights, 3, 100, 42, |_, _| {});
         let c0 = assignments[0];
         let c1 = assignments[30];
         let c2 = assignments[60];
@@ -1580,7 +1571,10 @@ mod tests {
         let prob: Vec<f64> = counts.iter().map(|&c| f64::from(c) / total).collect();
         let d_mixed = emd_u8_vs_f64(&counts, &centroid);
         let d_f64 = emd(&prob, &centroid);
-        assert!((d_mixed - d_f64).abs() < 1e-10, "mixed={d_mixed} f64={d_f64}");
+        assert!(
+            (d_mixed - d_f64).abs() < 1e-10,
+            "mixed={d_mixed} f64={d_f64}"
+        );
     }
 
     #[test]
@@ -1620,8 +1614,16 @@ mod tests {
         let sorted_evs = [0.1, 0.3, 0.9];
         let gaps = compute_centroid_gaps(&sorted_evs);
         assert_eq!(gaps.len(), 2);
-        assert!((gaps[0] - 0.2).abs() < 1e-10, "expected 0.2, got {}", gaps[0]);
-        assert!((gaps[1] - 0.6).abs() < 1e-10, "expected 0.6, got {}", gaps[1]);
+        assert!(
+            (gaps[0] - 0.2).abs() < 1e-10,
+            "expected 0.2, got {}",
+            gaps[0]
+        );
+        assert!(
+            (gaps[1] - 0.6).abs() < 1e-10,
+            "expected 0.6, got {}",
+            gaps[1]
+        );
     }
 
     #[test]
@@ -1661,10 +1663,7 @@ mod tests {
         let d_near = emd_u8_vs_f64_weighted(&counts, &near_centroid, &gaps);
         let d_far = emd_u8_vs_f64_weighted(&counts, &far_centroid, &gaps);
 
-        assert!(
-            d_far > d_near,
-            "far={d_far} should be > near={d_near}"
-        );
+        assert!(d_far > d_near, "far={d_far} should be > near={d_near}");
     }
 
     #[test]
@@ -1796,8 +1795,7 @@ mod tests {
             weights.push(1.0);
         }
 
-        let (labels, centroids) =
-            elkan_emd_weighted_u8(&data, &weights, 3, 50, 42, |_, _| {});
+        let (labels, centroids) = elkan_emd_weighted_u8(&data, &weights, 3, 50, 42, |_, _| {});
 
         assert_eq!(labels.len(), 90);
         assert_eq!(centroids.len(), 3);
@@ -1843,8 +1841,7 @@ mod tests {
             vec![0, 0, 10, 30],
         ];
         let weights = vec![1.0; 4];
-        let (_labels, centroids) =
-            elkan_emd_weighted_u8(&data, &weights, 2, 20, 42, |_, _| {});
+        let (_labels, centroids) = elkan_emd_weighted_u8(&data, &weights, 2, 20, 42, |_, _| {});
 
         assert_eq!(centroids.len(), 2);
         for c in &centroids {
@@ -1874,10 +1871,8 @@ mod tests {
         }
 
         let seed = 42;
-        let (naive_labels, _) =
-            kmeans_emd_weighted_u8(&data, &weights, 2, 50, seed, |_, _| {});
-        let (elkan_labels, _) =
-            elkan_emd_weighted_u8(&data, &weights, 2, 50, seed, |_, _| {});
+        let (naive_labels, _) = kmeans_emd_weighted_u8(&data, &weights, 2, 50, seed, |_, _| {});
+        let (elkan_labels, _) = elkan_emd_weighted_u8(&data, &weights, 2, 50, seed, |_, _| {});
 
         assert_eq!(naive_labels, elkan_labels, "weighted labels differ");
     }
@@ -1956,10 +1951,7 @@ mod tests {
     #[test]
     fn init_elkan_bounds_assigns_nearest() {
         let data = vec![vec![40u8, 0, 0, 0], vec![0, 0, 0, 40]];
-        let centroids = vec![
-            vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.0, 0.0, 0.0, 1.0],
-        ];
+        let centroids = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 1.0]];
         let bounds = init_elkan_bounds(&data, &centroids);
         assert_eq!(bounds.len(), 2);
         // First point should be assigned to centroid 0

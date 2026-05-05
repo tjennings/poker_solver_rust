@@ -100,20 +100,29 @@ impl BlueprintRangeGenerator {
 
         // Load bucket files — try multiple locations in priority order.
         let candidates = [
-            snap_dir.join("buckets"),                    // snapshot/buckets (copied during training)
-            bundle_dir.join("buckets"),                  // bundle/buckets
-            config.training.cluster_path.as_ref()        // cluster_path from config (relative to CWD)
+            snap_dir.join("buckets"),   // snapshot/buckets (copied during training)
+            bundle_dir.join("buckets"), // bundle/buckets
+            config
+                .training
+                .cluster_path
+                .as_ref() // cluster_path from config (relative to CWD)
                 .map(PathBuf::from)
                 .unwrap_or_default(),
-            config.training.cluster_path.as_ref()        // cluster_path relative to bundle_dir
+            config
+                .training
+                .cluster_path
+                .as_ref() // cluster_path relative to bundle_dir
                 .map(|cp| bundle_dir.join(cp))
                 .unwrap_or_default(),
         ];
-        let actual_buckets_dir = candidates.iter()
+        let actual_buckets_dir = candidates
+            .iter()
             .find(|p| p.join("flop.buckets").exists())
             .cloned()
             .unwrap_or_else(|| {
-                eprintln!("[blueprint ranges] warning: no bucket files found in any candidate directory");
+                eprintln!(
+                    "[blueprint ranges] warning: no bucket files found in any candidate directory"
+                );
                 bundle_dir.join("buckets")
             });
 
@@ -145,9 +154,15 @@ impl BlueprintRangeGenerator {
         })
     }
 
-    pub fn strategy(&self) -> &BlueprintV2Strategy { &self.strategy }
-    pub fn tree(&self) -> &GameTree { &self.tree }
-    pub fn decision_map(&self) -> &[u32] { &self.decision_map }
+    pub fn strategy(&self) -> &BlueprintV2Strategy {
+        &self.strategy
+    }
+    pub fn tree(&self) -> &GameTree {
+        &self.tree
+    }
+    pub fn decision_map(&self) -> &[u32] {
+        &self.decision_map
+    }
 
     /// Sample turn entry ranges by walking ONE random action path through
     /// preflop and flop, weighted by the blueprint's average strategy.
@@ -226,15 +241,13 @@ impl BlueprintRangeGenerator {
                                 if board_slice.iter().any(|b| *b == c0 || *b == c1) {
                                     continue;
                                 }
-                                bucket =
-                                    self.buckets.get_bucket(*street, [c0, c1], board_slice);
+                                bucket = self.buckets.get_bucket(*street, [c0, c1], board_slice);
                                 break;
                             }
                             bucket
                         };
 
-                        let probs =
-                            self.strategy.get_action_probs(dec_idx as usize, bucket);
+                        let probs = self.strategy.get_action_probs(dec_idx as usize, bucket);
 
                         // Weight by the sum of this hand's combo weights
                         let mut hand_weight = 0.0f64;
@@ -289,15 +302,13 @@ impl BlueprintRangeGenerator {
                                 if board_slice.iter().any(|b| *b == c0 || *b == c1) {
                                     continue;
                                 }
-                                bucket =
-                                    self.buckets.get_bucket(*street, [c0, c1], board_slice);
+                                bucket = self.buckets.get_bucket(*street, [c0, c1], board_slice);
                                 break;
                             }
                             bucket
                         };
 
-                        let probs =
-                            self.strategy.get_action_probs(dec_idx as usize, bucket);
+                        let probs = self.strategy.get_action_probs(dec_idx as usize, bucket);
                         let p = probs.get(chosen).copied().unwrap_or(0.0);
 
                         for (c0, c1) in hand.combos() {
@@ -319,7 +330,9 @@ impl BlueprintRangeGenerator {
                     if lc < 20 {
                         let oop_nz = oop_weights.iter().filter(|&&w| w > 0.01).count();
                         let ip_nz = ip_weights.iter().filter(|&&w| w > 0.01).count();
-                        eprintln!("[propagate] street={street:?} player={player} action={chosen}/{num_actions} oop_nz={oop_nz} ip_nz={ip_nz}");
+                        eprintln!(
+                            "[propagate] street={street:?} player={player} action={chosen}/{num_actions} oop_nz={oop_nz} ip_nz={ip_nz}"
+                        );
                     }
 
                     node_idx = children[chosen];

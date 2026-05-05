@@ -13,7 +13,11 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to spawn pbcopy: {e}"))?;
         use std::io::Write;
-        child.stdin.take().unwrap().write_all(text.as_bytes())
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
             .map_err(|e| format!("Failed to write to pbcopy: {e}"))?;
         child.wait().map_err(|e| format!("pbcopy failed: {e}"))?;
     }
@@ -25,7 +29,11 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to spawn xclip: {e}"))?;
         use std::io::Write;
-        child.stdin.take().unwrap().write_all(text.as_bytes())
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
             .map_err(|e| format!("Failed to write to xclip: {e}"))?;
         child.wait().map_err(|e| format!("xclip failed: {e}"))?;
     }
@@ -36,7 +44,11 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to spawn clip: {e}"))?;
         use std::io::Write;
-        child.stdin.take().unwrap().write_all(text.as_bytes())
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
             .map_err(|e| format!("Failed to write to clip: {e}"))?;
         child.wait().map_err(|e| format!("clip failed: {e}"))?;
     }

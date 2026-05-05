@@ -34,8 +34,7 @@ impl RecordWriter {
                     self.rotate()?;
                 }
             }
-            write_record(&mut self.writer, rec)
-                .map_err(|e| format!("write record: {e}"))?;
+            write_record(&mut self.writer, rec).map_err(|e| format!("write record: {e}"))?;
             self.records_in_file += 1;
             self.total_count += 1;
         }
@@ -63,8 +62,7 @@ impl RecordWriter {
 
     fn open_file(base: &Path, index: u32) -> Result<BufWriter<File>, String> {
         let path = Self::file_path(base, index);
-        let file = File::create(&path)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
+        let file = File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
         Ok(BufWriter::with_capacity(1 << 20, file))
     }
 
@@ -171,7 +169,10 @@ mod tests {
         writer.flush().unwrap();
 
         // 10 records at 3 per file = 4 files (3+3+3+1).
-        assert!(dir.path().join("data.bin").exists(), "first file should use original name");
+        assert!(
+            dir.path().join("data.bin").exists(),
+            "first file should use original name"
+        );
         assert!(dir.path().join("data_00001.bin").exists(), "second file");
         assert!(dir.path().join("data_00002.bin").exists(), "third file");
         assert!(dir.path().join("data_00003.bin").exists(), "fourth file");
@@ -216,7 +217,10 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(count_records_in_file(&dir.path().join("data.bin")), 10);
-        assert!(!dir.path().join("data_00001.bin").exists(), "no rotation files");
+        assert!(
+            !dir.path().join("data_00001.bin").exists(),
+            "no rotation files"
+        );
     }
 
     #[test]
@@ -268,12 +272,14 @@ mod tests {
         assert_eq!(read_record(&mut reader).unwrap().pot, 10.0);
 
         // File 1: pots 20, 30
-        let mut reader = BufReader::new(std::fs::File::open(dir.path().join("data_00001.bin")).unwrap());
+        let mut reader =
+            BufReader::new(std::fs::File::open(dir.path().join("data_00001.bin")).unwrap());
         assert_eq!(read_record(&mut reader).unwrap().pot, 20.0);
         assert_eq!(read_record(&mut reader).unwrap().pot, 30.0);
 
         // File 2: pot 40
-        let mut reader = BufReader::new(std::fs::File::open(dir.path().join("data_00002.bin")).unwrap());
+        let mut reader =
+            BufReader::new(std::fs::File::open(dir.path().join("data_00002.bin")).unwrap());
         assert_eq!(read_record(&mut reader).unwrap().pot, 40.0);
     }
 }

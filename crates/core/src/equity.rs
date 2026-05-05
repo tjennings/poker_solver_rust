@@ -92,7 +92,9 @@ pub fn calculate_equity(hand1: CanonicalHand, hand2: CanonicalHand, samples: u32
     }
 
     #[allow(clippy::cast_precision_loss)]
-    { total_wins / total_count as f64 }
+    {
+        total_wins / total_count as f64
+    }
 }
 
 /// Enumerate all non-overlapping `([Card;2], [Card;2])` pairs for two canonical hands.
@@ -345,5 +347,4 @@ mod tests {
         let eight_three = CanonicalHand::parse("83o").unwrap();
         assert_eq!(non_overlapping_combos(seven_two, eight_three).len(), 144); // 12 * 12
     }
-
 }

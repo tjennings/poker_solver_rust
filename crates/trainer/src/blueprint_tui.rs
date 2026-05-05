@@ -6,14 +6,14 @@
 //! monitored scenarios.
 
 use std::io;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
@@ -106,7 +106,10 @@ impl BlueprintTuiApp {
             self.active_tab = 0;
         }
 
-        let sparkline_max = self.telemetry_config.sparkline_window.min(SPARKLINE_HISTORY);
+        let sparkline_max = self
+            .telemetry_config
+            .sparkline_window
+            .min(SPARKLINE_HISTORY);
 
         // Throughput
         let now = Instant::now();
@@ -133,11 +136,7 @@ impl BlueprintTuiApp {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for &v in hist.iter() {
-                push_bounded(
-                    &mut self.delta_history,
-                    (v * 10000.0) as u64,
-                    sparkline_max,
-                );
+                push_bounded(&mut self.delta_history, (v * 10000.0) as u64, sparkline_max);
             }
             hist.clear();
         }
@@ -219,11 +218,7 @@ impl BlueprintTuiApp {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for &v in hist.iter() {
-                push_bounded(
-                    &mut self.prune_history,
-                    (v * 1000.0) as u64,
-                    sparkline_max,
-                );
+                push_bounded(&mut self.prune_history, (v * 1000.0) as u64, sparkline_max);
             }
             hist.clear();
         }
@@ -340,8 +335,8 @@ impl BlueprintTuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(20), // Metrics area (3 header + 8 sparklines x 2 + 1 spacer)
-                Constraint::Min(0),    // Strategy grids
-                Constraint::Length(1), // Hotkeys
+                Constraint::Min(0),     // Strategy grids
+                Constraint::Length(1),  // Hotkeys
             ])
             .split(area);
 
@@ -371,7 +366,7 @@ impl BlueprintTuiApp {
                 Constraint::Length(2), // Max negative regret sparkline
                 Constraint::Length(2), // Avg positive regret sparkline
                 Constraint::Length(2), // Traversals pruned sparkline
-                Constraint::Min(0),   // Spacer
+                Constraint::Min(0),    // Spacer
             ])
             .split(metrics_area);
 
@@ -430,10 +425,18 @@ impl BlueprintTuiApp {
     fn render_progress_gauge(&self, frame: &mut Frame, area: Rect) {
         let ratio = if let Some(t) = self.metrics.target_iterations {
             let current = self.metrics.iterations.load(Ordering::Relaxed);
-            if t > 0 { current as f64 / t as f64 } else { 0.0 }
+            if t > 0 {
+                current as f64 / t as f64
+            } else {
+                0.0
+            }
         } else if let Some(minutes) = self.metrics.time_limit_minutes {
             let elapsed = self.metrics.elapsed_secs();
-            if minutes > 0 { elapsed / (minutes as f64 * 60.0) } else { 0.0 }
+            if minutes > 0 {
+                elapsed / (minutes as f64 * 60.0)
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -510,8 +513,7 @@ impl BlueprintTuiApp {
                 .map(|t| t.elapsed().as_secs_f64())
                 .unwrap_or(0.0);
             let eta = if progress > 0 {
-                let remaining =
-                    (total - progress) as f64 / (progress as f64 / elapsed);
+                let remaining = (total - progress) as f64 / (progress as f64 / elapsed);
                 format!("ETA {remaining:.0}s")
             } else {
                 "ETA ...".to_string()
@@ -658,8 +660,7 @@ impl BlueprintTuiApp {
             }
         }
 
-        let paragraph = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::TOP));
+        let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
         frame.render_widget(paragraph, area);
     }
 
@@ -745,11 +746,7 @@ fn run_tui_inner(
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = BlueprintTuiApp::new(
-        Arc::clone(&metrics),
-        scenarios,
-        telemetry_config,
-    );
+    let mut app = BlueprintTuiApp::new(Arc::clone(&metrics), scenarios, telemetry_config);
     if let Some(panel) = audit_panel {
         app.set_audit_panel(panel);
     }
@@ -882,11 +879,7 @@ mod tests {
     #[timed_test(10)]
     fn app_renders_without_panic() {
         let metrics = make_metrics();
-        let app = BlueprintTuiApp::new(
-            metrics,
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let app = BlueprintTuiApp::new(metrics, vec![], TelemetryConfig::default());
         let backend = ratatui::backend::TestBackend::new(160, 50);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
@@ -896,11 +889,7 @@ mod tests {
     fn tab_switching() {
         let metrics = make_metrics();
         let scenarios = vec![make_scenario("A"), make_scenario("B")];
-        let mut app = BlueprintTuiApp::new(
-            metrics,
-            scenarios,
-            TelemetryConfig::default(),
-        );
+        let mut app = BlueprintTuiApp::new(metrics, scenarios, TelemetryConfig::default());
 
         assert_eq!(app.active_tab, 0);
         app.next_tab();
@@ -914,11 +903,7 @@ mod tests {
     #[timed_test(10)]
     fn app_renders_with_audit_panel() {
         let metrics = make_metrics();
-        let mut app = BlueprintTuiApp::new(
-            metrics,
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app = BlueprintTuiApp::new(metrics, vec![], TelemetryConfig::default());
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
                 name: "AKo test".to_string(),
@@ -967,11 +952,8 @@ mod tests {
     #[timed_test(10)]
     fn audit_panel_tick_updates_snapshots() {
         let metrics = make_metrics();
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
                 name: "test".to_string(),
@@ -1016,11 +998,7 @@ mod tests {
     #[timed_test(10)]
     fn hotkey_text_includes_audit_when_panel_set() {
         let metrics = make_metrics();
-        let mut app = BlueprintTuiApp::new(
-            metrics,
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app = BlueprintTuiApp::new(metrics, vec![], TelemetryConfig::default());
         // Without audit panel, render the hotkeys area and check for "tab"
         let backend = ratatui::backend::TestBackend::new(80, 50);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1053,11 +1031,8 @@ mod tests {
     fn tick_consumes_reloaded_tui_state() {
         let metrics = make_metrics();
         let scenarios = vec![make_scenario("Old")];
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            scenarios,
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), scenarios, TelemetryConfig::default());
         assert_eq!(app.scenarios.len(), 1);
         assert_eq!(app.scenarios[0].name, "Old");
 
@@ -1081,11 +1056,8 @@ mod tests {
     fn tick_reloaded_state_resets_active_tab() {
         let metrics = make_metrics();
         let scenarios = vec![make_scenario("A"), make_scenario("B")];
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            scenarios,
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), scenarios, TelemetryConfig::default());
         app.active_tab = 1;
 
         let state = crate::blueprint_tui_metrics::ReloadedTuiState {
@@ -1103,11 +1075,8 @@ mod tests {
     #[timed_test(10)]
     fn tick_reloaded_state_swaps_audit_panel() {
         let metrics = make_metrics();
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
         assert!(app.audit_panel.is_none());
 
         let state = crate::blueprint_tui_metrics::ReloadedTuiState {
@@ -1144,11 +1113,7 @@ mod tests {
     #[timed_test(10)]
     fn hotkey_text_includes_config_and_refresh() {
         let metrics = make_metrics();
-        let app = BlueprintTuiApp::new(
-            metrics,
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let app = BlueprintTuiApp::new(metrics, vec![], TelemetryConfig::default());
         // Render and check the hotkey bar contains [c]onfig and [r]efresh
         let backend = ratatui::backend::TestBackend::new(100, 50);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1160,8 +1125,14 @@ mod tests {
         for x in 0..buf.area().width {
             hotkey_line.push(buf[(x, last_row)].symbol().chars().next().unwrap_or(' '));
         }
-        assert!(hotkey_line.contains("[c]onfig"), "hotkey bar missing [c]onfig: {hotkey_line}");
-        assert!(hotkey_line.contains("[r]efresh"), "hotkey bar missing [r]efresh: {hotkey_line}");
+        assert!(
+            hotkey_line.contains("[c]onfig"),
+            "hotkey bar missing [c]onfig: {hotkey_line}"
+        );
+        assert!(
+            hotkey_line.contains("[r]efresh"),
+            "hotkey bar missing [r]efresh: {hotkey_line}"
+        );
     }
 
     #[timed_test(10)]
@@ -1175,11 +1146,8 @@ mod tests {
         // Push a prior exploitability value so the sparkline has data.
         metrics.push_exploitability(500.0);
 
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
         app.tick();
 
         let backend = ratatui::backend::TestBackend::new(120, 50);
@@ -1211,11 +1179,8 @@ mod tests {
         // No active pass -- total is 0.
         metrics.push_exploitability(500.0);
 
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
         app.tick();
 
         let backend = ratatui::backend::TestBackend::new(120, 50);
@@ -1262,8 +1227,8 @@ mod tests {
 
     #[timed_test(10)]
     fn app_renders_with_exploitable_spots_no_panic() {
-        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
         use poker_solver_core::blueprint_v2::Street;
+        use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
 
         let metrics = make_metrics();
         metrics.set_exploitable_spots(vec![
@@ -1284,11 +1249,8 @@ mod tests {
                 magnitude: 10.0,
             },
         ]);
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
         // Set up audit panel so the horizontal split fires
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
@@ -1339,11 +1301,8 @@ mod tests {
 
         let metrics = make_metrics();
         // Don't set any exploitable spots
-        let mut app = BlueprintTuiApp::new(
-            Arc::clone(&metrics),
-            vec![],
-            TelemetryConfig::default(),
-        );
+        let mut app =
+            BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
         // Set up audit panel so the split fires
         app.set_audit_panel(crate::blueprint_tui_audit_widget::AuditPanelState {
             metas: vec![crate::blueprint_tui_audit_widget::AuditMeta {
