@@ -137,13 +137,14 @@ fn default_force_allin_threshold() -> f64 {
 
 /// Return the number of board cards for a given street name.
 ///
-/// Panics if `street` is not one of `"river"`, `"turn"`, or `"flop"`.
+/// Panics if `street` is not one of `"river"`, `"turn"`, `"turn_boundary"`, or `"flop"`.
 pub fn board_cards_for_street(street: &str) -> usize {
     match street {
         "river" => 5,
         "turn" => 4,
+        "turn_boundary" => 4,
         "flop" => 3,
-        other => panic!("unknown street: {other:?} (expected river, turn, or flop)"),
+        other => panic!("unknown street: {other:?} (expected river, turn_boundary, turn, or flop)"),
     }
 }
 
@@ -156,6 +157,12 @@ pub struct DatagenConfig {
     /// Datagen mode: "model" uses river neural net at boundaries, "exact" solves to showdown.
     #[serde(default = "default_datagen_mode")]
     pub mode: String,
+    /// Target oracle for turn-boundary datasets: "river_net" or "exact_river".
+    #[serde(default = "default_turn_boundary_target_source")]
+    pub turn_boundary_target_source: String,
+    /// Optional weighted sampling policy for turn-boundary oracle datasets.
+    #[serde(default)]
+    pub turn_boundary_sampling: TurnBoundarySamplingConfig,
     #[serde(default = "default_pot_intervals")]
     pub pot_intervals: Vec<[i32; 2]>,
     #[serde(default)]
@@ -211,6 +218,8 @@ impl Default for DatagenConfig {
             num_samples: 1000,
             street: default_street(),
             mode: default_datagen_mode(),
+            turn_boundary_target_source: default_turn_boundary_target_source(),
+            turn_boundary_sampling: TurnBoundarySamplingConfig::default(),
             pot_intervals: default_pot_intervals(),
             spr_intervals: None,
             solver_iterations: 1000,
@@ -230,8 +239,36 @@ impl Default for DatagenConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnBoundarySamplingConfig {
+    #[serde(default)]
+    pub strata: Vec<TurnBoundarySamplingStratum>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnBoundarySamplingStratum {
+    pub name: String,
+    #[serde(default = "default_sampling_weight")]
+    pub weight: f64,
+    #[serde(default)]
+    pub pot_intervals: Option<Vec<[i32; 2]>>,
+    #[serde(default)]
+    pub spr_intervals: Option<Vec<[f64; 2]>>,
+    #[serde(default)]
+    pub raise_depth: Option<String>,
+    #[serde(default)]
+    pub boundary_ordinal: Option<String>,
+}
+
+fn default_sampling_weight() -> f64 {
+    1.0
+}
+
 fn default_datagen_mode() -> String {
     "model".into()
+}
+fn default_turn_boundary_target_source() -> String {
+    "river_net".into()
 }
 fn default_backend() -> String {
     "cpu".into()
@@ -454,6 +491,7 @@ training:
     fn board_cards_for_known_streets() {
         assert_eq!(board_cards_for_street("river"), 5);
         assert_eq!(board_cards_for_street("turn"), 4);
+        assert_eq!(board_cards_for_street("turn_boundary"), 4);
         assert_eq!(board_cards_for_street("flop"), 3);
     }
 
@@ -565,6 +603,69 @@ datagen:
     fn datagen_mode_defaults_to_model() {
         let config = DatagenConfig::default();
         assert_eq!(config.mode, "model");
+    }
+
+    #[test]
+    fn turn_boundary_target_source_defaults_to_river_net() {
+        let config = DatagenConfig::default();
+        assert_eq!(config.turn_boundary_target_source, "river_net");
+    }
+
+    #[test]
+    fn parse_config_with_turn_boundary_target_source() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  street: "turn_boundary"
+  turn_boundary_target_source: "exact_river"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.datagen.street, "turn_boundary");
+        assert_eq!(config.datagen.turn_boundary_target_source, "exact_river");
+    }
+
+    #[test]
+    fn turn_boundary_sampling_defaults_to_empty() {
+        let config = DatagenConfig::default();
+        assert!(config.turn_boundary_sampling.strata.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_turn_boundary_sampling_strata() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  street: "turn_boundary"
+  turn_boundary_sampling:
+    strata:
+      - name: "tiny_pot_high_spr"
+        weight: 4.0
+        pot_intervals: [[4, 12]]
+        spr_intervals: [[8.0, 20.0]]
+        raise_depth: "4bet_plus"
+        boundary_ordinal: "high_spr_probe"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        let strata = &config.datagen.turn_boundary_sampling.strata;
+        assert_eq!(strata.len(), 1);
+        assert_eq!(strata[0].name, "tiny_pot_high_spr");
+        assert_eq!(strata[0].weight, 4.0);
+        assert_eq!(strata[0].pot_intervals.as_ref().unwrap(), &vec![[4, 12]]);
+        assert_eq!(
+            strata[0].spr_intervals.as_ref().unwrap(),
+            &vec![[8.0, 20.0]]
+        );
+        assert_eq!(strata[0].raise_depth.as_deref(), Some("4bet_plus"));
+        assert_eq!(
+            strata[0].boundary_ordinal.as_deref(),
+            Some("high_spr_probe")
+        );
     }
 
     #[test]

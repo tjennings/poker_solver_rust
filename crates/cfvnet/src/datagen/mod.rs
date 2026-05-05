@@ -3,8 +3,12 @@ pub mod domain;
 pub mod generate;
 #[cfg(feature = "gpu-turn-datagen")]
 pub mod gpu_boundary_eval;
+pub mod manifest;
 pub mod precompute_ranges;
 pub mod range_gen;
 pub mod sampler;
 pub mod solver;
 pub mod storage;
+pub mod turn_boundary_dataset;
+pub mod turn_boundary_generate;
+pub mod turn_boundary_oracle;

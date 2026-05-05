@@ -1,5 +1,7 @@
 """Read CfvnetConfig YAML files (same format as Rust)."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +12,8 @@ import yaml
 class TrainConfig:
     """Training configuration matching Rust's TrainingConfig."""
 
+    street: str | None = None
+    board_size: int | None = None
     hidden_layers: int = 7
     hidden_size: int = 500
     batch_size: int = 2048
@@ -35,8 +39,12 @@ def load_config(path: Path) -> TrainConfig:
     with open(path) as f:
         raw = yaml.safe_load(f)
 
+    game = raw.get("game", {})
+    datagen = raw.get("datagen", {})
     training = raw.get("training", {})
     return TrainConfig(
+        street=datagen.get("street"),
+        board_size=game.get("board_size"),
         hidden_layers=training.get("hidden_layers", 7),
         hidden_size=training.get("hidden_size", 500),
         batch_size=training.get("batch_size", 2048),

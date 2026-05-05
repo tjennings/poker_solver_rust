@@ -9,7 +9,8 @@ import torch
 
 from cfvnet.config import TrainConfig
 from cfvnet.constants import NUM_COMBOS
-from cfvnet.train import _maybe_resume, train_boundary
+from cfvnet.data import LazyBoundaryDataset
+from cfvnet.train import _maybe_resume, _split_dataset, train_boundary
 
 
 def _write_test_data(path: Path, n: int = 32) -> None:
@@ -111,3 +112,32 @@ def test_maybe_resume_picks_numerically_latest_checkpoint():
         epoch = _maybe_resume(model, opt, sched, scaler, output_dir)
 
     assert epoch == 200, f"expected resume from epoch 200, got {epoch}"
+
+
+def test_split_dataset_prefers_frozen_validation_split():
+    """A dataset-local validation_split.yaml should define val indices."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_path = Path(tmpdir) / "train.bin"
+        _write_test_data(data_path, n=10)
+        (Path(tmpdir) / "validation_split.yaml").write_text(
+            """
+schema_version: 1
+seed: 123
+total_records: 10
+train_records: 7
+validation_records: 3
+validation_fraction: 0.3
+strata: {}
+validation_indices:
+  - 1
+  - 4
+  - 9
+"""
+        )
+
+        dataset = LazyBoundaryDataset.from_path(data_path)
+        train_ds, val_ds = _split_dataset(dataset, 0.3, data_path)
+
+    assert len(train_ds) == 7
+    assert len(val_ds) == 3
+    assert list(val_ds.indices) == [1, 4, 9]

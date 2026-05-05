@@ -11,11 +11,12 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from cfvnet.config import TrainConfig
 from cfvnet.data import LazyBoundaryDataset
 from cfvnet.loss import boundary_loss
+from cfvnet.manifest import read_validation_split
 from cfvnet.model import BoundaryNet
 
 
@@ -94,13 +95,20 @@ def _train_with_gpu_buffer(
 ) -> float:
     """Train using GPU ring buffer — zero CPU-GPU transfer per batch."""
     import threading
+
     from cfvnet.gpu_buffer import GpuRingBuffer
 
     # Refresh 10% of the pool per epoch, overlapped with training.
     refresh_count = buffer_size // 10
 
-    buf = GpuRingBuffer(data_path, capacity=buffer_size, device=device,
-                        num_workers=num_workers)
+    buf = GpuRingBuffer(
+        data_path,
+        capacity=buffer_size,
+        device=device,
+        num_workers=num_workers,
+        expected_street=config.street,
+        expected_board_size=config.board_size,
+    )
 
     # Steps per epoch = total records / batch_size (approximate).
     steps_per_epoch = max(buf._total_records // config.batch_size, 1)
@@ -274,8 +282,12 @@ def _train_with_dataloader(
     num_workers: int,
 ) -> float:
     """Train using standard DataLoader — for CPU or small datasets."""
-    dataset = LazyBoundaryDataset.from_path(data_path)
-    train_ds, val_ds = _split_dataset(dataset, config.validation_split)
+    dataset = LazyBoundaryDataset.from_path(
+        data_path,
+        expected_street=config.street,
+        expected_board_size=config.board_size,
+    )
+    train_ds, val_ds = _split_dataset(dataset, config.validation_split, data_path)
     train_loader = _make_dataloader(train_ds, config.batch_size, shuffle=True,
                                     num_workers=num_workers)
     val_loader = (_make_dataloader(val_ds, config.batch_size, shuffle=False,
@@ -298,7 +310,9 @@ def _train_with_dataloader(
 
         losses = {"train_loss": train_loss, "lr": scheduler.get_last_lr()[0]}
         if val_loader:
-            losses.update({"val_combined": val_combined, "val_huber": val_huber, "val_aux": val_aux})
+            losses.update(
+                {"val_combined": val_combined, "val_huber": val_huber, "val_aux": val_aux}
+            )
         if output_dir:
             _append_training_log(output_dir, epoch + 1, losses)
         _maybe_save_checkpoint(
@@ -359,15 +373,41 @@ def _format_epoch_msg(
 def _split_dataset(
     dataset: LazyBoundaryDataset,
     val_split: float,
+    data_path: Path | None = None,
 ) -> tuple:
     """Split dataset into train and val sets."""
     if val_split <= 0.0:
         return dataset, None
+    split_path = _find_validation_split(data_path) if data_path is not None else None
+    if split_path is not None:
+        split = read_validation_split(split_path)
+        split.validate(len(dataset))
+        validation = set(split.validation_indices)
+        train_indices = [idx for idx in range(len(dataset)) if idx not in validation]
+        if not validation:
+            return dataset, None
+        return Subset(dataset, train_indices), Subset(dataset, split.validation_indices)
+
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     if val_size == 0:
         return dataset, None
     return random_split(dataset, [train_size, val_size])
+
+
+def _find_validation_split(data_path: Path) -> Path | None:
+    """Find a frozen validation split next to the dataset, if present."""
+    candidates = []
+    if data_path.is_dir():
+        candidates.append(data_path / "validation_split.yaml")
+        candidates.append(data_path / "validation_split.yml")
+    else:
+        candidates.append(data_path.parent / "validation_split.yaml")
+        candidates.append(data_path.parent / "validation_split.yml")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _make_dataloader(

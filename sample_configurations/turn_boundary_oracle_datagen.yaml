@@ -1,0 +1,60 @@
+# Turn-boundary oracle dataset generation.
+#
+# River-net oracle (fast, requires GPU ONNX feature):
+#   cargo run -p cfvnet --release --features gpu-turn-datagen -- generate \
+#     -c sample_configurations/turn_boundary_oracle_datagen.yaml \
+#     -o local_data/cfvnet/turn_boundary/river_net_v1/data.bin \
+#     --per-file 10000
+#
+# Exact-river oracle is slower but useful for validation shards:
+#   set datagen.turn_boundary_target_source: "exact_river"
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["25%", "75%", "a"]
+  board_size: 4
+  add_allin_threshold: 1.5
+  force_allin_threshold: 0.15
+  river_model_path: "local_data/models/cfvnet_river_py_v2/model.onnx"
+
+datagen:
+  street: "turn_boundary"
+  turn_boundary_target_source: "river_net"
+  num_samples: 100000
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 20.0]]
+  turn_boundary_sampling:
+    strata:
+      - name: "normal_mix"
+        weight: 8.0
+      - name: "tiny_pot_high_spr"
+        weight: 3.0
+        pot_intervals: [[4, 12]]
+        spr_intervals: [[8.0, 20.0]]
+        raise_depth: "4bet_plus"
+      - name: "low_spr_allin_pressure"
+        weight: 2.0
+        pot_intervals: [[100, 200]]
+        spr_intervals: [[0.0, 0.5]]
+        raise_depth: "3bet_plus"
+  solver_iterations: 500
+  target_exploitability: 0.01
+  bet_size_fuzz: 0.0
+  threads: 12
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 8192
+  epochs: 500
+  learning_rate: 0.002
+  lr_min: 0.00002
+  huber_delta: 1.0
+  aux_loss_weight: 0.1
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 10
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  grad_clip_norm: 1.0

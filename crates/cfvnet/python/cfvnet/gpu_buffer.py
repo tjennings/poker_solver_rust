@@ -48,13 +48,15 @@ class GpuRingBuffer:
         capacity: int,
         device: torch.device,
         num_workers: int = 8,
+        expected_street: str | None = None,
+        expected_board_size: int | None = None,
     ) -> None:
         self._device = device
         self._capacity = capacity
         self._num_workers = num_workers
 
         # Build file index.  Each entry: (path, byte_offset, record_size).
-        files = _resolve_bin_files(data_path)
+        files = _resolve_bin_files(data_path, expected_street, expected_board_size)
         self._file_index: list[tuple[str, int, int]] = []
         skipped = 0
         for f in files:
