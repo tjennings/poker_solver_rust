@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-17T17:05:22Z
-updated_at: 2026-05-05T12:55:26Z
+updated_at: 2026-05-05T13:00:52Z
 ---
 
 Subgame solver's range matrix disagrees with Blueprint and Exact tabs at the same decision node, and the actor label is wrong.
@@ -62,3 +62,11 @@ Screenshots show turn-start subgame solve correctly updates the matrix, but afte
 - [ ] Navigating back to earlier actions in the street must not reset the matrix.
 - [ ] Blueprint, Subgame, and Exact each show the representative matrix for the current game state.
 - [ ] Add regression coverage for solved cache persistence and seat-label vocabulary.
+
+## Dispatch Plan
+
+- [x] Research root-cause hypotheses for label and solved-matrix cache behavior.
+- [x] Brainstorm backend-owned cache strategy with seat labels and source-specific navigation.
+- [ ] Dispatch implementation to Rust worker for `crates/tauri-app/src/game_session.rs`.
+- [ ] Dispatch review after implementation.
+- [ ] Integrate, test, and update bean summary.
