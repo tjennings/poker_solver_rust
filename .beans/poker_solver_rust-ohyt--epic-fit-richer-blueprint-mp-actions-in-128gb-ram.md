@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-ohyt
 title: 'Epic: fit richer blueprint_mp actions in 128GB RAM'
-status: todo
+status: in-progress
 type: epic
 priority: high
 created_at: 2026-05-05T15:01:07Z
-updated_at: 2026-05-05T15:01:07Z
+updated_at: 2026-05-05T15:06:52Z
 ---
 
 Increase the number of useful blueprint_mp actions that can be trained and served within a 128GB RAM target. Scope covers the first five implementation ideas from the memory research pass.

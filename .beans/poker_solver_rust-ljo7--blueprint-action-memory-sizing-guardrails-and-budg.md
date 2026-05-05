@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-ljo7
 title: 'Blueprint action memory: sizing guardrails and budget reports'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-05T15:01:15Z
-updated_at: 2026-05-05T15:01:47Z
+updated_at: 2026-05-05T15:06:55Z
 parent: poker_solver_rust-ohyt
 ---
 
