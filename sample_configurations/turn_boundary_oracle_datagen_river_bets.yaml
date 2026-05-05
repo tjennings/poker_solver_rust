@@ -1,0 +1,75 @@
+# Turn-boundary oracle dataset generation using the current river datagen bets.
+#
+# This mirrors sample_configurations/boundary_net_river_datagen.yaml's
+# Supremus-style action abstraction, but samples 4-card turn states and emits
+# direct turn-boundary CFV targets.
+#
+# River-net oracle (fast, requires GPU ONNX feature):
+#   cargo run -p cfvnet --release --features gpu-turn-datagen -- generate \
+#     -c sample_configurations/turn_boundary_oracle_datagen_river_bets.yaml \
+#     -o local_data/cfvnet/turn_boundary/river_bets_v1/data.bin \
+#     --num-samples 5000000 \
+#     --per-file 10000
+#
+# Exact-river oracle is slower but useful for validation shards:
+#   set datagen.turn_boundary_target_source: "exact_river"
+
+game:
+  initial_stack: 200
+  # Same bet rows as boundary_net_river_datagen.yaml. Fold, check, and call are
+  # implicit. Later rows not listed here are forced to all-in only.
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["25%", "75%", "a"]
+    - ["25%", "75%", "a"]
+    - ["25%", "75%", "a"]
+    - ["25%", "75%", "a"]
+    - ["a"]
+  board_size: 4
+  add_allin_threshold: 1.5
+  force_allin_threshold: 0.15
+  river_model_path: "local_data/models/cfvnet_river_py_v2/model.onnx"
+
+datagen:
+  street: "turn_boundary"
+  turn_boundary_target_source: "river_net"
+  blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
+  num_samples: 5000000
+  per_file: 10000
+  bet_size_fuzz: 0.20
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 20.0]]
+  turn_boundary_sampling:
+    strata:
+      - name: "normal_mix"
+        weight: 8.0
+      - name: "tiny_pot_high_spr"
+        weight: 3.0
+        pot_intervals: [[4, 12]]
+        spr_intervals: [[8.0, 20.0]]
+        raise_depth: "4bet_plus"
+      - name: "low_spr_allin_pressure"
+        weight: 2.0
+        pot_intervals: [[100, 200]]
+        spr_intervals: [[0.0, 0.5]]
+        raise_depth: "3bet_plus"
+  solver_iterations: 500
+  target_exploitability: 0.01
+  threads: 18
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 16384
+  epochs: 2000
+  learning_rate: 0.004
+  lr_min: 0.00004
+  huber_delta: 1.0
+  aux_loss_weight: 0.00001
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 25
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  encoder_threads: 14
+  gpu_prefetch: 3
+  grad_clip_norm: 1.0
