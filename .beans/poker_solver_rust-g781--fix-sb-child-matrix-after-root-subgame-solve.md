@@ -17,7 +17,7 @@ After solving a turn subgame at the street root, navigating BB Check to the SB a
 - [x] Fix solved matrix lookup so child states use solved representative matrices.
 - [x] Add regression coverage for solved root -> BB Check -> SB matrix.
 - [x] Run targeted and full verification.
-- [ ] Merge to local main.
+- [x] Merge to local main.
 
 ## Summary of Changes
 
