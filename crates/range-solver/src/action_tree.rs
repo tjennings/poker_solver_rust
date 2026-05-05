@@ -239,6 +239,7 @@ pub(crate) struct ActionTreeNode {
     pub(crate) player: u8,
     pub(crate) board_state: BoardState,
     pub(crate) amount: i32,
+    pub(crate) remaining_stack: i32,
     pub(crate) actions: Vec<Action>,
     pub(crate) children: Vec<MutexLike<ActionTreeNode>>,
 }
@@ -732,6 +733,8 @@ impl ActionTree {
 
     /// Recursively builds the action tree.
     fn build_tree_recursive(&self, node: &mut ActionTreeNode, info: BuildTreeInfo) {
+        node.remaining_stack = info.stack[0].min(info.stack[1]).max(0);
+
         if node.is_terminal() {
             // do nothing
         } else if node.is_chance() {

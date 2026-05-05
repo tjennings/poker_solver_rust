@@ -17,6 +17,7 @@ impl Default for PostFlopNode {
             river: NOT_DEALT,
             is_locked: false,
             amount: 0,
+            remaining_stack: 0,
             children_offset: 0,
             num_children: 0,
             num_elements_ip: 0,

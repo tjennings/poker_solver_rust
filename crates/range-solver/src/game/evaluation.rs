@@ -120,10 +120,9 @@ impl PostFlopGame {
                                      nor boundary_evaluator). Ensure hybrid setup populated \
                                      per_boundary_evaluators or set_boundary_cfvs() is called."
                                 );
-                            };
+                        };
                         let pot = self.tree_config.starting_pot + 2 * node.amount;
-                        let remaining =
-                            (self.tree_config.effective_stack as f64 - pot as f64 / 2.0).max(0.0);
+                        let remaining = f64::from(node.remaining_stack.max(0));
                         let opp_reach = self.boundary_reach[reach_index].lock().unwrap().clone();
                         let opp_reach_ref = if opp_reach.is_empty() {
                             &self.initial_weights[opp]

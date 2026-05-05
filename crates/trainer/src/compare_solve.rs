@@ -1798,7 +1798,7 @@ fn print_boundary_cfv_comparison(
         let node_idx = boundary_indices[ordinal];
         let node = game.node_at(node_idx);
         let pot_at = game.tree_config().starting_pot + 2 * node.bet_amount();
-        let remaining = (game.tree_config().effective_stack as f64 - pot_at as f64 / 2.0).max(0.0);
+        let remaining = f64::from(game.boundary_remaining_stack(ordinal).max(0));
         let turn_str = card_to_string(node.turn_card()).unwrap_or_else(|_| "--".to_string());
         let river_str = card_to_string(node.river_card()).unwrap_or_else(|_| "--".to_string());
         drop(node);

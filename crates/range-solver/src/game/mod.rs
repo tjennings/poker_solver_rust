@@ -157,6 +157,7 @@ pub struct PostFlopNode {
     pub(crate) river: Card,
     pub(crate) is_locked: bool,
     pub(crate) amount: i32,
+    pub(crate) remaining_stack: i32,
     pub(crate) children_offset: u32,
     pub(crate) num_children: u16,
     pub(crate) num_elements_ip: u16,

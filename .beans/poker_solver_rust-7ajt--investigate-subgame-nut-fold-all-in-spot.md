@@ -15,8 +15,8 @@ At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:che
 - [x] Reproduce the exact spot in a backend test or diagnostic.
 - [x] Inspect the range-solver root configuration, player/seat mapping, and terminal payoff orientation at the BB all-in node.
 - [x] Determine whether the bad strategy comes from the solver, boundary/payoff setup, or matrix extraction.
-- [ ] Fix the underlying bug or document the narrowed root cause if it is outside this patch.
-- [ ] Add regression coverage for SB not folding nut hands to a jam when call is clearly profitable.
+- [x] Fix the underlying bug or document the narrowed root cause if it is outside this patch.
+- [x] Add regression coverage for SB not folding nut hands to a jam when call is clearly profitable.
 - [ ] Run targeted and full verification.
 - [ ] Merge to local main.
 
@@ -26,3 +26,9 @@ At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:che
 - With root-aware comparison, the all-exact post-jam node has strong SB hands calling 100%, including AA/KK/JJ.
 - The pathological overjam reproduces one decision earlier with `--river-boundary exact_subtree`: exact calls AA/KK/JJ, while the depth-limited exact-subtree solve jams them.
 - `--river-boundary exact_oracle` remained close to exact in the same spot, so the next target is the exact-subtree boundary CFV contract/scale.
+
+## Fix Notes
+
+- Depth-boundary evaluation now uses the action tree's actual remaining stack instead of deriving stack from `effective_stack - pot / 2`.
+- Exact-subtree treats zero-stack boundaries as all-in runouts and returns raw per-combination showdown CFVs at the parent solver's scale.
+- The 10-iteration CLI reproduction now keeps AA/KK/KJs/KJo/JJ/AKs/AKo on call instead of all-in.

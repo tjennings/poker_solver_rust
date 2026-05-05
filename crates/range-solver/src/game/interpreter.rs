@@ -357,6 +357,13 @@ impl PostFlopGame {
         self.tree_config.starting_pot + 2 * node.amount
     }
 
+    /// Returns the remaining effective stack at a given depth boundary node.
+    pub fn boundary_remaining_stack(&self, ordinal: usize) -> i32 {
+        let indices = self.boundary_node_indices();
+        let node = self.node_arena[indices[ordinal]].lock();
+        node.remaining_stack
+    }
+
     /// Returns true if boundary CFVs for the given ordinal and player are empty.
     pub fn boundary_cfvs_empty(&self, ordinal: usize, player: usize) -> bool {
         let idx = ordinal * 2 + player;
@@ -1124,6 +1131,7 @@ impl PostFlopGame {
             let mut node = self.node_arena[node_index].lock();
             node.player = action_node.player;
             node.amount = action_node.amount;
+            node.remaining_stack = action_node.remaining_stack;
             is_terminal = node.is_terminal();
             is_chance = node.is_chance();
         }
@@ -1817,6 +1825,51 @@ mod tests {
                 "boundary pot should be >= starting pot, got {pot}"
             );
         }
+    }
+
+    #[test]
+    fn test_boundary_remaining_stack_tracks_in_street_call() {
+        let oop_range: crate::range::Range = "AA,KK,QQ".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ,JJ,TT".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: NOT_DEALT,
+        };
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 100,
+            effective_stack: 100,
+            initial_player: PLAYER_IP,
+            initial_stacks: Some([80, 100]),
+            initial_prev_action: Action::Bet(20),
+            initial_prev_amount: 20,
+            initial_amount: 0,
+            initial_num_bets: 1,
+            turn_bet_sizes: simple_bet_sizes(),
+            river_bet_sizes: simple_bet_sizes(),
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let game = PostFlopGame::with_config(card_config, tree).unwrap();
+
+        let root = game.node_arena[0].lock();
+        let children_offset = root.children_offset as usize;
+        let num_children = root.num_children as usize;
+        drop(root);
+        let call_child_idx = (children_offset..children_offset + num_children)
+            .find(|&idx| game.node_arena[idx].lock().prev_action == Action::Call)
+            .expect("root should allow a call");
+
+        let call_child = game.node_arena[call_child_idx].lock();
+        assert!(call_child.is_depth_boundary());
+        assert_eq!(call_child.remaining_stack, 80);
+        drop(call_child);
+
+        let ordinal = game.node_to_boundary[call_child_idx] as usize;
+        assert_eq!(game.boundary_remaining_stack(ordinal), 80);
     }
 
     #[test]

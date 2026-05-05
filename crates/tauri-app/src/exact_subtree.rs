@@ -251,6 +251,111 @@ fn solve_subtree_raw(
     (oop_out, ip_out)
 }
 
+fn weighted_num_combinations(
+    private_cards: &[Vec<(u8, u8)>; 2],
+    weights: &[Vec<f32>; 2],
+) -> f64 {
+    let mut n = 0.0;
+    for (i, &(o1, o2)) in private_cards[0].iter().enumerate() {
+        let oop_weight = f64::from(weights[0].get(i).copied().unwrap_or(0.0));
+        if oop_weight <= 0.0 {
+            continue;
+        }
+        for (j, &(i1, i2)) in private_cards[1].iter().enumerate() {
+            if o1 == i1 || o1 == i2 || o2 == i1 || o2 == i2 {
+                continue;
+            }
+            let ip_weight = f64::from(weights[1].get(j).copied().unwrap_or(0.0));
+            n += oop_weight * ip_weight;
+        }
+    }
+    n
+}
+
+fn all_in_showdown_raw_cfvs(
+    board: &[u8],
+    private_cards: &[Vec<(u8, u8)>; 2],
+    parent_initial_weights: &[Vec<f32>; 2],
+    pot: i32,
+    oop_reach: &[f32],
+    ip_reach: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let num_combinations = weighted_num_combinations(private_cards, parent_initial_weights);
+    if num_combinations <= 0.0 {
+        return (vec![0.0; oop_reach.len()], vec![0.0; ip_reach.len()]);
+    }
+
+    let half_pot = f64::from(pot) / 2.0;
+    (
+        all_in_showdown_raw_cfvs_for_player(
+            board,
+            private_cards,
+            0,
+            ip_reach,
+            half_pot,
+            num_combinations,
+        ),
+        all_in_showdown_raw_cfvs_for_player(
+            board,
+            private_cards,
+            1,
+            oop_reach,
+            half_pot,
+            num_combinations,
+        ),
+    )
+}
+
+fn all_in_showdown_raw_cfvs_for_player(
+    board: &[u8],
+    private_cards: &[Vec<(u8, u8)>; 2],
+    player: usize,
+    opponent_reach: &[f32],
+    half_pot: f64,
+    num_combinations: f64,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    let hero_cards = &private_cards[player];
+    let opp_cards = &private_cards[player ^ 1];
+    let board_cards: Vec<rs_poker::core::Card> = board
+        .iter()
+        .map(|&c| crate::exploration::range_solver_to_rs_card(c))
+        .collect();
+
+    hero_cards
+        .par_iter()
+        .map(|&(h1, h2)| {
+            let rs_h1 = crate::exploration::range_solver_to_rs_card(h1);
+            let rs_h2 = crate::exploration::range_solver_to_rs_card(h2);
+            let mut ev = 0.0f64;
+
+            for (j, &(o1, o2)) in opp_cards.iter().enumerate() {
+                let reach = f64::from(opponent_reach.get(j).copied().unwrap_or(0.0));
+                if reach <= 0.0 || h1 == o1 || h1 == o2 || h2 == o1 || h2 == o2 {
+                    continue;
+                }
+                let rs_o1 = crate::exploration::range_solver_to_rs_card(o1);
+                let rs_o2 = crate::exploration::range_solver_to_rs_card(o2);
+                if board_cards
+                    .iter()
+                    .any(|b| *b == rs_o1 || *b == rs_o2 || *b == rs_h1 || *b == rs_h2)
+                {
+                    continue;
+                }
+                let equity = poker_solver_core::showdown_equity::compute_matchup_equity(
+                    [rs_h1, rs_h2],
+                    [rs_o1, rs_o2],
+                    &board_cards,
+                );
+                ev += (2.0 * equity - 1.0) * reach;
+            }
+
+            (ev * half_pot / num_combinations) as f32
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_subtree_raw_inner(
     board: &[u8],
@@ -515,6 +620,17 @@ impl range_solver::game::BoundaryEvaluator for SubtreeExactEvaluator {
         _num_ip: usize,
         _continuation_index: usize,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
+        if remaining_stack <= 0.0 {
+            return Some(all_in_showdown_raw_cfvs(
+                &self.board,
+                &self.private_cards,
+                &self.parent_initial_weights,
+                pot,
+                oop_reach,
+                ip_reach,
+            ));
+        }
+
         Some(solve_subtree_raw(
             &self.board,
             &self.private_cards,
