@@ -202,10 +202,12 @@ export default function GameExplorer() {
   const playAction = useCallback(async (actionId: string) => {
     try {
       setLoading(true);
-      const s = await invoke<GameState>('game_play_action', {
+      const source = activeSourceRef.current;
+      await invoke<GameState>('game_play_action', {
         actionId,
-        source: activeSourceRef.current,
+        source,
       });
+      const s = await invoke<GameState>('game_get_state', { source });
       setState(s);
       setSelectedCell(null);
     } catch (e) {

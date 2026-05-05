@@ -4684,6 +4684,106 @@ mod tests {
         GameSession::new_for_test(tree)
     }
 
+    fn make_turn_root_check_to_sb_session() -> GameSession {
+        use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
+
+        let tree = V2GameTree {
+            nodes: vec![
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Bet(4.0)],
+                    children: vec![1],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Call],
+                    children: vec![2],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Flop,
+                    child: 3,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![4],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![5],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Turn,
+                    child: 6,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Check, TreeAction::Bet(48.0)],
+                    children: vec![7, 8],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Check, TreeAction::Bet(48.0)],
+                    children: vec![9, 10],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call],
+                    children: vec![11, 12],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 8.0,
+                    stacks: [196.0, 196.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 56.0,
+                    stacks: [172.0, 196.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Fold { winner: 1 },
+                    pot: 56.0,
+                    stacks: [196.0, 172.0],
+                },
+                V2GameNode::Terminal {
+                    kind: TerminalKind::Showdown,
+                    pot: 104.0,
+                    stacks: [172.0, 172.0],
+                },
+            ],
+            root: 0,
+            dealer: 0,
+            starting_stack: 200.0,
+        };
+
+        let mut session = GameSession::new_for_test(tree);
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Ks").unwrap();
+        session.deal_card("8d").unwrap();
+        session.deal_card("3c").unwrap();
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Js").unwrap();
+        session
+    }
+
     fn make_turn_sb_facing_bb_bet_session() -> GameSession {
         use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
 
@@ -5672,6 +5772,62 @@ mod tests {
         assert_eq!(matrix.cells[0][0].hand, "CHILD_CALL");
         assert_eq!(state.position, "SB");
         assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
+    }
+
+    #[test]
+    fn solve_then_bb_check_serves_solved_sb_child_matrix() {
+        let gss = GameSessionState::default();
+        let session = make_turn_root_check_to_sb_session();
+        *gss.session.write() = Some(session);
+
+        game_solve_core(
+            &gss,
+            Some("subgame".to_string()),
+            Some(1),
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while gss.subgame_solve.solving.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "solve did not finish before timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            gss.subgame_solve.solve_cache.read().contains_key(&vec![0]),
+            "completed root solve should cache the SB child after BB checks"
+        );
+
+        let state = game_play_action_core(&gss, "0", Some("subgame".to_string())).unwrap();
+        let matrix = state
+            .matrix
+            .expect("BB check should return cached solved SB matrix");
+
+        assert_eq!(state.position, "SB");
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
+        let returned_actions: Vec<_> = matrix
+            .actions
+            .iter()
+            .map(|action| (&action.label, &action.action_type))
+            .collect();
+        let cache = gss.subgame_solve.solve_cache.read();
+        let cached_actions: Vec<_> = cache[&vec![0]]
+            .actions
+            .iter()
+            .map(|action| (&action.label, &action.action_type))
+            .collect();
+        assert_eq!(returned_actions, cached_actions);
     }
 
     #[test]
