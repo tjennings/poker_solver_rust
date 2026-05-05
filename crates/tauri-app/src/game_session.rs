@@ -4799,6 +4799,147 @@ mod tests {
         session
     }
 
+    fn make_turn_street_navigation_session() -> GameSession {
+        use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
+
+        let terminal = |pot: f64| V2GameNode::Terminal {
+            kind: TerminalKind::Showdown,
+            pot,
+            stacks: [100.0, 100.0],
+        };
+
+        let tree = V2GameTree {
+            nodes: vec![
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Bet(4.0)],
+                    children: vec![1],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Preflop,
+                    actions: vec![TreeAction::Call],
+                    children: vec![2],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Flop,
+                    child: 3,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![4],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Flop,
+                    actions: vec![TreeAction::Check],
+                    children: vec![5],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Chance {
+                    next_street: Street::Turn,
+                    child: 6,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![
+                        TreeAction::Check,
+                        TreeAction::Bet(48.0),
+                        TreeAction::Bet(110.0),
+                        TreeAction::AllIn,
+                    ],
+                    children: vec![7, 11, 12, 13],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![
+                        TreeAction::Check,
+                        TreeAction::Bet(48.0),
+                        TreeAction::Bet(110.0),
+                        TreeAction::AllIn,
+                    ],
+                    children: vec![14, 8, 9, 10],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call, TreeAction::AllIn],
+                    children: vec![15, 16, 17],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call, TreeAction::AllIn],
+                    children: vec![18, 19, 20],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 1,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call],
+                    children: vec![21, 22],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call, TreeAction::AllIn],
+                    children: vec![23, 24, 25],
+                    blueprint_decision_idx: None,
+                },
+                V2GameNode::Decision {
+                    player: 0,
+                    street: Street::Turn,
+                    actions: vec![TreeAction::Fold, TreeAction::Call, TreeAction::AllIn],
+                    children: vec![26, 27, 28],
+                    blueprint_decision_idx: None,
+                },
+                terminal(400.0),
+                terminal(400.0),
+                terminal(104.0),
+                terminal(104.0),
+                terminal(104.0),
+                terminal(400.0),
+                terminal(166.0),
+                terminal(166.0),
+                terminal(400.0),
+                terminal(400.0),
+                terminal(400.0),
+                terminal(104.0),
+                terminal(104.0),
+                terminal(400.0),
+                terminal(166.0),
+                terminal(166.0),
+                terminal(400.0),
+            ],
+            root: 0,
+            dealer: 0,
+            starting_stack: 200.0,
+        };
+
+        let mut session = GameSession::new_for_test(tree);
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Ks").unwrap();
+        session.deal_card("8d").unwrap();
+        session.deal_card("3c").unwrap();
+        session.play_action("0").unwrap();
+        session.play_action("0").unwrap();
+        session.deal_card("Js").unwrap();
+        session
+    }
+
     fn make_turn_sb_facing_bb_bet_session() -> GameSession {
         use poker_solver_core::blueprint_v2::game_tree::TerminalKind;
 
@@ -5510,6 +5651,33 @@ mod tests {
         });
     }
 
+    fn seed_turn_street_navigation_cache(ss: &SolveState) {
+        let root = make_cached_node("ROOT_BB", &["Check", "24bb", "55bb", "All-in"], "BB");
+        let sb_after_check =
+            make_cached_node("SB_AFTER_CHECK", &["Check", "24bb", "55bb", "All-in"], "SB");
+        let bb_vs_sb_24 = make_cached_node("BB_VS_SB_24", &["Fold", "Call", "All-in"], "BB");
+        let bb_vs_sb_55 = make_cached_node("BB_VS_SB_55", &["Fold", "Call", "All-in"], "BB");
+        let bb_vs_sb_allin = make_cached_node("BB_VS_SB_ALLIN", &["Fold", "Call"], "BB");
+        let sb_vs_bb_24 = make_cached_node("SB_VS_BB_24", &["Fold", "Call", "All-in"], "SB");
+        let sb_vs_bb_55 = make_cached_node("SB_VS_BB_55", &["Fold", "Call", "All-in"], "SB");
+
+        let mut cache = ss.solve_cache.write();
+        cache.insert(vec![], root);
+        cache.insert(vec![0], sb_after_check);
+        cache.insert(vec![0, 1], bb_vs_sb_24);
+        cache.insert(vec![0, 2], bb_vs_sb_55);
+        cache.insert(vec![0, 3], bb_vs_sb_allin);
+        cache.insert(vec![1], sb_vs_bb_24);
+        cache.insert(vec![2], sb_vs_bb_55);
+        ss.iteration.store(100, Ordering::Relaxed);
+    }
+
+    fn matrix_label(state: &GameState) -> &str {
+        state.matrix.as_ref().expect("expected solved matrix").cells[0][0]
+            .hand
+            .as_str()
+    }
+
     #[test]
     fn solve_state_default_has_empty_cache_and_path() {
         let ss = SolveState::default();
@@ -5787,6 +5955,71 @@ mod tests {
         assert_eq!(matrix.cells[0][0].hand, "CHILD_CALL");
         assert_eq!(state.position, "SB");
         assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
+    }
+
+    fn assert_turn_street_navigation_uses_solve_cache(source: &str) {
+        let gss = GameSessionState::default();
+        let session = make_turn_street_navigation_session();
+        let mode = Some(source.to_string());
+        let ss = gss.solve_for(&mode);
+        anchor_solve_to_current_session(ss, &session);
+        seed_turn_street_navigation_cache(ss);
+        *gss.session.write() = Some(session);
+
+        let state = game_get_state_core(&gss, mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "ROOT_BB");
+        assert_eq!(state.position, "BB");
+
+        let state = game_play_action_core(&gss, "0", mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "SB_AFTER_CHECK");
+        assert_eq!(state.position, "SB");
+        assert_eq!(*ss.solve_path.read(), vec![0]);
+
+        let state = game_play_action_core(&gss, "1", mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "BB_VS_SB_24");
+        assert_eq!(state.position, "BB");
+        assert_eq!(*ss.solve_path.read(), vec![0, 1]);
+
+        let state = game_back_core(&gss, mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "SB_AFTER_CHECK");
+        assert_eq!(*ss.solve_path.read(), vec![0]);
+
+        let state = game_play_action_core(&gss, "2", mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "BB_VS_SB_55");
+        assert_eq!(*ss.solve_path.read(), vec![0, 2]);
+
+        let state = game_back_core(&gss, mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "SB_AFTER_CHECK");
+        let state = game_play_action_core(&gss, "3", mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "BB_VS_SB_ALLIN");
+        assert_eq!(*ss.solve_path.read(), vec![0, 3]);
+
+        let state = game_back_core(&gss, mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "SB_AFTER_CHECK");
+        let state = game_back_core(&gss, mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "ROOT_BB");
+        assert_eq!(*ss.solve_path.read(), Vec::<usize>::new());
+
+        let state = game_play_action_core(&gss, "1", mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "SB_VS_BB_24");
+        assert_eq!(state.position, "SB");
+        assert_eq!(*ss.solve_path.read(), vec![1]);
+
+        let state = game_back_core(&gss, mode.clone()).unwrap();
+        assert_eq!(matrix_label(&state), "ROOT_BB");
+        let state = game_play_action_core(&gss, "2", mode).unwrap();
+        assert_eq!(matrix_label(&state), "SB_VS_BB_55");
+        assert_eq!(*ss.solve_path.read(), vec![2]);
+    }
+
+    #[test]
+    fn solved_matrix_navigation_covers_turn_street_subgame_actions() {
+        assert_turn_street_navigation_uses_solve_cache("subgame");
+    }
+
+    #[test]
+    fn solved_matrix_navigation_covers_turn_street_exact_actions() {
+        assert_turn_street_navigation_uses_solve_cache("exact");
     }
 
     #[test]
@@ -6247,12 +6480,7 @@ mod tests {
         assert!(!game.is_chance_node());
 
         let matrix = build_solve_matrix_at_current(&mut game, None);
-        let total_weight: f32 = matrix
-            .cells
-            .iter()
-            .flatten()
-            .map(|cell| cell.weight)
-            .sum();
+        let total_weight: f32 = matrix.cells.iter().flatten().map(|cell| cell.weight).sum();
 
         assert_eq!(
             total_weight, 0.0,
