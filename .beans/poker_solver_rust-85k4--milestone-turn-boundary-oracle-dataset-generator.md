@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-85k4
 title: 'Milestone: turn-boundary oracle dataset generator'
-status: todo
+status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-05T02:55:44Z
-updated_at: 2026-05-05T02:55:44Z
+updated_at: 2026-05-05T03:12:03Z
 parent: poker_solver_rust-fp06
 ---
 
