@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-17T17:05:22Z
-updated_at: 2026-05-05T13:00:52Z
+updated_at: 2026-05-05T13:11:58Z
 ---
 
 Subgame solver's range matrix disagrees with Blueprint and Exact tabs at the same decision node, and the actor label is wrong.
@@ -70,3 +70,10 @@ Screenshots show turn-start subgame solve correctly updates the matrix, but afte
 - [ ] Dispatch implementation to Rust worker for `crates/tauri-app/src/game_session.rs`.
 - [ ] Dispatch review after implementation.
 - [ ] Integrate, test, and update bean summary.
+
+## Review Findings
+
+- [ ] Fix source switching after Blueprint navigation so Subgame/Exact derive the current cached path from action history.
+- [ ] Clear stale cache/path at solve start so a new solve cannot display old matrices.
+- [ ] Address or explicitly guard non-OOP solve roots so a turn node with SB to act cannot display a fresh BB/OOP root matrix under a seat label.
+- [ ] Add regression coverage for solve-root -> Blueprint action -> switch to Subgame/Exact showing the cached child matrix.
