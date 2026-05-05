@@ -17,7 +17,7 @@ At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:che
 - [x] Determine whether the bad strategy comes from the solver, boundary/payoff setup, or matrix extraction.
 - [x] Fix the underlying bug or document the narrowed root cause if it is outside this patch.
 - [x] Add regression coverage for SB not folding nut hands to a jam when call is clearly profitable.
-- [ ] Run targeted and full verification.
+- [x] Run targeted and full verification.
 - [ ] Merge to local main.
 
 ## Findings
@@ -32,3 +32,10 @@ At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:che
 - Depth-boundary evaluation now uses the action tree's actual remaining stack instead of deriving stack from `effective_stack - pot / 2`.
 - Exact-subtree treats zero-stack boundaries as all-in runouts and returns raw per-combination showdown CFVs at the parent solver's scale.
 - The 10-iteration CLI reproduction now keeps AA/KK/KJs/KJo/JJ/AKs/AKo on call instead of all-in.
+
+## Verification
+
+- `cargo test -p range-solver test_boundary_remaining_stack_tracks_in_street_call`
+- `cargo test -p poker-solver-tauri exact_subtree --no-run`
+- `cargo run -p poker-solver-trainer --release -- compare-solve --bundle /Users/coreco/code/poker_solver_rust/local_data/blueprints/1k_100bb_brdcfr_v2 --snapshot snapshot_0013 --spot 'sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:check,sb:24bb' --exact-iters 50 --subgame-iters 10 --river-boundary exact_subtree --tolerance 0`
+- Warm `cargo test`: passed in 50.70s.
