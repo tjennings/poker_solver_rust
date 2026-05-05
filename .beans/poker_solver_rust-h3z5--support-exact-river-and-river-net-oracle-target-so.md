@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-05-05T02:56:57Z
-updated_at: 2026-05-05T03:12:03Z
+updated_at: 2026-05-05T03:37:16Z
 parent: poker_solver_rust-85k4
 ---
 
@@ -14,3 +14,7 @@ Allow the dataset generator to emit targets from exact river solving where avail
 
 
 Started by defining the RiverRunoutOracle trait boundary so exact-river and river-net adapters can share the same turn-boundary averaging path.
+
+
+
+Added oracle adapters in crates/cfvnet/src/datagen/turn_boundary_oracle.rs: BoundaryNetRiverRunoutOracle wraps the existing river BoundaryNet inference contract and converts normalized chip/(pot+stack) outputs back to pot-relative CFVs, while ExactRiverSolverOracle wraps solve_situation for exact river targets. Both zero river-board blockers before target evaluation.

@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-05-05T02:56:54Z
-updated_at: 2026-05-05T03:12:03Z
+updated_at: 2026-05-05T03:37:16Z
 parent: poker_solver_rust-85k4
 ---
 
@@ -14,3 +14,7 @@ Generate turn-boundary training records by running the existing river-enumeratio
 
 
 Started with crates/cfvnet/src/datagen/turn_boundary_oracle.rs: a pure builder that averages legal river runout oracle CFVs into a turn-boundary TrainingRecord.
+
+
+
+The pure averaging builder now has concrete oracle sources available underneath it: a river-net adapter for scaled data and an exact-river adapter for validation/spot-check data. Next step is wiring selection into the dataset generation entrypoint.
