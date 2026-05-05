@@ -17,6 +17,7 @@ from cfvnet.constants import (
     RECORD_SIZE_RIVER,
     record_size,
 )
+from cfvnet.manifest import read_manifest
 
 # Byte sizes for the fixed portion of a record (after board).
 _F32_BYTES = 4
@@ -182,11 +183,33 @@ def _compute_spr_weight(pot: float, stack: float) -> float:
 def _resolve_bin_files(path: Path) -> list[Path]:
     """Get sorted list of .bin files from a path."""
     if path.is_dir():
+        manifest_path = _find_manifest(path)
+        if manifest_path is not None:
+            manifest = read_manifest(manifest_path)
+            manifest.validate_turn_boundary()
+            files = [path / shard.path for shard in manifest.shards]
+            missing = [p for p in files if not p.is_file()]
+            if missing:
+                missing_str = ", ".join(str(p) for p in missing)
+                raise ValueError(f"Manifest references missing shard(s): {missing_str}")
+            if not files:
+                raise ValueError(f"Manifest has no shards: {manifest_path}")
+            return files
+
         files = sorted(p for p in path.iterdir() if p.is_file() and p.suffix == ".bin")
         if not files:
             raise ValueError(f"No .bin files found in {path}")
         return files
     return [path]
+
+
+def _find_manifest(path: Path) -> Path | None:
+    """Find a supported manifest filename in a dataset directory."""
+    for name in ("manifest.yaml", "manifest.yml"):
+        candidate = path / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _count_records_in_file(path: Path) -> int:
