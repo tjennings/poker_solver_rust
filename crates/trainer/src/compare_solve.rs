@@ -18,9 +18,10 @@ use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_tauri::gadget;
 use poker_solver_tauri::postflop::CbvContext;
 use poker_solver_tauri::{
-    BoundaryKind, GameSession, StreetBoundaryConfig, StreetBoundaryMode, build_solve_game,
-    build_solve_game_parts, parse_rs_poker_card, resolve_street_boundary,
-    seed_solver_with_blueprint, validate_cfvnet_boundary_cut,
+    BoundaryKind, GameSession, SolveGameRoot, StreetBoundaryConfig, StreetBoundaryMode,
+    build_solve_game_parts_with_root, build_solve_game_with_root, effective_stack_for_solve_root,
+    parse_rs_poker_card, resolve_street_boundary, seed_solver_with_blueprint,
+    validate_cfvnet_boundary_cut,
 };
 
 use range_solver::card::card_to_string;
@@ -1986,6 +1987,7 @@ fn build_gadget_tree_game(
     eff_stack: i32,
     bet_sizes: &[Vec<f64>],
     depth_limit: Option<u8>,
+    solve_root: SolveGameRoot,
     ctx: &Arc<CbvContext>,
     current_node: u32,
     board_cards: &[poker_solver_core::poker::Card],
@@ -2009,6 +2011,7 @@ fn build_gadget_tree_game(
         eff_stack,
         bet_sizes,
         depth_limit,
+        solve_root,
         &board_u8,
         boundary_cut,
         solve_iters,
@@ -2016,7 +2019,7 @@ fn build_gadget_tree_game(
     )?;
 
     // Build the gadget game via the appropriate provider.
-    let (card_config, action_tree) = build_solve_game_parts(
+    let (card_config, action_tree) = build_solve_game_parts_with_root(
         board,
         oop_w,
         ip_w,
@@ -2025,6 +2028,7 @@ fn build_gadget_tree_game(
         bet_sizes,
         false,
         depth_limit,
+        Some(solve_root),
     )?;
 
     let game = match gadget_provider {
@@ -2079,12 +2083,13 @@ fn build_inner_evaluator(
     eff_stack: i32,
     bet_sizes: &[Vec<f64>],
     depth_limit: Option<u8>,
+    solve_root: SolveGameRoot,
     board_u8: &[u8],
     boundary_cut: &Option<(u8, BoundaryKind)>,
     solve_iters: u32,
     target_exp: f32,
 ) -> Result<Arc<dyn range_solver::game::BoundaryEvaluator>, String> {
-    let (tmp_cc, tmp_at) = build_solve_game_parts(
+    let (tmp_cc, tmp_at) = build_solve_game_parts_with_root(
         board,
         oop_w,
         ip_w,
@@ -2093,6 +2098,7 @@ fn build_inner_evaluator(
         bet_sizes,
         false,
         depth_limit,
+        Some(solve_root),
     )?;
     let tmp_game = PostFlopGame::with_config(tmp_cc, tmp_at)
         .map_err(|e| format!("Failed to build temp game: {e}"))?;
@@ -2306,7 +2312,8 @@ pub fn run(
     // 3. Extract solving parameters from session
     let board = state.board.clone();
     let pot = state.pot;
-    let eff_stack = state.stacks[0].min(state.stacks[1]);
+    let solve_root = session.solve_game_root()?;
+    let eff_stack = effective_stack_for_solve_root(&solve_root);
     let board_str = board.join("");
     let position = &state.position;
 
@@ -2402,8 +2409,17 @@ pub fn run(
 
     // 4. Build exact game
     eprintln!("[compare] building exact game...");
-    let mut exact_game =
-        build_solve_game(&board, &oop_w, &ip_w, pot, eff_stack, bet_sizes, true, None)?;
+    let mut exact_game = build_solve_game_with_root(
+        &board,
+        &oop_w,
+        &ip_w,
+        pot,
+        eff_stack,
+        bet_sizes,
+        true,
+        None,
+        Some(solve_root),
+    )?;
 
     let (mem_exact, _) = exact_game.memory_usage();
     if verbose {
@@ -2435,6 +2451,7 @@ pub fn run(
             eff_stack,
             bet_sizes,
             depth_limit,
+            solve_root,
             &ctx,
             current_node,
             &board_cards,
@@ -2445,7 +2462,7 @@ pub fn run(
             3.0,
         )?
     } else {
-        let mut game = build_solve_game(
+        let mut game = build_solve_game_with_root(
             &board,
             &oop_w,
             &ip_w,
@@ -2454,6 +2471,7 @@ pub fn run(
             bet_sizes,
             subgame_is_exact,
             depth_limit,
+            Some(solve_root),
         )?;
         // Wire legacy clamp path if --gadget-clamp
         setup_clamp_boundaries(
@@ -2727,6 +2745,20 @@ pub fn run(
         );
     }
 
+    println!();
+    println!("=== Selected hand classes ===");
+    for row in selected_class_rows(
+        &exact_strat,
+        &subgame_strat,
+        private_cards,
+        exact_game.weights(exact_player),
+        num_hands,
+        num_actions,
+        &action_short,
+    ) {
+        println!("{row}");
+    }
+
     // 13. Tolerance check (for harness-driven iteration loops). Compares the
     // reach-weighted per-class aggregate (the same quantity the UI shows) to
     // stay consistent with what humans will inspect.
@@ -2764,6 +2796,88 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn selected_class_rows(
+    exact: &[f32],
+    subgame: &[f32],
+    private_cards: &[(u8, u8)],
+    weights: &[f32],
+    num_hands: usize,
+    num_actions: usize,
+    action_short: &[String],
+) -> Vec<String> {
+    const CLASSES: &[&str] = &["AA", "KK", "KJs", "KJo", "JJ", "AKs", "AKo", "KQo"];
+    CLASSES
+        .iter()
+        .filter_map(|class| {
+            selected_class_row(
+                class,
+                exact,
+                subgame,
+                private_cards,
+                weights,
+                num_hands,
+                num_actions,
+                action_short,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selected_class_row(
+    class: &str,
+    exact: &[f32],
+    subgame: &[f32],
+    private_cards: &[(u8, u8)],
+    weights: &[f32],
+    num_hands: usize,
+    num_actions: usize,
+    action_short: &[String],
+) -> Option<String> {
+    let mut count = 0usize;
+    let mut raw_reach = 0.0f64;
+    let mut exact_sums = vec![0.0f64; num_actions];
+    let mut subgame_sums = vec![0.0f64; num_actions];
+
+    for (h, &(c1, c2)) in private_cards.iter().enumerate().take(num_hands) {
+        if canonical_hand_name(c1, c2) != class {
+            continue;
+        }
+        count += 1;
+        let w = f64::from(*weights.get(h).unwrap_or(&0.0));
+        raw_reach += w;
+        for a in 0..num_actions {
+            exact_sums[a] += f64::from(exact[a * num_hands + h]) * w;
+            subgame_sums[a] += f64::from(subgame[a * num_hands + h]) * w;
+        }
+    }
+
+    if count == 0 {
+        return None;
+    }
+
+    let denom = if raw_reach > 0.0 {
+        raw_reach
+    } else {
+        count as f64
+    };
+    let exact_parts: Vec<String> = exact_sums
+        .iter()
+        .zip(action_short)
+        .map(|(p, a)| format!("{a}:{:.2}", p / denom))
+        .collect();
+    let subgame_parts: Vec<String> = subgame_sums
+        .iter()
+        .zip(action_short)
+        .map(|(p, a)| format!("{a}:{:.2}", p / denom))
+        .collect();
+    Some(format!(
+        "{class:<3} combos={count:<2} raw_reach={raw_reach:.6} exact=[{}] subgame=[{}]",
+        exact_parts.join(" "),
+        subgame_parts.join(" "),
+    ))
 }
 
 /// Reach-weighted per-class aggregate of a strategy vector. Matches the

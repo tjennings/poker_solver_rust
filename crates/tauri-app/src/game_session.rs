@@ -238,7 +238,7 @@ impl SolveGameRoot {
     }
 }
 
-fn effective_stack_for_solve_root(root: &SolveGameRoot) -> i32 {
+pub fn effective_stack_for_solve_root(root: &SolveGameRoot) -> i32 {
     root.initial_stacks
         .iter()
         .copied()
@@ -1142,6 +1142,15 @@ impl GameSession {
             initial_amount: matched_amount,
             initial_num_bets,
         })
+    }
+
+    pub fn solve_game_root(&self) -> Result<SolveGameRoot, String> {
+        let node = &self.tree.nodes[self.node_idx as usize];
+        let player = match node {
+            V2GameNode::Decision { player, .. } => *player,
+            _ => return Err("Not at a decision node".to_string()),
+        };
+        self.solve_game_root_for_player(player)
     }
 
     /// Encode the current game state as a human-readable spot string.

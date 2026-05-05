@@ -103,6 +103,9 @@ pub use simulation::{
 pub use game_session::{
     build_solve_game,
     build_solve_game_parts,
+    build_solve_game_parts_with_root,
+    build_solve_game_with_root,
+    effective_stack_for_solve_root,
     game_back,
     game_back_core,
     game_cancel_solve,
@@ -129,6 +132,7 @@ pub use game_session::{
     GameAction,
     GameMatrix,
     GameMatrixCell,
+    SolveGameRoot,
     // Types
     GameSession,
     GameSessionState,
