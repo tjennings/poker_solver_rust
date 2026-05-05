@@ -2427,9 +2427,14 @@ pub fn game_play_action_core(
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.play_action(&session_action_id)?;
-    let state = session.get_state();
+    let mut state = session.get_state();
     if let Some(ss) = ss.as_ref() {
         if let Some(path) = resolve_solve_path_from_session(ss, session) {
+            if let Some(node) = cached_node_for_path(ss, &path) {
+                state.matrix = Some(node.matrix.clone());
+                state.actions = node.actions.clone();
+                state.position = node.position.clone();
+            }
             set_solve_path_if_changed(ss, &path);
         }
     }
@@ -5629,6 +5634,38 @@ mod tests {
         let record = &session.as_ref().unwrap().action_history[0];
         assert_eq!(record.action_id, "1");
         assert_eq!(record.label, "4bb");
+    }
+
+    #[test]
+    fn source_play_overlays_cached_matrix_after_session_action_id_fallback() {
+        let gss = GameSessionState::default();
+        let session = make_two_level_session();
+        anchor_solve_to_current_session(&gss.subgame_solve, &session);
+        *gss.session.write() = Some(session);
+
+        let root_actions = vec![GameAction {
+            id: "solver-call".to_string(),
+            label: "Call".to_string(),
+            action_type: "call".to_string(),
+        }];
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![],
+            make_cached_node_with_actions("ROOT", root_actions, "BB"),
+        );
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![0],
+            make_cached_node("CHILD_CALL", &["Check"], "SB"),
+        );
+        gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
+
+        let state = game_play_action_core(&gss, "1", Some("subgame".to_string())).unwrap();
+        let matrix = state
+            .matrix
+            .expect("subgame child matrix should overlay fallback navigation");
+
+        assert_eq!(matrix.cells[0][0].hand, "CHILD_CALL");
+        assert_eq!(state.position, "SB");
+        assert_eq!(*gss.subgame_solve.solve_path.read(), vec![0]);
     }
 
     #[test]
