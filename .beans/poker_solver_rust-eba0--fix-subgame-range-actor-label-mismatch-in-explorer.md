@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-17T17:05:22Z
-updated_at: 2026-05-05T13:11:58Z
+updated_at: 2026-05-05T13:18:50Z
 ---
 
 Subgame solver's range matrix disagrees with Blueprint and Exact tabs at the same decision node, and the actor label is wrong.
@@ -77,3 +77,7 @@ Screenshots show turn-start subgame solve correctly updates the matrix, but afte
 - [ ] Clear stale cache/path at solve start so a new solve cannot display old matrices.
 - [ ] Address or explicitly guard non-OOP solve roots so a turn node with SB to act cannot display a fresh BB/OOP root matrix under a seat label.
 - [ ] Add regression coverage for solve-root -> Blueprint action -> switch to Subgame/Exact showing the cached child matrix.
+
+## Second Review Finding
+
+- [ ] Replace fail-closed actor mismatch guard with a real in-street solve root: range-solver must be able to root at the current actor/pending-bet state so SB-facing-BB-bet nodes solve and display correctly.
