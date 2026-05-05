@@ -1848,7 +1848,8 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
     let strategy = game.strategy();
     let num_hands = game.num_private_hands(player);
     game.cache_normalized_weights();
-    let reach_weights = game.normalized_weights(player).to_vec();
+    let aggregation_weights = game.normalized_weights(player).to_vec();
+    let display_weights = game.weights(player).to_vec();
     let private_cards = game.private_cards(player);
     let available_actions = game.available_actions();
 
@@ -1862,24 +1863,27 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
     let mut prob_sums = vec![vec![vec![0.0f64; num_actions]; 13]; 13];
     let mut combo_counts = vec![vec![0usize; 13]; 13];
     let mut weight_sums = vec![vec![0.0f64; 13]; 13];
+    let mut aggregation_weight_sums = vec![vec![0.0f64; 13]; 13];
     let mut ev_sums = vec![vec![0.0f64; 13]; 13];
     let mut combo_details: Vec<Vec<Vec<ComboDetail>>> = vec![vec![Vec::new(); 13]; 13];
 
     for (hand_idx, &(c1_raw, c2_raw)) in private_cards.iter().enumerate() {
         let (row, col, _) = card_pair_to_matrix(c1_raw, c2_raw);
-        let w = reach_weights[hand_idx] as f64;
+        let strategy_w = aggregation_weights[hand_idx] as f64;
+        let display_w = display_weights[hand_idx] as f64;
         combo_counts[row][col] += 1;
-        weight_sums[row][col] += w;
+        weight_sums[row][col] += display_w;
+        aggregation_weight_sums[row][col] += strategy_w;
         if let Some(evs) = hand_evs {
             if hand_idx < evs.len() {
-                ev_sums[row][col] += evs[hand_idx] as f64 * w;
+                ev_sums[row][col] += evs[hand_idx] as f64 * strategy_w;
             }
         }
 
         let mut probs = Vec::with_capacity(num_actions);
         for (action_idx, prob_sum) in prob_sums[row][col].iter_mut().enumerate() {
             let prob = strategy[action_idx * num_hands + hand_idx];
-            *prob_sum += prob as f64 * w;
+            *prob_sum += prob as f64 * strategy_w;
             probs.push(prob);
         }
 
@@ -1893,7 +1897,7 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
         combo_details[row][col].push(ComboDetail {
             cards: format!("{s1}{s2}"),
             probabilities: probs,
-            weight: reach_weights[hand_idx],
+            weight: display_weights[hand_idx],
             bucket: None,
         });
     }
@@ -1904,27 +1908,28 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
                 .map(|col| {
                     let (label, suited, pair) = matrix_cell_label(row, col);
                     let count = combo_counts[row][col];
-                    let total_w = weight_sums[row][col];
+                    let display_total_w = weight_sums[row][col];
+                    let strategy_total_w = aggregation_weight_sums[row][col];
                     // Reach-weighted mean: P(action | class) = Σ P(action|combo) * w(combo) / Σ w(combo).
                     // Using simple /count here would treat blocker-adjusted combos as
                     // equally likely as full-weight ones, producing a misleading
                     // aggregate for hand classes whose combos have uneven reach.
-                    let probabilities = if total_w > 0.0 {
+                    let probabilities = if strategy_total_w > 0.0 {
                         prob_sums[row][col]
                             .iter()
-                            .map(|&s| (s / total_w) as f32)
+                            .map(|&s| (s / strategy_total_w) as f32)
                             .collect()
                     } else {
                         vec![0.0; num_actions]
                     };
-                    let ev = if total_w > 0.0 && hand_evs.is_some() {
-                        Some((ev_sums[row][col] / total_w) as f32)
+                    let ev = if strategy_total_w > 0.0 && hand_evs.is_some() {
+                        Some((ev_sums[row][col] / strategy_total_w) as f32)
                     } else {
                         None
                     };
                     let combos = std::mem::take(&mut combo_details[row][col]);
                     let weight = if count > 0 {
-                        (total_w / count as f64) as f32
+                        (display_total_w / count as f64) as f32
                     } else {
                         0.0
                     };
@@ -6081,6 +6086,70 @@ mod tests {
         assert_eq!(
             total_weight, 0.0,
             "child matrix must use the post-action reach, not the root range"
+        );
+    }
+
+    #[test]
+    fn build_solve_matrix_at_current_keeps_display_weights_bounded() {
+        use range_solver::bet_size::BetSizeOptions;
+        use range_solver::card::{card_from_str, flop_from_str, NOT_DEALT};
+        use range_solver::range::Range;
+        use range_solver::{Action, ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
+
+        let oop_range: Range = "AA,KK,QQ,JJ".parse().unwrap();
+        let ip_range: Range = "AA,KK,QQ,JJ".parse().unwrap();
+        let flop = flop_from_str("2c3d4h").unwrap();
+        let turn = card_from_str("Js").unwrap();
+
+        let sizes = BetSizeOptions::try_from(("50%,a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::Turn,
+            starting_pot: 20,
+            effective_stack: 90,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+            flop_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_bet_sizes: [sizes.clone(), sizes.clone()],
+            river_bet_sizes: [sizes.clone(), sizes.clone()],
+            turn_donk_sizes: None,
+            river_donk_sizes: None,
+            add_allin_threshold: 1.5,
+            force_allin_threshold: 0.15,
+            merging_threshold: 0.1,
+            depth_limit: Some(0),
+            ..Default::default()
+        };
+        let action_tree = ActionTree::new(tree_config).unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop,
+            turn,
+            river: NOT_DEALT,
+        };
+        let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
+        game.allocate_memory(false);
+
+        let check_idx = game
+            .available_actions()
+            .iter()
+            .position(|action| *action == Action::Check)
+            .expect("turn root should offer check");
+        game.play(check_idx);
+
+        assert!(!game.is_terminal_node());
+        assert!(!game.is_chance_node());
+
+        let matrix = build_solve_matrix_at_current(&mut game, None);
+        let max_weight = matrix
+            .cells
+            .iter()
+            .flatten()
+            .map(|cell| cell.weight)
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_weight <= 1.0,
+            "display weights drive cell bar height and must stay in 0..1, got {max_weight}"
         );
     }
 
