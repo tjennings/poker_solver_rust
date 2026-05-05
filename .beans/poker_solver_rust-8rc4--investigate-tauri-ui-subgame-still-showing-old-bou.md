@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-8rc4
 title: Investigate Tauri UI subgame still showing old boundary behavior
-status: in-progress
+status: completed
 type: bug
 priority: critical
 created_at: 2026-05-05T20:01:00Z
-updated_at: 2026-05-05T20:27:59Z
+updated_at: 2026-05-05T20:35:06Z
 ---
 
 User still sees original Tauri UI behavior after main merge: solving subgame at turn root, BB checks, SB shows default/incorrect subgame matrix and odd all-in/fold response persists. Verify whether Tauri frontend/backend uses fixed solve root and boundary stack/exact-subtree path, and repair if needed.
@@ -38,3 +38,4 @@ User still sees original Tauri UI behavior after main merge: solving subgame at 
 - `cargo test -p poker-solver-tauri subtree_effective_stack_uses_stack_behind_only`
 - `cargo test -p poker-solver-trainer resolved_boundary_is_oracle_tracks_first_non_exact_boundary`
 - `compare-solve` on the reported BB response spot with `--river-boundary exact_subtree` now resolves as all-exact from the turn root and reports zero exact/subgame strategy diff.
+- Merged fix branch to local main and re-ran `cargo test -p poker-solver-tauri sbc_exact_subtree_at_river_from_turn_root` on main.
