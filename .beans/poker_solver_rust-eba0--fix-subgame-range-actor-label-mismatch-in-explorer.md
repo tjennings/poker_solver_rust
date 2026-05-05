@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-04-17T17:05:22Z
-updated_at: 2026-05-05T13:18:50Z
+updated_at: 2026-05-05T13:31:06Z
 ---
 
 Subgame solver's range matrix disagrees with Blueprint and Exact tabs at the same decision node, and the actor label is wrong.
@@ -81,3 +81,8 @@ Screenshots show turn-start subgame solve correctly updates the matrix, but afte
 ## Second Review Finding
 
 - [ ] Replace fail-closed actor mismatch guard with a real in-street solve root: range-solver must be able to root at the current actor/pending-bet state so SB-facing-BB-bet nodes solve and display correctly.
+
+## Final Review Findings
+
+- [ ] Resolve solved cache paths by semantic action matching instead of numeric action IDs across Blueprint/Subgame/Exact action lists.
+- [ ] Allow rooted all-in response states where the bettor has zero remaining stack but the facing player still has fold/call decisions.
