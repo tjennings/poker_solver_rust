@@ -14,6 +14,7 @@ from pathlib import Path
 import torch
 import yaml
 
+from cfvnet.artifact import write_model_artifact
 from cfvnet.config import load_config
 from cfvnet.export import export_onnx
 from cfvnet.train import train_boundary
@@ -50,7 +51,18 @@ def main() -> None:
 
     print(f"\nTraining complete. Final loss: {result.final_train_loss:.6f}")
 
-    _export_latest_checkpoint(config, args.output)
+    exported = _export_latest_checkpoint(config, args.output)
+    if exported is not None:
+        checkpoint_path, onnx_path = exported
+        artifact_path = write_model_artifact(
+            output_dir=args.output,
+            data_path=args.data,
+            config_path=args.config,
+            config=config,
+            checkpoint_path=checkpoint_path,
+            onnx_path=onnx_path,
+        )
+        print(f"Artifact manifest saved to {artifact_path}")
 
 
 def _save_config_copy(config_path: Path, output_dir: Path) -> None:
@@ -67,7 +79,7 @@ def _save_config_copy(config_path: Path, output_dir: Path) -> None:
         yaml.dump(raw, f)
 
 
-def _export_latest_checkpoint(config, output_dir: Path) -> None:
+def _export_latest_checkpoint(config, output_dir: Path) -> tuple[Path, Path] | None:
     """Load the latest checkpoint and export to ONNX.
 
     Args:
@@ -85,7 +97,7 @@ def _export_latest_checkpoint(config, output_dir: Path) -> None:
         )
         if not checkpoints:
             print("Warning: no checkpoints found, skipping ONNX export")
-            return
+            return None
         best_path = checkpoints[-1]
         print(f"No best.pt found, using latest: {best_path.name}")
 
@@ -100,6 +112,7 @@ def _export_latest_checkpoint(config, output_dir: Path) -> None:
     onnx_path = output_dir / "model.onnx"
     export_onnx(model, onnx_path)
     print(f"ONNX model saved to {onnx_path}")
+    return best_path, onnx_path
 
 
 def _resolve_device(device_str: str) -> torch.device:
