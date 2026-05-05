@@ -3,21 +3,24 @@ use std::path::Path;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{CfvnetConfig, DatagenConfig, TurnBoundarySamplingStratum};
 use crate::datagen::manifest::{SourceMetadata, TargetSource};
-use crate::datagen::sampler::{sample_situation, sample_situation_with_blueprint, Situation};
+use crate::datagen::sampler::{Situation, sample_situation, sample_situation_with_blueprint};
 use crate::datagen::storage::TrainingRecord;
 use crate::datagen::turn_boundary_dataset::TurnBoundaryDatasetWriter;
 #[cfg(feature = "gpu-turn-datagen")]
 use crate::datagen::turn_boundary_oracle::BoundaryNetRiverRunoutOracle;
 use crate::datagen::turn_boundary_oracle::{
-    build_turn_boundary_record, ExactRiverSolverOracle, RiverRunoutOracle, TurnBoundaryInput,
+    ExactRiverSolverOracle, RiverRunoutOracle, TurnBoundaryInput, build_turn_boundary_record,
 };
 
 use super::domain::RangeSource;
+
+const PARALLEL_CHUNK_SIZE: u64 = 256;
 
 /// Generate a manifest-backed turn-boundary oracle dataset.
 pub fn generate_turn_boundary_data(
@@ -56,13 +59,23 @@ pub fn generate_turn_boundary_data(
         }
         TargetSource::ExactRiver => {
             let oracle = ExactRiverSolverOracle::new(build_exact_solve_config(config)?);
-            generate_turn_boundary_data_with_oracle(
-                config,
-                output_path,
-                TargetSource::ExactRiver,
-                SourceMetadata::default(),
-                &oracle,
-            )?;
+            if config.datagen.threads > 1 {
+                generate_turn_boundary_data_with_oracle_parallel(
+                    config,
+                    output_path,
+                    TargetSource::ExactRiver,
+                    SourceMetadata::default(),
+                    &oracle,
+                )?;
+            } else {
+                generate_turn_boundary_data_with_oracle(
+                    config,
+                    output_path,
+                    TargetSource::ExactRiver,
+                    SourceMetadata::default(),
+                    &oracle,
+                )?;
+            }
             Ok(())
         }
         TargetSource::Mixed => Err("turn_boundary target source 'mixed' is manifest-only".into()),
@@ -128,6 +141,100 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
         )?;
         pb.inc(1);
         pb.set_message(format!("written:{}", writer.count()));
+    }
+
+    pb.finish_with_message("done");
+    let manifest = writer.finish().map_err(|e| e.to_string())?;
+    if let Some(split) = validation_builder.finish() {
+        let split_path = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("validation_split.yaml");
+        split.write_yaml(&split_path)?;
+    }
+    eprintln!(
+        "Wrote {} turn-boundary records to {} with manifest.yaml",
+        manifest.coverage.total_records,
+        output_path.display()
+    );
+    Ok(manifest.coverage.total_records)
+}
+
+pub fn generate_turn_boundary_data_with_oracle_parallel<O: RiverRunoutOracle + Sync>(
+    config: &CfvnetConfig,
+    output_path: &Path,
+    target_source: TargetSource,
+    source: SourceMetadata,
+    oracle: &O,
+) -> Result<u64, String> {
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let range_source_label = if config.datagen.blueprint_path.is_some() {
+        "blueprint"
+    } else {
+        "rsp"
+    };
+    let range_source = RangeSource::from_config(&config.datagen)?;
+    let sampling_policy = SamplingPolicy::new(&config.datagen)?;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut validation_builder = ValidationSplitBuilder::new(
+        config.training.validation_split,
+        seed ^ 0x9e37_79b9_7f4a_7c15,
+    );
+
+    let mut writer = TurnBoundaryDatasetWriter::create(
+        output_path,
+        config.datagen.per_file,
+        target_source,
+        source,
+    )?;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.datagen.threads.max(1))
+        .build()
+        .map_err(|e| format!("thread pool: {e}"))?;
+
+    let pb = ProgressBar::new(config.datagen.num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
+
+    let mut remaining = config.datagen.num_samples;
+    while remaining > 0 {
+        let chunk_len = remaining.min(PARALLEL_CHUNK_SIZE);
+        remaining -= chunk_len;
+
+        let sampled: Vec<_> = (0..chunk_len)
+            .map(|_| {
+                sample_turn_boundary_situation(config, &range_source, &sampling_policy, &mut rng)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let built = pool.install(|| {
+            sampled
+                .par_iter()
+                .map(|sampled| {
+                    range_solver::set_force_sequential(true);
+                    build_turn_boundary_records_for_sample(sampled, oracle)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for built in built {
+            let built = built?;
+            validation_builder.record(&built.records[0], built.raise_depth, built.boundary_ordinal);
+            validation_builder.record(&built.records[1], built.raise_depth, built.boundary_ordinal);
+            writer.write_with_coverage(
+                &built.records,
+                range_source_label,
+                built.raise_depth,
+                built.boundary_ordinal,
+            )?;
+            pb.inc(1);
+            pb.set_message(format!("written:{}", writer.count()));
+        }
     }
 
     pb.finish_with_message("done");
@@ -343,6 +450,34 @@ struct SampledSituation<'a> {
     boundary_ordinal: &'a str,
 }
 
+struct BuiltTurnBoundaryRecords<'a> {
+    records: [TrainingRecord; 2],
+    raise_depth: &'a str,
+    boundary_ordinal: &'a str,
+}
+
+fn build_turn_boundary_records_for_sample<'a, O: RiverRunoutOracle>(
+    sampled: &SampledSituation<'a>,
+    oracle: &O,
+) -> Result<BuiltTurnBoundaryRecords<'a>, String> {
+    let sit = &sampled.situation;
+    let input = TurnBoundaryInput {
+        board: [sit.board[0], sit.board[1], sit.board[2], sit.board[3]],
+        pot: sit.pot as f32,
+        effective_stack: sit.effective_stack as f32,
+        player: 0,
+        oop_range: sit.ranges[0],
+        ip_range: sit.ranges[1],
+    };
+    let oop = build_turn_boundary_record(&input, oracle)?;
+    let ip = build_turn_boundary_record(&TurnBoundaryInput { player: 1, ..input }, oracle)?;
+    Ok(BuiltTurnBoundaryRecords {
+        records: [oop, ip],
+        raise_depth: sampled.raise_depth,
+        boundary_ordinal: sampled.boundary_ordinal,
+    })
+}
+
 struct SamplingPolicy<'a> {
     strata: &'a [TurnBoundarySamplingStratum],
     total_weight: f64,
@@ -528,6 +663,36 @@ mod tests {
         );
         assert!(!manifest.coverage.by_spr_bucket.is_empty());
         assert!(!manifest.coverage.by_board_texture.is_empty());
+    }
+
+    #[test]
+    fn parallel_writer_preserves_counts_and_manifest() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("turn_boundary.bin");
+        let mut config = test_config(5, Some(4));
+        config.datagen.threads = 2;
+
+        let written = generate_turn_boundary_data_with_oracle_parallel(
+            &config,
+            &output,
+            TargetSource::ExactRiver,
+            SourceMetadata::default(),
+            &ConstantOracle(0.25),
+        )
+        .unwrap();
+
+        assert_eq!(written, 10);
+        let manifest = DatasetManifest::read_yaml(dir.path().join("manifest.yaml")).unwrap();
+        manifest.validate_turn_boundary().unwrap();
+        assert_eq!(manifest.coverage.total_records, 10);
+        assert_eq!(
+            manifest.coverage.by_target_source.get("exact_river"),
+            Some(&10)
+        );
+        assert_eq!(
+            manifest.coverage.by_raise_depth.get("sampled_turn_state"),
+            Some(&10)
+        );
     }
 
     #[test]
