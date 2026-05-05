@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-7ajt
 title: Investigate subgame nut-fold all-in spot
-status: in-progress
+status: completed
 type: bug
 priority: critical
 created_at: 2026-05-05T18:23:04Z
-updated_at: 2026-05-05T18:23:04Z
+updated_at: 2026-05-05T19:49:38Z
 ---
 
 At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:check,sb:24bb,bb:all-in, the subgame appears to make BB jam 100% because SB folds every hand, including KK.
@@ -18,7 +18,7 @@ At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:che
 - [x] Fix the underlying bug or document the narrowed root cause if it is outside this patch.
 - [x] Add regression coverage for SB not folding nut hands to a jam when call is clearly profitable.
 - [x] Run targeted and full verification.
-- [ ] Merge to local main.
+- [x] Merge to local main.
 
 ## Findings
 
@@ -39,3 +39,7 @@ At spot sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:che
 - `cargo test -p poker-solver-tauri exact_subtree --no-run`
 - `cargo run -p poker-solver-trainer --release -- compare-solve --bundle /Users/coreco/code/poker_solver_rust/local_data/blueprints/1k_100bb_brdcfr_v2 --snapshot snapshot_0013 --spot 'sb:2bb,bb:10bb,sb:22bb,bb:call|Ks8d3c|bb:check,sb:15bb,bb:call|Js|bb:check,sb:24bb' --exact-iters 50 --subgame-iters 10 --river-boundary exact_subtree --tolerance 0`
 - Warm `cargo test`: passed in 50.70s.
+
+## Summary of Changes
+
+Merged the root-aware compare-solve diagnostics and exact-subtree boundary stack fixes to local main.
