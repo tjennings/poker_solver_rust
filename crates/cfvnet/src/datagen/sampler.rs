@@ -223,6 +223,7 @@ mod tests {
             num_samples: 100,
             street: "river".into(),
             mode: "model".into(),
+            turn_boundary_target_source: "river_net".into(),
             pot_intervals: vec![[4, 20], [20, 80], [80, 200], [200, 400]],
             spr_intervals: None,
             solver_iterations: 100,

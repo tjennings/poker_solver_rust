@@ -614,6 +614,12 @@ fn cmd_generate(
     if let Some(rp) = river_output {
         cfg.datagen.river_output = Some(rp.to_string_lossy().into_owned());
     }
+    let uses_internal_sharding = cfg.datagen.street == "turn_boundary";
+    if uses_internal_sharding {
+        if let Some(limit) = per_file {
+            cfg.datagen.per_file = Some(limit);
+        }
+    }
 
     // Resolve output path: CLI -o > config turn_output/river_output (by street).
     let output = output
@@ -635,7 +641,11 @@ fn cmd_generate(
     ensure_parent_dir(&output);
 
     let total = cfg.datagen.num_samples;
-    let chunk_size = per_file.or(cfg.datagen.per_file).unwrap_or(total);
+    let chunk_size = if uses_internal_sharding {
+        total
+    } else {
+        per_file.or(cfg.datagen.per_file).unwrap_or(total)
+    };
     let num_files = total.div_ceil(chunk_size);
 
     let street = cfg.datagen.street.as_str();
@@ -672,6 +682,12 @@ fn cmd_generate(
         }
 
         let result = match street {
+            "turn_boundary" => {
+                cfvnet::datagen::turn_boundary_generate::generate_turn_boundary_data(
+                    &cfg,
+                    &file_output,
+                )
+            }
             "turn" | "river" => {
                 cfvnet::datagen::domain::pipeline::DomainPipeline::run(&cfg, &file_output)
             }
