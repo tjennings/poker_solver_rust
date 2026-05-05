@@ -15,7 +15,8 @@ use crate::datagen::turn_boundary_dataset::TurnBoundaryDatasetWriter;
 #[cfg(feature = "gpu-turn-datagen")]
 use crate::datagen::turn_boundary_oracle::BoundaryNetRiverRunoutOracle;
 use crate::datagen::turn_boundary_oracle::{
-    ExactRiverSolverOracle, RiverRunoutOracle, TurnBoundaryInput, build_turn_boundary_record,
+    ExactRiverSolverOracle, RiverRunoutOracle, TurnBoundaryInput,
+    build_exact_turn_boundary_records, build_turn_boundary_record,
 };
 
 use super::domain::RangeSource;
@@ -59,23 +60,7 @@ pub fn generate_turn_boundary_data(
         }
         TargetSource::ExactRiver => {
             let oracle = ExactRiverSolverOracle::new(build_exact_solve_config(config)?);
-            if config.datagen.threads > 1 {
-                generate_turn_boundary_data_with_oracle_parallel(
-                    config,
-                    output_path,
-                    TargetSource::ExactRiver,
-                    SourceMetadata::default(),
-                    &oracle,
-                )?;
-            } else {
-                generate_turn_boundary_data_with_oracle(
-                    config,
-                    output_path,
-                    TargetSource::ExactRiver,
-                    SourceMetadata::default(),
-                    &oracle,
-                )?;
-            }
+            generate_turn_boundary_data_with_exact_oracle(config, output_path, &oracle)?;
             Ok(())
         }
         TargetSource::Mixed => Err("turn_boundary target source 'mixed' is manifest-only".into()),
@@ -138,6 +123,73 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
             range_source_label,
             sampled.raise_depth,
             sampled.boundary_ordinal,
+        )?;
+        pb.inc(1);
+        pb.set_message(format!("written:{}", writer.count()));
+    }
+
+    pb.finish_with_message("done");
+    let manifest = writer.finish().map_err(|e| e.to_string())?;
+    if let Some(split) = validation_builder.finish() {
+        let split_path = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("validation_split.yaml");
+        split.write_yaml(&split_path)?;
+    }
+    eprintln!(
+        "Wrote {} turn-boundary records to {} with manifest.yaml",
+        manifest.coverage.total_records,
+        output_path.display()
+    );
+    Ok(manifest.coverage.total_records)
+}
+
+fn generate_turn_boundary_data_with_exact_oracle(
+    config: &CfvnetConfig,
+    output_path: &Path,
+    oracle: &ExactRiverSolverOracle,
+) -> Result<u64, String> {
+    let seed = crate::config::resolve_seed(config.datagen.seed);
+    let range_source_label = if config.datagen.blueprint_path.is_some() {
+        "blueprint"
+    } else {
+        "rsp"
+    };
+    let range_source = RangeSource::from_config(&config.datagen)?;
+    let sampling_policy = SamplingPolicy::new(&config.datagen)?;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut validation_builder = ValidationSplitBuilder::new(
+        config.training.validation_split,
+        seed ^ 0x9e37_79b9_7f4a_7c15,
+    );
+
+    let mut writer = TurnBoundaryDatasetWriter::create(
+        output_path,
+        config.datagen.per_file,
+        TargetSource::ExactRiver,
+        SourceMetadata::default(),
+    )?;
+
+    let pb = ProgressBar::new(config.datagen.num_samples);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos}/{len} [{elapsed_precise}] ETA {eta} ({per_sec}) {msg}")
+            .expect("valid template"),
+    );
+
+    for _ in 0..config.datagen.num_samples {
+        let sampled =
+            sample_turn_boundary_situation(config, &range_source, &sampling_policy, &mut rng)?;
+        let built = build_exact_turn_boundary_records_for_sample(&sampled, oracle)?;
+        validation_builder.record(&built.records[0], built.raise_depth, built.boundary_ordinal);
+        validation_builder.record(&built.records[1], built.raise_depth, built.boundary_ordinal);
+        writer.write_with_coverage(
+            &built.records,
+            range_source_label,
+            built.raise_depth,
+            built.boundary_ordinal,
         )?;
         pb.inc(1);
         pb.set_message(format!("written:{}", writer.count()));
@@ -473,6 +525,27 @@ fn build_turn_boundary_records_for_sample<'a, O: RiverRunoutOracle>(
     let ip = build_turn_boundary_record(&TurnBoundaryInput { player: 1, ..input }, oracle)?;
     Ok(BuiltTurnBoundaryRecords {
         records: [oop, ip],
+        raise_depth: sampled.raise_depth,
+        boundary_ordinal: sampled.boundary_ordinal,
+    })
+}
+
+fn build_exact_turn_boundary_records_for_sample<'a>(
+    sampled: &SampledSituation<'a>,
+    oracle: &ExactRiverSolverOracle,
+) -> Result<BuiltTurnBoundaryRecords<'a>, String> {
+    let sit = &sampled.situation;
+    let input = TurnBoundaryInput {
+        board: [sit.board[0], sit.board[1], sit.board[2], sit.board[3]],
+        pot: sit.pot as f32,
+        effective_stack: sit.effective_stack as f32,
+        player: 0,
+        oop_range: sit.ranges[0],
+        ip_range: sit.ranges[1],
+    };
+    let records = build_exact_turn_boundary_records(&input, oracle)?;
+    Ok(BuiltTurnBoundaryRecords {
+        records,
         raise_depth: sampled.raise_depth,
         boundary_ordinal: sampled.boundary_ordinal,
     })

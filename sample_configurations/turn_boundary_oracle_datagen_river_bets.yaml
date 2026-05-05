@@ -4,15 +4,16 @@
 # Supremus-style action abstraction, but samples 4-card turn states and emits
 # direct turn-boundary CFV targets.
 #
-# River-net oracle (fast, requires GPU ONNX feature):
+# Exact-river oracle correctness shard:
 #   cargo run -p cfvnet --release --features gpu-turn-datagen -- generate \
 #     -c sample_configurations/turn_boundary_oracle_datagen_river_bets.yaml \
-#     -o local_data/cfvnet/turn_boundary/river_bets_v1/data.bin \
-#     --num-samples 5000000 \
+#     -o local_data/cfvnet/turn_boundary/river_bets_exact_v1/data.bin \
+#     --num-samples 1000 \
 #     --per-file 10000
 #
-# Exact-river oracle is slower but useful for validation shards:
-#   set datagen.turn_boundary_target_source: "exact_river"
+# Exact-river labels are slow: each turn sample averages exact solves over 48
+# river runouts. Use this for trusted validation/correction shards, not 5M-scale
+# teacher data.
 
 game:
   initial_stack: 200
@@ -34,7 +35,7 @@ datagen:
   street: "turn_boundary"
   turn_boundary_target_source: "exact_river"
   blueprint_path: "local_data/cfvnet/preflop_ranges.bin"
-  num_samples: 5000000
+  num_samples: 1000
   per_file: 10000
   bet_size_fuzz: 0.20
   pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
@@ -55,7 +56,9 @@ datagen:
         raise_depth: "3bet_plus"
   solver_iterations: 500
   target_exploitability: 0.01
-  threads: 18
+  # Exact-river turn-boundary generation relies on range-solver's internal
+  # parallelism. Outer sample-level parallelism was slower for this workload.
+  threads: 1
 
 training:
   hidden_layers: 7

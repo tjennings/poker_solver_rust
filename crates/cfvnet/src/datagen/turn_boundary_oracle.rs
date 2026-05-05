@@ -111,6 +111,15 @@ impl ExactRiverSolverOracle {
     pub fn new(config: SolveConfig) -> Self {
         Self { config }
     }
+
+    pub fn evaluate_both(
+        &self,
+        input: RiverRunoutInput<'_>,
+    ) -> Result<([f32; NUM_COMBOS], [f32; NUM_COMBOS]), String> {
+        let situation = river_input_to_situation(&input)?;
+        let result = solve_situation(&situation, &self.config)?;
+        Ok((result.oop_evs, result.ip_evs))
+    }
 }
 
 impl RiverRunoutOracle for ExactRiverSolverOracle {
@@ -191,6 +200,89 @@ pub fn build_turn_boundary_record<O: RiverRunoutOracle>(
         cfvs,
         valid_mask,
     })
+}
+
+/// Build both player records for exact-river targets while sharing each river
+/// solve. A river solve returns both players' EV arrays, so this avoids doing
+/// the same 48 river games twice.
+pub fn build_exact_turn_boundary_records(
+    input: &TurnBoundaryInput,
+    oracle: &ExactRiverSolverOracle,
+) -> Result<[TrainingRecord; 2], String> {
+    validate_input(input)?;
+
+    let mut oop_sums = [0.0_f32; NUM_COMBOS];
+    let mut ip_sums = [0.0_f32; NUM_COMBOS];
+    let mut counts = [0_u8; NUM_COMBOS];
+
+    for river in remaining_river_cards(&input.board) {
+        let mut board = [0_u8; 5];
+        board[..4].copy_from_slice(&input.board);
+        board[4] = river;
+
+        let (oop_values, ip_values) = oracle.evaluate_both(RiverRunoutInput {
+            board,
+            pot: input.pot,
+            effective_stack: input.effective_stack,
+            player: 0,
+            oop_range: &input.oop_range,
+            ip_range: &input.ip_range,
+        })?;
+
+        for idx in 0..NUM_COMBOS {
+            if !combo_conflicts_with_card(idx, river)
+                && !combo_conflicts_with_board(idx, &input.board)
+            {
+                oop_sums[idx] += oop_values[idx];
+                ip_sums[idx] += ip_values[idx];
+                counts[idx] += 1;
+            }
+        }
+    }
+
+    Ok([
+        record_from_sums(input, 0, &oop_sums, &counts),
+        record_from_sums(input, 1, &ip_sums, &counts),
+    ])
+}
+
+fn record_from_sums(
+    input: &TurnBoundaryInput,
+    player: u8,
+    sums: &[f32; NUM_COMBOS],
+    counts: &[u8; NUM_COMBOS],
+) -> TrainingRecord {
+    let mut cfvs = [0.0_f32; NUM_COMBOS];
+    let mut valid_mask = [0_u8; NUM_COMBOS];
+    for idx in 0..NUM_COMBOS {
+        if counts[idx] > 0 {
+            cfvs[idx] = sums[idx] / f32::from(counts[idx]);
+            valid_mask[idx] = 1;
+        }
+    }
+
+    let player_range = if player == 0 {
+        &input.oop_range
+    } else {
+        &input.ip_range
+    };
+    let game_value = player_range
+        .iter()
+        .zip(cfvs.iter())
+        .map(|(&reach, &cfv)| reach * cfv)
+        .sum();
+
+    TrainingRecord {
+        board: input.board.to_vec(),
+        pot: input.pot,
+        effective_stack: input.effective_stack,
+        player,
+        game_value,
+        oop_range: input.oop_range,
+        ip_range: input.ip_range,
+        cfvs,
+        valid_mask,
+    }
 }
 
 pub fn remaining_river_cards(board: &[u8; 4]) -> Vec<u8> {
