@@ -160,6 +160,9 @@ pub struct DatagenConfig {
     /// Target oracle for turn-boundary datasets: "river_net" or "exact_river".
     #[serde(default = "default_turn_boundary_target_source")]
     pub turn_boundary_target_source: String,
+    /// Optional weighted sampling policy for turn-boundary oracle datasets.
+    #[serde(default)]
+    pub turn_boundary_sampling: TurnBoundarySamplingConfig,
     #[serde(default = "default_pot_intervals")]
     pub pot_intervals: Vec<[i32; 2]>,
     #[serde(default)]
@@ -216,6 +219,7 @@ impl Default for DatagenConfig {
             street: default_street(),
             mode: default_datagen_mode(),
             turn_boundary_target_source: default_turn_boundary_target_source(),
+            turn_boundary_sampling: TurnBoundarySamplingConfig::default(),
             pot_intervals: default_pot_intervals(),
             spr_intervals: None,
             solver_iterations: 1000,
@@ -233,6 +237,31 @@ impl Default for DatagenConfig {
             gpu_batch_size: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnBoundarySamplingConfig {
+    #[serde(default)]
+    pub strata: Vec<TurnBoundarySamplingStratum>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnBoundarySamplingStratum {
+    pub name: String,
+    #[serde(default = "default_sampling_weight")]
+    pub weight: f64,
+    #[serde(default)]
+    pub pot_intervals: Option<Vec<[i32; 2]>>,
+    #[serde(default)]
+    pub spr_intervals: Option<Vec<[f64; 2]>>,
+    #[serde(default)]
+    pub raise_depth: Option<String>,
+    #[serde(default)]
+    pub boundary_ordinal: Option<String>,
+}
+
+fn default_sampling_weight() -> f64 {
+    1.0
 }
 
 fn default_datagen_mode() -> String {
@@ -596,6 +625,47 @@ datagen:
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.datagen.street, "turn_boundary");
         assert_eq!(config.datagen.turn_boundary_target_source, "exact_river");
+    }
+
+    #[test]
+    fn turn_boundary_sampling_defaults_to_empty() {
+        let config = DatagenConfig::default();
+        assert!(config.turn_boundary_sampling.strata.is_empty());
+    }
+
+    #[test]
+    fn parse_config_with_turn_boundary_sampling_strata() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  num_samples: 100
+  street: "turn_boundary"
+  turn_boundary_sampling:
+    strata:
+      - name: "tiny_pot_high_spr"
+        weight: 4.0
+        pot_intervals: [[4, 12]]
+        spr_intervals: [[8.0, 20.0]]
+        raise_depth: "4bet_plus"
+        boundary_ordinal: "high_spr_probe"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        let strata = &config.datagen.turn_boundary_sampling.strata;
+        assert_eq!(strata.len(), 1);
+        assert_eq!(strata[0].name, "tiny_pot_high_spr");
+        assert_eq!(strata[0].weight, 4.0);
+        assert_eq!(strata[0].pot_intervals.as_ref().unwrap(), &vec![[4, 12]]);
+        assert_eq!(
+            strata[0].spr_intervals.as_ref().unwrap(),
+            &vec![[8.0, 20.0]]
+        );
+        assert_eq!(strata[0].raise_depth.as_deref(), Some("4bet_plus"));
+        assert_eq!(
+            strata[0].boundary_ordinal.as_deref(),
+            Some("high_spr_probe")
+        );
     }
 
     #[test]

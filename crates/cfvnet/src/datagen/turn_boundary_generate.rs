@@ -1,9 +1,12 @@
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
-use crate::config::CfvnetConfig;
+use crate::config::{CfvnetConfig, DatagenConfig, TurnBoundarySamplingStratum};
 use crate::datagen::manifest::{SourceMetadata, TargetSource};
+use crate::datagen::sampler::{sample_situation, sample_situation_with_blueprint, Situation};
 use crate::datagen::turn_boundary_dataset::TurnBoundaryDatasetWriter;
 #[cfg(feature = "gpu-turn-datagen")]
 use crate::datagen::turn_boundary_oracle::BoundaryNetRiverRunoutOracle;
@@ -11,7 +14,7 @@ use crate::datagen::turn_boundary_oracle::{
     build_turn_boundary_record, ExactRiverSolverOracle, RiverRunoutOracle, TurnBoundaryInput,
 };
 
-use super::domain::{RangeSource, SituationGenerator};
+use super::domain::RangeSource;
 
 /// Generate a manifest-backed turn-boundary oracle dataset.
 pub fn generate_turn_boundary_data(
@@ -77,14 +80,8 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
         "rsp"
     };
     let range_source = RangeSource::from_config(&config.datagen)?;
-    let mut sit_gen = SituationGenerator::new(
-        &config.datagen,
-        config.game.initial_stack,
-        4,
-        seed,
-        config.datagen.num_samples,
-    )
-    .with_range_source(range_source);
+    let sampling_policy = SamplingPolicy::new(&config.datagen)?;
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
     let mut writer = TurnBoundaryDatasetWriter::create(
         output_path,
@@ -100,7 +97,10 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
             .expect("valid template"),
     );
 
-    for sit in &mut sit_gen {
+    for _ in 0..config.datagen.num_samples {
+        let sampled =
+            sample_turn_boundary_situation(config, &range_source, &sampling_policy, &mut rng)?;
+        let sit = sampled.situation;
         let input = TurnBoundaryInput {
             board: [sit.board[0], sit.board[1], sit.board[2], sit.board[3]],
             pot: sit.pot as f32,
@@ -114,8 +114,8 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
         writer.write_with_coverage(
             &[oop, ip],
             range_source_label,
-            "sampled_turn_state",
-            "turn_entry",
+            sampled.raise_depth,
+            sampled.boundary_ordinal,
         )?;
         pb.inc(1);
         pb.set_message(format!("written:{}", writer.count()));
@@ -129,6 +129,92 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
         output_path.display()
     );
     Ok(manifest.coverage.total_records)
+}
+
+struct SampledSituation<'a> {
+    situation: Situation,
+    raise_depth: &'a str,
+    boundary_ordinal: &'a str,
+}
+
+struct SamplingPolicy<'a> {
+    strata: &'a [TurnBoundarySamplingStratum],
+    total_weight: f64,
+}
+
+impl<'a> SamplingPolicy<'a> {
+    fn new(config: &'a DatagenConfig) -> Result<Self, String> {
+        let total_weight = config
+            .turn_boundary_sampling
+            .strata
+            .iter()
+            .map(|stratum| stratum.weight.max(0.0))
+            .sum();
+        if !config.turn_boundary_sampling.strata.is_empty() && total_weight <= 0.0 {
+            return Err("turn_boundary_sampling strata must have positive total weight".into());
+        }
+        Ok(Self {
+            strata: &config.turn_boundary_sampling.strata,
+            total_weight,
+        })
+    }
+
+    fn choose<R: Rng>(&self, rng: &mut R) -> Option<&'a TurnBoundarySamplingStratum> {
+        if self.strata.is_empty() {
+            return None;
+        }
+        let mut remaining = rng.gen_range(0.0..self.total_weight);
+        for stratum in self.strata {
+            let weight = stratum.weight.max(0.0);
+            if remaining < weight {
+                return Some(stratum);
+            }
+            remaining -= weight;
+        }
+        self.strata.last()
+    }
+}
+
+fn sample_turn_boundary_situation<'a, R: Rng>(
+    config: &CfvnetConfig,
+    range_source: &RangeSource,
+    sampling_policy: &'a SamplingPolicy<'a>,
+    rng: &mut R,
+) -> Result<SampledSituation<'a>, String> {
+    let stratum = sampling_policy.choose(rng);
+    let mut sample_config = config.datagen.clone();
+    if let Some(stratum) = stratum {
+        if let Some(pot_intervals) = &stratum.pot_intervals {
+            sample_config.pot_intervals = pot_intervals.clone();
+        }
+        if let Some(spr_intervals) = &stratum.spr_intervals {
+            sample_config.spr_intervals = Some(spr_intervals.clone());
+        }
+    }
+
+    let situation = match range_source {
+        RangeSource::Rsp => sample_situation(&sample_config, config.game.initial_stack, 4, rng),
+        RangeSource::Blueprint(precomputed) => sample_situation_with_blueprint(
+            &sample_config,
+            config.game.initial_stack,
+            4,
+            precomputed,
+            rng,
+        ),
+    };
+    let raise_depth = stratum
+        .and_then(|stratum| stratum.raise_depth.as_deref())
+        .unwrap_or("sampled_turn_state");
+    let boundary_ordinal = stratum
+        .and_then(|stratum| stratum.boundary_ordinal.as_deref())
+        .or_else(|| stratum.map(|stratum| stratum.name.as_str()))
+        .unwrap_or("turn_entry");
+
+    Ok(SampledSituation {
+        situation,
+        raise_depth,
+        boundary_ordinal,
+    })
 }
 
 fn parse_target_source(value: &str) -> Result<TargetSource, String> {
@@ -162,6 +248,7 @@ mod tests {
     use super::*;
     use crate::config::{
         BetSizeConfig, DatagenConfig, EvaluationConfig, GameConfig, TrainingConfig,
+        TurnBoundarySamplingConfig, TurnBoundarySamplingStratum,
     };
     use crate::datagen::manifest::DatasetManifest;
     use crate::datagen::storage::NUM_COMBOS;
@@ -238,8 +325,73 @@ mod tests {
     }
 
     #[test]
+    fn weighted_sampling_strata_override_pot_spr_and_coverage_labels() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("turn_boundary.bin");
+        let mut config = test_config(2, None);
+        config.datagen.turn_boundary_sampling = TurnBoundarySamplingConfig {
+            strata: vec![TurnBoundarySamplingStratum {
+                name: "tiny_pot_high_spr".to_string(),
+                weight: 1.0,
+                pot_intervals: Some(vec![[4, 5]]),
+                spr_intervals: Some(vec![[8.0, 20.0]]),
+                raise_depth: Some("4bet_plus".to_string()),
+                boundary_ordinal: None,
+            }],
+        };
+
+        let written = generate_turn_boundary_data_with_oracle(
+            &config,
+            &output,
+            TargetSource::ExactRiver,
+            SourceMetadata::default(),
+            &ConstantOracle(0.25),
+        )
+        .unwrap();
+
+        assert_eq!(written, 4);
+        let manifest = DatasetManifest::read_yaml(dir.path().join("manifest.yaml")).unwrap();
+        assert_eq!(manifest.coverage.by_pot_bucket.get("pot_lt_10"), Some(&4));
+        assert_eq!(manifest.coverage.by_spr_bucket.get("spr_8_20"), Some(&4));
+        assert_eq!(manifest.coverage.by_raise_depth.get("4bet_plus"), Some(&4));
+        assert_eq!(
+            manifest
+                .coverage
+                .by_boundary_ordinal
+                .get("tiny_pot_high_spr"),
+            Some(&4)
+        );
+    }
+
+    #[test]
     fn rejects_unknown_target_source() {
         let err = parse_target_source("banana").unwrap_err();
         assert!(err.contains("unknown turn_boundary_target_source"));
+    }
+
+    #[test]
+    fn rejects_sampling_policy_with_no_positive_weight() {
+        let mut config = test_config(1, None);
+        config.datagen.turn_boundary_sampling = TurnBoundarySamplingConfig {
+            strata: vec![TurnBoundarySamplingStratum {
+                name: "disabled".to_string(),
+                weight: 0.0,
+                pot_intervals: None,
+                spr_intervals: None,
+                raise_depth: None,
+                boundary_ordinal: None,
+            }],
+        };
+
+        let err = generate_turn_boundary_data_with_oracle(
+            &config,
+            Path::new("/tmp/unused.bin"),
+            TargetSource::ExactRiver,
+            SourceMetadata::default(),
+            &ConstantOracle(0.25),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("positive total weight"));
     }
 }

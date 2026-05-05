@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-05T02:55:44Z
-updated_at: 2026-05-05T03:48:58Z
+updated_at: 2026-05-05T03:57:14Z
 parent: poker_solver_rust-fp06
 ---
 
@@ -14,3 +14,7 @@ Design and implement sampling so the turn-boundary dataset covers normal play pl
 
 
 Completed the coverage-counter slice. Remaining milestone work is oversampling policy for sparse/deep-raise/high-SPR strata and frozen stratified validation split generation.
+
+
+
+Completed oversampling policy slice. Remaining milestone work: frozen stratified validation split generation.
