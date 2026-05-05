@@ -149,3 +149,68 @@ def write_manifest(path: Path, manifest: DatasetManifest) -> None:
     """Write a dataset manifest as YAML."""
     with open(path, "w") as f:
         yaml.safe_dump(manifest.to_dict(), f, sort_keys=False)
+
+
+@dataclass
+class ValidationSplitStratum:
+    """Per-stratum validation split counts."""
+
+    total_records: int
+    validation_records: int
+
+
+@dataclass
+class ValidationSplitManifest:
+    """Frozen validation split emitted by turn-boundary datagen."""
+
+    schema_version: int
+    seed: int
+    total_records: int
+    train_records: int
+    validation_records: int
+    validation_fraction: float
+    strata: dict[str, ValidationSplitStratum]
+    validation_indices: list[int]
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> ValidationSplitManifest:
+        """Parse a validation split dictionary loaded from YAML."""
+        strata_raw = raw.get("strata") or {}
+        return cls(
+            schema_version=raw["schema_version"],
+            seed=raw["seed"],
+            total_records=raw["total_records"],
+            train_records=raw["train_records"],
+            validation_records=raw["validation_records"],
+            validation_fraction=raw["validation_fraction"],
+            strata={
+                key: ValidationSplitStratum(**value)
+                for key, value in strata_raw.items()
+            },
+            validation_indices=list(raw.get("validation_indices") or []),
+        )
+
+    def validate(self, dataset_len: int | None = None) -> None:
+        """Raise ValueError if the split is internally inconsistent."""
+        if self.schema_version != 1:
+            raise ValueError(f"expected schema_version=1, got {self.schema_version}")
+        if self.train_records + self.validation_records != self.total_records:
+            raise ValueError("train_records + validation_records must equal total_records")
+        if len(self.validation_indices) != self.validation_records:
+            raise ValueError("validation_indices length does not match validation_records")
+        if self.validation_indices != sorted(set(self.validation_indices)):
+            raise ValueError("validation_indices must be sorted and unique")
+        if dataset_len is not None and self.total_records != dataset_len:
+            raise ValueError(
+                f"validation split total_records={self.total_records} "
+                f"does not match dataset length={dataset_len}"
+            )
+        if self.validation_indices and self.validation_indices[-1] >= self.total_records:
+            raise ValueError("validation index outside dataset")
+
+
+def read_validation_split(path: Path) -> ValidationSplitManifest:
+    """Read a frozen validation split from YAML."""
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    return ValidationSplitManifest.from_dict(raw)

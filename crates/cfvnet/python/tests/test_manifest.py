@@ -10,6 +10,7 @@ from cfvnet.manifest import (
     DatasetManifest,
     ShardMetadata,
     read_manifest,
+    read_validation_split,
     write_manifest,
 )
 
@@ -101,3 +102,52 @@ def test_dataset_directory_manifest_rejects_missing_shard(tmp_path: Path):
 
     with pytest.raises(ValueError, match="missing shard"):
         _resolve_bin_files(tmp_path)
+
+
+def test_validation_split_manifest_validates(tmp_path: Path):
+    split_path = tmp_path / "validation_split.yaml"
+    split_path.write_text(
+        """
+schema_version: 1
+seed: 123
+total_records: 10
+train_records: 8
+validation_records: 2
+validation_fraction: 0.2
+strata:
+  raise=4bet_plus|spr_8_20:
+    total_records: 10
+    validation_records: 2
+validation_indices:
+  - 3
+  - 7
+"""
+    )
+
+    split = read_validation_split(split_path)
+    split.validate(dataset_len=10)
+
+    assert split.validation_indices == [3, 7]
+    assert split.strata["raise=4bet_plus|spr_8_20"].validation_records == 2
+
+
+def test_validation_split_rejects_unsorted_duplicate_indices(tmp_path: Path):
+    split_path = tmp_path / "validation_split.yaml"
+    split_path.write_text(
+        """
+schema_version: 1
+seed: 123
+total_records: 10
+train_records: 8
+validation_records: 2
+validation_fraction: 0.2
+strata: {}
+validation_indices:
+  - 7
+  - 7
+"""
+    )
+
+    split = read_validation_split(split_path)
+    with pytest.raises(ValueError, match="sorted and unique"):
+        split.validate(dataset_len=10)

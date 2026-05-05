@@ -3,10 +3,13 @@ use std::path::Path;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{CfvnetConfig, DatagenConfig, TurnBoundarySamplingStratum};
 use crate::datagen::manifest::{SourceMetadata, TargetSource};
 use crate::datagen::sampler::{sample_situation, sample_situation_with_blueprint, Situation};
+use crate::datagen::storage::TrainingRecord;
 use crate::datagen::turn_boundary_dataset::TurnBoundaryDatasetWriter;
 #[cfg(feature = "gpu-turn-datagen")]
 use crate::datagen::turn_boundary_oracle::BoundaryNetRiverRunoutOracle;
@@ -82,6 +85,10 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
     let range_source = RangeSource::from_config(&config.datagen)?;
     let sampling_policy = SamplingPolicy::new(&config.datagen)?;
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut validation_builder = ValidationSplitBuilder::new(
+        config.training.validation_split,
+        seed ^ 0x9e37_79b9_7f4a_7c15,
+    );
 
     let mut writer = TurnBoundaryDatasetWriter::create(
         output_path,
@@ -111,6 +118,8 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
         };
         let oop = build_turn_boundary_record(&input, oracle)?;
         let ip = build_turn_boundary_record(&TurnBoundaryInput { player: 1, ..input }, oracle)?;
+        validation_builder.record(&oop, sampled.raise_depth, sampled.boundary_ordinal);
+        validation_builder.record(&ip, sampled.raise_depth, sampled.boundary_ordinal);
         writer.write_with_coverage(
             &[oop, ip],
             range_source_label,
@@ -123,12 +132,209 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
 
     pb.finish_with_message("done");
     let manifest = writer.finish().map_err(|e| e.to_string())?;
+    if let Some(split) = validation_builder.finish() {
+        let split_path = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("validation_split.yaml");
+        split.write_yaml(&split_path)?;
+    }
     eprintln!(
         "Wrote {} turn-boundary records to {} with manifest.yaml",
         manifest.coverage.total_records,
         output_path.display()
     );
     Ok(manifest.coverage.total_records)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ValidationSplitManifest {
+    schema_version: u32,
+    seed: u64,
+    total_records: u64,
+    train_records: u64,
+    validation_records: u64,
+    validation_fraction: f64,
+    strata: BTreeMap<String, ValidationSplitStratum>,
+    validation_indices: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ValidationSplitStratum {
+    total_records: u64,
+    validation_records: u64,
+}
+
+impl ValidationSplitManifest {
+    fn write_yaml(&self, path: &Path) -> Result<(), String> {
+        let file = std::fs::File::create(path)
+            .map_err(|e| format!("create validation split {}: {e}", path.display()))?;
+        serde_yaml::to_writer(file, self)
+            .map_err(|e| format!("write validation split {}: {e}", path.display()))
+    }
+}
+
+struct ValidationSplitBuilder {
+    fraction: f64,
+    seed: u64,
+    next_index: u64,
+    by_stratum: BTreeMap<String, Vec<u64>>,
+}
+
+impl ValidationSplitBuilder {
+    fn new(fraction: f64, seed: u64) -> Self {
+        Self {
+            fraction,
+            seed,
+            next_index: 0,
+            by_stratum: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, rec: &TrainingRecord, raise_depth: &str, boundary_ordinal: &str) {
+        if self.fraction <= 0.0 {
+            self.next_index += 1;
+            return;
+        }
+        let key = validation_stratum_key(rec, raise_depth, boundary_ordinal);
+        self.by_stratum
+            .entry(key)
+            .or_default()
+            .push(self.next_index);
+        self.next_index += 1;
+    }
+
+    fn finish(self) -> Option<ValidationSplitManifest> {
+        if self.fraction <= 0.0 || self.next_index == 0 {
+            return None;
+        }
+
+        let mut selected = BTreeSet::new();
+        let mut strata = BTreeMap::new();
+        for (key, mut indices) in self.by_stratum {
+            deterministic_shuffle(&mut indices, self.seed ^ stable_hash(&key));
+            let target = ((indices.len() as f64) * self.fraction).round() as usize;
+            let validation_count = target.min(indices.len());
+            for idx in indices.iter().take(validation_count) {
+                selected.insert(*idx);
+            }
+            strata.insert(
+                key,
+                ValidationSplitStratum {
+                    total_records: indices.len() as u64,
+                    validation_records: validation_count as u64,
+                },
+            );
+        }
+
+        if selected.is_empty() {
+            return None;
+        }
+
+        let validation_indices: Vec<u64> = selected.into_iter().collect();
+        let validation_records = validation_indices.len() as u64;
+        Some(ValidationSplitManifest {
+            schema_version: 1,
+            seed: self.seed,
+            total_records: self.next_index,
+            train_records: self.next_index - validation_records,
+            validation_records,
+            validation_fraction: self.fraction,
+            strata,
+            validation_indices,
+        })
+    }
+}
+
+fn validation_stratum_key(
+    rec: &TrainingRecord,
+    raise_depth: &str,
+    boundary_ordinal: &str,
+) -> String {
+    format!(
+        "raise={raise_depth}|boundary={boundary_ordinal}|{}|{}|{}|board={}",
+        validation_pot_bucket(rec.pot),
+        validation_stack_bucket(rec.effective_stack),
+        validation_spr_bucket(rec.effective_stack, rec.pot),
+        validation_board_texture(&rec.board),
+    )
+}
+
+fn validation_pot_bucket(pot: f32) -> &'static str {
+    match pot {
+        p if p < 10.0 => "pot_lt_10",
+        p if p < 25.0 => "pot_10_25",
+        p if p < 50.0 => "pot_25_50",
+        p if p < 100.0 => "pot_50_100",
+        p if p < 200.0 => "pot_100_200",
+        _ => "pot_200_plus",
+    }
+}
+
+fn validation_stack_bucket(stack: f32) -> &'static str {
+    match stack {
+        s if s <= 0.0 => "stack_0",
+        s if s < 25.0 => "stack_1_25",
+        s if s < 50.0 => "stack_25_50",
+        s if s < 100.0 => "stack_50_100",
+        s if s < 200.0 => "stack_100_200",
+        _ => "stack_200_plus",
+    }
+}
+
+fn validation_spr_bucket(stack: f32, pot: f32) -> &'static str {
+    let spr = if pot > 0.0 {
+        stack / pot
+    } else {
+        f32::INFINITY
+    };
+    match spr {
+        s if s < 0.5 => "spr_lt_0_5",
+        s if s < 1.5 => "spr_0_5_1_5",
+        s if s < 4.0 => "spr_1_5_4",
+        s if s < 8.0 => "spr_4_8",
+        s if s < 20.0 => "spr_8_20",
+        _ => "spr_20_plus",
+    }
+}
+
+fn validation_board_texture(board: &[u8]) -> String {
+    let mut ranks = [false; 13];
+    let mut suit_counts = [0_u8; 4];
+    for &card in board {
+        ranks[(card / 4) as usize] = true;
+        suit_counts[(card % 4) as usize] += 1;
+    }
+    let suit = match suit_counts.iter().copied().max().unwrap_or(0) {
+        4 => "monotone",
+        3 => "three_flush",
+        2 => "two_tone",
+        _ => "rainbow",
+    };
+    let connected = if ranks.windows(4).any(|window| window.iter().all(|&v| v)) {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    format!("{suit}_{connected}")
+}
+
+fn deterministic_shuffle(values: &mut [u64], seed: u64) {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    for i in (1..values.len()).rev() {
+        let j = rng.gen_range(0..=i);
+        values.swap(i, j);
+    }
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 struct SampledSituation<'a> {
@@ -393,5 +599,53 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("positive total weight"));
+    }
+
+    #[test]
+    fn writes_frozen_validation_split_when_configured() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("turn_boundary.bin");
+        let mut config = test_config(10, None);
+        config.training.validation_split = 0.2;
+
+        generate_turn_boundary_data_with_oracle(
+            &config,
+            &output,
+            TargetSource::ExactRiver,
+            SourceMetadata::default(),
+            &ConstantOracle(0.25),
+        )
+        .unwrap();
+
+        let split_path = dir.path().join("validation_split.yaml");
+        assert!(split_path.exists());
+        let split: ValidationSplitManifest =
+            serde_yaml::from_reader(std::fs::File::open(split_path).unwrap()).unwrap();
+        assert_eq!(split.schema_version, 1);
+        assert_eq!(split.total_records, 20);
+        assert_eq!(split.validation_records, 4);
+        assert_eq!(split.train_records, 16);
+        assert_eq!(split.validation_indices.len(), 4);
+        assert!(split.validation_indices.windows(2).all(|w| w[0] < w[1]));
+        assert!(!split.strata.is_empty());
+    }
+
+    #[test]
+    fn omits_validation_split_when_disabled() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("turn_boundary.bin");
+        let mut config = test_config(3, None);
+        config.training.validation_split = 0.0;
+
+        generate_turn_boundary_data_with_oracle(
+            &config,
+            &output,
+            TargetSource::ExactRiver,
+            SourceMetadata::default(),
+            &ConstantOracle(0.25),
+        )
+        .unwrap();
+
+        assert!(!dir.path().join("validation_split.yaml").exists());
     }
 }

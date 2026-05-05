@@ -11,11 +11,12 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from cfvnet.config import TrainConfig
 from cfvnet.data import LazyBoundaryDataset
 from cfvnet.loss import boundary_loss
+from cfvnet.manifest import read_validation_split
 from cfvnet.model import BoundaryNet
 
 
@@ -275,7 +276,7 @@ def _train_with_dataloader(
 ) -> float:
     """Train using standard DataLoader — for CPU or small datasets."""
     dataset = LazyBoundaryDataset.from_path(data_path)
-    train_ds, val_ds = _split_dataset(dataset, config.validation_split)
+    train_ds, val_ds = _split_dataset(dataset, config.validation_split, data_path)
     train_loader = _make_dataloader(train_ds, config.batch_size, shuffle=True,
                                     num_workers=num_workers)
     val_loader = (_make_dataloader(val_ds, config.batch_size, shuffle=False,
@@ -359,15 +360,41 @@ def _format_epoch_msg(
 def _split_dataset(
     dataset: LazyBoundaryDataset,
     val_split: float,
+    data_path: Path | None = None,
 ) -> tuple:
     """Split dataset into train and val sets."""
     if val_split <= 0.0:
         return dataset, None
+    split_path = _find_validation_split(data_path) if data_path is not None else None
+    if split_path is not None:
+        split = read_validation_split(split_path)
+        split.validate(len(dataset))
+        validation = set(split.validation_indices)
+        train_indices = [idx for idx in range(len(dataset)) if idx not in validation]
+        if not validation:
+            return dataset, None
+        return Subset(dataset, train_indices), Subset(dataset, split.validation_indices)
+
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     if val_size == 0:
         return dataset, None
     return random_split(dataset, [train_size, val_size])
+
+
+def _find_validation_split(data_path: Path) -> Path | None:
+    """Find a frozen validation split next to the dataset, if present."""
+    candidates = []
+    if data_path.is_dir():
+        candidates.append(data_path / "validation_split.yaml")
+        candidates.append(data_path / "validation_split.yml")
+    else:
+        candidates.append(data_path.parent / "validation_split.yaml")
+        candidates.append(data_path.parent / "validation_split.yml")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _make_dataloader(
