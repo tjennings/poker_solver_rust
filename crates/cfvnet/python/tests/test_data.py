@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from cfvnet.constants import (
     NUM_COMBOS,
@@ -13,6 +14,7 @@ from cfvnet.constants import (
 from cfvnet.data import (
     _count_records_in_file,
     _encode_raw_to_tensors,
+    _resolve_bin_files,
     read_records,
 )
 
@@ -226,6 +228,22 @@ def test_count_records_in_file_turn():
         f.flush()
         path = Path(f.name)
     assert _count_records_in_file(path) == 5
+
+
+def test_resolve_bin_files_enforces_expected_board_size(tmp_path: Path):
+    oop = np.zeros(NUM_COMBOS, dtype=np.float32)
+    ip = np.zeros(NUM_COMBOS, dtype=np.float32)
+    cfvs = np.zeros(NUM_COMBOS, dtype=np.float32)
+    mask = np.zeros(NUM_COMBOS, dtype=np.uint8)
+    path = tmp_path / "river.bin"
+    path.write_bytes(
+        _encode_record_bytes(
+            [0, 4, 8, 12, 16], 100.0, 50.0, 0, 0.0, oop, ip, cfvs, mask,
+        )
+    )
+
+    with pytest.raises(ValueError, match="expected board_size=4"):
+        _resolve_bin_files(path, expected_board_size=4)
 
 
 def test_count_records_in_file_flop():

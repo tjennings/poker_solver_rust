@@ -95,13 +95,20 @@ def _train_with_gpu_buffer(
 ) -> float:
     """Train using GPU ring buffer — zero CPU-GPU transfer per batch."""
     import threading
+
     from cfvnet.gpu_buffer import GpuRingBuffer
 
     # Refresh 10% of the pool per epoch, overlapped with training.
     refresh_count = buffer_size // 10
 
-    buf = GpuRingBuffer(data_path, capacity=buffer_size, device=device,
-                        num_workers=num_workers)
+    buf = GpuRingBuffer(
+        data_path,
+        capacity=buffer_size,
+        device=device,
+        num_workers=num_workers,
+        expected_street=config.street,
+        expected_board_size=config.board_size,
+    )
 
     # Steps per epoch = total records / batch_size (approximate).
     steps_per_epoch = max(buf._total_records // config.batch_size, 1)
@@ -275,7 +282,11 @@ def _train_with_dataloader(
     num_workers: int,
 ) -> float:
     """Train using standard DataLoader — for CPU or small datasets."""
-    dataset = LazyBoundaryDataset.from_path(data_path)
+    dataset = LazyBoundaryDataset.from_path(
+        data_path,
+        expected_street=config.street,
+        expected_board_size=config.board_size,
+    )
     train_ds, val_ds = _split_dataset(dataset, config.validation_split, data_path)
     train_loader = _make_dataloader(train_ds, config.batch_size, shuffle=True,
                                     num_workers=num_workers)
@@ -299,7 +310,9 @@ def _train_with_dataloader(
 
         losses = {"train_loss": train_loss, "lr": scheduler.get_last_lr()[0]}
         if val_loader:
-            losses.update({"val_combined": val_combined, "val_huber": val_huber, "val_aux": val_aux})
+            losses.update(
+                {"val_combined": val_combined, "val_huber": val_huber, "val_aux": val_aux}
+            )
         if output_dir:
             _append_training_log(output_dir, epoch + 1, losses)
         _maybe_save_checkpoint(

@@ -31,6 +31,8 @@ training:
         cfg = load_config(Path(f.name))
 
     assert cfg.hidden_layers == 7
+    assert cfg.street == "river"
+    assert cfg.board_size is None
     assert cfg.hidden_size == 768
     assert cfg.batch_size == 8192
     assert cfg.epochs == 100
@@ -59,3 +61,22 @@ datagen:
     assert cfg.hidden_size == 500
     assert cfg.batch_size == 2048
     assert cfg.epochs == 2
+
+
+def test_load_config_parses_turn_boundary_contract():
+    yaml_content = """\
+game:
+  board_size: 4
+datagen:
+  street: "turn_boundary"
+training:
+  batch_size: 4096
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(yaml_content)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.street == "turn_boundary"
+    assert cfg.board_size == 4
+    assert cfg.batch_size == 4096

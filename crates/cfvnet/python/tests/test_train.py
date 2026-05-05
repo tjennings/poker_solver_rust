@@ -9,8 +9,8 @@ import torch
 
 from cfvnet.config import TrainConfig
 from cfvnet.constants import NUM_COMBOS
-from cfvnet.train import _maybe_resume, _split_dataset, train_boundary
 from cfvnet.data import LazyBoundaryDataset
+from cfvnet.train import _maybe_resume, _split_dataset, train_boundary
 
 
 def _write_test_data(path: Path, n: int = 32) -> None:

@@ -38,6 +38,8 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Data: {args.data}")
     print(f"Output: {args.output}")
+    if config.street or config.board_size:
+        print(f"Dataset contract: street={config.street!r} board_size={config.board_size!r}")
 
     result = train_boundary(
         data_path=args.data,

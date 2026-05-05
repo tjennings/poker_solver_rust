@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import struct
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,10 +13,9 @@ from cfvnet.constants import (
     INPUT_SIZE,
     NUM_COMBOS,
     NUM_RANKS,
-    RECORD_SIZE_RIVER,
     record_size,
 )
-from cfvnet.manifest import read_manifest
+from cfvnet.manifest import DatasetManifest, read_manifest
 
 # Byte sizes for the fixed portion of a record (after board).
 _F32_BYTES = 4
@@ -180,13 +178,17 @@ def _compute_spr_weight(pot: float, stack: float) -> float:
     return min(1.0 / max(spr, 0.1), 10.0)
 
 
-def _resolve_bin_files(path: Path) -> list[Path]:
+def _resolve_bin_files(
+    path: Path,
+    expected_street: str | None = None,
+    expected_board_size: int | None = None,
+) -> list[Path]:
     """Get sorted list of .bin files from a path."""
     if path.is_dir():
         manifest_path = _find_manifest(path)
         if manifest_path is not None:
             manifest = read_manifest(manifest_path)
-            manifest.validate_turn_boundary()
+            _validate_manifest_contract(manifest, expected_street, expected_board_size)
             files = [path / shard.path for shard in manifest.shards]
             missing = [p for p in files if not p.is_file()]
             if missing:
@@ -199,8 +201,51 @@ def _resolve_bin_files(path: Path) -> list[Path]:
         files = sorted(p for p in path.iterdir() if p.is_file() and p.suffix == ".bin")
         if not files:
             raise ValueError(f"No .bin files found in {path}")
+        _validate_file_board_sizes(files, expected_board_size)
         return files
+    _validate_file_board_sizes([path], expected_board_size)
     return [path]
+
+
+def _validate_manifest_contract(
+    manifest: DatasetManifest,
+    expected_street: str | None,
+    expected_board_size: int | None,
+) -> None:
+    """Validate dataset manifest compatibility with the requested trainer."""
+    if expected_street == "turn_boundary":
+        manifest.validate_turn_boundary()
+    elif expected_street is not None and manifest.street != expected_street:
+        raise ValueError(f"expected street={expected_street!r}, got {manifest.street!r}")
+
+    if expected_board_size is not None:
+        schema_board_size = manifest.record_schema.board_size
+        if schema_board_size != expected_board_size:
+            raise ValueError(
+                f"expected board_size={expected_board_size}, got {schema_board_size}"
+            )
+        for shard in manifest.shards:
+            if shard.board_size != expected_board_size:
+                raise ValueError(
+                    f"shard {shard.path} expected board_size={expected_board_size}, "
+                    f"got {shard.board_size}"
+                )
+
+
+def _validate_file_board_sizes(files: list[Path], expected_board_size: int | None) -> None:
+    """Validate the board-size prefix for raw .bin files when requested."""
+    if expected_board_size is None:
+        return
+    for file in files:
+        with open(file, "rb") as fh:
+            header = fh.read(1)
+        if len(header) < 1:
+            continue
+        board_size = header[0]
+        if board_size != expected_board_size:
+            raise ValueError(
+                f"{file} expected board_size={expected_board_size}, got {board_size}"
+            )
 
 
 def _find_manifest(path: Path) -> Path | None:
@@ -291,8 +336,11 @@ def _load_bulk(files: list[Path]) -> BoundaryDataset:
 
         if (file_idx + 1) % 100 == 0 or file_idx + 1 == len(files):
             pct = 100.0 * (file_idx + 1) / len(files)
-            print(f"  [{pct:5.1f}%] {offset:,} records loaded from {file_idx + 1}/{len(files)} files",
-                  flush=True)
+            print(
+                f"  [{pct:5.1f}%] {offset:,} records loaded "
+                f"from {file_idx + 1}/{len(files)} files",
+                flush=True,
+            )
 
     print(f"  Done: {offset:,} records, "
           f"{inputs.nbytes / 1024**3:.1f} GB inputs, "
@@ -442,7 +490,12 @@ class BoundaryDataset:
         self._sample_weights = np.array([it.sample_weight for it in items], dtype=np.float32)
 
     @classmethod
-    def from_path(cls, path: Path) -> BoundaryDataset:
+    def from_path(
+        cls,
+        path: Path,
+        expected_street: str | None = None,
+        expected_board_size: int | None = None,
+    ) -> BoundaryDataset:
         """Load from a file or directory of .bin files into memory.
 
         For large datasets that don't fit in RAM, use LazyBoundaryDataset instead.
@@ -453,7 +506,7 @@ class BoundaryDataset:
         Returns:
             BoundaryDataset with all records encoded.
         """
-        files = _resolve_bin_files(path)
+        files = _resolve_bin_files(path, expected_street, expected_board_size)
         return _load_bulk(files)
 
     @classmethod
@@ -521,7 +574,12 @@ class LazyBoundaryDataset:
         print(f"  Indexed {len(self._index):,} records from {len(self._files)} files")
 
     @classmethod
-    def from_path(cls, path: Path) -> LazyBoundaryDataset:
+    def from_path(
+        cls,
+        path: Path,
+        expected_street: str | None = None,
+        expected_board_size: int | None = None,
+    ) -> LazyBoundaryDataset:
         """Create a lazy dataset from a file or directory.
 
         Args:
@@ -530,7 +588,7 @@ class LazyBoundaryDataset:
         Returns:
             LazyBoundaryDataset ready for use with DataLoader.
         """
-        files = _resolve_bin_files(path)
+        files = _resolve_bin_files(path, expected_street, expected_board_size)
         return cls(files)
 
     def __len__(self) -> int:

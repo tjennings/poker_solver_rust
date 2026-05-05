@@ -104,6 +104,26 @@ def test_dataset_directory_manifest_rejects_missing_shard(tmp_path: Path):
         _resolve_bin_files(tmp_path)
 
 
+def test_dataset_directory_manifest_enforces_requested_turn_boundary_schema(tmp_path: Path):
+    shard = tmp_path / "turn_000001.bin"
+    shard.write_bytes(b"")
+
+    manifest = DatasetManifest.turn_boundary("river_net")
+    manifest.street = "river"
+    manifest.shards = [
+        ShardMetadata(
+            path=shard.name,
+            records=0,
+            board_size=4,
+            record_size_bytes=record_size(4),
+        )
+    ]
+    write_manifest(tmp_path / "manifest.yaml", manifest)
+
+    with pytest.raises(ValueError, match="expected street='turn_boundary'"):
+        _resolve_bin_files(tmp_path, expected_street="turn_boundary", expected_board_size=4)
+
+
 def test_validation_split_manifest_validates(tmp_path: Path):
     split_path = tmp_path / "validation_split.yaml"
     split_path.write_text(
