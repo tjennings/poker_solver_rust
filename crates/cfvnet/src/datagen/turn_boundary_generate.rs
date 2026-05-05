@@ -71,6 +71,11 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
     oracle: &O,
 ) -> Result<u64, String> {
     let seed = crate::config::resolve_seed(config.datagen.seed);
+    let range_source_label = if config.datagen.blueprint_path.is_some() {
+        "blueprint"
+    } else {
+        "rsp"
+    };
     let range_source = RangeSource::from_config(&config.datagen)?;
     let mut sit_gen = SituationGenerator::new(
         &config.datagen,
@@ -106,7 +111,12 @@ pub fn generate_turn_boundary_data_with_oracle<O: RiverRunoutOracle>(
         };
         let oop = build_turn_boundary_record(&input, oracle)?;
         let ip = build_turn_boundary_record(&TurnBoundaryInput { player: 1, ..input }, oracle)?;
-        writer.write(&[oop, ip])?;
+        writer.write_with_coverage(
+            &[oop, ip],
+            range_source_label,
+            "sampled_turn_state",
+            "turn_entry",
+        )?;
         pb.inc(1);
         pb.set_message(format!("written:{}", writer.count()));
     }
@@ -210,6 +220,21 @@ mod tests {
         assert_eq!(manifest.target_source, TargetSource::ExactRiver);
         assert_eq!(manifest.coverage.total_records, 6);
         assert_eq!(manifest.shards.len(), 3);
+        assert_eq!(
+            manifest.coverage.by_target_source.get("exact_river"),
+            Some(&6)
+        );
+        assert_eq!(manifest.coverage.by_range_source.get("rsp"), Some(&6));
+        assert_eq!(
+            manifest.coverage.by_raise_depth.get("sampled_turn_state"),
+            Some(&6)
+        );
+        assert_eq!(
+            manifest.coverage.by_boundary_ordinal.get("turn_entry"),
+            Some(&6)
+        );
+        assert!(!manifest.coverage.by_spr_bucket.is_empty());
+        assert!(!manifest.coverage.by_board_texture.is_empty());
     }
 
     #[test]

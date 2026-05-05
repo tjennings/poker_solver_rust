@@ -1,4 +1,4 @@
-use crate::datagen::storage::{record_size, NUM_COMBOS};
+use crate::datagen::storage::{record_size, TrainingRecord, NUM_COMBOS};
 use crate::model::network::INPUT_SIZE;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -73,7 +73,17 @@ pub struct CoverageSummary {
     #[serde(default)]
     pub by_raise_depth: BTreeMap<String, u64>,
     #[serde(default)]
+    pub by_boundary_ordinal: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_allin_proximity: BTreeMap<String, u64>,
+    #[serde(default)]
     pub by_board_texture: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_range_entropy: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_range_source: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_target_source: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -167,6 +177,181 @@ impl DatasetManifest {
         self.coverage.total_records = self.shards.iter().map(|shard| shard.records).sum();
         Ok(())
     }
+}
+
+impl CoverageSummary {
+    pub fn record_turn_boundary(
+        &mut self,
+        rec: &TrainingRecord,
+        target_source: TargetSource,
+        range_source: &str,
+        raise_depth: &str,
+        boundary_ordinal: &str,
+    ) {
+        self.total_records += 1;
+        increment(&mut self.by_pot_bucket, pot_bucket(rec.pot));
+        increment(&mut self.by_stack_bucket, stack_bucket(rec.effective_stack));
+        increment(
+            &mut self.by_spr_bucket,
+            spr_bucket(rec.effective_stack, rec.pot),
+        );
+        increment(
+            &mut self.by_allin_proximity,
+            allin_proximity_bucket(rec.effective_stack, rec.pot),
+        );
+        increment(&mut self.by_raise_depth, raise_depth.to_string());
+        increment(&mut self.by_boundary_ordinal, boundary_ordinal.to_string());
+        increment(&mut self.by_board_texture, board_texture_bucket(&rec.board));
+        increment(&mut self.by_range_entropy, range_entropy_bucket(rec));
+        increment(&mut self.by_range_source, range_source.to_string());
+        increment(
+            &mut self.by_target_source,
+            target_source.as_str().to_string(),
+        );
+    }
+}
+
+impl TargetSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TargetSource::RiverNet => "river_net",
+            TargetSource::ExactRiver => "exact_river",
+            TargetSource::Mixed => "mixed",
+        }
+    }
+}
+
+fn increment(map: &mut BTreeMap<String, u64>, key: String) {
+    *map.entry(key).or_insert(0) += 1;
+}
+
+fn pot_bucket(pot: f32) -> String {
+    match pot {
+        p if p < 10.0 => "pot_lt_10",
+        p if p < 25.0 => "pot_10_25",
+        p if p < 50.0 => "pot_25_50",
+        p if p < 100.0 => "pot_50_100",
+        p if p < 200.0 => "pot_100_200",
+        _ => "pot_200_plus",
+    }
+    .to_string()
+}
+
+fn stack_bucket(stack: f32) -> String {
+    match stack {
+        s if s <= 0.0 => "stack_0",
+        s if s < 25.0 => "stack_1_25",
+        s if s < 50.0 => "stack_25_50",
+        s if s < 100.0 => "stack_50_100",
+        s if s < 200.0 => "stack_100_200",
+        _ => "stack_200_plus",
+    }
+    .to_string()
+}
+
+fn spr_bucket(stack: f32, pot: f32) -> String {
+    let spr = if pot > 0.0 {
+        stack / pot
+    } else {
+        f32::INFINITY
+    };
+    match spr {
+        s if s < 0.5 => "spr_lt_0_5",
+        s if s < 1.5 => "spr_0_5_1_5",
+        s if s < 4.0 => "spr_1_5_4",
+        s if s < 8.0 => "spr_4_8",
+        s if s < 20.0 => "spr_8_20",
+        _ => "spr_20_plus",
+    }
+    .to_string()
+}
+
+fn allin_proximity_bucket(stack: f32, pot: f32) -> String {
+    let ratio = if pot > 0.0 {
+        stack / pot
+    } else {
+        f32::INFINITY
+    };
+    match ratio {
+        r if r <= 0.25 => "near_allin_le_0_25p",
+        r if r <= 0.5 => "near_allin_0_25_0_5p",
+        r if r <= 1.0 => "near_allin_0_5_1p",
+        _ => "not_near_allin",
+    }
+    .to_string()
+}
+
+fn board_texture_bucket(board: &[u8]) -> String {
+    let mut rank_counts = [0_u8; 13];
+    let mut suit_counts = [0_u8; 4];
+    for &card in board {
+        rank_counts[(card / 4) as usize] += 1;
+        suit_counts[(card % 4) as usize] += 1;
+    }
+
+    let paired = match rank_counts.iter().copied().max().unwrap_or(0) {
+        4 => "quads",
+        3 => "trips",
+        2 => "paired",
+        _ => "unpaired",
+    };
+    let suit = match suit_counts.iter().copied().max().unwrap_or(0) {
+        4 => "monotone",
+        3 => "three_flush",
+        2 => "two_tone",
+        _ => "rainbow",
+    };
+    let connected = if has_four_card_run(&rank_counts) {
+        "connected"
+    } else {
+        "disconnected"
+    };
+    format!("{paired}_{suit}_{connected}")
+}
+
+fn has_four_card_run(rank_counts: &[u8; 13]) -> bool {
+    let mut present = [false; 14];
+    for (rank, &count) in rank_counts.iter().enumerate() {
+        if count > 0 {
+            present[rank] = true;
+            if rank == 12 {
+                present[13] = true;
+            }
+        }
+    }
+    present.windows(4).any(|window| window.iter().all(|&v| v))
+}
+
+fn range_entropy_bucket(rec: &TrainingRecord) -> String {
+    let range = if rec.player == 0 {
+        &rec.oop_range
+    } else {
+        &rec.ip_range
+    };
+    let total: f64 = range.iter().map(|&v| f64::from(v.max(0.0))).sum();
+    if total <= 0.0 {
+        return "entropy_empty".to_string();
+    }
+
+    let mut entropy = 0.0_f64;
+    let mut support = 0_u32;
+    for &value in range {
+        let p = f64::from(value.max(0.0)) / total;
+        if p > 0.0 {
+            entropy -= p * p.ln();
+            support += 1;
+        }
+    }
+    if support <= 1 {
+        return "entropy_zero".to_string();
+    }
+    let normalized = entropy / f64::from(support).ln();
+    match normalized {
+        h if h < 0.35 => "entropy_low",
+        h if h < 0.70 => "entropy_medium",
+        _ => "entropy_high",
+    }
+    .to_string()
 }
 
 impl RecordSchema {
@@ -268,6 +453,22 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    fn sample_record() -> TrainingRecord {
+        let mut rec = TrainingRecord {
+            board: vec![0, 4, 8, 12],
+            pot: 20.0,
+            effective_stack: 10.0,
+            player: 0,
+            game_value: 0.0,
+            oop_range: [0.0; NUM_COMBOS],
+            ip_range: [0.0; NUM_COMBOS],
+            cfvs: [0.0; NUM_COMBOS],
+            valid_mask: [0; NUM_COMBOS],
+        };
+        rec.oop_range[0] = 1.0;
+        rec
+    }
+
     #[test]
     fn turn_boundary_schema_matches_binary_record_contract() {
         let schema = RecordSchema::turn_boundary();
@@ -304,6 +505,36 @@ mod tests {
 
         assert_eq!(loaded, manifest);
         loaded.validate_turn_boundary().unwrap();
+    }
+
+    #[test]
+    fn coverage_records_turn_boundary_strata() {
+        let mut coverage = CoverageSummary::default();
+        coverage.record_turn_boundary(
+            &sample_record(),
+            TargetSource::RiverNet,
+            "rsp",
+            "4bet_plus",
+            "boundary_03",
+        );
+
+        assert_eq!(coverage.total_records, 1);
+        assert_eq!(coverage.by_pot_bucket.get("pot_10_25"), Some(&1));
+        assert_eq!(coverage.by_stack_bucket.get("stack_1_25"), Some(&1));
+        assert_eq!(coverage.by_spr_bucket.get("spr_0_5_1_5"), Some(&1));
+        assert_eq!(
+            coverage.by_allin_proximity.get("near_allin_0_25_0_5p"),
+            Some(&1)
+        );
+        assert_eq!(coverage.by_raise_depth.get("4bet_plus"), Some(&1));
+        assert_eq!(coverage.by_boundary_ordinal.get("boundary_03"), Some(&1));
+        assert_eq!(coverage.by_range_entropy.get("entropy_zero"), Some(&1));
+        assert_eq!(coverage.by_range_source.get("rsp"), Some(&1));
+        assert_eq!(coverage.by_target_source.get("river_net"), Some(&1));
+        assert_eq!(
+            coverage.by_board_texture.get("unpaired_monotone_connected"),
+            Some(&1)
+        );
     }
 
     #[test]

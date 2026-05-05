@@ -46,10 +46,30 @@ impl TurnBoundaryDatasetWriter {
     }
 
     pub fn write(&mut self, records: &[TrainingRecord]) -> Result<(), String> {
+        self.write_with_coverage(records, "unknown", "unknown", "unknown")
+    }
+
+    pub fn write_with_coverage(
+        &mut self,
+        records: &[TrainingRecord],
+        range_source: &str,
+        raise_depth: &str,
+        boundary_ordinal: &str,
+    ) -> Result<(), String> {
         for rec in records {
             validate_turn_boundary_record(rec)?;
         }
-        self.writer.write(records)
+        self.writer.write(records)?;
+        for rec in records {
+            self.manifest.coverage.record_turn_boundary(
+                rec,
+                self.manifest.target_source,
+                range_source,
+                raise_depth,
+                boundary_ordinal,
+            );
+        }
+        Ok(())
     }
 
     pub fn count(&self) -> u64 {
@@ -169,6 +189,9 @@ mod tests {
         let loaded = DatasetManifest::read_yaml(&manifest_path).unwrap();
         assert_eq!(loaded, manifest);
         loaded.validate_turn_boundary().unwrap();
+        assert_eq!(loaded.coverage.by_target_source.get("river_net"), Some(&5));
+        assert_eq!(loaded.coverage.by_raise_depth.get("unknown"), Some(&5));
+        assert_eq!(loaded.coverage.by_boundary_ordinal.get("unknown"), Some(&5));
     }
 
     #[test]

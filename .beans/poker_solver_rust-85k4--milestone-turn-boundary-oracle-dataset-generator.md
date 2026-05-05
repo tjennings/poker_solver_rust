@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-05T02:55:44Z
-updated_at: 2026-05-05T03:42:50Z
+updated_at: 2026-05-05T03:48:58Z
 parent: poker_solver_rust-fp06
 ---
 
@@ -14,3 +14,7 @@ Build the data generator that creates turn-boundary training examples by enumera
 
 
 Progress: turn-boundary generation now has a CLI/config route (street=turn_boundary), oracle source selection, exact/river-net adapters, and sharded manifest output. Remaining milestone gap is richer coverage/validation bucket summaries in the manifest.
+
+
+
+Coverage gap reduced: turn-boundary manifest now records stratified counters for generated data. Validation split generation remains under poker_solver_rust-q93y.
