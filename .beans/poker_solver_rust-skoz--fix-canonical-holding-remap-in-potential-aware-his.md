@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-skoz
 title: Fix canonical holding remap in potential-aware histograms
-status: todo
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-06T16:39:00Z
-updated_at: 2026-05-06T16:39:00Z
+updated_at: 2026-05-06T16:53:15Z
 parent: poker_solver_rust-hfnv
 ---
 
@@ -16,3 +16,7 @@ Acceptance:
 - Fix global turn/flop clustering histogram construction
 - Audit per-flop clustering paths for the same failure mode
 - Confirm MCCFR runtime lookup and clustering feature construction agree on board and holding canonicalization
+
+## Work Start
+
+Started implementation after the river nut-distance feature slice. Initial focus is aligning build_bucket_histogram_u8 with runtime bucket lookup: canonicalize the child board, apply the child board suit mapping to the holding, and index the child bucket file with the mapped combo.
