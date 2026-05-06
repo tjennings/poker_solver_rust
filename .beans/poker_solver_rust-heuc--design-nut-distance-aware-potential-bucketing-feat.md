@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-06T16:39:30Z
-updated_at: 2026-05-06T16:43:58Z
+updated_at: 2026-05-06T16:47:18Z
 parent: poker_solver_rust-hfnv
 ---
 
@@ -30,3 +30,7 @@ Initial implementation slice:
 - Then implement river-side nut dominance features and diagnostics before changing flop/turn clustering.
 - Validate with weight sweeps: wn = 0.0, 0.1, 0.25, 0.5, 1.0.
 - Keep potential EMD primary; nut distance starts as a board-aware regularizer.
+
+## Implementation Note
+
+Added draft implementation spec in docs/plans/2026-05-06-nut-distance-aware-potential-bucketing.md. The spec defines the combined metric, normalization contract, initial weight sweep, river-first implementation sequence, and diagnostics for nut collision versus potential-EMD degradation.
