@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(result.meta_iterations, 100);
     }
 
-    #[timed_test]
+    #[timed_test(3)]
     fn train_3_player_toy_completes() {
         let config = toy_config(3, 100);
         let result = train_blueprint_mp(&config);
@@ -851,7 +851,7 @@ mod tests {
 
     // -- run_training tests --
 
-    #[timed_test]
+    #[timed_test(3)]
     fn run_training_returns_correct_meta_iterations() {
         let config = toy_config(2, 50);
         let ctx = setup_training(&config);
