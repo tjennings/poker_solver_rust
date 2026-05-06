@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn default_backend() -> String {
     if cfg!(feature = "cuda") {
@@ -412,8 +412,8 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
     match backend {
         "wgpu" => {
             use burn::backend::{
-                Autodiff,
                 wgpu::{Wgpu, WgpuDevice},
+                Autodiff,
             };
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
@@ -443,7 +443,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
-            use burn::backend::{Autodiff, CudaJit, cuda_jit::CudaDevice};
+            use burn::backend::{cuda_jit::CudaDevice, Autodiff, CudaJit};
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
@@ -523,8 +523,8 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
     match backend {
         "wgpu" => {
             use burn::backend::{
-                Autodiff,
                 wgpu::{Wgpu, WgpuDevice},
+                Autodiff,
             };
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
@@ -554,7 +554,7 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
-            use burn::backend::{Autodiff, CudaJit, cuda_jit::CudaDevice};
+            use burn::backend::{cuda_jit::CudaDevice, Autodiff, CudaJit};
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
@@ -1025,7 +1025,7 @@ fn cmd_eval_boundary_onnx(model_path: PathBuf, data_path: PathBuf) {
     use cfvnet::eval::metrics::compute_normalized_mae;
     use cfvnet::model::boundary_dataset::encode_boundary_record;
     use cfvnet::model::network::INPUT_SIZE;
-    use ort::session::{Session, builder::GraphOptimizationLevel};
+    use ort::session::{builder::GraphOptimizationLevel, Session};
 
     let session = Session::builder()
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
@@ -1145,7 +1145,7 @@ fn cmd_diagnose_boundary_onnx(
     use cfvnet::datagen::storage::{read_record, record_size};
     use cfvnet::model::boundary_dataset::encode_boundary_record;
     use cfvnet::model::network::INPUT_SIZE;
-    use ort::session::{Session, builder::GraphOptimizationLevel};
+    use ort::session::{builder::GraphOptimizationLevel, Session};
     use range_solver::card::index_to_card_pair;
     use std::collections::HashMap;
 
@@ -1687,30 +1687,19 @@ fn cmd_datagen_eval(data: PathBuf) {
     use cfvnet::datagen::storage::read_record;
     use std::io::BufReader;
 
-    let paths: Vec<PathBuf> = if data.is_dir() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&data)
-            .unwrap_or_else(|e| {
-                eprintln!("failed to read directory {}: {e}", data.display());
-                std::process::exit(1);
-            })
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if entry.file_type().ok()?.is_file() {
-                    Some(entry.path())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        entries.sort();
-        entries
-    } else {
-        vec![data.clone()]
-    };
+    let input = datagen_eval_input(&data).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let paths = input.paths;
 
     if paths.is_empty() {
         eprintln!("no files found in {}", data.display());
         std::process::exit(1);
+    }
+
+    if let Some(manifest) = &input.manifest {
+        print!("{}", format_datagen_eval_manifest_section(manifest));
     }
 
     let mut pots = Vec::new();
@@ -1912,6 +1901,146 @@ fn cmd_datagen_eval(data: PathBuf) {
     print_stats("  Top-10 mass   ", &ip_top10_concs);
     print_stats("  Max/mean      ", &ip_max_mean_ratios);
     print_stats("  Total mass    ", &ip_totals);
+}
+
+struct DatagenEvalInput {
+    paths: Vec<PathBuf>,
+    manifest: Option<cfvnet::datagen::manifest::DatasetManifest>,
+}
+
+fn datagen_eval_input(data: &Path) -> Result<DatagenEvalInput, String> {
+    use cfvnet::datagen::manifest::DatasetManifest;
+
+    if !data.is_dir() {
+        return Ok(DatagenEvalInput {
+            paths: vec![data.to_path_buf()],
+            manifest: None,
+        });
+    }
+
+    let manifest_path = data.join("manifest.yaml");
+    if manifest_path.is_file() {
+        let manifest = DatasetManifest::read_yaml(&manifest_path)
+            .map_err(|e| format!("failed to read manifest {}: {e}", manifest_path.display()))?;
+        manifest.validate_turn_boundary().map_err(|e| {
+            format!(
+                "invalid turn-boundary manifest {}: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let paths = manifest
+            .shards
+            .iter()
+            .map(|shard| data.join(&shard.path))
+            .collect();
+        return Ok(DatagenEvalInput {
+            paths,
+            manifest: Some(manifest),
+        });
+    }
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(data)
+        .map_err(|e| format!("failed to read directory {}: {e}", data.display()))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if entry.file_type().ok()?.is_file() {
+                let path = entry.path();
+                if is_probably_binary_training_shard(&path) {
+                    Some(path)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+    paths.sort();
+    Ok(DatagenEvalInput {
+        paths,
+        manifest: None,
+    })
+}
+
+fn is_probably_binary_training_shard(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name == "manifest.yaml" {
+        return false;
+    }
+
+    !matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("json" | "lock" | "md" | "toml" | "txt" | "yaml" | "yml")
+    )
+}
+
+fn format_datagen_eval_manifest_section(
+    manifest: &cfvnet::datagen::manifest::DatasetManifest,
+) -> String {
+    use cfvnet::datagen::manifest::{CoverageSummary, DatasetStreet, TargetSource};
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+
+    fn street_label(street: DatasetStreet) -> &'static str {
+        match street {
+            DatasetStreet::TurnBoundary => "turn_boundary",
+        }
+    }
+
+    fn target_source_label(target_source: TargetSource) -> &'static str {
+        target_source.as_str()
+    }
+
+    fn write_map(out: &mut String, label: &str, map: &BTreeMap<String, u64>) {
+        let _ = writeln!(out, "  {label}:");
+        if map.is_empty() {
+            let _ = writeln!(out, "    (empty)");
+        } else {
+            for (key, value) in map {
+                let _ = writeln!(out, "    {key}: {value}");
+            }
+        }
+    }
+
+    let CoverageSummary {
+        total_records,
+        by_spr_bucket,
+        by_pot_bucket,
+        by_stack_bucket,
+        by_raise_depth,
+        by_boundary_ordinal,
+        by_allin_proximity,
+        by_board_texture,
+        by_range_entropy,
+        by_range_source,
+        by_target_source,
+    } = &manifest.coverage;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "\n=== Dataset Manifest ===");
+    let _ = writeln!(out, "street: {}", street_label(manifest.street));
+    let _ = writeln!(
+        out,
+        "target_source: {}",
+        target_source_label(manifest.target_source)
+    );
+    let _ = writeln!(out, "total_records: {total_records}");
+    let _ = writeln!(out, "shards: {}", manifest.shards.len());
+    let _ = writeln!(out, "\nCoverage:");
+    write_map(&mut out, "by_spr_bucket", by_spr_bucket);
+    write_map(&mut out, "by_pot_bucket", by_pot_bucket);
+    write_map(&mut out, "by_stack_bucket", by_stack_bucket);
+    write_map(&mut out, "by_raise_depth", by_raise_depth);
+    write_map(&mut out, "by_boundary_ordinal", by_boundary_ordinal);
+    write_map(&mut out, "by_allin_proximity", by_allin_proximity);
+    write_map(&mut out, "by_board_texture", by_board_texture);
+    write_map(&mut out, "by_range_entropy", by_range_entropy);
+    write_map(&mut out, "by_range_source", by_range_source);
+    write_map(&mut out, "by_target_source", by_target_source);
+    out
 }
 
 /// Compute range-shape statistics for a single range vector.
@@ -2651,6 +2780,79 @@ mod tests {
         std::fs::write(&path, &[0u8]).unwrap();
         infer_board_cards_from_data(&path);
         // cleanup won't run due to panic, but temp dir is fine
+    }
+
+    #[test]
+    fn datagen_eval_input_uses_manifest_shards_only() {
+        use cfvnet::datagen::manifest::{DatasetManifest, TargetSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard_dir = dir.path().join("shards");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let shard_a = shard_dir.join("part-a.bin");
+        let shard_b = shard_dir.join("part-b.bin");
+        std::fs::write(&shard_a, b"binary-a").unwrap();
+        std::fs::write(&shard_b, b"binary-b").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"not a shard").unwrap();
+        std::fs::write(dir.path().join("stray.bin"), b"not listed").unwrap();
+
+        let mut manifest = DatasetManifest::new_turn_boundary(TargetSource::RiverNet);
+        manifest
+            .add_turn_boundary_shard(dir.path(), &shard_b, 2, Some(TargetSource::RiverNet))
+            .unwrap();
+        manifest
+            .add_turn_boundary_shard(dir.path(), &shard_a, 1, Some(TargetSource::RiverNet))
+            .unwrap();
+        manifest
+            .write_yaml(dir.path().join("manifest.yaml"))
+            .unwrap();
+
+        let input = datagen_eval_input(dir.path()).unwrap();
+        assert_eq!(input.paths, vec![shard_b, shard_a]);
+        assert_eq!(input.manifest.unwrap().coverage.total_records, 3);
+    }
+
+    #[test]
+    fn datagen_eval_input_legacy_directory_skips_obvious_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_a = dir.path().join("a.bin");
+        let shard_b = dir.path().join("b.dat");
+        std::fs::write(&shard_b, b"binary-b").unwrap();
+        std::fs::write(dir.path().join("manifest.yaml"), b"not valid manifest").unwrap();
+        std::fs::remove_file(dir.path().join("manifest.yaml")).unwrap();
+        std::fs::write(&shard_a, b"binary-a").unwrap();
+        std::fs::write(dir.path().join("README.md"), b"metadata").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"metadata").unwrap();
+
+        let input = datagen_eval_input(dir.path()).unwrap();
+        assert_eq!(input.paths, vec![shard_a, shard_b]);
+        assert!(input.manifest.is_none());
+    }
+
+    #[test]
+    fn datagen_eval_manifest_section_is_deterministic() {
+        use cfvnet::datagen::manifest::{DatasetManifest, TargetSource};
+
+        let mut manifest = DatasetManifest::new_turn_boundary(TargetSource::ExactRiver);
+        manifest.coverage.total_records = 4;
+        manifest.coverage.by_spr_bucket.insert("spr_z".into(), 1);
+        manifest.coverage.by_spr_bucket.insert("spr_a".into(), 3);
+        manifest
+            .coverage
+            .by_pot_bucket
+            .insert("pot_10_25".into(), 4);
+        manifest
+            .coverage
+            .by_target_source
+            .insert("exact_river".into(), 4);
+
+        let output = format_datagen_eval_manifest_section(&manifest);
+        assert!(output.contains("street: turn_boundary"));
+        assert!(output.contains("target_source: exact_river"));
+        assert!(output.contains("total_records: 4"));
+        assert!(output.contains("  by_spr_bucket:\n    spr_a: 3\n    spr_z: 1\n"));
+        assert!(output.contains("  by_raise_depth:\n    (empty)\n"));
+        assert!(output.contains("  by_target_source:\n    exact_river: 4\n"));
     }
 
     #[test]
