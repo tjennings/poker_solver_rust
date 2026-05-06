@@ -7,39 +7,37 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::sync::atomic::{AtomicI16, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use super::game_tree::{MpGameNode, MpGameTree};
 use super::mmap_buffer::MmapBuffer;
 
 /// Fixed-point scaling factor for regret values.
 ///
-/// Regret deltas are stored as `(chip_value * REGRET_SCALE) as i16`.
-/// At scale 1, max storable value is +/-32767 chips (~163bb in a 6-player game).
-/// Single-iteration max delta is ~1200 chips (3.7% of i16 range), allowing
-/// ~27 iterations of pure positive accumulation before saturation.
-/// DCFR discounting keeps actual values well below saturation.
+/// Regret deltas are stored as `(chip_value * REGRET_SCALE) as i32`.
+/// At scale 1, max storable value is over +/-2.1B chips, leaving durable
+/// headroom for long 6-max runs while keeping chip-valued regret precision.
 pub const REGRET_SCALE: f64 = 1.0;
 
 /// Fixed-point scaling factor for average-strategy probabilities.
 ///
 /// This is intentionally separate from `REGRET_SCALE`: regrets are chip-valued
-/// and currently fit at scale 1, while probabilities need fractional precision
-/// before being stored in integer strategy sums.
+/// while probabilities need fractional precision before being stored in integer
+/// strategy sums.
 pub const STRATEGY_SCALE: f64 = 1_000.0;
 
 /// Flat-buffer storage for regrets and strategy sums.
 pub struct MpStorage {
-    /// Cumulative regrets: one `AtomicI16` per (node, bucket, action).
-    pub regrets: MmapBuffer<AtomicI16>,
+    /// Cumulative regrets: one `AtomicI32` per (node, bucket, action).
+    pub regrets: MmapBuffer<AtomicI32>,
     /// Strategy sums: one `AtomicI32` per (node, bucket, action).
     pub strategy_sums: MmapBuffer<AtomicI32>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata.
     layout: Vec<NodeLayout>,
-    /// Floor for cumulative regret. `i16::MIN` = no floor (default).
-    pub regret_floor: i16,
+    /// Floor for cumulative regret. `i32::MIN` = no floor (default).
+    pub regret_floor: i32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -59,7 +57,7 @@ impl MpStorage {
             .iter()
             .filter(|n| matches!(n, MpGameNode::Decision { .. }))
             .count();
-        let regret_bytes = total * std::mem::size_of::<AtomicI16>();
+        let regret_bytes = total * std::mem::size_of::<AtomicI32>();
         let strat_bytes = total * std::mem::size_of::<AtomicI32>();
         let virtual_total = regret_bytes + strat_bytes;
         let estimated_physical = virtual_total as f64 * 0.6;
@@ -77,7 +75,7 @@ impl MpStorage {
             strategy_sums: MmapBuffer::new(total),
             bucket_counts,
             layout,
-            regret_floor: i16::MIN,
+            regret_floor: i32::MIN,
         }
     }
 
@@ -88,22 +86,22 @@ impl MpStorage {
         self.layout[node_idx as usize].num_actions as usize
     }
 
-    /// Read a single regret value atomically (raw scaled i16).
+    /// Read a single regret value atomically (raw scaled i32).
     #[inline]
     #[must_use]
-    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i16 {
+    pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
         self.regrets[self.slot(node_idx, bucket, action)].load(Ordering::Relaxed)
     }
 
     /// Add a delta to a single regret value atomically with saturation.
     #[inline]
-    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i16) {
+    pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         let idx = self.slot(node_idx, bucket, action);
         let floor = self.regret_floor;
         self.regrets[idx]
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 let val = old.saturating_add(delta);
-                Some(if floor == i16::MIN {
+                Some(if floor == i32::MIN {
                     val
                 } else {
                     val.max(floor)
@@ -396,25 +394,36 @@ mod tests {
     }
 
     #[timed_test]
-    fn regret_i16_saturates_on_overflow() {
+    fn regret_i32_saturates_on_overflow() {
         let tree = minimal_tree(2);
         let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
         let node = first_decision_node(&tree);
 
-        storage.add_regret(node, 0, 0, i16::MAX - 10);
+        storage.add_regret(node, 0, 0, i32::MAX - 10);
         storage.add_regret(node, 0, 0, 100);
-        assert_eq!(storage.get_regret(node, 0, 0), i16::MAX);
+        assert_eq!(storage.get_regret(node, 0, 0), i32::MAX);
     }
 
     #[timed_test]
-    fn regret_i16_saturates_negative_overflow() {
+    fn regret_i32_saturates_negative_overflow() {
         let tree = minimal_tree(2);
         let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
         let node = first_decision_node(&tree);
 
-        storage.add_regret(node, 0, 0, i16::MIN + 10);
+        storage.add_regret(node, 0, 0, i32::MIN + 10);
         storage.add_regret(node, 0, 0, -100);
-        assert_eq!(storage.get_regret(node, 0, 0), i16::MIN);
+        assert_eq!(storage.get_regret(node, 0, 0), i32::MIN);
+    }
+
+    #[timed_test]
+    fn regret_storage_exceeds_i16_max_without_saturating() {
+        let tree = minimal_tree(2);
+        let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
+        let node = first_decision_node(&tree);
+
+        storage.add_regret(node, 0, 0, i16::MAX as i32 - 10);
+        storage.add_regret(node, 0, 0, 100);
+        assert!(storage.get_regret(node, 0, 0) > i16::MAX as i32);
     }
 
     #[timed_test]
@@ -443,12 +452,14 @@ mod tests {
     #[timed_test]
     fn regret_scale_1_covers_max_pot() {
         // 6-player 100bb max pot = ~1200 chips
-        // At REGRET_SCALE=1: 1200 * 1 = 1200, fits in i16 (max 32767)
-        // Leaves 27x headroom for accumulation before saturation
+        // At REGRET_SCALE=1: 1200 * 1 = 1200, leaving ample i32 headroom.
         let max_pot_chips = 1200.0_f64;
-        let scaled = (max_pot_chips * REGRET_SCALE) as i16;
+        let scaled = (max_pot_chips * REGRET_SCALE) as i32;
         assert_eq!(scaled, 1200);
-        assert!(scaled < i16::MAX / 20, "should have substantial headroom");
+        assert!(
+            scaled < i32::MAX / 1_000_000,
+            "should have substantial headroom"
+        );
     }
 
     #[timed_test]

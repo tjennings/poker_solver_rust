@@ -405,11 +405,11 @@ pub(crate) fn push_bounded(buf: &mut Vec<u64>, value: u64, max_len: usize) {
 
 /// Compute regret statistics from a flat regret array and push to TUI metrics.
 ///
-/// Scans all `AtomicI16` regret values, computes max, min, and average positive
+/// Scans all `AtomicI32` regret values, computes max, min, and average positive
 /// regret (after dividing by `regret_scale`), and pushes one sample of each
 /// into the metrics sparkline history.
 pub fn push_regret_telemetry(
-    regrets: &[std::sync::atomic::AtomicI16],
+    regrets: &[std::sync::atomic::AtomicI32],
     regret_scale: f64,
     metrics: &BlueprintTuiMetrics,
 ) {
@@ -421,7 +421,7 @@ pub fn push_regret_telemetry(
         .par_chunks(1_000_000)
         .map(|chunk| scan_regret_chunk(chunk))
         .reduce(
-            || (i16::MIN, i16::MAX, 0i64, 0u64),
+            || (i32::MIN, i32::MAX, 0i64, 0u64),
             |(mx1, mn1, ps1, pc1), (mx2, mn2, ps2, pc2)| {
                 (mx1.max(mx2), mn1.min(mn2), ps1 + ps2, pc1 + pc2)
             },
@@ -436,10 +436,10 @@ pub fn push_regret_telemetry(
     metrics.push_avg_pos_regret(avg);
 }
 
-/// Scan a chunk of `AtomicI16` regrets, returning (max, min, pos_sum, pos_count).
-fn scan_regret_chunk(chunk: &[std::sync::atomic::AtomicI16]) -> (i16, i16, i64, u64) {
-    let mut mx = i16::MIN;
-    let mut mn = i16::MAX;
+/// Scan a chunk of `AtomicI32` regrets, returning (max, min, pos_sum, pos_count).
+fn scan_regret_chunk(chunk: &[std::sync::atomic::AtomicI32]) -> (i32, i32, i64, u64) {
+    let mut mx = i32::MIN;
+    let mut mn = i32::MAX;
     let mut ps: i64 = 0;
     let mut pc: u64 = 0;
     for atom in chunk {
@@ -914,12 +914,12 @@ mod tests {
 
     #[timed_test]
     fn push_regret_telemetry_max_positive() {
-        use std::sync::atomic::AtomicI16;
+        use std::sync::atomic::AtomicI32;
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             None, None,
         ));
         // scale=20, so 100 raw = 5.0 chip value
-        let regrets = [AtomicI16::new(100), AtomicI16::new(-60), AtomicI16::new(40)];
+        let regrets = [AtomicI32::new(100), AtomicI32::new(-60), AtomicI32::new(40)];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let hist = metrics.max_regret_history.lock().unwrap();
         assert_eq!(hist.len(), 1);
@@ -927,15 +927,29 @@ mod tests {
     }
 
     #[timed_test]
+    fn push_regret_telemetry_handles_above_i16_max() {
+        use std::sync::atomic::AtomicI32;
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            None, None,
+        ));
+        let raw = i16::MAX as i32 + 1_000;
+        let regrets = [AtomicI32::new(raw), AtomicI32::new(-60)];
+        super::push_regret_telemetry(&regrets, 1.0, &metrics);
+        let hist = metrics.max_regret_history.lock().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0], f64::from(raw));
+    }
+
+    #[timed_test]
     fn push_regret_telemetry_min_negative() {
-        use std::sync::atomic::AtomicI16;
+        use std::sync::atomic::AtomicI32;
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             None, None,
         ));
         let regrets = [
-            AtomicI16::new(100),
-            AtomicI16::new(-140),
-            AtomicI16::new(40),
+            AtomicI32::new(100),
+            AtomicI32::new(-140),
+            AtomicI32::new(40),
         ];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let hist = metrics.min_regret_history.lock().unwrap();
@@ -945,12 +959,12 @@ mod tests {
 
     #[timed_test]
     fn push_regret_telemetry_avg_positive() {
-        use std::sync::atomic::AtomicI16;
+        use std::sync::atomic::AtomicI32;
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             None, None,
         ));
         // Two positive: 100 and 40, scale=20 -> 5.0 and 2.0 -> avg=3.5
-        let regrets = [AtomicI16::new(100), AtomicI16::new(-60), AtomicI16::new(40)];
+        let regrets = [AtomicI32::new(100), AtomicI32::new(-60), AtomicI32::new(40)];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let hist = metrics.avg_pos_regret_history.lock().unwrap();
         assert_eq!(hist.len(), 1);
@@ -962,7 +976,7 @@ mod tests {
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             None, None,
         ));
-        let regrets: [std::sync::atomic::AtomicI16; 0] = [];
+        let regrets: [std::sync::atomic::AtomicI32; 0] = [];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let max_hist = metrics.max_regret_history.lock().unwrap();
         assert!(max_hist.is_empty());
@@ -970,11 +984,11 @@ mod tests {
 
     #[timed_test]
     fn push_regret_telemetry_all_negative() {
-        use std::sync::atomic::AtomicI16;
+        use std::sync::atomic::AtomicI32;
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             None, None,
         ));
-        let regrets = [AtomicI16::new(-1000), AtomicI16::new(-2000)];
+        let regrets = [AtomicI32::new(-1000), AtomicI32::new(-2000)];
         super::push_regret_telemetry(&regrets, 20.0, &metrics);
         let hist = metrics.avg_pos_regret_history.lock().unwrap();
         assert_eq!(hist.len(), 1);

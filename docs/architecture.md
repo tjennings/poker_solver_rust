@@ -192,7 +192,7 @@ crates/core/src/blueprint_mp/
 - **Lead/raise split**: Separate bet sizes for opening bets vs raises
 - **Full side pot resolution** at showdown terminals
 - **128-bit info set keys** with 22 action slots (panics on overflow)
-- **Pre-allocated storage** (lazy allocation planned as future optimization)
+- **Pre-allocated storage** (lazy allocation planned as future optimization): cumulative regrets use 32-bit atomics, and average-strategy sums use 32-bit atomics
 - **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 

@@ -104,6 +104,7 @@ snapshots:
 
 - `sample_configurations/blueprint_mp_3player.yaml` -- 3-player 50bb test
 - `sample_configurations/blueprint_mp_6player_ante.yaml` -- 6-player 100bb with BB-ante
+- `sample_configurations/blueprint_mp_6max_simplified_actions.yaml` -- 6-max 20bb 200-bucket trainer with compact action sets and TUI scenarios
 
 ---
 

@@ -87,7 +87,7 @@ pub fn traverse_external(
     rake_rate: f64,
     rake_cap: Chips,
     prune: bool,
-    prune_threshold: i16,
+    prune_threshold: i32,
 ) -> (f64, PruneStats) {
     match &tree.nodes[node_idx as usize] {
         MpGameNode::Terminal {
@@ -177,7 +177,7 @@ fn traverse_traverser(
     rake_rate: f64,
     rake_cap: Chips,
     prune: bool,
-    prune_threshold: i16,
+    prune_threshold: i32,
 ) -> (f64, PruneStats) {
     let mut strategy = [0.0_f64; MAX_ACTIONS];
     storage.regret_matched_strategy(node_idx, bucket, num_actions, &mut strategy);
@@ -239,7 +239,7 @@ fn should_prune_action(
     tree: &MpGameTree,
     storage: &MpStorage,
     prune: bool,
-    prune_threshold: i16,
+    prune_threshold: i32,
     child_idx: u32,
     node_idx: u32,
     bucket: u16,
@@ -275,7 +275,7 @@ fn update_regrets_with_pruning(
             continue;
         }
         let raw = (val - node_value) * REGRET_SCALE;
-        let delta = raw.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64).round() as i32;
         storage.add_regret(node_idx, bucket, a, delta);
     }
 }
@@ -309,7 +309,7 @@ fn traverse_opponent(
     rake_rate: f64,
     rake_cap: Chips,
     prune: bool,
-    prune_threshold: i16,
+    prune_threshold: i32,
 ) -> (f64, PruneStats) {
     let mut strategy = [0.0_f64; MAX_ACTIONS];
     storage.regret_matched_strategy(node_idx, bucket, num_actions, &mut strategy);
