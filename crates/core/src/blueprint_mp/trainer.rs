@@ -471,7 +471,7 @@ mod tests {
         assert!(result.meta_iterations > 0);
     }
 
-    #[timed_test]
+    #[timed_test(2)]
     fn train_result_tracks_iterations() {
         let config = toy_config(2, 50);
         let result = train_blueprint_mp(&config);
@@ -689,7 +689,7 @@ mod tests {
         assert!(after > 0, "strategy sum should stay positive, got {after}");
     }
 
-    #[timed_test]
+    #[timed_test(2)]
     fn dcfr_discount_handles_negative_regrets() {
         let tree = minimal_tree(2);
         let bucket_counts = [10u16, 10, 10, 10];
