@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-wx08
 title: Preserve CFVNet river centroids for downstream EMD
-status: todo
+status: scrapped
 type: bug
 priority: high
 created_at: 2026-05-06T16:39:06Z
-updated_at: 2026-05-06T16:39:06Z
+updated_at: 2026-05-06T19:14:20Z
 parent: poker_solver_rust-hfnv
 ---
 
@@ -16,3 +16,7 @@ Acceptance:
 - Thread river EVs and gaps into turn clustering exactly as with exhaustive river clustering
 - Add regression coverage for cfvnet_river_data producing non-empty river.centroids
 - Update diagnostics/docs if CFVNet river bucket semantics differ from showdown-equity river buckets
+
+## Reasons for Scrapping
+
+User decided CFVNet river centroid ordering is not important for the current bucket-quality workstream. We will not spend time preserving CFVNet river centroids unless CFVNet-backed river clustering becomes relevant again.
