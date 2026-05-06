@@ -229,22 +229,32 @@ fn build_bucket_histogram_u8(
         crate::poker::Suit::Club,
     )); // placeholder
 
-    let ci = combo_index(combo[0], combo[1]);
-
     for &next_card in deck {
         if board.contains(&next_card) || next_card == combo[0] || next_card == combo[1] {
             continue;
         }
 
         *extended.last_mut().expect("non-empty") = next_card;
-        let packed = canonical_key(&extended);
-        if let Some(&board_idx) = board_map.get(&packed) {
-            let bucket = prev_buckets.get_bucket(board_idx, ci);
+        if let Some(bucket) = lookup_child_bucket(combo, &extended, prev_buckets, board_map) {
             histogram[bucket as usize] += 1;
         }
     }
 
     histogram.iter().map(|&c| c.min(255) as u8).collect()
+}
+
+fn lookup_child_bucket(
+    combo: [Card; 2],
+    child_board: &[Card],
+    prev_buckets: &BucketFile,
+    board_map: &FxHashMap<PackedBoard, u32>,
+) -> Option<u16> {
+    let canonical = CanonicalBoard::from_cards(child_board).ok()?;
+    let packed = canonical_key(&canonical.cards);
+    let board_idx = board_map.get(&packed)?;
+    let (c0, c1) = canonical.canonicalize_holding(combo[0], combo[1]);
+    let ci = combo_index(c0, c1);
+    Some(prev_buckets.get_bucket(*board_idx, ci))
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,6 +2410,61 @@ mod tests {
             total <= 46,
             "total counts should not exceed river card count"
         );
+    }
+
+    #[test]
+    fn test_build_bucket_histogram_u8_remaps_combo_for_canonical_child_board() {
+        use crate::poker::Suit::{Club, Diamond, Heart, Spade};
+        use crate::poker::Value::{Ace, Jack, King, Queen, Seven, Three, Two};
+
+        let c = Card::new;
+        let deck = build_deck();
+        let turn_board = [
+            c(Queen, Heart),
+            c(Jack, Heart),
+            c(Seven, Diamond),
+            c(Two, Club),
+        ];
+        let river_card = c(Three, Heart);
+        let child_board = [
+            turn_board[0],
+            turn_board[1],
+            turn_board[2],
+            turn_board[3],
+            river_card,
+        ];
+        let canonical_child = CanonicalBoard::from_cards(&child_board).expect("valid river board");
+        let packed = canonical_key(&canonical_child.cards);
+
+        let combo = [c(Ace, Spade), c(King, Diamond)];
+        let raw_ci = combo_index(combo[0], combo[1]);
+        let (mapped_0, mapped_1) = canonical_child.canonicalize_holding(combo[0], combo[1]);
+        let mapped_ci = combo_index(mapped_0, mapped_1);
+        assert_ne!(
+            raw_ci, mapped_ci,
+            "test requires a non-identity child-board suit remap"
+        );
+
+        let mut river_buckets_data = vec![0_u16; TOTAL_COMBOS as usize];
+        river_buckets_data[mapped_ci as usize] = 1;
+
+        let river_bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::River,
+                bucket_count: 2,
+                board_count: 1,
+                combos_per_board: TOTAL_COMBOS,
+                version: VERSION,
+            },
+            boards: vec![packed],
+            buckets: river_buckets_data,
+        };
+        let board_map = river_bf.board_index_map();
+
+        let hist = build_bucket_histogram_u8(combo, &turn_board, &deck, &river_bf, &board_map);
+
+        assert_eq!(hist[1], 1);
+        assert_eq!(hist[0], 0);
     }
 
     // -----------------------------------------------------------------------
