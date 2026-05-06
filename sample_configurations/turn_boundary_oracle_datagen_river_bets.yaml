@@ -56,8 +56,8 @@ datagen:
         pot_intervals: [[100, 200]]
         spr_intervals: [[0.0, 0.5]]
         raise_depth: "3bet_plus"
-  solver_iterations: 500
-  target_exploitability: 0.01
+  solver_iterations: 350
+  target_exploitability: 0.5
   # Bounded exact-river runout parallelism within one sampled turn state.
   # Avoid very high values; many simultaneous solver instances are slower.
   threads: 4

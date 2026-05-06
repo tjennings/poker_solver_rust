@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-05T02:55:44Z
-updated_at: 2026-05-05T03:48:58Z
+updated_at: 2026-05-06T00:27:34Z
 parent: poker_solver_rust-fp06
 ---
 
@@ -18,3 +18,5 @@ Progress: turn-boundary generation now has a CLI/config route (street=turn_bound
 
 
 Coverage gap reduced: turn-boundary manifest now records stratified counters for generated data. Validation split generation remains under poker_solver_rust-q93y.
+
+Progress: exact-river production config now favors faster sample throughput with solver_iterations=350 and target_exploitability=0.5, while retaining bounded river-runout parallelism via threads=4. Use tighter settings for trusted validation shards.
