@@ -13,6 +13,7 @@ pub mod exploitable_spots;
 pub mod full_depth_solver;
 pub mod game_tree;
 pub mod mccfr;
+pub mod nut_features;
 pub mod per_flop_bucket_file;
 
 pub mod leaf_evaluator;

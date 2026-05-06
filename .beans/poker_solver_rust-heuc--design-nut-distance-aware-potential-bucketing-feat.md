@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-06T16:39:30Z
-updated_at: 2026-05-06T16:47:18Z
+updated_at: 2026-05-06T16:52:41Z
 parent: poker_solver_rust-hfnv
 ---
 
@@ -34,3 +34,11 @@ Initial implementation slice:
 ## Implementation Note
 
 Added draft implementation spec in docs/plans/2026-05-06-nut-distance-aware-potential-bucketing.md. The spec defines the combined metric, normalization contract, initial weight sweep, river-first implementation sequence, and diagnostics for nut collision versus potential-EMD degradation.
+
+## Prototype Progress
+
+Added a river-only nut-distance feature module that enumerates board-legal opponent holdings and reports made-hand family, same-family beater counts, class gap, global rank percentile, dominance margin, nut blockers, and a reserved redraw flag. Validated with focused tests for nut flush, dominated flush, top set vs bottom set, and non-river rejection.
+
+Validation:
+- cargo test -p poker-solver-core nut_features
+- cargo test
