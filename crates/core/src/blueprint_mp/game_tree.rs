@@ -354,17 +354,28 @@ fn find_dealer(config: &MpGameConfig) -> u8 {
 
 fn generate_actions(config: &TreeBuildConfig, state: &BuildState) -> Vec<TreeAction> {
     let mut actions = Vec::new();
+    let is_unopened_preflop = is_unopened_preflop(state);
 
     if state.facing_bet {
         actions.push(TreeAction::Fold);
     }
 
-    add_check_or_call(state, &mut actions);
+    if is_unopened_preflop && state.facing_bet {
+        actions.push(TreeAction::Call);
+    } else {
+        add_check_or_call(state, &mut actions);
+    }
     add_sized_actions(config, state, &mut actions);
-    add_all_in_if_needed(state, &mut actions);
+    if !is_unopened_preflop {
+        add_all_in_if_needed(state, &mut actions);
+    }
     dedup_all_in(&mut actions);
 
     actions
+}
+
+fn is_unopened_preflop(state: &BuildState) -> bool {
+    state.street == Street::Preflop && state.raise_count == 0
 }
 
 fn add_check_or_call(state: &BuildState, actions: &mut Vec<TreeAction>) {
@@ -385,9 +396,7 @@ fn add_check_or_call(state: &BuildState, actions: &mut Vec<TreeAction>) {
 
 fn add_sized_actions(config: &TreeBuildConfig, state: &BuildState, actions: &mut Vec<TreeAction>) {
     let depth = state.raise_count as usize;
-    if depth >= config.max_raise_depths(state.street) {
-        return;
-    }
+    let is_preflop_open = is_unopened_preflop(state);
 
     let remaining = state.stacks[state.to_act.index() as usize];
     if remaining < Chips(SIZE_EPSILON) {
@@ -396,16 +405,23 @@ fn add_sized_actions(config: &TreeBuildConfig, state: &BuildState, actions: &mut
 
     // Preflop open-raise (raise_count=0, facing the BB blind) uses lead sizes.
     // Subsequent raises (3-bet, 4-bet) use raise depth sizes.
-    let is_preflop_open = state.street == Street::Preflop && state.raise_count == 0;
-    if is_preflop_open || !state.facing_bet {
+    if is_preflop_open {
+        add_lead_sizes(state, config.lead_sizes(state.street), actions);
+    } else if !state.facing_bet {
+        if depth >= config.max_raise_depths(state.street) {
+            return;
+        }
         add_lead_sizes(state, config.lead_sizes(state.street), actions);
     } else {
         let raise_depth = if state.street == Street::Preflop {
             // 3-bet = depth 0, 4-bet = depth 1, etc.
-            (depth - 1).max(0)
+            depth.saturating_sub(1)
         } else {
             depth
         };
+        if raise_depth >= config.max_raise_depths(state.street) {
+            return;
+        }
         add_raise_sizes(
             state,
             config.raise_sizes_at_depth(state.street, raise_depth),
@@ -922,6 +938,120 @@ mod tests {
         serde_yaml::Value::Number(serde_yaml::Number::from(v))
     }
 
+    fn assert_unopened_preflop_actions(
+        actions: &[TreeAction],
+        all_in_to: f64,
+        position: &str,
+    ) {
+        assert!(
+            actions.iter().any(|a| matches!(a, TreeAction::Fold)),
+            "{position} unopened preflop actions should include Fold, got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, TreeAction::Call)),
+            "{position} unopened preflop actions should include Call/limp, got {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, TreeAction::Fold | TreeAction::Call | TreeAction::Lead(_))),
+            "{position} unopened preflop actions should only be Fold, Call/limp, plus opens, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, TreeAction::AllIn)),
+            "{position} unopened preflop actions should not include AllIn, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, TreeAction::Raise(_))),
+            "{position} unopened preflop actions should not include Raise, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| {
+                matches!(a, TreeAction::Lead(chips) if (*chips - all_in_to).abs() < SIZE_EPSILON)
+            }),
+            "{position} unopened preflop actions should not include an all-in-equivalent open, got {actions:?}"
+        );
+    }
+
+    fn six_player_unopened_config() -> (MpGameConfig, MpActionAbstractionConfig) {
+        let blinds = vec![
+            ForcedBet {
+                seat: 4,
+                kind: ForcedBetKind::SmallBlind,
+                amount: 1.0,
+            },
+            ForcedBet {
+                seat: 5,
+                kind: ForcedBetKind::BigBlind,
+                amount: 2.0,
+            },
+        ];
+        let game = MpGameConfig {
+            name: "6-max unopened".into(),
+            num_players: 6,
+            stack_depth: 10.0,
+            blinds,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop_sizes = MpStreetSizes {
+            lead: vec![
+                serde_yaml::Value::String("2bb".into()),
+                serde_yaml::Value::String("5bb".into()),
+            ],
+            raise: vec![vec![serde_yaml::Value::String("3.0x".into())]],
+        };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action = MpActionAbstractionConfig {
+            preflop: preflop_sizes,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        (game, action)
+    }
+
+    fn six_player_response_config() -> (MpGameConfig, MpActionAbstractionConfig) {
+        let blinds = vec![
+            ForcedBet {
+                seat: 4,
+                kind: ForcedBetKind::SmallBlind,
+                amount: 1.0,
+            },
+            ForcedBet {
+                seat: 5,
+                kind: ForcedBetKind::BigBlind,
+                amount: 2.0,
+            },
+        ];
+        let game = MpGameConfig {
+            name: "6-max response".into(),
+            num_players: 6,
+            stack_depth: 30.0,
+            blinds,
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop_sizes = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("5bb".into())],
+            raise: vec![vec![serde_yaml::Value::String("10bb".into())]],
+        };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action = MpActionAbstractionConfig {
+            preflop: preflop_sizes,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        (game, action)
+    }
+
     /// Build a minimal config with NO sized bets (fold/check/call/all-in only).
     fn minimal_config(num_players: u8) -> (MpGameConfig, MpActionAbstractionConfig) {
         let blinds = vec![
@@ -1174,9 +1304,9 @@ mod tests {
     }
 
     #[timed_test]
-    fn build_all_in_deduplication() {
+    fn build_unopened_preflop_suppresses_all_in_equivalent_open() {
         // Use a stack where a sized bet equals the remaining stack.
-        // The all-in should not appear twice.
+        // Unopened preflop should not synthesize an AllIn action in its place.
         let blinds = vec![
             ForcedBet {
                 seat: 0,
@@ -1214,16 +1344,115 @@ mod tests {
             river: postflop_sizes,
         };
         let tree = MpGameTree::build(&game, &action_cfg);
-        // Check root: should have exactly one AllIn action
         if let MpGameNode::Decision { actions, .. } = &tree.nodes[tree.root as usize] {
-            let allin_count = actions
-                .iter()
-                .filter(|a| matches!(a, TreeAction::AllIn))
-                .count();
             assert_eq!(
-                allin_count, 1,
-                "Should have exactly one AllIn action, got {allin_count}. Actions: {actions:?}"
+                actions,
+                &[TreeAction::Fold, TreeAction::Call],
+                "Unopened root should suppress all-in-equivalent open, got {actions:?}"
             );
+        }
+    }
+
+    #[timed_test]
+    fn build_6_player_unopened_positions_have_fold_call_and_non_all_in_opens() {
+        let (game, action_cfg) = six_player_unopened_config();
+        let tree = MpGameTree::build(&game, &action_cfg);
+
+        let mut node_idx = tree.root;
+        for (position, all_in_to) in [
+            ("UTG", 10.0),
+            ("HJ", 10.0),
+            ("CO", 10.0),
+            ("BTN", 10.0),
+            ("SB", 10.0),
+        ] {
+            let MpGameNode::Decision {
+                actions, children, ..
+            } = &tree.nodes[node_idx as usize]
+            else {
+                panic!("{position} should be an unopened preflop Decision node");
+            };
+
+            assert_unopened_preflop_actions(actions, all_in_to, position);
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, TreeAction::Lead(chips) if (*chips - 4.0).abs() < SIZE_EPSILON)),
+                "{position} should keep the non-all-in open size, got {actions:?}"
+            );
+
+            if position == "SB" {
+                break;
+            }
+
+            let fold_idx = actions
+                .iter()
+                .position(|a| matches!(a, TreeAction::Fold))
+                .expect("unopened preflop node should have Fold");
+            node_idx = children[fold_idx];
+        }
+    }
+
+    #[timed_test]
+    fn build_6_player_after_open_has_response_actions() {
+        let (game, action) = six_player_response_config();
+        let tree = MpGameTree::build(&game, &action);
+
+        let root = &tree.nodes[tree.root as usize];
+        if let MpGameNode::Decision {
+            actions, children, ..
+        } = root
+        {
+            assert_eq!(
+                actions,
+                &[TreeAction::Fold, TreeAction::Call, TreeAction::Lead(10.0)],
+                "Unopened root should have Fold, Call, and configured non-all-in open, got {actions:?}"
+            );
+            let open_idx = actions
+                .iter()
+                .position(|a| matches!(a, TreeAction::Lead(v) if (v - 10.0).abs() < SIZE_EPSILON))
+                .expect("Root should have 5bb open");
+            let response = &tree.nodes[children[open_idx] as usize];
+            if let MpGameNode::Decision {
+                actions: response_actions,
+                ..
+            } = response
+            {
+                assert!(
+                    response_actions
+                        .iter()
+                        .any(|a| matches!(a, TreeAction::Fold)),
+                    "Post-open response should have Fold, got {response_actions:?}"
+                );
+                assert!(
+                    response_actions
+                        .iter()
+                        .any(|a| matches!(a, TreeAction::Call)),
+                    "Post-open response should have Call, got {response_actions:?}"
+                );
+                assert!(
+                    response_actions
+                        .iter()
+                        .any(|a| matches!(a, TreeAction::Raise(_))),
+                    "Post-open response should have Raise, got {response_actions:?}"
+                );
+                assert!(
+                    response_actions
+                        .iter()
+                        .any(|a| matches!(a, TreeAction::AllIn)),
+                    "Post-open response should have AllIn, got {response_actions:?}"
+                );
+                assert!(
+                    !response_actions
+                        .iter()
+                        .any(|a| matches!(a, TreeAction::Lead(_))),
+                    "Post-open response should raise, not lead, got {response_actions:?}"
+                );
+            } else {
+                panic!("Open child should be a response Decision");
+            }
+        } else {
+            panic!("Root should be Decision");
         }
     }
 

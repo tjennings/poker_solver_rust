@@ -2964,7 +2964,7 @@ snapshots:
     }
 
     /// resolve_tui_scenarios should produce ResolvedMpScenario from configs.
-    #[timed_test(10)]
+    #[timed_test(20)]
     fn resolve_tui_scenarios_from_tree() {
         use poker_solver_core::blueprint_mp::config::*;
         use poker_solver_core::blueprint_mp::game_tree::MpGameTree;

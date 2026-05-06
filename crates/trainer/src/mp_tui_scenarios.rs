@@ -268,20 +268,22 @@ fn position_to_seat(name: &str, num_players: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mp_tui_widgets::cell_to_half_blocks;
     use poker_solver_core::blueprint_mp::config::*;
     use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
+    use ratatui::style::Color;
     use test_macros::timed_test;
 
     fn yaml_f64(v: f64) -> serde_yaml::Value {
         serde_yaml::Value::Number(serde_yaml::Number::from(v))
     }
 
-    /// Build a 6-player tree with a 5bb preflop raise and 0.67x postflop lead.
+    /// Build a compact 6-player tree for preflop spot resolution.
     fn test_6p_tree() -> MpGameTree {
         let game = MpGameConfig {
             name: "test".into(),
             num_players: 6,
-            stack_depth: 200.0,
+            stack_depth: 20.0,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -299,17 +301,57 @@ mod tests {
         };
         let preflop = MpStreetSizes {
             lead: vec![serde_yaml::Value::String("5bb".into())],
-            raise: vec![vec![serde_yaml::Value::String("5bb".into())]],
+            raise: vec![],
         };
-        let postflop = MpStreetSizes {
-            lead: vec![yaml_f64(0.67)],
-            raise: vec![vec![yaml_f64(1.0)]],
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
         };
         let action = MpActionAbstractionConfig {
             preflop,
-            flop: postflop.clone(),
-            turn: postflop.clone(),
-            river: postflop,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        MpGameTree::build(&game, &action)
+    }
+
+    fn shallow_6p_tree_with_all_in_sized_open() -> MpGameTree {
+        let game = MpGameConfig {
+            name: "shallow".into(),
+            num_players: 6,
+            stack_depth: 10.0,
+            blinds: vec![
+                ForcedBet {
+                    seat: 4,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop = MpStreetSizes {
+            lead: vec![
+                serde_yaml::Value::String("2bb".into()),
+                serde_yaml::Value::String("5bb".into()),
+            ],
+            raise: vec![vec![serde_yaml::Value::String("3.0x".into())]],
+        };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action = MpActionAbstractionConfig {
+            preflop,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
         };
         MpGameTree::build(&game, &action)
     }
@@ -363,6 +405,73 @@ mod tests {
             assert_eq!(seat.index(), 4, "SB is seat 4");
         } else {
             panic!("expected Decision node for SB after 4 folds");
+        }
+    }
+
+    #[timed_test(10)]
+    fn extract_unopened_folded_to_positions_do_not_label_shoves() {
+        let tree = shallow_6p_tree_with_all_in_sized_open();
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+
+        for (position, spot) in [
+            ("UTG", ""),
+            ("HJ", "utg:fold"),
+            ("CO", "utg:fold,hj:fold"),
+            ("BTN", "utg:fold,hj:fold,co:fold"),
+            ("SB", "utg:fold,hj:fold,co:fold,btn:fold"),
+        ] {
+            let (node_idx, _) = resolve_mp_spot(&tree, spot, 6)
+                .unwrap_or_else(|| panic!("{position} unopened spot should resolve"));
+            let grid = extract_mp_grid(&tree, &storage, node_idx, 0, position);
+            let labels: Vec<&str> = grid.cells[0][0]
+                .actions
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect();
+
+            assert_eq!(
+                labels,
+                vec!["fold", "call", "bet 2bb"],
+                "{position} TUI labels should include fold/call plus non-all-in opens, got {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"all-in"),
+                "{position} TUI labels should not include all-in, got {labels:?}"
+            );
+            assert!(
+                !labels.contains(&"bet 5bb"),
+                "{position} TUI labels should not include all-in-equivalent bet, got {labels:?}"
+            );
+        }
+    }
+
+    #[timed_test(10)]
+    fn extract_unopened_folded_to_positions_do_not_render_shove_colors() {
+        let tree = shallow_6p_tree_with_all_in_sized_open();
+        let storage = MpStorage::new(&tree, [169, 50, 50, 50]);
+        let all_in_purple = Color::Rgb(180, 30, 180);
+
+        for (position, spot) in [
+            ("UTG", ""),
+            ("HJ", "utg:fold"),
+            ("CO", "utg:fold,hj:fold"),
+            ("BTN", "utg:fold,hj:fold,co:fold"),
+            ("SB", "utg:fold,hj:fold,co:fold,btn:fold"),
+        ] {
+            let (node_idx, _) = resolve_mp_spot(&tree, spot, 6)
+                .unwrap_or_else(|| panic!("{position} unopened spot should resolve"));
+            let grid = extract_mp_grid(&tree, &storage, node_idx, 0, position);
+
+            for row in &grid.cells {
+                for cell in row {
+                    let blocks = cell_to_half_blocks(cell, 8);
+                    assert!(
+                        !blocks.contains(&all_in_purple),
+                        "{position} unopened grid should not render all-in purple; actions were {:?}",
+                        cell.actions
+                    );
+                }
+            }
         }
     }
 
