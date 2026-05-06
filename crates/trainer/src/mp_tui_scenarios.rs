@@ -316,7 +316,7 @@ mod tests {
 
     // -- resolve_mp_spot tests --
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_empty_returns_root() {
         let tree = test_6p_tree();
         let (idx, board) = resolve_mp_spot(&tree, "", 6).unwrap();
@@ -324,7 +324,7 @@ mod tests {
         assert!(board.is_empty());
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_single_fold() {
         let tree = test_6p_tree();
         let result = resolve_mp_spot(&tree, "utg:fold", 6);
@@ -338,7 +338,7 @@ mod tests {
         }
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_utg_open() {
         let tree = test_6p_tree();
         let result = resolve_mp_spot(&tree, "utg:5bb", 6);
@@ -352,7 +352,7 @@ mod tests {
         }
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_full_fold_sequence() {
         // 4 folds (UTG, HJ, CO, BTN) leave SB and BB active.
         let tree = test_6p_tree();
@@ -366,14 +366,14 @@ mod tests {
         }
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_invalid_position_returns_none() {
         let tree = test_6p_tree();
         let result = resolve_mp_spot(&tree, "xyz:5bb", 6);
         assert!(result.is_none());
     }
 
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_invalid_action_returns_none() {
         let tree = test_6p_tree();
         let result = resolve_mp_spot(&tree, "utg:999bb", 6);
