@@ -98,6 +98,7 @@ snapshots:
 | Blind structure | `small_blind` + `big_blind` fields | Per-seat `blinds` list with types |
 | Bet sizing | Per-street, indexed by raise depth | Lead/raise split per street |
 | Info key | 64-bit, 6 action slots | 128-bit, 22 action slots |
+| Average strategy storage | Signed 64-bit sums | Saturating unsigned 64-bit sums |
 | Side pots | N/A (2 players) | Full multi-way resolution |
 
 #### Sample Configs

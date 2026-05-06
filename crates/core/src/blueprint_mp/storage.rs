@@ -7,7 +7,7 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use super::game_tree::{MpGameNode, MpGameTree};
 use super::mmap_buffer::MmapBuffer;
@@ -30,8 +30,8 @@ pub const STRATEGY_SCALE: f64 = 1_000.0;
 pub struct MpStorage {
     /// Cumulative regrets: one `AtomicI32` per (node, bucket, action).
     pub regrets: MmapBuffer<AtomicI32>,
-    /// Strategy sums: one `AtomicI32` per (node, bucket, action).
-    pub strategy_sums: MmapBuffer<AtomicI32>,
+    /// Strategy sums: one `AtomicU64` per (node, bucket, action).
+    pub strategy_sums: MmapBuffer<AtomicU64>,
     /// Number of buckets per street `[preflop, flop, turn, river]`.
     pub bucket_counts: [u16; 4],
     /// Per-node layout metadata.
@@ -58,7 +58,7 @@ impl MpStorage {
             .filter(|n| matches!(n, MpGameNode::Decision { .. }))
             .count();
         let regret_bytes = total * std::mem::size_of::<AtomicI32>();
-        let strat_bytes = total * std::mem::size_of::<AtomicI32>();
+        let strat_bytes = total * std::mem::size_of::<AtomicU64>();
         let virtual_total = regret_bytes + strat_bytes;
         let estimated_physical = virtual_total as f64 * 0.6;
         eprintln!(
@@ -113,14 +113,22 @@ impl MpStorage {
     /// Read a single strategy sum value atomically.
     #[inline]
     #[must_use]
-    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+    pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> u64 {
         self.strategy_sums[self.slot(node_idx, bucket, action)].load(Ordering::Relaxed)
     }
 
-    /// Add a delta to a single strategy sum value atomically.
+    /// Add a non-negative delta to a single strategy sum value atomically.
     #[inline]
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
-        self.strategy_sums[self.slot(node_idx, bucket, action)].fetch_add(delta, Ordering::Relaxed);
+        debug_assert!(delta >= 0, "strategy sum deltas must be non-negative");
+        let Ok(delta) = u64::try_from(delta) else {
+            return;
+        };
+        self.strategy_sums[self.slot(node_idx, bucket, action)]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(old.saturating_add(delta))
+            })
+            .ok();
     }
 
     /// Current strategy via regret matching, written into `out`.
@@ -153,7 +161,7 @@ impl MpStorage {
         let start = self.slot(node_idx, bucket, 0);
         let mut total = 0.0_f64;
         for (i, slot) in out[..num_actions].iter_mut().enumerate() {
-            let s = f64::from(self.strategy_sums[start + i].load(Ordering::Relaxed));
+            let s = self.strategy_sums[start + i].load(Ordering::Relaxed) as f64;
             *slot = s;
             total += s;
         }
@@ -438,7 +446,7 @@ mod tests {
     }
 
     #[timed_test]
-    fn strategy_sum_i32_round_trip() {
+    fn strategy_sum_u64_round_trip() {
         let tree = minimal_tree(2);
         let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
         let node = first_decision_node(&tree);
@@ -447,6 +455,56 @@ mod tests {
         assert_eq!(storage.get_strategy_sum(node, 0, 0), 1_000_000);
         storage.add_strategy_sum(node, 0, 0, 500_000);
         assert_eq!(storage.get_strategy_sum(node, 0, 0), 1_500_000);
+    }
+
+    #[timed_test]
+    fn strategy_sum_exceeds_i32_max_without_wrapping() {
+        let tree = minimal_tree(2);
+        let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
+        let node = first_decision_node(&tree);
+
+        storage.add_strategy_sum(node, 0, 0, i32::MAX);
+        storage.add_strategy_sum(node, 0, 0, i32::MAX);
+
+        assert_eq!(storage.get_strategy_sum(node, 0, 0), 4_294_967_294);
+        assert!(storage.get_strategy_sum(node, 0, 0) > i32::MAX as u64);
+    }
+
+    #[timed_test]
+    fn strategy_sum_saturates_at_u64_max() {
+        let tree = minimal_tree(2);
+        let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
+        let node = first_decision_node(&tree);
+        let slot = storage.slot(node, 0, 0);
+
+        storage.strategy_sums[slot].store(u64::MAX - 10, Ordering::Relaxed);
+        storage.add_strategy_sum(node, 0, 0, 100);
+        assert_eq!(storage.get_strategy_sum(node, 0, 0), u64::MAX);
+
+        storage.add_strategy_sum(node, 0, 0, 1);
+        assert_eq!(storage.get_strategy_sum(node, 0, 0), u64::MAX);
+    }
+
+    #[timed_test]
+    fn average_strategy_handles_sums_above_i32_max() {
+        let tree = minimal_tree(2);
+        let storage = MpStorage::new(&tree, [10, 10, 10, 10]);
+        let node = first_decision_node(&tree);
+        let num_actions = storage.num_actions(node);
+
+        if num_actions >= 2 {
+            let start = storage.slot(node, 0, 0);
+            storage.strategy_sums[start].store(3_000_000_000, Ordering::Relaxed);
+            storage.strategy_sums[start + 1].store(7_000_000_000, Ordering::Relaxed);
+        }
+
+        let mut out = vec![0.0; num_actions];
+        storage.average_strategy(node, 0, num_actions, &mut out);
+
+        if num_actions >= 2 {
+            assert!((out[0] - 0.3).abs() < 1e-10);
+            assert!((out[1] - 0.7).abs() < 1e-10);
+        }
     }
 
     #[timed_test]

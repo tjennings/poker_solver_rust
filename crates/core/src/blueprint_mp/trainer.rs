@@ -10,8 +10,8 @@
     clippy::too_many_arguments
 )]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Global prune counters — accumulated per batch, read+reset by TUI bridge.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -21,12 +21,12 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
-use super::MAX_PLAYERS;
 use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
 use super::game_tree::MpGameTree;
 use super::mccfr::{sample_deal, traverse_external};
 use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
+use super::MAX_PLAYERS;
 use crate::blueprint_v2::mccfr::AllBuckets;
 use crate::blueprint_v2::trainer::load_bucket_files;
 
@@ -245,7 +245,8 @@ fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingC
     });
     storage.strategy_sums.par_iter().for_each(|atom| {
         let v = atom.load(Ordering::Relaxed);
-        atom.store((f64::from(v) * d_strat) as i32, Ordering::Relaxed);
+        let discounted = ((v as f64) * d_strat).clamp(0.0, u64::MAX as f64) as u64;
+        atom.store(discounted, Ordering::Relaxed);
     });
 }
 
@@ -691,6 +692,28 @@ mod tests {
             "strategy sum should be discounted, got {after}"
         );
         assert!(after > 0, "strategy sum should stay positive, got {after}");
+    }
+
+    #[timed_test]
+    fn dcfr_discount_preserves_u64_strategy_sums_above_i32_max() {
+        let tree = minimal_tree(2);
+        let bucket_counts = [10u16, 10, 10, 10];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        let node = first_decision_node(&tree);
+        storage.add_strategy_sum(node, 0, 0, i32::MAX);
+        storage.add_strategy_sum(node, 0, 0, i32::MAX);
+        let before = storage.get_strategy_sum(node, 0, 0);
+        let config = toy_training_config(1000);
+
+        apply_dcfr_discount(&storage, 50_000, &config);
+
+        let after = storage.get_strategy_sum(node, 0, 0);
+        assert!(before > i32::MAX as u64, "setup should exceed i32::MAX");
+        assert!(after < before, "strategy sum should be discounted");
+        assert!(
+            after > i32::MAX as u64,
+            "large u64 strategy sum should remain above i32::MAX, got {after}"
+        );
     }
 
     #[timed_test(2)]
