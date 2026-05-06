@@ -16,19 +16,18 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 1000
+    buckets: 200
   turn:
-    buckets: 1000
+    buckets: 200
   river:
-    buckets: 1000
+    buckets: 200
 
 action_abstraction:
   preflop:
     lead: ["2bb"]
     raise:
-      - ["3.0x"]
-      - ["2.5x"]
-      - ["2.0x"]
+      - ["0.33x", "1.0x"]
+      - ["0.33x", "1.0x"]
   flop:
     lead: [0.33, 0.75, 1.0]
     raise:
@@ -43,7 +42,7 @@ action_abstraction:
       - [0.5, 1.0]
 
 training:
-  cluster_path: "./local_data/buckets/1k_v3"
+  cluster_path: "./local_data/buckets/200_v1"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000
   prune_after_iterations: 100000
