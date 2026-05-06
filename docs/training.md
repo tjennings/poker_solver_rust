@@ -333,6 +333,10 @@ cargo run -p poker-solver-trainer --release -- diag-clusters \
 cargo run -p poker-solver-trainer --release -- diag-clusters \
   -d output/buckets --transitions
 
+# Transition consistency audit (sample boards and compare next-street bucket distributions)
+cargo run -p poker-solver-trainer --release -- diag-clusters \
+  -d output/buckets --transition-audit --transition-audit-boards 50
+
 # Sample hands from a specific bucket
 cargo run -p poker-solver-trainer --release -- diag-clusters \
   -d output/buckets --sample-bucket river 5
@@ -343,6 +347,8 @@ Options:
 - `--audit` -- Run equity audit by sampling boards
 - `--audit-boards <N>` -- Number of boards to sample for audit (default: 50)
 - `--transitions` -- Print cross-street transition matrices for adjacent street pairs (preflop→flop, flop→turn, turn→river)
+- `--transition-audit` -- Sample flop→turn and turn→river boards and report whether combos in each current bucket produce similar next-street bucket distributions. Board and holding lookups are canonicalized together, matching runtime bucket lookup semantics.
+- `--transition-audit-boards <N>` -- Number of boards to sample for transition consistency audit (default: 20)
 - `--sample-bucket <STREET> <BUCKET_ID>` -- Show 10 sample hands from the given bucket
 - `--centroid-emd <STREET>` -- Placeholder; centroid EMD requires feature vectors not stored in bucket files
 

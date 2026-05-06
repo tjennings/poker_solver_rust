@@ -17,8 +17,8 @@ use super::Street;
 use super::bucket_file::BucketFile;
 use super::centroid_file::CentroidFile;
 use super::cluster_pipeline::{
-    build_deck, canonical_key, compute_board_equities, enumerate_combos, sample_boards,
-    sample_n_card_boards,
+    build_deck, canonical_key, combo_index, compute_board_equities, enumerate_combos,
+    sample_boards, sample_n_card_boards,
 };
 
 use crate::abstraction::isomorphism::CanonicalBoard;
@@ -359,6 +359,23 @@ fn canonicalize_and_lookup_slice(
         .and_then(|key| board_map.get(&key).copied())
 }
 
+/// Look up a bucket after applying the board's canonical suit mapping to the
+/// holding. This mirrors runtime bucket lookup and avoids mixing raw combo
+/// indices with canonical board indices.
+fn canonicalized_combo_bucket(
+    bf: &BucketFile,
+    board_map: &rustc_hash::FxHashMap<super::bucket_file::PackedBoard, u32>,
+    board: &[Card],
+    combo: [Card; 2],
+) -> Option<u16> {
+    let canonical = CanonicalBoard::from_cards(board).ok()?;
+    let packed = canonical_key(&canonical.cards);
+    let board_idx = board_map.get(&packed)?;
+    let (c0, c1) = canonical.canonicalize_holding(combo[0], combo[1]);
+    let combo_idx = combo_index(c0, c1);
+    Some(bf.get_bucket(*board_idx, combo_idx))
+}
+
 /// Per-bucket transition consistency statistics.
 #[derive(Debug)]
 pub struct BucketTransitionStats {
@@ -477,7 +494,7 @@ pub fn audit_transition_consistency(
 
     for board in &boards {
         // Look up this board in the current bucket file
-        let Some(current_board_idx) = canonicalize_and_lookup_slice(board, &current_map) else {
+        let Some(_current_board_idx) = canonicalize_and_lookup_slice(board, &current_map) else {
             continue;
         };
 
@@ -489,15 +506,18 @@ pub fn audit_transition_consistency(
             .collect();
 
         // For each combo, build histogram over next-street buckets
-        for (combo_idx, combo) in combos.iter().enumerate() {
+        for combo in &combos {
             // Skip combos blocked by the board
             if board.iter().any(|&bc| bc == combo[0] || bc == combo[1]) {
                 continue;
             }
 
-            #[allow(clippy::cast_possible_truncation)]
-            let current_bucket =
-                current_bf.get_bucket(current_board_idx, combo_idx as u16) as usize;
+            let Some(current_bucket) =
+                canonicalized_combo_bucket(current_bf, &current_map, board, *combo)
+            else {
+                continue;
+            };
+            let current_bucket = current_bucket as usize;
             if current_bucket >= current_k {
                 continue;
             }
@@ -515,10 +535,10 @@ pub fn audit_transition_consistency(
                 let mut next_board: Vec<Card> = board.clone();
                 next_board.push(next_card);
 
-                if let Some(next_board_idx) = canonicalize_and_lookup_slice(&next_board, &next_map)
+                if let Some(next_bucket) =
+                    canonicalized_combo_bucket(next_bf, &next_map, &next_board, *combo)
                 {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let next_bucket = next_bf.get_bucket(next_board_idx, combo_idx as u16) as usize;
+                    let next_bucket = next_bucket as usize;
                     if next_bucket < next_k {
                         histogram[next_bucket] += 1;
                         total += 1;
@@ -1860,6 +1880,50 @@ mod tests {
         let s = matrix.summary();
         // Row 1 should show 0s, not percentages
         assert!(s.contains("     0"), "empty row should show 0: {s}");
+    }
+
+    #[test]
+    fn transition_diagnostic_lookup_remaps_combo_for_canonical_board() {
+        use crate::poker::{Suit, Value};
+
+        let raw_board = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+        ];
+        let combo = [
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Diamond),
+        ];
+
+        let canonical = CanonicalBoard::from_cards(&raw_board).unwrap();
+        let raw_combo_idx = combo_index(combo[0], combo[1]);
+        let (mapped_0, mapped_1) = canonical.canonicalize_holding(combo[0], combo[1]);
+        let mapped_combo_idx = combo_index(mapped_0, mapped_1);
+        assert_ne!(raw_combo_idx, mapped_combo_idx);
+
+        let mut buckets = vec![0_u16; 1326];
+        buckets[raw_combo_idx as usize] = 1;
+        buckets[mapped_combo_idx as usize] = 2;
+
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Flop,
+                bucket_count: 3,
+                board_count: 1,
+                combos_per_board: 1326,
+                version: 2,
+            },
+            boards: vec![canonical_key(&canonical.cards)],
+            buckets,
+        };
+        let board_map = bf.board_index_map();
+
+        assert_eq!(bf.get_bucket(0, raw_combo_idx), 1);
+        assert_eq!(
+            canonicalized_combo_bucket(&bf, &board_map, &raw_board, combo),
+            Some(2)
+        );
     }
 
     #[test]
