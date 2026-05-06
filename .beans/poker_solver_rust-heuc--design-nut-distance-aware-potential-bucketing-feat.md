@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-heuc
 title: Design nut-distance-aware potential bucketing features
-status: todo
+status: in-progress
 type: feature
 priority: high
 created_at: 2026-05-06T16:39:30Z
-updated_at: 2026-05-06T16:39:30Z
+updated_at: 2026-05-06T16:43:58Z
 parent: poker_solver_rust-hfnv
 ---
 
@@ -22,3 +22,11 @@ Acceptance:
 - Define exact feature formulas for flop/turn/river with board-aware nut ordering
 - Prototype diagnostics that show whether buckets separate nut flushes/straights/sets from dominated versions
 - Recommend a default weighting and validation experiment before full retraining
+
+## Build Start
+
+Initial implementation slice:
+- First produce a small design/spec for normalized potential EMD + nut-distance scaling.
+- Then implement river-side nut dominance features and diagnostics before changing flop/turn clustering.
+- Validate with weight sweeps: wn = 0.0, 0.1, 0.25, 0.5, 1.0.
+- Keep potential EMD primary; nut distance starts as a board-aware regularizer.
