@@ -5,8 +5,8 @@
 //! `game_deal_card`, `game_back`, `game_solve`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use parking_lot::RwLock;
@@ -19,9 +19,9 @@ use poker_solver_core::blueprint_v2::game_tree::{
 };
 use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
 
-use range_solver::card::{card_to_string, NOT_DEALT};
+use range_solver::card::{NOT_DEALT, card_to_string};
 use range_solver::interface::Game;
-use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
+use range_solver::{PostFlopGame, compute_exploitability, finalize, solve_step};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +35,8 @@ pub enum StreetBoundaryMode {
     Exact,
     Cfvnet {
         model_path: String,
+        #[serde(default)]
+        inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode,
     },
     /// Cut here and solve the downstream subtree exactly (full CFR).
     ExactSubtree,
@@ -65,7 +67,10 @@ pub struct StreetBoundaryConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BoundaryKind {
     /// Use an ONNX cfvnet model for boundary CFVs.
-    Cfvnet(String),
+    Cfvnet {
+        model_path: String,
+        inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode,
+    },
     /// Solve the downstream subtree exactly (full CFR).
     ExactSubtree,
 }
@@ -98,8 +103,17 @@ pub fn resolve_street_boundary(
         }
         match mode {
             StreetBoundaryMode::Exact => {}
-            StreetBoundaryMode::Cfvnet { model_path } => {
-                return Some(((i - 1) as u8, BoundaryKind::Cfvnet(model_path.clone())));
+            StreetBoundaryMode::Cfvnet {
+                model_path,
+                inference_mode,
+            } => {
+                return Some((
+                    (i - 1) as u8,
+                    BoundaryKind::Cfvnet {
+                        model_path: model_path.clone(),
+                        inference_mode: *inference_mode,
+                    },
+                ));
             }
             StreetBoundaryMode::ExactSubtree => {
                 return Some(((i - 1) as u8, BoundaryKind::ExactSubtree));
@@ -113,7 +127,8 @@ pub fn validate_cfvnet_boundary_cut(
     boundary_cut: &Option<(u8, BoundaryKind)>,
     root_street: Street,
 ) -> Result<(), String> {
-    if matches!(boundary_cut, Some((0, BoundaryKind::Cfvnet(_)))) && root_street == Street::Flop {
+    if matches!(boundary_cut, Some((0, BoundaryKind::Cfvnet { .. }))) && root_street == Street::Flop
+    {
         return Err(
             "CFVNet boundary from a flop solve would evaluate 3-card flop boards, \
              but the ONNX evaluator supports only 4-card and 5-card boards. \
@@ -125,11 +140,11 @@ pub fn validate_cfvnet_boundary_cut(
 }
 
 use crate::exploration::{
-    blueprint_sizes_to_range_solver, board_for_street_slice, build_canonical_to_combo_map,
-    canonical_hand_index_from_ranks, hand_label_from_matrix, parse_board, pot_at_v2_node,
-    ActionInfo, BucketLookup, RANKS,
+    ActionInfo, BucketLookup, RANKS, blueprint_sizes_to_range_solver, board_for_street_slice,
+    build_canonical_to_combo_map, canonical_hand_index_from_ranks, hand_label_from_matrix,
+    parse_board, pot_at_v2_node,
 };
-use crate::postflop::{parse_rs_poker_card, CbvContext, RolloutLeafEvaluator};
+use crate::postflop::{CbvContext, RolloutLeafEvaluator, parse_rs_poker_card};
 
 // ---------------------------------------------------------------------------
 // Types returned to the frontend
@@ -413,11 +428,7 @@ impl GameSession {
 
     /// Map V2 player to weight index: BB/OOP = 0, SB/IP = 1.
     fn weight_index(&self, v2_player: u8) -> usize {
-        if v2_player == self.tree.dealer {
-            1
-        } else {
-            0
-        }
+        if v2_player == self.tree.dealer { 1 } else { 0 }
     }
 
     /// Get the street at the current node.
@@ -1439,16 +1450,23 @@ fn build_inner_evaluator_for_solve(
             .with_solve_iters(solve_iters)
             .with_target_exploitability(target_exp),
         ),
-        Some((_, BoundaryKind::Cfvnet(model_path))) => {
+        Some((
+            _,
+            BoundaryKind::Cfvnet {
+                model_path,
+                inference_mode,
+            },
+        )) => {
             let session = cfvnet::eval::boundary_evaluator::load_shared_onnx_session(
                 std::path::Path::new(model_path),
             )
             .map_err(|e| format!("ONNX session load failed: {e}"))?;
             Arc::new(
-                cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+                cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared_with_mode(
                     session,
                     board_u8.to_vec(),
                     private_cards,
+                    *inference_mode,
                 ),
             )
         }
@@ -2137,7 +2155,7 @@ pub fn game_solve_core(
         } else {
             let subgame = base.join("subgame");
             match &boundary_cut {
-                Some((_, BoundaryKind::Cfvnet(_))) => subgame.join("cfvnet"),
+                Some((_, BoundaryKind::Cfvnet { .. })) => subgame.join("cfvnet"),
                 Some((_, BoundaryKind::ExactSubtree)) => subgame.join("exact_subtree"),
                 None => subgame,
             }
@@ -2249,8 +2267,11 @@ pub fn game_solve_core(
             if let Some((_, ref kind)) = boundary_cut {
                 if n_boundaries > 0 {
                     match kind {
-                        BoundaryKind::Cfvnet(model_path) => {
-                            setup_neural_boundaries(&mut game, model_path, None);
+                        BoundaryKind::Cfvnet {
+                            model_path,
+                            inference_mode,
+                        } => {
+                            setup_neural_boundaries(&mut game, model_path, *inference_mode, None);
                         }
                         BoundaryKind::ExactSubtree => {
                             setup_exact_subtree_boundaries_with_gadget(
@@ -2268,7 +2289,9 @@ pub fn game_solve_core(
             let n_original = n_boundaries / 3;
             eprintln!(
                 "[solve] gadget-tree (A2): {} original boundaries, {} total (incl. {} gadget terminals)",
-                n_original, n_boundaries, n_boundaries - n_original,
+                n_original,
+                n_boundaries,
+                n_boundaries - n_original,
             );
         } else {
             eprintln!(
@@ -2467,6 +2490,7 @@ pub fn game_solve_core(
 fn setup_neural_boundaries(
     game: &mut PostFlopGame,
     model_path: &str,
+    inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode,
     opt_out: Option<Arc<dyn crate::gadget::OptOutProvider>>,
 ) {
     let path = std::path::PathBuf::from(model_path);
@@ -2494,11 +2518,13 @@ fn setup_neural_boundaries(
             game.private_cards(0).to_vec(),
             game.private_cards(1).to_vec(),
         ];
-        let neural_eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
-            Arc::clone(&session),
-            board_4.clone(),
-            private_cards_pair.clone(),
-        );
+        let neural_eval =
+            cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared_with_mode(
+                Arc::clone(&session),
+                board_4.clone(),
+                private_cards_pair.clone(),
+                inference_mode,
+            );
         let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
             Some(provider) => Arc::new(crate::gadget::GadgetEvaluator::new(
@@ -2515,7 +2541,9 @@ fn setup_neural_boundaries(
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
-    eprintln!("[solve] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",);
+    eprintln!(
+        "[solve] neural-cfvnet mode: {n_boundaries} boundaries (ONNX, {inference_mode:?}){gadget_label}",
+    );
 }
 
 /// Wire per-boundary `SubtreeExactEvaluator`s into the game's
@@ -3126,14 +3154,16 @@ mod tests {
     fn game_session_state_has_dual_solve_states() {
         let gss = GameSessionState::default();
         // Both subgame_solve and exact_solve should exist and default to not solving
-        assert!(!gss
-            .subgame_solve
-            .solving
-            .load(std::sync::atomic::Ordering::Relaxed));
-        assert!(!gss
-            .exact_solve
-            .solving
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !gss.subgame_solve
+                .solving
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(
+            !gss.exact_solve
+                .solving
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -3451,39 +3481,45 @@ mod tests {
     #[test]
     fn cancel_solve_sets_cancel_flag_subgame() {
         let gss = GameSessionState::default();
-        assert!(!gss
-            .subgame_solve
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !gss.subgame_solve
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         game_cancel_solve_core(&gss, None).unwrap();
-        assert!(gss
-            .subgame_solve
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            gss.subgame_solve
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         // exact_solve should be unaffected
-        assert!(!gss
-            .exact_solve
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !gss.exact_solve
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]
     fn cancel_solve_sets_cancel_flag_exact() {
         let gss = GameSessionState::default();
-        assert!(!gss
-            .exact_solve
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !gss.exact_solve
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         game_cancel_solve_core(&gss, Some("exact".to_string())).unwrap();
-        assert!(gss
-            .exact_solve
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            gss.exact_solve
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         // subgame_solve should be unaffected
-        assert!(!gss
-            .subgame_solve
-            .cancel
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !gss.subgame_solve
+                .cancel
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     // -------------------------------------------------------------------
@@ -3733,7 +3769,7 @@ mod tests {
     fn build_solve_matrix_from_postflop_game() {
         // Build a tiny PostFlopGame and verify matrix extraction
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{flop_from_str, NOT_DEALT};
+        use range_solver::card::{NOT_DEALT, flop_from_str};
         use range_solver::range::Range;
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
@@ -4653,7 +4689,7 @@ mod tests {
     #[test]
     fn build_solve_cache_contains_root_and_children() {
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{flop_from_str, NOT_DEALT};
+        use range_solver::card::{NOT_DEALT, flop_from_str};
         use range_solver::range::Range;
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
@@ -4709,7 +4745,7 @@ mod tests {
     #[test]
     fn build_solve_matrix_at_current_works_without_back_to_root() {
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{flop_from_str, NOT_DEALT};
+        use range_solver::card::{NOT_DEALT, flop_from_str};
         use range_solver::range::Range;
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
@@ -4763,6 +4799,27 @@ mod tests {
     // StreetBoundaryConfig + resolve_street_boundary tests
     // -------------------------------------------------------------------
 
+    fn cfvnet_mode(model_path: &str) -> StreetBoundaryMode {
+        StreetBoundaryMode::Cfvnet {
+            model_path: model_path.to_string(),
+            inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::default(),
+        }
+    }
+
+    fn cfvnet_kind(model_path: &str) -> BoundaryKind {
+        BoundaryKind::Cfvnet {
+            model_path: model_path.to_string(),
+            inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::default(),
+        }
+    }
+
+    fn direct_cfvnet_kind(model_path: &str) -> BoundaryKind {
+        BoundaryKind::Cfvnet {
+            model_path: model_path.to_string(),
+            inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct,
+        }
+    }
+
     #[test]
     fn sbc_all_exact_returns_none() {
         let config = StreetBoundaryConfig::default();
@@ -4778,15 +4835,10 @@ mod tests {
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Exact,
-            river: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/river.onnx".to_string(),
-            },
+            river: cfvnet_mode("/models/river.onnx"),
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(
-            result,
-            Some((1, BoundaryKind::Cfvnet("/models/river.onnx".to_string())))
-        );
+        assert_eq!(result, Some((1, cfvnet_kind("/models/river.onnx"))));
     }
 
     #[test]
@@ -4795,28 +4847,23 @@ mod tests {
         // (near tree = flop only, 0 transitions).
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
-            turn: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/turn.onnx".to_string(),
-            },
+            turn: cfvnet_mode("/models/turn.onnx"),
             river: StreetBoundaryMode::Exact,
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(
-            result,
-            Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string())))
-        );
+        assert_eq!(result, Some((0, cfvnet_kind("/models/turn.onnx"))));
     }
 
     #[test]
     fn sbc_rejects_cfvnet_cut_that_would_use_flop_boards() {
-        let boundary_cut = Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string())));
+        let boundary_cut = Some((0, cfvnet_kind("/models/turn.onnx")));
         let err = validate_cfvnet_boundary_cut(&boundary_cut, Street::Flop).unwrap_err();
         assert!(err.contains("3-card flop boards"));
     }
 
     #[test]
     fn sbc_allows_cfvnet_cut_with_turn_boundary_boards() {
-        let boundary_cut = Some((0, BoundaryKind::Cfvnet("/models/river.onnx".to_string())));
+        let boundary_cut = Some((0, cfvnet_kind("/models/river.onnx")));
         assert!(validate_cfvnet_boundary_cut(&boundary_cut, Street::Turn).is_ok());
     }
 
@@ -4831,9 +4878,7 @@ mod tests {
         // flop=Cfvnet on flop root is degenerate — can't cut before our
         // current position. Falls through to all-exact (None).
         let config = StreetBoundaryConfig {
-            flop: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/flop.onnx".to_string(),
-            },
+            flop: cfvnet_mode("/models/flop.onnx"),
             turn: StreetBoundaryMode::Exact,
             river: StreetBoundaryMode::Exact,
         };
@@ -4845,19 +4890,12 @@ mod tests {
     fn sbc_first_cfvnet_wins_when_multiple() {
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
-            turn: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/turn.onnx".to_string(),
-            },
-            river: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/river.onnx".to_string(),
-            },
+            turn: cfvnet_mode("/models/turn.onnx"),
+            river: cfvnet_mode("/models/river.onnx"),
         };
         // First non-exact wins: turn cut at depth 0 from flop root.
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(
-            result,
-            Some((0, BoundaryKind::Cfvnet("/models/turn.onnx".to_string())))
-        );
+        assert_eq!(result, Some((0, cfvnet_kind("/models/turn.onnx"))));
     }
 
     #[test]
@@ -4865,16 +4903,11 @@ mod tests {
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Exact,
-            river: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/river.onnx".to_string(),
-            },
+            river: cfvnet_mode("/models/river.onnx"),
         };
         // From turn root: near tree = turn, cut before river = depth=0.
         let result = resolve_street_boundary(&config, Street::Turn);
-        assert_eq!(
-            result,
-            Some((0, BoundaryKind::Cfvnet("/models/river.onnx".to_string())))
-        );
+        assert_eq!(result, Some((0, cfvnet_kind("/models/river.onnx"))));
     }
 
     #[test]
@@ -4882,9 +4915,7 @@ mod tests {
         // turn=Cfvnet on turn root is degenerate — same as flop case above.
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
-            turn: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/turn.onnx".to_string(),
-            },
+            turn: cfvnet_mode("/models/turn.onnx"),
             river: StreetBoundaryMode::Exact,
         };
         let result = resolve_street_boundary(&config, Street::Turn);
@@ -4894,9 +4925,7 @@ mod tests {
     #[test]
     fn sbc_preflop_root_returns_none() {
         let config = StreetBoundaryConfig {
-            flop: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/flop.onnx".to_string(),
-            },
+            flop: cfvnet_mode("/models/flop.onnx"),
             turn: StreetBoundaryMode::Exact,
             river: StreetBoundaryMode::Exact,
         };
@@ -4924,13 +4953,11 @@ mod tests {
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Exact,
-            river: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/river.onnx".to_string(),
-            },
+            river: cfvnet_mode("/models/river.onnx"),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: StreetBoundaryConfig = serde_json::from_str(&json).unwrap();
-        if let StreetBoundaryMode::Cfvnet { model_path } = &parsed.river {
+        if let StreetBoundaryMode::Cfvnet { model_path, .. } = &parsed.river {
             assert_eq!(model_path, "/models/river.onnx");
         } else {
             panic!("expected Cfvnet for river");
@@ -4947,11 +4974,38 @@ mod tests {
         let config: StreetBoundaryConfig = serde_json::from_str(json).unwrap();
         assert!(matches!(config.flop, StreetBoundaryMode::Exact));
         assert!(matches!(config.turn, StreetBoundaryMode::Exact));
-        if let StreetBoundaryMode::Cfvnet { model_path } = &config.river {
+        if let StreetBoundaryMode::Cfvnet {
+            model_path,
+            inference_mode,
+        } = &config.river
+        {
             assert_eq!(model_path, "/path/to/model.onnx");
+            assert_eq!(
+                *inference_mode,
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn
+            );
         } else {
             panic!("expected Cfvnet");
         }
+    }
+
+    #[test]
+    fn sbc_serde_accepts_direct_cfvnet_inference_mode() {
+        let json = r#"{
+            "flop": {"mode": "exact"},
+            "turn": {"mode": "exact"},
+            "river": {
+                "mode": "cfvnet",
+                "model_path": "/path/to/turn_boundary.onnx",
+                "inference_mode": "direct"
+            }
+        }"#;
+        let config: StreetBoundaryConfig = serde_json::from_str(json).unwrap();
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(
+            result,
+            Some((1, direct_cfvnet_kind("/path/to/turn_boundary.onnx")))
+        );
     }
 
     // -------------------------------------------------------------------
@@ -5006,15 +5060,10 @@ mod tests {
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::Exact,
-            river: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/river.onnx".to_string(),
-            },
+            river: cfvnet_mode("/models/river.onnx"),
         };
         let result = resolve_street_boundary(&config, Street::Flop);
-        assert_eq!(
-            result,
-            Some((1, BoundaryKind::Cfvnet("/models/river.onnx".to_string())))
-        );
+        assert_eq!(result, Some((1, cfvnet_kind("/models/river.onnx"))));
     }
 
     #[test]
@@ -5022,9 +5071,7 @@ mod tests {
         let config = StreetBoundaryConfig {
             flop: StreetBoundaryMode::Exact,
             turn: StreetBoundaryMode::ExactSubtree,
-            river: StreetBoundaryMode::Cfvnet {
-                model_path: "/models/river.onnx".to_string(),
-            },
+            river: cfvnet_mode("/models/river.onnx"),
         };
         let result = resolve_street_boundary(&config, Street::Flop);
         assert_eq!(result, Some((0, BoundaryKind::ExactSubtree)));

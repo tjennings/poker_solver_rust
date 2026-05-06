@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_COMBOS, NUM_RANKS};
 use range_solver::card::{card_pair_to_index, index_to_card_pair};
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(feature = "onnx"))]
 use crate::model::boundary_net::BoundaryNet;
@@ -128,6 +129,20 @@ pub fn denormalize_ev(normalized: &[f32], pot: f32, effective_stack: f32) -> Vec
     normalized.iter().map(|&v| v * total).collect()
 }
 
+/// Runtime inference contract for a cfvnet boundary model.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryInferenceMode {
+    /// Preserve the legacy river-model adapter: 5-card boards are evaluated
+    /// directly, while 4-card turn boards enumerate all valid river runouts
+    /// and average the river model's outputs.
+    #[default]
+    RiverEnumeratedTurn,
+    /// Evaluate the boundary board exactly as supplied. This is the contract
+    /// used by direct turn-boundary models trained on 4-card boards.
+    Direct,
+}
+
 // ---------------------------------------------------------------------------
 // Burn-based implementation (default, when `onnx` feature is NOT enabled)
 // ---------------------------------------------------------------------------
@@ -142,6 +157,7 @@ pub struct NeuralBoundaryEvaluator {
     model: Mutex<BoundaryNet<NdArray>>,
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
+    inference_mode: BoundaryInferenceMode,
 }
 
 #[cfg(not(feature = "onnx"))]
@@ -151,10 +167,25 @@ impl NeuralBoundaryEvaluator {
         board: Vec<u8>,
         private_cards: [Vec<(u8, u8)>; 2],
     ) -> Self {
+        Self::new_with_inference_mode(
+            model,
+            board,
+            private_cards,
+            BoundaryInferenceMode::default(),
+        )
+    }
+
+    pub fn new_with_inference_mode(
+        model: BoundaryNet<NdArray>,
+        board: Vec<u8>,
+        private_cards: [Vec<(u8, u8)>; 2],
+        inference_mode: BoundaryInferenceMode,
+    ) -> Self {
         Self {
             model: Mutex::new(model),
             board,
             private_cards,
+            inference_mode,
         }
     }
 }
@@ -234,8 +265,9 @@ impl NeuralBoundaryEvaluator {
         // Board-size branch. The river cfvnet was trained on 5-card boards;
         // feeding a 4-card (turn) board is OOD. For turn boundaries, average
         // the net's output over all valid river cards.
-        let normalized_1326 = match self.board.len() {
-            5 => self.burn_forward(
+        let normalized_1326 = match (self.inference_mode, self.board.len()) {
+            (BoundaryInferenceMode::Direct, 4 | 5)
+            | (BoundaryInferenceMode::RiverEnumeratedTurn, 5) => self.burn_forward(
                 &oop_range_1326,
                 &ip_range_1326,
                 &self.board,
@@ -243,14 +275,16 @@ impl NeuralBoundaryEvaluator {
                 eff_stack_f32,
                 player as u8,
             ),
-            4 => self.burn_river_enumerated(
+            (BoundaryInferenceMode::RiverEnumeratedTurn, 4) => self.burn_river_enumerated(
                 &oop_range_1326,
                 &ip_range_1326,
                 pot_f32,
                 eff_stack_f32,
                 player as u8,
             ),
-            n => panic!("NeuralBoundaryEvaluator: unsupported board length {n} (expected 4 or 5)"),
+            (_, n) => {
+                panic!("NeuralBoundaryEvaluator: unsupported board length {n} (expected 4 or 5)")
+            }
         };
 
         let chip_evs: Vec<f32> = normalized_1326.iter().map(|&v| v * total).collect();
@@ -366,6 +400,7 @@ pub struct NeuralBoundaryEvaluator {
     session: Arc<ort::session::Session>,
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
+    inference_mode: BoundaryInferenceMode,
 }
 
 #[cfg(feature = "onnx")]
@@ -402,23 +437,17 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         _num_ip: usize,
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        let oop_cfvs = self.forward_for_player(0, pot, remaining_stack, oop_reach, ip_reach);
-        let ip_cfvs = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
-        (oop_cfvs, ip_cfvs)
+        self.forward_for_both_players(pot, remaining_stack, oop_reach, ip_reach)
     }
 }
 
 #[cfg(feature = "onnx")]
 impl NeuralBoundaryEvaluator {
-    fn forward_for_player(
+    fn build_1326_ranges(
         &self,
-        player: usize,
-        pot: i32,
-        remaining_stack: f64,
         oop_reach_game: &[f32],
         ip_reach_game: &[f32],
-    ) -> Vec<f32> {
-        // Build 1326-element range vectors from game ordering for BOTH sides.
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut oop_range_1326 = vec![0.0_f32; NUM_COMBOS];
         for (i, &(c1, c2)) in self.private_cards[0].iter().enumerate() {
             if i < oop_reach_game.len() {
@@ -431,29 +460,57 @@ impl NeuralBoundaryEvaluator {
                 ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
             }
         }
+        (oop_range_1326, ip_range_1326)
+    }
+
+    fn map_outputs_to_game_hands(
+        &self,
+        normalized_1326: &[f32],
+        player: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let hands = &self.private_cards[player];
+        let mut cfvs = Vec::with_capacity(hands.len());
+        for &(c1, c2) in hands {
+            cfvs.push(normalized_1326[card_pair_to_index(c1, c2)] * scale);
+        }
+        cfvs
+    }
+
+    fn forward_for_both_players(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach_game: &[f32],
+        ip_reach_game: &[f32],
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (oop_range_1326, ip_range_1326) = self.build_1326_ranges(oop_reach_game, ip_reach_game);
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
 
-        let normalized_1326 = match self.board.len() {
-            5 => self.onnx_forward(
+        let (normalized_oop, normalized_ip) = match (self.inference_mode, self.board.len()) {
+            (BoundaryInferenceMode::Direct, 4 | 5)
+            | (BoundaryInferenceMode::RiverEnumeratedTurn, 5) => self.onnx_forward_both_players(
                 &oop_range_1326,
                 &ip_range_1326,
                 &self.board,
                 pot_f32,
                 eff_stack_f32,
-                player as u8,
             ),
-            4 => self.onnx_river_enumerated(
-                &oop_range_1326,
-                &ip_range_1326,
-                pot_f32,
-                eff_stack_f32,
-                player as u8,
-            ),
-            n => panic!(
-                "NeuralBoundaryEvaluator (onnx): unsupported board length {n} (expected 4 or 5)"
-            ),
+            (BoundaryInferenceMode::RiverEnumeratedTurn, 4) => self
+                .onnx_river_enumerated_both_players(
+                    &oop_range_1326,
+                    &ip_range_1326,
+                    pot_f32,
+                    eff_stack_f32,
+                ),
+            (_, n) => {
+                panic!(
+                    "NeuralBoundaryEvaluator (onnx): unsupported board length {n} \
+                     (expected 4 or 5)"
+                )
+            }
         };
 
         // Unit conversion: target = cfv_halfpot * pot / (pot + eff_stack)
@@ -463,27 +520,27 @@ impl NeuralBoundaryEvaluator {
             0.0
         };
 
-        // Map 1326-combo ordering back to game private_cards ordering.
-        let hands = &self.private_cards[player];
-        let mut cfvs = Vec::with_capacity(hands.len());
-        for &(c1, c2) in hands {
-            cfvs.push(normalized_1326[card_pair_to_index(c1, c2)] * scale);
-        }
-        cfvs
+        (
+            self.map_outputs_to_game_hands(&normalized_oop, 0, scale),
+            self.map_outputs_to_game_hands(&normalized_ip, 1, scale),
+        )
     }
 
-    fn onnx_forward(
+    fn onnx_forward_both_players(
         &self,
         oop_1326: &[f32],
         ip_1326: &[f32],
         board: &[u8],
         pot: f32,
         eff_stack: f32,
-        player: u8,
-    ) -> Vec<f32> {
-        let input_vec =
-            encode_boundary_inference_input(oop_1326, ip_1326, board, pot, eff_stack, player);
-        let input_tensor = ort::value::Tensor::from_array(([1_i64, INPUT_SIZE as i64], input_vec))
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut input_vec = Vec::with_capacity(2 * INPUT_SIZE);
+        for player in [0_u8, 1] {
+            input_vec.extend(encode_boundary_inference_input(
+                oop_1326, ip_1326, board, pot, eff_stack, player,
+            ));
+        }
+        let input_tensor = ort::value::Tensor::from_array(([2_i64, INPUT_SIZE as i64], input_vec))
             .expect("ort tensor creation");
         let outputs = self
             .session
@@ -492,28 +549,39 @@ impl NeuralBoundaryEvaluator {
         let output_view = outputs[0]
             .try_extract_tensor::<f32>()
             .expect("ort output extract f32");
-        output_view.iter().copied().collect()
+        let all_outputs: Vec<f32> = output_view.iter().copied().collect();
+        (
+            all_outputs[..NUM_COMBOS].to_vec(),
+            all_outputs[NUM_COMBOS..2 * NUM_COMBOS].to_vec(),
+        )
     }
 
     /// Enumerate all valid river cards given a 4-card (turn) board, blocker-
     /// adjust ranges per river, run a single batched session.run for all
     /// rivers, and average the 1326-combo CFVs (per-combo, counting only
     /// rivers that don't block the combo).
-    fn onnx_river_enumerated(
+    fn onnx_river_enumerated_both_players(
         &self,
         oop_1326: &[f32],
         ip_1326: &[f32],
         pot: f32,
         eff_stack: f32,
-        player: u8,
-    ) -> Vec<f32> {
-        let (valid_rivers, flat_input) =
-            build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, player);
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (valid_rivers, oop_input) =
+            build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, 0);
+        let (valid_rivers_ip, ip_input) =
+            build_river_batch_inputs(&self.board, oop_1326, ip_1326, pot, eff_stack, 1);
+        debug_assert_eq!(valid_rivers, valid_rivers_ip);
         let n_rivers = valid_rivers.len();
+        let mut flat_input = Vec::with_capacity(2 * n_rivers * INPUT_SIZE);
+        flat_input.extend(oop_input);
+        flat_input.extend(ip_input);
 
-        let input_tensor =
-            ort::value::Tensor::from_array(([n_rivers as i64, INPUT_SIZE as i64], flat_input))
-                .expect("ort tensor creation");
+        let input_tensor = ort::value::Tensor::from_array((
+            [(2 * n_rivers) as i64, INPUT_SIZE as i64],
+            flat_input,
+        ))
+        .expect("ort tensor creation");
         let outputs = self
             .session
             .run(ort::inputs![input_tensor].expect("ort inputs"))
@@ -523,7 +591,11 @@ impl NeuralBoundaryEvaluator {
             .expect("ort output extract f32");
         let all_outputs: Vec<f32> = output_view.iter().copied().collect();
 
-        accumulate_river_cfvs(&valid_rivers, &all_outputs)
+        let split = n_rivers * NUM_COMBOS;
+        (
+            accumulate_river_cfvs(&valid_rivers, &all_outputs[..split]),
+            accumulate_river_cfvs(&valid_rivers, &all_outputs[split..]),
+        )
     }
 }
 
@@ -540,6 +612,7 @@ pub fn load_neural_boundary_evaluator(
         session,
         board,
         private_cards,
+        inference_mode: BoundaryInferenceMode::default(),
     })
 }
 
@@ -573,10 +646,26 @@ pub fn neural_boundary_evaluator_from_shared(
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
 ) -> NeuralBoundaryEvaluator {
+    neural_boundary_evaluator_from_shared_with_mode(
+        session,
+        board,
+        private_cards,
+        BoundaryInferenceMode::default(),
+    )
+}
+
+#[cfg(feature = "onnx")]
+pub fn neural_boundary_evaluator_from_shared_with_mode(
+    session: Arc<ort::session::Session>,
+    board: Vec<u8>,
+    private_cards: [Vec<(u8, u8)>; 2],
+    inference_mode: BoundaryInferenceMode,
+) -> NeuralBoundaryEvaluator {
     NeuralBoundaryEvaluator {
         session,
         board,
         private_cards,
+        inference_mode,
     }
 }
 

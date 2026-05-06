@@ -395,6 +395,7 @@ Options:
 - `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
 - `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
+- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `river_enumerated_turn` (default) preserves the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. `direct` evaluates the supplied boundary board as-is, which is required for direct turn-boundary ONNX models trained on 4-card boards.
 - `--oracle-orientation <MODE>` -- Hidden `exact_oracle` diagnostic. Accepted values are `current`, `swap`, `sign-flip`, and `swap-sign-flip`; use only to audit OOP/IP and sign orientation at the raw boundary-CFV handoff.
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.

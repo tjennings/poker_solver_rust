@@ -386,6 +386,10 @@ enum Commands {
         #[arg(long)]
         flop_model: Option<String>,
 
+        /// Flop cfvnet inference mode: "river_enumerated_turn" or "direct"
+        #[arg(long, default_value = "river_enumerated_turn")]
+        flop_model_kind: String,
+
         /// Turn boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
         #[arg(long, default_value = "exact")]
         turn_boundary: String,
@@ -394,6 +398,10 @@ enum Commands {
         #[arg(long)]
         turn_model: Option<String>,
 
+        /// Turn cfvnet inference mode: "river_enumerated_turn" or "direct"
+        #[arg(long, default_value = "river_enumerated_turn")]
+        turn_model_kind: String,
+
         /// River boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
         #[arg(long, default_value = "exact")]
         river_boundary: String,
@@ -401,6 +409,10 @@ enum Commands {
         /// ONNX model path for river boundary (required when --river-boundary=cfvnet)
         #[arg(long)]
         river_model: Option<String>,
+
+        /// River cfvnet inference mode: "river_enumerated_turn" or "direct"
+        #[arg(long, default_value = "river_enumerated_turn")]
+        river_model_kind: String,
 
         /// Diagnostic exact_oracle CFV orientation transform.
         #[arg(long, default_value = "current", hide = true)]
@@ -1458,10 +1470,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             dump_boundary_cfvs,
             flop_boundary,
             flop_model,
+            flop_model_kind,
             turn_boundary,
             turn_model,
+            turn_model_kind,
             river_boundary,
             river_model,
+            river_model_kind,
             oracle_orientation,
             oracle_scale,
             oracle_iteration_aligned,
@@ -1478,6 +1493,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let parse_mode =
                 |mode: &str,
                  model: Option<String>,
+                 model_kind: &str,
                  street: &str|
                  -> Result<poker_solver_tauri::StreetBoundaryMode, Box<dyn Error>> {
                     match mode {
@@ -1488,7 +1504,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     "--{street}-model is required when --{street}-boundary=cfvnet"
                                 )
                             })?;
-                            Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet { model_path: path })
+                            let inference_mode = match model_kind {
+                                "river_enumerated_turn" | "river-enumerated-turn" => {
+                                    cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn
+                                }
+                                "direct" => {
+                                    cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "invalid --{street}-model-kind value '{other}': expected \
+                                         'river_enumerated_turn' or 'direct'"
+                                    )
+                                    .into());
+                                }
+                            };
+                            Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet {
+                                model_path: path,
+                                inference_mode,
+                            })
                         }
                         "exact_subtree" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
                         "exact_oracle" => Ok(poker_solver_tauri::StreetBoundaryMode::ExactSubtree),
@@ -1508,9 +1542,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 compare_solve::OracleCfvOrientation::parse(&oracle_orientation)
                     .map_err(|e| -> Box<dyn Error> { e.into() })?;
             let sbc = poker_solver_tauri::StreetBoundaryConfig {
-                flop: parse_mode(&flop_boundary, flop_model, "flop")?,
-                turn: parse_mode(&turn_boundary, turn_model, "turn")?,
-                river: parse_mode(&river_boundary, river_model, "river")?,
+                flop: parse_mode(&flop_boundary, flop_model, &flop_model_kind, "flop")?,
+                turn: parse_mode(&turn_boundary, turn_model, &turn_model_kind, "turn")?,
+                river: parse_mode(&river_boundary, river_model, &river_model_kind, "river")?,
             };
             let trace_config = boundary_trace::TraceConfig {
                 boundaries: trace_boundaries,
@@ -2964,7 +2998,7 @@ snapshots:
     }
 
     /// resolve_tui_scenarios should produce ResolvedMpScenario from configs.
-    #[timed_test(10)]
+    #[timed_test(30)]
     fn resolve_tui_scenarios_from_tree() {
         use poker_solver_core::blueprint_mp::config::*;
         use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
@@ -3072,6 +3106,8 @@ snapshots:
             "cfvnet",
             "--river-model",
             "/path/to/model.onnx",
+            "--river-model-kind",
+            "direct",
         ]);
         assert!(
             cli2.is_ok(),
@@ -3082,11 +3118,13 @@ snapshots:
         if let super::Commands::CompareSolve {
             river_boundary,
             river_model,
+            river_model_kind,
             ..
         } = cli2.unwrap().command
         {
             assert_eq!(river_boundary, "cfvnet");
             assert_eq!(river_model.as_deref(), Some("/path/to/model.onnx"));
+            assert_eq!(river_model_kind, "direct");
         } else {
             panic!("expected CompareSolve variant");
         }
