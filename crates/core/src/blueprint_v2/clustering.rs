@@ -35,6 +35,25 @@ pub fn emd(p: &[f64], q: &[f64]) -> f64 {
     distance
 }
 
+/// Weighted Earth Mover's Distance between two probability distributions over
+/// ordered buckets.
+///
+/// Like [`emd`], but each boundary-crossing CDF step is scaled by `gaps[i]`.
+/// `gaps` has length K-1 where K = `p.len()`. With uniform gaps of 1.0 this
+/// equals the unweighted variant for normalized distributions.
+#[must_use]
+pub fn emd_weighted(p: &[f64], q: &[f64], gaps: &[f64]) -> f64 {
+    debug_assert_eq!(p.len(), q.len());
+    debug_assert_eq!(gaps.len(), p.len() - 1);
+    let mut cdf_diff = 0.0_f64;
+    let mut distance = 0.0_f64;
+    for i in 0..p.len() - 1 {
+        cdf_diff += p[i] - q[i];
+        distance += cdf_diff.abs() * gaps[i];
+    }
+    distance
+}
+
 /// EMD between two unnormalized u8 count histograms.
 ///
 /// Normalizes each histogram on-the-fly by dividing by its sum. Both slices
@@ -113,6 +132,32 @@ pub fn nearest_centroid_u8_weighted(point: &[u8], centroids: &[Vec<f64>], gaps: 
         }
     }
     best_idx
+}
+
+fn validate_emd_gaps(dim: usize, gaps: &[f64]) {
+    assert_eq!(
+        gaps.len(),
+        dim.saturating_sub(1),
+        "weighted EMD gaps must have length dim - 1"
+    );
+    assert!(
+        gaps.iter().all(|gap| gap.is_finite() && *gap >= 0.0),
+        "weighted EMD gaps must be finite and non-negative"
+    );
+}
+
+fn emd_u8_vs_f64_maybe_weighted(counts: &[u8], centroid: &[f64], gaps: Option<&[f64]>) -> f64 {
+    match gaps {
+        Some(gaps) => emd_u8_vs_f64_weighted(counts, centroid, gaps),
+        None => emd_u8_vs_f64(counts, centroid),
+    }
+}
+
+fn emd_maybe_weighted(p: &[f64], q: &[f64], gaps: Option<&[f64]>) -> f64 {
+    match gaps {
+        Some(gaps) => emd_weighted(p, q, gaps),
+        None => emd(p, q),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,9 +711,52 @@ pub fn elkan_emd_weighted_u8(
     seed: u64,
     progress: impl Fn(u32, u32),
 ) -> (Vec<u16>, Vec<Vec<f64>>) {
+    elkan_emd_weighted_u8_impl(data, weights, k, max_iterations, seed, None, progress)
+}
+
+/// Triangle-inequality accelerated k-means with weighted-ground EMD distance
+/// for u8 histograms.
+///
+/// The `gaps` slice supplies the ground distance between adjacent histogram
+/// buckets. This should be used when final assignment also uses weighted EMD,
+/// so sampled centroid training and exhaustive assignment optimize the same
+/// distance.
+///
+/// # Panics
+/// Panics if `data` is empty, `k` is zero, `data.len() != weights.len()`, or
+/// `gaps.len() != data[0].len() - 1`.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn elkan_emd_weighted_u8_with_gaps(
+    data: &[Vec<u8>],
+    weights: &[f64],
+    k: usize,
+    max_iterations: u32,
+    seed: u64,
+    gaps: &[f64],
+    progress: impl Fn(u32, u32),
+) -> (Vec<u16>, Vec<Vec<f64>>) {
+    assert!(!data.is_empty(), "data must not be empty");
+    validate_emd_gaps(data[0].len(), gaps);
+    elkan_emd_weighted_u8_impl(data, weights, k, max_iterations, seed, Some(gaps), progress)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn elkan_emd_weighted_u8_impl(
+    data: &[Vec<u8>],
+    weights: &[f64],
+    k: usize,
+    max_iterations: u32,
+    seed: u64,
+    gaps: Option<&[f64]>,
+    progress: impl Fn(u32, u32),
+) -> (Vec<u16>, Vec<Vec<f64>>) {
     assert_eq!(data.len(), weights.len());
     assert!(!data.is_empty(), "data must not be empty");
     assert!(k > 0, "k must be positive");
+    if let Some(gaps) = gaps {
+        validate_emd_gaps(data[0].len(), gaps);
+    }
 
     let n = data.len();
     if k >= n {
@@ -678,14 +766,14 @@ pub fn elkan_emd_weighted_u8(
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut centroids = kmeanspp_init_u8(data, k, &mut rng);
+    let mut centroids = kmeanspp_init_u8_with_gaps(data, k, &mut rng, gaps);
     let dim = centroids[0].len();
-    let mut bounds = init_elkan_bounds(data, &centroids);
+    let mut bounds = init_elkan_bounds_with_gaps(data, &centroids, gaps);
 
     for iter in 0..max_iterations {
         progress(iter, max_iterations);
 
-        let (pairwise, midpoints) = compute_pairwise_and_midpoints(&centroids);
+        let (pairwise, midpoints) = compute_pairwise_and_midpoints_with_gaps(&centroids, gaps);
 
         // Elkan assignment: only check points where upper > s(assigned).
         bounds
@@ -695,12 +783,12 @@ pub fn elkan_emd_weighted_u8(
             .for_each(|(i, b)| {
                 let point = &data[i];
                 if b.stale() {
-                    let d = emd_u8_vs_f64(point, &centroids[b.j()]) as f32;
+                    let d = emd_u8_vs_f64_maybe_weighted(point, &centroids[b.j()], gaps) as f32;
                     b.refresh(d);
                 }
                 for j in 0..k {
                     if b.has_shifted(&pairwise, j) {
-                        let d = emd_u8_vs_f64(point, &centroids[j]) as f32;
+                        let d = emd_u8_vs_f64_maybe_weighted(point, &centroids[j], gaps) as f32;
                         b.witness(d, j);
                     }
                 }
@@ -709,7 +797,7 @@ pub fn elkan_emd_weighted_u8(
         // Weighted centroid update via shared helper.
         let assignments: Vec<usize> = bounds.iter().map(ElkanBounds::j).collect();
         let (new_centroids, reseeded) =
-            weighted_centroid_update_u8(data, weights, &assignments, k, dim, &centroids);
+            weighted_centroid_update_u8(data, weights, &assignments, k, dim, &centroids, gaps);
 
         // Update bounds for re-seeded points.
         for (ci, reseed) in reseeded.iter().enumerate() {
@@ -721,7 +809,7 @@ pub fn elkan_emd_weighted_u8(
         // Compute drift and update bounds.
         let drifts: Vec<f32> = (0..k)
             .into_par_iter()
-            .map(|i| emd(&centroids[i], &new_centroids[i]) as f32)
+            .map(|i| emd_maybe_weighted(&centroids[i], &new_centroids[i], gaps) as f32)
             .collect();
 
         let max_drift: f32 = drifts.iter().copied().fold(0.0, f32::max);
@@ -737,7 +825,7 @@ pub fn elkan_emd_weighted_u8(
     // Final assignment pass to ensure labels match centroids exactly.
     let assignments: Vec<u16> = data
         .par_iter()
-        .map(|point| nearest_centroid_u8(point, &centroids))
+        .map(|point| nearest_centroid_u8_with_gaps(point, &centroids, gaps))
         .collect();
 
     (assignments, centroids)
@@ -804,7 +892,7 @@ fn kmeans_emd_weighted_u8(
         let assign_usize: Vec<usize> = assignments.iter().map(|&a| a as usize).collect();
         let dim = centroids[0].len();
         let (new_centroids, reseeded) =
-            weighted_centroid_update_u8(data, weights, &assign_usize, k, dim, &centroids);
+            weighted_centroid_update_u8(data, weights, &assign_usize, k, dim, &centroids, None);
 
         // Update assignments for re-seeded points.
         for (ci, reseed) in reseeded.iter().enumerate() {
@@ -955,10 +1043,21 @@ fn normalize_u8(counts: &[u8]) -> Vec<f64> {
 /// Index of the nearest centroid to a u8 histogram `point` by EMD.
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn nearest_centroid_u8(point: &[u8], centroids: &[Vec<f64>]) -> u16 {
+    nearest_centroid_u8_with_gaps(point, centroids, None)
+}
+
+/// Index of the nearest centroid to a u8 histogram, optionally using weighted
+/// ground distances between adjacent histogram bins.
+#[allow(clippy::cast_possible_truncation)]
+fn nearest_centroid_u8_with_gaps(
+    point: &[u8],
+    centroids: &[Vec<f64>],
+    gaps: Option<&[f64]>,
+) -> u16 {
     let mut best_idx = 0_u16;
     let mut best_dist = f64::MAX;
     for (ci, centroid) in centroids.iter().enumerate() {
-        let d = emd_u8_vs_f64(point, centroid);
+        let d = emd_u8_vs_f64_maybe_weighted(point, centroid, gaps);
         if d < best_dist {
             best_dist = d;
             best_idx = ci as u16;
@@ -967,14 +1066,19 @@ pub(crate) fn nearest_centroid_u8(point: &[u8], centroids: &[Vec<f64>]) -> u16 {
     best_idx
 }
 
-/// Find the u8 data point with the largest EMD distance to its assigned
-/// centroid. Used to re-seed empty clusters.
-fn farthest_point_u8(data: &[Vec<u8>], assignments: &[u16], centroids: &[Vec<f64>]) -> usize {
+/// Find the u8 data point farthest from its assigned centroid, optionally
+/// using weighted EMD ground distances.
+fn farthest_point_u8_with_gaps(
+    data: &[Vec<u8>],
+    assignments: &[u16],
+    centroids: &[Vec<f64>],
+    gaps: Option<&[f64]>,
+) -> usize {
     let mut best_idx = 0;
     let mut best_dist = -1.0_f64;
     for (i, point) in data.iter().enumerate() {
         let ci = assignments[i] as usize;
-        let d = emd_u8_vs_f64(point, &centroids[ci]);
+        let d = emd_u8_vs_f64_maybe_weighted(point, &centroids[ci], gaps);
         if d > best_dist {
             best_dist = d;
             best_idx = i;
@@ -985,8 +1089,19 @@ fn farthest_point_u8(data: &[Vec<u8>], assignments: &[u16], centroids: &[Vec<f64
 
 /// Compute K x K pairwise EMD distances between centroids and midpoints.
 /// Exploits symmetry: only computes K*(K-1)/2 distances.
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 fn compute_pairwise_and_midpoints(centroids: &[Vec<f64>]) -> (Vec<Vec<f32>>, Vec<f32>) {
+    compute_pairwise_and_midpoints_with_gaps(centroids, None)
+}
+
+/// Compute K x K pairwise distances between centroids and midpoint bounds,
+/// optionally using weighted EMD ground distances.
+#[allow(clippy::cast_possible_truncation)]
+fn compute_pairwise_and_midpoints_with_gaps(
+    centroids: &[Vec<f64>],
+    gaps: Option<&[f64]>,
+) -> (Vec<Vec<f32>>, Vec<f32>) {
     let k = centroids.len();
     let mut pairwise = vec![vec![0.0_f32; k]; k];
     // Compute upper triangle only, then mirror
@@ -994,7 +1109,13 @@ fn compute_pairwise_and_midpoints(centroids: &[Vec<f64>]) -> (Vec<Vec<f32>>, Vec
         .flat_map(|i| (i + 1..k).map(move |j| (i, j)))
         .collect::<Vec<_>>()
         .par_iter()
-        .map(|&(i, j)| (i, j, emd(&centroids[i], &centroids[j]) as f32))
+        .map(|&(i, j)| {
+            (
+                i,
+                j,
+                emd_maybe_weighted(&centroids[i], &centroids[j], gaps) as f32,
+            )
+        })
         .collect();
     for (i, j, d) in pairs {
         pairwise[i][j] = d;
@@ -1014,8 +1135,19 @@ fn compute_pairwise_and_midpoints(centroids: &[Vec<f64>]) -> (Vec<Vec<f32>>, Vec
 }
 
 /// Initialize `ElkanBounds` for all data points by computing full N x K distances.
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 fn init_elkan_bounds(data: &[Vec<u8>], centroids: &[Vec<f64>]) -> Vec<ElkanBounds> {
+    init_elkan_bounds_with_gaps(data, centroids, None)
+}
+
+/// Initialize `ElkanBounds`, optionally using weighted EMD ground distances.
+#[allow(clippy::cast_possible_truncation)]
+fn init_elkan_bounds_with_gaps(
+    data: &[Vec<u8>],
+    centroids: &[Vec<f64>],
+    gaps: Option<&[f64]>,
+) -> Vec<ElkanBounds> {
     let k = centroids.len();
     data.par_iter()
         .map(|point| {
@@ -1023,7 +1155,7 @@ fn init_elkan_bounds(data: &[Vec<u8>], centroids: &[Vec<f64>]) -> Vec<ElkanBound
             let mut best_j = 0;
             let mut best_d = f32::MAX;
             for (j, centroid) in centroids.iter().enumerate() {
-                let d = emd_u8_vs_f64(point, centroid) as f32;
+                let d = emd_u8_vs_f64_maybe_weighted(point, centroid, gaps) as f32;
                 b.lower[j] = d;
                 if d < best_d {
                     best_d = d;
@@ -1048,6 +1180,7 @@ fn weighted_centroid_update_u8(
     k: usize,
     dim: usize,
     current_centroids: &[Vec<f64>],
+    gaps: Option<&[f64]>,
 ) -> (Vec<Vec<f64>>, Vec<Option<usize>>) {
     let mut new_centroids = vec![vec![0.0_f64; dim]; k];
     let mut weight_sums = vec![0.0_f64; k];
@@ -1068,7 +1201,7 @@ fn weighted_centroid_update_u8(
     let mut reseeded = vec![None; k];
     for ci in 0..k {
         if weight_sums[ci] <= 0.0 {
-            let farthest = farthest_point_u8(data, &assign_u16, current_centroids);
+            let farthest = farthest_point_u8_with_gaps(data, &assign_u16, current_centroids, gaps);
             new_centroids[ci] = normalize_u8(&data[farthest]);
             reseeded[ci] = Some(farthest);
         } else {
@@ -1085,8 +1218,21 @@ fn weighted_centroid_update_u8(
 /// K-means++ seeding with EMD distance for u8 count histograms.
 ///
 /// Returns f64 centroids (normalized probability distributions).
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64>> {
+    kmeanspp_init_u8_with_gaps(data, k, rng, None)
+}
+
+/// K-means++ seeding for u8 count histograms, optionally using weighted EMD
+/// ground distances.
+#[allow(clippy::cast_possible_truncation)]
+fn kmeanspp_init_u8_with_gaps(
+    data: &[Vec<u8>],
+    k: usize,
+    rng: &mut StdRng,
+    gaps: Option<&[f64]>,
+) -> Vec<Vec<f64>> {
     let n = data.len();
     let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(k);
 
@@ -1103,7 +1249,7 @@ fn kmeanspp_init_u8(data: &[Vec<u8>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64
             .par_iter()
             .zip(dists.par_iter_mut())
             .map(|(point, dist)| {
-                let d = emd_u8_vs_f64(point, newest);
+                let d = emd_u8_vs_f64_maybe_weighted(point, newest, gaps);
                 let d2 = d * d;
                 if d2 < *dist {
                     *dist = d2;
@@ -1649,6 +1795,21 @@ mod tests {
     }
 
     #[test]
+    fn test_emd_weighted_uniform_gaps() {
+        // The f64 centroid-centroid distance used by Elkan bounds should agree
+        // with unweighted EMD when ground-distance gaps are uniform.
+        let p: Vec<f64> = vec![0.4, 0.1, 0.2, 0.3];
+        let q: Vec<f64> = vec![0.0, 0.5, 0.3, 0.2];
+        let gaps = vec![1.0, 1.0, 1.0];
+        let d_weighted = emd_weighted(&p, &q, &gaps);
+        let d_unweighted = emd(&p, &q);
+        assert!(
+            (d_weighted - d_unweighted).abs() < 1e-10,
+            "weighted={d_weighted} unweighted={d_unweighted}"
+        );
+    }
+
+    #[test]
     fn test_emd_u8_vs_f64_weighted_nonuniform_gaps() {
         // All mass at bucket 0. Compare distance to centroids at bucket 1 vs bucket 3.
         // With gaps [0.1, 0.3, 0.5], bucket 3 is farther than bucket 1.
@@ -1677,6 +1838,19 @@ mod tests {
         let gaps = vec![1.0, 1.0, 1.0];
         let idx = nearest_centroid_u8_weighted(&point, &centroids, &gaps);
         assert_eq!(idx, 0, "should pick centroid 0 (closer)");
+    }
+
+    #[test]
+    fn test_nearest_centroid_u8_weighted_respects_gaps() {
+        // Bucket 1 is one unweighted step from bucket 0 and two from bucket 3,
+        // but a large first gap makes bucket 3 closer under weighted EMD.
+        let point: Vec<u8> = vec![0, 40, 0, 0];
+        let centroids = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 1.0]];
+        let gaps = vec![10.0, 0.1, 0.1];
+        let unweighted_idx = nearest_centroid_u8(&point, &centroids);
+        let weighted_idx = nearest_centroid_u8_weighted(&point, &centroids, &gaps);
+        assert_eq!(unweighted_idx, 0);
+        assert_eq!(weighted_idx, 1);
     }
 
     #[test]
@@ -1809,6 +1983,60 @@ mod tests {
     }
 
     #[test]
+    fn elkan_emd_with_uniform_gaps_matches_unweighted() {
+        let data = vec![
+            vec![40u8, 0, 0, 0],
+            vec![36, 4, 0, 0],
+            vec![0, 36, 4, 0],
+            vec![0, 0, 4, 36],
+            vec![0, 0, 0, 40],
+        ];
+        let weights = vec![1.0, 1.5, 1.0, 2.0, 1.0];
+        let gaps = vec![1.0, 1.0, 1.0];
+
+        let (unweighted_labels, unweighted_centroids) =
+            elkan_emd_weighted_u8(&data, &weights, 3, 25, 7, |_, _| {});
+        let (weighted_labels, weighted_centroids) =
+            elkan_emd_weighted_u8_with_gaps(&data, &weights, 3, 25, 7, &gaps, |_, _| {});
+
+        assert_eq!(weighted_labels, unweighted_labels);
+        assert_eq!(weighted_centroids.len(), unweighted_centroids.len());
+        for (weighted, unweighted) in weighted_centroids.iter().zip(unweighted_centroids.iter()) {
+            for (w, u) in weighted.iter().zip(unweighted.iter()) {
+                assert!(
+                    (w - u).abs() < 1e-10,
+                    "weighted centroid {w} differed from unweighted {u}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elkan_emd_with_gaps_final_labels_match_weighted_nearest() {
+        let data = vec![
+            vec![40u8, 0, 0, 0],
+            vec![36, 4, 0, 0],
+            vec![0, 40, 0, 0],
+            vec![0, 36, 4, 0],
+            vec![0, 0, 4, 36],
+            vec![0, 0, 0, 40],
+        ];
+        let weights = vec![1.0; data.len()];
+        let gaps = vec![10.0, 0.1, 0.1];
+
+        let (labels, centroids) =
+            elkan_emd_weighted_u8_with_gaps(&data, &weights, 3, 30, 42, &gaps, |_, _| {});
+
+        for (point, label) in data.iter().zip(labels.iter()) {
+            let expected = nearest_centroid_u8_weighted(point, &centroids, &gaps);
+            assert_eq!(
+                *label, expected,
+                "final label should use the same weighted EMD as exhaustive assignment"
+            );
+        }
+    }
+
+    #[test]
     fn elkan_emd_k_equals_n() {
         let data = vec![vec![10, 0], vec![0, 10], vec![5, 5]];
         let weights = vec![1.0, 1.0, 1.0];
@@ -1885,7 +2113,7 @@ mod tests {
         let assignments: Vec<usize> = vec![0, 1];
         let current = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 1.0]];
         let (new_centroids, reseeded) =
-            weighted_centroid_update_u8(&data, &weights, &assignments, 2, 4, &current);
+            weighted_centroid_update_u8(&data, &weights, &assignments, 2, 4, &current, None);
         assert_eq!(new_centroids.len(), 2);
         // First centroid: point [40,0,0,0] normalized = [1,0,0,0]
         assert!((new_centroids[0][0] - 1.0).abs() < 1e-10);
@@ -1904,7 +2132,7 @@ mod tests {
         let assignments: Vec<usize> = vec![0, 0];
         let current = vec![vec![0.5, 0.5, 0.0, 0.0], vec![0.0, 0.0, 0.5, 0.5]];
         let (new_centroids, reseeded) =
-            weighted_centroid_update_u8(&data, &weights, &assignments, 2, 4, &current);
+            weighted_centroid_update_u8(&data, &weights, &assignments, 2, 4, &current, None);
         assert_eq!(new_centroids.len(), 2);
         // Cluster 1 was empty, should be reseeded
         assert!(reseeded[1].is_some());

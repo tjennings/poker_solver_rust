@@ -42,8 +42,9 @@ use super::Street;
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
 use super::centroid_file::CentroidFile;
 use super::clustering::{
-    compute_centroid_ev, compute_centroid_gaps, elkan_emd_weighted_u8, fast_kmeans_1d, kmeans_1d,
-    nearest_centroid_1d, nearest_centroid_u8, nearest_centroid_u8_weighted, sort_centroids_by_ev,
+    compute_centroid_ev, compute_centroid_gaps, elkan_emd_weighted_u8,
+    elkan_emd_weighted_u8_with_gaps, fast_kmeans_1d, kmeans_1d, nearest_centroid_1d,
+    nearest_centroid_u8, nearest_centroid_u8_weighted, sort_centroids_by_ev,
 };
 use super::config::ClusteringConfig;
 use super::per_flop_bucket_file::PerFlopBucketFile;
@@ -459,7 +460,9 @@ pub fn cluster_river_exhaustive(
 /// then exhaustive nearest-centroid assignment for all canonical boards.
 ///
 /// Phase 1 samples canonical boards, builds bucket histograms over the
-/// prior street, and runs `elkan_emd_weighted_u8` to find centroids.
+/// prior street, and runs EMD k-means to find centroids. When child centroid
+/// gaps are available, sampled training uses the same weighted ground distance
+/// as exhaustive assignment.
 /// Phase 2 enumerates ALL canonical boards and assigns each combo to its
 /// nearest centroid via `nearest_centroid_u8`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -519,17 +522,30 @@ fn cluster_histogram_exhaustive<const N: usize>(
         }
     }
 
-    let (_labels, centroids_f64) = elkan_emd_weighted_u8(
-        &all_features,
-        &all_weights,
-        bucket_count as usize,
-        kmeans_iterations,
-        seed,
-        |iter, total| {
-            #[allow(clippy::cast_precision_loss)]
-            progress("k-means", (iter + 1) as f64 / total as f64);
-        },
-    );
+    let progress_kmeans = |iter, total| {
+        #[allow(clippy::cast_precision_loss)]
+        progress("k-means", (iter + 1) as f64 / total as f64);
+    };
+    let (_labels, centroids_f64) = if child_centroid_gaps.is_empty() {
+        elkan_emd_weighted_u8(
+            &all_features,
+            &all_weights,
+            bucket_count as usize,
+            kmeans_iterations,
+            seed,
+            progress_kmeans,
+        )
+    } else {
+        elkan_emd_weighted_u8_with_gaps(
+            &all_features,
+            &all_weights,
+            bucket_count as usize,
+            kmeans_iterations,
+            seed,
+            child_centroid_gaps,
+            progress_kmeans,
+        )
+    };
 
     // Sort centroids by expected equity so bucket IDs are ordered.
     let (sorted_centroids, _remap) = sort_centroids_by_ev(&centroids_f64, child_centroid_evs);
