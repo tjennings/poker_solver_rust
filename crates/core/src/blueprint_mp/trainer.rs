@@ -22,6 +22,15 @@ static LAZY_DEAL_NANOS: AtomicU64 = AtomicU64::new(0);
 static LAZY_BUCKET_NANOS: AtomicU64 = AtomicU64::new(0);
 static LAZY_TRAVERSE_NANOS: AtomicU64 = AtomicU64::new(0);
 static LAZY_DISCOUNT_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_TRAVERSAL_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAZY_MAX_JOB_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_MAX_JOB_ITER: AtomicU64 = AtomicU64::new(0);
+static LAZY_SLOW_JOBS: AtomicU64 = AtomicU64::new(0);
+static LAZY_MAX_TRAVERSER_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_MAX_TRAVERSER_CONTEXT: AtomicU64 = AtomicU64::new(0);
+static LAZY_SLOW_TRAVERSERS: AtomicU64 = AtomicU64::new(0);
+const SLOW_LAZY_JOB_NANOS: u64 = 1_000_000_000;
+const SLOW_LAZY_TRAVERSER_NANOS: u64 = 1_000_000_000;
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -56,17 +65,34 @@ pub struct LazyMpTimingSnapshot {
     pub bucket_nanos: u64,
     pub traverse_nanos: u64,
     pub discount_nanos: u64,
+    pub traversal_count: u64,
+    pub max_job_nanos: u64,
+    pub max_job_iter: u64,
+    pub slow_jobs: u64,
+    pub max_traverser_nanos: u64,
+    pub max_traverser_iter: u64,
+    pub max_traverser_seat: u8,
+    pub slow_traversers: u64,
 }
 
 /// Read and reset lazy sparse MP training timing counters.
 #[must_use]
 pub fn take_lazy_mp_timing_snapshot() -> LazyMpTimingSnapshot {
+    let max_traverser_context = LAZY_MAX_TRAVERSER_CONTEXT.swap(0, Ordering::Relaxed);
     LazyMpTimingSnapshot {
         batch_wall_nanos: LAZY_BATCH_WALL_NANOS.swap(0, Ordering::Relaxed),
         deal_nanos: LAZY_DEAL_NANOS.swap(0, Ordering::Relaxed),
         bucket_nanos: LAZY_BUCKET_NANOS.swap(0, Ordering::Relaxed),
         traverse_nanos: LAZY_TRAVERSE_NANOS.swap(0, Ordering::Relaxed),
         discount_nanos: LAZY_DISCOUNT_NANOS.swap(0, Ordering::Relaxed),
+        traversal_count: LAZY_TRAVERSAL_COUNT.swap(0, Ordering::Relaxed),
+        max_job_nanos: LAZY_MAX_JOB_NANOS.swap(0, Ordering::Relaxed),
+        max_job_iter: LAZY_MAX_JOB_ITER.swap(0, Ordering::Relaxed),
+        slow_jobs: LAZY_SLOW_JOBS.swap(0, Ordering::Relaxed),
+        max_traverser_nanos: LAZY_MAX_TRAVERSER_NANOS.swap(0, Ordering::Relaxed),
+        max_traverser_iter: max_traverser_context >> 8,
+        max_traverser_seat: (max_traverser_context & 0xFF) as u8,
+        slow_traversers: LAZY_SLOW_TRAVERSERS.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -399,6 +425,8 @@ fn run_lazy_batch(
     let (batch_stats, timing): (PruneStats, LazyWorkerTiming) = (0..batch_size)
         .into_par_iter()
         .map(|i| {
+            let job_started = Instant::now();
+            let job_iter = base_iter.wrapping_add(i);
             let seed = base_iter
                 .wrapping_add(i)
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -413,8 +441,12 @@ fn run_lazy_batch(
             let bucket_nanos = nanos_since(bucket_started);
 
             let mut local = PruneStats::default();
-            let traverse_started = Instant::now();
+            let traversers_started = Instant::now();
+            let mut max_traverser_nanos = 0;
+            let mut max_traverser_seat = 0;
+            let mut slow_traversers = 0;
             for traverser in 0..num_players {
+                let traverser_started = Instant::now();
                 let (_, stats) = traverse_external_lazy(
                     game,
                     storage,
@@ -426,15 +458,36 @@ fn run_lazy_batch(
                     prune,
                     prune_threshold,
                 );
+                let traverser_nanos = nanos_since(traverser_started);
+                if traverser_nanos > max_traverser_nanos {
+                    max_traverser_nanos = traverser_nanos;
+                    max_traverser_seat = traverser;
+                }
+                if traverser_nanos >= SLOW_LAZY_TRAVERSER_NANOS {
+                    slow_traversers += 1;
+                }
                 local.merge(stats);
             }
-            let traverse_nanos = nanos_since(traverse_started);
+            let traverse_nanos = nanos_since(traversers_started);
+            let job_nanos = nanos_since(job_started);
             (
                 local,
                 LazyWorkerTiming {
                     deal_nanos,
                     bucket_nanos,
                     traverse_nanos,
+                    traversal_count: u64::from(num_players),
+                    max_job_nanos: job_nanos,
+                    max_job_iter: job_iter,
+                    slow_jobs: if job_nanos >= SLOW_LAZY_JOB_NANOS {
+                        1
+                    } else {
+                        0
+                    },
+                    max_traverser_nanos,
+                    max_traverser_iter: job_iter,
+                    max_traverser_seat,
+                    slow_traversers,
                 },
             )
         })
@@ -450,6 +503,21 @@ fn run_lazy_batch(
     LAZY_DEAL_NANOS.fetch_add(timing.deal_nanos, Ordering::Relaxed);
     LAZY_BUCKET_NANOS.fetch_add(timing.bucket_nanos, Ordering::Relaxed);
     LAZY_TRAVERSE_NANOS.fetch_add(timing.traverse_nanos, Ordering::Relaxed);
+    LAZY_TRAVERSAL_COUNT.fetch_add(timing.traversal_count, Ordering::Relaxed);
+    record_lazy_max(
+        &LAZY_MAX_JOB_NANOS,
+        &LAZY_MAX_JOB_ITER,
+        timing.max_job_nanos,
+        timing.max_job_iter,
+    );
+    LAZY_SLOW_JOBS.fetch_add(timing.slow_jobs, Ordering::Relaxed);
+    record_lazy_max(
+        &LAZY_MAX_TRAVERSER_NANOS,
+        &LAZY_MAX_TRAVERSER_CONTEXT,
+        timing.max_traverser_nanos,
+        pack_traverser_context(timing.max_traverser_iter, timing.max_traverser_seat),
+    );
+    LAZY_SLOW_TRAVERSERS.fetch_add(timing.slow_traversers, Ordering::Relaxed);
     PRUNE_HITS.fetch_add(batch_stats.hits, Ordering::Relaxed);
     PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
 }
@@ -459,6 +527,14 @@ struct LazyWorkerTiming {
     deal_nanos: u64,
     bucket_nanos: u64,
     traverse_nanos: u64,
+    traversal_count: u64,
+    max_job_nanos: u64,
+    max_job_iter: u64,
+    slow_jobs: u64,
+    max_traverser_nanos: u64,
+    max_traverser_iter: u64,
+    max_traverser_seat: u8,
+    slow_traversers: u64,
 }
 
 impl LazyWorkerTiming {
@@ -466,7 +542,37 @@ impl LazyWorkerTiming {
         self.deal_nanos = self.deal_nanos.saturating_add(other.deal_nanos);
         self.bucket_nanos = self.bucket_nanos.saturating_add(other.bucket_nanos);
         self.traverse_nanos = self.traverse_nanos.saturating_add(other.traverse_nanos);
+        self.traversal_count = self.traversal_count.saturating_add(other.traversal_count);
+        self.slow_jobs = self.slow_jobs.saturating_add(other.slow_jobs);
+        self.slow_traversers = self.slow_traversers.saturating_add(other.slow_traversers);
+        if other.max_job_nanos > self.max_job_nanos {
+            self.max_job_nanos = other.max_job_nanos;
+            self.max_job_iter = other.max_job_iter;
+        }
+        if other.max_traverser_nanos > self.max_traverser_nanos {
+            self.max_traverser_nanos = other.max_traverser_nanos;
+            self.max_traverser_iter = other.max_traverser_iter;
+            self.max_traverser_seat = other.max_traverser_seat;
+        }
     }
+}
+
+fn record_lazy_max(max_nanos: &AtomicU64, max_context: &AtomicU64, nanos: u64, context: u64) {
+    let mut current = max_nanos.load(Ordering::Relaxed);
+    while nanos > current {
+        match max_nanos.compare_exchange_weak(current, nanos, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                max_context.store(context, Ordering::Relaxed);
+                break;
+            }
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn pack_traverser_context(iter: u64, seat: u8) -> u64 {
+    (iter << 8) | u64::from(seat)
 }
 
 fn nanos_since(started: Instant) -> u64 {
@@ -786,6 +892,10 @@ mod tests {
         assert!(timing.deal_nanos > 0);
         assert!(timing.bucket_nanos > 0);
         assert!(timing.traverse_nanos > 0);
+        assert!(timing.traversal_count >= 4);
+        assert!(timing.max_job_nanos > 0);
+        assert!(timing.max_traverser_nanos > 0);
+        assert!(timing.max_traverser_seat < config.game.num_players);
         let _ = take_lazy_mp_timing_snapshot();
     }
 

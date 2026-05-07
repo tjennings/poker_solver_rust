@@ -2825,7 +2825,7 @@ impl MpNoTuiHeartbeat {
         };
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
@@ -2846,6 +2846,14 @@ impl MpNoTuiHeartbeat {
             format_nanos_millis(loop_timing.traverse_nanos),
             format_nanos_millis(loop_timing.discount_nanos),
             format_nanos_millis(stats_nanos),
+            loop_timing.traversal_count,
+            format_nanos_millis(loop_timing.max_job_nanos),
+            loop_timing.max_job_iter,
+            loop_timing.slow_jobs,
+            format_nanos_millis(loop_timing.max_traverser_nanos),
+            loop_timing.max_traverser_iter,
+            loop_timing.max_traverser_seat,
+            loop_timing.slow_traversers,
             prune_pct,
         );
         self.last_print = now;
