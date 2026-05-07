@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rayon::prelude::*;
@@ -135,6 +135,9 @@ struct Shard {
 /// Thread-safe sparse regret and average-strategy storage for lazy MP CFR.
 pub struct SparseMpStorage {
     shards: Box<[Shard]>,
+    shard_entry_counts: Box<[AtomicUsize]>,
+    entry_count: AtomicUsize,
+    slot_count: AtomicUsize,
     regret_floor: AtomicI32,
 }
 
@@ -159,8 +162,15 @@ impl SparseMpStorage {
             .map(|_| Shard::default())
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let shard_entry_counts = (0..shard_count)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             shards,
+            shard_entry_counts,
+            entry_count: AtomicUsize::new(0),
+            slot_count: AtomicUsize::new(0),
             regret_floor: AtomicI32::new(i32::MIN),
         }
     }
@@ -181,36 +191,37 @@ impl SparseMpStorage {
     /// Number of visited infosets currently allocated.
     #[must_use]
     pub fn entry_count(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| lock_entries(shard).len())
-            .sum()
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     /// Storage accounting for allocated sparse entries.
     #[must_use]
     pub fn stats(&self) -> SparseStorageStats {
-        let mut entries = 0;
-        let mut slots = 0;
         let mut nonempty_shards = 0;
         let mut max_entries_per_shard = 0;
-        for shard in &self.shards {
-            let guard = lock_entries(shard);
-            let shard_entries = guard.len();
-            entries += shard_entries;
+        for shard_entries in &self.shard_entry_counts {
+            let shard_entries = shard_entries.load(Ordering::Relaxed);
             if shard_entries > 0 {
                 nonempty_shards += 1;
             }
             max_entries_per_shard = max_entries_per_shard.max(shard_entries);
-            slots += guard
-                .values()
-                .map(|node| node.action_count())
-                .sum::<usize>();
         }
+        let entries = self.entry_count.load(Ordering::Relaxed);
+        let slots = self.slot_count.load(Ordering::Relaxed);
         let approx_bytes = self
             .shards
             .len()
             .saturating_mul(std::mem::size_of::<Shard>())
+            .saturating_add(
+                self.shard_entry_counts
+                    .len()
+                    .saturating_mul(std::mem::size_of::<AtomicUsize>()),
+            )
+            .saturating_add(
+                std::mem::size_of::<AtomicUsize>()
+                    .saturating_mul(2)
+                    .saturating_add(std::mem::size_of::<AtomicI32>()),
+            )
             .saturating_add(entries.saturating_mul(
                 std::mem::size_of::<MpInfosetKey>() + std::mem::size_of::<Arc<SparseNode>>(),
             ))
@@ -417,7 +428,7 @@ impl SparseMpStorage {
     }
 
     fn get_node(&self, key: MpInfosetKey) -> Option<Arc<SparseNode>> {
-        let shard = self.shard_for(key);
+        let shard = &self.shards[self.shard_index_for(key)];
         let guard = lock_entries(shard);
         guard.get(&key).cloned()
     }
@@ -426,7 +437,8 @@ impl SparseMpStorage {
         if num_actions == 0 {
             return None;
         }
-        let shard = self.shard_for(key);
+        let shard_idx = self.shard_index_for(key);
+        let shard = &self.shards[shard_idx];
         let mut guard = lock_entries(shard);
         if let Some(node) = guard.get(&key) {
             debug_assert_eq!(
@@ -438,16 +450,18 @@ impl SparseMpStorage {
         }
         let node = Arc::new(SparseNode::new(num_actions));
         guard.insert(key, Arc::clone(&node));
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
+        self.slot_count.fetch_add(num_actions, Ordering::Relaxed);
+        self.shard_entry_counts[shard_idx].fetch_add(1, Ordering::Relaxed);
         Some(node)
     }
 
-    fn shard_for(&self, key: MpInfosetKey) -> &Shard {
+    fn shard_index_for(&self, key: MpInfosetKey) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let shard_count = u64::try_from(self.shards.len()).expect("shard count fits in u64");
-        let idx = usize::try_from(hasher.finish() % shard_count)
-            .expect("bounded sparse shard index fits in usize");
-        &self.shards[idx]
+        usize::try_from(hasher.finish() % shard_count)
+            .expect("bounded sparse shard index fits in usize")
     }
 }
 
@@ -664,6 +678,22 @@ mod tests {
     }
 
     #[timed_test]
+    fn stats_do_not_double_count_existing_entries() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(1);
+
+        storage.add_regret(k, 3, 0, 1);
+        storage.add_regret(k, 3, 1, 1);
+        storage.add_strategy_sum(k, 3, 2, 1);
+
+        let stats = storage.stats();
+        assert_eq!(storage.entry_count(), 1);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.regret_slots, 3);
+        assert_eq!(stats.strategy_slots, 3);
+    }
+
+    #[timed_test]
     fn default_storage_uses_high_shard_count_for_large_lazy_runs() {
         let storage = SparseMpStorage::new();
         let stats = storage.stats();
@@ -705,6 +735,10 @@ mod tests {
         let restored = SparseMpStorage::from_snapshot_entries(storage.snapshot_entries());
 
         assert_eq!(restored.entry_count(), 1);
+        let stats = restored.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.regret_slots, 2);
+        assert_eq!(stats.strategy_slots, 2);
         assert_eq!(restored.get_regret(key(4), 0), 44);
         assert_eq!(restored.get_regret(key(4), 1), 0);
         assert_eq!(restored.get_strategy_sum(key(4), 0), 0);
