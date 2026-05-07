@@ -124,6 +124,8 @@ snapshots:
 
 100bb is a target stack depth for Blueprint MP. Use `training.backend: lazy_sparse` for 100bb 6-max configs with multiple preflop raise depths; it generates public states on demand and stores only visited infosets. The default `eager` backend still builds the complete public betting tree and dense regret/strategy storage before training, so `inspect-mp-config` will block known 100bb-scale dense-risk patterns unless `lazy_sparse` is selected.
 
+Lazy sparse DCFR discounting runs in parallel across sparse storage shards. The `discount` timing field in no-TUI telemetry is the wall-clock measurement to watch when checking whether discount passes are still causing single-core pauses.
+
 In `--no-tui` mode, lazy sparse progress is reported once per minute with sparse entries, slot counts, approximate storage, allocation growth rates, shard distribution, timing buckets for batch wall time, deal sampling, bucket lookup, traversal, DCFR discounting, and console stats collection, plus long-tail traversal telemetry (`max_job`, `max_trav`, and slow counts). These fields help diagnose whether throughput dips line up with sparse storage growth, shard imbalance, compute phases, reporting overhead, or a single long traversal holding the batch barrier.
 
 Run the 500/100/100 6-max experiment with:

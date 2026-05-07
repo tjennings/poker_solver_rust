@@ -13,6 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::{Seat, Street};
@@ -353,7 +354,7 @@ impl SparseMpStorage {
 
     /// Apply DCFR/LCFR discounts to visited entries only.
     pub fn discount(&self, d_pos: f64, d_neg: f64, d_strat: f64) {
-        for shard in &self.shards {
+        self.shards.par_iter().for_each(|shard| {
             let guard = lock_entries(shard);
             for node in guard.values() {
                 for regret in &node.regrets {
@@ -366,7 +367,7 @@ impl SparseMpStorage {
                     strategy_sum.store(discount_u64(value, d_strat), Ordering::Relaxed);
                 }
             }
-        }
+        });
     }
 
     /// Snapshot all visited entries in deterministic key order.
@@ -614,6 +615,35 @@ mod tests {
         assert_eq!(storage.get_strategy_sum(k, 0), 100);
         assert_eq!(storage.get_strategy_sum(k, 1), 200);
         assert_eq!(storage.entry_count(), 1);
+    }
+
+    #[timed_test]
+    fn discount_updates_entries_across_many_shards() {
+        let storage = SparseMpStorage::with_shards(64);
+        for bucket in 0..512 {
+            let k = key(bucket);
+            storage.add_regret(k, 2, 0, 100);
+            storage.add_regret(k, 2, 1, -100);
+            storage.add_strategy_sum(k, 2, 0, 1_000);
+            storage.add_strategy_sum(k, 2, 1, 2_000);
+        }
+
+        let before = storage.stats();
+        assert!(
+            before.nonempty_shards > 1,
+            "test should cover multiple shards"
+        );
+
+        storage.discount(0.5, 0.25, 0.1);
+
+        for bucket in 0..512 {
+            let k = key(bucket);
+            assert_eq!(storage.get_regret(k, 0), 50);
+            assert_eq!(storage.get_regret(k, 1), -25);
+            assert_eq!(storage.get_strategy_sum(k, 0), 100);
+            assert_eq!(storage.get_strategy_sum(k, 1), 200);
+        }
+        assert_eq!(storage.entry_count(), 512);
     }
 
     #[timed_test]
