@@ -118,6 +118,7 @@ snapshots:
 - `sample_configurations/blueprint_mp_6player_ante.yaml` -- 6-player 100bb with BB-ante
 - `sample_configurations/blueprint_mp_6max_simplified_actions.yaml` -- 6-max 20bb trainer using shared 500/50/50 postflop buckets, compact action sets, and TUI scenarios
 - `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml` -- 6-max 20bb trainer using shared 500/100/100 postflop buckets for the current bucket-quality experiment
+- `sample_configurations/blueprint_mp_6max_100bb_lazy_sparse_smoke.yaml` -- 6-max 100bb lazy-sparse regression smoke with two preflop raise rows and one training iteration
 
 #### 100bb Status
 

@@ -3534,6 +3534,51 @@ tui:
         assert!(result.is_ok());
     }
 
+    #[timed_test(5)]
+    fn mp_100bb_lazy_sparse_smoke_config_advances_without_dense_setup() {
+        use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_mp_6max_100bb_lazy_sparse_smoke.yaml"
+        ))
+        .expect("blueprint_mp_6max_100bb_lazy_sparse_smoke.yaml must exist");
+        let config: BlueprintMpConfig =
+            serde_yaml::from_str(&yaml).expect("YAML must parse as BlueprintMpConfig");
+
+        let report = super::inspect_mp_config(&config).unwrap();
+        assert_eq!(report.num_players, 6);
+        assert_eq!(report.stack_bb, 100.0);
+        assert_eq!(report.preflop_raise_rows, 2);
+        assert_eq!(report.backend, MpTrainingBackend::LazySparse);
+        assert!(
+            report.eager_risk.is_some(),
+            "the sample must remain a known dense eager risk"
+        );
+
+        let ctx = setup_lazy_training(&config);
+        assert_eq!(
+            ctx.storage.stats().approx_bytes,
+            0,
+            "lazy setup should not allocate visited infosets"
+        );
+
+        let result = run_lazy_training(&ctx, &config.training, &config.game);
+        let stats = ctx.storage.stats();
+
+        assert_eq!(result.meta_iterations, 1);
+        assert_eq!(ctx.iterations.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            stats.entries > 0,
+            "one lazy meta-iteration should visit and allocate sparse infosets"
+        );
+        assert!(
+            stats.approx_bytes < 10 * 1024 * 1024,
+            "one lazy smoke iteration should stay bounded, got {} bytes",
+            stats.approx_bytes
+        );
+    }
+
     #[test]
     fn inspect_mp_config_flags_100bb_multi_preflop_raise_rows() {
         let yaml = r#"

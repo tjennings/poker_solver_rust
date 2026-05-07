@@ -1,0 +1,62 @@
+# Blueprint MP Config - 100BB 6-max lazy_sparse regression smoke
+# Exercises multiple preflop raise depths without materializing eager dense storage.
+game:
+  name: "6-max 100bb lazy sparse smoke"
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 4
+      type: small_blind
+      amount: 1
+    - seat: 5
+      type: big_blind
+      amount: 2
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+  turn:
+    buckets: 100
+  river:
+    buckets: 100
+
+action_abstraction:
+  preflop:
+    lead: ["2bb"]
+    raise:
+      - ["1.0x"]
+      - ["1.0x"]
+  flop:
+    lead: [0.75]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+
+training:
+  backend: lazy_sparse
+  iterations: 1
+  batch_size: 1
+  lcfr_warmup_iterations: 300000
+  prune_after_iterations: 100000
+  prune_threshold: -50
+  dcfr_alpha: 1.5
+  dcfr_beta: 0.0
+  dcfr_gamma: 2.0
+
+snapshots:
+  resume: false
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/mp_6max_100bb_lazy_sparse_smoke"
+
+tui:
+  enabled: false
