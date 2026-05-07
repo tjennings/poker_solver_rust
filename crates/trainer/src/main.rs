@@ -60,6 +60,12 @@ enum Commands {
         #[arg(long)]
         no_tui: bool,
     },
+    /// Inspect a multiplayer blueprint config before training
+    InspectMpConfig {
+        /// YAML config file (BlueprintMpConfig)
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Run the clustering pipeline to build bucket assignments (Blueprint V2)
     Cluster {
         /// YAML config file (BlueprintV2Config — uses clustering section)
@@ -800,6 +806,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::TrainBlueprintMp { config, no_tui } => {
             run_train_blueprint_mp(config.to_str().expect("invalid config path"), no_tui)?;
+        }
+        Commands::InspectMpConfig { config } => {
+            run_inspect_mp_config(config.to_str().expect("invalid config path"))?;
         }
         Commands::Cluster { config, output } => {
             let yaml = std::fs::read_to_string(&config)?;
@@ -2471,6 +2480,18 @@ fn format_board_suffix(turn: Option<&str>, river: Option<&str>) -> String {
 // N-player blueprint training
 // ---------------------------------------------------------------------------
 
+fn run_inspect_mp_config(path: &str) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(path)?;
+    let config: BlueprintMpConfig = serde_yaml::from_str(&yaml)?;
+    config
+        .game
+        .validate()
+        .map_err(|e| format!("invalid config: {e}"))?;
+    let report = inspect_mp_config(&config)?;
+    print_mp_config_report(&report);
+    Ok(())
+}
+
 fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>> {
     let yaml = std::fs::read_to_string(path)?;
     let config: BlueprintMpConfig = serde_yaml::from_str(&yaml)?;
@@ -2478,6 +2499,13 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
         .game
         .validate()
         .map_err(|e| format!("invalid config: {e}"))?;
+    let report = inspect_mp_config(&config)?;
+    if let Some(risk) = &report.eager_risk {
+        return Err(format!(
+            "MP config is too large for the current eager backend: {risk}. Run inspect-mp-config for details."
+        )
+        .into());
+    }
     let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
     eprintln!(
         "Starting N-player blueprint training: {} ({} players, {}bb deep)",
@@ -2491,6 +2519,111 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
         run_mp_without_tui(&config)?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct MpConfigReport {
+    name: String,
+    num_players: u8,
+    stack_chips: f64,
+    big_blind: f64,
+    stack_bb: f64,
+    bucket_counts: [u16; 4],
+    preflop_lead_sizes: usize,
+    preflop_raise_rows: usize,
+    postflop_raise_rows: [usize; 3],
+    eager_risk: Option<String>,
+}
+
+fn inspect_mp_config(config: &BlueprintMpConfig) -> Result<MpConfigReport, Box<dyn Error>> {
+    let big_blind = mp_big_blind_amount(config)
+        .ok_or_else(|| "config must include a positive big_blind forced bet".to_string())?;
+    let stack_bb = config.game.stack_depth / big_blind;
+    let preflop_raise_rows = config.action_abstraction.preflop.raise.len();
+    let postflop_raise_rows = [
+        config.action_abstraction.flop.raise.len(),
+        config.action_abstraction.turn.raise.len(),
+        config.action_abstraction.river.raise.len(),
+    ];
+    let eager_risk = mp_eager_risk(
+        config.game.num_players,
+        stack_bb,
+        preflop_raise_rows,
+        postflop_raise_rows,
+    );
+    Ok(MpConfigReport {
+        name: config.game.name.clone(),
+        num_players: config.game.num_players,
+        stack_chips: config.game.stack_depth,
+        big_blind,
+        stack_bb,
+        bucket_counts: config.clustering.bucket_counts(),
+        preflop_lead_sizes: config.action_abstraction.preflop.lead.len(),
+        preflop_raise_rows,
+        postflop_raise_rows,
+        eager_risk,
+    })
+}
+
+fn mp_big_blind_amount(config: &BlueprintMpConfig) -> Option<f64> {
+    use poker_solver_core::blueprint_mp::config::ForcedBetKind;
+
+    config
+        .game
+        .blinds
+        .iter()
+        .find(|blind| blind.kind == ForcedBetKind::BigBlind && blind.amount > 0.0)
+        .map(|blind| blind.amount)
+}
+
+fn mp_eager_risk(
+    num_players: u8,
+    stack_bb: f64,
+    preflop_raise_rows: usize,
+    postflop_raise_rows: [usize; 3],
+) -> Option<String> {
+    let total_postflop_rows: usize = postflop_raise_rows.iter().sum();
+    if num_players >= 6 && stack_bb >= 80.0 && preflop_raise_rows >= 2 {
+        return Some(
+            "unsafe for current eager backend: 100bb-scale 6-max with multiple preflop raise rows can exceed hundreds of millions of nodes and hundreds of GB of dense storage; use the planned lazy_sparse backend once implemented".to_string(),
+        );
+    }
+    if num_players >= 6 && stack_bb >= 80.0 && total_postflop_rows >= 4 {
+        return Some(
+            "high risk for current eager backend: 100bb-scale 6-max with broad postflop raise rows may materialize an impractically large dense tree".to_string(),
+        );
+    }
+    None
+}
+
+fn print_mp_config_report(report: &MpConfigReport) {
+    eprintln!("Blueprint MP config preflight");
+    eprintln!("  Name: {}", report.name);
+    eprintln!("  Players: {}", report.num_players);
+    eprintln!(
+        "  Stack: {:.1} chips ({:.1}bb, BB={:.1} chips)",
+        report.stack_chips, report.stack_bb, report.big_blind
+    );
+    eprintln!(
+        "  Buckets: preflop={}, flop={}, turn={}, river={}",
+        report.bucket_counts[0],
+        report.bucket_counts[1],
+        report.bucket_counts[2],
+        report.bucket_counts[3]
+    );
+    eprintln!(
+        "  Actions: preflop_leads={}, preflop_raise_rows={}, flop_raise_rows={}, turn_raise_rows={}, river_raise_rows={}",
+        report.preflop_lead_sizes,
+        report.preflop_raise_rows,
+        report.postflop_raise_rows[0],
+        report.postflop_raise_rows[1],
+        report.postflop_raise_rows[2]
+    );
+    if let Some(risk) = &report.eager_risk {
+        eprintln!("  Eager backend: {risk}");
+    } else {
+        eprintln!("  Eager backend: no known 100bb-scale risk pattern detected");
+    }
 }
 
 fn run_mp_without_tui(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
@@ -3120,6 +3253,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inspect_mp_config_cli_parses() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "inspect-mp-config",
+            "--config",
+            "/tmp/test.yaml",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "inspect-mp-config CLI must parse: {:?}",
+            cli.err()
+        );
+    }
+
     /// The 3-player sample config must parse as BlueprintMpConfig.
     #[timed_test]
     fn mp_3player_sample_yaml_parses() {
@@ -3221,6 +3370,66 @@ snapshots:
         std::fs::write(&path, yaml).unwrap();
         let result = super::run_train_blueprint_mp(path.to_str().unwrap(), false);
         assert!(result.is_err(), "should reject num_players=99");
+    }
+
+    #[test]
+    fn inspect_mp_config_flags_100bb_multi_preflop_raise_rows() {
+        let yaml = r#"
+game:
+  name: "100bb risk"
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 4
+      type: small_blind
+      amount: 1
+    - seat: 5
+      type: big_blind
+      amount: 2
+
+action_abstraction:
+  preflop:
+    lead: ["2bb"]
+    raise:
+      - ["1.0x"]
+      - ["1.0x"]
+  flop:
+    lead: [0.75]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop: { buckets: 169 }
+  flop: { buckets: 500 }
+  turn: { buckets: 100 }
+  river: { buckets: 100 }
+
+training:
+  iterations: 1
+
+snapshots:
+  warmup_minutes: 1
+  snapshot_every_minutes: 1
+  output_dir: "/tmp/risk"
+"#;
+        let config: BlueprintMpConfig = serde_yaml::from_str(yaml).unwrap();
+
+        let report = super::inspect_mp_config(&config).unwrap();
+
+        assert_eq!(report.stack_bb, 100.0);
+        assert_eq!(report.preflop_raise_rows, 2);
+        assert!(
+            report.eager_risk.is_some(),
+            "100bb 6-max with two preflop raise rows should be flagged"
+        );
     }
 
     #[test]

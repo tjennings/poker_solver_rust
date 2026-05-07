@@ -27,6 +27,15 @@ Train a multiplayer (2-8 player) blueprint strategy using external-sampling MCCF
 cargo run -p poker-solver-trainer --release -- train-blueprint-mp <config.yaml>
 ```
 
+### inspect-mp-config
+
+Inspect a multiplayer blueprint config before training. This reports effective stack depth, bucket counts, action-row counts, and known eager-backend risk patterns before the trainer builds dense tree/storage structures.
+
+```bash
+cargo run -p poker-solver-trainer --release -- inspect-mp-config \
+  -c sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml
+```
+
 #### Config Format
 
 The N-player config uses a different format from the 2-player `train-blueprint` command:
