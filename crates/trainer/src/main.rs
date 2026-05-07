@@ -22,14 +22,13 @@ mod validation_spots;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
-use poker_solver_core::blueprint_mp::trainer::train_blueprint_mp;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 
@@ -2489,13 +2488,183 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
     if tui_config.enabled && !no_tui {
         run_mp_with_tui(&config, &tui_config)?;
     } else {
-        let result = train_blueprint_mp(&config);
-        eprintln!(
-            "Training complete: {} meta-iterations",
-            result.meta_iterations
-        );
+        run_mp_without_tui(&config)?;
     }
     Ok(())
+}
+
+fn run_mp_without_tui(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_mp::trainer::{run_training, setup_training};
+
+    let ctx = setup_training(config);
+    let shared_iters = Arc::clone(&ctx.iterations);
+    let storage = Arc::clone(&ctx.storage);
+    let train_config = config.clone();
+    let train_handle =
+        std::thread::spawn(move || run_training(&ctx, &train_config.training, &train_config.game));
+
+    let mut heartbeat = MpNoTuiHeartbeat::new();
+    eprintln!("  no-TUI progress: heartbeat every 10s");
+    while !train_handle.is_finished() {
+        std::thread::sleep(Duration::from_secs(1));
+        if heartbeat.should_print() {
+            heartbeat.print(&shared_iters, &storage);
+        }
+    }
+    heartbeat.print(&shared_iters, &storage);
+    let result = train_handle.join().expect("training thread panicked");
+    eprintln!(
+        "Training complete: {} meta-iterations",
+        result.meta_iterations
+    );
+    Ok(())
+}
+
+struct MpNoTuiHeartbeat {
+    started: Instant,
+    last_print: Instant,
+    last_iters: u64,
+}
+
+impl MpNoTuiHeartbeat {
+    const INTERVAL: Duration = Duration::from_secs(10);
+
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_print: now,
+            last_iters: 0,
+        }
+    }
+
+    fn should_print(&self) -> bool {
+        self.last_print.elapsed() >= Self::INTERVAL
+    }
+
+    fn print(
+        &mut self,
+        iterations: &AtomicU64,
+        storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    ) {
+        let now = Instant::now();
+        let iters = iterations.load(Ordering::Relaxed);
+        let since_last = now.duration_since(self.last_print).as_secs_f64();
+        let elapsed = now.duration_since(self.started);
+        let interval_iters = iters.saturating_sub(self.last_iters);
+        let interval_rate = if since_last > 0.0 {
+            interval_iters as f64 / since_last
+        } else {
+            0.0
+        };
+        let elapsed_secs = elapsed.as_secs_f64();
+        let avg_rate = if elapsed_secs > 0.0 {
+            iters as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+        let regret = sample_mp_regret_summary(
+            &storage.regrets,
+            poker_solver_core::blueprint_mp::storage::REGRET_SCALE,
+            1_000_000,
+        );
+        let prune_pct = take_mp_prune_pct();
+        let regret_text = regret.map_or_else(
+            || "regret[n/a]".to_string(),
+            |r| {
+                format!(
+                    "regret[max+={:.1}, max-={:.1}, avg+={:.3e}, pos={}/{} sampled]",
+                    r.max_positive, r.max_negative, r.avg_positive, r.positive_count, r.samples
+                )
+            },
+        );
+        eprintln!(
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} {} prune={:.1}%",
+            iters,
+            interval_rate,
+            avg_rate,
+            format_duration_compact(elapsed),
+            regret_text,
+            prune_pct,
+        );
+        self.last_print = now;
+        self.last_iters = iters;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MpRegretSummary {
+    max_positive: f64,
+    max_negative: f64,
+    avg_positive: f64,
+    positive_count: u64,
+    samples: u64,
+}
+
+fn sample_mp_regret_summary(
+    regrets: &[AtomicI32],
+    regret_scale: f64,
+    max_samples: usize,
+) -> Option<MpRegretSummary> {
+    if regrets.is_empty() || max_samples == 0 {
+        return None;
+    }
+    let step = (regrets.len() / max_samples).max(1);
+    let mut max_positive = 0_i32;
+    let mut min_negative = 0_i32;
+    let mut positive_sum = 0_i64;
+    let mut positive_count = 0_u64;
+    let mut samples = 0_u64;
+
+    for atom in regrets.iter().step_by(step).take(max_samples) {
+        let v = atom.load(Ordering::Relaxed);
+        max_positive = max_positive.max(v);
+        min_negative = min_negative.min(v);
+        if v > 0 {
+            positive_sum += i64::from(v);
+            positive_count += 1;
+        }
+        samples += 1;
+    }
+
+    let avg_positive = if positive_count > 0 {
+        (positive_sum as f64 / positive_count as f64) / regret_scale
+    } else {
+        0.0
+    };
+    Some(MpRegretSummary {
+        max_positive: f64::from(max_positive) / regret_scale,
+        max_negative: f64::from(min_negative) / regret_scale,
+        avg_positive,
+        positive_count,
+        samples,
+    })
+}
+
+fn take_mp_prune_pct() -> f64 {
+    use poker_solver_core::blueprint_mp::trainer::{PRUNE_HITS, PRUNE_TOTAL};
+
+    let hits = PRUNE_HITS.swap(0, Ordering::Relaxed);
+    let total = PRUNE_TOTAL.swap(0, Ordering::Relaxed);
+    if total > 0 {
+        hits as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
+fn format_duration_compact(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn run_mp_with_tui(
@@ -2520,6 +2689,7 @@ fn run_mp_with_tui(
     let train_config = config.clone();
     let train_handle =
         std::thread::spawn(move || run_training(&ctx, &train_config.training, &train_config.game));
+    let telemetry_in_flight = Arc::new(AtomicBool::new(false));
     bridge_mp_iterations(
         &shared_iters,
         &storage,
@@ -2529,6 +2699,7 @@ fn run_mp_with_tui(
         &quit_flag,
         &train_handle,
         &config.snapshots,
+        &telemetry_in_flight,
     );
     // Signal both the TUI and training thread to stop
     metrics.quit_requested.store(true, Ordering::Relaxed);
@@ -2567,6 +2738,7 @@ fn bridge_mp_iterations<T>(
     quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    telemetry_in_flight: &Arc<AtomicBool>,
 ) {
     let mut last_telemetry = Instant::now();
     let telemetry_interval = Duration::from_secs(10);
@@ -2582,13 +2754,20 @@ fn bridge_mp_iterations<T>(
             }
         }
         if last_telemetry.elapsed() >= telemetry_interval {
-            // Spawn telemetry scan on a background thread to avoid blocking
-            // the iteration counter bridge (the scan touches billions of entries).
-            let s = Arc::clone(storage);
-            let t = Arc::clone(tree);
-            let m = Arc::clone(metrics);
-            let nodes = scenario_node_ids.to_vec();
-            std::thread::spawn(move || push_mp_telemetry(&s, &t, &nodes, &m, iters));
+            if !telemetry_in_flight.swap(true, Ordering::Relaxed) {
+                // Spawn telemetry scan on a background thread to avoid blocking
+                // the iteration counter bridge. Keep only one full-storage scan
+                // active so large abstractions cannot stack memory-bandwidth work.
+                let s = Arc::clone(storage);
+                let t = Arc::clone(tree);
+                let m = Arc::clone(metrics);
+                let nodes = scenario_node_ids.to_vec();
+                let gate = Arc::clone(telemetry_in_flight);
+                std::thread::spawn(move || {
+                    push_mp_telemetry(&s, &t, &nodes, &m, iters);
+                    gate.store(false, Ordering::Relaxed);
+                });
+            }
             last_telemetry = Instant::now();
         }
         if handle.is_finished() {
@@ -2730,16 +2909,7 @@ fn push_mp_telemetry(
         poker_solver_core::blueprint_mp::storage::REGRET_SCALE,
         metrics,
     );
-    // Push prune stats
-    use poker_solver_core::blueprint_mp::trainer::{PRUNE_HITS, PRUNE_TOTAL};
-    let hits = PRUNE_HITS.swap(0, Ordering::Relaxed);
-    let total = PRUNE_TOTAL.swap(0, Ordering::Relaxed);
-    let prune_pct = if total > 0 {
-        hits as f64 / total as f64 * 100.0
-    } else {
-        0.0
-    };
-    metrics.push_prune_fraction(prune_pct);
+    metrics.push_prune_fraction(take_mp_prune_pct());
     // Push strategy grids for each scenario
     for (idx, &node_idx) in scenario_node_ids.iter().enumerate() {
         let grid_state = mp_tui_scenarios::extract_mp_grid(tree, storage, node_idx, iters, "");
@@ -3162,6 +3332,24 @@ snapshots:
         .unwrap();
         assert_eq!(metadata["kind"], "blueprint_mp");
         assert_eq!(metadata["iterations"], 123);
+    }
+
+    #[test]
+    fn sample_mp_regret_summary_reports_scaled_stats() {
+        let regrets = [
+            std::sync::atomic::AtomicI32::new(100),
+            std::sync::atomic::AtomicI32::new(-60),
+            std::sync::atomic::AtomicI32::new(40),
+            std::sync::atomic::AtomicI32::new(0),
+        ];
+
+        let summary = super::sample_mp_regret_summary(&regrets, 20.0, 10).unwrap();
+
+        assert_eq!(summary.max_positive, 5.0);
+        assert_eq!(summary.max_negative, -3.0);
+        assert!((summary.avg_positive - 3.5).abs() < 1e-9);
+        assert_eq!(summary.positive_count, 2);
+        assert_eq!(summary.samples, 4);
     }
 
     /// The 6-player ante sample config should have a tui section after update.
