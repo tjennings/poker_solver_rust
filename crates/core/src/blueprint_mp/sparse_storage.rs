@@ -1,0 +1,652 @@
+//! Sparse visited-infoset storage for lazy multiplayer blueprint training.
+//!
+//! Unlike [`super::storage::MpStorage`], this backend does not allocate a
+//! `(public-node, bucket, action)` slab for the full eager tree. Entries are
+//! allocated only after an infoset is touched, while missing entries retain the
+//! CFR semantics of zero regret and uniform strategy.
+
+#![allow(clippy::cast_precision_loss)]
+
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use serde::{Deserialize, Serialize};
+
+use super::{Seat, Street};
+
+const DEFAULT_SHARDS: usize = 256;
+
+/// Stable key for one lazy MP infoset.
+///
+/// `history_hi`/`history_lo` carry the compact action history when it fits in
+/// 128 bits. `history_hash` keeps keys stable for longer histories, while
+/// `history_len` distinguishes equal packed prefixes of different lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MpInfosetKey {
+    pub seat: u8,
+    pub street: u8,
+    pub bucket: u16,
+    pub spr_bucket: u8,
+    pub history_hi: u64,
+    pub history_lo: u64,
+    pub history_hash: u64,
+    pub history_len: u16,
+}
+
+impl MpInfosetKey {
+    /// Create a key from typed MP components.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_parts(
+        seat: Seat,
+        street: Street,
+        bucket: u16,
+        spr_bucket: u8,
+        history_hi: u64,
+        history_lo: u64,
+        history_hash: u64,
+        history_len: u16,
+    ) -> Self {
+        Self {
+            seat: seat.index(),
+            street: street as u8,
+            bucket,
+            spr_bucket,
+            history_hi,
+            history_lo,
+            history_hash,
+            history_len,
+        }
+    }
+
+    /// Return the seat component.
+    #[must_use]
+    pub const fn seat(self) -> Seat {
+        Seat::from_raw(self.seat)
+    }
+
+    /// Return the street component when the serialized byte is valid.
+    #[must_use]
+    pub const fn street(self) -> Option<Street> {
+        Street::from_u8(self.street)
+    }
+}
+
+/// Coarse storage accounting for sparse MP storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseStorageStats {
+    pub entries: usize,
+    pub regret_slots: usize,
+    pub strategy_slots: usize,
+    pub approx_bytes: usize,
+}
+
+/// Serializable snapshot of one visited sparse infoset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseSnapshotEntry {
+    pub key: MpInfosetKey,
+    pub num_actions: u8,
+    pub regrets: Vec<i32>,
+    pub strategy_sums: Vec<u64>,
+}
+
+struct SparseNode {
+    num_actions: u8,
+    regrets: Box<[AtomicI32]>,
+    strategy_sums: Box<[AtomicU64]>,
+}
+
+impl SparseNode {
+    fn new(num_actions: usize) -> Self {
+        let num_actions_u8 =
+            u8::try_from(num_actions).expect("sparse infoset supports at most 255 actions");
+        let regrets = (0..num_actions)
+            .map(|_| AtomicI32::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let strategy_sums = (0..num_actions)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            num_actions: num_actions_u8,
+            regrets,
+            strategy_sums,
+        }
+    }
+
+    fn action_count(&self) -> usize {
+        self.num_actions as usize
+    }
+}
+
+#[derive(Default)]
+struct Shard {
+    entries: Mutex<HashMap<MpInfosetKey, Arc<SparseNode>>>,
+}
+
+/// Thread-safe sparse regret and average-strategy storage for lazy MP CFR.
+pub struct SparseMpStorage {
+    shards: Box<[Shard]>,
+    regret_floor: AtomicI32,
+}
+
+impl Default for SparseMpStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SparseMpStorage {
+    /// Build storage with the default shard count.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_shards(DEFAULT_SHARDS)
+    }
+
+    /// Build storage with a caller-selected shard count.
+    #[must_use]
+    pub fn with_shards(num_shards: usize) -> Self {
+        let shard_count = num_shards.max(1);
+        let shards = (0..shard_count)
+            .map(|_| Shard::default())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            shards,
+            regret_floor: AtomicI32::new(i32::MIN),
+        }
+    }
+
+    /// Build storage from sparse snapshot entries.
+    #[must_use]
+    pub fn from_snapshot_entries(entries: impl IntoIterator<Item = SparseSnapshotEntry>) -> Self {
+        let storage = Self::new();
+        storage.load_snapshot_entries(entries);
+        storage
+    }
+
+    /// Set a lower bound for cumulative regret updates.
+    pub fn set_regret_floor(&self, floor: i32) {
+        self.regret_floor.store(floor, Ordering::Relaxed);
+    }
+
+    /// Number of visited infosets currently allocated.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| lock_entries(shard).len())
+            .sum()
+    }
+
+    /// Storage accounting for allocated sparse entries.
+    #[must_use]
+    pub fn stats(&self) -> SparseStorageStats {
+        let mut entries = 0;
+        let mut slots = 0;
+        for shard in &self.shards {
+            let guard = lock_entries(shard);
+            entries += guard.len();
+            slots += guard
+                .values()
+                .map(|node| node.action_count())
+                .sum::<usize>();
+        }
+        let approx_bytes = entries
+            .saturating_mul(
+                std::mem::size_of::<MpInfosetKey>() + std::mem::size_of::<Arc<SparseNode>>(),
+            )
+            .saturating_add(slots.saturating_mul(
+                std::mem::size_of::<AtomicI32>() + std::mem::size_of::<AtomicU64>(),
+            ));
+        SparseStorageStats {
+            entries,
+            regret_slots: slots,
+            strategy_slots: slots,
+            approx_bytes,
+        }
+    }
+
+    /// Read a regret value. Missing entries or out-of-range actions return zero.
+    #[must_use]
+    pub fn get_regret(&self, key: MpInfosetKey, action: usize) -> i32 {
+        let Some(node) = self.get_node(key) else {
+            return 0;
+        };
+        node.regrets
+            .get(action)
+            .map_or(0, |atom| atom.load(Ordering::Relaxed))
+    }
+
+    /// Read a strategy-sum value. Missing entries or out-of-range actions return zero.
+    #[must_use]
+    pub fn get_strategy_sum(&self, key: MpInfosetKey, action: usize) -> u64 {
+        let Some(node) = self.get_node(key) else {
+            return 0;
+        };
+        node.strategy_sums
+            .get(action)
+            .map_or(0, |atom| atom.load(Ordering::Relaxed))
+    }
+
+    /// Add a regret delta, allocating the infoset if needed.
+    pub fn add_regret(&self, key: MpInfosetKey, num_actions: usize, action: usize, delta: i32) {
+        if action >= num_actions {
+            return;
+        }
+        let Some(node) = self.get_or_create_node(key, num_actions) else {
+            return;
+        };
+        let Some(atom) = node.regrets.get(action) else {
+            return;
+        };
+        let floor = self.regret_floor.load(Ordering::Relaxed);
+        atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let value = old.saturating_add(delta);
+            Some(if floor == i32::MIN {
+                value
+            } else {
+                value.max(floor)
+            })
+        })
+        .ok();
+    }
+
+    /// Add a non-negative strategy-sum delta, allocating the infoset if needed.
+    pub fn add_strategy_sum(
+        &self,
+        key: MpInfosetKey,
+        num_actions: usize,
+        action: usize,
+        delta: i32,
+    ) {
+        if action >= num_actions {
+            return;
+        }
+        let Ok(delta) = u64::try_from(delta) else {
+            return;
+        };
+        let Some(node) = self.get_or_create_node(key, num_actions) else {
+            return;
+        };
+        let Some(atom) = node.strategy_sums.get(action) else {
+            return;
+        };
+        atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            Some(old.saturating_add(delta))
+        })
+        .ok();
+    }
+
+    /// Current strategy via regret matching. Missing entries are uniform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` is shorter than `num_actions`.
+    pub fn regret_matched_strategy(&self, key: MpInfosetKey, num_actions: usize, out: &mut [f64]) {
+        assert!(
+            out.len() >= num_actions,
+            "strategy output shorter than action count"
+        );
+        let Some(node) = self.get_node(key) else {
+            fill_uniform(out, num_actions);
+            return;
+        };
+        let mut positive_sum = 0.0;
+        for (i, slot) in out[..num_actions].iter_mut().enumerate() {
+            let raw = node
+                .regrets
+                .get(i)
+                .map_or(0, |atom| atom.load(Ordering::Relaxed));
+            let regret = f64::from(raw.max(0));
+            *slot = regret;
+            positive_sum += regret;
+        }
+        normalize_or_uniform(out, num_actions, positive_sum);
+    }
+
+    /// Average strategy from strategy sums. Missing or zero-sum entries are uniform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` is shorter than `num_actions`.
+    pub fn average_strategy(&self, key: MpInfosetKey, num_actions: usize, out: &mut [f64]) {
+        assert!(
+            out.len() >= num_actions,
+            "strategy output shorter than action count"
+        );
+        let Some(node) = self.get_node(key) else {
+            fill_uniform(out, num_actions);
+            return;
+        };
+        let mut total = 0.0;
+        for (i, slot) in out[..num_actions].iter_mut().enumerate() {
+            let sum = node
+                .strategy_sums
+                .get(i)
+                .map_or(0, |atom| atom.load(Ordering::Relaxed));
+            *slot = sum as f64;
+            total += *slot;
+        }
+        normalize_or_uniform(out, num_actions, total);
+    }
+
+    /// Apply DCFR/LCFR discounts to visited entries only.
+    pub fn discount(&self, d_pos: f64, d_neg: f64, d_strat: f64) {
+        for shard in &self.shards {
+            let guard = lock_entries(shard);
+            for node in guard.values() {
+                for regret in &node.regrets {
+                    let value = regret.load(Ordering::Relaxed);
+                    let factor = if value >= 0 { d_pos } else { d_neg };
+                    regret.store(discount_i32(value, factor), Ordering::Relaxed);
+                }
+                for strategy_sum in &node.strategy_sums {
+                    let value = strategy_sum.load(Ordering::Relaxed);
+                    strategy_sum.store(discount_u64(value, d_strat), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Snapshot all visited entries in deterministic key order.
+    #[must_use]
+    pub fn snapshot_entries(&self) -> Vec<SparseSnapshotEntry> {
+        let mut entries = Vec::with_capacity(self.entry_count());
+        for shard in &self.shards {
+            let guard = lock_entries(shard);
+            for (&key, node) in guard.iter() {
+                entries.push(SparseSnapshotEntry {
+                    key,
+                    num_actions: node.num_actions,
+                    regrets: node
+                        .regrets
+                        .iter()
+                        .map(|atom| atom.load(Ordering::Relaxed))
+                        .collect(),
+                    strategy_sums: node
+                        .strategy_sums
+                        .iter()
+                        .map(|atom| atom.load(Ordering::Relaxed))
+                        .collect(),
+                });
+            }
+        }
+        entries.sort_unstable_by_key(|entry| entry.key);
+        entries
+    }
+
+    /// Load sparse snapshot entries, replacing values for matching visited keys.
+    pub fn load_snapshot_entries(&self, entries: impl IntoIterator<Item = SparseSnapshotEntry>) {
+        for entry in entries {
+            let num_actions = usize::from(entry.num_actions);
+            let Some(node) = self.get_or_create_node(entry.key, num_actions) else {
+                continue;
+            };
+            for (idx, regret) in node.regrets.iter().enumerate() {
+                regret.store(*entry.regrets.get(idx).unwrap_or(&0), Ordering::Relaxed);
+            }
+            for (idx, strategy_sum) in node.strategy_sums.iter().enumerate() {
+                strategy_sum.store(
+                    *entry.strategy_sums.get(idx).unwrap_or(&0),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    fn get_node(&self, key: MpInfosetKey) -> Option<Arc<SparseNode>> {
+        let shard = self.shard_for(key);
+        let guard = lock_entries(shard);
+        guard.get(&key).cloned()
+    }
+
+    fn get_or_create_node(&self, key: MpInfosetKey, num_actions: usize) -> Option<Arc<SparseNode>> {
+        if num_actions == 0 {
+            return None;
+        }
+        let shard = self.shard_for(key);
+        let mut guard = lock_entries(shard);
+        if let Some(node) = guard.get(&key) {
+            debug_assert_eq!(
+                node.action_count(),
+                num_actions,
+                "same sparse infoset key used with different action counts"
+            );
+            return Some(Arc::clone(node));
+        }
+        let node = Arc::new(SparseNode::new(num_actions));
+        guard.insert(key, Arc::clone(&node));
+        Some(node)
+    }
+
+    fn shard_for(&self, key: MpInfosetKey) -> &Shard {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let shard_count = u64::try_from(self.shards.len()).expect("shard count fits in u64");
+        let idx = usize::try_from(hasher.finish() % shard_count)
+            .expect("bounded sparse shard index fits in usize");
+        &self.shards[idx]
+    }
+}
+
+fn lock_entries(shard: &Shard) -> MutexGuard<'_, HashMap<MpInfosetKey, Arc<SparseNode>>> {
+    shard
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn normalize_or_uniform(out: &mut [f64], n: usize, sum: f64) {
+    if n == 0 {
+        return;
+    }
+    if sum > 0.0 {
+        for value in &mut out[..n] {
+            *value /= sum;
+        }
+    } else {
+        fill_uniform(out, n);
+    }
+}
+
+fn fill_uniform(out: &mut [f64], n: usize) {
+    if n == 0 {
+        return;
+    }
+    out[..n].fill(1.0 / n as f64);
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn discount_i32(value: i32, factor: f64) -> i32 {
+    (f64::from(value) * factor)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn discount_u64(value: u64, factor: f64) -> u64 {
+    ((value as f64) * factor).clamp(0.0, u64::MAX as f64) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_macros::timed_test;
+
+    fn key(bucket: u16) -> MpInfosetKey {
+        MpInfosetKey::from_parts(
+            Seat::from_raw(2),
+            Street::Flop,
+            bucket,
+            3,
+            0xAA,
+            0xBB,
+            0xCC,
+            4,
+        )
+    }
+
+    fn assert_strategy_close(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual_value, expected_value) in actual.iter().zip(expected) {
+            assert!(
+                (actual_value - expected_value).abs() < 1e-12,
+                "strategy mismatch: actual={actual:?} expected={expected:?}"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn missing_entries_read_as_zero_and_uniform() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(7);
+
+        assert_eq!(storage.get_regret(k, 0), 0);
+        assert_eq!(storage.get_strategy_sum(k, 1), 0);
+
+        let mut strategy = [0.0; 3];
+        storage.regret_matched_strategy(k, 3, &mut strategy);
+        assert_strategy_close(&strategy, &[1.0 / 3.0; 3]);
+
+        storage.average_strategy(k, 3, &mut strategy);
+        assert_strategy_close(&strategy, &[1.0 / 3.0; 3]);
+        assert_eq!(storage.entry_count(), 0);
+    }
+
+    #[timed_test]
+    fn regret_round_trip_and_regret_matching() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(2);
+
+        storage.add_regret(k, 3, 0, -500);
+        storage.add_regret(k, 3, 1, 100);
+        storage.add_regret(k, 3, 2, 300);
+
+        assert_eq!(storage.get_regret(k, 0), -500);
+        assert_eq!(storage.get_regret(k, 1), 100);
+        assert_eq!(storage.get_regret(k, 2), 300);
+
+        let mut strategy = [0.0; 3];
+        storage.regret_matched_strategy(k, 3, &mut strategy);
+        assert_strategy_close(&strategy, &[0.0, 0.25, 0.75]);
+    }
+
+    #[timed_test]
+    fn strategy_sum_round_trip_and_average_strategy() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(2);
+
+        storage.add_strategy_sum(k, 2, 0, 300);
+        storage.add_strategy_sum(k, 2, 1, 700);
+        storage.add_strategy_sum(k, 2, 1, -10);
+
+        assert_eq!(storage.get_strategy_sum(k, 0), 300);
+        assert_eq!(storage.get_strategy_sum(k, 1), 700);
+
+        let mut strategy = [0.0; 2];
+        storage.average_strategy(k, 2, &mut strategy);
+        assert_strategy_close(&strategy, &[0.3, 0.7]);
+    }
+
+    #[timed_test]
+    fn out_of_range_updates_are_ignored() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(9);
+
+        storage.add_regret(k, 2, 2, 100);
+        storage.add_strategy_sum(k, 2, 3, 100);
+
+        assert_eq!(storage.entry_count(), 0);
+        assert_eq!(storage.get_regret(k, 2), 0);
+        assert_eq!(storage.get_strategy_sum(k, 3), 0);
+    }
+
+    #[timed_test]
+    fn regret_floor_is_applied_to_updates() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(1);
+
+        storage.set_regret_floor(-1_000);
+        storage.add_regret(k, 2, 0, -5_000);
+
+        assert_eq!(storage.get_regret(k, 0), -1_000);
+    }
+
+    #[timed_test]
+    fn discount_updates_visited_entries_only() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(3);
+
+        storage.add_regret(k, 2, 0, 101);
+        storage.add_regret(k, 2, 1, -101);
+        storage.add_strategy_sum(k, 2, 0, 1_000);
+        storage.add_strategy_sum(k, 2, 1, 2_000);
+
+        storage.discount(0.5, 0.25, 0.1);
+
+        assert_eq!(storage.get_regret(k, 0), 51);
+        assert_eq!(storage.get_regret(k, 1), -25);
+        assert_eq!(storage.get_strategy_sum(k, 0), 100);
+        assert_eq!(storage.get_strategy_sum(k, 1), 200);
+        assert_eq!(storage.entry_count(), 1);
+    }
+
+    #[timed_test]
+    fn stats_count_entries_and_slots() {
+        let storage = SparseMpStorage::with_shards(4);
+
+        storage.add_regret(key(1), 2, 0, 1);
+        storage.add_strategy_sum(key(2), 3, 1, 1);
+
+        let stats = storage.stats();
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.regret_slots, 5);
+        assert_eq!(stats.strategy_slots, 5);
+        assert!(stats.approx_bytes > 0);
+    }
+
+    #[timed_test]
+    fn snapshot_entries_are_sorted_and_complete() {
+        let storage = SparseMpStorage::with_shards(4);
+
+        storage.add_regret(key(9), 2, 1, 22);
+        storage.add_strategy_sum(key(9), 2, 0, 11);
+        storage.add_regret(key(1), 3, 2, 33);
+
+        let snapshot = storage.snapshot_entries();
+
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot[0].key < snapshot[1].key);
+        assert_eq!(snapshot[0].num_actions, 3);
+        assert_eq!(snapshot[0].regrets, vec![0, 0, 33]);
+        assert_eq!(snapshot[0].strategy_sums, vec![0, 0, 0]);
+        assert_eq!(snapshot[1].num_actions, 2);
+        assert_eq!(snapshot[1].regrets, vec![0, 22]);
+        assert_eq!(snapshot[1].strategy_sums, vec![11, 0]);
+    }
+
+    #[timed_test]
+    fn snapshot_entries_can_restore_storage() {
+        let storage = SparseMpStorage::with_shards(4);
+
+        storage.add_regret(key(4), 2, 0, 44);
+        storage.add_strategy_sum(key(4), 2, 1, 55);
+
+        let restored = SparseMpStorage::from_snapshot_entries(storage.snapshot_entries());
+
+        assert_eq!(restored.entry_count(), 1);
+        assert_eq!(restored.get_regret(key(4), 0), 44);
+        assert_eq!(restored.get_regret(key(4), 1), 0);
+        assert_eq!(restored.get_strategy_sum(key(4), 0), 0);
+        assert_eq!(restored.get_strategy_sum(key(4), 1), 55);
+    }
+}

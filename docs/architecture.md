@@ -180,6 +180,7 @@ crates/core/src/blueprint_mp/
 ├── info_key.rs         # 128-bit InfoKey (seat + bucket + street + SPR + 22 actions)
 ├── terminal.rs         # Side pot resolution, showdown, fold payoffs
 ├── storage.rs          # Flat-buffer atomic regret/strategy storage
+├── sparse_storage.rs   # Visited-infoset sparse atomic storage for lazy traversal
 ├── mccfr.rs            # External-sampling MCCFR traversal (Pluribus-style)
 ├── trainer.rs          # Training loop with per-seat traverser cycling, DCFR
 └── exploitability.rs   # Per-seat best-response diagnostic
@@ -193,6 +194,7 @@ crates/core/src/blueprint_mp/
 - **Full side pot resolution** at showdown terminals
 - **128-bit info set keys** with 22 action slots (panics on overflow)
 - **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
+- **Sparse visited-infoset storage** for the planned lazy backend: unvisited infosets read as zero/uniform, visited infosets allocate sharded atomic regret and strategy counters, and snapshots export only touched entries
 - **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
