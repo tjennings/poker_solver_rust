@@ -21,7 +21,7 @@ mod validate_rollout;
 mod validation_spots;
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -2528,6 +2528,7 @@ fn run_mp_with_tui(
         &metrics,
         &quit_flag,
         &train_handle,
+        &config.snapshots,
     );
     // Signal both the TUI and training thread to stop
     metrics.quit_requested.store(true, Ordering::Relaxed);
@@ -2565,13 +2566,21 @@ fn bridge_mp_iterations<T>(
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
 ) {
     let mut last_telemetry = Instant::now();
     let telemetry_interval = Duration::from_secs(10);
+    let started = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
+        if metrics.take_snapshot_trigger() {
+            match save_mp_snapshot(snapshot_config, storage, tree, iters, started.elapsed()) {
+                Ok(path) => eprintln!("  MP snapshot saved to {}", path.display()),
+                Err(e) => eprintln!("  Warning: failed to save MP snapshot: {e}"),
+            }
+        }
         if last_telemetry.elapsed() >= telemetry_interval {
             // Spawn telemetry scan on a background thread to avoid blocking
             // the iteration counter bridge (the scan touches billions of entries).
@@ -2593,6 +2602,119 @@ fn bridge_mp_iterations<T>(
             break;
         }
     }
+}
+
+fn save_mp_snapshot(
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
+    iterations: u64,
+    elapsed: Duration,
+) -> std::io::Result<PathBuf> {
+    let output_dir = PathBuf::from(&snapshot_config.output_dir);
+    std::fs::create_dir_all(&output_dir)?;
+    let snapshot_idx = next_snapshot_index(&output_dir)?;
+    let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
+    std::fs::create_dir_all(&snapshot_dir)?;
+
+    let strategy = mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
+    strategy.save(&snapshot_dir.join("strategy.bin"))?;
+    save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
+
+    let metadata = serde_json::json!({
+        "kind": "blueprint_mp",
+        "snapshot_index": snapshot_idx,
+        "iterations": iterations,
+        "elapsed_seconds": elapsed.as_secs(),
+        "elapsed_minutes": elapsed.as_secs() / 60,
+        "bucket_counts": storage.bucket_counts,
+    });
+    let metadata_json = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
+    Ok(snapshot_dir)
+}
+
+fn next_snapshot_index(output_dir: &Path) -> std::io::Result<u32> {
+    let mut next = 0_u32;
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(num) = name.strip_prefix("snapshot_") else {
+            continue;
+        };
+        if let Ok(idx) = num.parse::<u32>() {
+            next = next.max(idx.saturating_add(1));
+        }
+    }
+    Ok(next)
+}
+
+fn mp_strategy_from_storage(
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
+    iterations: u64,
+    elapsed_minutes: u64,
+) -> poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy {
+    use poker_solver_core::blueprint_mp::game_tree::MpGameNode;
+
+    let mut action_probs = Vec::new();
+    let mut node_action_counts = Vec::new();
+    let mut node_street_indices = Vec::new();
+
+    for (node_idx, node) in tree.nodes.iter().enumerate() {
+        if let MpGameNode::Decision {
+            street, actions, ..
+        } = node
+        {
+            let num_actions = actions.len();
+            let street_idx = *street as u8;
+            let buckets = storage.bucket_counts[street_idx as usize];
+            let mut avg = vec![0.0_f64; num_actions];
+
+            node_action_counts.push(num_actions as u16);
+            node_street_indices.push(street_idx);
+            for bucket in 0..buckets {
+                storage.average_strategy(node_idx as u32, bucket, num_actions, &mut avg);
+                action_probs.extend(avg.iter().map(|&p| p as f32));
+            }
+        }
+    }
+
+    let mut strategy = poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy {
+        action_probs,
+        node_action_counts,
+        node_street_indices,
+        bucket_counts: storage.bucket_counts,
+        iterations,
+        elapsed_minutes,
+        node_offsets: Vec::new(),
+    };
+    strategy.post_deserialize();
+    strategy
+}
+
+fn save_mp_storage(
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    path: &Path,
+) -> std::io::Result<()> {
+    let regrets: Vec<i32> = storage
+        .regrets
+        .iter()
+        .map(|atom| atom.load(Ordering::Relaxed))
+        .collect();
+    let strategy_sums: Vec<u64> = storage
+        .strategy_sums
+        .iter()
+        .map(|atom| atom.load(Ordering::Relaxed))
+        .collect();
+    let payload = (&storage.bucket_counts, &regrets, &strategy_sums);
+    let file = std::fs::File::create(path)?;
+    let writer = std::io::BufWriter::new(file);
+    bincode::serialize_into(writer, &payload).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 fn push_mp_telemetry(
@@ -2931,6 +3053,117 @@ snapshots:
         assert!(result.is_err(), "should reject num_players=99");
     }
 
+    #[test]
+    fn mp_snapshot_save_creates_strategy_and_metadata() {
+        use poker_solver_core::blueprint_mp::config::{
+            ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
+            MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
+        };
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+
+        let tiny_preflop_size = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("1bb".into())],
+            raise: vec![],
+        };
+        let tiny_postflop_size = MpStreetSizes {
+            lead: vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))],
+            raise: vec![],
+        };
+        let config = BlueprintMpConfig {
+            game: MpGameConfig {
+                name: "snapshot test".into(),
+                num_players: 2,
+                stack_depth: 6.0,
+                blinds: vec![
+                    ForcedBet {
+                        seat: 0,
+                        kind: ForcedBetKind::SmallBlind,
+                        amount: 1.0,
+                    },
+                    ForcedBet {
+                        seat: 1,
+                        kind: ForcedBetKind::BigBlind,
+                        amount: 2.0,
+                    },
+                ],
+                rake_rate: 0.0,
+                rake_cap: 0.0,
+            },
+            action_abstraction: MpActionAbstractionConfig {
+                preflop: tiny_preflop_size,
+                flop: tiny_postflop_size.clone(),
+                turn: tiny_postflop_size.clone(),
+                river: tiny_postflop_size,
+            },
+            clustering: MpClusteringConfig {
+                preflop: MpStreetCluster { buckets: 2 },
+                flop: MpStreetCluster { buckets: 2 },
+                turn: MpStreetCluster { buckets: 2 },
+                river: MpStreetCluster { buckets: 2 },
+            },
+            training: MpTrainingConfig {
+                cluster_path: None,
+                iterations: Some(1),
+                time_limit_minutes: None,
+                lcfr_warmup_iterations: 0,
+                lcfr_discount_interval: 50,
+                prune_after_iterations: 1_000_000,
+                prune_threshold: -250,
+                prune_explore_pct: 0.05,
+                batch_size: 1,
+                dcfr_alpha: 1.5,
+                dcfr_beta: 0.0,
+                dcfr_gamma: 2.0,
+                print_every_minutes: 999,
+                purify_threshold: 0.0,
+                exploitability_interval_minutes: 0,
+                exploitability_samples: 0,
+            },
+            snapshots: MpSnapshotConfig {
+                warmup_minutes: 0,
+                snapshot_every_minutes: 1,
+                output_dir: String::new(),
+                resume: false,
+                max_snapshots: None,
+            },
+        };
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            123,
+            std::time::Duration::from_secs(7),
+        )
+        .expect("snapshot save should succeed");
+
+        assert!(snapshot_dir.join("strategy.bin").exists());
+        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+
+        let strategy = BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin")).unwrap();
+        assert_eq!(strategy.iterations, 123);
+        assert_eq!(strategy.bucket_counts, [2, 2, 2, 2]);
+        assert!(
+            !strategy.node_action_counts.is_empty(),
+            "snapshot should include decision-node strategy data"
+        );
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp");
+        assert_eq!(metadata["iterations"], 123);
+    }
+
     /// The 6-player ante sample config should have a tui section after update.
     #[timed_test]
     fn mp_6player_tui_section_parses() {
@@ -2976,7 +3209,7 @@ snapshots:
         let game = MpGameConfig {
             name: "test".into(),
             num_players: 6,
-            stack_depth: 200.0,
+            stack_depth: 40.0,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
