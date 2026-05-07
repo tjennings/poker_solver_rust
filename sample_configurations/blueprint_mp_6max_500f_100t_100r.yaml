@@ -27,17 +27,16 @@ action_abstraction:
     lead: ["2bb"]
     raise:
       - ["0.33x", "1.0x"]
-      - ["0.33x", "1.0x"]
   flop:
-    lead: [0.33, 0.75, 1.0]
+    lead: [0.75]
     raise:
-      - [0.33, 0.75, 1.0]
+      - [1.0]
   turn:
-    lead: [0.5, 1.0]
+    lead: [1.0]
     raise:
-      - [0.5, 1.0]
+      - [1.0]
   river:
-    lead: [0.5, 1.0]
+    lead: [1.0]
     raise:
       - [0.5, 1.0]
 
