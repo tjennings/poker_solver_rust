@@ -23,7 +23,9 @@ use rayon::prelude::*;
 
 use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
 use super::game_tree::MpGameTree;
+use super::lazy_mccfr::{traverse_external_lazy, LazyMpGame};
 use super::mccfr::{sample_deal, traverse_external};
+use super::sparse_storage::SparseMpStorage;
 use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
 use super::MAX_PLAYERS;
@@ -40,6 +42,18 @@ pub struct TrainResult {
 pub struct TrainContext {
     pub tree: Arc<MpGameTree>,
     pub storage: Arc<MpStorage>,
+    pub buckets: Arc<AllBuckets>,
+    pub iterations: Arc<AtomicU64>,
+    /// Set to `true` to signal the training loop to stop after the current batch.
+    pub quit: Arc<AtomicBool>,
+    pub num_players: u8,
+    pub bucket_counts: [u16; 4],
+}
+
+/// Shared lazy/sparse training state accessible from outside the training loop.
+pub struct LazyTrainContext {
+    pub game: Arc<LazyMpGame>,
+    pub storage: Arc<SparseMpStorage>,
     pub buckets: Arc<AllBuckets>,
     pub iterations: Arc<AtomicU64>,
     /// Set to `true` to signal the training loop to stop after the current batch.
@@ -73,7 +87,32 @@ pub fn setup_training(config: &BlueprintMpConfig) -> TrainContext {
     }
 }
 
+/// Build lazy public game and sparse storage without materializing the eager tree.
+#[must_use]
+pub fn setup_lazy_training(config: &BlueprintMpConfig) -> LazyTrainContext {
+    let game = LazyMpGame::new(&config.game, &config.action_abstraction);
+    let bucket_counts = config.clustering.bucket_counts();
+    let bucket_files = config.training.cluster_path.as_ref().map_or_else(
+        || [None, None, None, None],
+        |path| load_bucket_files(std::path::Path::new(path)),
+    );
+    let mut all_buckets = AllBuckets::new(bucket_counts, bucket_files);
+    if config.training.cluster_path.is_none() {
+        all_buckets.equity_fallback = true;
+    }
+    LazyTrainContext {
+        game: Arc::new(game),
+        storage: Arc::new(SparseMpStorage::new()),
+        buckets: Arc::new(all_buckets),
+        iterations: Arc::new(AtomicU64::new(0)),
+        quit: Arc::new(AtomicBool::new(false)),
+        num_players: config.game.num_players,
+        bucket_counts,
+    }
+}
+
 /// Run training on an existing context. Updates `ctx.iterations` atomically.
+#[must_use]
 pub fn run_training(
     ctx: &TrainContext,
     training: &MpTrainingConfig,
@@ -81,6 +120,27 @@ pub fn run_training(
 ) -> TrainResult {
     training_loop(
         &ctx.tree,
+        &ctx.storage,
+        &ctx.buckets,
+        training,
+        ctx.num_players,
+        ctx.bucket_counts,
+        game.rake_rate,
+        Chips(game.rake_cap),
+        &ctx.iterations,
+        &ctx.quit,
+    )
+}
+
+/// Run lazy/sparse training on an existing context. Updates `ctx.iterations` atomically.
+#[must_use]
+pub fn run_lazy_training(
+    ctx: &LazyTrainContext,
+    training: &MpTrainingConfig,
+    game: &MpGameConfig,
+) -> TrainResult {
+    training_loop_lazy(
+        &ctx.game,
         &ctx.storage,
         &ctx.buckets,
         training,
@@ -102,6 +162,15 @@ pub fn train_blueprint_mp(config: &BlueprintMpConfig) -> TrainResult {
     run_training(&ctx, &config.training, &config.game)
 }
 
+/// Train an N-player blueprint strategy with lazy traversal and sparse storage.
+///
+/// One meta-iteration = N traversals (one per seat as traverser).
+#[must_use]
+pub fn train_blueprint_mp_lazy(config: &BlueprintMpConfig) -> TrainResult {
+    let ctx = setup_lazy_training(config);
+    run_lazy_training(&ctx, &config.training, &config.game)
+}
+
 fn training_loop(
     tree: &MpGameTree,
     storage: &MpStorage,
@@ -116,7 +185,7 @@ fn training_loop(
 ) -> TrainResult {
     let max_iters = config.iterations.unwrap_or(u64::MAX);
     let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
-        .clamp(i32::MIN as f64, i32::MAX as f64)
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
         .round() as i32;
     let mut meta_iter: u64 = 0;
     let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
@@ -150,6 +219,63 @@ fn training_loop(
 
         if should_discount(meta_iter, config) {
             apply_dcfr_discount(storage, meta_iter, config);
+        }
+    }
+
+    TrainResult {
+        meta_iterations: meta_iter,
+        final_strategy_delta: 0.0,
+    }
+}
+
+fn training_loop_lazy(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    all_buckets: &AllBuckets,
+    config: &MpTrainingConfig,
+    num_players: u8,
+    bucket_counts: [u16; 4],
+    rake_rate: f64,
+    rake_cap: Chips,
+    iterations: &AtomicU64,
+    quit: &AtomicBool,
+) -> TrainResult {
+    let max_iters = config.iterations.unwrap_or(u64::MAX);
+    let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+        .round() as i32;
+    let mut meta_iter = 0;
+    let mut rng = SmallRng::seed_from_u64(0xC0DE_5EED_1234_5678);
+
+    loop {
+        if meta_iter >= max_iters || quit.load(Ordering::Relaxed) {
+            break;
+        }
+        let remaining = max_iters.saturating_sub(meta_iter);
+        let batch = config.batch_size.min(remaining);
+        if batch == 0 {
+            break;
+        }
+
+        let prune = should_prune(meta_iter, config, &mut rng);
+        run_lazy_batch(
+            game,
+            storage,
+            all_buckets,
+            num_players,
+            bucket_counts,
+            rake_rate,
+            rake_cap,
+            batch,
+            meta_iter,
+            prune,
+            scaled_threshold,
+        );
+        meta_iter += batch;
+        iterations.store(meta_iter, Ordering::Relaxed);
+
+        if should_discount(meta_iter, config) {
+            apply_dcfr_discount_lazy(storage, meta_iter, config);
         }
     }
 
@@ -221,6 +347,54 @@ fn run_batch(
     PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
 }
 
+fn run_lazy_batch(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    all_buckets: &AllBuckets,
+    num_players: u8,
+    bucket_counts: [u16; 4],
+    rake_rate: f64,
+    rake_cap: Chips,
+    batch_size: u64,
+    base_iter: u64,
+    prune: bool,
+    prune_threshold: i32,
+) {
+    use super::mccfr::PruneStats;
+    let batch_stats: PruneStats = (0..batch_size)
+        .into_par_iter()
+        .map(|i| {
+            let seed = base_iter
+                .wrapping_add(i)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let deal = sample_deal(num_players, &mut rng);
+            let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
+            let mut local = PruneStats::default();
+            for traverser in 0..num_players {
+                let (_, stats) = traverse_external_lazy(
+                    game,
+                    storage,
+                    &buckets,
+                    Seat::from_raw(traverser),
+                    &mut rng,
+                    rake_rate,
+                    rake_cap,
+                    prune,
+                    prune_threshold,
+                );
+                local.merge(stats);
+            }
+            local
+        })
+        .reduce(PruneStats::default, |mut a, b| {
+            a.merge(b);
+            a
+        });
+    PRUNE_HITS.fetch_add(batch_stats.hits, Ordering::Relaxed);
+    PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
+}
+
 fn should_discount(meta_iter: u64, config: &MpTrainingConfig) -> bool {
     if meta_iter < config.lcfr_warmup_iterations {
         return false;
@@ -240,7 +414,7 @@ fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingC
         let d = if v >= 0 { d_pos } else { d_neg };
         let discounted = (f64::from(v) * d)
             .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
         atom.store(discounted, Ordering::Relaxed);
     });
     storage.strategy_sums.par_iter().for_each(|atom| {
@@ -248,6 +422,15 @@ fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingC
         let discounted = ((v as f64) * d_strat).clamp(0.0, u64::MAX as f64) as u64;
         atom.store(discounted, Ordering::Relaxed);
     });
+}
+
+fn apply_dcfr_discount_lazy(storage: &SparseMpStorage, meta_iter: u64, config: &MpTrainingConfig) {
+    let interval = config.lcfr_discount_interval.max(1);
+    let epoch = meta_iter / interval;
+    let (d_pos, d_neg) = regret_discount_factors(epoch, config.dcfr_alpha, config.dcfr_beta);
+    let d_strat = strategy_discount_factor(epoch, config.dcfr_gamma);
+
+    storage.discount(d_pos, d_neg, d_strat);
 }
 
 fn regret_discount_factors(epoch: u64, alpha: f64, beta: f64) -> (f64, f64) {
@@ -268,7 +451,7 @@ fn strategy_discount_factor(epoch: u64, gamma: f64) -> f64 {
 fn compute_deal_buckets(
     deal: &Deal,
     all_buckets: &AllBuckets,
-    bucket_counts: [u16; 4],
+    _bucket_counts: [u16; 4],
 ) -> DealWithBuckets {
     use crate::blueprint_v2::Street as V2Street;
     let streets = [
@@ -280,9 +463,13 @@ fn compute_deal_buckets(
     let board_slices: [&[crate::poker::Card]; 4] =
         [&[], &deal.board[..3], &deal.board[..4], &deal.board[..5]];
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
-    for p in 0..deal.num_players as usize {
+    for (p, seat_buckets) in buckets
+        .iter_mut()
+        .enumerate()
+        .take(deal.num_players as usize)
+    {
         for (s, (&street, board)) in streets.iter().zip(board_slices.iter()).enumerate() {
-            buckets[p][s] = Bucket(all_buckets.get_bucket(street, deal.hole_cards[p], board));
+            seat_buckets[s] = Bucket(all_buckets.get_bucket(street, deal.hole_cards[p], board));
         }
     }
     DealWithBuckets {
@@ -398,6 +585,27 @@ mod tests {
         }
     }
 
+    fn lazy_100bb_config(iterations: u64) -> BlueprintMpConfig {
+        let mut config = toy_config(6, iterations);
+        config.game.name = "6-max lazy 100bb test".to_string();
+        config.game.stack_depth = 200.0;
+        config.action_abstraction.preflop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("2bb".to_string())],
+            raise: vec![
+                vec![serde_yaml::Value::String("2.0x".to_string())],
+                vec![serde_yaml::Value::String("2.0x".to_string())],
+            ],
+        };
+        config.action_abstraction.flop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))],
+            raise: vec![vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))]],
+        };
+        config.action_abstraction.turn = config.action_abstraction.flop.clone();
+        config.action_abstraction.river = config.action_abstraction.flop.clone();
+        config.training.batch_size = 1;
+        config
+    }
+
     fn toy_training_config(iterations: u64) -> MpTrainingConfig {
         MpTrainingConfig {
             cluster_path: None,
@@ -474,6 +682,23 @@ mod tests {
         let config = toy_config(2, 10);
         let result = train_blueprint_mp(&config);
         assert!(result.meta_iterations > 0);
+    }
+
+    #[timed_test]
+    fn lazy_train_2_player_toy_completes() {
+        let config = toy_config(2, 10);
+        let result = train_blueprint_mp_lazy(&config);
+        assert_eq!(result.meta_iterations, 10);
+    }
+
+    #[timed_test]
+    fn lazy_setup_100bb_two_preflop_raise_rows_does_not_allocate_eager_tree() {
+        let config = lazy_100bb_config(1);
+        let ctx = setup_lazy_training(&config);
+
+        assert_eq!(ctx.num_players, 6);
+        assert_eq!(ctx.game.root_state().to_act(), Seat::from_raw(2));
+        assert_eq!(ctx.storage.entry_count(), 0);
     }
 
     #[timed_test(2)]
