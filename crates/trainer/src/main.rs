@@ -2660,7 +2660,7 @@ fn run_mp_without_tui(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> 
         std::thread::spawn(move || run_training(&ctx, &train_config.training, &train_config.game));
 
     let mut heartbeat = MpNoTuiHeartbeat::new();
-    eprintln!("  no-TUI progress: heartbeat every 10s");
+    eprintln!("  no-TUI progress: heartbeat every 60s");
     while !train_handle.is_finished() {
         std::thread::sleep(Duration::from_secs(1));
         if heartbeat.should_print() {
@@ -2688,7 +2688,7 @@ fn run_mp_without_tui_lazy(config: &BlueprintMpConfig) -> Result<(), Box<dyn Err
     });
 
     let mut heartbeat = MpNoTuiHeartbeat::new();
-    eprintln!("  no-TUI lazy_sparse progress: heartbeat every 10s");
+    eprintln!("  no-TUI lazy_sparse progress: heartbeat every 60s");
     while !train_handle.is_finished() {
         std::thread::sleep(Duration::from_secs(1));
         if heartbeat.should_print() {
@@ -2711,7 +2711,7 @@ struct MpNoTuiHeartbeat {
 }
 
 impl MpNoTuiHeartbeat {
-    const INTERVAL: Duration = Duration::from_secs(10);
+    const INTERVAL: Duration = Duration::from_secs(60);
 
     fn new() -> Self {
         let now = Instant::now();
@@ -3696,6 +3696,14 @@ snapshots:
         assert!(
             report.eager_risk.is_some(),
             "preflight should still show the dense backend risk for context"
+        );
+    }
+
+    #[test]
+    fn mp_no_tui_heartbeat_interval_is_one_minute() {
+        assert_eq!(
+            super::MpNoTuiHeartbeat::INTERVAL,
+            std::time::Duration::from_secs(60)
         );
     }
 
