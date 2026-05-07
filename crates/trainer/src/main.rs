@@ -2784,6 +2784,8 @@ impl MpNoTuiHeartbeat {
         iterations: &AtomicU64,
         storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
     ) {
+        use poker_solver_core::blueprint_mp::trainer::take_lazy_mp_timing_snapshot;
+
         let now = Instant::now();
         let iters = iterations.load(Ordering::Relaxed);
         let since_last = now.duration_since(self.last_print).as_secs_f64();
@@ -2800,7 +2802,10 @@ impl MpNoTuiHeartbeat {
         } else {
             0.0
         };
+        let loop_timing = take_lazy_mp_timing_snapshot();
+        let stats_started = Instant::now();
         let stats = storage.stats();
+        let stats_nanos = u64::try_from(stats_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let entries_since_last = stats.entries.saturating_sub(self.last_sparse_entries);
         let bytes_since_last = stats.approx_bytes.saturating_sub(self.last_sparse_bytes);
         let entries_per_sec = if since_last > 0.0 {
@@ -2820,7 +2825,7 @@ impl MpNoTuiHeartbeat {
         };
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
@@ -2835,6 +2840,12 @@ impl MpNoTuiHeartbeat {
             stats.shard_count,
             avg_entries_per_shard,
             stats.max_entries_per_shard,
+            format_nanos_millis(loop_timing.batch_wall_nanos),
+            format_nanos_millis(loop_timing.deal_nanos),
+            format_nanos_millis(loop_timing.bucket_nanos),
+            format_nanos_millis(loop_timing.traverse_nanos),
+            format_nanos_millis(loop_timing.discount_nanos),
+            format_nanos_millis(stats_nanos),
             prune_pct,
         );
         self.last_print = now;
@@ -2917,6 +2928,10 @@ fn format_duration_compact(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn format_nanos_millis(nanos: u64) -> String {
+    format!("{:.1}ms", nanos as f64 / 1_000_000.0)
 }
 
 fn format_bytes_decimal(bytes: usize) -> String {

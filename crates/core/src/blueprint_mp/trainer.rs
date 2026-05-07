@@ -12,10 +12,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Global prune counters — accumulated per batch, read+reset by TUI bridge.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static PRUNE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static LAZY_BATCH_WALL_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_DEAL_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_BUCKET_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_TRAVERSE_NANOS: AtomicU64 = AtomicU64::new(0);
+static LAZY_DISCOUNT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -36,6 +42,32 @@ use crate::blueprint_v2::trainer::load_bucket_files;
 pub struct TrainResult {
     pub meta_iterations: u64,
     pub final_strategy_delta: f64,
+}
+
+/// Timing counters accumulated by the lazy sparse MP training loop.
+///
+/// Worker component timings are summed across Rayon workers, so they can exceed
+/// wall-clock time. `batch_wall_nanos` and `discount_nanos` are wall-clock
+/// measurements from the coordinator thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LazyMpTimingSnapshot {
+    pub batch_wall_nanos: u64,
+    pub deal_nanos: u64,
+    pub bucket_nanos: u64,
+    pub traverse_nanos: u64,
+    pub discount_nanos: u64,
+}
+
+/// Read and reset lazy sparse MP training timing counters.
+#[must_use]
+pub fn take_lazy_mp_timing_snapshot() -> LazyMpTimingSnapshot {
+    LazyMpTimingSnapshot {
+        batch_wall_nanos: LAZY_BATCH_WALL_NANOS.swap(0, Ordering::Relaxed),
+        deal_nanos: LAZY_DEAL_NANOS.swap(0, Ordering::Relaxed),
+        bucket_nanos: LAZY_BUCKET_NANOS.swap(0, Ordering::Relaxed),
+        traverse_nanos: LAZY_TRAVERSE_NANOS.swap(0, Ordering::Relaxed),
+        discount_nanos: LAZY_DISCOUNT_NANOS.swap(0, Ordering::Relaxed),
+    }
 }
 
 /// Shared training state accessible from outside the training loop.
@@ -275,7 +307,9 @@ fn training_loop_lazy(
         iterations.store(meta_iter, Ordering::Relaxed);
 
         if should_discount(meta_iter, config) {
+            let discount_started = Instant::now();
             apply_dcfr_discount_lazy(storage, meta_iter, config);
+            LAZY_DISCOUNT_NANOS.fetch_add(nanos_since(discount_started), Ordering::Relaxed);
         }
     }
 
@@ -361,16 +395,25 @@ fn run_lazy_batch(
     prune_threshold: i32,
 ) {
     use super::mccfr::PruneStats;
-    let batch_stats: PruneStats = (0..batch_size)
+    let batch_started = Instant::now();
+    let (batch_stats, timing): (PruneStats, LazyWorkerTiming) = (0..batch_size)
         .into_par_iter()
         .map(|i| {
             let seed = base_iter
                 .wrapping_add(i)
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut rng = SmallRng::seed_from_u64(seed);
+
+            let deal_started = Instant::now();
             let deal = sample_deal(num_players, &mut rng);
+            let deal_nanos = nanos_since(deal_started);
+
+            let bucket_started = Instant::now();
             let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
+            let bucket_nanos = nanos_since(bucket_started);
+
             let mut local = PruneStats::default();
+            let traverse_started = Instant::now();
             for traverser in 0..num_players {
                 let (_, stats) = traverse_external_lazy(
                     game,
@@ -385,14 +428,49 @@ fn run_lazy_batch(
                 );
                 local.merge(stats);
             }
-            local
+            let traverse_nanos = nanos_since(traverse_started);
+            (
+                local,
+                LazyWorkerTiming {
+                    deal_nanos,
+                    bucket_nanos,
+                    traverse_nanos,
+                },
+            )
         })
-        .reduce(PruneStats::default, |mut a, b| {
-            a.merge(b);
-            a
-        });
+        .reduce(
+            || (PruneStats::default(), LazyWorkerTiming::default()),
+            |mut a, b| {
+                a.0.merge(b.0);
+                a.1.merge(b.1);
+                a
+            },
+        );
+    LAZY_BATCH_WALL_NANOS.fetch_add(nanos_since(batch_started), Ordering::Relaxed);
+    LAZY_DEAL_NANOS.fetch_add(timing.deal_nanos, Ordering::Relaxed);
+    LAZY_BUCKET_NANOS.fetch_add(timing.bucket_nanos, Ordering::Relaxed);
+    LAZY_TRAVERSE_NANOS.fetch_add(timing.traverse_nanos, Ordering::Relaxed);
     PRUNE_HITS.fetch_add(batch_stats.hits, Ordering::Relaxed);
     PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Default)]
+struct LazyWorkerTiming {
+    deal_nanos: u64,
+    bucket_nanos: u64,
+    traverse_nanos: u64,
+}
+
+impl LazyWorkerTiming {
+    fn merge(&mut self, other: Self) {
+        self.deal_nanos = self.deal_nanos.saturating_add(other.deal_nanos);
+        self.bucket_nanos = self.bucket_nanos.saturating_add(other.bucket_nanos);
+        self.traverse_nanos = self.traverse_nanos.saturating_add(other.traverse_nanos);
+    }
+}
+
+fn nanos_since(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn should_discount(meta_iter: u64, config: &MpTrainingConfig) -> bool {
@@ -692,6 +770,23 @@ mod tests {
         let config = toy_config(2, 10);
         let result = train_blueprint_mp_lazy(&config);
         assert_eq!(result.meta_iterations, 10);
+    }
+
+    #[timed_test]
+    fn lazy_timing_snapshot_tracks_compute_components() {
+        let _ = take_lazy_mp_timing_snapshot();
+        let mut config = toy_config(2, 2);
+        config.training.batch_size = 1;
+
+        let result = train_blueprint_mp_lazy(&config);
+        let timing = take_lazy_mp_timing_snapshot();
+
+        assert_eq!(result.meta_iterations, 2);
+        assert!(timing.batch_wall_nanos > 0);
+        assert!(timing.deal_nanos > 0);
+        assert!(timing.bucket_nanos > 0);
+        assert!(timing.traverse_nanos > 0);
+        let _ = take_lazy_mp_timing_snapshot();
     }
 
     #[timed_test]
