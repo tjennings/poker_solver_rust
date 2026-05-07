@@ -2708,6 +2708,8 @@ struct MpNoTuiHeartbeat {
     started: Instant,
     last_print: Instant,
     last_iters: u64,
+    last_sparse_entries: usize,
+    last_sparse_bytes: usize,
 }
 
 impl MpNoTuiHeartbeat {
@@ -2719,6 +2721,8 @@ impl MpNoTuiHeartbeat {
             started: now,
             last_print: now,
             last_iters: 0,
+            last_sparse_entries: 0,
+            last_sparse_bytes: 0,
         }
     }
 
@@ -2797,21 +2801,46 @@ impl MpNoTuiHeartbeat {
             0.0
         };
         let stats = storage.stats();
+        let entries_since_last = stats.entries.saturating_sub(self.last_sparse_entries);
+        let bytes_since_last = stats.approx_bytes.saturating_sub(self.last_sparse_bytes);
+        let entries_per_sec = if since_last > 0.0 {
+            entries_since_last as f64 / since_last
+        } else {
+            0.0
+        };
+        let bytes_per_sec = if since_last > 0.0 {
+            bytes_since_last as f64 / since_last
+        } else {
+            0.0
+        };
+        let avg_entries_per_shard = if stats.shard_count > 0 {
+            stats.entries as f64 / stats.shard_count as f64
+        } else {
+            0.0
+        };
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={}, regret_slots={}, strategy_slots={}, approx={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
             format_duration_compact(elapsed),
             stats.entries,
+            entries_per_sec,
             stats.regret_slots,
             stats.strategy_slots,
             format_bytes_decimal(stats.approx_bytes),
+            format_bytes_decimal(bytes_per_sec as usize),
+            stats.nonempty_shards,
+            stats.shard_count,
+            avg_entries_per_shard,
+            stats.max_entries_per_shard,
             prune_pct,
         );
         self.last_print = now;
         self.last_iters = iters;
+        self.last_sparse_entries = stats.entries;
+        self.last_sparse_bytes = stats.approx_bytes;
     }
 }
 
@@ -3558,7 +3587,7 @@ tui:
 
         let ctx = setup_lazy_training(&config);
         assert_eq!(
-            ctx.storage.stats().approx_bytes,
+            ctx.storage.stats().entries,
             0,
             "lazy setup should not allocate visited infosets"
         );

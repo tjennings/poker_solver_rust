@@ -7,8 +7,8 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Seat, Street};
 
-const DEFAULT_SHARDS: usize = 256;
+const DEFAULT_SHARDS: usize = 4096;
 
 /// Stable key for one lazy MP infoset.
 ///
@@ -82,6 +82,9 @@ pub struct SparseStorageStats {
     pub regret_slots: usize,
     pub strategy_slots: usize,
     pub approx_bytes: usize,
+    pub shard_count: usize,
+    pub nonempty_shards: usize,
+    pub max_entries_per_shard: usize,
 }
 
 /// Serializable snapshot of one visited sparse infoset.
@@ -188,18 +191,28 @@ impl SparseMpStorage {
     pub fn stats(&self) -> SparseStorageStats {
         let mut entries = 0;
         let mut slots = 0;
+        let mut nonempty_shards = 0;
+        let mut max_entries_per_shard = 0;
         for shard in &self.shards {
             let guard = lock_entries(shard);
-            entries += guard.len();
+            let shard_entries = guard.len();
+            entries += shard_entries;
+            if shard_entries > 0 {
+                nonempty_shards += 1;
+            }
+            max_entries_per_shard = max_entries_per_shard.max(shard_entries);
             slots += guard
                 .values()
                 .map(|node| node.action_count())
                 .sum::<usize>();
         }
-        let approx_bytes = entries
-            .saturating_mul(
+        let approx_bytes = self
+            .shards
+            .len()
+            .saturating_mul(std::mem::size_of::<Shard>())
+            .saturating_add(entries.saturating_mul(
                 std::mem::size_of::<MpInfosetKey>() + std::mem::size_of::<Arc<SparseNode>>(),
-            )
+            ))
             .saturating_add(slots.saturating_mul(
                 std::mem::size_of::<AtomicI32>() + std::mem::size_of::<AtomicU64>(),
             ));
@@ -208,6 +221,9 @@ impl SparseMpStorage {
             regret_slots: slots,
             strategy_slots: slots,
             approx_bytes,
+            shard_count: self.shards.len(),
+            nonempty_shards,
+            max_entries_per_shard,
         }
     }
 
@@ -611,7 +627,22 @@ mod tests {
         assert_eq!(stats.entries, 2);
         assert_eq!(stats.regret_slots, 5);
         assert_eq!(stats.strategy_slots, 5);
+        assert_eq!(stats.shard_count, 4);
+        assert!(stats.nonempty_shards > 0);
+        assert!(stats.max_entries_per_shard > 0);
         assert!(stats.approx_bytes > 0);
+    }
+
+    #[timed_test]
+    fn default_storage_uses_high_shard_count_for_large_lazy_runs() {
+        let storage = SparseMpStorage::new();
+        let stats = storage.stats();
+
+        assert_eq!(stats.shard_count, DEFAULT_SHARDS);
+        assert!(stats.shard_count >= 4096);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.nonempty_shards, 0);
+        assert_eq!(stats.max_entries_per_shard, 0);
     }
 
     #[timed_test]
