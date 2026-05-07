@@ -76,7 +76,7 @@ impl<I: BoundaryNetInfer> RiverRunoutOracle for BoundaryNetRiverRunoutOracle<I> 
         validate_river_input(&input)?;
 
         let (oop_range, ip_range) =
-            ranges_with_board_blockers_zeroed(input.oop_range, input.ip_range, &input.board);
+            canonicalize_ranges_for_board(input.oop_range, input.ip_range, &input.board)?;
         let row = encode_boundary_inference_input(
             &oop_range,
             &ip_range,
@@ -142,6 +142,7 @@ pub fn build_turn_boundary_record<O: RiverRunoutOracle>(
     oracle: &O,
 ) -> Result<TrainingRecord, String> {
     validate_input(input)?;
+    let input = canonicalized_turn_boundary_input(input)?;
 
     let mut sums = [0.0_f32; NUM_COMBOS];
     let mut counts = [0_u8; NUM_COMBOS];
@@ -211,8 +212,9 @@ pub fn build_exact_turn_boundary_records(
     oracle: &ExactRiverSolverOracle,
 ) -> Result<[TrainingRecord; 2], String> {
     validate_input(input)?;
+    let input = canonicalized_turn_boundary_input(input)?;
 
-    build_exact_turn_boundary_records_from_runouts(input, oracle, None)
+    build_exact_turn_boundary_records_from_runouts(&input, oracle, None)
 }
 
 pub fn build_exact_turn_boundary_records_parallel(
@@ -221,8 +223,9 @@ pub fn build_exact_turn_boundary_records_parallel(
     pool: &rayon::ThreadPool,
 ) -> Result<[TrainingRecord; 2], String> {
     validate_input(input)?;
+    let input = canonicalized_turn_boundary_input(input)?;
 
-    build_exact_turn_boundary_records_from_runouts(input, oracle, Some(pool))
+    build_exact_turn_boundary_records_from_runouts(&input, oracle, Some(pool))
 }
 
 fn build_exact_turn_boundary_records_from_runouts(
@@ -405,7 +408,7 @@ fn river_input_to_situation(input: &RiverRunoutInput<'_>) -> Result<Situation, S
     let pot = integer_chip_value(input.pot, "pot")?;
     let effective_stack = integer_chip_value(input.effective_stack, "effective_stack")?;
     let (oop_range, ip_range) =
-        ranges_with_board_blockers_zeroed(input.oop_range, input.ip_range, &input.board);
+        canonicalize_ranges_for_board(input.oop_range, input.ip_range, &input.board)?;
 
     Ok(Situation {
         board: input.board,
@@ -432,11 +435,26 @@ fn integer_chip_value(value: f32, field: &str) -> Result<i32, String> {
     Ok(rounded as i32)
 }
 
-fn ranges_with_board_blockers_zeroed(
+fn canonicalized_turn_boundary_input(
+    input: &TurnBoundaryInput,
+) -> Result<TurnBoundaryInput, String> {
+    let (oop_range, ip_range) =
+        canonicalize_ranges_for_board(&input.oop_range, &input.ip_range, &input.board)?;
+    Ok(TurnBoundaryInput {
+        board: input.board,
+        pot: input.pot,
+        effective_stack: input.effective_stack,
+        player: input.player,
+        oop_range,
+        ip_range,
+    })
+}
+
+fn canonicalize_ranges_for_board(
     oop_range: &[f32; NUM_COMBOS],
     ip_range: &[f32; NUM_COMBOS],
-    board: &[u8; 5],
-) -> ([f32; NUM_COMBOS], [f32; NUM_COMBOS]) {
+    board: &[u8],
+) -> Result<([f32; NUM_COMBOS], [f32; NUM_COMBOS]), String> {
     let mut oop = *oop_range;
     let mut ip = *ip_range;
     for idx in 0..NUM_COMBOS {
@@ -446,7 +464,35 @@ fn ranges_with_board_blockers_zeroed(
             ip[idx] = 0.0;
         }
     }
-    (oop, ip)
+    normalize_range(&mut oop, "OOP", board)?;
+    normalize_range(&mut ip, "IP", board)?;
+    Ok((oop, ip))
+}
+
+fn normalize_range(range: &mut [f32; NUM_COMBOS], label: &str, board: &[u8]) -> Result<(), String> {
+    let mut total = 0.0_f32;
+    for (idx, &weight) in range.iter().enumerate() {
+        if !weight.is_finite() {
+            return Err(format!(
+                "{label} range contains non-finite weight at combo {idx}"
+            ));
+        }
+        if weight < 0.0 {
+            return Err(format!(
+                "{label} range contains negative weight at combo {idx}"
+            ));
+        }
+        total += weight;
+    }
+    if total <= 0.0 {
+        return Err(format!(
+            "{label} range has no mass after applying board blockers {board:?}"
+        ));
+    }
+    for weight in range {
+        *weight /= total;
+    }
+    Ok(())
 }
 
 fn combo_conflicts_with_board(idx: usize, board: &[u8; 4]) -> bool {
@@ -560,6 +606,36 @@ mod tests {
 
         assert_eq!(rec.player, 1);
         assert_eq!(rec.game_value, -0.5);
+    }
+
+    #[test]
+    fn build_record_stores_canonical_turn_ranges() {
+        let oracle = ConstantOracle::new(0.25);
+        let mut input = sample_input(0);
+        let blocked_combo = card_pair_to_index(0, 8);
+        let live_a = card_pair_to_index(8, 9);
+        let live_b = card_pair_to_index(10, 11);
+
+        input.oop_range = [0.0; NUM_COMBOS];
+        input.ip_range = [0.0; NUM_COMBOS];
+        input.oop_range[blocked_combo] = 100.0;
+        input.oop_range[live_a] = 2.0;
+        input.oop_range[live_b] = 2.0;
+        input.ip_range[blocked_combo] = 50.0;
+        input.ip_range[live_a] = 3.0;
+        input.ip_range[live_b] = 1.0;
+
+        let rec = build_turn_boundary_record(&input, &oracle).unwrap();
+
+        assert_eq!(rec.oop_range[blocked_combo], 0.0);
+        assert_eq!(rec.ip_range[blocked_combo], 0.0);
+        assert!((rec.oop_range.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((rec.ip_range.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((rec.oop_range[live_a] - 0.5).abs() < 1e-6);
+        assert!((rec.oop_range[live_b] - 0.5).abs() < 1e-6);
+        assert!((rec.ip_range[live_a] - 0.75).abs() < 1e-6);
+        assert!((rec.ip_range[live_b] - 0.25).abs() < 1e-6);
+        assert!((rec.game_value - 0.25).abs() < 1e-6);
     }
 
     #[test]

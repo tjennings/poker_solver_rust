@@ -1713,6 +1713,8 @@ fn cmd_datagen_eval(data: PathBuf) {
     let mut card_max: u8 = 0;
     let mut num_extreme_records = 0u64;
     let mut extreme_examples: Vec<String> = Vec::new();
+    let mut range_contract_violations = 0u64;
+    let mut range_contract_examples: Vec<String> = Vec::new();
 
     // Range shape statistics
     let mut oop_densities = Vec::new();
@@ -1739,6 +1741,19 @@ fn cmd_datagen_eval(data: PathBuf) {
                     pots.push(rec.pot as f64);
                     stacks.push(rec.effective_stack as f64);
                     game_values.push(rec.game_value as f64);
+
+                    let violations = range_contract_violations_for_record(&rec);
+                    if !violations.is_empty() {
+                        range_contract_violations += 1;
+                        if range_contract_examples.len() < 10 {
+                            range_contract_examples.push(format!(
+                                "  file={} rec={}: {}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                                rec_idx,
+                                violations.join("; ")
+                            ));
+                        }
+                    }
 
                     // Track board card IDs
                     for &c in &rec.board {
@@ -1901,6 +1916,19 @@ fn cmd_datagen_eval(data: PathBuf) {
     print_stats("  Top-10 mass   ", &ip_top10_concs);
     print_stats("  Max/mean      ", &ip_max_mean_ratios);
     print_stats("  Total mass    ", &ip_totals);
+
+    if range_contract_violations > 0 {
+        eprintln!(
+            "\nRange Contract Violations ({range_contract_violations} records): expected finite non-negative ranges, zero board-blocked combo mass, and total mass near 1.0 per player."
+        );
+        for ex in &range_contract_examples {
+            eprintln!("{ex}");
+        }
+        if range_contract_violations > 10 {
+            eprintln!("  ... and {} more", range_contract_violations - 10);
+        }
+        std::process::exit(1);
+    }
 }
 
 struct DatagenEvalInput {
@@ -2081,6 +2109,56 @@ fn range_stats(range: &[f32]) -> (f64, f64, f64, f64, f64) {
     };
 
     (density, entropy, top10_mass, max_mean_ratio, total)
+}
+
+fn range_contract_violations_for_record(
+    rec: &cfvnet::datagen::storage::TrainingRecord,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    validate_range_contract("OOP", &rec.oop_range, &rec.board, &mut violations);
+    validate_range_contract("IP", &rec.ip_range, &rec.board, &mut violations);
+    violations
+}
+
+fn validate_range_contract(label: &str, range: &[f32], board: &[u8], violations: &mut Vec<String>) {
+    use range_solver::card::index_to_card_pair;
+
+    const MASS_TOLERANCE: f64 = 1e-3;
+    const BLOCKER_TOLERANCE: f32 = 1e-7;
+
+    let mut total = 0.0_f64;
+    let mut blocked_mass = 0.0_f64;
+    let mut non_finite = 0usize;
+    let mut negative = 0usize;
+
+    for (idx, &weight) in range.iter().enumerate() {
+        if !weight.is_finite() {
+            non_finite += 1;
+            continue;
+        }
+        if weight < -BLOCKER_TOLERANCE {
+            negative += 1;
+        }
+        total += weight as f64;
+
+        let (c0, c1) = index_to_card_pair(idx);
+        if board.contains(&c0) || board.contains(&c1) {
+            blocked_mass += weight.abs() as f64;
+        }
+    }
+
+    if non_finite > 0 {
+        violations.push(format!("{label} range has {non_finite} non-finite weights"));
+    }
+    if negative > 0 {
+        violations.push(format!("{label} range has {negative} negative weights"));
+    }
+    if blocked_mass > f64::from(BLOCKER_TOLERANCE) {
+        violations.push(format!("{label} blocked_mass={blocked_mass:.6}"));
+    }
+    if (total - 1.0).abs() > MASS_TOLERANCE {
+        violations.push(format!("{label} total_mass={total:.6}"));
+    }
 }
 
 fn print_stats(label: &str, values: &[f64]) {
@@ -2869,6 +2947,60 @@ mod tests {
         assert!((top10 - expected_top10).abs() < 1e-6, "top10={top10}");
         assert!((max_mean - 1.0).abs() < 1e-9, "max_mean={max_mean}");
         assert!((total - 1326.0).abs() < 1e-6, "total={total}");
+    }
+
+    #[test]
+    fn range_contract_accepts_normalized_board_blocked_ranges() {
+        use cfvnet::datagen::storage::TrainingRecord;
+        use range_solver::card::card_pair_to_index;
+
+        let live_combo = card_pair_to_index(8, 9);
+        let mut rec = TrainingRecord {
+            board: vec![0, 1, 2, 3],
+            pot: 100.0,
+            effective_stack: 100.0,
+            player: 0,
+            game_value: 0.0,
+            oop_range: [0.0; 1326],
+            ip_range: [0.0; 1326],
+            cfvs: [0.0; 1326],
+            valid_mask: [0; 1326],
+        };
+        rec.oop_range[live_combo] = 1.0;
+        rec.ip_range[live_combo] = 1.0;
+
+        let violations = range_contract_violations_for_record(&rec);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[test]
+    fn range_contract_rejects_raw_blueprint_style_ranges() {
+        use cfvnet::datagen::storage::TrainingRecord;
+        use range_solver::card::card_pair_to_index;
+
+        let blocked_combo = card_pair_to_index(0, 8);
+        let mut rec = TrainingRecord {
+            board: vec![0, 1, 2, 3],
+            pot: 100.0,
+            effective_stack: 100.0,
+            player: 0,
+            game_value: 0.0,
+            oop_range: [1.0; 1326],
+            ip_range: [1.0; 1326],
+            cfvs: [0.0; 1326],
+            valid_mask: [0; 1326],
+        };
+        rec.oop_range[blocked_combo] = 5.0;
+
+        let violations = range_contract_violations_for_record(&rec);
+        assert!(
+            violations.iter().any(|msg| msg.contains("blocked_mass")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|msg| msg.contains("total_mass")),
+            "{violations:?}"
+        );
     }
 
     #[test]
