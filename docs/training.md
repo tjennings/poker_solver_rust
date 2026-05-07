@@ -24,7 +24,8 @@ cargo run -p poker-solver-trainer --release -- train-blueprint \
 Train a multiplayer (2-8 player) blueprint strategy using external-sampling MCCFR.
 
 ```bash
-cargo run -p poker-solver-trainer --release -- train-blueprint-mp <config.yaml>
+cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
+  -c <config.yaml>
 ```
 
 ### inspect-mp-config
@@ -86,6 +87,7 @@ clustering:
     buckets: 200
 
 training:
+  backend: lazy_sparse     # eager (default) or lazy_sparse
   iterations: 100000
   batch_size: 200
   dcfr_alpha: 1.5
@@ -119,13 +121,14 @@ snapshots:
 
 #### 100bb Status
 
-100bb is a target stack depth for Blueprint MP, but the current backend is still eager: it builds the complete public betting tree and dense regret/strategy storage before training. A 100bb 6-max config with multiple preflop raise depths can be too large for this backend. The planned path is a lazy/sparse trainer that generates public states on demand and stores only visited infosets; see `docs/plans/2026-05-07-blueprint-mp-100bb-design.md`.
+100bb is a target stack depth for Blueprint MP. Use `training.backend: lazy_sparse` for 100bb 6-max configs with multiple preflop raise depths; it generates public states on demand and stores only visited infosets. The default `eager` backend still builds the complete public betting tree and dense regret/strategy storage before training, so `inspect-mp-config` will block known 100bb-scale dense-risk patterns unless `lazy_sparse` is selected.
 
 Run the 500/100/100 6-max experiment with:
 
 ```bash
 cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
-  -c sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml
+  -c sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml \
+  --no-tui
 ```
 
 ---

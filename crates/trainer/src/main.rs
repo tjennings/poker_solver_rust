@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
+use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, MpTrainingBackend};
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 
@@ -2500,11 +2500,13 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
         .validate()
         .map_err(|e| format!("invalid config: {e}"))?;
     let report = inspect_mp_config(&config)?;
-    if let Some(risk) = &report.eager_risk {
-        return Err(format!(
-            "MP config is too large for the current eager backend: {risk}. Run inspect-mp-config for details."
-        )
-        .into());
+    if report.backend == MpTrainingBackend::Eager {
+        if let Some(risk) = &report.eager_risk {
+            return Err(format!(
+                "MP config is too large for the current eager backend: {risk}. Run inspect-mp-config for details."
+            )
+            .into());
+        }
     }
     let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
     eprintln!(
@@ -2513,7 +2515,15 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
         config.game.num_players,
         config.game.stack_depth / 2.0
     );
-    if tui_config.enabled && !no_tui {
+    if config.training.backend == MpTrainingBackend::LazySparse {
+        if tui_config.enabled && !no_tui {
+            return Err(
+                "Blueprint MP lazy_sparse backend currently supports --no-tui only; rerun with --no-tui"
+                    .into(),
+            );
+        }
+        run_mp_without_tui_lazy(&config)?;
+    } else if tui_config.enabled && !no_tui {
         run_mp_with_tui(&config, &tui_config)?;
     } else {
         run_mp_without_tui(&config)?;
@@ -2532,6 +2542,7 @@ struct MpConfigReport {
     preflop_lead_sizes: usize,
     preflop_raise_rows: usize,
     postflop_raise_rows: [usize; 3],
+    backend: MpTrainingBackend,
     eager_risk: Option<String>,
 }
 
@@ -2561,6 +2572,7 @@ fn inspect_mp_config(config: &BlueprintMpConfig) -> Result<MpConfigReport, Box<d
         preflop_lead_sizes: config.action_abstraction.preflop.lead.len(),
         preflop_raise_rows,
         postflop_raise_rows,
+        backend: config.training.backend,
         eager_risk,
     })
 }
@@ -2619,10 +2631,21 @@ fn print_mp_config_report(report: &MpConfigReport) {
         report.postflop_raise_rows[1],
         report.postflop_raise_rows[2]
     );
+    eprintln!("  Selected backend: {}", mp_backend_label(report.backend));
     if let Some(risk) = &report.eager_risk {
         eprintln!("  Eager backend: {risk}");
+        if report.backend == MpTrainingBackend::LazySparse {
+            eprintln!("  Lazy sparse backend: selected; eager dense risk will not block training");
+        }
     } else {
         eprintln!("  Eager backend: no known 100bb-scale risk pattern detected");
+    }
+}
+
+fn mp_backend_label(backend: MpTrainingBackend) -> &'static str {
+    match backend {
+        MpTrainingBackend::Eager => "eager",
+        MpTrainingBackend::LazySparse => "lazy_sparse",
     }
 }
 
@@ -2648,6 +2671,34 @@ fn run_mp_without_tui(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> 
     let result = train_handle.join().expect("training thread panicked");
     eprintln!(
         "Training complete: {} meta-iterations",
+        result.meta_iterations
+    );
+    Ok(())
+}
+
+fn run_mp_without_tui_lazy(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+
+    let ctx = setup_lazy_training(config);
+    let shared_iters = Arc::clone(&ctx.iterations);
+    let storage = Arc::clone(&ctx.storage);
+    let train_config = config.clone();
+    let train_handle = std::thread::spawn(move || {
+        run_lazy_training(&ctx, &train_config.training, &train_config.game)
+    });
+
+    let mut heartbeat = MpNoTuiHeartbeat::new();
+    eprintln!("  no-TUI lazy_sparse progress: heartbeat every 10s");
+    while !train_handle.is_finished() {
+        std::thread::sleep(Duration::from_secs(1));
+        if heartbeat.should_print() {
+            heartbeat.print_sparse(&shared_iters, &storage);
+        }
+    }
+    heartbeat.print_sparse(&shared_iters, &storage);
+    let result = train_handle.join().expect("lazy training thread panicked");
+    eprintln!(
+        "Lazy sparse training complete: {} meta-iterations",
         result.meta_iterations
     );
     Ok(())
@@ -2718,6 +2769,45 @@ impl MpNoTuiHeartbeat {
             avg_rate,
             format_duration_compact(elapsed),
             regret_text,
+            prune_pct,
+        );
+        self.last_print = now;
+        self.last_iters = iters;
+    }
+
+    fn print_sparse(
+        &mut self,
+        iterations: &AtomicU64,
+        storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    ) {
+        let now = Instant::now();
+        let iters = iterations.load(Ordering::Relaxed);
+        let since_last = now.duration_since(self.last_print).as_secs_f64();
+        let elapsed = now.duration_since(self.started);
+        let interval_iters = iters.saturating_sub(self.last_iters);
+        let interval_rate = if since_last > 0.0 {
+            interval_iters as f64 / since_last
+        } else {
+            0.0
+        };
+        let elapsed_secs = elapsed.as_secs_f64();
+        let avg_rate = if elapsed_secs > 0.0 {
+            iters as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+        let stats = storage.stats();
+        let prune_pct = take_mp_prune_pct();
+        eprintln!(
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={}, regret_slots={}, strategy_slots={}, approx={}] prune={:.1}%",
+            iters,
+            interval_rate,
+            avg_rate,
+            format_duration_compact(elapsed),
+            stats.entries,
+            stats.regret_slots,
+            stats.strategy_slots,
+            format_bytes_decimal(stats.approx_bytes),
             prune_pct,
         );
         self.last_print = now;
@@ -2797,6 +2887,22 @@ fn format_duration_compact(duration: Duration) -> String {
         format!("{minutes}m{seconds:02}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+fn format_bytes_decimal(bytes: usize) -> String {
+    const KB: f64 = 1_000.0;
+    const MB: f64 = KB * 1_000.0;
+    const GB: f64 = MB * 1_000.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.2}GB", bytes_f / GB)
+    } else if bytes_f >= MB {
+        format!("{:.1}MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1}KB", bytes_f / KB)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -3089,7 +3195,7 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
 
 #[cfg(test)]
 mod tests {
-    use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
+    use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, MpTrainingBackend};
     use poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig;
     use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
     use test_macros::timed_test;
@@ -3372,6 +3478,62 @@ snapshots:
         assert!(result.is_err(), "should reject num_players=99");
     }
 
+    #[timed_test(2)]
+    fn run_train_blueprint_mp_lazy_sparse_no_tui_zero_iters_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy.yaml");
+        let yaml = r#"
+game:
+  name: "lazy tiny"
+  num_players: 2
+  stack_depth: 20
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1
+    - seat: 1
+      type: big_blind
+      amount: 2
+
+action_abstraction:
+  preflop:
+    lead: []
+    raise: []
+  flop:
+    lead: []
+    raise: []
+  turn:
+    lead: []
+    raise: []
+  river:
+    lead: []
+    raise: []
+
+clustering:
+  preflop: { buckets: 10 }
+  flop: { buckets: 10 }
+  turn: { buckets: 10 }
+  river: { buckets: 10 }
+
+training:
+  backend: lazy_sparse
+  iterations: 0
+
+snapshots:
+  warmup_minutes: 1
+  snapshot_every_minutes: 1
+  output_dir: "/tmp/lazy_tiny"
+
+tui:
+  enabled: false
+"#;
+        std::fs::write(&path, yaml).unwrap();
+
+        let result = super::run_train_blueprint_mp(path.to_str().unwrap(), true);
+
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn inspect_mp_config_flags_100bb_multi_preflop_raise_rows() {
         let yaml = r#"
@@ -3433,6 +3595,66 @@ snapshots:
     }
 
     #[test]
+    fn inspect_mp_config_reports_lazy_sparse_backend_without_clearing_eager_risk() {
+        let yaml = r#"
+game:
+  name: "100bb sparse"
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 4
+      type: small_blind
+      amount: 1
+    - seat: 5
+      type: big_blind
+      amount: 2
+
+action_abstraction:
+  preflop:
+    lead: ["2bb"]
+    raise:
+      - ["1.0x"]
+      - ["1.0x"]
+  flop:
+    lead: [0.75]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop: { buckets: 169 }
+  flop: { buckets: 500 }
+  turn: { buckets: 100 }
+  river: { buckets: 100 }
+
+training:
+  backend: lazy_sparse
+  iterations: 1
+
+snapshots:
+  warmup_minutes: 1
+  snapshot_every_minutes: 1
+  output_dir: "/tmp/sparse"
+"#;
+        let config: BlueprintMpConfig = serde_yaml::from_str(yaml).unwrap();
+
+        let report = super::inspect_mp_config(&config).unwrap();
+
+        assert_eq!(report.backend, MpTrainingBackend::LazySparse);
+        assert!(
+            report.eager_risk.is_some(),
+            "preflight should still show the dense backend risk for context"
+        );
+    }
+
+    #[test]
     fn mp_snapshot_save_creates_strategy_and_metadata() {
         use poker_solver_core::blueprint_mp::config::{
             ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
@@ -3482,6 +3704,7 @@ snapshots:
                 river: MpStreetCluster { buckets: 2 },
             },
             training: MpTrainingConfig {
+                backend: MpTrainingBackend::Eager,
                 cluster_path: None,
                 iterations: Some(1),
                 time_limit_minutes: None,

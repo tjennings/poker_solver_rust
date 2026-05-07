@@ -153,6 +153,8 @@ pub struct MpStreetCluster {
 /// MCCFR training schedule and parameters for multiplayer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MpTrainingConfig {
+    #[serde(default = "default_training_backend")]
+    pub backend: MpTrainingBackend,
     #[serde(default)]
     pub cluster_path: Option<String>,
     #[serde(default)]
@@ -187,6 +189,16 @@ pub struct MpTrainingConfig {
     pub exploitability_samples: u64,
 }
 
+/// Multiplayer blueprint training storage/traversal backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MpTrainingBackend {
+    /// Eagerly materialize the public tree and dense regret/strategy storage.
+    Eager,
+    /// Traverse public states on demand and store only visited sparse infosets.
+    LazySparse,
+}
+
 // ── Snapshot config ──────────────────────────────────────────────────
 
 /// Checkpoint output settings for multiplayer training.
@@ -202,6 +214,10 @@ pub struct MpSnapshotConfig {
 }
 
 // ── Default value functions ──────────────────────────────────────────
+
+const fn default_training_backend() -> MpTrainingBackend {
+    MpTrainingBackend::Eager
+}
 
 const fn default_lcfr_warmup() -> u64 {
     5_000_000
@@ -314,8 +330,67 @@ snapshots:
             serde_yaml::from_str(yaml).expect("failed to parse 6max config");
 
         assert_eq!(cfg.game.num_players, 6);
+        assert_eq!(cfg.training.backend, MpTrainingBackend::Eager);
         assert_eq!(cfg.game.blinds.len(), 3);
         assert!(matches!(cfg.game.blinds[2].kind, ForcedBetKind::BbAnte));
+    }
+
+    #[timed_test]
+    fn deserialize_lazy_sparse_backend() {
+        let yaml = r#"
+game:
+  name: "Lazy"
+  num_players: 2
+  stack_depth: 100.0
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+
+training:
+  backend: lazy_sparse
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 10
+  snapshot_every_minutes: 5
+  output_dir: "/tmp/lazy"
+"#;
+
+        let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("failed to parse backend");
+
+        assert_eq!(cfg.training.backend, MpTrainingBackend::LazySparse);
     }
 
     #[timed_test]

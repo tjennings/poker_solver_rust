@@ -10,8 +10,8 @@
     clippy::too_many_arguments
 )]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Global prune counters — accumulated per batch, read+reset by TUI bridge.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -21,14 +21,14 @@ use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
+use super::MAX_PLAYERS;
 use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
 use super::game_tree::MpGameTree;
-use super::lazy_mccfr::{traverse_external_lazy, LazyMpGame};
+use super::lazy_mccfr::{LazyMpGame, traverse_external_lazy};
 use super::mccfr::{sample_deal, traverse_external};
 use super::sparse_storage::SparseMpStorage;
 use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
-use super::MAX_PLAYERS;
 use crate::blueprint_v2::mccfr::AllBuckets;
 use crate::blueprint_v2::trainer::load_bucket_files;
 
@@ -508,7 +508,8 @@ mod tests {
     use super::*;
     use crate::blueprint_mp::config::{
         BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig,
-        MpGameConfig, MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
+        MpGameConfig, MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingBackend,
+        MpTrainingConfig,
     };
     use crate::blueprint_mp::game_tree::MpGameTree;
     use crate::blueprint_mp::mccfr::sample_deal;
@@ -552,6 +553,7 @@ mod tests {
             river: MpStreetCluster { buckets: 10 },
         };
         let training = MpTrainingConfig {
+            backend: MpTrainingBackend::Eager,
             cluster_path: None,
             iterations: Some(iterations),
             time_limit_minutes: None,
@@ -608,6 +610,7 @@ mod tests {
 
     fn toy_training_config(iterations: u64) -> MpTrainingConfig {
         MpTrainingConfig {
+            backend: MpTrainingBackend::Eager,
             cluster_path: None,
             iterations: Some(iterations),
             time_limit_minutes: None,

@@ -95,6 +95,7 @@ fn build_full_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         river: MpStreetCluster { buckets: 10 },
     };
     let training = MpTrainingConfig {
+        backend: MpTrainingBackend::Eager,
         cluster_path: None,
         iterations: Some(iterations),
         time_limit_minutes: None,
