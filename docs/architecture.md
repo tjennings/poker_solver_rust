@@ -192,9 +192,13 @@ crates/core/src/blueprint_mp/
 - **Lead/raise split**: Separate bet sizes for opening bets vs raises
 - **Full side pot resolution** at showdown terminals
 - **128-bit info set keys** with 22 action slots (panics on overflow)
-- **Pre-allocated storage** (lazy allocation planned as future optimization): cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
+- **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
 - **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
+
+### 100bb MP Scaling Plan
+
+The current `blueprint_mp` backend eagerly materializes the full public betting tree and dense `(node, bucket, action)` storage. Normal 100bb 6-max configs with multiple preflop raise depths can exceed hundreds of millions of public nodes and hundreds of GB of virtual storage. The intended 100bb path is a lazy/sparse backend: traverse compact public states on demand, key regrets by stable infoset/action-history keys, and store only visited infosets. See `docs/plans/2026-05-07-blueprint-mp-100bb-design.md`.
 
 ## Range Solver (Exact Postflop Solver)
 

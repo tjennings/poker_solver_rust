@@ -108,6 +108,10 @@ snapshots:
 - `sample_configurations/blueprint_mp_6max_simplified_actions.yaml` -- 6-max 20bb trainer using shared 500/50/50 postflop buckets, compact action sets, and TUI scenarios
 - `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml` -- 6-max 20bb trainer using shared 500/100/100 postflop buckets for the current bucket-quality experiment
 
+#### 100bb Status
+
+100bb is a target stack depth for Blueprint MP, but the current backend is still eager: it builds the complete public betting tree and dense regret/strategy storage before training. A 100bb 6-max config with multiple preflop raise depths can be too large for this backend. The planned path is a lazy/sparse trainer that generates public states on demand and stores only visited infosets; see `docs/plans/2026-05-07-blueprint-mp-100bb-design.md`.
+
 Run the 500/100/100 6-max experiment with:
 
 ```bash
