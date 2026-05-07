@@ -105,7 +105,15 @@ snapshots:
 
 - `sample_configurations/blueprint_mp_3player.yaml` -- 3-player 50bb test
 - `sample_configurations/blueprint_mp_6player_ante.yaml` -- 6-player 100bb with BB-ante
-- `sample_configurations/blueprint_mp_6max_simplified_actions.yaml` -- 6-max 20bb 200-bucket trainer with compact action sets and TUI scenarios
+- `sample_configurations/blueprint_mp_6max_simplified_actions.yaml` -- 6-max 20bb trainer using shared 500/50/50 postflop buckets, compact action sets, and TUI scenarios
+- `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml` -- 6-max 20bb trainer using shared 500/100/100 postflop buckets for the current bucket-quality experiment
+
+Run the 500/100/100 6-max experiment with:
+
+```bash
+cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
+  -c sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml
+```
 
 ---
 
