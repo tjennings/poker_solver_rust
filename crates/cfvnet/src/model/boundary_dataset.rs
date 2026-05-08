@@ -1,7 +1,7 @@
 use crate::datagen::storage::TrainingRecord;
 use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_RANKS};
 
-/// A single training item for BoundaryNet with normalized EV targets.
+/// A single training item for BoundaryNet with solver-native bcfv targets.
 #[derive(Debug, Clone)]
 pub struct BoundaryItem {
     pub input: Vec<f32>,
@@ -14,7 +14,7 @@ pub struct BoundaryItem {
     pub sample_weight: f32,
 }
 
-/// Encode a TrainingRecord into a BoundaryItem with normalized pot/stack and targets.
+/// Encode a TrainingRecord into a BoundaryItem.
 pub fn encode_boundary_record(rec: &TrainingRecord) -> BoundaryItem {
     let total_stake = rec.pot + rec.effective_stack;
     let norm = if total_stake > 0.0 { total_stake } else { 1.0 };
@@ -43,10 +43,9 @@ pub fn encode_boundary_record(rec: &TrainingRecord) -> BoundaryItem {
 
     debug_assert_eq!(input.len(), INPUT_SIZE);
 
-    // Normalize targets: chip_ev / total_stake
-    // chip_ev = cfv_pot_relative * pot
-    let pot_over_norm = rec.pot / norm;
-    let target: Vec<f32> = rec.cfvs.iter().map(|&cfv| cfv * pot_over_norm).collect();
+    // Direct BoundaryNet contract: model outputs the same bcfv units consumed
+    // by range-solver boundary evaluators.
+    let target = rec.cfvs.to_vec();
 
     let mask: Vec<f32> = rec
         .valid_mask
@@ -60,8 +59,7 @@ pub fn encode_boundary_record(rec: &TrainingRecord) -> BoundaryItem {
         rec.ip_range.to_vec()
     };
 
-    // game_value = sum(range[i] * target[i]) — recompute from normalized targets
-    // rather than scaling raw game_value (which is a weighted sum, not a single value).
+    // game_value = sum(range[i] * target[i]).
     let game_value: f32 = range.iter().zip(target.iter()).map(|(&r, &t)| r * t).sum();
 
     // SPR-based sample weight: low SPR → higher weight.
@@ -137,28 +135,26 @@ mod tests {
     }
 
     #[test]
-    fn encode_normalizes_target() {
+    fn encode_uses_direct_bcfv_target() {
         let rec = sample_record();
         let item = encode_boundary_record(&rec);
-        // cfvs[0]=0.3 (pot-relative), chip_ev = 0.3 * pot = 0.3 * 100 = 30
-        // normalized = 30 / 250 = 0.12
         assert!(
-            (item.target[0] - 0.12).abs() < 1e-6,
+            (item.target[0] - 0.3).abs() < 1e-6,
             "target[0]: {}",
             item.target[0]
         );
     }
 
     #[test]
-    fn encode_normalizes_game_value() {
+    fn encode_uses_direct_bcfv_game_value() {
         let rec = sample_record();
         let item = encode_boundary_record(&rec);
         // game_value = sum(range[i] * target[i])
         // range = oop_range = [0.5, 0.5, 0, ...]
-        // target[0] = 0.3 * 100/250 = 0.12, target[1] = 0 * 100/250 = 0
-        // game_value = 0.5 * 0.12 + 0.5 * 0.0 = 0.06
+        // target[0] = 0.3, target[1] = 0
+        // game_value = 0.5 * 0.3 + 0.5 * 0.0 = 0.15
         assert!(
-            (item.game_value - 0.06).abs() < 1e-6,
+            (item.game_value - 0.15).abs() < 1e-6,
             "game_value: {}",
             item.game_value
         );

@@ -27,8 +27,8 @@ pub struct RiverRunoutInput<'a> {
     pub ip_range: &'a [f32; NUM_COMBOS],
 }
 
-/// Evaluates one river runout and returns pot-relative CFVs for the requested
-/// player perspective.
+/// Evaluates one river runout and returns solver-native bcfv values for the
+/// requested player perspective.
 pub trait RiverRunoutOracle {
     fn evaluate(&self, input: RiverRunoutInput<'_>) -> Result<[f32; NUM_COMBOS], String>;
 }
@@ -54,9 +54,10 @@ impl<T: BoundaryNetInfer + ?Sized> BoundaryNetInfer for &T {
 
 /// River oracle backed by the existing river BoundaryNet contract.
 ///
-/// BoundaryNet predicts normalized values (`chip_cfv / (pot + stack)`). The
-/// turn-boundary dataset stores pot-relative CFVs, so this adapter converts the
-/// model output back to `chip_cfv / pot` before returning it.
+/// River BoundaryNet predicts normalized pot-share values
+/// (`chip_cfv / (pot + stack)`). The direct turn-boundary dataset stores
+/// solver-native bcfv values, so this adapter converts via:
+/// `bcfv = 2 * chip_cfv / pot - 1`.
 pub struct BoundaryNetRiverRunoutOracle<I> {
     inferer: I,
 }
@@ -97,7 +98,7 @@ impl<I: BoundaryNetInfer> RiverRunoutOracle for BoundaryNetRiverRunoutOracle<I> 
         let scale = (input.pot + input.effective_stack) / input.pot;
         let mut cfvs = [0.0_f32; NUM_COMBOS];
         for (out, value) in cfvs.iter_mut().zip(normalized.iter()) {
-            *out = *value * scale;
+            *out = 2.0 * *value * scale - 1.0;
         }
         Ok(cfvs)
     }
@@ -286,14 +287,17 @@ fn solve_exact_river_runout(
     board[..4].copy_from_slice(&input.board);
     board[4] = river;
 
-    let (oop_values, ip_values) = oracle.evaluate_both(RiverRunoutInput {
-        board,
-        pot: input.pot,
-        effective_stack: input.effective_stack,
-        player: 0,
-        oop_range: &input.oop_range,
-        ip_range: &input.ip_range,
-    })?;
+    let (oop_values_pot_relative, ip_values_pot_relative) =
+        oracle.evaluate_both(RiverRunoutInput {
+            board,
+            pot: input.pot,
+            effective_stack: input.effective_stack,
+            player: 0,
+            oop_range: &input.oop_range,
+            ip_range: &input.ip_range,
+        })?;
+    let oop_values = oop_values_pot_relative.map(|v| 2.0 * v - 1.0);
+    let ip_values = ip_values_pot_relative.map(|v| 2.0 * v - 1.0);
     Ok((river, oop_values, ip_values))
 }
 
@@ -649,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_net_oracle_zeroes_board_blockers_and_returns_pot_relative_cfvs() {
+    fn boundary_net_oracle_zeroes_board_blockers_and_returns_bcfvs() {
         let inferer = CapturingInferer::new(vec![0.125; NUM_COMBOS]);
         let oracle = BoundaryNetRiverRunoutOracle::new(&inferer);
         let input = sample_input(1);
@@ -665,7 +669,7 @@ mod tests {
             })
             .unwrap();
 
-        assert!((values[card_pair_to_index(8, 9)] - 0.5).abs() < 1e-6);
+        assert!(values[card_pair_to_index(8, 9)].abs() < 1e-6);
 
         let calls = inferer.calls.borrow();
         assert_eq!(calls.len(), 1);

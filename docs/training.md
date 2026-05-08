@@ -433,7 +433,7 @@ Options:
 - `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
 - `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
-- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `river_enumerated_turn` (default) preserves the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. `direct` evaluates the supplied boundary board as-is, which is required for direct turn-boundary ONNX models trained on 4-card boards.
+- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `river_enumerated_turn` (default) preserves the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. `direct` evaluates the supplied boundary board as-is and expects the ONNX output to already be solver-native bcfv values.
 - `--oracle-orientation <MODE>` -- Hidden `exact_oracle` diagnostic. Accepted values are `current`, `swap`, `sign-flip`, and `swap-sign-flip`; use only to audit OOP/IP and sign orientation at the raw boundary-CFV handoff.
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
@@ -822,15 +822,15 @@ cargo run -p cfvnet --release -- compare-exact \
   --num-spots 20
 ```
 
-### BoundaryNet (Normalized EV Model)
+### BoundaryNet (Direct Boundary-CFV Model)
 
-BoundaryNet is a sibling model to CfvNet that outputs **normalized EVs** (`chip_ev / (pot + effective_stack)`) instead of pot-relative CFVs. It uses the same training data but with different input encoding (pot/stack as fractions of total stake) and normalized targets.
+BoundaryNet is a sibling model to CfvNet that outputs **solver-native boundary CFVs** directly. These are bcfv units: `0.0` is the break-even half-pot baseline, `+1.0` is one half-pot above break-even, and `-1.0` is one half-pot below. It uses BoundaryNet input encoding with pot/stack as fractions of total stake, but the output target is the exact value convention consumed by the range-solver boundary evaluator.
 
 BoundaryNet is designed as a depth-boundary evaluator for the range-solver, enabling turn solving with neural network leaf values at river boundaries.
 
 #### Train a BoundaryNet
 
-Uses the same training data as CfvNet (generated with `generate`):
+Use direct turn-boundary data generated with the turn-boundary pipeline. The data must store bcfv targets, not pot-relative EV/share values:
 
 ```bash
 cargo run -p cfvnet --release -- train-boundary \
@@ -841,7 +841,7 @@ cargo run -p cfvnet --release -- train-boundary \
 
 #### Evaluate BoundaryNet
 
-Reports normalized MAE with per-SPR bucket breakdown (<1, 1-3, 3-10, 10+):
+Reports bcfv MAE with per-SPR bucket breakdown (<1, 1-3, 3-10, 10+):
 
 ```bash
 cargo run -p cfvnet --release -- eval-boundary \

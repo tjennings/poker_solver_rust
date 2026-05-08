@@ -9,7 +9,7 @@ use super::network::{HiddenBlock, INPUT_SIZE, OUTPUT_SIZE};
 /// Boundary value network for depth-bounded range solving.
 ///
 /// Same architecture as CfvNet (MLP with BatchNorm + PReLU hidden blocks),
-/// but outputs normalized EVs: `chip_ev / (pot + effective_stack)`.
+/// but outputs solver-native boundary CFVs directly.
 ///
 /// Input encoding differs: pot and stack are encoded as fractions of
 /// `(pot + effective_stack)` rather than divided by 400.

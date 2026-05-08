@@ -564,7 +564,7 @@ fn spawn_dataloader_thread(
 /// Train a `BoundaryNet` using a streaming dataloader.
 ///
 /// Structurally identical to `train()` for CfvNet, but uses boundary encoding
-/// (normalized pot/stack inputs and normalized EV targets).
+/// (normalized pot/stack inputs and solver-native bcfv targets).
 pub fn train_boundary<B: AutodiffBackend>(
     device: &B::Device,
     data_path: &Path,

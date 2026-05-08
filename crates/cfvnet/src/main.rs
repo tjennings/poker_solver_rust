@@ -118,7 +118,7 @@ enum Commands {
         #[arg(long, default_value = "1")]
         threads: usize,
     },
-    /// Train the BoundaryNet model (normalized EV output for range-solver integration)
+    /// Train the BoundaryNet model (direct bcfv output for range-solver integration)
     TrainBoundary {
         #[arg(short, long)]
         config: PathBuf,
@@ -412,8 +412,8 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
     match backend {
         "wgpu" => {
             use burn::backend::{
-                wgpu::{Wgpu, WgpuDevice},
                 Autodiff,
+                wgpu::{Wgpu, WgpuDevice},
             };
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
@@ -443,7 +443,7 @@ fn cmd_train(config_path: PathBuf, data: PathBuf, output: PathBuf, backend: &str
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
-            use burn::backend::{cuda_jit::CudaDevice, Autodiff, CudaJit};
+            use burn::backend::{Autodiff, CudaJit, cuda_jit::CudaDevice};
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
@@ -523,8 +523,8 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
     match backend {
         "wgpu" => {
             use burn::backend::{
-                wgpu::{Wgpu, WgpuDevice},
                 Autodiff,
+                wgpu::{Wgpu, WgpuDevice},
             };
             type B = Autodiff<Wgpu>;
             let device = WgpuDevice::DefaultDevice;
@@ -554,7 +554,7 @@ fn cmd_train_boundary(config_path: PathBuf, data: PathBuf, output: PathBuf, back
         }
         #[cfg(feature = "cuda")]
         "cuda" => {
-            use burn::backend::{cuda_jit::CudaDevice, Autodiff, CudaJit};
+            use burn::backend::{Autodiff, CudaJit, cuda_jit::CudaDevice};
             type B = Autodiff<CudaJit<f32>>;
             let device = CudaDevice::default();
             println!("Using CUDA backend (NVIDIA GPU)");
@@ -1025,7 +1025,7 @@ fn cmd_eval_boundary_onnx(model_path: PathBuf, data_path: PathBuf) {
     use cfvnet::eval::metrics::compute_normalized_mae;
     use cfvnet::model::boundary_dataset::encode_boundary_record;
     use cfvnet::model::network::INPUT_SIZE;
-    use ort::session::{builder::GraphOptimizationLevel, Session};
+    use ort::session::{Session, builder::GraphOptimizationLevel};
 
     let session = Session::builder()
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
@@ -1145,7 +1145,7 @@ fn cmd_diagnose_boundary_onnx(
     use cfvnet::datagen::storage::{read_record, record_size};
     use cfvnet::model::boundary_dataset::encode_boundary_record;
     use cfvnet::model::network::INPUT_SIZE;
-    use ort::session::{builder::GraphOptimizationLevel, Session};
+    use ort::session::{Session, builder::GraphOptimizationLevel};
     use range_solver::card::index_to_card_pair;
     use std::collections::HashMap;
 
@@ -1709,7 +1709,7 @@ fn cmd_datagen_eval(data: PathBuf) {
     let mut cfv_maxs = Vec::new();
     let mut cfv_abs_maxs = Vec::new();
     let mut total_stakes = Vec::new();
-    let mut norm_target_abs_maxs = Vec::new();
+    let mut boundary_target_abs_maxs = Vec::new();
     let mut card_max: u8 = 0;
     let mut num_extreme_records = 0u64;
     let mut extreme_examples: Vec<String> = Vec::new();
@@ -1782,32 +1782,31 @@ fn cmd_datagen_eval(data: PathBuf) {
                         cfv_abs_maxs.push(cfv_min.abs().max(cfv_max.abs()));
                     }
 
-                    // Normalized target statistics (BoundaryNet encoding)
+                    // Direct target statistics (BoundaryNet bcfv output)
                     let total_stake = rec.pot as f64 + rec.effective_stack as f64;
                     total_stakes.push(total_stake);
                     if total_stake > 0.0 {
-                        let pot_over_norm = rec.pot as f64 / total_stake;
-                        let mut norm_abs_max = 0.0_f64;
+                        let mut target_abs_max = 0.0_f64;
                         for (i, &cfv) in rec.cfvs.iter().enumerate() {
                             if rec.valid_mask[i] != 0 {
-                                let norm = (cfv as f64) * pot_over_norm;
-                                if norm.abs() > norm_abs_max {
-                                    norm_abs_max = norm.abs();
+                                let target = cfv as f64;
+                                if target.abs() > target_abs_max {
+                                    target_abs_max = target.abs();
                                 }
                             }
                         }
-                        norm_target_abs_maxs.push(norm_abs_max);
+                        boundary_target_abs_maxs.push(target_abs_max);
 
                         // Flag extreme records
-                        let norm_gv = (rec.game_value as f64 * pot_over_norm).abs();
-                        if norm_abs_max > 5.0 || norm_gv > 5.0 || total_stake < 1.0 {
+                        let target_gv = (rec.game_value as f64).abs();
+                        if target_abs_max > 5.0 || target_gv > 5.0 || total_stake < 1.0 {
                             num_extreme_records += 1;
                             if extreme_examples.len() < 10 {
                                 extreme_examples.push(format!(
-                                    "  file={} rec={}: pot={:.1} stack={:.1} total={:.1} gv={:.4} norm_gv={:.4} max_norm_cfv={:.4} board={:?}",
+                                    "  file={} rec={}: pot={:.1} stack={:.1} total={:.1} gv={:.4} target_gv={:.4} max_boundary_cfv={:.4} board={:?}",
                                     path.file_name().unwrap_or_default().to_string_lossy(),
                                     rec_idx, rec.pot, rec.effective_stack, total_stake,
-                                    rec.game_value, norm_gv, norm_abs_max, rec.board
+                                    rec.game_value, target_gv, target_abs_max, rec.board
                                 ));
                             }
                         }
@@ -1851,17 +1850,17 @@ fn cmd_datagen_eval(data: PathBuf) {
     print_stats("  pot", &pots);
     print_stats("  effective_stack", &stacks);
     print_stats("  total_stake (pot+stack)", &total_stakes);
-    print_stats("  game_value (pot-relative)", &game_values);
-    print_stats("  cfv_min (pot-relative)", &cfv_mins);
-    print_stats("  cfv_max (pot-relative)", &cfv_maxs);
-    print_stats("  |cfv|_max (pot-relative)", &cfv_abs_maxs);
-    print_stats("  |norm_target|_max (boundary)", &norm_target_abs_maxs);
+    print_stats("  game_value (bcfv)", &game_values);
+    print_stats("  cfv_min (bcfv)", &cfv_mins);
+    print_stats("  cfv_max (bcfv)", &cfv_maxs);
+    print_stats("  |cfv|_max (bcfv)", &cfv_abs_maxs);
+    print_stats("  |boundary_target|_max (bcfv)", &boundary_target_abs_maxs);
     println!("  max board card ID: {card_max} (expected < 52)");
 
     // Extreme records
     if num_extreme_records > 0 {
         println!(
-            "\nExtreme Records ({num_extreme_records} total, |norm_cfv|>5 or |norm_gv|>5 or total_stake<1):"
+            "\nExtreme Records ({num_extreme_records} total, |boundary_cfv|>5 or |boundary_gv|>5 or total_stake<1):"
         );
         for ex in &extreme_examples {
             println!("{ex}");
@@ -1877,10 +1876,7 @@ fn cmd_datagen_eval(data: PathBuf) {
     print_raw_frequency_histogram("Frequency by Pot Size", &pots);
     print_raw_frequency_histogram("Frequency by Game Value", &game_values);
     print_raw_frequency_histogram("Frequency by |CFV|_max", &cfv_abs_maxs);
-    print_raw_frequency_histogram(
-        "Frequency by |Normalized Target|_max",
-        &norm_target_abs_maxs,
-    );
+    print_raw_frequency_histogram("Frequency by |Boundary CFV|_max", &boundary_target_abs_maxs);
 
     let sprs: Vec<f64> = pots
         .iter()

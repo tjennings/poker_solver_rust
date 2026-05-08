@@ -255,13 +255,13 @@ Input(2720) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
 - Input: OOP range (1326) + IP range (1326) + board one-hot (52) + rank presence (13) + pot/400 + stack/400 + player
 - Output: 1326 pot-relative counterfactual values
 
-**BoundaryNet** (normalized EV output):
+**BoundaryNet** (solver-native bcfv output):
 ```
 Input(2720) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
 ```
 - Input: same layout as CfvNet, but pot and stack encoded as `pot/(pot+stack)` and `stack/(pot+stack)`
-- Output: 1326 normalized EVs (`chip_ev / (pot + effective_stack)`)
-- At inference: `chip_ev[h] = normalized_ev[h] * (pot + effective_stack)`
+- Output: 1326 solver-native bcfv values. `0.0` is the break-even half-pot baseline, `+1.0` is one half-pot above break-even, and `-1.0` is one half-pot below.
+- At inference: the ONNX output is mapped directly back into range-solver private-card order. No pot/share/stack conversion is applied in the evaluator.
 
 Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game-value constraint. ~2.9M parameters (default 7x500).
 
@@ -269,7 +269,7 @@ Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game
 
 **CfvNet** provides standalone river value predictions for evaluation and comparison.
 
-**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. The evaluator supports two runtime contracts. `river_enumerated_turn` preserves the legacy river-net adapter by evaluating every valid river runout from a 4-card turn board and averaging the river outputs. `direct` sends the supplied boundary board directly to ONNX, which is the contract for turn-boundary models trained on 4-card boards. The ONNX evaluator batches OOP/IP rows together for each boundary cache fill, so direct mode performs one session run per boundary rather than one run per player.
+**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. The evaluator supports two runtime contracts. `river_enumerated_turn` preserves the legacy river-net adapter by evaluating every valid river runout from a 4-card turn board and averaging the river outputs. `direct` sends the supplied boundary board directly to ONNX, which is the contract for turn-boundary models trained on 4-card boards. Direct models must output solver-native bcfv values, not pot-share EVs. The ONNX evaluator batches OOP/IP rows together for each boundary cache fill, so direct mode performs one session run per boundary rather than one run per player.
 
 Depth-boundary evaluators have two value conventions. Legacy evaluators return normalized boundary CFVs, and the range-solver converts them through the standard half-pot and opponent-reach formula before regret updates. Raw CFV evaluators return already reach-integrated per-combination chip CFVs. For raw evaluators, each boundary visit caches only the current traverser's value slot; the opposite player is computed on that player's own traversal after their current opponent reach has been recorded.
 

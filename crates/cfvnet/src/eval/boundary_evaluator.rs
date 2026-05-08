@@ -5,6 +5,7 @@
 //! - `onnx` feature: uses `ort::Session` loaded from a `.onnx` file exported by PyTorch.
 
 use std::path::Path;
+#[cfg(feature = "onnx")]
 use std::sync::Arc;
 
 use crate::model::network::{DECK_SIZE, INPUT_SIZE, NUM_COMBOS, NUM_RANKS};
@@ -139,7 +140,8 @@ pub enum BoundaryInferenceMode {
     #[default]
     RiverEnumeratedTurn,
     /// Evaluate the boundary board exactly as supplied. This is the contract
-    /// used by direct turn-boundary models trained on 4-card boards.
+    /// used by direct turn-boundary models trained on 4-card boards. The ONNX
+    /// output must already be in solver-native bcfv units.
     Direct,
 }
 
@@ -260,12 +262,11 @@ impl NeuralBoundaryEvaluator {
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
-        let total = pot_f32 + eff_stack_f32;
 
         // Board-size branch. The river cfvnet was trained on 5-card boards;
         // feeding a 4-card (turn) board is OOD. For turn boundaries, average
         // the net's output over all valid river cards.
-        let normalized_1326 = match (self.inference_mode, self.board.len()) {
+        let cfvs_1326 = match (self.inference_mode, self.board.len()) {
             (BoundaryInferenceMode::Direct, 4 | 5)
             | (BoundaryInferenceMode::RiverEnumeratedTurn, 5) => self.burn_forward(
                 &oop_range_1326,
@@ -287,13 +288,11 @@ impl NeuralBoundaryEvaluator {
             }
         };
 
-        let chip_evs: Vec<f32> = normalized_1326.iter().map(|&v| v * total).collect();
-
         // Map 1326-combo ordering back to game private_cards ordering.
         let hands = &self.private_cards[player];
         let mut cfvs = Vec::with_capacity(hands.len());
         for &(c1, c2) in hands {
-            cfvs.push(chip_evs[card_pair_to_index(c1, c2)]);
+            cfvs.push(cfvs_1326[card_pair_to_index(c1, c2)]);
         }
         cfvs
     }
@@ -463,16 +462,11 @@ impl NeuralBoundaryEvaluator {
         (oop_range_1326, ip_range_1326)
     }
 
-    fn map_outputs_to_game_hands(
-        &self,
-        normalized_1326: &[f32],
-        player: usize,
-        scale: f32,
-    ) -> Vec<f32> {
+    fn map_outputs_to_game_hands(&self, cfvs_1326: &[f32], player: usize) -> Vec<f32> {
         let hands = &self.private_cards[player];
         let mut cfvs = Vec::with_capacity(hands.len());
         for &(c1, c2) in hands {
-            cfvs.push(normalized_1326[card_pair_to_index(c1, c2)] * scale);
+            cfvs.push(cfvs_1326[card_pair_to_index(c1, c2)]);
         }
         cfvs
     }
@@ -489,7 +483,7 @@ impl NeuralBoundaryEvaluator {
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
 
-        let (normalized_oop, normalized_ip) = match (self.inference_mode, self.board.len()) {
+        let (oop_cfvs, ip_cfvs) = match (self.inference_mode, self.board.len()) {
             (BoundaryInferenceMode::Direct, 4 | 5)
             | (BoundaryInferenceMode::RiverEnumeratedTurn, 5) => self.onnx_forward_both_players(
                 &oop_range_1326,
@@ -513,16 +507,9 @@ impl NeuralBoundaryEvaluator {
             }
         };
 
-        // Unit conversion: target = cfv_halfpot * pot / (pot + eff_stack)
-        let scale = if pot_f32 > 0.0 {
-            (pot_f32 + eff_stack_f32) / pot_f32
-        } else {
-            0.0
-        };
-
         (
-            self.map_outputs_to_game_hands(&normalized_oop, 0, scale),
-            self.map_outputs_to_game_hands(&normalized_ip, 1, scale),
+            self.map_outputs_to_game_hands(&oop_cfvs, 0),
+            self.map_outputs_to_game_hands(&ip_cfvs, 1),
         )
     }
 
