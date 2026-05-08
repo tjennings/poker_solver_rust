@@ -702,8 +702,11 @@ fn generate_actions(config: &LazyActionConfig, state: &LazyPublicState) -> Vec<T
     } else {
         add_check_or_call(state, &mut actions);
     }
-    add_sized_actions(config, state, &mut actions);
-    if !is_unopened_preflop {
+    let suppress_new_aggression = suppresses_new_aggression(state);
+    if !suppress_new_aggression {
+        add_sized_actions(config, state, &mut actions);
+    }
+    if !is_unopened_preflop && !suppress_new_aggression {
         add_all_in_if_needed(state, &mut actions);
     }
     dedup_all_in(&mut actions);
@@ -761,6 +764,10 @@ fn add_sized_actions(
             actions,
         );
     }
+}
+
+fn suppresses_new_aggression(state: &LazyPublicState) -> bool {
+    state.street == Street::River && spr_bucket(*state) == 0
 }
 
 fn add_lead_sizes(state: &LazyPublicState, sizes: LeadSizes<'_>, actions: &mut Vec<TreeAction>) {
@@ -1148,6 +1155,34 @@ mod tests {
         }
     }
 
+    fn river_spr_zero_state(facing_bet: bool, to_call: f64, remaining: f64) -> LazyPublicState {
+        let mut active = PlayerSet::empty();
+        active.insert(Seat::from_raw(0));
+        active.insert(Seat::from_raw(1));
+        let mut street_bets = [Chips::ZERO; MAX_PLAYERS];
+        street_bets[1] = Chips(to_call);
+        let mut stacks = [Chips::ZERO; MAX_PLAYERS];
+        stacks[0] = Chips(remaining);
+        stacks[1] = Chips(remaining);
+        LazyPublicState {
+            stacks,
+            street_bets,
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+            active,
+            all_in: PlayerSet::empty(),
+            acted_since_aggression: PlayerSet::empty(),
+            street: Street::River,
+            pot: Chips(100.0),
+            num_players: 2,
+            raise_count: if facing_bet { 1 } else { 0 },
+            to_act: Seat::from_raw(0),
+            facing_bet,
+            last_raise_to: Chips(to_call),
+            dealer: 0,
+            big_blind_amount: Chips(2.0),
+        }
+    }
+
     #[timed_test]
     fn lazy_root_generates_open_actions_without_building_tree() {
         let game = LazyMpGame::new(&game_config(6, 200.0), &action_config());
@@ -1168,6 +1203,36 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON))
         );
+    }
+
+    #[timed_test]
+    fn lazy_river_spr_zero_suppresses_new_aggression_when_unopened() {
+        let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
+        let state = river_spr_zero_state(false, 0.0, 50.0);
+
+        let actions = game.actions(&state);
+
+        assert_eq!(actions, vec![TreeAction::Check]);
+    }
+
+    #[timed_test]
+    fn lazy_river_spr_zero_suppresses_all_in_raise_when_facing_bet() {
+        let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
+        let state = river_spr_zero_state(true, 10.0, 50.0);
+
+        let actions = game.actions(&state);
+
+        assert_eq!(actions, vec![TreeAction::Fold, TreeAction::Call]);
+    }
+
+    #[timed_test]
+    fn lazy_river_spr_zero_keeps_all_in_call_when_call_closes_stack() {
+        let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
+        let state = river_spr_zero_state(true, 50.0, 50.0);
+
+        let actions = game.actions(&state);
+
+        assert_eq!(actions, vec![TreeAction::Fold, TreeAction::AllIn]);
     }
 
     #[timed_test]
