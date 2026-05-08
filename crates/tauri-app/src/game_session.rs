@@ -176,7 +176,7 @@ fn boundary_evaluator_log_line(
                     "Direct CFVNet"
                 }
                 cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy => {
-                    "Direct CFVNet (legacy normalized)"
+                    "Direct CFVNet (legacy scaled bcfv)"
                 }
                 cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn => {
                     "CFVNet"
@@ -6692,7 +6692,7 @@ mod tests {
         let cut = Some((0, direct_normalized_legacy_cfvnet_kind("/models/turn.onnx")));
         assert_eq!(
             boundary_evaluator_log_line("subgame", &cut),
-            "[solve] solver: subgame; boundary evaluator: Direct CFVNet (legacy normalized); depth_limit=0; inference_mode=direct_normalized_legacy; model=/models/turn.onnx"
+            "[solve] solver: subgame; boundary evaluator: Direct CFVNet (legacy scaled bcfv); depth_limit=0; inference_mode=direct_normalized_legacy; model=/models/turn.onnx"
         );
     }
 
