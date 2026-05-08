@@ -6,7 +6,10 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const TURN_BOUNDARY_SCHEMA_VERSION: u32 = 1;
+pub const BOUNDARY_SCHEMA_VERSION: u32 = 1;
+pub const TURN_BOUNDARY_SCHEMA_VERSION: u32 = BOUNDARY_SCHEMA_VERSION;
+pub const FLOP_BOUNDARY_SCHEMA_VERSION: u32 = BOUNDARY_SCHEMA_VERSION;
+pub const FLOP_BOUNDARY_BOARD_SIZE: u8 = 3;
 pub const TURN_BOUNDARY_BOARD_SIZE: u8 = 4;
 
 /// Dataset-level metadata written next to binary TrainingRecord shards.
@@ -25,6 +28,7 @@ pub struct DatasetManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatasetStreet {
+    FlopBoundary,
     TurnBoundary,
 }
 
@@ -49,6 +53,8 @@ pub enum ValueNormalization {
 pub enum TargetSource {
     RiverNet,
     ExactRiver,
+    TurnNet,
+    ExactTurn,
     Mixed,
 }
 
@@ -107,10 +113,18 @@ pub struct ShardMetadata {
 
 impl DatasetManifest {
     pub fn new_turn_boundary(target_source: TargetSource) -> Self {
+        Self::new_boundary(DatasetStreet::TurnBoundary, target_source)
+    }
+
+    pub fn new_flop_boundary(target_source: TargetSource) -> Self {
+        Self::new_boundary(DatasetStreet::FlopBoundary, target_source)
+    }
+
+    fn new_boundary(street: DatasetStreet, target_source: TargetSource) -> Self {
         Self {
-            schema_version: TURN_BOUNDARY_SCHEMA_VERSION,
-            street: DatasetStreet::TurnBoundary,
-            record_schema: RecordSchema::turn_boundary(),
+            schema_version: BOUNDARY_SCHEMA_VERSION,
+            street,
+            record_schema: RecordSchema::for_boundary_street(street),
             target_source,
             source: SourceMetadata::default(),
             coverage: CoverageSummary::default(),
@@ -130,21 +144,37 @@ impl DatasetManifest {
     }
 
     pub fn validate_turn_boundary(&self) -> Result<(), ManifestValidationError> {
-        if self.schema_version != TURN_BOUNDARY_SCHEMA_VERSION {
+        self.validate_boundary(DatasetStreet::TurnBoundary)
+    }
+
+    pub fn validate_flop_boundary(&self) -> Result<(), ManifestValidationError> {
+        self.validate_boundary(DatasetStreet::FlopBoundary)
+    }
+
+    fn validate_boundary(
+        &self,
+        expected_street: DatasetStreet,
+    ) -> Result<(), ManifestValidationError> {
+        if self.schema_version != BOUNDARY_SCHEMA_VERSION {
             return Err(ManifestValidationError::SchemaVersion {
                 actual: self.schema_version,
             });
         }
-        if self.street != DatasetStreet::TurnBoundary {
-            return Err(ManifestValidationError::Street);
+        if self.street != expected_street {
+            return Err(ManifestValidationError::Street {
+                expected: expected_street,
+                actual: self.street,
+            });
         }
-        self.record_schema.validate_turn_boundary()?;
+        self.record_schema.validate_boundary(expected_street)?;
 
-        let expected_record_size = record_size(TURN_BOUNDARY_BOARD_SIZE as usize);
+        let expected_board_size = expected_street.board_size();
+        let expected_record_size = record_size(expected_board_size as usize);
         for shard in &self.shards {
-            if shard.board_size != TURN_BOUNDARY_BOARD_SIZE {
+            if shard.board_size != expected_board_size {
                 return Err(ManifestValidationError::ShardBoardSize {
                     path: shard.path.clone(),
+                    expected: expected_board_size,
                     actual: shard.board_size,
                 });
             }
@@ -166,16 +196,66 @@ impl DatasetManifest {
         records: u64,
         target_source: Option<TargetSource>,
     ) -> Result<(), ManifestValidationError> {
+        self.add_boundary_shard(
+            DatasetStreet::TurnBoundary,
+            dataset_dir,
+            shard_path,
+            records,
+            target_source,
+        )
+    }
+
+    pub fn add_flop_boundary_shard(
+        &mut self,
+        dataset_dir: impl AsRef<Path>,
+        shard_path: impl AsRef<Path>,
+        records: u64,
+        target_source: Option<TargetSource>,
+    ) -> Result<(), ManifestValidationError> {
+        self.add_boundary_shard(
+            DatasetStreet::FlopBoundary,
+            dataset_dir,
+            shard_path,
+            records,
+            target_source,
+        )
+    }
+
+    fn add_boundary_shard(
+        &mut self,
+        street: DatasetStreet,
+        dataset_dir: impl AsRef<Path>,
+        shard_path: impl AsRef<Path>,
+        records: u64,
+        target_source: Option<TargetSource>,
+    ) -> Result<(), ManifestValidationError> {
         let path = manifest_shard_path(dataset_dir, shard_path)?;
+        let board_size = street.board_size();
         self.shards.push(ShardMetadata {
             path,
             records,
-            board_size: TURN_BOUNDARY_BOARD_SIZE,
-            record_size_bytes: record_size(TURN_BOUNDARY_BOARD_SIZE as usize),
+            board_size,
+            record_size_bytes: record_size(board_size as usize),
             target_source,
         });
         self.coverage.total_records = self.shards.iter().map(|shard| shard.records).sum();
         Ok(())
+    }
+}
+
+impl DatasetStreet {
+    pub fn board_size(self) -> u8 {
+        match self {
+            DatasetStreet::FlopBoundary => FLOP_BOUNDARY_BOARD_SIZE,
+            DatasetStreet::TurnBoundary => TURN_BOUNDARY_BOARD_SIZE,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DatasetStreet::FlopBoundary => "flop_boundary",
+            DatasetStreet::TurnBoundary => "turn_boundary",
+        }
     }
 }
 
@@ -216,6 +296,8 @@ impl TargetSource {
         match self {
             TargetSource::RiverNet => "river_net",
             TargetSource::ExactRiver => "exact_river",
+            TargetSource::TurnNet => "turn_net",
+            TargetSource::ExactTurn => "exact_turn",
             TargetSource::Mixed => "mixed",
         }
     }
@@ -356,23 +438,34 @@ fn range_entropy_bucket(rec: &TrainingRecord) -> String {
 
 impl RecordSchema {
     pub fn turn_boundary() -> Self {
+        Self::for_boundary_street(DatasetStreet::TurnBoundary)
+    }
+
+    pub fn flop_boundary() -> Self {
+        Self::for_boundary_street(DatasetStreet::FlopBoundary)
+    }
+
+    fn for_boundary_street(street: DatasetStreet) -> Self {
+        let board_size = street.board_size();
         Self {
             format: "cfvnet_training_record_v1".to_string(),
-            board_size: TURN_BOUNDARY_BOARD_SIZE,
-            record_size_bytes: record_size(TURN_BOUNDARY_BOARD_SIZE as usize),
+            board_size,
+            record_size_bytes: record_size(board_size as usize),
             input_size: INPUT_SIZE,
             output_size: NUM_COMBOS,
             normalization: ValueNormalization::ChipCfvOverPotPlusStack,
         }
     }
 
-    fn validate_turn_boundary(&self) -> Result<(), ManifestValidationError> {
-        if self.board_size != TURN_BOUNDARY_BOARD_SIZE {
+    fn validate_boundary(&self, street: DatasetStreet) -> Result<(), ManifestValidationError> {
+        let expected_board_size = street.board_size();
+        if self.board_size != expected_board_size {
             return Err(ManifestValidationError::BoardSize {
+                expected: expected_board_size,
                 actual: self.board_size,
             });
         }
-        let expected_record_size = record_size(TURN_BOUNDARY_BOARD_SIZE as usize);
+        let expected_record_size = record_size(expected_board_size as usize);
         if self.record_size_bytes != expected_record_size {
             return Err(ManifestValidationError::RecordSize {
                 actual: self.record_size_bytes,
@@ -405,13 +498,16 @@ pub enum ManifestIoError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ManifestValidationError {
-    #[error("expected schema_version=1, got {actual}")]
+    #[error("expected schema_version={BOUNDARY_SCHEMA_VERSION}, got {actual}")]
     SchemaVersion { actual: u32 },
-    #[error("expected street=turn_boundary")]
-    Street,
-    #[error("expected board_size=4, got {actual}")]
-    BoardSize { actual: u8 },
-    #[error("expected record_size_bytes={}, got {actual}", record_size(TURN_BOUNDARY_BOARD_SIZE as usize))]
+    #[error("expected street={expected:?}, got {actual:?}")]
+    Street {
+        expected: DatasetStreet,
+        actual: DatasetStreet,
+    },
+    #[error("expected board_size={expected}, got {actual}")]
+    BoardSize { expected: u8, actual: u8 },
+    #[error("expected record_size_bytes for boundary street, got {actual}")]
     RecordSize { actual: usize },
     #[error("expected input_size={INPUT_SIZE}, got {actual}")]
     InputSize { actual: usize },
@@ -419,8 +515,12 @@ pub enum ManifestValidationError {
     OutputSize { actual: usize },
     #[error("expected normalization=chip_cfv_over_pot_plus_stack")]
     Normalization,
-    #[error("shard {path} expected board_size=4, got {actual}")]
-    ShardBoardSize { path: String, actual: u8 },
+    #[error("shard {path} expected board_size={expected}, got {actual}")]
+    ShardBoardSize {
+        path: String,
+        expected: u8,
+        actual: u8,
+    },
     #[error("shard {path} has record_size_bytes={actual}")]
     ShardRecordSize { path: String, actual: usize },
     #[error("shard path {path} is not inside dataset directory {dataset_dir}")]
@@ -483,6 +583,19 @@ mod tests {
     }
 
     #[test]
+    fn flop_boundary_schema_matches_binary_record_contract() {
+        let schema = RecordSchema::flop_boundary();
+        assert_eq!(schema.board_size, 3);
+        assert_eq!(schema.record_size_bytes, record_size(3));
+        assert_eq!(schema.input_size, INPUT_SIZE);
+        assert_eq!(schema.output_size, NUM_COMBOS);
+        assert_eq!(
+            schema.normalization,
+            ValueNormalization::ChipCfvOverPotPlusStack
+        );
+    }
+
+    #[test]
     fn manifest_round_trips_as_yaml() {
         let mut manifest = DatasetManifest::new_turn_boundary(TargetSource::RiverNet);
         manifest.source.generator_commit = Some("abc123".to_string());
@@ -505,6 +618,32 @@ mod tests {
 
         assert_eq!(loaded, manifest);
         loaded.validate_turn_boundary().unwrap();
+    }
+
+    #[test]
+    fn flop_manifest_round_trips_as_yaml() {
+        let mut manifest = DatasetManifest::new_flop_boundary(TargetSource::TurnNet);
+        manifest.source.source_model_path =
+            Some("local_data/models/turn_boundary/best.onnx".into());
+        manifest.coverage.total_records = 128;
+        manifest
+            .coverage
+            .by_target_source
+            .insert("turn_net".to_string(), 128);
+        manifest.shards.push(ShardMetadata {
+            path: "flop_000001.bin".to_string(),
+            records: 128,
+            board_size: FLOP_BOUNDARY_BOARD_SIZE,
+            record_size_bytes: record_size(3),
+            target_source: Some(TargetSource::TurnNet),
+        });
+
+        let file = NamedTempFile::new().unwrap();
+        manifest.write_yaml(file.path()).unwrap();
+        let loaded = DatasetManifest::read_yaml(file.path()).unwrap();
+
+        assert_eq!(loaded, manifest);
+        loaded.validate_flop_boundary().unwrap();
     }
 
     #[test]
@@ -543,7 +682,13 @@ mod tests {
         manifest.record_schema.board_size = 5;
 
         let err = manifest.validate_turn_boundary().unwrap_err();
-        assert_eq!(err, ManifestValidationError::BoardSize { actual: 5 });
+        assert_eq!(
+            err,
+            ManifestValidationError::BoardSize {
+                expected: TURN_BOUNDARY_BOARD_SIZE,
+                actual: 5
+            }
+        );
     }
 
     #[test]
@@ -568,6 +713,32 @@ mod tests {
         );
         assert_eq!(manifest.coverage.total_records, 192);
         manifest.validate_turn_boundary().unwrap();
+    }
+
+    #[test]
+    fn add_flop_shard_records_relative_manifest_path_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard0 = dir.path().join("flop.bin");
+        let shard1 = dir.path().join("flop_00001.bin");
+        let mut manifest = DatasetManifest::new_flop_boundary(TargetSource::TurnNet);
+
+        manifest
+            .add_flop_boundary_shard(dir.path(), &shard0, 128, None)
+            .unwrap();
+        manifest
+            .add_flop_boundary_shard(dir.path(), &shard1, 64, Some(TargetSource::ExactTurn))
+            .unwrap();
+
+        assert_eq!(manifest.shards[0].path, "flop.bin");
+        assert_eq!(manifest.shards[0].board_size, FLOP_BOUNDARY_BOARD_SIZE);
+        assert_eq!(manifest.shards[0].record_size_bytes, record_size(3));
+        assert_eq!(manifest.shards[1].path, "flop_00001.bin");
+        assert_eq!(
+            manifest.shards[1].target_source,
+            Some(TargetSource::ExactTurn)
+        );
+        assert_eq!(manifest.coverage.total_records, 192);
+        manifest.validate_flop_boundary().unwrap();
     }
 
     #[test]

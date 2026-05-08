@@ -64,6 +64,10 @@ pub fn generate_turn_boundary_data(
             generate_turn_boundary_data_with_exact_oracle(config, output_path, &oracle)?;
             Ok(())
         }
+        TargetSource::TurnNet | TargetSource::ExactTurn => Err(format!(
+            "turn_boundary target source '{}' is reserved for flop_boundary datagen",
+            target_source.as_str()
+        )),
         TargetSource::Mixed => Err("turn_boundary target source 'mixed' is manifest-only".into()),
     }
 }
@@ -650,9 +654,11 @@ fn parse_target_source(value: &str) -> Result<TargetSource, String> {
     match value {
         "river_net" => Ok(TargetSource::RiverNet),
         "exact_river" => Ok(TargetSource::ExactRiver),
+        "turn_net" => Ok(TargetSource::TurnNet),
+        "exact_turn" => Ok(TargetSource::ExactTurn),
         "mixed" => Ok(TargetSource::Mixed),
         other => Err(format!(
-            "unknown turn_boundary_target_source '{other}', expected river_net or exact_river"
+            "unknown turn_boundary_target_source '{other}', expected river_net, exact_river, turn_net, exact_turn, or mixed"
         )),
     }
 }

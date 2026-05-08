@@ -236,6 +236,27 @@ mod tests {
     }
 
     #[test]
+    fn record_roundtrip_3_card_board() {
+        let mut rec = sample_record();
+        rec.board = vec![0, 4, 8];
+
+        let mut file = NamedTempFile::new().unwrap();
+        write_record(&mut file, &rec).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let loaded = read_record(&mut file).unwrap();
+        assert_eq!(rec.board, loaded.board);
+        assert_eq!(loaded.board.len(), 3);
+        assert_eq!(rec.pot, loaded.pot);
+        assert_eq!(rec.effective_stack, loaded.effective_stack);
+        assert_eq!(rec.player, loaded.player);
+        assert_eq!(rec.oop_range, loaded.oop_range);
+        assert_eq!(rec.ip_range, loaded.ip_range);
+        assert_eq!(rec.cfvs, loaded.cfvs);
+        assert_eq!(rec.valid_mask, loaded.valid_mask);
+    }
+
+    #[test]
     fn record_roundtrip_5_card_board() {
         let rec = sample_record();
         let mut file = NamedTempFile::new().unwrap();
@@ -267,5 +288,15 @@ mod tests {
         }
         file4.seek(SeekFrom::Start(0)).unwrap();
         assert_eq!(count_records(&mut file4, 4).unwrap(), 4);
+
+        // 3-card records
+        let mut rec3 = sample_record();
+        rec3.board = vec![0, 4, 8];
+        let mut file3 = NamedTempFile::new().unwrap();
+        for _ in 0..2 {
+            write_record(&mut file3, &rec3).unwrap();
+        }
+        file3.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(count_records(&mut file3, 3).unwrap(), 2);
     }
 }

@@ -115,9 +115,9 @@ impl GameConfig {
         if self.bet_sizes.depths().is_empty() {
             return Err("bet_sizes must have at least one depth".into());
         }
-        if self.board_size != 4 && self.board_size != 5 {
+        if self.board_size != 3 && self.board_size != 4 && self.board_size != 5 {
             return Err(format!(
-                "board_size must be 4 or 5, got {}",
+                "board_size must be 3, 4, or 5, got {}",
                 self.board_size
             ));
         }
@@ -137,14 +137,18 @@ fn default_force_allin_threshold() -> f64 {
 
 /// Return the number of board cards for a given street name.
 ///
-/// Panics if `street` is not one of `"river"`, `"turn"`, `"turn_boundary"`, or `"flop"`.
+/// Panics if `street` is not one of `"river"`, `"turn"`, `"turn_boundary"`,
+/// `"flop"`, or `"flop_boundary"`.
 pub fn board_cards_for_street(street: &str) -> usize {
     match street {
         "river" => 5,
         "turn" => 4,
         "turn_boundary" => 4,
         "flop" => 3,
-        other => panic!("unknown street: {other:?} (expected river, turn_boundary, turn, or flop)"),
+        "flop_boundary" => 3,
+        other => panic!(
+            "unknown street: {other:?} (expected river, turn_boundary, turn, flop_boundary, or flop)"
+        ),
     }
 }
 

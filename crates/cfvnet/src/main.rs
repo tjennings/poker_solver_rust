@@ -2010,6 +2010,7 @@ fn format_datagen_eval_manifest_section(
 
     fn street_label(street: DatasetStreet) -> &'static str {
         match street {
+            DatasetStreet::FlopBoundary => "flop_boundary",
             DatasetStreet::TurnBoundary => "turn_boundary",
         }
     }
