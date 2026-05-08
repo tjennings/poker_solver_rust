@@ -88,6 +88,16 @@ pub struct SparseStorageStats {
     pub max_entries_per_shard: usize,
 }
 
+/// Cumulative sparse storage activity counters for throughput diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparseStorageActivity {
+    pub read_probes: u64,
+    pub read_hits: u64,
+    pub write_probes: u64,
+    pub write_hits: u64,
+    pub inserts: u64,
+}
+
 /// Serializable snapshot of one visited sparse infoset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparseSnapshotEntry {
@@ -138,6 +148,11 @@ pub struct SparseMpStorage {
     shard_entry_counts: Box<[AtomicUsize]>,
     entry_count: AtomicUsize,
     slot_count: AtomicUsize,
+    read_probes: AtomicU64,
+    read_hits: AtomicU64,
+    write_probes: AtomicU64,
+    write_hits: AtomicU64,
+    inserts: AtomicU64,
     regret_floor: AtomicI32,
 }
 
@@ -171,6 +186,11 @@ impl SparseMpStorage {
             shard_entry_counts,
             entry_count: AtomicUsize::new(0),
             slot_count: AtomicUsize::new(0),
+            read_probes: AtomicU64::new(0),
+            read_hits: AtomicU64::new(0),
+            write_probes: AtomicU64::new(0),
+            write_hits: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
             regret_floor: AtomicI32::new(i32::MIN),
         }
     }
@@ -236,6 +256,18 @@ impl SparseMpStorage {
             shard_count: self.shards.len(),
             nonempty_shards,
             max_entries_per_shard,
+        }
+    }
+
+    /// Cumulative storage access counters for training telemetry.
+    #[must_use]
+    pub fn activity(&self) -> SparseStorageActivity {
+        SparseStorageActivity {
+            read_probes: self.read_probes.load(Ordering::Relaxed),
+            read_hits: self.read_hits.load(Ordering::Relaxed),
+            write_probes: self.write_probes.load(Ordering::Relaxed),
+            write_hits: self.write_hits.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
         }
     }
 
@@ -430,7 +462,12 @@ impl SparseMpStorage {
     fn get_node(&self, key: MpInfosetKey) -> Option<Arc<SparseNode>> {
         let shard = &self.shards[self.shard_index_for(key)];
         let guard = lock_entries(shard);
-        guard.get(&key).cloned()
+        self.read_probes.fetch_add(1, Ordering::Relaxed);
+        let node = guard.get(&key).cloned();
+        if node.is_some() {
+            self.read_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        node
     }
 
     fn get_or_create_node(&self, key: MpInfosetKey, num_actions: usize) -> Option<Arc<SparseNode>> {
@@ -440,12 +477,14 @@ impl SparseMpStorage {
         let shard_idx = self.shard_index_for(key);
         let shard = &self.shards[shard_idx];
         let mut guard = lock_entries(shard);
+        self.write_probes.fetch_add(1, Ordering::Relaxed);
         if let Some(node) = guard.get(&key) {
             debug_assert_eq!(
                 node.action_count(),
                 num_actions,
                 "same sparse infoset key used with different action counts"
             );
+            self.write_hits.fetch_add(1, Ordering::Relaxed);
             return Some(Arc::clone(node));
         }
         let node = Arc::new(SparseNode::new(num_actions));
@@ -453,6 +492,7 @@ impl SparseMpStorage {
         self.entry_count.fetch_add(1, Ordering::Relaxed);
         self.slot_count.fetch_add(num_actions, Ordering::Relaxed);
         self.shard_entry_counts[shard_idx].fetch_add(1, Ordering::Relaxed);
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         Some(node)
     }
 
@@ -691,6 +731,36 @@ mod tests {
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.regret_slots, 3);
         assert_eq!(stats.strategy_slots, 3);
+    }
+
+    #[timed_test]
+    fn activity_counts_sparse_probes_hits_and_inserts() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(1);
+
+        assert_eq!(storage.activity(), SparseStorageActivity::default());
+
+        assert_eq!(storage.get_regret(k, 0), 0);
+        let after_missing_read = storage.activity();
+        assert_eq!(after_missing_read.read_probes, 1);
+        assert_eq!(after_missing_read.read_hits, 0);
+
+        storage.add_regret(k, 2, 0, 1);
+        let after_insert = storage.activity();
+        assert_eq!(after_insert.write_probes, 1);
+        assert_eq!(after_insert.write_hits, 0);
+        assert_eq!(after_insert.inserts, 1);
+
+        storage.add_strategy_sum(k, 2, 1, 2);
+        let after_existing_write = storage.activity();
+        assert_eq!(after_existing_write.write_probes, 2);
+        assert_eq!(after_existing_write.write_hits, 1);
+        assert_eq!(after_existing_write.inserts, 1);
+
+        assert_eq!(storage.get_strategy_sum(k, 1), 2);
+        let after_hit_read = storage.activity();
+        assert_eq!(after_hit_read.read_probes, 2);
+        assert_eq!(after_hit_read.read_hits, 1);
     }
 
     #[timed_test]

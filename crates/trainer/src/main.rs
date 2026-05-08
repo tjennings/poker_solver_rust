@@ -2710,7 +2710,11 @@ struct MpNoTuiHeartbeat {
     last_iters: u64,
     last_sparse_entries: usize,
     last_sparse_bytes: usize,
+    last_sparse_activity: SparseStorageActivity,
 }
+
+type SparseStorageActivity =
+    poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
 
 impl MpNoTuiHeartbeat {
     const INTERVAL: Duration = Duration::from_secs(60);
@@ -2723,6 +2727,7 @@ impl MpNoTuiHeartbeat {
             last_iters: 0,
             last_sparse_entries: 0,
             last_sparse_bytes: 0,
+            last_sparse_activity: Default::default(),
         }
     }
 
@@ -2805,6 +2810,8 @@ impl MpNoTuiHeartbeat {
         let loop_timing = take_lazy_mp_timing_snapshot();
         let stats_started = Instant::now();
         let stats = storage.stats();
+        let activity = storage.activity();
+        let activity_delta = sparse_activity_delta(activity, self.last_sparse_activity);
         let stats_nanos = u64::try_from(stats_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let entries_since_last = stats.entries.saturating_sub(self.last_sparse_entries);
         let bytes_since_last = stats.approx_bytes.saturating_sub(self.last_sparse_bytes);
@@ -2823,9 +2830,14 @@ impl MpNoTuiHeartbeat {
         } else {
             0.0
         };
+        let read_probe_rate = per_second(activity_delta.read_probes, since_last);
+        let write_probe_rate = per_second(activity_delta.write_probes, since_last);
+        let insert_rate = per_second(activity_delta.inserts, since_last);
+        let read_hit_pct = percent(activity_delta.read_hits, activity_delta.read_probes);
+        let write_hit_pct = percent(activity_delta.write_hits, activity_delta.write_probes);
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
@@ -2840,6 +2852,11 @@ impl MpNoTuiHeartbeat {
             stats.shard_count,
             avg_entries_per_shard,
             stats.max_entries_per_shard,
+            read_probe_rate,
+            read_hit_pct,
+            write_probe_rate,
+            write_hit_pct,
+            insert_rate,
             format_nanos_millis(loop_timing.batch_wall_nanos),
             format_nanos_millis(loop_timing.deal_nanos),
             format_nanos_millis(loop_timing.bucket_nanos),
@@ -2860,6 +2877,36 @@ impl MpNoTuiHeartbeat {
         self.last_iters = iters;
         self.last_sparse_entries = stats.entries;
         self.last_sparse_bytes = stats.approx_bytes;
+        self.last_sparse_activity = activity;
+    }
+}
+
+fn sparse_activity_delta(
+    current: SparseStorageActivity,
+    previous: SparseStorageActivity,
+) -> SparseStorageActivity {
+    SparseStorageActivity {
+        read_probes: current.read_probes.saturating_sub(previous.read_probes),
+        read_hits: current.read_hits.saturating_sub(previous.read_hits),
+        write_probes: current.write_probes.saturating_sub(previous.write_probes),
+        write_hits: current.write_hits.saturating_sub(previous.write_hits),
+        inserts: current.inserts.saturating_sub(previous.inserts),
+    }
+}
+
+fn per_second(count: u64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs > 0.0 {
+        count as f64 / elapsed_secs
+    } else {
+        0.0
+    }
+}
+
+fn percent(part: u64, total: u64) -> f64 {
+    if total > 0 {
+        part as f64 * 100.0 / total as f64
+    } else {
+        0.0
     }
 }
 
