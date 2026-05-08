@@ -2718,6 +2718,9 @@ type SparseStorageActivity =
     poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
 type SparseInsertAttribution =
     poker_solver_core::blueprint_mp::sparse_storage::SparseInsertAttribution;
+type LazyActionLimitSnapshot =
+    poker_solver_core::blueprint_mp::lazy_mccfr::LazyActionLimitSnapshot;
+const STREET_LABELS: [&str; 4] = ["pf", "f", "t", "r"];
 const HISTORY_LEN_BIN_LABELS: [&str; 8] =
     ["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"];
 const ACTION_COUNT_BIN_LABELS: [&str; 8] =
@@ -2797,6 +2800,7 @@ impl MpNoTuiHeartbeat {
         iterations: &AtomicU64,
         storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
     ) {
+        use poker_solver_core::blueprint_mp::lazy_mccfr::take_lazy_action_limit_snapshot;
         use poker_solver_core::blueprint_mp::trainer::take_lazy_mp_timing_snapshot;
 
         let now = Instant::now();
@@ -2816,6 +2820,7 @@ impl MpNoTuiHeartbeat {
             0.0
         };
         let loop_timing = take_lazy_mp_timing_snapshot();
+        let action_limit = take_lazy_action_limit_snapshot();
         let stats_started = Instant::now();
         let stats = storage.stats();
         let activity = storage.activity();
@@ -2848,9 +2853,10 @@ impl MpNoTuiHeartbeat {
         let write_hit_pct = percent(activity_delta.write_hits, activity_delta.write_probes);
         let insert_by_text =
             format_sparse_insert_attribution(insert_attribution_delta, since_last);
+        let action_limit_text = format_lazy_action_limit(action_limit, since_last);
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] {} timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] {} {} timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
@@ -2871,6 +2877,7 @@ impl MpNoTuiHeartbeat {
             write_hit_pct,
             insert_rate,
             insert_by_text,
+            action_limit_text,
             format_nanos_millis(loop_timing.batch_wall_nanos),
             format_nanos_millis(loop_timing.deal_nanos),
             format_nanos_millis(loop_timing.bucket_nanos),
@@ -2973,6 +2980,34 @@ fn format_sparse_insert_attribution(
         ACTION_COUNT_BIN_LABELS[action_idx],
         per_second(action_count, elapsed_secs),
     )
+}
+
+fn format_lazy_action_limit(snapshot: LazyActionLimitSnapshot, elapsed_secs: f64) -> String {
+    format!(
+        "action_limit[max={}, over_dec={}, over_aggr={}, allin_aggr={}]",
+        format_street_counts_raw(&snapshot.max_raise_count),
+        format_street_counts_rate(&snapshot.over_config_decisions, elapsed_secs),
+        format_street_counts_rate(&snapshot.over_config_aggressions, elapsed_secs),
+        format_street_counts_rate(&snapshot.all_in_aggressions, elapsed_secs),
+    )
+}
+
+fn format_street_counts_raw(values: &[u64; 4]) -> String {
+    STREET_LABELS
+        .iter()
+        .zip(values)
+        .map(|(label, value)| format!("{label}:{value}"))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn format_street_counts_rate(values: &[u64; 4], elapsed_secs: f64) -> String {
+    STREET_LABELS
+        .iter()
+        .zip(values)
+        .map(|(label, value)| format!("{label}:{:.0}/s", per_second(*value, elapsed_secs)))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn top_index(values: &[u64]) -> (usize, u64) {

@@ -11,6 +11,7 @@
 )]
 
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::{ForcedBetKind, MpActionAbstractionConfig, MpGameConfig};
 use super::game_tree::{TerminalKind, TreeAction};
@@ -24,6 +25,16 @@ const SIZE_EPSILON: f64 = 0.01;
 const MAX_ACTIONS: usize = 16;
 const ACTION_BITS: u16 = 4;
 const PACKED_ACTION_SLOTS: u16 = 32;
+pub const LAZY_ACTION_STREET_COUNT: usize = 4;
+
+static ACTION_MAX_RAISE_COUNT: [AtomicU64; LAZY_ACTION_STREET_COUNT] =
+    [const { AtomicU64::new(0) }; LAZY_ACTION_STREET_COUNT];
+static ACTION_OVER_CONFIG_DECISIONS: [AtomicU64; LAZY_ACTION_STREET_COUNT] =
+    [const { AtomicU64::new(0) }; LAZY_ACTION_STREET_COUNT];
+static ACTION_OVER_CONFIG_AGGRESSIONS: [AtomicU64; LAZY_ACTION_STREET_COUNT] =
+    [const { AtomicU64::new(0) }; LAZY_ACTION_STREET_COUNT];
+static ACTION_ALL_IN_AGGRESSIONS: [AtomicU64; LAZY_ACTION_STREET_COUNT] =
+    [const { AtomicU64::new(0) }; LAZY_ACTION_STREET_COUNT];
 
 #[derive(Debug, Clone, Copy)]
 enum PreflopSize {
@@ -107,6 +118,26 @@ enum LeadSizes<'a> {
 enum RaiseSizes<'a> {
     Preflop(&'a [PreflopSize]),
     Postflop(&'a [f64]),
+}
+
+/// Lazy action abstraction audit counters accumulated between heartbeat reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LazyActionLimitSnapshot {
+    pub max_raise_count: [u64; LAZY_ACTION_STREET_COUNT],
+    pub over_config_decisions: [u64; LAZY_ACTION_STREET_COUNT],
+    pub over_config_aggressions: [u64; LAZY_ACTION_STREET_COUNT],
+    pub all_in_aggressions: [u64; LAZY_ACTION_STREET_COUNT],
+}
+
+/// Read and reset lazy action abstraction audit counters.
+#[must_use]
+pub fn take_lazy_action_limit_snapshot() -> LazyActionLimitSnapshot {
+    LazyActionLimitSnapshot {
+        max_raise_count: take_atomic_array(&ACTION_MAX_RAISE_COUNT),
+        over_config_decisions: take_atomic_array(&ACTION_OVER_CONFIG_DECISIONS),
+        over_config_aggressions: take_atomic_array(&ACTION_OVER_CONFIG_AGGRESSIONS),
+        all_in_aggressions: take_atomic_array(&ACTION_ALL_IN_AGGRESSIONS),
+    }
 }
 
 /// Lazy public game model used by sparse traversal.
@@ -706,10 +737,14 @@ fn generate_actions(config: &LazyActionConfig, state: &LazyPublicState) -> Vec<T
     if !suppress_new_aggression {
         add_sized_actions(config, state, &mut actions);
     }
-    if !is_unopened_preflop && !suppress_new_aggression {
+    if !is_unopened_preflop
+        && !suppress_new_aggression
+        && u64::from(state.raise_count) < allowed_raise_count_with_all_in(config, state.street)
+    {
         add_all_in_if_needed(state, &mut actions);
     }
     dedup_all_in(&mut actions);
+    record_action_limit_audit(config, state, &actions);
     actions
 }
 
@@ -768,6 +803,54 @@ fn add_sized_actions(
 
 fn suppresses_new_aggression(state: &LazyPublicState) -> bool {
     state.street == Street::River && spr_bucket(*state) == 0
+}
+
+fn record_action_limit_audit(
+    config: &LazyActionConfig,
+    state: &LazyPublicState,
+    actions: &[TreeAction],
+) {
+    let street_idx = state.street as usize;
+    let current_count = u64::from(state.raise_count);
+    let allowed_count = allowed_raise_count_with_all_in(config, state.street);
+    ACTION_MAX_RAISE_COUNT[street_idx].fetch_max(current_count, Ordering::Relaxed);
+    if current_count > allowed_count {
+        ACTION_OVER_CONFIG_DECISIONS[street_idx].fetch_add(1, Ordering::Relaxed);
+    }
+    for action in actions {
+        if !action_increments_raise_count(state, *action) {
+            continue;
+        }
+        let after_count = current_count.saturating_add(1);
+        ACTION_MAX_RAISE_COUNT[street_idx].fetch_max(after_count, Ordering::Relaxed);
+        if after_count > allowed_count {
+            ACTION_OVER_CONFIG_AGGRESSIONS[street_idx].fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(action, TreeAction::AllIn) {
+            ACTION_ALL_IN_AGGRESSIONS[street_idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn allowed_raise_count_with_all_in(config: &LazyActionConfig, street: Street) -> u64 {
+    let configured = if street == Street::Preflop {
+        u64::from(!config.preflop_lead.is_empty()) + config.max_raise_depths(street) as u64
+    } else {
+        config.max_raise_depths(street) as u64
+    };
+    configured.saturating_add(1)
+}
+
+fn action_increments_raise_count(state: &LazyPublicState, action: TreeAction) -> bool {
+    match action {
+        TreeAction::Lead(_) | TreeAction::Raise(_) => true,
+        TreeAction::AllIn => {
+            let idx = state.to_act.index() as usize;
+            let raise_to = state.street_bets[idx] + state.stacks[idx];
+            !(state.facing_bet && raise_to <= max_street_bet(state) + Chips(SIZE_EPSILON))
+        }
+        TreeAction::Fold | TreeAction::Check | TreeAction::Call => false,
+    }
 }
 
 fn add_lead_sizes(state: &LazyPublicState, sizes: LeadSizes<'_>, actions: &mut Vec<TreeAction>) {
@@ -1085,6 +1168,10 @@ fn mix_history(hash: u64, value: u64) -> u64 {
         .rotate_left(27)
 }
 
+fn take_atomic_array<const N: usize>(atoms: &[AtomicU64; N]) -> [u64; N] {
+    std::array::from_fn(|idx| atoms[idx].swap(0, Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod tests {
     use rand::rngs::SmallRng;
@@ -1183,6 +1270,36 @@ mod tests {
         }
     }
 
+    fn postflop_audit_state(street: Street, facing_bet: bool, raise_count: u8) -> LazyPublicState {
+        let mut active = PlayerSet::empty();
+        active.insert(Seat::from_raw(0));
+        active.insert(Seat::from_raw(1));
+        let mut street_bets = [Chips::ZERO; MAX_PLAYERS];
+        if facing_bet {
+            street_bets[1] = Chips(10.0);
+        }
+        let mut stacks = [Chips::ZERO; MAX_PLAYERS];
+        stacks[0] = Chips(50.0);
+        stacks[1] = Chips(50.0);
+        LazyPublicState {
+            stacks,
+            street_bets,
+            contributions: [Chips::ZERO; MAX_PLAYERS],
+            active,
+            all_in: PlayerSet::empty(),
+            acted_since_aggression: PlayerSet::empty(),
+            street,
+            pot: Chips(100.0),
+            num_players: 2,
+            raise_count,
+            to_act: Seat::from_raw(0),
+            facing_bet,
+            last_raise_to: Chips(10.0),
+            dealer: 0,
+            big_blind_amount: Chips(2.0),
+        }
+    }
+
     #[timed_test]
     fn lazy_root_generates_open_actions_without_building_tree() {
         let game = LazyMpGame::new(&game_config(6, 200.0), &action_config());
@@ -1233,6 +1350,37 @@ mod tests {
         let actions = game.actions(&state);
 
         assert_eq!(actions, vec![TreeAction::Fold, TreeAction::AllIn]);
+    }
+
+    #[timed_test]
+    fn lazy_action_limit_audit_allows_one_all_in_aggression_past_raise_rows() {
+        let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
+        let _ = take_lazy_action_limit_snapshot();
+        let state = postflop_audit_state(Street::Flop, true, 1);
+
+        let actions = game.actions(&state);
+        let snapshot = take_lazy_action_limit_snapshot();
+
+        assert!(actions.iter().any(|action| matches!(action, TreeAction::AllIn)));
+        assert_eq!(snapshot.max_raise_count[Street::Flop as usize], 2);
+        assert_eq!(snapshot.all_in_aggressions[Street::Flop as usize], 1);
+        assert_eq!(snapshot.over_config_decisions[Street::Flop as usize], 0);
+        assert_eq!(snapshot.over_config_aggressions[Street::Flop as usize], 0);
+    }
+
+    #[timed_test]
+    fn lazy_action_limit_audit_flags_decisions_past_allowed_extra_all_in() {
+        let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
+        let _ = take_lazy_action_limit_snapshot();
+        let state = postflop_audit_state(Street::Flop, false, 3);
+
+        let actions = game.actions(&state);
+        let snapshot = take_lazy_action_limit_snapshot();
+
+        assert_eq!(actions, vec![TreeAction::Check]);
+        assert_eq!(snapshot.max_raise_count[Street::Flop as usize], 3);
+        assert_eq!(snapshot.over_config_decisions[Street::Flop as usize], 1);
+        assert_eq!(snapshot.over_config_aggressions[Street::Flop as usize], 0);
     }
 
     #[timed_test]
