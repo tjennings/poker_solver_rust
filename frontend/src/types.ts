@@ -146,7 +146,7 @@ export interface SimulationResult {
 
 export type StreetBoundaryMode =
   | { mode: 'exact' }
-  | { mode: 'cfvnet'; model_path: string }
+  | { mode: 'cfvnet'; model_path: string; inference_mode?: 'river_enumerated_turn' | 'direct' }
   | { mode: 'exact_subtree' };
 
 export interface StreetBoundaryConfig {
