@@ -4,8 +4,8 @@
 #   cd crates/cfvnet/python
 #   uv run python scripts/train_boundary.py \
 #     -c ../../../sample_configurations/turn_boundary_cfvnet.yaml \
-#     -d ../../../local_data/cfvnet/turn_boundary/river_net_v1 \
-#     -o ../../../local_data/models/turn_boundary_cfvnet_v1
+#     -d ../../../local_data/cfvnet/turn_boundary/v2 \
+#     -o ../../../local_data/models/turn_boundary_cfvnet_v2
 #
 # The trainer enforces datagen.street=turn_boundary and game.board_size=4 when
 # loading a manifest-backed dataset.
