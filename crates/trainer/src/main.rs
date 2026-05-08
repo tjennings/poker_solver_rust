@@ -2711,10 +2711,17 @@ struct MpNoTuiHeartbeat {
     last_sparse_entries: usize,
     last_sparse_bytes: usize,
     last_sparse_activity: SparseStorageActivity,
+    last_sparse_insert_attribution: SparseInsertAttribution,
 }
 
 type SparseStorageActivity =
     poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
+type SparseInsertAttribution =
+    poker_solver_core::blueprint_mp::sparse_storage::SparseInsertAttribution;
+const HISTORY_LEN_BIN_LABELS: [&str; 8] =
+    ["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"];
+const ACTION_COUNT_BIN_LABELS: [&str; 8] =
+    ["1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65+"];
 
 impl MpNoTuiHeartbeat {
     const INTERVAL: Duration = Duration::from_secs(60);
@@ -2728,6 +2735,7 @@ impl MpNoTuiHeartbeat {
             last_sparse_entries: 0,
             last_sparse_bytes: 0,
             last_sparse_activity: Default::default(),
+            last_sparse_insert_attribution: Default::default(),
         }
     }
 
@@ -2812,6 +2820,9 @@ impl MpNoTuiHeartbeat {
         let stats = storage.stats();
         let activity = storage.activity();
         let activity_delta = sparse_activity_delta(activity, self.last_sparse_activity);
+        let insert_attribution = storage.insert_attribution();
+        let insert_attribution_delta =
+            sparse_insert_attribution_delta(insert_attribution, self.last_sparse_insert_attribution);
         let stats_nanos = u64::try_from(stats_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let entries_since_last = stats.entries.saturating_sub(self.last_sparse_entries);
         let bytes_since_last = stats.approx_bytes.saturating_sub(self.last_sparse_bytes);
@@ -2835,9 +2846,11 @@ impl MpNoTuiHeartbeat {
         let insert_rate = per_second(activity_delta.inserts, since_last);
         let read_hit_pct = percent(activity_delta.read_hits, activity_delta.read_probes);
         let write_hit_pct = percent(activity_delta.write_hits, activity_delta.write_probes);
+        let insert_by_text =
+            format_sparse_insert_attribution(insert_attribution_delta, since_last);
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] {} timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
@@ -2857,6 +2870,7 @@ impl MpNoTuiHeartbeat {
             write_probe_rate,
             write_hit_pct,
             insert_rate,
+            insert_by_text,
             format_nanos_millis(loop_timing.batch_wall_nanos),
             format_nanos_millis(loop_timing.deal_nanos),
             format_nanos_millis(loop_timing.bucket_nanos),
@@ -2878,6 +2892,7 @@ impl MpNoTuiHeartbeat {
         self.last_sparse_entries = stats.entries;
         self.last_sparse_bytes = stats.approx_bytes;
         self.last_sparse_activity = activity;
+        self.last_sparse_insert_attribution = insert_attribution;
     }
 }
 
@@ -2892,6 +2907,81 @@ fn sparse_activity_delta(
         write_hits: current.write_hits.saturating_sub(previous.write_hits),
         inserts: current.inserts.saturating_sub(previous.inserts),
     }
+}
+
+fn sparse_insert_attribution_delta(
+    current: SparseInsertAttribution,
+    previous: SparseInsertAttribution,
+) -> SparseInsertAttribution {
+    SparseInsertAttribution {
+        by_street: array_saturating_sub(current.by_street, previous.by_street),
+        by_seat: array_saturating_sub(current.by_seat, previous.by_seat),
+        by_spr_bucket: array_saturating_sub(current.by_spr_bucket, previous.by_spr_bucket),
+        history_len_bins: array_saturating_sub(
+            current.history_len_bins,
+            previous.history_len_bins,
+        ),
+        action_count_bins: array_saturating_sub(
+            current.action_count_bins,
+            previous.action_count_bins,
+        ),
+        history_len_max: current.history_len_max,
+        action_count_sum: current
+            .action_count_sum
+            .saturating_sub(previous.action_count_sum),
+        action_count_max: current.action_count_max,
+    }
+}
+
+fn array_saturating_sub<const N: usize>(current: [u64; N], previous: [u64; N]) -> [u64; N] {
+    std::array::from_fn(|idx| current[idx].saturating_sub(previous[idx]))
+}
+
+fn format_sparse_insert_attribution(
+    attribution: SparseInsertAttribution,
+    elapsed_secs: f64,
+) -> String {
+    let street_text = format!(
+        "pf:{:.0}/f:{:.0}/t:{:.0}/r:{:.0}",
+        per_second(attribution.by_street[0], elapsed_secs),
+        per_second(attribution.by_street[1], elapsed_secs),
+        per_second(attribution.by_street[2], elapsed_secs),
+        per_second(attribution.by_street[3], elapsed_secs),
+    );
+    let (seat_idx, seat_count) = top_index(&attribution.by_seat);
+    let (spr_idx, spr_count) = top_index(&attribution.by_spr_bucket);
+    let (history_idx, history_count) = top_index(&attribution.history_len_bins);
+    let (action_idx, action_count) = top_index(&attribution.action_count_bins);
+    let insert_count: u64 = attribution.by_street.iter().sum();
+    let action_avg = if insert_count > 0 {
+        attribution.action_count_sum as f64 / insert_count as f64
+    } else {
+        0.0
+    };
+    format!(
+        "insert_by[st={}, seat_top=p{}:{:.0}/s, spr_top={}:{:.0}/s, hist_top={}:{:.0}/s max_seen={}, act_avg={:.1} max_seen={} top={}:{:.0}/s]",
+        street_text,
+        seat_idx,
+        per_second(seat_count, elapsed_secs),
+        spr_idx,
+        per_second(spr_count, elapsed_secs),
+        HISTORY_LEN_BIN_LABELS[history_idx],
+        per_second(history_count, elapsed_secs),
+        attribution.history_len_max,
+        action_avg,
+        attribution.action_count_max,
+        ACTION_COUNT_BIN_LABELS[action_idx],
+        per_second(action_count, elapsed_secs),
+    )
+}
+
+fn top_index(values: &[u64]) -> (usize, u64) {
+    values
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by_key(|(_, count)| *count)
+        .unwrap_or((0, 0))
 }
 
 fn per_second(count: u64, elapsed_secs: f64) -> f64 {

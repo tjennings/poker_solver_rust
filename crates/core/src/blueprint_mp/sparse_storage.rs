@@ -16,9 +16,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::{Seat, Street};
+use super::{MAX_PLAYERS, Seat, Street};
 
 const DEFAULT_SHARDS: usize = 4096;
+pub const SPARSE_INSERT_STREET_COUNT: usize = 4;
+pub const SPARSE_INSERT_SPR_BUCKET_COUNT: usize = 32;
+pub const SPARSE_INSERT_HISTORY_LEN_BIN_COUNT: usize = 8;
+pub const SPARSE_INSERT_ACTION_COUNT_BIN_COUNT: usize = 8;
 
 /// Stable key for one lazy MP infoset.
 ///
@@ -98,6 +102,19 @@ pub struct SparseStorageActivity {
     pub inserts: u64,
 }
 
+/// Cumulative attribution for newly inserted sparse infosets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparseInsertAttribution {
+    pub by_street: [u64; SPARSE_INSERT_STREET_COUNT],
+    pub by_seat: [u64; MAX_PLAYERS],
+    pub by_spr_bucket: [u64; SPARSE_INSERT_SPR_BUCKET_COUNT],
+    pub history_len_bins: [u64; SPARSE_INSERT_HISTORY_LEN_BIN_COUNT],
+    pub action_count_bins: [u64; SPARSE_INSERT_ACTION_COUNT_BIN_COUNT],
+    pub history_len_max: u64,
+    pub action_count_sum: u64,
+    pub action_count_max: u64,
+}
+
 /// Serializable snapshot of one visited sparse infoset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparseSnapshotEntry {
@@ -153,6 +170,14 @@ pub struct SparseMpStorage {
     write_probes: AtomicU64,
     write_hits: AtomicU64,
     inserts: AtomicU64,
+    insert_by_street: [AtomicU64; SPARSE_INSERT_STREET_COUNT],
+    insert_by_seat: [AtomicU64; MAX_PLAYERS],
+    insert_by_spr_bucket: [AtomicU64; SPARSE_INSERT_SPR_BUCKET_COUNT],
+    insert_history_len_bins: [AtomicU64; SPARSE_INSERT_HISTORY_LEN_BIN_COUNT],
+    insert_action_count_bins: [AtomicU64; SPARSE_INSERT_ACTION_COUNT_BIN_COUNT],
+    insert_history_len_max: AtomicU64,
+    insert_action_count_sum: AtomicU64,
+    insert_action_count_max: AtomicU64,
     regret_floor: AtomicI32,
 }
 
@@ -191,6 +216,14 @@ impl SparseMpStorage {
             write_probes: AtomicU64::new(0),
             write_hits: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
+            insert_by_street: std::array::from_fn(|_| AtomicU64::new(0)),
+            insert_by_seat: std::array::from_fn(|_| AtomicU64::new(0)),
+            insert_by_spr_bucket: std::array::from_fn(|_| AtomicU64::new(0)),
+            insert_history_len_bins: std::array::from_fn(|_| AtomicU64::new(0)),
+            insert_action_count_bins: std::array::from_fn(|_| AtomicU64::new(0)),
+            insert_history_len_max: AtomicU64::new(0),
+            insert_action_count_sum: AtomicU64::new(0),
+            insert_action_count_max: AtomicU64::new(0),
             regret_floor: AtomicI32::new(i32::MIN),
         }
     }
@@ -268,6 +301,21 @@ impl SparseMpStorage {
             write_probes: self.write_probes.load(Ordering::Relaxed),
             write_hits: self.write_hits.load(Ordering::Relaxed),
             inserts: self.inserts.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Cumulative attribution for newly allocated sparse infosets.
+    #[must_use]
+    pub fn insert_attribution(&self) -> SparseInsertAttribution {
+        SparseInsertAttribution {
+            by_street: load_atomic_array(&self.insert_by_street),
+            by_seat: load_atomic_array(&self.insert_by_seat),
+            by_spr_bucket: load_atomic_array(&self.insert_by_spr_bucket),
+            history_len_bins: load_atomic_array(&self.insert_history_len_bins),
+            action_count_bins: load_atomic_array(&self.insert_action_count_bins),
+            history_len_max: self.insert_history_len_max.load(Ordering::Relaxed),
+            action_count_sum: self.insert_action_count_sum.load(Ordering::Relaxed),
+            action_count_max: self.insert_action_count_max.load(Ordering::Relaxed),
         }
     }
 
@@ -493,7 +541,33 @@ impl SparseMpStorage {
         self.slot_count.fetch_add(num_actions, Ordering::Relaxed);
         self.shard_entry_counts[shard_idx].fetch_add(1, Ordering::Relaxed);
         self.inserts.fetch_add(1, Ordering::Relaxed);
+        self.record_insert(key, num_actions);
         Some(node)
+    }
+
+    fn record_insert(&self, key: MpInfosetKey, num_actions: usize) {
+        if let Some(counter) = self.insert_by_street.get(usize::from(key.street)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(counter) = self.insert_by_seat.get(usize::from(key.seat)) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        let spr_idx = usize::from(key.spr_bucket).min(SPARSE_INSERT_SPR_BUCKET_COUNT - 1);
+        self.insert_by_spr_bucket[spr_idx].fetch_add(1, Ordering::Relaxed);
+
+        let history_len = u64::from(key.history_len);
+        self.insert_history_len_bins[history_len_bin(key.history_len)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.insert_history_len_max
+            .fetch_max(history_len, Ordering::Relaxed);
+
+        let action_count = u64::try_from(num_actions).unwrap_or(u64::MAX);
+        self.insert_action_count_bins[action_count_bin(num_actions)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.insert_action_count_sum
+            .fetch_add(action_count, Ordering::Relaxed);
+        self.insert_action_count_max
+            .fetch_max(action_count, Ordering::Relaxed);
     }
 
     fn shard_index_for(&self, key: MpInfosetKey) -> usize {
@@ -502,6 +576,36 @@ impl SparseMpStorage {
         let shard_count = u64::try_from(self.shards.len()).expect("shard count fits in u64");
         usize::try_from(hasher.finish() % shard_count)
             .expect("bounded sparse shard index fits in usize")
+    }
+}
+
+fn load_atomic_array<const N: usize>(atoms: &[AtomicU64; N]) -> [u64; N] {
+    std::array::from_fn(|idx| atoms[idx].load(Ordering::Relaxed))
+}
+
+fn history_len_bin(history_len: u16) -> usize {
+    match history_len {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        4..=7 => 3,
+        8..=15 => 4,
+        16..=31 => 5,
+        32..=63 => 6,
+        _ => 7,
+    }
+}
+
+fn action_count_bin(action_count: usize) -> usize {
+    match action_count {
+        0 | 1 => 0,
+        2 => 1,
+        3..=4 => 2,
+        5..=8 => 3,
+        9..=16 => 4,
+        17..=32 => 5,
+        33..=64 => 6,
+        _ => 7,
     }
 }
 
@@ -761,6 +865,50 @@ mod tests {
         let after_hit_read = storage.activity();
         assert_eq!(after_hit_read.read_probes, 2);
         assert_eq!(after_hit_read.read_hits, 1);
+    }
+
+    #[timed_test]
+    fn insert_attribution_counts_new_entries_by_key_shape() {
+        let storage = SparseMpStorage::with_shards(4);
+        let preflop = MpInfosetKey::from_parts(
+            Seat::from_raw(0),
+            Street::Preflop,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let river = MpInfosetKey::from_parts(
+            Seat::from_raw(5),
+            Street::River,
+            2,
+            31,
+            0,
+            0,
+            0,
+            70,
+        );
+
+        storage.add_regret(preflop, 1, 0, 1);
+        storage.add_strategy_sum(preflop, 1, 0, 1);
+        storage.add_regret(river, 9, 0, 1);
+
+        let attribution = storage.insert_attribution();
+        assert_eq!(attribution.by_street[Street::Preflop as usize], 1);
+        assert_eq!(attribution.by_street[Street::River as usize], 1);
+        assert_eq!(attribution.by_seat[0], 1);
+        assert_eq!(attribution.by_seat[5], 1);
+        assert_eq!(attribution.by_spr_bucket[0], 1);
+        assert_eq!(attribution.by_spr_bucket[31], 1);
+        assert_eq!(attribution.history_len_bins[0], 1);
+        assert_eq!(attribution.history_len_bins[7], 1);
+        assert_eq!(attribution.history_len_max, 70);
+        assert_eq!(attribution.action_count_bins[0], 1);
+        assert_eq!(attribution.action_count_bins[4], 1);
+        assert_eq!(attribution.action_count_sum, 10);
+        assert_eq!(attribution.action_count_max, 9);
     }
 
     #[timed_test]
