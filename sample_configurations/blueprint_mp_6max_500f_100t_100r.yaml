@@ -3,7 +3,7 @@
 game:
   name: "6-max 20bb simplified actions 500f 100t 100r"
   num_players: 6
-  stack_depth: 40
+  stack_depth: 200
   blinds:
     - seat: 4
       type: small_blind
@@ -26,27 +26,33 @@ action_abstraction:
   preflop:
     lead: ["2bb"]
     raise:
-      - ["0.33x", "1.0x"]
+      - ["0.33x", "0.75x", "1.0x"]
+      - ["0.33x", "0.75x", "1.0x"]
+      - ["0.33x", "0.75x", "1.0x"]
   flop:
-    lead: [0.75]
-    raise:
-      - [1.0]
-  turn:
-    lead: [1.0]
-    raise:
-      - [1.0]
-  river:
-    lead: [1.0]
+    lead: [0.25, 0.50, 0.75]
     raise:
       - [0.5, 1.0]
+      - [0.5, 1.0]
+  turn:
+    lead: [0.25, 0.50, 0.75]
+    raise:
+      - [0.5, 1.0]
+      - [0.5, 1.0]
+  river:
+    lead: [0.25, 0.50, 0.75]
+    raise:
+      - [0.5, 1.0, 1.5]
+      - [0.5, 1.0, 1.5]
 
 training:
+  backend: lazy_sparse
   cluster_path: "./local_data/buckets/500f_100t_100r_v1"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000
   prune_after_iterations: 100000
-  prune_threshold: -50
-  batch_size: 2000
+  prune_threshold: -5
+  batch_size: 500
   dcfr_alpha: 1.5
   dcfr_beta: 0.0
   dcfr_gamma: 2.0
