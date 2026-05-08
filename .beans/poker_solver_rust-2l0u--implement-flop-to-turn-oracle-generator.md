@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-2l0u
 title: Implement flop-to-turn oracle generator
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-08T19:23:49Z
-updated_at: 2026-05-08T19:23:49Z
+updated_at: 2026-05-08T20:09:20Z
 parent: poker_solver_rust-8rxb
 ---
 
