@@ -145,6 +145,51 @@ pub fn validate_cfvnet_boundary_cut(
     Ok(())
 }
 
+fn inference_mode_label(
+    inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode,
+) -> &'static str {
+    match inference_mode {
+        cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn => {
+            "river_enumerated_turn"
+        }
+        cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => "direct",
+    }
+}
+
+fn boundary_evaluator_log_line(
+    solver_mode: &str,
+    boundary_cut: &Option<(u8, BoundaryKind)>,
+) -> String {
+    match boundary_cut {
+        Some((
+            depth,
+            BoundaryKind::Cfvnet {
+                model_path,
+                inference_mode,
+            },
+        )) => {
+            let evaluator = match inference_mode {
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => {
+                    "Direct CFVNet"
+                }
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn => {
+                    "CFVNet"
+                }
+            };
+            format!(
+                "[solve] solver: {solver_mode}; boundary evaluator: {evaluator}; depth_limit={depth}; inference_mode={}; model={model_path}",
+                inference_mode_label(*inference_mode)
+            )
+        }
+        Some((depth, BoundaryKind::ExactSubtree)) => format!(
+            "[solve] solver: {solver_mode}; boundary evaluator: Exact Subtree; depth_limit={depth}"
+        ),
+        None => format!(
+            "[solve] solver: {solver_mode}; boundary evaluator: Exact full tree; depth_limit=none; model=none"
+        ),
+    }
+}
+
 use crate::exploration::{
     ActionInfo, BucketLookup, RANKS, blueprint_sizes_to_range_solver, board_for_street_slice,
     build_canonical_to_combo_map, canonical_hand_index_from_ranks, hand_label_from_matrix,
@@ -2668,6 +2713,10 @@ pub fn game_solve_core(
         resolve_street_boundary(&sbc, root_street)
     };
     validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
+    eprintln!(
+        "{}",
+        boundary_evaluator_log_line(if is_exact { "exact" } else { "subgame" }, &boundary_cut)
+    );
 
     // Apply range clamping
     let clamp = range_clamp_threshold.unwrap_or(0.0) as f32;
@@ -6613,6 +6662,24 @@ mod tests {
             model_path: model_path.to_string(),
             inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct,
         }
+    }
+
+    #[test]
+    fn boundary_evaluator_log_line_includes_direct_model() {
+        let cut = Some((0, direct_cfvnet_kind("/models/turn.onnx")));
+        assert_eq!(
+            boundary_evaluator_log_line("subgame", &cut),
+            "[solve] solver: subgame; boundary evaluator: Direct CFVNet; depth_limit=0; inference_mode=direct; model=/models/turn.onnx"
+        );
+    }
+
+    #[test]
+    fn boundary_evaluator_log_line_includes_legacy_model() {
+        let cut = Some((1, cfvnet_kind("/models/river.onnx")));
+        assert_eq!(
+            boundary_evaluator_log_line("subgame", &cut),
+            "[solve] solver: subgame; boundary evaluator: CFVNet; depth_limit=1; inference_mode=river_enumerated_turn; model=/models/river.onnx"
+        );
     }
 
     #[test]
