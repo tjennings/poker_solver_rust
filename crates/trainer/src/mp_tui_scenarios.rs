@@ -5,6 +5,8 @@
 //! MP storage for TUI display.
 
 use poker_solver_core::blueprint_mp::game_tree::{MpGameNode, MpGameTree, TreeAction};
+use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
+use poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage;
 use poker_solver_core::blueprint_mp::storage::MpStorage;
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{self, Card};
@@ -35,6 +37,35 @@ pub fn resolve_mp_spot(tree: &MpGameTree, spot: &str, num_players: u8) -> Option
     Some((node_idx, board))
 }
 
+/// Walk the lazy MP public game following a position-aware spot string.
+///
+/// Board segments are parsed for display consistency, but lazy public-state
+/// street advancement is driven by betting actions.
+pub fn resolve_lazy_mp_spot(
+    game: &LazyMpGame,
+    spot: &str,
+    num_players: u8,
+) -> Option<(LazyResolvedSpot, Vec<Card>)> {
+    let spot = spot.trim();
+    let mut resolved = LazyResolvedSpot::root(game);
+    let mut board = Vec::new();
+    if spot.is_empty() {
+        return Some((resolved, board));
+    }
+    for segment in spot.split('|') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if segment.contains(':') {
+            resolved = resolve_lazy_action_segment(game, resolved, segment, num_players)?;
+        } else {
+            parse_board_segment(segment, &mut board)?;
+        }
+    }
+    Some((resolved, board))
+}
+
 fn resolve_action_segment(
     tree: &MpGameTree,
     mut node_idx: u32,
@@ -58,6 +89,23 @@ fn resolve_action_segment(
         node_idx = children[matched];
     }
     Some(node_idx)
+}
+
+fn resolve_lazy_action_segment(
+    game: &LazyMpGame,
+    mut resolved: LazyResolvedSpot,
+    segment: &str,
+    num_players: u8,
+) -> Option<LazyResolvedSpot> {
+    for pair in segment.split(',') {
+        let pair = pair.trim();
+        let (pos_name, label) = pair.split_once(':')?;
+        let _expected_seat = position_to_seat(pos_name.trim(), num_players)?;
+        let actions = resolved.actions(game);
+        let matched = match_action_label_mp(label.trim(), &actions)?;
+        resolved = resolved.advance(game, matched)?;
+    }
+    Some(resolved)
 }
 
 fn match_action_label_mp(label: &str, actions: &[TreeAction]) -> Option<usize> {
@@ -168,6 +216,53 @@ pub fn extract_mp_grid(
     }
 }
 
+/// Extract a 13x13 strategy grid from lazy sparse MP storage.
+pub fn extract_lazy_mp_grid(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    spot: LazyResolvedSpot,
+    bucket_counts: [u16; 4],
+    iteration: u64,
+    scenario_name: &str,
+    action_path: &str,
+    board: &[Card],
+) -> HandGridState {
+    let mut cells: [[CellStrategy; 13]; 13] =
+        std::array::from_fn(|_| std::array::from_fn(|_| CellStrategy::default()));
+    let actions = spot.actions(game);
+    let num_actions = actions.len();
+    let street = spot.street();
+    let bucket_count = usize::from(bucket_counts[street.index()]);
+    let labels: Vec<String> = actions.iter().map(format_mp_action).collect();
+
+    if num_actions > 0 && bucket_count > 0 {
+        fill_lazy_grid_cells(
+            &mut cells,
+            storage,
+            spot,
+            num_actions,
+            bucket_count,
+            &labels,
+        );
+    }
+
+    HandGridState {
+        cells,
+        prev_cells: None,
+        scenario_name: scenario_name.to_string(),
+        action_path: if action_path.is_empty() {
+            vec![]
+        } else {
+            vec![action_path.to_string()]
+        },
+        board_display: board_display(board),
+        cluster_id: None,
+        street_label: format!("{street:?}"),
+        iteration_at_snapshot: iteration,
+        error_message: None,
+    }
+}
+
 fn fill_grid_cells(
     cells: &mut [[CellStrategy; 13]; 13],
     storage: &MpStorage,
@@ -187,6 +282,25 @@ fn fill_grid_cells(
     }
 }
 
+fn fill_lazy_grid_cells(
+    cells: &mut [[CellStrategy; 13]; 13],
+    storage: &SparseMpStorage,
+    spot: LazyResolvedSpot,
+    num_actions: usize,
+    bucket_count: usize,
+    labels: &[String],
+) {
+    let mut out = vec![0.0_f64; num_actions];
+    for row in 0..13 {
+        for col in 0..13 {
+            let hand = CanonicalHand::from_matrix_position(row, col).unwrap();
+            let bucket = (hand.index() % bucket_count) as u16;
+            storage.average_strategy(spot.key_for_bucket(bucket), num_actions, &mut out);
+            cells[row][col] = build_cell_strategy(&out, labels);
+        }
+    }
+}
+
 fn build_cell_strategy(probs: &[f64], labels: &[String]) -> CellStrategy {
     let actions: Vec<(String, f32)> = labels
         .iter()
@@ -194,6 +308,20 @@ fn build_cell_strategy(probs: &[f64], labels: &[String]) -> CellStrategy {
         .map(|(label, &freq)| (label.clone(), freq as f32))
         .collect();
     CellStrategy { actions, ev: None }
+}
+
+fn board_display(board: &[Card]) -> Option<String> {
+    if board.is_empty() {
+        None
+    } else {
+        Some(
+            board
+                .iter()
+                .map(|card| format!("{card}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
 }
 
 /// Format an MP `TreeAction` for TUI display.

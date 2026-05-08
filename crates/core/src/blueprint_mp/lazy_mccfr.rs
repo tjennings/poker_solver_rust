@@ -258,6 +258,66 @@ impl LazyHistory {
     }
 }
 
+/// A lazy public-state cursor resolved from a user-facing spot string.
+///
+/// This is the lazy backend equivalent of an eager public-node id: it carries
+/// the current public state plus the compact action history needed to derive
+/// sparse infoset keys for strategy lookup.
+#[derive(Clone, Copy)]
+pub struct LazyResolvedSpot {
+    state: LazyPublicState,
+    history: LazyHistory,
+}
+
+impl LazyResolvedSpot {
+    /// Resolve the lazy root spot for a game.
+    #[must_use]
+    pub fn root(game: &LazyMpGame) -> Self {
+        Self {
+            state: game.root_state(),
+            history: LazyHistory::default(),
+        }
+    }
+
+    /// Current acting seat.
+    #[must_use]
+    pub const fn to_act(self) -> Seat {
+        self.state.to_act()
+    }
+
+    /// Current street.
+    #[must_use]
+    pub const fn street(self) -> Street {
+        self.state.street()
+    }
+
+    /// Generate legal actions at this resolved spot.
+    #[must_use]
+    pub fn actions(self, game: &LazyMpGame) -> Vec<TreeAction> {
+        game.actions(&self.state)
+    }
+
+    /// Build the sparse infoset key for a street-local bucket at this spot.
+    #[must_use]
+    pub fn key_for_bucket(self, bucket: u16) -> MpInfosetKey {
+        self.history.key(self.state, bucket)
+    }
+
+    /// Advance this resolved spot by one action index.
+    #[must_use]
+    pub fn advance(self, game: &LazyMpGame, action_idx: usize) -> Option<Self> {
+        let actions = game.actions(&self.state);
+        let action = *actions.get(action_idx)?;
+        match normalize_node(apply_action(self.state, action)) {
+            LazyNode::Decision(state) => Some(Self {
+                state,
+                history: self.history.append(action_idx),
+            }),
+            LazyNode::Terminal { .. } => None,
+        }
+    }
+}
+
 enum LazyNode {
     Decision(LazyPublicState),
     Terminal {

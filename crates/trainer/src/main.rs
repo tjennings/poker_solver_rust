@@ -3174,6 +3174,14 @@ fn run_mp_with_tui_lazy(
     use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
 
     let ctx = setup_lazy_training(config);
+    let (scenarios, lazy_scenario_spots) = resolve_lazy_tui_scenarios(
+        &ctx.game,
+        &ctx.storage,
+        ctx.bucket_counts,
+        &tui_config.scenarios,
+        config.game.num_players,
+        0,
+    );
     let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
         config.training.iterations,
         config.training.time_limit_minutes,
@@ -3181,7 +3189,9 @@ fn run_mp_with_tui_lazy(
     let shared_iters = Arc::clone(&ctx.iterations);
     let quit_flag = Arc::clone(&ctx.quit);
     let storage = Arc::clone(&ctx.storage);
-    let tui_handle = spawn_mp_tui(&metrics, Vec::new(), tui_config, config.game.num_players);
+    let game = Arc::clone(&ctx.game);
+    let bucket_counts = ctx.bucket_counts;
+    let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
     let train_config = config.clone();
     let train_handle = std::thread::spawn(move || {
         run_lazy_training(&ctx, &train_config.training, &train_config.game)
@@ -3190,6 +3200,9 @@ fn run_mp_with_tui_lazy(
     bridge_mp_lazy_iterations(
         &shared_iters,
         &storage,
+        &game,
+        &lazy_scenario_spots,
+        bucket_counts,
         &metrics,
         &quit_flag,
         &train_handle,
@@ -3280,6 +3293,9 @@ fn bridge_mp_iterations<T>(
 fn bridge_mp_lazy_iterations<T>(
     source: &Arc<AtomicU64>,
     storage: &Arc<poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage>,
+    game: &Arc<poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame>,
+    scenario_spots: &[poker_solver_core::blueprint_mp::lazy_mccfr::LazyResolvedSpot],
+    bucket_counts: [u16; 4],
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
@@ -3302,6 +3318,14 @@ fn bridge_mp_lazy_iterations<T>(
         if last_telemetry.elapsed() >= telemetry_interval {
             let sample = storage.telemetry_sample(LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES);
             push_sparse_mp_telemetry(sample, &mut previous_strategy_fingerprint, metrics);
+            push_lazy_mp_strategy_grids(
+                storage,
+                game,
+                scenario_spots,
+                bucket_counts,
+                metrics,
+                iters,
+            );
             metrics.push_prune_fraction(take_mp_prune_pct());
             last_telemetry = Instant::now();
         }
@@ -3510,6 +3534,29 @@ fn push_sparse_mp_telemetry(
     metrics.push_strategy_delta(delta);
 }
 
+fn push_lazy_mp_strategy_grids(
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    game: &poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame,
+    scenario_spots: &[poker_solver_core::blueprint_mp::lazy_mccfr::LazyResolvedSpot],
+    bucket_counts: [u16; 4],
+    metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
+    iters: u64,
+) {
+    for (idx, &spot) in scenario_spots.iter().enumerate() {
+        let grid_state = mp_tui_scenarios::extract_lazy_mp_grid(
+            game,
+            storage,
+            spot,
+            bucket_counts,
+            iters,
+            "",
+            "",
+            &[],
+        );
+        metrics.update_scenario_grid(idx, grid_state.cells);
+    }
+}
+
 fn resolve_tui_scenarios(
     tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
     configs: &[blueprint_tui_config::ScenarioConfig],
@@ -3527,6 +3574,46 @@ fn resolve_tui_scenarios(
             })
         })
         .collect()
+}
+
+fn resolve_lazy_tui_scenarios(
+    game: &poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame,
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    bucket_counts: [u16; 4],
+    configs: &[blueprint_tui_config::ScenarioConfig],
+    num_players: u8,
+    iteration: u64,
+) -> (
+    Vec<mp_tui::ResolvedMpScenario>,
+    Vec<poker_solver_core::blueprint_mp::lazy_mccfr::LazyResolvedSpot>,
+) {
+    let mut scenarios = Vec::new();
+    let mut spots = Vec::new();
+    for sc in configs {
+        let Some((spot, board)) =
+            mp_tui_scenarios::resolve_lazy_mp_spot(game, &sc.spot, num_players)
+        else {
+            continue;
+        };
+        let grid = mp_tui_scenarios::extract_lazy_mp_grid(
+            game,
+            storage,
+            spot,
+            bucket_counts,
+            iteration,
+            &sc.name,
+            &sc.spot,
+            &board,
+        );
+        let node_idx = u32::try_from(scenarios.len()).unwrap_or(u32::MAX);
+        scenarios.push(mp_tui::ResolvedMpScenario {
+            name: sc.name.clone(),
+            node_idx,
+            grid,
+        });
+        spots.push(spot);
+    }
+    (scenarios, spots)
 }
 
 fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
@@ -4360,6 +4447,79 @@ snapshots:
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "UTG open");
         assert_eq!(resolved[1].name, "HJ vs UTG");
+    }
+
+    #[timed_test(20)]
+    fn resolve_lazy_tui_scenarios_from_lazy_game() {
+        use poker_solver_core::blueprint_mp::config::*;
+        use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
+        use poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage;
+
+        let game = MpGameConfig {
+            name: "test".into(),
+            num_players: 6,
+            stack_depth: 40.0,
+            blinds: vec![
+                ForcedBet {
+                    seat: 4,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("5bb".into())],
+            raise: vec![vec![serde_yaml::Value::String("5bb".into())]],
+        };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action = MpActionAbstractionConfig {
+            preflop,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        let lazy_game = LazyMpGame::new(&game, &action);
+        let storage = SparseMpStorage::with_shards(4);
+        let scenarios = vec![
+            crate::blueprint_tui_config::ScenarioConfig {
+                name: "UTG open".into(),
+                spot: String::new(),
+            },
+            crate::blueprint_tui_config::ScenarioConfig {
+                name: "HJ vs UTG".into(),
+                spot: "utg:5bb".into(),
+            },
+            crate::blueprint_tui_config::ScenarioConfig {
+                name: "Invalid spot".into(),
+                spot: "xyz:999bb".into(),
+            },
+        ];
+
+        let (resolved, spots) = super::resolve_lazy_tui_scenarios(
+            &lazy_game,
+            &storage,
+            [169, 50, 50, 50],
+            &scenarios,
+            6,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(spots.len(), 2);
+        assert_eq!(resolved[0].name, "UTG open");
+        assert_eq!(resolved[1].name, "HJ vs UTG");
+        assert!(!resolved[0].grid.cells[0][0].actions.is_empty());
+        assert!(!resolved[1].grid.cells[0][0].actions.is_empty());
     }
 
     /// compare-solve should accept per-street boundary flags.

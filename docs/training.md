@@ -128,7 +128,7 @@ Lazy sparse DCFR discounting runs in parallel across sparse storage shards. The 
 
 In `--no-tui` mode, lazy sparse progress is reported once per minute with sparse entries, slot counts, approximate storage, allocation growth rates, shard distribution, storage activity, insert attribution, action-limit audit fields, timing buckets for batch wall time, deal sampling, bucket lookup, traversal, DCFR discounting, and console stats collection, plus long-tail traversal telemetry (`max_job`, `max_trav`, and slow counts). Sparse entries, slots, and shard occupancy are maintained with live counters, so heartbeat stats stay O(shards) instead of scanning every visited infoset. The `activity[...]` block reports sparse read probe rate, read hit rate, write probe rate, write hit rate, and insert rate for the heartbeat interval. The `insert_by[...]` block attributes newly allocated infosets by street, top seat, top history-length bin, and action-count shape. Lazy sparse strategy keys use seat, a street-namespaced abstract bucket, and action history; SPR is not part of storage identity. River SPR-0 states suppress new lead/raise/all-in aggression while preserving check, fold, call, and all-in-call resolution, which keeps low-SPR river histories from expanding into many strategically similar betting branches. The `action_limit[...]` block audits max observed per-street raise counts and any decisions/aggressive actions beyond configured raise rows plus one all-in aggression allowance. These fields help diagnose whether throughput dips line up with sparse storage growth, shard imbalance, compute phases, reporting overhead, new allocation pressure, lookup pressure, action-history/key explosion, action-limit escape, or a single long traversal holding the batch barrier.
 
-When `tui.enabled: true`, lazy sparse MP training launches the multiplayer TUI instead of no-TUI logs. The lazy sparse TUI shows live iterations, throughput, sampled regret telemetry, prune percentage, and sampled strategy-delta movement without materializing the dense public tree. Scenario hand grids remain eager-backend only until lazy spot resolution can map configured spots to sparse public-state keys. Pressing `s` in lazy sparse TUI writes a sparse snapshot containing `sparse_entries.bin` and `metadata.json`.
+When `tui.enabled: true`, lazy sparse MP training launches the multiplayer TUI instead of no-TUI logs. The lazy sparse TUI shows live iterations, throughput, sampled regret telemetry, prune percentage, sampled strategy-delta movement, and configured scenario hand grids without materializing the dense public tree. Scenario grids resolve configured spots against the lazy public state and read average strategy from sparse infoset keys. Pressing `s` in lazy sparse TUI writes a sparse snapshot containing `sparse_entries.bin` and `metadata.json`.
 
 Run the 500/100/100 6-max experiment with:
 
@@ -501,7 +501,7 @@ tui:
       spot: ""
 ```
 
-Alternatively, omit `--no-tui` from the command line (the TUI is enabled by default when `tui.enabled: true`). With `training.backend: lazy_sparse`, the dashboard currently reports live global telemetry and sampled strategy movement; configured hand-grid scenarios require the eager backend.
+Alternatively, omit `--no-tui` from the command line (the TUI is enabled by default when `tui.enabled: true`). With `training.backend: lazy_sparse`, the dashboard reports live global telemetry, sampled strategy movement, and configured hand-grid scenarios backed by sparse strategy rows.
 
 #### Position Labels
 
