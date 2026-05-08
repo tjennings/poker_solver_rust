@@ -39,6 +39,8 @@ describe('buildSolveParams', () => {
     flop_model_path: '',
     turn_model_path: '',
     river_model_path: '',
+    turn_model_kind: 'direct' as const,
+    river_model_kind: 'river_enumerated_turn' as const,
   };
 
   it('returns mode in params', () => {
@@ -100,19 +102,45 @@ describe('buildSolveParams', () => {
     expect(params.streetBoundaryConfig).toEqual({
       flop: { mode: 'exact' },
       turn: { mode: 'exact' },
-      river: { mode: 'cfvnet', model_path: '/models/river_v2.onnx' },
+      river: {
+        mode: 'cfvnet',
+        model_path: '/models/river_v2.onnx',
+        inference_mode: 'river_enumerated_turn',
+      },
     });
   });
 
-  it('throws for cfvnet turn boundary mode', () => {
+  it('builds direct cfvnet streetBoundaryConfig for turn with model path', () => {
     const config = {
       ...defaultConfig,
       turn_boundary_mode: 'cfvnet' as const,
       turn_model_path: '/models/turn_v1.onnx',
     };
-    expect(() => buildSolveParams('subgame', config)).toThrow(
-      'CFVNet boundary is only supported for river boundary mode',
-    );
+    const params = buildSolveParams('subgame', config);
+    expect(params.streetBoundaryConfig).toEqual({
+      flop: { mode: 'exact' },
+      turn: {
+        mode: 'cfvnet',
+        model_path: '/models/turn_v1.onnx',
+        inference_mode: 'direct',
+      },
+      river: { mode: 'exact' },
+    });
+  });
+
+  it('preserves legacy river-enumerated turn cfvnet mode when selected', () => {
+    const config = {
+      ...defaultConfig,
+      turn_boundary_mode: 'cfvnet' as const,
+      turn_model_path: '/models/river_adapter.onnx',
+      turn_model_kind: 'river_enumerated_turn' as const,
+    };
+    const params = buildSolveParams('subgame', config);
+    expect(params.streetBoundaryConfig.turn).toEqual({
+      mode: 'cfvnet',
+      model_path: '/models/river_adapter.onnx',
+      inference_mode: 'river_enumerated_turn',
+    });
   });
 
   it('throws if cfvnet mode has empty model_path', () => {
@@ -133,7 +161,7 @@ describe('buildSolveParams', () => {
       flop_model_path: '/models/flop.onnx',
     };
     expect(() => buildSolveParams('subgame', config)).toThrow(
-      'CFVNet boundary is only supported for river boundary mode',
+      'CFVNet boundary is only supported for turn or river boundary mode',
     );
   });
 

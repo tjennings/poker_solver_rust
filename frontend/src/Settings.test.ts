@@ -16,6 +16,8 @@ describe('hasAnyCut', () => {
     flop_model_path: '',
     turn_model_path: '',
     river_model_path: '',
+    turn_model_kind: 'direct',
+    river_model_kind: 'river_enumerated_turn',
     trace_boundaries: '',
     trace_iters: 'last',
     enable_safe_resolving: false,

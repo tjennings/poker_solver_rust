@@ -144,9 +144,11 @@ export interface SimulationResult {
   elapsed_ms: number;
 }
 
+export type BoundaryInferenceMode = 'river_enumerated_turn' | 'direct';
+
 export type StreetBoundaryMode =
   | { mode: 'exact' }
-  | { mode: 'cfvnet'; model_path: string; inference_mode?: 'river_enumerated_turn' | 'direct' }
+  | { mode: 'cfvnet'; model_path: string; inference_mode?: BoundaryInferenceMode }
   | { mode: 'exact_subtree' };
 
 export interface StreetBoundaryConfig {
@@ -171,6 +173,8 @@ export interface GlobalConfig {
   flop_model_path: string;
   turn_model_path: string;
   river_model_path: string;
+  turn_model_kind: BoundaryInferenceMode;
+  river_model_kind: BoundaryInferenceMode;
   // Boundary tracing (debug)
   trace_boundaries: string;
   trace_iters: string;

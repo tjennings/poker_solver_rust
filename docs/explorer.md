@@ -132,6 +132,20 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `list_agents` | List available agent TOML configs |
 | `get_combo_classes` | Get combo-level hand class breakdown for a cell |
 
+## Boundary Evaluation
+
+The Settings view controls depth-boundary evaluators for Subgame and Exact solves. The first non-Exact street after the current root street becomes the cut point; later streets are disabled because they cannot be reached by the depth-limited solve.
+
+Available boundary modes:
+
+- `Exact`: no neural or subtree cut at that street.
+- `CFVNet`: evaluate the boundary with an ONNX model. Turn and river boundaries are supported; flop CFVNet is intentionally disabled.
+- `Exact Subtree`: solve the downstream subtree exactly with DCFR.
+
+For turn-boundary CFVNet checkpoints trained directly on 4-card turn boards, set the turn boundary to `CFVNet`, choose the ONNX file, and set model kind to `Direct`. The current local direct checkpoint path is `local_data/models/turn_boundary_cfvnet_v2/best.onnx`; the companion `.onnx.data` file must stay beside it but is local data and should not be committed.
+
+Legacy turn-boundary evaluation through a river model remains available with model kind `River enum`, which averages river-model outputs over valid river runouts. River CFVNet keeps `River enum` as the default model kind for backward compatibility.
+
 ## Boundary Tracing
 
 When solving hybrid (cfvnet) spots, you can enable per-boundary trace logging to capture what the boundary evaluator sees and produces at each depth boundary.

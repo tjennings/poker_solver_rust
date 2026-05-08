@@ -1,10 +1,19 @@
 import { useState, useEffect } from 'react';
 import { isTauri } from './invoke';
 import { useGlobalConfig } from './useGlobalConfig';
-import type { GlobalConfig } from './types';
+import type { BoundaryInferenceMode, GlobalConfig } from './types';
 
 const STREETS = ['flop', 'turn', 'river'] as const;
 type Street = typeof STREETS[number];
+type CfvnetStreet = Exclude<Street, 'flop'>;
+const DEFAULT_MODEL_KIND: Record<CfvnetStreet, BoundaryInferenceMode> = {
+  turn: 'direct',
+  river: 'river_enumerated_turn',
+};
+
+function isCfvnetStreet(street: Street): street is CfvnetStreet {
+  return street !== 'flop';
+}
 
 /** Returns true if any per-street boundary mode is not 'exact' (i.e. a cut is active). */
 export function hasAnyCut(cfg: GlobalConfig): boolean {
@@ -54,17 +63,28 @@ function BoundaryEvaluationSettings({
         const pathKey = `${street}_model_path` as keyof GlobalConfig;
         const mode = config[modeKey] as 'exact' | 'cfvnet' | 'exact_subtree';
         const modelPath = config[pathKey] as string;
+        const modelKindKey = isCfvnetStreet(street) ? `${street}_model_kind` as keyof GlobalConfig : null;
+        const modelKind = modelKindKey
+          ? config[modelKindKey] as BoundaryInferenceMode
+          : undefined;
         const disabled = firstCutIdx !== -1 && idx > firstCutIdx;
 
         return (
-          <div key={street} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem' }}>
+          <div key={street} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem', flexWrap: 'wrap' }}>
             <span style={{ width: 40, fontSize: '0.8rem', color: '#aaa', textTransform: 'capitalize' }}>
               {street}
             </span>
             <select
               value={mode}
               disabled={disabled}
-              onChange={e => setConfig({ [modeKey]: e.target.value } as Partial<GlobalConfig>)}
+              onChange={e => {
+                const nextMode = e.target.value as GlobalConfig[typeof modeKey];
+                const update = { [modeKey]: nextMode } as Partial<GlobalConfig>;
+                if (nextMode === 'cfvnet' && modelKindKey && !modelKind) {
+                  Object.assign(update, { [modelKindKey]: DEFAULT_MODEL_KIND[street as CfvnetStreet] });
+                }
+                setConfig(update);
+              }}
               style={{
                 width: 100,
                 padding: '0.35rem 0.5rem',
@@ -79,11 +99,32 @@ function BoundaryEvaluationSettings({
               title={disabled ? 'Earlier boundary cut takes precedence' : undefined}
             >
               <option value="exact">Exact</option>
-              <option value="cfvnet" disabled={street !== 'river'}>CFVNet</option>
+              <option value="cfvnet" disabled={street === 'flop'}>CFVNet</option>
               <option value="exact_subtree">Exact Subtree</option>
             </select>
             {mode === 'cfvnet' && !disabled && (
               <>
+                {modelKindKey && (
+                  <select
+                    value={modelKind ?? DEFAULT_MODEL_KIND[street as CfvnetStreet]}
+                    onChange={e => setConfig({ [modelKindKey]: e.target.value as BoundaryInferenceMode } as Partial<GlobalConfig>)}
+                    style={{
+                      width: 128,
+                      padding: '0.35rem 0.5rem',
+                      background: 'rgba(255,255,255,0.06)',
+                      border: '1px solid rgba(255,255,255,0.12)',
+                      borderRadius: 6,
+                      color: '#eee',
+                      fontSize: '0.8rem',
+                      fontFamily: 'inherit',
+                      cursor: 'pointer',
+                    }}
+                    title={modelKind === 'river_enumerated_turn' ? 'Legacy river model averaged across river runouts' : 'Direct model input for the boundary board'}
+                  >
+                    <option value="direct">Direct</option>
+                    <option value="river_enumerated_turn">River enum</option>
+                  </select>
+                )}
                 <input
                   type="text"
                   value={modelPath}
