@@ -115,6 +115,17 @@ pub struct SparseInsertAttribution {
     pub action_count_max: u64,
 }
 
+/// Regret and average-strategy sample for sparse telemetry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SparseTelemetrySample {
+    pub entries_sampled: usize,
+    pub regret_slots_sampled: usize,
+    pub max_positive_regret: i32,
+    pub max_negative_regret: i32,
+    pub avg_positive_regret: f64,
+    pub strategy_fingerprint: f64,
+}
+
 /// Serializable snapshot of one visited sparse infoset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparseSnapshotEntry {
@@ -316,6 +327,72 @@ impl SparseMpStorage {
             history_len_max: self.insert_history_len_max.load(Ordering::Relaxed),
             action_count_sum: self.insert_action_count_sum.load(Ordering::Relaxed),
             action_count_max: self.insert_action_count_max.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Sample sparse entries for TUI telemetry without scanning the whole store.
+    ///
+    /// The sample walks shards in order and takes a bounded number of entries
+    /// per shard. It is intended for trend telemetry, not exact reporting.
+    #[must_use]
+    pub fn telemetry_sample(&self, max_entries: usize) -> SparseTelemetrySample {
+        if max_entries == 0 {
+            return SparseTelemetrySample::default();
+        }
+        let per_shard = max_entries.div_ceil(self.shards.len()).max(1);
+        let mut entries_sampled = 0_usize;
+        let mut regret_slots_sampled = 0_usize;
+        let mut max_positive_regret = 0_i32;
+        let mut max_negative_regret = 0_i32;
+        let mut positive_sum = 0_i64;
+        let mut positive_count = 0_u64;
+        let mut strategy_fingerprint = 0.0_f64;
+
+        for shard in &self.shards {
+            if entries_sampled >= max_entries {
+                break;
+            }
+            let guard = lock_entries(shard);
+            let remaining = max_entries - entries_sampled;
+            for (key, node) in guard.iter().take(per_shard.min(remaining)) {
+                entries_sampled += 1;
+                regret_slots_sampled += node.action_count();
+                let mut strategy_total = 0_u64;
+                for (action_idx, regret) in node.regrets.iter().enumerate() {
+                    let value = regret.load(Ordering::Relaxed);
+                    max_positive_regret = max_positive_regret.max(value);
+                    max_negative_regret = max_negative_regret.min(value);
+                    if value > 0 {
+                        positive_sum += i64::from(value);
+                        positive_count += 1;
+                    }
+                    let strategy_sum = node.strategy_sums[action_idx].load(Ordering::Relaxed);
+                    strategy_total = strategy_total.saturating_add(strategy_sum);
+                }
+                if strategy_total > 0 {
+                    let key_weight = sparse_key_fingerprint_weight(*key);
+                    for (action_idx, strategy_sum) in node.strategy_sums.iter().enumerate() {
+                        let prob =
+                            strategy_sum.load(Ordering::Relaxed) as f64 / strategy_total as f64;
+                        strategy_fingerprint += key_weight * (action_idx as f64 + 1.0) * prob;
+                    }
+                }
+            }
+        }
+
+        let avg_positive_regret = if positive_count > 0 {
+            positive_sum as f64 / positive_count as f64
+        } else {
+            0.0
+        };
+
+        SparseTelemetrySample {
+            entries_sampled,
+            regret_slots_sampled,
+            max_positive_regret,
+            max_negative_regret,
+            avg_positive_regret,
+            strategy_fingerprint,
         }
     }
 
@@ -607,6 +684,17 @@ fn action_count_bin(action_count: usize) -> usize {
         33..=64 => 6,
         _ => 7,
     }
+}
+
+fn sparse_key_fingerprint_weight(key: MpInfosetKey) -> f64 {
+    let mixed = key
+        .history_hash
+        .wrapping_add(key.history_lo.rotate_left(17))
+        .wrapping_add(key.history_hi.rotate_left(31))
+        .wrapping_add(u64::from(key.bucket) << 8)
+        .wrapping_add(u64::from(key.seat) << 3)
+        .wrapping_add(u64::from(key.street));
+    (mixed % 1_000_003) as f64 / 1_000_003.0
 }
 
 fn lock_entries(shard: &Shard) -> MutexGuard<'_, HashMap<MpInfosetKey, Arc<SparseNode>>> {
@@ -941,6 +1029,29 @@ mod tests {
         assert_eq!(snapshot[1].num_actions, 2);
         assert_eq!(snapshot[1].regrets, vec![0, 22]);
         assert_eq!(snapshot[1].strategy_sums, vec![11, 0]);
+    }
+
+    #[timed_test]
+    fn telemetry_sample_reports_sparse_regret_and_strategy_movement_signal() {
+        let storage = SparseMpStorage::with_shards(4);
+
+        storage.add_regret(key(3), 3, 0, 30);
+        storage.add_regret(key(3), 3, 1, -20);
+        storage.add_strategy_sum(key(3), 3, 0, 10);
+        storage.add_strategy_sum(key(3), 3, 1, 30);
+        storage.add_regret(key(7), 2, 1, 15);
+
+        let sample = storage.telemetry_sample(16);
+
+        assert_eq!(sample.entries_sampled, 2);
+        assert_eq!(sample.regret_slots_sampled, 5);
+        assert_eq!(sample.max_positive_regret, 30);
+        assert_eq!(sample.max_negative_regret, -20);
+        assert!((sample.avg_positive_regret - 22.5).abs() < 1e-9);
+        assert!(
+            sample.strategy_fingerprint > 0.0,
+            "strategy fingerprint should move once strategy sums exist"
+        );
     }
 
     #[timed_test]

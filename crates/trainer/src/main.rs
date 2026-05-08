@@ -2517,12 +2517,10 @@ fn run_train_blueprint_mp(path: &str, no_tui: bool) -> Result<(), Box<dyn Error>
     );
     if config.training.backend == MpTrainingBackend::LazySparse {
         if tui_config.enabled && !no_tui {
-            return Err(
-                "Blueprint MP lazy_sparse backend currently supports --no-tui only; rerun with --no-tui"
-                    .into(),
-            );
+            run_mp_with_tui_lazy(&config, &tui_config)?;
+        } else {
+            run_mp_without_tui_lazy(&config)?;
         }
-        run_mp_without_tui_lazy(&config)?;
     } else if tui_config.enabled && !no_tui {
         run_mp_with_tui(&config, &tui_config)?;
     } else {
@@ -2718,9 +2716,12 @@ type SparseStorageActivity =
     poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
 type SparseInsertAttribution =
     poker_solver_core::blueprint_mp::sparse_storage::SparseInsertAttribution;
+type SparseTelemetrySample =
+    poker_solver_core::blueprint_mp::sparse_storage::SparseTelemetrySample;
 type LazyActionLimitSnapshot =
     poker_solver_core::blueprint_mp::lazy_mccfr::LazyActionLimitSnapshot;
 const STREET_LABELS: [&str; 4] = ["pf", "f", "t", "r"];
+const LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES: usize = 8192;
 const HISTORY_LEN_BIN_LABELS: [&str; 8] =
     ["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"];
 const ACTION_COUNT_BIN_LABELS: [&str; 8] =
@@ -3176,6 +3177,46 @@ fn run_mp_with_tui(
     Ok(())
 }
 
+fn run_mp_with_tui_lazy(
+    config: &BlueprintMpConfig,
+    tui_config: &blueprint_tui_config::BlueprintTuiConfig,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+
+    let ctx = setup_lazy_training(config);
+    let metrics = Arc::new(blueprint_tui_metrics::BlueprintTuiMetrics::new(
+        config.training.iterations,
+        config.training.time_limit_minutes,
+    ));
+    let shared_iters = Arc::clone(&ctx.iterations);
+    let quit_flag = Arc::clone(&ctx.quit);
+    let storage = Arc::clone(&ctx.storage);
+    let tui_handle = spawn_mp_tui(&metrics, Vec::new(), tui_config, config.game.num_players);
+    let train_config = config.clone();
+    let train_handle = std::thread::spawn(move || {
+        run_lazy_training(&ctx, &train_config.training, &train_config.game)
+    });
+
+    bridge_mp_lazy_iterations(
+        &shared_iters,
+        &storage,
+        &metrics,
+        &quit_flag,
+        &train_handle,
+        &config.snapshots,
+    );
+
+    metrics.quit_requested.store(true, Ordering::Relaxed);
+    quit_flag.store(true, Ordering::Relaxed);
+    let result = train_handle.join().expect("lazy training thread panicked");
+    let _ = tui_handle.join();
+    eprintln!(
+        "Lazy sparse training complete: {} meta-iterations",
+        result.meta_iterations
+    );
+    Ok(())
+}
+
 fn spawn_mp_tui(
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     scenarios: Vec<mp_tui::ResolvedMpScenario>,
@@ -3246,6 +3287,51 @@ fn bridge_mp_iterations<T>(
     }
 }
 
+fn bridge_mp_lazy_iterations<T>(
+    source: &Arc<AtomicU64>,
+    storage: &Arc<poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage>,
+    metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
+    quit_flag: &Arc<std::sync::atomic::AtomicBool>,
+    handle: &std::thread::JoinHandle<T>,
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+) {
+    let mut last_telemetry = Instant::now();
+    let telemetry_interval = Duration::from_secs(10);
+    let started = Instant::now();
+    let mut previous_strategy_fingerprint = None;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let iters = source.load(Ordering::Relaxed);
+        metrics.iterations.store(iters, Ordering::Relaxed);
+        if metrics.take_snapshot_trigger() {
+            match save_lazy_mp_snapshot(snapshot_config, storage, iters, started.elapsed()) {
+                Ok(path) => eprintln!("  Lazy MP snapshot saved to {}", path.display()),
+                Err(e) => eprintln!("  Warning: failed to save lazy MP snapshot: {e}"),
+            }
+        }
+        if last_telemetry.elapsed() >= telemetry_interval {
+            let sample = storage.telemetry_sample(LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES);
+            push_sparse_mp_telemetry(
+                sample,
+                &mut previous_strategy_fingerprint,
+                metrics,
+            );
+            metrics.push_prune_fraction(take_mp_prune_pct());
+            last_telemetry = Instant::now();
+        }
+        if handle.is_finished() {
+            metrics
+                .iterations
+                .store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+            break;
+        }
+        if metrics.quit_requested.load(Ordering::Relaxed) {
+            quit_flag.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+}
+
 fn save_mp_snapshot(
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
@@ -3270,6 +3356,41 @@ fn save_mp_snapshot(
         "elapsed_seconds": elapsed.as_secs(),
         "elapsed_minutes": elapsed.as_secs() / 60,
         "bucket_counts": storage.bucket_counts,
+    });
+    let metadata_json = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
+    Ok(snapshot_dir)
+}
+
+fn save_lazy_mp_snapshot(
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    iterations: u64,
+    elapsed: Duration,
+) -> std::io::Result<PathBuf> {
+    let output_dir = PathBuf::from(&snapshot_config.output_dir);
+    std::fs::create_dir_all(&output_dir)?;
+    let snapshot_idx = next_snapshot_index(&output_dir)?;
+    let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
+    std::fs::create_dir_all(&snapshot_dir)?;
+
+    let entries = storage.snapshot_entries();
+    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
+    let writer = std::io::BufWriter::new(file);
+    bincode::serialize_into(writer, &entries).map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let stats = storage.stats();
+    let metadata = serde_json::json!({
+        "kind": "blueprint_mp_lazy_sparse",
+        "snapshot_index": snapshot_idx,
+        "iterations": iterations,
+        "elapsed_seconds": elapsed.as_secs(),
+        "elapsed_minutes": elapsed.as_secs() / 60,
+        "entries": stats.entries,
+        "regret_slots": stats.regret_slots,
+        "strategy_slots": stats.strategy_slots,
+        "approx_bytes": stats.approx_bytes,
     });
     let metadata_json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -3382,6 +3503,25 @@ fn push_mp_telemetry(
             }
         }
     }
+}
+
+fn push_sparse_mp_telemetry(
+    sample: SparseTelemetrySample,
+    previous_strategy_fingerprint: &mut Option<f64>,
+    metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
+) {
+    if sample.entries_sampled == 0 {
+        return;
+    }
+    let scale = poker_solver_core::blueprint_mp::storage::REGRET_SCALE;
+    metrics.push_max_regret(f64::from(sample.max_positive_regret) / scale);
+    metrics.push_min_regret(f64::from(sample.max_negative_regret) / scale);
+    metrics.push_avg_pos_regret(sample.avg_positive_regret / scale);
+    let delta = previous_strategy_fingerprint
+        .map(|previous| (sample.strategy_fingerprint - previous).abs())
+        .unwrap_or(0.0);
+    *previous_strategy_fingerprint = Some(sample.strategy_fingerprint);
+    metrics.push_strategy_delta(delta);
 }
 
 fn resolve_tui_scenarios(
@@ -4041,6 +4181,91 @@ snapshots:
         .unwrap();
         assert_eq!(metadata["kind"], "blueprint_mp");
         assert_eq!(metadata["iterations"], 123);
+    }
+
+    #[test]
+    fn lazy_mp_snapshot_save_creates_sparse_entries_and_metadata() {
+        use poker_solver_core::blueprint_mp::config::MpSnapshotConfig;
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+
+        let storage = poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key = MpInfosetKey::from_parts(
+            Seat::from_raw(0),
+            Street::Preflop,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            warmup_minutes: 0,
+            snapshot_every_minutes: 1,
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            resume: false,
+            max_snapshots: None,
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &snapshot_config,
+            &storage,
+            456,
+            std::time::Duration::from_secs(11),
+        )
+        .expect("lazy sparse snapshot save should succeed");
+
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
+        assert_eq!(metadata["iterations"], 456);
+        assert_eq!(metadata["entries"], 1);
+    }
+
+    #[test]
+    fn sparse_mp_telemetry_pushes_regret_and_strategy_delta() {
+        let metrics = crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None);
+        let mut previous = None;
+        let first = super::SparseTelemetrySample {
+            entries_sampled: 2,
+            regret_slots_sampled: 5,
+            max_positive_regret: 2000,
+            max_negative_regret: -1000,
+            avg_positive_regret: 1500.0,
+            strategy_fingerprint: 2.0,
+        };
+        let second = super::SparseTelemetrySample {
+            strategy_fingerprint: 2.25,
+            ..first.clone()
+        };
+
+        super::push_sparse_mp_telemetry(first, &mut previous, &metrics);
+        super::push_sparse_mp_telemetry(second, &mut previous, &metrics);
+
+        assert_eq!(
+            *metrics.max_regret_history.lock().unwrap(),
+            vec![2000.0, 2000.0]
+        );
+        assert_eq!(
+            *metrics.min_regret_history.lock().unwrap(),
+            vec![-1000.0, -1000.0]
+        );
+        assert_eq!(
+            *metrics.avg_pos_regret_history.lock().unwrap(),
+            vec![1500.0, 1500.0]
+        );
+        assert_eq!(
+            *metrics.strategy_delta_history.lock().unwrap(),
+            vec![0.0, 0.25]
+        );
     }
 
     #[test]
