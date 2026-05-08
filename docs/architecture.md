@@ -196,7 +196,7 @@ crates/core/src/blueprint_mp/
 - **128-bit info set keys** with 22 action slots (panics on overflow)
 - **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
 - **Sparse visited-infoset storage** for the planned lazy backend: unvisited infosets read as zero/uniform, visited infosets allocate sharded atomic regret and strategy counters, and snapshots export only touched entries
-- **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, street, bucket, SPR bucket, and action history
+- **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
 - **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 

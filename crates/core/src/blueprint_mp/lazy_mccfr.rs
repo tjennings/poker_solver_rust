@@ -13,13 +13,13 @@
 use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::MAX_PLAYERS;
 use super::config::{ForcedBetKind, MpActionAbstractionConfig, MpGameConfig};
 use super::game_tree::{TerminalKind, TreeAction};
-use super::mccfr::{terminal_value, PruneStats};
+use super::mccfr::{PruneStats, terminal_value};
 use super::sparse_storage::{MpInfosetKey, SparseMpStorage};
 use super::storage::{REGRET_SCALE, STRATEGY_SCALE};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat, Street};
-use super::MAX_PLAYERS;
 
 const SIZE_EPSILON: f64 = 0.01;
 const MAX_ACTIONS: usize = 16;
@@ -246,11 +246,10 @@ impl LazyHistory {
     }
 
     fn key(self, state: LazyPublicState, bucket: u16) -> MpInfosetKey {
-        MpInfosetKey::from_parts(
+        MpInfosetKey::from_street_bucket(
             state.to_act,
             state.street,
             bucket,
-            spr_bucket(state),
             self.hi,
             self.lo,
             self.hash,
@@ -1174,8 +1173,8 @@ fn take_atomic_array<const N: usize>(atoms: &[AtomicU64; N]) -> [u64; N] {
 
 #[cfg(test)]
 mod tests {
-    use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
     use test_macros::timed_test;
 
     use super::*;
@@ -1309,12 +1308,16 @@ mod tests {
 
         assert_eq!(root.to_act(), Seat::from_raw(2));
         assert_eq!(root.street(), Street::Preflop);
-        assert!(actions
-            .iter()
-            .any(|action| matches!(action, TreeAction::Fold)));
-        assert!(actions
-            .iter()
-            .any(|action| matches!(action, TreeAction::Call)));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Fold))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call))
+        );
         assert!(
             actions
                 .iter()
@@ -1361,7 +1364,11 @@ mod tests {
         let actions = game.actions(&state);
         let snapshot = take_lazy_action_limit_snapshot();
 
-        assert!(actions.iter().any(|action| matches!(action, TreeAction::AllIn)));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::AllIn))
+        );
         assert_eq!(snapshot.max_raise_count[Street::Flop as usize], 2);
         assert_eq!(snapshot.all_in_aggressions[Street::Flop as usize], 1);
         assert_eq!(snapshot.over_config_decisions[Street::Flop as usize], 0);

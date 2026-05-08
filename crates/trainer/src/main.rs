@@ -2712,18 +2712,14 @@ struct MpNoTuiHeartbeat {
     last_sparse_insert_attribution: SparseInsertAttribution,
 }
 
-type SparseStorageActivity =
-    poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
+type SparseStorageActivity = poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
 type SparseInsertAttribution =
     poker_solver_core::blueprint_mp::sparse_storage::SparseInsertAttribution;
-type SparseTelemetrySample =
-    poker_solver_core::blueprint_mp::sparse_storage::SparseTelemetrySample;
-type LazyActionLimitSnapshot =
-    poker_solver_core::blueprint_mp::lazy_mccfr::LazyActionLimitSnapshot;
+type SparseTelemetrySample = poker_solver_core::blueprint_mp::sparse_storage::SparseTelemetrySample;
+type LazyActionLimitSnapshot = poker_solver_core::blueprint_mp::lazy_mccfr::LazyActionLimitSnapshot;
 const STREET_LABELS: [&str; 4] = ["pf", "f", "t", "r"];
 const LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES: usize = 8192;
-const HISTORY_LEN_BIN_LABELS: [&str; 8] =
-    ["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"];
+const HISTORY_LEN_BIN_LABELS: [&str; 8] = ["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"];
 const ACTION_COUNT_BIN_LABELS: [&str; 8] =
     ["1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65+"];
 
@@ -2827,8 +2823,10 @@ impl MpNoTuiHeartbeat {
         let activity = storage.activity();
         let activity_delta = sparse_activity_delta(activity, self.last_sparse_activity);
         let insert_attribution = storage.insert_attribution();
-        let insert_attribution_delta =
-            sparse_insert_attribution_delta(insert_attribution, self.last_sparse_insert_attribution);
+        let insert_attribution_delta = sparse_insert_attribution_delta(
+            insert_attribution,
+            self.last_sparse_insert_attribution,
+        );
         let stats_nanos = u64::try_from(stats_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let entries_since_last = stats.entries.saturating_sub(self.last_sparse_entries);
         let bytes_since_last = stats.approx_bytes.saturating_sub(self.last_sparse_bytes);
@@ -2852,8 +2850,7 @@ impl MpNoTuiHeartbeat {
         let insert_rate = per_second(activity_delta.inserts, since_last);
         let read_hit_pct = percent(activity_delta.read_hits, activity_delta.read_probes);
         let write_hit_pct = percent(activity_delta.write_hits, activity_delta.write_probes);
-        let insert_by_text =
-            format_sparse_insert_attribution(insert_attribution_delta, since_last);
+        let insert_by_text = format_sparse_insert_attribution(insert_attribution_delta, since_last);
         let action_limit_text = format_lazy_action_limit(action_limit, since_last);
         let prune_pct = take_mp_prune_pct();
         eprintln!(
@@ -2924,11 +2921,7 @@ fn sparse_insert_attribution_delta(
     SparseInsertAttribution {
         by_street: array_saturating_sub(current.by_street, previous.by_street),
         by_seat: array_saturating_sub(current.by_seat, previous.by_seat),
-        by_spr_bucket: array_saturating_sub(current.by_spr_bucket, previous.by_spr_bucket),
-        history_len_bins: array_saturating_sub(
-            current.history_len_bins,
-            previous.history_len_bins,
-        ),
+        history_len_bins: array_saturating_sub(current.history_len_bins, previous.history_len_bins),
         action_count_bins: array_saturating_sub(
             current.action_count_bins,
             previous.action_count_bins,
@@ -2957,7 +2950,6 @@ fn format_sparse_insert_attribution(
         per_second(attribution.by_street[3], elapsed_secs),
     );
     let (seat_idx, seat_count) = top_index(&attribution.by_seat);
-    let (spr_idx, spr_count) = top_index(&attribution.by_spr_bucket);
     let (history_idx, history_count) = top_index(&attribution.history_len_bins);
     let (action_idx, action_count) = top_index(&attribution.action_count_bins);
     let insert_count: u64 = attribution.by_street.iter().sum();
@@ -2967,12 +2959,10 @@ fn format_sparse_insert_attribution(
         0.0
     };
     format!(
-        "insert_by[st={}, seat_top=p{}:{:.0}/s, spr_top={}:{:.0}/s, hist_top={}:{:.0}/s max_seen={}, act_avg={:.1} max_seen={} top={}:{:.0}/s]",
+        "insert_by[st={}, seat_top=p{}:{:.0}/s, hist_top={}:{:.0}/s max_seen={}, act_avg={:.1} max_seen={} top={}:{:.0}/s]",
         street_text,
         seat_idx,
         per_second(seat_count, elapsed_secs),
-        spr_idx,
-        per_second(spr_count, elapsed_secs),
         HISTORY_LEN_BIN_LABELS[history_idx],
         per_second(history_count, elapsed_secs),
         attribution.history_len_max,
@@ -3311,11 +3301,7 @@ fn bridge_mp_lazy_iterations<T>(
         }
         if last_telemetry.elapsed() >= telemetry_interval {
             let sample = storage.telemetry_sample(LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES);
-            push_sparse_mp_telemetry(
-                sample,
-                &mut previous_strategy_fingerprint,
-                metrics,
-            );
+            push_sparse_mp_telemetry(sample, &mut previous_strategy_fingerprint, metrics);
             metrics.push_prune_fraction(take_mp_prune_pct());
             last_telemetry = Instant::now();
         }
@@ -4189,17 +4175,10 @@ snapshots:
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
 
-        let storage = poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
-        let key = MpInfosetKey::from_parts(
-            Seat::from_raw(0),
-            Street::Preflop,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-        );
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
         storage.add_regret(key, 2, 0, 25);
         storage.add_strategy_sum(key, 2, 1, 50);
         let dir = tempfile::tempdir().unwrap();

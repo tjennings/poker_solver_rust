@@ -20,11 +20,17 @@ use super::{MAX_PLAYERS, Seat, Street};
 
 const DEFAULT_SHARDS: usize = 4096;
 pub const SPARSE_INSERT_STREET_COUNT: usize = 4;
-pub const SPARSE_INSERT_SPR_BUCKET_COUNT: usize = 32;
 pub const SPARSE_INSERT_HISTORY_LEN_BIN_COUNT: usize = 8;
 pub const SPARSE_INSERT_ACTION_COUNT_BIN_COUNT: usize = 8;
+const LOCAL_BUCKET_BITS: u16 = 14;
+const LOCAL_BUCKET_MASK: u16 = (1 << LOCAL_BUCKET_BITS) - 1;
 
 /// Stable key for one lazy MP infoset.
+///
+/// `bucket` is a global abstract-bucket id: the high two bits encode street,
+/// while the low fourteen bits carry the street-local bucket assignment. This
+/// keeps street out of the key identity as a separate dimension while still
+/// making same-numbered flop/turn/river buckets distinct.
 ///
 /// `history_hi`/`history_lo` carry the compact action history when it fits in
 /// 128 bits. `history_hash` keeps keys stable for longer histories, while
@@ -32,9 +38,7 @@ pub const SPARSE_INSERT_ACTION_COUNT_BIN_COUNT: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MpInfosetKey {
     pub seat: u8,
-    pub street: u8,
     pub bucket: u16,
-    pub spr_bucket: u8,
     pub history_hi: u64,
     pub history_lo: u64,
     pub history_hash: u64,
@@ -44,12 +48,30 @@ pub struct MpInfosetKey {
 impl MpInfosetKey {
     /// Create a key from typed MP components.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub const fn from_parts(
+    pub fn from_street_bucket(
         seat: Seat,
         street: Street,
         bucket: u16,
-        spr_bucket: u8,
+        history_hi: u64,
+        history_lo: u64,
+        history_hash: u64,
+        history_len: u16,
+    ) -> Self {
+        Self::from_parts(
+            seat,
+            Self::global_bucket(street, bucket),
+            history_hi,
+            history_lo,
+            history_hash,
+            history_len,
+        )
+    }
+
+    /// Create a key from a global abstract-bucket id.
+    #[must_use]
+    pub const fn from_parts(
+        seat: Seat,
+        bucket: u16,
         history_hi: u64,
         history_lo: u64,
         history_hash: u64,
@@ -57,9 +79,7 @@ impl MpInfosetKey {
     ) -> Self {
         Self {
             seat: seat.index(),
-            street: street as u8,
             bucket,
-            spr_bucket,
             history_hi,
             history_lo,
             history_hash,
@@ -73,10 +93,27 @@ impl MpInfosetKey {
         Seat::from_raw(self.seat)
     }
 
-    /// Return the street component when the serialized byte is valid.
+    /// Encode a street-local bucket into the global bucket namespace.
     #[must_use]
-    pub const fn street(self) -> Option<Street> {
-        Street::from_u8(self.street)
+    pub fn global_bucket(street: Street, local_bucket: u16) -> u16 {
+        assert!(
+            local_bucket <= LOCAL_BUCKET_MASK,
+            "street-local bucket {local_bucket} exceeds 14-bit sparse key capacity"
+        );
+        ((street as u16) << LOCAL_BUCKET_BITS) | local_bucket
+    }
+
+    /// Return the street implied by this key's global bucket id.
+    #[must_use]
+    pub const fn bucket_street(self) -> Option<Street> {
+        let raw = (self.bucket >> LOCAL_BUCKET_BITS) as u8;
+        Street::from_u8(raw)
+    }
+
+    /// Return the street-local bucket assignment.
+    #[must_use]
+    pub const fn local_bucket(self) -> u16 {
+        self.bucket & LOCAL_BUCKET_MASK
     }
 }
 
@@ -107,7 +144,6 @@ pub struct SparseStorageActivity {
 pub struct SparseInsertAttribution {
     pub by_street: [u64; SPARSE_INSERT_STREET_COUNT],
     pub by_seat: [u64; MAX_PLAYERS],
-    pub by_spr_bucket: [u64; SPARSE_INSERT_SPR_BUCKET_COUNT],
     pub history_len_bins: [u64; SPARSE_INSERT_HISTORY_LEN_BIN_COUNT],
     pub action_count_bins: [u64; SPARSE_INSERT_ACTION_COUNT_BIN_COUNT],
     pub history_len_max: u64,
@@ -183,7 +219,6 @@ pub struct SparseMpStorage {
     inserts: AtomicU64,
     insert_by_street: [AtomicU64; SPARSE_INSERT_STREET_COUNT],
     insert_by_seat: [AtomicU64; MAX_PLAYERS],
-    insert_by_spr_bucket: [AtomicU64; SPARSE_INSERT_SPR_BUCKET_COUNT],
     insert_history_len_bins: [AtomicU64; SPARSE_INSERT_HISTORY_LEN_BIN_COUNT],
     insert_action_count_bins: [AtomicU64; SPARSE_INSERT_ACTION_COUNT_BIN_COUNT],
     insert_history_len_max: AtomicU64,
@@ -229,7 +264,6 @@ impl SparseMpStorage {
             inserts: AtomicU64::new(0),
             insert_by_street: std::array::from_fn(|_| AtomicU64::new(0)),
             insert_by_seat: std::array::from_fn(|_| AtomicU64::new(0)),
-            insert_by_spr_bucket: std::array::from_fn(|_| AtomicU64::new(0)),
             insert_history_len_bins: std::array::from_fn(|_| AtomicU64::new(0)),
             insert_action_count_bins: std::array::from_fn(|_| AtomicU64::new(0)),
             insert_history_len_max: AtomicU64::new(0),
@@ -321,7 +355,6 @@ impl SparseMpStorage {
         SparseInsertAttribution {
             by_street: load_atomic_array(&self.insert_by_street),
             by_seat: load_atomic_array(&self.insert_by_seat),
-            by_spr_bucket: load_atomic_array(&self.insert_by_spr_bucket),
             history_len_bins: load_atomic_array(&self.insert_history_len_bins),
             action_count_bins: load_atomic_array(&self.insert_action_count_bins),
             history_len_max: self.insert_history_len_max.load(Ordering::Relaxed),
@@ -623,14 +656,14 @@ impl SparseMpStorage {
     }
 
     fn record_insert(&self, key: MpInfosetKey, num_actions: usize) {
-        if let Some(counter) = self.insert_by_street.get(usize::from(key.street)) {
-            counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(street) = key.bucket_street() {
+            if let Some(counter) = self.insert_by_street.get(street.index()) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if let Some(counter) = self.insert_by_seat.get(usize::from(key.seat)) {
             counter.fetch_add(1, Ordering::Relaxed);
         }
-        let spr_idx = usize::from(key.spr_bucket).min(SPARSE_INSERT_SPR_BUCKET_COUNT - 1);
-        self.insert_by_spr_bucket[spr_idx].fetch_add(1, Ordering::Relaxed);
 
         let history_len = u64::from(key.history_len);
         self.insert_history_len_bins[history_len_bin(key.history_len)]
@@ -692,8 +725,7 @@ fn sparse_key_fingerprint_weight(key: MpInfosetKey) -> f64 {
         .wrapping_add(key.history_lo.rotate_left(17))
         .wrapping_add(key.history_hi.rotate_left(31))
         .wrapping_add(u64::from(key.bucket) << 8)
-        .wrapping_add(u64::from(key.seat) << 3)
-        .wrapping_add(u64::from(key.street));
+        .wrapping_add(u64::from(key.seat) << 3);
     (mixed % 1_000_003) as f64 / 1_000_003.0
 }
 
@@ -746,11 +778,10 @@ mod tests {
     use test_macros::timed_test;
 
     fn key(bucket: u16) -> MpInfosetKey {
-        MpInfosetKey::from_parts(
+        MpInfosetKey::from_street_bucket(
             Seat::from_raw(2),
             Street::Flop,
             bucket,
-            3,
             0xAA,
             0xBB,
             0xCC,
@@ -958,26 +989,10 @@ mod tests {
     #[timed_test]
     fn insert_attribution_counts_new_entries_by_key_shape() {
         let storage = SparseMpStorage::with_shards(4);
-        let preflop = MpInfosetKey::from_parts(
-            Seat::from_raw(0),
-            Street::Preflop,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-        );
-        let river = MpInfosetKey::from_parts(
-            Seat::from_raw(5),
-            Street::River,
-            2,
-            31,
-            0,
-            0,
-            0,
-            70,
-        );
+        let preflop =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        let river =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(5), Street::River, 2, 0, 0, 0, 70);
 
         storage.add_regret(preflop, 1, 0, 1);
         storage.add_strategy_sum(preflop, 1, 0, 1);
@@ -988,8 +1003,6 @@ mod tests {
         assert_eq!(attribution.by_street[Street::River as usize], 1);
         assert_eq!(attribution.by_seat[0], 1);
         assert_eq!(attribution.by_seat[5], 1);
-        assert_eq!(attribution.by_spr_bucket[0], 1);
-        assert_eq!(attribution.by_spr_bucket[31], 1);
         assert_eq!(attribution.history_len_bins[0], 1);
         assert_eq!(attribution.history_len_bins[7], 1);
         assert_eq!(attribution.history_len_max, 70);
@@ -997,6 +1010,20 @@ mod tests {
         assert_eq!(attribution.action_count_bins[4], 1);
         assert_eq!(attribution.action_count_sum, 10);
         assert_eq!(attribution.action_count_max, 9);
+    }
+
+    #[timed_test]
+    fn global_bucket_makes_same_local_bucket_distinct_by_street() {
+        let flop =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(1), Street::Flop, 42, 0, 0, 0, 0);
+        let turn =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(1), Street::Turn, 42, 0, 0, 0, 0);
+
+        assert_ne!(flop, turn);
+        assert_eq!(flop.bucket_street(), Some(Street::Flop));
+        assert_eq!(turn.bucket_street(), Some(Street::Turn));
+        assert_eq!(flop.local_bucket(), 42);
+        assert_eq!(turn.local_bucket(), 42);
     }
 
     #[timed_test]
