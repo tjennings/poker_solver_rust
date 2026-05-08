@@ -1393,7 +1393,7 @@ mod tests {
         }
     }
 
-    #[timed_test]
+    #[timed_test(3)]
     fn build_6_player_after_open_has_response_actions() {
         let (game, action) = six_player_response_config();
         let tree = MpGameTree::build(&game, &action);

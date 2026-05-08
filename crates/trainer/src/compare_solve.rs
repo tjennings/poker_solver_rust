@@ -554,6 +554,7 @@ fn load_bundle_with_snapshot(
 fn setup_neural_boundaries(
     game: &mut PostFlopGame,
     model_path: &Path,
+    inference_mode: cfvnet::eval::boundary_evaluator::BoundaryInferenceMode,
     opt_out: Option<Arc<dyn poker_solver_tauri::gadget::OptOutProvider>>,
 ) {
     let boundary_boards = game.boundary_boards();
@@ -580,11 +581,13 @@ fn setup_neural_boundaries(
             game.private_cards(0).to_vec(),
             game.private_cards(1).to_vec(),
         ];
-        let neural_eval = cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
-            Arc::clone(&session),
-            board_4.clone(),
-            private_cards_pair.clone(),
-        );
+        let neural_eval =
+            cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared_with_mode(
+                Arc::clone(&session),
+                board_4.clone(),
+                private_cards_pair.clone(),
+                inference_mode,
+            );
         let inner: Arc<dyn range_solver::game::BoundaryEvaluator> = Arc::new(neural_eval);
         let wrapped: Arc<dyn range_solver::game::BoundaryEvaluator> = match &opt_out {
             Some(provider) => Arc::new(poker_solver_tauri::gadget::GadgetEvaluator::new(
@@ -601,7 +604,9 @@ fn setup_neural_boundaries(
     game.per_boundary_evaluators = per_boundary;
     game.boundary_evaluator = None;
 
-    eprintln!("[compare] neural-cfvnet mode: {n_boundaries} boundaries (ONNX){gadget_label}",);
+    eprintln!(
+        "[compare] neural-cfvnet mode: {n_boundaries} boundaries (ONNX, {inference_mode:?}){gadget_label}",
+    );
 }
 
 /// Wire per-boundary `SubtreeExactEvaluator`s into the game's
@@ -2124,15 +2129,22 @@ fn build_inner_evaluator(
             .with_solve_iters(solve_iters)
             .with_target_exploitability(target_exp),
         ),
-        Some((_, BoundaryKind::Cfvnet(model_path))) => {
+        Some((
+            _,
+            BoundaryKind::Cfvnet {
+                model_path,
+                inference_mode,
+            },
+        )) => {
             let session =
                 cfvnet::eval::boundary_evaluator::load_shared_onnx_session(Path::new(model_path))
                     .map_err(|e| format!("ONNX session load failed: {e}"))?;
             Arc::new(
-                cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared(
+                cfvnet::eval::boundary_evaluator::neural_boundary_evaluator_from_shared_with_mode(
                     session,
                     board_u8.to_vec(),
                     private_cards,
+                    *inference_mode,
                 ),
             )
         }
@@ -2183,8 +2195,11 @@ fn setup_clamp_boundaries(
     if let Some((_, kind)) = boundary_cut {
         if n_boundaries > 0 {
             match kind {
-                BoundaryKind::Cfvnet(model_path) => {
-                    setup_neural_boundaries(game, Path::new(model_path), opt_out);
+                BoundaryKind::Cfvnet {
+                    model_path,
+                    inference_mode,
+                } => {
+                    setup_neural_boundaries(game, Path::new(model_path), *inference_mode, opt_out);
                 }
                 BoundaryKind::ExactSubtree => {
                     setup_exact_subtree_boundaries(game, opt_out, solve_iters, target_exp);
@@ -2395,7 +2410,15 @@ pub fn run(
     println!(
         "iters: {iter_label}  boundary: {}{}",
         match &boundary_cut {
-            Some((d, BoundaryKind::Cfvnet(p))) => format!("depth={d}, model={p}"),
+            Some((
+                d,
+                BoundaryKind::Cfvnet {
+                    model_path,
+                    inference_mode,
+                },
+            )) => {
+                format!("depth={d}, model={model_path}, inference={inference_mode:?}")
+            }
             Some((d, BoundaryKind::ExactSubtree)) if oracle_boundary_active => {
                 format!("depth={d}, exact_oracle")
             }

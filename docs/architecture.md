@@ -269,7 +269,7 @@ Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game
 
 **CfvNet** provides standalone river value predictions for evaluation and comparison.
 
-**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. When solving turn subgames, the solver queries BoundaryNet at river boundary nodes instead of full-depth DCFR, enabling fast turn solving. The Tauri explorer supports loading a trained BoundaryNet model via `boundary_model_path` config.
+**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. The evaluator supports two runtime contracts. `river_enumerated_turn` preserves the legacy river-net adapter by evaluating every valid river runout from a 4-card turn board and averaging the river outputs. `direct` sends the supplied boundary board directly to ONNX, which is the contract for turn-boundary models trained on 4-card boards. The ONNX evaluator batches OOP/IP rows together for each boundary cache fill, so direct mode performs one session run per boundary rather than one run per player.
 
 Depth-boundary evaluators have two value conventions. Legacy evaluators return normalized boundary CFVs, and the range-solver converts them through the standard half-pot and opponent-reach formula before regret updates. Raw CFV evaluators return already reach-integrated per-combination chip CFVs. For raw evaluators, each boundary visit caches only the current traverser's value slot; the opposite player is computed on that player's own traversal after their current opponent reach has been recorded.
 

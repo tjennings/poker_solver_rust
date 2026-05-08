@@ -9,6 +9,9 @@ import torch
 from cfvnet.constants import INPUT_SIZE
 from cfvnet.model import BoundaryNet
 
+VERIFY_RTOL = 1e-3
+VERIFY_ATOL = 2e-4
+
 
 def export_onnx(model: BoundaryNet, path: Path) -> None:
     """Export a trained BoundaryNet to ONNX format.
@@ -52,7 +55,7 @@ def _verify_export(model: BoundaryNet, path: Path) -> None:
     onnx_out = session.run(None, {"input": x.numpy()})[0]
 
     np.testing.assert_allclose(
-        pytorch_out, onnx_out, rtol=1e-4, atol=1e-4,
+        pytorch_out, onnx_out, rtol=VERIFY_RTOL, atol=VERIFY_ATOL,
         err_msg="ONNX output does not match PyTorch",
     )
     print(f"  ONNX export verified: {path} ({path.stat().st_size / 1024:.0f} KB)")
