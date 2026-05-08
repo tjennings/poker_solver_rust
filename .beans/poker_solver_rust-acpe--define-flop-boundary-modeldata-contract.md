@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-acpe
 title: Define flop-boundary model/data contract
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-08T19:23:38Z
-updated_at: 2026-05-08T19:23:38Z
+updated_at: 2026-05-08T19:41:51Z
 parent: poker_solver_rust-2ek4
 ---
 
