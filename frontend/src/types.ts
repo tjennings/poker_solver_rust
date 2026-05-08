@@ -145,6 +145,7 @@ export interface SimulationResult {
 }
 
 export type BoundaryInferenceMode = 'river_enumerated_turn' | 'direct';
+export type BoundaryModeConfig = 'exact' | 'cfvnet' | 'direct_cfvnet' | 'exact_subtree';
 
 export type StreetBoundaryMode =
   | { mode: 'exact' }
@@ -167,14 +168,12 @@ export interface GlobalConfig {
   range_clamp_threshold: number;
   // Per-street boundary config + remembered model paths per street
   // (paths persist across "exact" toggles so users don't lose them).
-  flop_boundary_mode: 'exact' | 'cfvnet' | 'exact_subtree';
-  turn_boundary_mode: 'exact' | 'cfvnet' | 'exact_subtree';
-  river_boundary_mode: 'exact' | 'cfvnet' | 'exact_subtree';
+  flop_boundary_mode: BoundaryModeConfig;
+  turn_boundary_mode: BoundaryModeConfig;
+  river_boundary_mode: BoundaryModeConfig;
   flop_model_path: string;
   turn_model_path: string;
   river_model_path: string;
-  turn_model_kind: BoundaryInferenceMode;
-  river_model_kind: BoundaryInferenceMode;
   // Boundary tracing (debug)
   trace_boundaries: string;
   trace_iters: string;

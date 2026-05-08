@@ -139,12 +139,13 @@ The Settings view controls depth-boundary evaluators for Subgame and Exact solve
 Available boundary modes:
 
 - `Exact`: no neural or subtree cut at that street.
-- `CFVNet`: evaluate the boundary with an ONNX model. Turn and river boundaries are supported; flop CFVNet is intentionally disabled.
+- `CFVNet`: evaluate the boundary with the legacy river-model adapter. On a 4-card turn boundary this averages river-model outputs over valid river runouts.
+- `Direct CFVNet`: evaluate the boundary board directly with an ONNX model. This is the mode for direct turn-boundary checkpoints trained on 4-card turn boards.
 - `Exact Subtree`: solve the downstream subtree exactly with DCFR.
 
-For turn-boundary CFVNet checkpoints trained directly on 4-card turn boards, set the turn boundary to `CFVNet`, choose the ONNX file, and set model kind to `Direct`. The current local direct checkpoint path is `local_data/models/turn_boundary_cfvnet_v2/best.onnx`; the companion `.onnx.data` file must stay beside it but is local data and should not be committed.
+Turn and river CFVNet boundaries are supported; flop CFVNet is intentionally disabled. For turn-boundary CFVNet checkpoints trained directly on 4-card turn boards, set the turn boundary to `Direct CFVNet` and choose the ONNX file. The current local direct checkpoint path is `local_data/models/turn_boundary_cfvnet_v2/best.onnx`; the companion `.onnx.data` file must stay beside it but is local data and should not be committed.
 
-Legacy turn-boundary evaluation through a river model remains available with model kind `River enum`, which averages river-model outputs over valid river runouts. River CFVNet keeps `River enum` as the default model kind for backward compatibility.
+The legacy `CFVNet` option remains available temporarily for compatibility and can be removed after the direct path is confirmed in the Explorer.
 
 ## Boundary Tracing
 

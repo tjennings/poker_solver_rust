@@ -16,8 +16,6 @@ describe('hasAnyCut', () => {
     flop_model_path: '',
     turn_model_path: '',
     river_model_path: '',
-    turn_model_kind: 'direct',
-    river_model_kind: 'river_enumerated_turn',
     trace_boundaries: '',
     trace_iters: 'last',
     enable_safe_resolving: false,
@@ -33,6 +31,10 @@ describe('hasAnyCut', () => {
 
   it('returns true when turn is cfvnet', () => {
     expect(hasAnyCut({ ...allExact, turn_boundary_mode: 'cfvnet' })).toBe(true);
+  });
+
+  it('returns true when turn is direct_cfvnet', () => {
+    expect(hasAnyCut({ ...allExact, turn_boundary_mode: 'direct_cfvnet' })).toBe(true);
   });
 
   it('returns true when river is cfvnet', () => {

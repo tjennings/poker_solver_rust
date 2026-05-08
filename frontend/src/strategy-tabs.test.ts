@@ -39,8 +39,6 @@ describe('buildSolveParams', () => {
     flop_model_path: '',
     turn_model_path: '',
     river_model_path: '',
-    turn_model_kind: 'direct' as const,
-    river_model_kind: 'river_enumerated_turn' as const,
   };
 
   it('returns mode in params', () => {
@@ -113,7 +111,7 @@ describe('buildSolveParams', () => {
   it('builds direct cfvnet streetBoundaryConfig for turn with model path', () => {
     const config = {
       ...defaultConfig,
-      turn_boundary_mode: 'cfvnet' as const,
+      turn_boundary_mode: 'direct_cfvnet' as const,
       turn_model_path: '/models/turn_v1.onnx',
     };
     const params = buildSolveParams('subgame', config);
@@ -133,7 +131,6 @@ describe('buildSolveParams', () => {
       ...defaultConfig,
       turn_boundary_mode: 'cfvnet' as const,
       turn_model_path: '/models/river_adapter.onnx',
-      turn_model_kind: 'river_enumerated_turn' as const,
     };
     const params = buildSolveParams('subgame', config);
     expect(params.streetBoundaryConfig.turn).toEqual({
