@@ -130,6 +130,16 @@ pub fn denormalize_ev(normalized: &[f32], pot: f32, effective_stack: f32) -> Vec
     normalized.iter().map(|&v| v * total).collect()
 }
 
+/// Convert the legacy direct BoundaryNet output contract
+/// (`chip_ev / (pot + effective_stack)`) to solver-native bcfv units.
+fn legacy_normalized_ev_to_bcfv(normalized: &[f32], pot: f32, effective_stack: f32) -> Vec<f32> {
+    if pot <= 0.0 {
+        return vec![0.0; normalized.len()];
+    }
+    let scale = (pot + effective_stack) / pot;
+    normalized.iter().map(|&v| 2.0 * v * scale - 1.0).collect()
+}
+
 /// Runtime inference contract for a cfvnet boundary model.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,6 +153,11 @@ pub enum BoundaryInferenceMode {
     /// used by direct turn-boundary models trained on 4-card boards. The ONNX
     /// output must already be in solver-native bcfv units.
     Direct,
+    /// Temporary compatibility contract for the current direct turn-boundary
+    /// checkpoint, which outputs `chip_ev / (pot + effective_stack)`.
+    /// The evaluator converts it to solver-native bcfv before handing values
+    /// to range-solver.
+    DirectNormalizedLegacy,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +291,17 @@ impl NeuralBoundaryEvaluator {
                 eff_stack_f32,
                 player as u8,
             ),
+            (BoundaryInferenceMode::DirectNormalizedLegacy, 4 | 5) => {
+                let normalized = self.burn_forward(
+                    &oop_range_1326,
+                    &ip_range_1326,
+                    &self.board,
+                    pot_f32,
+                    eff_stack_f32,
+                    player as u8,
+                );
+                legacy_normalized_ev_to_bcfv(&normalized, pot_f32, eff_stack_f32)
+            }
             (BoundaryInferenceMode::RiverEnumeratedTurn, 4) => self.burn_river_enumerated(
                 &oop_range_1326,
                 &ip_range_1326,
@@ -492,6 +518,19 @@ impl NeuralBoundaryEvaluator {
                 pot_f32,
                 eff_stack_f32,
             ),
+            (BoundaryInferenceMode::DirectNormalizedLegacy, 4 | 5) => {
+                let (oop_normalized, ip_normalized) = self.onnx_forward_both_players(
+                    &oop_range_1326,
+                    &ip_range_1326,
+                    &self.board,
+                    pot_f32,
+                    eff_stack_f32,
+                );
+                (
+                    legacy_normalized_ev_to_bcfv(&oop_normalized, pot_f32, eff_stack_f32),
+                    legacy_normalized_ev_to_bcfv(&ip_normalized, pot_f32, eff_stack_f32),
+                )
+            }
             (BoundaryInferenceMode::RiverEnumeratedTurn, 4) => self
                 .onnx_river_enumerated_both_players(
                     &oop_range_1326,
@@ -826,6 +865,13 @@ mod tests {
         assert!((chip_ev[0] - 30.0).abs() < 1e-4);
         assert!((chip_ev[1] - (-10.0)).abs() < 1e-4);
         assert!((chip_ev[2] - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn legacy_normalized_ev_to_bcfv_converts_current_checkpoint_units() {
+        let out = legacy_normalized_ev_to_bcfv(&[73.0 / 273.0, 146.0 / 273.0], 146.0, 127.0);
+        assert!((out[0] - 0.0).abs() < 1e-6, "break-even output: {}", out[0]);
+        assert!((out[1] - 1.0).abs() < 1e-6, "full-pot output: {}", out[1]);
     }
 
     #[test]

@@ -144,7 +144,10 @@ export interface SimulationResult {
   elapsed_ms: number;
 }
 
-export type BoundaryInferenceMode = 'river_enumerated_turn' | 'direct';
+export type BoundaryInferenceMode =
+  | 'river_enumerated_turn'
+  | 'direct'
+  | 'direct_normalized_legacy';
 export type BoundaryModeConfig = 'exact' | 'cfvnet' | 'direct_cfvnet' | 'exact_subtree';
 
 export type StreetBoundaryMode =

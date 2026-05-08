@@ -120,7 +120,7 @@ describe('buildSolveParams', () => {
       turn: {
         mode: 'cfvnet',
         model_path: '/models/turn_v1.onnx',
-        inference_mode: 'direct',
+        inference_mode: 'direct_normalized_legacy',
       },
       river: { mode: 'exact' },
     });

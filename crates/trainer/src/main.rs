@@ -391,7 +391,7 @@ enum Commands {
         #[arg(long)]
         flop_model: Option<String>,
 
-        /// Flop cfvnet inference mode: "river_enumerated_turn" or "direct"
+        /// Flop cfvnet inference mode: "river_enumerated_turn", "direct", or "direct_normalized_legacy"
         #[arg(long, default_value = "river_enumerated_turn")]
         flop_model_kind: String,
 
@@ -403,7 +403,7 @@ enum Commands {
         #[arg(long)]
         turn_model: Option<String>,
 
-        /// Turn cfvnet inference mode: "river_enumerated_turn" or "direct"
+        /// Turn cfvnet inference mode: "river_enumerated_turn", "direct", or "direct_normalized_legacy"
         #[arg(long, default_value = "river_enumerated_turn")]
         turn_model_kind: String,
 
@@ -415,7 +415,7 @@ enum Commands {
         #[arg(long)]
         river_model: Option<String>,
 
-        /// River cfvnet inference mode: "river_enumerated_turn" or "direct"
+        /// River cfvnet inference mode: "river_enumerated_turn", "direct", or "direct_normalized_legacy"
         #[arg(long, default_value = "river_enumerated_turn")]
         river_model_kind: String,
 
@@ -1519,10 +1519,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 "direct" => {
                                     cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct
                                 }
+                                "direct_normalized_legacy" | "direct-normalized-legacy" => {
+                                    cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy
+                                }
                                 other => {
                                     return Err(format!(
                                         "invalid --{street}-model-kind value '{other}': expected \
-                                         'river_enumerated_turn' or 'direct'"
+                                         'river_enumerated_turn', 'direct', or \
+                                         'direct_normalized_legacy'"
                                     )
                                     .into());
                                 }

@@ -37,7 +37,7 @@ function modeFromConfig(
     return {
       mode: 'cfvnet',
       model_path: modelPath,
-      inference_mode: mode === 'direct_cfvnet' ? 'direct' : 'river_enumerated_turn',
+      inference_mode: mode === 'direct_cfvnet' ? 'direct_normalized_legacy' : 'river_enumerated_turn',
     };
   }
   if (mode === 'exact_subtree') {

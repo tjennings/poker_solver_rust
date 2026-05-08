@@ -433,7 +433,7 @@ Options:
 - `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
 - `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
-- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `river_enumerated_turn` (default) preserves the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. `direct` evaluates the supplied boundary board as-is and expects the ONNX output to already be solver-native bcfv values.
+- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `river_enumerated_turn` (default) preserves the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. `direct` evaluates the supplied boundary board as-is and expects the ONNX output to already be solver-native bcfv values. `direct_normalized_legacy` evaluates the supplied boundary board as-is but converts the current legacy direct checkpoint output from `chip_ev / (pot + effective_stack)` into bcfv before range-solver consumes it.
 - `--oracle-orientation <MODE>` -- Hidden `exact_oracle` diagnostic. Accepted values are `current`, `swap`, `sign-flip`, and `swap-sign-flip`; use only to audit OOP/IP and sign orientation at the raw boundary-CFV handoff.
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
@@ -824,7 +824,9 @@ cargo run -p cfvnet --release -- compare-exact \
 
 ### BoundaryNet (Direct Boundary-CFV Model)
 
-BoundaryNet is a sibling model to CfvNet that outputs **solver-native boundary CFVs** directly. These are bcfv units: `0.0` is the break-even half-pot baseline, `+1.0` is one half-pot above break-even, and `-1.0` is one half-pot below. It uses BoundaryNet input encoding with pot/stack as fractions of total stake, but the output target is the exact value convention consumed by the range-solver boundary evaluator.
+BoundaryNet is a sibling model to CfvNet that outputs **solver-native boundary CFVs** directly for new direct models. These are bcfv units: `0.0` is the break-even half-pot baseline, `+1.0` is one half-pot above break-even, and `-1.0` is one half-pot below. It uses BoundaryNet input encoding with pot/stack as fractions of total stake, but the output target is the exact value convention consumed by the range-solver boundary evaluator.
+
+The current local direct checkpoint was trained on the older normalized target `chip_ev / (pot + effective_stack)`. Use `direct_normalized_legacy` for that checkpoint; it applies `bcfv = 2 * output * (pot + effective_stack) / pot - 1` at inference.
 
 BoundaryNet is designed as a depth-boundary evaluator for the range-solver, enabling turn solving with neural network leaf values at river boundaries.
 

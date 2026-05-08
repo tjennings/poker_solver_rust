@@ -153,6 +153,9 @@ fn inference_mode_label(
             "river_enumerated_turn"
         }
         cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => "direct",
+        cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy => {
+            "direct_normalized_legacy"
+        }
     }
 }
 
@@ -171,6 +174,9 @@ fn boundary_evaluator_log_line(
             let evaluator = match inference_mode {
                 cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => {
                     "Direct CFVNet"
+                }
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy => {
+                    "Direct CFVNet (legacy normalized)"
                 }
                 cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn => {
                     "CFVNet"
@@ -6664,12 +6670,29 @@ mod tests {
         }
     }
 
+    fn direct_normalized_legacy_cfvnet_kind(model_path: &str) -> BoundaryKind {
+        BoundaryKind::Cfvnet {
+            model_path: model_path.to_string(),
+            inference_mode:
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy,
+        }
+    }
+
     #[test]
     fn boundary_evaluator_log_line_includes_direct_model() {
         let cut = Some((0, direct_cfvnet_kind("/models/turn.onnx")));
         assert_eq!(
             boundary_evaluator_log_line("subgame", &cut),
             "[solve] solver: subgame; boundary evaluator: Direct CFVNet; depth_limit=0; inference_mode=direct; model=/models/turn.onnx"
+        );
+    }
+
+    #[test]
+    fn boundary_evaluator_log_line_includes_direct_legacy_model() {
+        let cut = Some((0, direct_normalized_legacy_cfvnet_kind("/models/turn.onnx")));
+        assert_eq!(
+            boundary_evaluator_log_line("subgame", &cut),
+            "[solve] solver: subgame; boundary evaluator: Direct CFVNet (legacy normalized); depth_limit=0; inference_mode=direct_normalized_legacy; model=/models/turn.onnx"
         );
     }
 
@@ -6867,6 +6890,28 @@ mod tests {
         assert_eq!(
             result,
             Some((1, direct_cfvnet_kind("/path/to/turn_boundary.onnx")))
+        );
+    }
+
+    #[test]
+    fn sbc_serde_accepts_direct_normalized_legacy_cfvnet_inference_mode() {
+        let json = r#"{
+            "flop": {"mode": "exact"},
+            "turn": {"mode": "exact"},
+            "river": {
+                "mode": "cfvnet",
+                "model_path": "/path/to/turn_boundary.onnx",
+                "inference_mode": "direct_normalized_legacy"
+            }
+        }"#;
+        let config: StreetBoundaryConfig = serde_json::from_str(json).unwrap();
+        let result = resolve_street_boundary(&config, Street::Flop);
+        assert_eq!(
+            result,
+            Some((
+                1,
+                direct_normalized_legacy_cfvnet_kind("/path/to/turn_boundary.onnx")
+            ))
         );
     }
 
