@@ -1,0 +1,48 @@
+# Flop-boundary oracle dataset generation.
+#
+# Uses the direct turn-boundary ONNX model at 4-card turn boundary leaves:
+#   cargo run -p cfvnet --release --features onnx -- generate \
+#     -c sample_configurations/flop_boundary_oracle_datagen.yaml \
+#     -o local_data/cfvnet/flop_boundary/turn_net_v1/data.bin \
+#     --per-file 10000
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["25%", "75%", "a"]
+  board_size: 3
+  add_allin_threshold: 1.5
+  force_allin_threshold: 0.15
+  # Historical field name; for flop_boundary this must point to a direct
+  # turn-boundary BoundaryNet ONNX export.
+  river_model_path: "local_data/models/turn_boundary_cfvnet_v2/best.onnx"
+
+datagen:
+  street: "flop_boundary"
+  turn_boundary_target_source: "turn_net"
+  num_samples: 100000
+  pot_intervals: [[4, 50], [50, 100], [100, 150], [150, 200]]
+  spr_intervals: [[0.0, 0.5], [0.5, 1.5], [1.5, 4.0], [4.0, 8.0], [8.0, 20.0]]
+  solver_iterations: 500
+  target_exploitability: 0.01
+  leaf_eval_interval: 100
+  bet_size_fuzz: 0.0
+  threads: 1
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 16384
+  epochs: 2000
+  learning_rate: 0.004
+  lr_min: 0.00004
+  huber_delta: 1.0
+  aux_loss_weight: 0.00001
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 25
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  encoder_threads: 14
+  gpu_prefetch: 3
+  grad_clip_norm: 1.0

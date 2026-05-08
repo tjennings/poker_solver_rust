@@ -681,7 +681,7 @@ See `sample_configurations/blueprint_v2_1kbkt_sapcfr.yaml` for the full config.
 
 ## CFVnet Training Pipeline
 
-The `cfvnet` crate trains Deep Counterfactual Value Networks following the Supremus/DeepStack approach: solve random subgames, extract per-combo counterfactual values, and train a neural network to predict them. Networks are trained bottom-up: river first, then turn (using the river network as leaf evaluator).
+The `cfvnet` crate trains Deep Counterfactual Value Networks following the Supremus/DeepStack approach: solve random subgames, extract per-combo counterfactual values, and train a neural network to predict them. Networks are trained bottom-up: river first, then turn-boundary, then flop-boundary.
 
 ### River Network
 
@@ -881,6 +881,25 @@ cargo run -p cfvnet --release -- compare-boundary \
 
 To enable neural boundary evaluation for turn solving in the explorer, configure the model path in the Tauri app's postflop settings. When set, turn subgame solving uses BoundaryNet at river boundaries instead of full-depth or rollout evaluation.
 
+### Direct Boundary Datasets
+
+Direct boundary datasets use manifest-backed binary shards with the same `TrainingRecord` layout. The street determines the board length:
+
+- `turn_boundary`: 4-card boards, targets produced from a river model or exact river solves.
+- `flop_boundary`: 3-card boards, targets produced by solving flop games to 4-card turn boundary leaves and evaluating those leaves with the direct turn-boundary model.
+
+Generate a flop-boundary pilot dataset:
+
+```bash
+cargo run -p cfvnet --release --features onnx -- generate \
+  -c sample_configurations/flop_boundary_oracle_datagen.yaml \
+  -o local_data/cfvnet/flop_boundary/turn_net_v1/data.bin \
+  --num-samples 1000 \
+  --per-file 1000
+```
+
+For `datagen.street: "flop_boundary"`, `game.board_size` must be `3` and `datagen.turn_boundary_target_source` must be `"turn_net"`. The existing `game.river_model_path` field currently carries the direct turn-boundary ONNX path for this mode.
+
 ### Inspect Training Data Distribution
 
 Print frequency histograms (stack size and pot size, 20 equal-width buckets) for generated training data:
@@ -908,12 +927,12 @@ See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
 
 | Parameter | Default | Description |
 |-|-|-|
-| `datagen.street` | `"river"` | Street to generate data for (`"river"` or `"turn"`) |
+| `datagen.street` | `"river"` | Street to generate data for (`"river"`, `"turn"`, `"turn_boundary"`, or `"flop_boundary"`) |
 | `datagen.backend` | `"cpu"` | Solver backend: `"cpu"` or `"gpu"` (GPU requires `--features gpu-datagen`) |
 | `datagen.gpu_batch_size` | 142 | Subgames per GPU kernel launch (only with `backend: "gpu"`) |
 | `datagen.num_samples` | 1,000,000 | Training situations to generate |
 | `datagen.solver_iterations` | 1000 | DCFR iterations per situation |
-| `game.river_model_path` | none | Path to trained river model (required for turn) |
+| `game.river_model_path` | none | Path to trained river model for turn generation, or direct turn-boundary ONNX for `flop_boundary` |
 | `training.hidden_layers` | 7 | MLP depth |
 | `training.hidden_size` | 500 | Hidden layer width |
 | `training.batch_size` | 2048 | Training batch size |

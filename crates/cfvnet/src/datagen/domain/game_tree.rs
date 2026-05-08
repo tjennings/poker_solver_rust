@@ -168,6 +168,65 @@ fn build_turn_game_inner(
     Some(game)
 }
 
+fn build_flop_game_inner(
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    bet_sizes: &[Vec<BetSize>],
+    exact: bool,
+) -> Option<PostFlopGame> {
+    if board_u8.len() != 3 {
+        return None;
+    }
+
+    let oop_range = RsRange::from_raw_data(&ranges[0]).expect("valid OOP range");
+    let ip_range = RsRange::from_raw_data(&ranges[1]).expect("valid IP range");
+
+    let bet = bet_sizes.first().map(|v| v.to_vec()).unwrap_or_default();
+    let raise = bet_sizes.get(1).map_or_else(Vec::new, Vec::clone);
+    let bet_size_opts = BetSizeOptions {
+        bet,
+        raise,
+        per_num_bets: bet_sizes.to_vec(),
+    };
+
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop: [board_u8[0], board_u8[1], board_u8[2]],
+        turn: NOT_DEALT,
+        river: NOT_DEALT,
+    };
+
+    let (river_bet_sizes, depth_limit) = if exact {
+        ([bet_size_opts.clone(), bet_size_opts.clone()], None)
+    } else {
+        (
+            [BetSizeOptions::default(), BetSizeOptions::default()],
+            Some(1),
+        )
+    };
+
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Flop,
+        starting_pot: pot as i32,
+        effective_stack: effective_stack as i32,
+        flop_bet_sizes: [bet_size_opts.clone(), bet_size_opts.clone()],
+        turn_bet_sizes: [bet_size_opts.clone(), bet_size_opts],
+        river_bet_sizes,
+        depth_limit,
+        add_allin_threshold: 0.0,
+        force_allin_threshold: 0.0,
+        merging_threshold: 0.0,
+        ..Default::default()
+    };
+
+    let action_tree = ActionTree::new(tree_config).expect("valid action tree");
+    let mut game = PostFlopGame::with_config(card_config, action_tree).expect("valid game");
+    game.allocate_memory(true);
+    Some(game)
+}
+
 /// Build a depth-limited turn game tree (model mode, with boundary nodes at river).
 pub fn build_turn_game(
     board_u8: &[u8],
@@ -188,6 +247,28 @@ pub fn build_turn_game_exact(
     bet_sizes: &[Vec<BetSize>],
 ) -> Option<PostFlopGame> {
     build_turn_game_inner(board_u8, pot, effective_stack, ranges, bet_sizes, true)
+}
+
+/// Build a depth-limited flop game tree with 4-card turn boundary nodes.
+pub fn build_flop_game(
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    bet_sizes: &[Vec<BetSize>],
+) -> Option<PostFlopGame> {
+    build_flop_game_inner(board_u8, pot, effective_stack, ranges, bet_sizes, false)
+}
+
+/// Build a full flop+turn+river game tree.
+pub fn build_flop_game_exact(
+    board_u8: &[u8],
+    pot: f64,
+    effective_stack: f64,
+    ranges: &[[f32; NUM_COMBOS]; 2],
+    bet_sizes: &[Vec<BetSize>],
+) -> Option<PostFlopGame> {
+    build_flop_game_inner(board_u8, pot, effective_stack, ranges, bet_sizes, true)
 }
 
 /// Build a canonical (maximum-SPR) turn tree for batched datagen.
@@ -351,6 +432,25 @@ mod tests {
             panic!("size should remain pot-relative");
         };
         assert!(size >= 0.01, "should clamp to minimum 0.01");
+    }
+
+    #[test]
+    fn flop_depth_limited_tree_has_four_card_turn_boundaries() {
+        let board = [0, 4, 8];
+        let ranges = [[1.0_f32; NUM_COMBOS]; 2];
+        let sizes = vec![vec![pot(0.5)], vec![BetSize::AllIn]];
+
+        let game = build_flop_game(&board, 100.0, 1_000.0, &ranges, &sizes)
+            .expect("flop depth-limited tree should build");
+        let boards = game.boundary_boards();
+
+        assert!(!boards.is_empty(), "flop tree should expose boundaries");
+        assert_eq!(boards.len(), game.num_boundary_nodes());
+        for boundary_board in boards {
+            assert_eq!(boundary_board.len(), 4);
+            assert_eq!(&boundary_board[..3], &board);
+            assert!(!board.contains(&boundary_board[3]));
+        }
     }
 
     #[test]

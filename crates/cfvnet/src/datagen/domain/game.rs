@@ -30,6 +30,10 @@ impl Game {
         &self.tree
     }
 
+    pub fn inner_mut(&mut self) -> &mut PostFlopGame {
+        &mut self.tree
+    }
+
     pub fn num_private_hands(&self, player: usize) -> usize {
         self.tree.num_private_hands(player)
     }
@@ -87,8 +91,8 @@ impl Game {
     }
 }
 
-/// Builds a Game from a Situation by delegating to the existing
-/// `build_turn_game` / `build_turn_game_exact` functions.
+/// Builds a Game from a Situation by delegating to the street-specific
+/// depth-limited/full tree construction helpers.
 pub struct GameBuilder {
     bet_sizes: Vec<Vec<BetSize>>,
     pub(crate) exact: bool,
@@ -104,6 +108,14 @@ impl GameBuilder {
         }
     }
 
+    pub fn depth_limited(bet_sizes: Vec<Vec<BetSize>>) -> Self {
+        Self {
+            bet_sizes,
+            exact: false,
+            fuzz: 0.0,
+        }
+    }
+
     pub fn with_fuzz(mut self, fuzz: f64) -> Self {
         self.fuzz = fuzz;
         self
@@ -115,22 +127,30 @@ impl GameBuilder {
         } else {
             self.bet_sizes.clone()
         };
-        let tree = if self.exact {
-            super::game_tree::build_turn_game_exact(
-                sit.board_cards(),
-                f64::from(sit.pot),
-                f64::from(sit.effective_stack),
+        let board = sit.board_cards();
+        let pot = f64::from(sit.pot);
+        let effective_stack = f64::from(sit.effective_stack);
+        let tree = match (board.len(), self.exact) {
+            (3, false) => {
+                super::game_tree::build_flop_game(board, pot, effective_stack, &sit.ranges, &sizes)?
+            }
+            (3, true) => super::game_tree::build_flop_game_exact(
+                board,
+                pot,
+                effective_stack,
                 &sit.ranges,
                 &sizes,
-            )?
-        } else {
-            super::game_tree::build_turn_game(
-                sit.board_cards(),
-                f64::from(sit.pot),
-                f64::from(sit.effective_stack),
+            )?,
+            (_, false) => {
+                super::game_tree::build_turn_game(board, pot, effective_stack, &sit.ranges, &sizes)?
+            }
+            (_, true) => super::game_tree::build_turn_game_exact(
+                board,
+                pot,
+                effective_stack,
                 &sit.ranges,
                 &sizes,
-            )?
+            )?,
         };
         Some(Game::new(sit.clone(), tree))
     }

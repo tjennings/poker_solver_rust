@@ -1,5 +1,6 @@
 pub mod blueprint_ranges;
 pub mod domain;
+pub mod flop_boundary_generate;
 pub mod generate;
 #[cfg(feature = "gpu-turn-datagen")]
 pub mod gpu_boundary_eval;
