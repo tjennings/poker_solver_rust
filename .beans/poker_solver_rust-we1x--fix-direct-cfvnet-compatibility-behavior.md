@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: critical
 created_at: 2026-05-08T20:47:13Z
-updated_at: 2026-05-08T20:57:35Z
+updated_at: 2026-05-09T02:33:06Z
 ---
 
 Direct CFVNet compatibility conversion makes subgame behavior worse: subgame bets/shoves 100% while exact checks 100%. Audit model target units, bcfv conversion, sign/player orientation, and boundary evaluator handoff; patch only once the solver convention is verified.
@@ -25,3 +25,7 @@ The current Python BoundaryNet trainer encodes targets as `bcfv * pot / (pot + e
 Verification: focused `cfvnet` conversion test passed, focused Tauri solver-log test passed, `git diff --check` passed, `beans check` passed, and warm full `cargo test --quiet` passed in 51.96s.
 
 Residual: after the corrected conversion, the reported behavior regressed from 100% bet/shove back to the earlier 50/50 check/bet split while exact remains 100% check. That remaining mismatch is a boundary-value audit/model-quality problem, not explained by the removed affine offset.
+
+## Diagnostic Spot
+
+Reported residual policy mismatch: subgame too passive while exact is more aggressive on `sb:2bb,bb:10bb,sb:22bb,bb:call|9s8h7d|bb:check,sb:check|6d`. Use this as a value-level audit case after the corrected scaled-bcfv conversion. Since the solve root is turn, the turn-boundary Direct CFVNet checkpoint should be configured as a river boundary (`--river-boundary cfvnet`) so boundary boards are 4-card turn boards.
