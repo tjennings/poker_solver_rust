@@ -1,4 +1,4 @@
-use crate::datagen::storage::{NUM_COMBOS, TrainingRecord, record_size};
+use crate::datagen::storage::{record_size, TrainingRecord, NUM_COMBOS};
 use crate::model::network::INPUT_SIZE;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -542,6 +542,8 @@ pub fn manifest_shard_path(
             }
         })?;
         stripped.to_path_buf()
+    } else if let Ok(stripped) = shard_path.strip_prefix(dataset_dir) {
+        stripped.to_path_buf()
     } else {
         shard_path.to_path_buf()
     };
@@ -713,6 +715,17 @@ mod tests {
         );
         assert_eq!(manifest.coverage.total_records, 192);
         manifest.validate_turn_boundary().unwrap();
+    }
+
+    #[test]
+    fn manifest_shard_path_strips_relative_dataset_prefix() {
+        let path = manifest_shard_path(
+            "local_data/cfvnet/turn_boundary/v2",
+            "local_data/cfvnet/turn_boundary/v2/a_BVZnf",
+        )
+        .unwrap();
+
+        assert_eq!(path, "a_BVZnf");
     }
 
     #[test]

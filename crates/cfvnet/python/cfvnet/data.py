@@ -189,14 +189,14 @@ def _resolve_bin_files(
         if manifest_path is not None:
             manifest = read_manifest(manifest_path)
             _validate_manifest_contract(manifest, expected_street, expected_board_size)
-            files = [path / shard.path for shard in manifest.shards]
-            missing = [p for p in files if not p.is_file()]
+            files = [_resolve_manifest_shard_path(path, shard.path) for shard in manifest.shards]
+            missing = [Path(shard.path) for shard, file in zip(manifest.shards, files) if file is None]
             if missing:
                 missing_str = ", ".join(str(p) for p in missing)
                 raise ValueError(f"Manifest references missing shard(s): {missing_str}")
             if not files:
                 raise ValueError(f"Manifest has no shards: {manifest_path}")
-            return files
+            return [file for file in files if file is not None]
 
         files = sorted(p for p in path.iterdir() if p.is_file() and p.suffix == ".bin")
         if not files:
@@ -205,6 +205,54 @@ def _resolve_bin_files(
         return files
     _validate_file_board_sizes([path], expected_board_size)
     return [path]
+
+
+def _resolve_manifest_shard_path(dataset_dir: Path, shard_path: str) -> Path | None:
+    """Resolve a manifest shard path, including legacy duplicated dataset prefixes."""
+    shard = Path(shard_path)
+    candidates: list[Path]
+    if shard.is_absolute():
+        candidates = [shard]
+    else:
+        candidates = [dataset_dir / shard]
+        stripped = _strip_duplicated_dataset_prefix(dataset_dir, shard)
+        if stripped is not None:
+            candidates.append(dataset_dir / stripped)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _strip_duplicated_dataset_prefix(dataset_dir: Path, shard_path: Path) -> Path | None:
+    """Strip a relative shard prefix that lexically repeats the dataset directory."""
+    shard_parts = _relative_path_parts(shard_path)
+    if not shard_parts:
+        return None
+
+    dataset_variants = [dataset_dir]
+    try:
+        dataset_variants.append(dataset_dir.resolve())
+    except OSError:
+        pass
+
+    best: tuple[str, ...] | None = None
+    for variant in dataset_variants:
+        dataset_parts = _relative_path_parts(variant)
+        max_prefix = min(len(dataset_parts), len(shard_parts) - 1)
+        for prefix_len in range(max_prefix, 1, -1):
+            if tuple(dataset_parts[-prefix_len:]) == tuple(shard_parts[:prefix_len]):
+                rest = tuple(shard_parts[prefix_len:])
+                if best is None or len(rest) < len(best):
+                    best = rest
+                break
+
+    return Path(*best) if best else None
+
+
+def _relative_path_parts(path: Path) -> tuple[str, ...]:
+    return tuple(part for part in path.parts if part not in (path.anchor, ".", ".."))
 
 
 def _validate_manifest_contract(

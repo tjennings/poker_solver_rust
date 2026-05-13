@@ -88,6 +88,34 @@ def test_dataset_directory_uses_manifest_shard_order(tmp_path: Path):
     assert _resolve_bin_files(tmp_path) == [first, second]
 
 
+def test_dataset_directory_accepts_manifest_shard_path_with_dataset_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repo = tmp_path / "repo"
+    dataset = repo / "local_data" / "cfvnet" / "turn_boundary" / "v2"
+    cwd = repo / "crates" / "cfvnet" / "python"
+    dataset.mkdir(parents=True)
+    cwd.mkdir(parents=True)
+    shard = dataset / "a_BVZnf"
+    shard.write_bytes(b"")
+
+    manifest = DatasetManifest.turn_boundary("river_net")
+    manifest.shards = [
+        ShardMetadata(
+            path="local_data/cfvnet/turn_boundary/v2/a_BVZnf",
+            records=0,
+            board_size=4,
+            record_size_bytes=record_size(4),
+        )
+    ]
+    write_manifest(dataset / "manifest.yaml", manifest)
+
+    monkeypatch.chdir(cwd)
+
+    data_path = Path("../../../local_data/cfvnet/turn_boundary/v2")
+    assert _resolve_bin_files(data_path) == [data_path / "a_BVZnf"]
+
+
 def test_dataset_directory_manifest_rejects_missing_shard(tmp_path: Path):
     manifest = DatasetManifest.turn_boundary("river_net")
     manifest.shards = [
