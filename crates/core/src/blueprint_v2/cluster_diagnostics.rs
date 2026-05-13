@@ -7,6 +7,7 @@
 //! equity for every combo, and reports per-bucket equity statistics to
 //! verify that hands within the same bucket share similar equity profiles.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -22,6 +23,7 @@ use super::cluster_pipeline::{
 };
 
 use crate::abstraction::isomorphism::CanonicalBoard;
+use crate::hand_class::{HandClass, classify, intra_class_strength};
 use crate::showdown_equity;
 
 /// Size distribution statistics for bucket assignments.
@@ -337,12 +339,590 @@ pub fn audit_bucket_equity(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hand-class bucket assignment audit
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct BucketShare {
+    pub bucket_id: u16,
+    pub count: usize,
+    pub share: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandClassShare {
+    pub hand_class: String,
+    pub count: usize,
+    pub share: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandClassTraceExample {
+    pub hand_class: String,
+    /// Rank-like strength within the hand class, 14 high and 1 low.
+    pub strength: u8,
+    pub equity_decile: u8,
+    pub bucket: u16,
+    pub equity: f64,
+    pub hand: String,
+    pub board: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandClassStrengthBucketStats {
+    pub hand_class: String,
+    /// Rank-like strength within the hand class, 14 high and 1 low.
+    pub strength: u8,
+    pub equity_decile: u8,
+    pub count: usize,
+    pub distinct_buckets: usize,
+    pub bucket_entropy: f64,
+    pub mean_bucket: f64,
+    pub top_buckets: Vec<BucketShare>,
+    pub examples: Vec<HandClassTraceExample>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketHandClassMixStats {
+    pub bucket_id: u16,
+    pub count: usize,
+    pub dominant_class: String,
+    pub dominant_share: f64,
+    pub class_entropy: f64,
+    pub mean_equity: f64,
+    pub min_equity: f64,
+    pub max_equity: f64,
+    pub top_classes: Vec<HandClassShare>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandClassStrengthInversion {
+    pub hand_class: String,
+    pub weaker_strength: u8,
+    pub weaker_mean_bucket: f64,
+    pub stronger_strength: u8,
+    pub stronger_mean_bucket: f64,
+    pub delta_buckets: f64,
+}
+
+#[derive(Debug)]
+pub struct HandClassBucketAuditReport {
+    pub street: String,
+    pub bucket_count: u16,
+    pub sample_boards: usize,
+    pub assignments: usize,
+    pub skipped_lookups: usize,
+    pub top_n: usize,
+    pub class_strength_groups: Vec<HandClassStrengthBucketStats>,
+    pub bucket_mixes: Vec<BucketHandClassMixStats>,
+    pub strength_inversions: Vec<HandClassStrengthInversion>,
+}
+
+impl HandClassBucketAuditReport {
+    /// Format as a human-readable summary.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+
+        let mut s = format!(
+            "{street}: hand-class bucket audit ({bc} buckets, {boards} sample boards)\n  \
+             assignments={assignments}, skipped_lookups={skipped}",
+            street = self.street,
+            bc = self.bucket_count,
+            boards = self.sample_boards,
+            assignments = self.assignments,
+            skipped = self.skipped_lookups,
+        );
+
+        let _ = writeln!(s, "\n  Worst class/strength bucket spreads:");
+        for g in self.class_strength_groups.iter().take(self.top_n) {
+            let top = g
+                .top_buckets
+                .iter()
+                .map(|b| format!("{}:{:.1}%/{}", b.bucket_id, b.share * 100.0, b.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                s,
+                "    {:<14} str={:>2} eq_decile={} n={:<6} distinct={:<4} entropy={:.2} mean_bucket={:.1} top=[{}]",
+                g.hand_class,
+                g.strength,
+                g.equity_decile,
+                g.count,
+                g.distinct_buckets,
+                g.bucket_entropy,
+                g.mean_bucket,
+                top,
+            );
+            for ex in &g.examples {
+                let _ = writeln!(
+                    s,
+                    "      ex bucket={} eq={:.3} {} on {}",
+                    ex.bucket, ex.equity, ex.hand, ex.board,
+                );
+            }
+        }
+
+        let _ = writeln!(s, "\n  Worst mixed buckets:");
+        for b in self.bucket_mixes.iter().take(self.top_n) {
+            let classes = b
+                .top_classes
+                .iter()
+                .map(|c| format!("{}:{:.1}%/{}", c.hand_class, c.share * 100.0, c.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                s,
+                "    bucket {:>4}: n={:<6} dom={} {:.1}% entropy={:.2} eq={:.3}..{:.3} mean={:.3} classes=[{}]",
+                b.bucket_id,
+                b.count,
+                b.dominant_class,
+                b.dominant_share * 100.0,
+                b.class_entropy,
+                b.min_equity,
+                b.max_equity,
+                b.mean_equity,
+                classes,
+            );
+        }
+
+        let _ = writeln!(s, "\n  Possible strength-order inversions:");
+        if self.strength_inversions.is_empty() {
+            let _ = writeln!(s, "    none observed");
+        } else {
+            for inv in self.strength_inversions.iter().take(self.top_n) {
+                let _ = writeln!(
+                    s,
+                    "    {:<14} weaker str={} mean_bucket={:.1} > stronger str={} mean_bucket={:.1} delta={:.1}",
+                    inv.hand_class,
+                    inv.weaker_strength,
+                    inv.weaker_mean_bucket,
+                    inv.stronger_strength,
+                    inv.stronger_mean_bucket,
+                    inv.delta_buckets,
+                );
+            }
+        }
+
+        s
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HandClassGroupAcc {
+    class_id: u8,
+    strength: u8,
+    equity_decile: u8,
+    count: usize,
+    sum_bucket: f64,
+    bucket_counts: Vec<usize>,
+    examples: Vec<HandClassTraceExample>,
+}
+
+impl HandClassGroupAcc {
+    fn new(class_id: u8, strength: u8, equity_decile: u8, bucket_count: usize) -> Self {
+        Self {
+            class_id,
+            strength,
+            equity_decile,
+            count: 0,
+            sum_bucket: 0.0,
+            bucket_counts: vec![0; bucket_count],
+            examples: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BucketClassAcc {
+    count: usize,
+    class_counts: Vec<usize>,
+    sum_equity: f64,
+    min_equity: f64,
+    max_equity: f64,
+}
+
+impl BucketClassAcc {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            class_counts: vec![0; HandClass::NUM_MADE],
+            sum_equity: 0.0,
+            min_equity: f64::INFINITY,
+            max_equity: f64::NEG_INFINITY,
+        }
+    }
+}
+
+type HandClassAuditSample = (u8, u8, u8, u16, f64, String, String);
+
+/// Audit how postflop bucket assignments line up with hand class and
+/// within-class strength.
+///
+/// The grouping key is `(made hand class, rank-like strength, equity decile)`.
+/// The rank-like strength is 14 high and 1 low, so nut flushes and ace-high
+/// straights appear above king-high or lower variants inside the same class.
+///
+/// Preflop bucket files are intentionally skipped because preflop assignment
+/// has no board-dependent made hand class.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn audit_hand_class_bucket_assignments(
+    bf: &BucketFile,
+    num_sample_boards: usize,
+    seed: u64,
+    top_n: usize,
+) -> HandClassBucketAuditReport {
+    let bucket_count = bf.header.bucket_count as usize;
+    let street = bf.header.street;
+    if street == Street::Preflop {
+        return HandClassBucketAuditReport {
+            street: "Preflop".to_string(),
+            bucket_count: bf.header.bucket_count,
+            sample_boards: 0,
+            assignments: 0,
+            skipped_lookups: 0,
+            top_n,
+            class_strength_groups: Vec::new(),
+            bucket_mixes: Vec::new(),
+            strength_inversions: Vec::new(),
+        };
+    }
+
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let board_map = bf.board_index_map();
+    let card_count = match street {
+        Street::Flop => 3,
+        Street::Turn => 4,
+        Street::River => 5,
+        Street::Preflop => unreachable!("preflop returned above"),
+    };
+    let boards = sample_n_card_boards(&deck, card_count, num_sample_boards, seed);
+
+    let observations: Vec<Result<HandClassAuditSample, ()>> = boards
+        .par_iter()
+        .flat_map_iter(|board| {
+            combos
+                .iter()
+                .filter_map(|&combo| {
+                    if board.iter().any(|&bc| bc == combo[0] || bc == combo[1]) {
+                        return None;
+                    }
+                    let Some(bucket) = canonicalized_combo_bucket(bf, &board_map, board, combo)
+                    else {
+                        return Some(Err(()));
+                    };
+                    let bucket_usize = bucket as usize;
+                    if bucket_usize >= bucket_count {
+                        return Some(Err(()));
+                    }
+                    let classification = classify(combo, board).ok()?;
+                    let class_id = classification.strongest_made_id();
+                    if !HandClass::is_made_hand_id(class_id) {
+                        return None;
+                    }
+                    let class = HandClass::from_discriminant(class_id)?;
+                    let strength = class_strength_high_is_strong(combo, board, class);
+                    let equity = showdown_equity::compute_equity(combo, board);
+                    let equity_decile = equity_decile(equity);
+                    Some(Ok((
+                        class_id,
+                        strength,
+                        equity_decile,
+                        bucket,
+                        equity,
+                        format!("{} {}", combo[0], combo[1]),
+                        format_cards(board),
+                    )))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let skipped_lookups = observations.iter().filter(|obs| obs.is_err()).count();
+    let samples = observations
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+
+    let assignments = samples.len();
+
+    let mut groups: HashMap<(u8, u8, u8), HandClassGroupAcc> = HashMap::new();
+    let mut buckets = vec![BucketClassAcc::new(); bucket_count];
+
+    for (class_id, strength, equity_decile, bucket, equity, hand, board) in samples {
+        let key = (class_id, strength, equity_decile);
+        let group = groups.entry(key).or_insert_with(|| {
+            HandClassGroupAcc::new(class_id, strength, equity_decile, bucket_count)
+        });
+        group.count += 1;
+        group.sum_bucket += f64::from(bucket);
+        group.bucket_counts[bucket as usize] += 1;
+        if group.examples.len() < 2 {
+            group.examples.push(HandClassTraceExample {
+                hand_class: hand_class_name(class_id),
+                strength,
+                equity_decile,
+                bucket,
+                equity,
+                hand,
+                board,
+            });
+        }
+
+        let bucket_acc = &mut buckets[bucket as usize];
+        bucket_acc.count += 1;
+        bucket_acc.class_counts[class_id as usize] += 1;
+        bucket_acc.sum_equity += equity;
+        bucket_acc.min_equity = bucket_acc.min_equity.min(equity);
+        bucket_acc.max_equity = bucket_acc.max_equity.max(equity);
+    }
+
+    let mut class_strength_groups = groups
+        .into_values()
+        .map(|g| build_group_stats(g, top_n))
+        .collect::<Vec<_>>();
+    class_strength_groups.sort_by(|a, b| {
+        b.distinct_buckets
+            .cmp(&a.distinct_buckets)
+            .then_with(|| {
+                b.bucket_entropy
+                    .partial_cmp(&a.bucket_entropy)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.count.cmp(&a.count))
+    });
+
+    let mut bucket_mixes = buckets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(bucket_id, acc)| build_bucket_mix_stats(bucket_id, &acc, top_n))
+        .collect::<Vec<_>>();
+    bucket_mixes.sort_by(|a, b| {
+        b.class_entropy
+            .partial_cmp(&a.class_entropy)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (b.max_equity - b.min_equity)
+                    .partial_cmp(&(a.max_equity - a.min_equity))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.count.cmp(&a.count))
+    });
+
+    let strength_inversions =
+        detect_strength_inversions(&class_strength_groups, bf.header.bucket_count);
+
+    HandClassBucketAuditReport {
+        street: format!("{street:?}"),
+        bucket_count: bf.header.bucket_count,
+        sample_boards: num_sample_boards,
+        assignments,
+        skipped_lookups,
+        top_n,
+        class_strength_groups,
+        bucket_mixes,
+        strength_inversions,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn build_group_stats(g: HandClassGroupAcc, top_n: usize) -> HandClassStrengthBucketStats {
+    let top_buckets = top_bucket_shares(&g.bucket_counts, g.count, top_n);
+    let distinct_buckets = g.bucket_counts.iter().filter(|&&count| count > 0).count();
+    let bucket_entropy = entropy(g.bucket_counts.iter().copied(), g.count);
+    HandClassStrengthBucketStats {
+        hand_class: hand_class_name(g.class_id),
+        strength: g.strength,
+        equity_decile: g.equity_decile,
+        count: g.count,
+        distinct_buckets,
+        bucket_entropy,
+        mean_bucket: if g.count == 0 {
+            0.0
+        } else {
+            g.sum_bucket / g.count as f64
+        },
+        top_buckets,
+        examples: g.examples,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn build_bucket_mix_stats(
+    bucket_id: usize,
+    acc: &BucketClassAcc,
+    top_n: usize,
+) -> Option<BucketHandClassMixStats> {
+    if acc.count == 0 {
+        return None;
+    }
+    let top_classes = top_class_shares(&acc.class_counts, acc.count, top_n);
+    let dominant = top_classes.first()?;
+    #[allow(clippy::cast_possible_truncation)]
+    Some(BucketHandClassMixStats {
+        bucket_id: bucket_id as u16,
+        count: acc.count,
+        dominant_class: dominant.hand_class.clone(),
+        dominant_share: dominant.share,
+        class_entropy: entropy(acc.class_counts.iter().copied(), acc.count),
+        mean_equity: acc.sum_equity / acc.count as f64,
+        min_equity: acc.min_equity,
+        max_equity: acc.max_equity,
+        top_classes,
+    })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn detect_strength_inversions(
+    groups: &[HandClassStrengthBucketStats],
+    bucket_count: u16,
+) -> Vec<HandClassStrengthInversion> {
+    let mut by_class_strength: HashMap<(String, u8), (f64, usize)> = HashMap::new();
+    for group in groups {
+        let entry = by_class_strength
+            .entry((group.hand_class.clone(), group.strength))
+            .or_insert((0.0, 0));
+        entry.0 += group.mean_bucket * group.count as f64;
+        entry.1 += group.count;
+    }
+
+    let mut by_class: HashMap<String, Vec<(u8, f64)>> = HashMap::new();
+    for ((class, strength), (weighted_sum, count)) in by_class_strength {
+        if count == 0 {
+            continue;
+        }
+        by_class
+            .entry(class)
+            .or_default()
+            .push((strength, weighted_sum / count as f64));
+    }
+
+    let threshold = (f64::from(bucket_count) * 0.02).max(1.0);
+    let mut inversions = Vec::new();
+    for (class, mut strengths) in by_class {
+        strengths.sort_by_key(|(strength, _)| *strength);
+        for (i, &(weaker_strength, weaker_mean)) in strengths.iter().enumerate() {
+            for &(stronger_strength, stronger_mean) in &strengths[i + 1..] {
+                let delta = weaker_mean - stronger_mean;
+                if delta > threshold {
+                    inversions.push(HandClassStrengthInversion {
+                        hand_class: class.clone(),
+                        weaker_strength,
+                        weaker_mean_bucket: weaker_mean,
+                        stronger_strength,
+                        stronger_mean_bucket: stronger_mean,
+                        delta_buckets: delta,
+                    });
+                }
+            }
+        }
+    }
+    inversions.sort_by(|a, b| {
+        b.delta_buckets
+            .partial_cmp(&a.delta_buckets)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    inversions
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn top_bucket_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<BucketShare> {
+    let mut shares = counts
+        .iter()
+        .enumerate()
+        .filter_map(|(bucket_id, &count)| {
+            if count == 0 {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(BucketShare {
+                bucket_id: bucket_id as u16,
+                count,
+                share: count as f64 / total as f64,
+            })
+        })
+        .collect::<Vec<_>>();
+    shares.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.bucket_id.cmp(&b.bucket_id))
+    });
+    shares.truncate(top_n);
+    shares
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn top_class_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<HandClassShare> {
+    let mut shares = counts
+        .iter()
+        .enumerate()
+        .filter_map(|(class_id, &count)| {
+            if count == 0 {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(HandClassShare {
+                hand_class: hand_class_name(class_id as u8),
+                count,
+                share: count as f64 / total as f64,
+            })
+        })
+        .collect::<Vec<_>>();
+    shares.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.hand_class.cmp(&b.hand_class))
+    });
+    shares.truncate(top_n);
+    shares
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn entropy(counts: impl Iterator<Item = usize>, total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    counts
+        .filter(|&count| count > 0)
+        .map(|count| {
+            let p = count as f64 / total as f64;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+fn hand_class_name(class_id: u8) -> String {
+    HandClass::from_discriminant(class_id)
+        .map_or_else(|| "Unknown".to_string(), |class| class.to_string())
+}
+
+fn class_strength_high_is_strong(hole: [Card; 2], board: &[Card], class: HandClass) -> u8 {
+    15u8.saturating_sub(intra_class_strength(hole, board, class))
+        .clamp(1, 14)
+}
+
+fn equity_decile(equity: f64) -> u8 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let decile = (equity.clamp(0.0, 1.0) * 10.0) as u8;
+    decile.min(9)
+}
+
+fn format_cards(cards: &[Card]) -> String {
+    cards
+        .iter()
+        .map(|card| format!("{card}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Canonicalize a 5-card board and look up its index in the board map.
 fn canonicalize_and_lookup(
     board: &[Card; 5],
     board_map: &rustc_hash::FxHashMap<super::bucket_file::PackedBoard, u32>,
 ) -> Option<u32> {
-    CanonicalBoard::from_cards(&board.to_vec())
+    CanonicalBoard::from_cards(board.as_ref())
         .ok()
         .map(|cb| canonical_key(&cb.cards))
         .and_then(|key| board_map.get(&key).copied())
@@ -1924,6 +2504,98 @@ mod tests {
             canonicalized_combo_bucket(&bf, &board_map, &raw_board, combo),
             Some(2)
         );
+    }
+
+    #[test]
+    fn hand_class_strength_is_high_for_nut_flush() {
+        use crate::poker::{Suit, Value};
+
+        let board = [
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Eight, Suit::Heart),
+            Card::new(Value::Four, Suit::Heart),
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Seven, Suit::Diamond),
+        ];
+        let nut_flush = [
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::Three, Suit::Heart),
+        ];
+        let queen_high_flush = [
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Ten, Suit::Heart),
+        ];
+
+        assert_eq!(
+            class_strength_high_is_strong(nut_flush, &board, HandClass::Flush),
+            14
+        );
+        assert!(
+            class_strength_high_is_strong(nut_flush, &board, HandClass::Flush)
+                > class_strength_high_is_strong(queen_high_flush, &board, HandClass::Flush)
+        );
+    }
+
+    #[test]
+    fn hand_class_bucket_audit_produces_trace_sections() {
+        let deck = build_deck();
+        let boards = sample_n_card_boards(&deck, 3, 2, 7);
+        let packed_boards = boards
+            .iter()
+            .map(|board| {
+                let canonical = CanonicalBoard::from_cards(board).unwrap();
+                canonical_key(&canonical.cards)
+            })
+            .collect::<Vec<_>>();
+
+        let mut buckets = Vec::with_capacity(boards.len() * 1326);
+        for _ in &boards {
+            for combo_idx in 0..1326 {
+                #[allow(clippy::cast_possible_truncation)]
+                buckets.push((combo_idx % 4) as u16);
+            }
+        }
+
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Flop,
+                bucket_count: 4,
+                board_count: boards.len() as u32,
+                combos_per_board: 1326,
+                version: 2,
+            },
+            boards: packed_boards,
+            buckets,
+        };
+
+        let report = audit_hand_class_bucket_assignments(&bf, 2, 7, 3);
+        assert!(report.assignments > 0);
+        assert_eq!(report.skipped_lookups, 0);
+        assert!(!report.class_strength_groups.is_empty());
+        assert!(!report.bucket_mixes.is_empty());
+        let summary = report.summary();
+        assert!(summary.contains("Worst class/strength bucket spreads"));
+        assert!(summary.contains("Worst mixed buckets"));
+    }
+
+    #[test]
+    fn hand_class_bucket_audit_skips_preflop() {
+        let bf = BucketFile {
+            header: BucketFileHeader {
+                street: Street::Preflop,
+                bucket_count: 169,
+                board_count: 1,
+                combos_per_board: 1326,
+                version: 2,
+            },
+            boards: vec![PackedBoard(0)],
+            buckets: vec![0_u16; 1326],
+        };
+
+        let report = audit_hand_class_bucket_assignments(&bf, 10, 7, 3);
+        assert_eq!(report.assignments, 0);
+        assert!(report.class_strength_groups.is_empty());
+        assert!(report.bucket_mixes.is_empty());
     }
 
     #[test]

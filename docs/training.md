@@ -367,6 +367,10 @@ cargo run -p poker-solver-trainer --release -- diag-clusters \
 cargo run -p poker-solver-trainer --release -- diag-clusters \
   -d output/buckets --transition-audit --transition-audit-boards 50
 
+# Hand-class assignment audit (trace class/strength groups into buckets)
+cargo run -p poker-solver-trainer --release -- diag-clusters \
+  -d output/buckets --hand-class-audit --hand-class-audit-boards 25
+
 # Sample hands from a specific bucket
 cargo run -p poker-solver-trainer --release -- diag-clusters \
   -d output/buckets --sample-bucket river 5
@@ -379,6 +383,9 @@ Options:
 - `--transitions` -- Print cross-street transition matrices for adjacent street pairs (preflop→flop, flop→turn, turn→river)
 - `--transition-audit` -- Sample flop→turn and turn→river boards and report whether combos in each current bucket produce similar next-street bucket distributions. Board and holding lookups are canonicalized together, matching runtime bucket lookup semantics.
 - `--transition-audit-boards <N>` -- Number of boards to sample for transition consistency audit (default: 20)
+- `--hand-class-audit` -- Sample flop/turn/river boards and trace bucket assignments by made hand class, rank-like intra-class strength, and equity decile. Reports class/strength groups that scatter across many buckets, buckets that mix incompatible hand classes, and possible strength-order inversions.
+- `--hand-class-audit-boards <N>` -- Number of boards to sample for hand-class audit (default: 10)
+- `--hand-class-audit-top <N>` -- Rows to show in each hand-class audit section (default: 10)
 - `--sample-bucket <STREET> <BUCKET_ID>` -- Show 10 sample hands from the given bucket
 - `--centroid-emd <STREET>` -- Placeholder; centroid EMD requires feature vectors not stored in bucket files
 

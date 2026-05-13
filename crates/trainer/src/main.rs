@@ -104,6 +104,15 @@ enum Commands {
         /// Number of boards to sample for transition audit (default 20)
         #[arg(long, default_value = "20")]
         transition_audit_boards: usize,
+        /// Audit bucket assignments by made hand class, intra-class strength, and equity decile
+        #[arg(long)]
+        hand_class_audit: bool,
+        /// Number of boards to sample for hand-class audit (default 10)
+        #[arg(long, default_value = "10")]
+        hand_class_audit_boards: usize,
+        /// Number of rows to show per hand-class audit section (default 10)
+        #[arg(long, default_value = "10")]
+        hand_class_audit_top: usize,
     },
     /// Pre-compute the equity+delta lookup cache for fast expected-delta bucketing.
     /// Generates turn table first (averaging over river cards), then flop table
@@ -1032,10 +1041,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             cfvnet_audit,
             transition_audit,
             transition_audit_boards,
+            hand_class_audit,
+            hand_class_audit_boards,
+            hand_class_audit_top,
         } => {
             use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
             use poker_solver_core::blueprint_v2::cluster_diagnostics::{
-                cross_street_transition_matrix, sample_hands_for_bucket,
+                audit_hand_class_bucket_assignments, cross_street_transition_matrix,
+                sample_hands_for_bucket,
             };
 
             let reports =
@@ -1118,6 +1131,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                             transition_audit_boards,
                             42,
                             centroids.as_ref(),
+                        );
+                        eprintln!("{}", report.summary());
+                    }
+                }
+            }
+            if hand_class_audit {
+                for street_name in &["flop", "turn", "river"] {
+                    let path = cluster_dir.join(format!("{street_name}.buckets"));
+                    if path.exists() {
+                        eprintln!(
+                            "\nHand-class bucket audit: {street_name} ({hand_class_audit_boards} sample boards)..."
+                        );
+                        let bf = BucketFile::load(&path)?;
+                        let report = audit_hand_class_bucket_assignments(
+                            &bf,
+                            hand_class_audit_boards,
+                            42,
+                            hand_class_audit_top,
                         );
                         eprintln!("{}", report.summary());
                     }
