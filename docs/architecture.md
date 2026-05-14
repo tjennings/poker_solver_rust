@@ -212,6 +212,8 @@ The negative-action subtree purge is an opt-in experiment layered on the lazy sp
 
 Physical purge runs immediately after lazy DCFR discounting. The boundary sweep scans the currently blocked edge set, rereads each parent action regret after discounting, and gives DCFR the first chance to soften or reactivate the edge. Edges whose regret reaches `negative_action_reactivate_at` are removed from the blocked set without deleting their child subtree. Remaining blocked child prefixes are batched into one sparse-storage scan for the discount boundary; matching rows at or below any stored child prefix are removed, preserving sibling histories while dropping already visited descendants below blocked actions.
 
+The normal lazy traversal-pruning gate also only skips aggressive actions. Passive structural actions remain traversable even when their regret is below `prune_threshold`, matching the eager solver's protection for high-leverage terminal/routing branches.
+
 ## Range Solver (Exact Postflop Solver)
 
 A self-contained postflop solver that computes Nash equilibrium strategies for specific hero/villain ranges on a given board. Unlike the blueprint solver (which uses hand abstraction), the range solver works with concrete hand combinations and produces exact strategies.

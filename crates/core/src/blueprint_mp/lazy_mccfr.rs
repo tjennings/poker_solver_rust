@@ -499,6 +499,7 @@ fn traverse_traverser(
             storage,
             prune,
             prune_threshold,
+            action_increments_raise_count(&state, action),
             key,
             action_idx,
             &mut prune_stats,
@@ -681,11 +682,12 @@ fn should_prune_lazy(
     storage: &SparseMpStorage,
     prune: bool,
     prune_threshold: i32,
+    action_is_aggressive: bool,
     key: MpInfosetKey,
     action: usize,
     stats: &mut PruneStats,
 ) -> bool {
-    if !prune {
+    if !prune || !action_is_aggressive {
         return false;
     }
     stats.total += 1;
@@ -1864,6 +1866,38 @@ mod tests {
         assert!((masked[0] - 0.0).abs() < 1e-12);
         assert!((masked[1] - (2.0 / 3.0)).abs() < 1e-12);
         assert!((masked[2] - (1.0 / 3.0)).abs() < 1e-12);
+    }
+
+    #[timed_test]
+    fn lazy_pruning_ignores_passive_actions() {
+        let storage = SparseMpStorage::with_shards(8);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(key, 2, 0, -10_000);
+
+        assert!(!should_prune_lazy(
+            &storage, true, -1, false, key, 0, &mut stats
+        ));
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[timed_test]
+    fn lazy_pruning_still_skips_negative_aggressive_actions() {
+        let storage = SparseMpStorage::with_shards(8);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(key, 2, 1, -10_000);
+
+        assert!(should_prune_lazy(
+            &storage, true, -1, true, key, 1, &mut stats
+        ));
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.hits, 1);
     }
 
     #[timed_test]
