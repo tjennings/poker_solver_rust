@@ -203,7 +203,7 @@ fn install_turn_boundary_evaluators(
     session: Arc<ort::session::Session>,
 ) -> Result<(), String> {
     use crate::eval::boundary_evaluator::{
-        neural_boundary_evaluator_from_shared_with_mode, BoundaryInferenceMode,
+        BoundaryInferenceMode, neural_boundary_evaluator_from_shared_with_mode,
     };
 
     let boundary_boards = game.inner().boundary_boards();
