@@ -750,6 +750,24 @@ cargo run -p cfvnet --release -- generate \
   --per-file 10000
 ```
 
+To verify that more DCFR iterations improve the exact same sampled spots,
+run the fixed-spot convergence diagnostic. It samples the river spots once,
+then resolves those same spots at each iteration cap. By default it disables
+`datagen.target_exploitability`, so the table measures the iteration ceiling
+rather than early stopping:
+
+```bash
+cargo run -p cfvnet --release -- sampled-river-convergence \
+  --config sample_configurations/river_cfvnet_sampled_spots.yaml \
+  --num-spots 5 \
+  --iterations 50,100,250,500,1000,2500,5000
+```
+
+Add `--respect-target` to test production early-stop behavior. If
+`avg_iter` stays well below the iteration cap, increasing
+`datagen.solver_iterations` will not improve the output for those spots unless
+`datagen.target_exploitability` is lowered or disabled.
+
 **GPU requirements:**
 - NVIDIA GPU with CUDA 12.1+ and compute capability ≥ 6.0
 - Build with `--features gpu-datagen` to enable the GPU dependency
