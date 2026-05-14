@@ -13,7 +13,7 @@ use crate::config::CfvnetConfig;
 #[cfg(feature = "onnx")]
 use crate::datagen::domain::game::Game;
 #[cfg(feature = "onnx")]
-use crate::datagen::domain::solver::{SolvedGame, SolverConfig};
+use crate::datagen::domain::solver::{SolvedGame, SolverCompletionReason, SolverConfig};
 #[cfg(feature = "onnx")]
 use crate::datagen::manifest::{SourceMetadata, TargetSource};
 #[cfg(feature = "onnx")]
@@ -264,6 +264,8 @@ fn solve_game(mut game: Game, config: &SolverConfig) -> SolvedGame {
                     return SolvedGame {
                         game,
                         exploitability: exploit,
+                        iterations: iteration + 1,
+                        completion_reason: SolverCompletionReason::TargetExploitability,
                     };
                 }
             }
@@ -278,5 +280,7 @@ fn solve_game(mut game: Game, config: &SolverConfig) -> SolvedGame {
     SolvedGame {
         game,
         exploitability,
+        iterations: config.max_iterations,
+        completion_reason: SolverCompletionReason::MaxIterations,
     }
 }

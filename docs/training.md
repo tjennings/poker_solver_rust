@@ -959,6 +959,7 @@ See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
 | `datagen.sampled_river_spots` | `false` | For `street: "river"`, walk a blueprint bundle to reached river decisions instead of using random/RSP or precomputed preflop-only ranges |
 | `datagen.blueprint_bundle_path` | none | Full blueprint bundle directory used when `sampled_river_spots` is enabled |
 | `datagen.solver_iterations` | 1000 | DCFR iterations per situation |
+| `datagen.target_exploitability` | none | Optional early-stop threshold as a pot fraction: stop when exploitability in chips is `<= target_exploitability * pot`; at 100bb/200-chip stacks, `0.01` means roughly `5 * pot` mbb/h |
 | `game.river_model_path` | none | Path to trained river model for turn generation, or direct turn-boundary ONNX for `flop_boundary` |
 | `training.hidden_layers` | 7 | MLP depth |
 | `training.hidden_size` | 500 | Hidden layer width |
