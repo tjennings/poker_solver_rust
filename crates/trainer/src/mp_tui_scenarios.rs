@@ -436,6 +436,7 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop,
             flop: empty.clone(),
             turn: empty.clone(),
@@ -476,6 +477,7 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop,
             flop: empty.clone(),
             turn: empty.clone(),
@@ -804,6 +806,7 @@ mod tests {
             raise: vec![vec![yaml_f64(1.0)]],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop,
             flop: postflop.clone(),
             turn: postflop.clone(),

@@ -87,6 +87,7 @@ impl PreflopSize {
 // ── Internal: parsed config ─────────────────────────────────────────
 
 struct TreeBuildConfig {
+    max_flop_players: Option<u8>,
     preflop_lead: Vec<PreflopSize>,
     preflop_raise: Vec<Vec<PreflopSize>>,
     flop_lead: Vec<f64>,
@@ -100,6 +101,7 @@ struct TreeBuildConfig {
 impl TreeBuildConfig {
     fn from_action_config(ac: &MpActionAbstractionConfig) -> Self {
         Self {
+            max_flop_players: ac.max_flop_players,
             preflop_lead: parse_preflop_values(&ac.preflop.lead),
             preflop_raise: parse_preflop_raise_depths(&ac.preflop.raise),
             flop_lead: parse_f64_values(&ac.flop.lead),
@@ -360,10 +362,13 @@ fn generate_actions(config: &TreeBuildConfig, state: &BuildState) -> Vec<TreeAct
         actions.push(TreeAction::Fold);
     }
 
-    if is_unopened_preflop && state.facing_bet {
+    if is_unopened_preflop
+        && state.facing_bet
+        && preflop_call_allowed(config.max_flop_players, state)
+    {
         actions.push(TreeAction::Call);
     } else {
-        add_check_or_call(state, &mut actions);
+        add_check_or_call(config, state, &mut actions);
     }
     add_sized_actions(config, state, &mut actions);
     if !is_unopened_preflop {
@@ -378,11 +383,14 @@ fn is_unopened_preflop(state: &BuildState) -> bool {
     state.street == Street::Preflop && state.raise_count == 0
 }
 
-fn add_check_or_call(state: &BuildState, actions: &mut Vec<TreeAction>) {
+fn add_check_or_call(config: &TreeBuildConfig, state: &BuildState, actions: &mut Vec<TreeAction>) {
     let seat = state.to_act;
     let remaining = state.stacks[seat.index() as usize];
 
     if state.facing_bet {
+        if !preflop_call_allowed(config.max_flop_players, state) {
+            return;
+        }
         let to_call = max_street_bet(state) - state.street_bets[seat.index() as usize];
         if to_call >= remaining - Chips(SIZE_EPSILON) {
             actions.push(TreeAction::AllIn);
@@ -534,6 +542,9 @@ fn add_all_in_if_needed(state: &BuildState, actions: &mut Vec<TreeAction>) {
         return;
     }
     let all_in_to = state.street_bets[seat.index() as usize] + remaining;
+    if state.facing_bet && all_in_to <= max_street_bet(state) + Chips(SIZE_EPSILON) {
+        return;
+    }
     let already = actions.iter().any(|a| match a {
         TreeAction::Lead(v) | TreeAction::Raise(v) => {
             (Chips(*v) - all_in_to).0.abs() < SIZE_EPSILON
@@ -567,6 +578,56 @@ fn max_street_bet(state: &BuildState) -> Chips {
         .iter()
         .copied()
         .fold(Chips::ZERO, Chips::max)
+}
+
+fn preflop_call_allowed(max_flop_players: Option<u8>, state: &BuildState) -> bool {
+    let Some(max_flop_players) = max_flop_players else {
+        return true;
+    };
+    if state.street != Street::Preflop || !state.facing_bet {
+        return true;
+    }
+
+    let current_max = max_street_bet(state);
+    let actor = state.to_act;
+    let committed_after_call = state
+        .active
+        .iter()
+        .filter(|seat| {
+            *seat == actor
+                || state.all_in.contains(*seat)
+                || (state.street_bets[seat.index() as usize] - current_max)
+                    .0
+                    .abs()
+                    < SIZE_EPSILON
+        })
+        .count();
+    let max_flop_players = usize::from(max_flop_players);
+
+    if preflop_call_closes_action(state, current_max) {
+        committed_after_call <= max_flop_players
+    } else {
+        committed_after_call < max_flop_players
+    }
+}
+
+fn preflop_call_closes_action(state: &BuildState, current_max: Chips) -> bool {
+    for seat in state.active.iter() {
+        if seat == state.to_act || state.all_in.contains(seat) {
+            continue;
+        }
+        if !state.acted_since_aggression.contains(seat) {
+            return false;
+        }
+        if (state.street_bets[seat.index() as usize] - current_max)
+            .0
+            .abs()
+            >= SIZE_EPSILON
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn min_raise_to(state: &BuildState) -> Chips {
@@ -925,6 +986,7 @@ mod tests {
         };
 
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: preflop_sizes,
             flop: postflop_sizes.clone(),
             turn: postflop_sizes.clone(),
@@ -938,11 +1000,7 @@ mod tests {
         serde_yaml::Value::Number(serde_yaml::Number::from(v))
     }
 
-    fn assert_unopened_preflop_actions(
-        actions: &[TreeAction],
-        all_in_to: f64,
-        position: &str,
-    ) {
+    fn assert_unopened_preflop_actions(actions: &[TreeAction], all_in_to: f64, position: &str) {
         assert!(
             actions.iter().any(|a| matches!(a, TreeAction::Fold)),
             "{position} unopened preflop actions should include Fold, got {actions:?}"
@@ -1006,6 +1064,7 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: preflop_sizes,
             flop: empty.clone(),
             turn: empty.clone(),
@@ -1044,6 +1103,7 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: preflop_sizes,
             flop: empty.clone(),
             turn: empty.clone(),
@@ -1079,12 +1139,100 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: empty.clone(),
             flop: empty.clone(),
             turn: empty.clone(),
             river: empty,
         };
         (game, action)
+    }
+
+    fn six_player_cap_action_config(max_flop_players: Option<u8>) -> TreeBuildConfig {
+        let (_, mut action) = six_player_response_config();
+        action.max_flop_players = max_flop_players;
+        TreeBuildConfig::from_action_config(&action)
+    }
+
+    fn six_player_open_one_caller_state(active_seats: &[u8], to_act: u8) -> BuildState {
+        let mut street_bets = [Chips::ZERO; MAX_PLAYERS];
+        street_bets[0] = Chips(10.0);
+        street_bets[1] = Chips(10.0);
+        street_bets[4] = Chips(1.0);
+        street_bets[5] = Chips(2.0);
+
+        let mut stacks = [Chips::ZERO; MAX_PLAYERS];
+        let mut contributions = [Chips::ZERO; MAX_PLAYERS];
+        for idx in 0..6 {
+            stacks[idx] = Chips(30.0) - street_bets[idx];
+            contributions[idx] = street_bets[idx];
+        }
+
+        let mut active = PlayerSet::empty();
+        for &seat in active_seats {
+            active.insert(Seat::from_raw(seat));
+        }
+
+        let mut acted_since_aggression = PlayerSet::empty();
+        acted_since_aggression.insert(Seat::from_raw(0));
+        acted_since_aggression.insert(Seat::from_raw(1));
+        let pot = Chips(contributions.iter().map(|chips| chips.0).sum());
+
+        BuildState {
+            stacks,
+            street_bets,
+            contributions,
+            active,
+            all_in: PlayerSet::empty(),
+            acted_since_aggression,
+            street: Street::Preflop,
+            pot,
+            num_players: 6,
+            raise_count: 1,
+            to_act: Seat::from_raw(to_act),
+            facing_bet: true,
+            last_raise_to: Chips(10.0),
+            dealer: 3,
+            big_blind_amount: Chips(2.0),
+        }
+    }
+
+    #[timed_test]
+    fn preflop_flop_player_cap_removes_non_closing_overcall_but_keeps_closing_call() {
+        let config = six_player_cap_action_config(Some(3));
+        let sb_non_closing = six_player_open_one_caller_state(&[0, 1, 4, 5], 4);
+        let bb_closing = six_player_open_one_caller_state(&[0, 1, 5], 5);
+
+        let sb_actions = generate_actions(&config, &sb_non_closing);
+        let bb_actions = generate_actions(&config, &bb_closing);
+
+        assert!(
+            !sb_actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call)),
+            "SB non-closing overcall should be capped after opener plus caller: {sb_actions:?}"
+        );
+        assert!(
+            bb_actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call)),
+            "BB closing call should remain legal at the cap: {bb_actions:?}"
+        );
+    }
+
+    #[timed_test]
+    fn preflop_flop_player_cap_none_preserves_non_closing_call() {
+        let config = six_player_cap_action_config(None);
+        let sb_non_closing = six_player_open_one_caller_state(&[0, 1, 4, 5], 4);
+
+        let actions = generate_actions(&config, &sb_non_closing);
+
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call)),
+            "default uncapped config should preserve SB non-closing call: {actions:?}"
+        );
     }
 
     #[timed_test]
@@ -1338,6 +1486,7 @@ mod tests {
             raise: vec![vec![yaml_f64(1.0)]],
         };
         let action_cfg = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: preflop_sizes,
             flop: postflop_sizes.clone(),
             turn: postflop_sizes.clone(),
@@ -1375,9 +1524,9 @@ mod tests {
 
             assert_unopened_preflop_actions(actions, all_in_to, position);
             assert!(
-                actions
-                    .iter()
-                    .any(|a| matches!(a, TreeAction::Lead(chips) if (*chips - 4.0).abs() < SIZE_EPSILON)),
+                actions.iter().any(
+                    |a| matches!(a, TreeAction::Lead(chips) if (*chips - 4.0).abs() < SIZE_EPSILON)
+                ),
                 "{position} should keep the non-all-in open size, got {actions:?}"
             );
 
@@ -1743,6 +1892,7 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: empty.clone(),
             flop: empty.clone(),
             turn: empty.clone(),

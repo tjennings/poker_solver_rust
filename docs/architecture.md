@@ -192,6 +192,7 @@ crates/core/src/blueprint_mp/
 - **2-8 players** with `MAX_PLAYERS = 8`
 - **Configurable blinds**: SB, BB, ante, BB-ante, straddle via per-seat config
 - **Lead/raise split**: Separate bet sizes for opening bets vs raises
+- **Optional preflop flop-player cap**: `action_abstraction.max_flop_players` prunes non-closing preflop calls that would fill the last allowed flop seat, while preserving closing calls up to the cap
 - **Full side pot resolution** at showdown terminals
 - **128-bit info set keys** with 22 action slots (panics on overflow)
 - **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics

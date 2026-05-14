@@ -4251,6 +4251,7 @@ snapshots:
                 rake_cap: 0.0,
             },
             action_abstraction: MpActionAbstractionConfig {
+                max_flop_players: None,
                 preflop: tiny_preflop_size,
                 flop: tiny_postflop_size.clone(),
                 turn: tiny_postflop_size.clone(),
@@ -4491,6 +4492,7 @@ snapshots:
             raise: vec![vec![yaml_f64(1.0)]],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop,
             flop: postflop.clone(),
             turn: postflop.clone(),
@@ -4552,6 +4554,7 @@ snapshots:
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop,
             flop: empty.clone(),
             turn: empty.clone(),

@@ -23,6 +23,7 @@ clustering:
     buckets: 100
 
 action_abstraction:
+  max_flop_players: 3
   preflop:
     lead: ["2bb"]
     raise:

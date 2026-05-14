@@ -468,6 +468,7 @@ mod tests {
             raise: vec![],
         };
         let action = MpActionAbstractionConfig {
+            max_flop_players: None,
             preflop: empty.clone(),
             flop: empty.clone(),
             turn: empty.clone(),

@@ -58,6 +58,7 @@ game:
       amount: 2
 
 action_abstraction:
+  max_flop_players: 3           # optional preflop cap; omit for uncapped
   preflop:
     lead: ["5bb", "6bb"]        # opening raise sizes
     raise:
@@ -123,6 +124,8 @@ snapshots:
 #### 100bb Status
 
 100bb is a target stack depth for Blueprint MP. Use `training.backend: lazy_sparse` for 100bb 6-max configs with multiple preflop raise depths; it generates public states on demand and stores only visited infosets. The default `eager` backend still builds the complete public betting tree and dense regret/strategy storage before training, so `inspect-mp-config` will block known 100bb-scale dense-risk patterns unless `lazy_sparse` is selected.
+
+Set `action_abstraction.max_flop_players` to cap how many active players can continue from preflop to the flop. When set, preflop non-closing calls that would consume the last allowed flop-player slot are removed, while action-closing calls are still allowed up to the cap. Omitting the field preserves uncapped action generation.
 
 Lazy sparse DCFR discounting runs in parallel across sparse storage shards. The `discount` timing field in no-TUI telemetry is the wall-clock measurement to watch when checking whether discount passes are still causing single-core pauses.
 

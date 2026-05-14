@@ -47,6 +47,7 @@ fn sized_action_config() -> MpActionAbstractionConfig {
         raise: vec![vec![serde_yaml::Value::String("3.0x".into())]],
     };
     MpActionAbstractionConfig {
+        max_flop_players: None,
         preflop,
         flop: postflop.clone(),
         turn: postflop.clone(),
@@ -83,6 +84,7 @@ fn build_full_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         raise: vec![],
     };
     let action = MpActionAbstractionConfig {
+        max_flop_players: None,
         preflop: empty.clone(),
         flop: empty.clone(),
         turn: empty.clone(),

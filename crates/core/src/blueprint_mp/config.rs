@@ -102,6 +102,8 @@ pub enum ForcedBetKind {
 /// Per-street action abstraction with lead/raise split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MpActionAbstractionConfig {
+    #[serde(default)]
+    pub max_flop_players: Option<u8>,
     pub preflop: MpStreetSizes,
     pub flop: MpStreetSizes,
     pub turn: MpStreetSizes,
@@ -289,6 +291,7 @@ game:
       amount: 2.0
 
 action_abstraction:
+  max_flop_players: 3
   preflop:
     lead: [0.5, 1.0]
     raise:
@@ -331,6 +334,7 @@ snapshots:
 
         assert_eq!(cfg.game.num_players, 6);
         assert_eq!(cfg.training.backend, MpTrainingBackend::Eager);
+        assert_eq!(cfg.action_abstraction.max_flop_players, Some(3));
         assert_eq!(cfg.game.blinds.len(), 3);
         assert!(matches!(cfg.game.blinds[2].kind, ForcedBetKind::BbAnte));
     }
@@ -391,6 +395,7 @@ snapshots:
         let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("failed to parse backend");
 
         assert_eq!(cfg.training.backend, MpTrainingBackend::LazySparse);
+        assert_eq!(cfg.action_abstraction.max_flop_players, None);
     }
 
     #[timed_test]
