@@ -79,7 +79,9 @@ fn build_river_batch_inputs(
     for &river in &valid_rivers {
         let mut board_5 = board.to_vec();
         board_5.push(river);
-        let (oop_r, ip_r) = blocker_adjust_ranges(oop_1326, ip_1326, river);
+        let (mut oop_r, mut ip_r) = blocker_adjust_ranges(oop_1326, ip_1326, river);
+        sanitize_canonical_inference_ranges(&mut oop_r, &mut ip_r, &board_5)
+            .expect("river-enumerated boundary inference ranges must be valid");
         let row = encode_boundary_inference_input(&oop_r, &ip_r, &board_5, pot, eff_stack, player);
         flat_input.extend_from_slice(&row);
     }
@@ -182,6 +184,18 @@ pub fn sanitize_canonical_range_after_blockers(
         *value /= mass;
     }
     Ok(true)
+}
+
+fn sanitize_canonical_inference_ranges(
+    oop_1326: &mut [f32],
+    ip_1326: &mut [f32],
+    board: &[u8],
+) -> Result<(bool, bool), String> {
+    let oop_has_mass = sanitize_canonical_range_after_blockers(oop_1326, board)
+        .map_err(|e| format!("invalid OOP inference range: {e}"))?;
+    let ip_has_mass = sanitize_canonical_range_after_blockers(ip_1326, board)
+        .map_err(|e| format!("invalid IP inference range: {e}"))?;
+    Ok((oop_has_mass, ip_has_mass))
 }
 
 /// BoundaryNet normalizes chip CFV targets by `pot + effective_stack`.
@@ -362,6 +376,8 @@ impl NeuralBoundaryEvaluator {
                 ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
             }
         }
+        sanitize_canonical_inference_ranges(&mut oop_range_1326, &mut ip_range_1326, &self.board)
+            .expect("mapped game-order boundary inference ranges must be valid");
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
@@ -421,8 +437,12 @@ impl NeuralBoundaryEvaluator {
         eff_stack: f32,
         player: u8,
     ) -> Vec<f32> {
+        let mut oop_clean = oop_1326.to_vec();
+        let mut ip_clean = ip_1326.to_vec();
+        sanitize_canonical_inference_ranges(&mut oop_clean, &mut ip_clean, board)
+            .expect("burn boundary inference ranges must be valid");
         let input =
-            encode_boundary_inference_input(oop_1326, ip_1326, board, pot, eff_stack, player);
+            encode_boundary_inference_input(&oop_clean, &ip_clean, board, pot, eff_stack, player);
         let device = Default::default();
         let tensor =
             Tensor::<NdArray, 2>::from_data(TensorData::new(input, [1, INPUT_SIZE]), &device);
@@ -573,6 +593,8 @@ impl NeuralBoundaryEvaluator {
                 ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
             }
         }
+        sanitize_canonical_inference_ranges(&mut oop_range_1326, &mut ip_range_1326, &self.board)
+            .expect("mapped game-order boundary inference ranges must be valid");
         (oop_range_1326, ip_range_1326)
     }
 
@@ -648,10 +670,14 @@ impl NeuralBoundaryEvaluator {
         pot: f32,
         eff_stack: f32,
     ) -> (Vec<f32>, Vec<f32>) {
+        let mut oop_clean = oop_1326.to_vec();
+        let mut ip_clean = ip_1326.to_vec();
+        sanitize_canonical_inference_ranges(&mut oop_clean, &mut ip_clean, board)
+            .expect("onnx boundary inference ranges must be valid");
         let mut input_vec = Vec::with_capacity(2 * INPUT_SIZE);
         for player in [0_u8, 1] {
             input_vec.extend(encode_boundary_inference_input(
-                oop_1326, ip_1326, board, pot, eff_stack, player,
+                &oop_clean, &ip_clean, board, pot, eff_stack, player,
             ));
         }
         let input_tensor = ort::value::Tensor::from_array(([2_i64, INPUT_SIZE as i64], input_vec))
@@ -1014,6 +1040,54 @@ mod tests {
 
         assert!(!has_mass);
         assert_eq!(range.iter().sum::<f32>(), 0.0);
+    }
+
+    #[test]
+    fn river_batch_inputs_renormalize_after_candidate_river_blockers() {
+        let board = vec![0u8, 4, 8, 12];
+        let oop_range = vec![2.0_f32; NUM_COMBOS];
+        let ip_range = vec![3.0_f32; NUM_COMBOS];
+        let river = 20u8;
+
+        let (valid_rivers, flat_input) =
+            build_river_batch_inputs(&board, &oop_range, &ip_range, 100.0, 150.0, 0);
+        let row_idx = valid_rivers
+            .iter()
+            .position(|&r| r == river)
+            .expect("river should be valid");
+        let row = &flat_input[row_idx * INPUT_SIZE..(row_idx + 1) * INPUT_SIZE];
+        let oop = &row[..NUM_COMBOS];
+        let ip = &row[NUM_COMBOS..2 * NUM_COMBOS];
+
+        let mut board_5 = board.clone();
+        board_5.push(river);
+        assert_eq!(oop[card_pair_to_index(0, 1)], 0.0);
+        assert_eq!(oop[card_pair_to_index(20, 21)], 0.0);
+        assert_eq!(ip[card_pair_to_index(4, 5)], 0.0);
+        assert_eq!(ip[card_pair_to_index(20, 22)], 0.0);
+        assert!((oop.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!((ip.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        for combo_idx in 0..NUM_COMBOS {
+            if combo_contains_any_board_card(combo_idx, &board_5) {
+                assert_eq!(oop[combo_idx], 0.0);
+                assert_eq!(ip[combo_idx], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn river_batch_inputs_keep_zero_mass_ranges_zero() {
+        let board = vec![0u8, 4, 8, 12];
+        let oop_range = vec![0.0_f32; NUM_COMBOS];
+        let ip_range = vec![0.0_f32; NUM_COMBOS];
+
+        let (_valid_rivers, flat_input) =
+            build_river_batch_inputs(&board, &oop_range, &ip_range, 100.0, 150.0, 0);
+
+        for row in flat_input.chunks_exact(INPUT_SIZE) {
+            assert_eq!(row[..NUM_COMBOS].iter().sum::<f32>(), 0.0);
+            assert_eq!(row[NUM_COMBOS..2 * NUM_COMBOS].iter().sum::<f32>(), 0.0);
+        }
     }
 
     #[test]
