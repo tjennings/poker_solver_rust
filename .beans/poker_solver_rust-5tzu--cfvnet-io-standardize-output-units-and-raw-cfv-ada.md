@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-5tzu
 title: 'CFVNet IO: standardize output units and raw-CFV adapter'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:10:45Z
-updated_at: 2026-05-14T01:10:45Z
+updated_at: 2026-05-14T01:26:29Z
 parent: poker_solver_rust-8e9f
 blocked_by:
     - poker_solver_rust-kai4
