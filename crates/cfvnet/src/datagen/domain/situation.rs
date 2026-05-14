@@ -1,6 +1,9 @@
 use crate::config::DatagenConfig;
+use crate::datagen::blueprint_ranges::BlueprintRangeGenerator;
 use crate::datagen::precompute_ranges::PrecomputedRanges;
-use crate::datagen::sampler::{Situation, sample_situation, sample_situation_with_blueprint};
+use crate::datagen::sampler::{
+    Situation, sample_situation, sample_situation_with_blueprint, sample_situation_with_river_spot,
+};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::path::Path;
@@ -11,12 +14,26 @@ pub enum RangeSource {
     Rsp,
     /// Blueprint-derived ranges from precomputed preflop paths.
     Blueprint(PrecomputedRanges),
+    /// Concrete river spots sampled by walking a full blueprint bundle.
+    SampledRiver(BlueprintRangeGenerator),
 }
 
 impl RangeSource {
     /// Load from config: if `blueprint_path` is set, load precomputed ranges.
     /// Otherwise use RSP.
     pub fn from_config(config: &DatagenConfig) -> Result<Self, String> {
+        if config.sampled_river_spots {
+            let bp_path = config
+                .blueprint_bundle_path
+                .as_ref()
+                .or(config.blueprint_path.as_ref())
+                .ok_or("sampled_river_spots requires blueprint_bundle_path")?;
+            let path = Path::new(bp_path);
+            let generator = BlueprintRangeGenerator::load(path)
+                .map_err(|e| format!("load blueprint bundle: {e}"))?;
+            eprintln!("[SituationGenerator] sampling reached river spots from {bp_path}");
+            return Ok(RangeSource::SampledRiver(generator));
+        }
         if let Some(ref bp_path) = config.blueprint_path {
             let path = Path::new(bp_path);
             let ranges =
@@ -88,6 +105,16 @@ impl Iterator for SituationGenerator {
                     precomputed,
                     &mut self.rng,
                 ),
+                RangeSource::SampledRiver(generator) => match sample_situation_with_river_spot(
+                    &self.config,
+                    self.initial_stack,
+                    self.board_size,
+                    generator,
+                    &mut self.rng,
+                ) {
+                    Some(sit) => sit,
+                    None => continue,
+                },
             };
             if sit.effective_stack > 0 {
                 return Some(sit);

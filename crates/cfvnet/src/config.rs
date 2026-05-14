@@ -207,6 +207,16 @@ pub struct DatagenConfig {
     /// When set, datagen uses blueprint-propagated ranges instead of random RSP.
     #[serde(default)]
     pub blueprint_path: Option<String>,
+    /// Path to a full blueprint bundle used by sampled river-spot datagen.
+    /// Unlike `blueprint_path`, this points at the bundle directory rather than
+    /// a precomputed range cache.
+    #[serde(default)]
+    pub blueprint_bundle_path: Option<String>,
+    /// When true and `street=river`, sample reached river spots by walking the
+    /// blueprint strategy through preflop/flop/turn instead of combining random
+    /// boards with preflop-only ranges.
+    #[serde(default)]
+    pub sampled_river_spots: bool,
     /// Solver backend: "cpu" (default) or "gpu".
     #[serde(default = "default_backend")]
     pub backend: String,
@@ -237,6 +247,8 @@ impl Default for DatagenConfig {
             river_output: None,
             per_file: None,
             blueprint_path: None,
+            blueprint_bundle_path: None,
+            sampled_river_spots: false,
             backend: default_backend(),
             gpu_batch_size: None,
         }
@@ -761,6 +773,8 @@ datagen:
     fn blueprint_path_defaults_to_none() {
         let config = DatagenConfig::default();
         assert!(config.blueprint_path.is_none());
+        assert!(config.blueprint_bundle_path.is_none());
+        assert!(!config.sampled_river_spots);
     }
 
     #[test]
@@ -791,6 +805,26 @@ datagen:
 "#;
         let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.datagen.blueprint_path.is_none());
+    }
+
+    #[test]
+    fn parse_config_with_sampled_river_spots() {
+        let yaml = r#"
+game:
+  initial_stack: 200
+  bet_sizes: ["50%", "a"]
+datagen:
+  street: "river"
+  num_samples: 100
+  sampled_river_spots: true
+  blueprint_bundle_path: "/path/to/blueprint_bundle"
+"#;
+        let config: CfvnetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.datagen.sampled_river_spots);
+        assert_eq!(
+            config.datagen.blueprint_bundle_path.as_deref(),
+            Some("/path/to/blueprint_bundle")
+        );
     }
 
     #[test]

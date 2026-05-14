@@ -634,6 +634,9 @@ fn sample_turn_boundary_situation<'a, R: Rng>(
             precomputed,
             rng,
         ),
+        RangeSource::SampledRiver(_) => {
+            return Err("sampled_river_spots only supports datagen.street=river".into());
+        }
     };
     let raise_depth = stratum
         .and_then(|stratum| stratum.raise_depth.as_deref())
