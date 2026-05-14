@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -169,6 +170,19 @@ pub struct SparseInsertAttribution {
     pub action_count_max: u64,
 }
 
+/// Cumulative negative-action gate and subtree purge telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparseNegativeActionTelemetry {
+    pub actions_newly_pruned: u64,
+    pub actions_reactivated: u64,
+    pub subtree_purge_calls: u64,
+    pub rows_purged: u64,
+    pub regret_slots_purged: u64,
+    pub strategy_slots_purged: u64,
+    pub blocked_traversal_skips: u64,
+    pub purge_scan_nanos: u64,
+}
+
 /// Regret and average-strategy sample for sparse telemetry.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SparseTelemetrySample {
@@ -255,6 +269,14 @@ pub struct SparseMpStorage {
     insert_history_len_max: AtomicU64,
     insert_action_count_sum: AtomicU64,
     insert_action_count_max: AtomicU64,
+    negative_actions_newly_pruned: AtomicU64,
+    negative_actions_reactivated: AtomicU64,
+    negative_subtree_purge_calls: AtomicU64,
+    negative_rows_purged: AtomicU64,
+    negative_regret_slots_purged: AtomicU64,
+    negative_strategy_slots_purged: AtomicU64,
+    negative_blocked_traversal_skips: AtomicU64,
+    negative_purge_scan_nanos: AtomicU64,
     regret_floor: AtomicI32,
 }
 
@@ -306,6 +328,14 @@ impl SparseMpStorage {
             insert_history_len_max: AtomicU64::new(0),
             insert_action_count_sum: AtomicU64::new(0),
             insert_action_count_max: AtomicU64::new(0),
+            negative_actions_newly_pruned: AtomicU64::new(0),
+            negative_actions_reactivated: AtomicU64::new(0),
+            negative_subtree_purge_calls: AtomicU64::new(0),
+            negative_rows_purged: AtomicU64::new(0),
+            negative_regret_slots_purged: AtomicU64::new(0),
+            negative_strategy_slots_purged: AtomicU64::new(0),
+            negative_blocked_traversal_skips: AtomicU64::new(0),
+            negative_purge_scan_nanos: AtomicU64::new(0),
             regret_floor: AtomicI32::new(i32::MIN),
         }
     }
@@ -398,6 +428,29 @@ impl SparseMpStorage {
             action_count_sum: self.insert_action_count_sum.load(Ordering::Relaxed),
             action_count_max: self.insert_action_count_max.load(Ordering::Relaxed),
         }
+    }
+
+    /// Cumulative negative-action subtree purge experiment telemetry.
+    #[must_use]
+    pub fn negative_action_telemetry(&self) -> SparseNegativeActionTelemetry {
+        SparseNegativeActionTelemetry {
+            actions_newly_pruned: self.negative_actions_newly_pruned.load(Ordering::Relaxed),
+            actions_reactivated: self.negative_actions_reactivated.load(Ordering::Relaxed),
+            subtree_purge_calls: self.negative_subtree_purge_calls.load(Ordering::Relaxed),
+            rows_purged: self.negative_rows_purged.load(Ordering::Relaxed),
+            regret_slots_purged: self.negative_regret_slots_purged.load(Ordering::Relaxed),
+            strategy_slots_purged: self.negative_strategy_slots_purged.load(Ordering::Relaxed),
+            blocked_traversal_skips: self
+                .negative_blocked_traversal_skips
+                .load(Ordering::Relaxed),
+            purge_scan_nanos: self.negative_purge_scan_nanos.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count a traversal action skipped because a negative-action gate is blocked.
+    pub fn record_negative_action_blocked_traversal_skip(&self) {
+        self.negative_blocked_traversal_skips
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sample sparse entries for TUI telemetry without scanning the whole store.
@@ -508,6 +561,7 @@ impl SparseMpStorage {
             return SparsePurgeStats::default();
         }
 
+        let started = Instant::now();
         let mut stats = SparsePurgeStats::default();
         for (shard_idx, shard) in self.shards.iter().enumerate() {
             let mut guard = lock_entries(shard);
@@ -546,6 +600,7 @@ impl SparseMpStorage {
                 stats.strategy_slots_purged += shard_slots_purged;
             }
         }
+        self.record_negative_action_purge_scan(stats, started);
         stats
     }
 
@@ -586,6 +641,8 @@ impl SparseMpStorage {
                         self.purge_subtree_with_history_prefix(prefix_hi, prefix_lo, prefix_len);
                     guard.remove(&edge);
                     self.blocked_edge_count.fetch_sub(1, Ordering::Release);
+                    self.negative_actions_reactivated
+                        .fetch_add(1, Ordering::Relaxed);
                     return NegativeActionGateResult {
                         reactivated: true,
                         purge_stats,
@@ -608,6 +665,8 @@ impl SparseMpStorage {
 
             guard.insert(edge);
             self.blocked_edge_count.fetch_add(1, Ordering::Release);
+            self.negative_actions_newly_pruned
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         let purge_stats = self.purge_subtree_with_history_prefix(prefix_hi, prefix_lo, prefix_len);
@@ -892,6 +951,27 @@ impl SparseMpStorage {
             .fetch_max(action_count, Ordering::Relaxed);
     }
 
+    fn record_negative_action_purge_scan(&self, stats: SparsePurgeStats, started: Instant) {
+        self.negative_subtree_purge_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.negative_rows_purged.fetch_add(
+            saturating_usize_to_u64(stats.rows_purged),
+            Ordering::Relaxed,
+        );
+        self.negative_regret_slots_purged.fetch_add(
+            saturating_usize_to_u64(stats.regret_slots_purged),
+            Ordering::Relaxed,
+        );
+        self.negative_strategy_slots_purged.fetch_add(
+            saturating_usize_to_u64(stats.strategy_slots_purged),
+            Ordering::Relaxed,
+        );
+        self.negative_purge_scan_nanos.fetch_add(
+            saturating_u128_to_u64(started.elapsed().as_nanos()),
+            Ordering::Relaxed,
+        );
+    }
+
     fn shard_index_for(&self, key: MpInfosetKey) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
@@ -912,6 +992,14 @@ impl SparseMpStorage {
 
 fn load_atomic_array<const N: usize>(atoms: &[AtomicU64; N]) -> [u64; N] {
     std::array::from_fn(|idx| atoms[idx].load(Ordering::Relaxed))
+}
+
+fn saturating_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn history_len_bin(history_len: u16) -> usize {
@@ -1575,6 +1663,63 @@ mod tests {
         assert_eq!(result, NegativeActionGateResult::default());
         assert_eq!(storage.negative_action_blocked_edge_count(), 0);
         assert_eq!(storage.get_regret(child, 0), 22);
+    }
+
+    #[timed_test]
+    fn negative_action_telemetry_accumulates_gate_purge_and_skip_counters() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[7]);
+        let child = history_key(2, &[7, 3]);
+        let grandchild = history_key(3, &[7, 3, 4]);
+        let (child_hi, child_lo) = pack_history(&[7, 3]);
+
+        assert_eq!(
+            storage.negative_action_telemetry(),
+            SparseNegativeActionTelemetry::default()
+        );
+
+        storage.add_regret(parent, 4, 3, -6);
+        storage.add_regret(child, 2, 0, 22);
+        storage.add_regret(grandchild, 3, 1, 33);
+
+        let first =
+            storage.transition_negative_action_edge(parent, 3, -6, -5, 0, (child_hi, child_lo, 2));
+        assert!(first.blocked);
+        assert_eq!(first.purge_stats.rows_purged, 2);
+
+        let after_prune = storage.negative_action_telemetry();
+        assert_eq!(after_prune.actions_newly_pruned, 1);
+        assert_eq!(after_prune.actions_reactivated, 0);
+        assert_eq!(after_prune.subtree_purge_calls, 1);
+        assert_eq!(after_prune.rows_purged, 2);
+        assert_eq!(after_prune.regret_slots_purged, 5);
+        assert_eq!(after_prune.strategy_slots_purged, 5);
+        assert_eq!(after_prune.blocked_traversal_skips, 0);
+
+        storage.record_negative_action_blocked_traversal_skip();
+        storage.record_negative_action_blocked_traversal_skip();
+        let after_skips = storage.negative_action_telemetry();
+        assert_eq!(after_skips.blocked_traversal_skips, 2);
+
+        let still_blocked =
+            storage.transition_negative_action_edge(parent, 3, -1, -5, 0, (child_hi, child_lo, 2));
+        assert!(still_blocked.blocked);
+        let after_repurge = storage.negative_action_telemetry();
+        assert_eq!(after_repurge.actions_newly_pruned, 1);
+        assert_eq!(after_repurge.subtree_purge_calls, 2);
+        assert_eq!(after_repurge.rows_purged, 2);
+
+        let reactivated =
+            storage.transition_negative_action_edge(parent, 3, 0, -5, 0, (child_hi, child_lo, 2));
+        assert!(reactivated.reactivated);
+        let final_telemetry = storage.negative_action_telemetry();
+        assert_eq!(final_telemetry.actions_newly_pruned, 1);
+        assert_eq!(final_telemetry.actions_reactivated, 1);
+        assert_eq!(final_telemetry.subtree_purge_calls, 3);
+        assert_eq!(final_telemetry.rows_purged, 2);
+        assert_eq!(final_telemetry.regret_slots_purged, 5);
+        assert_eq!(final_telemetry.strategy_slots_purged, 5);
+        assert_eq!(final_telemetry.blocked_traversal_skips, 2);
     }
 
     #[timed_test]

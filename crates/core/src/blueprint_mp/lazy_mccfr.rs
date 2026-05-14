@@ -484,6 +484,7 @@ fn traverse_traverser(
     for (action_idx, action) in actions.iter().copied().enumerate() {
         let child_history = history.append(action_idx);
         if blocked[action_idx] {
+            storage.record_negative_action_blocked_traversal_skip();
             pruned[action_idx] = true;
             continue;
         }
@@ -588,6 +589,12 @@ fn traverse_opponent(
     storage.add_strategy_sum(key, num_actions, sampled, delta);
 
     let child_history = history.append(sampled);
+    // Opponent nodes only attempt the sampled child. Use a read-only current
+    // edge check here so telemetry cannot count blocked non-sampled actions or
+    // perturb traversal/purge behavior with a second gate transition.
+    if negative_action.enabled && storage.is_negative_action_edge_blocked(key, sampled) {
+        storage.record_negative_action_blocked_traversal_skip();
+    }
     let (value, stats) = traverse_node(
         game,
         storage,
@@ -1869,5 +1876,49 @@ mod tests {
         assert!(value.is_finite());
         assert!(storage.is_negative_action_edge_blocked(root_key, action_idx));
         assert_eq!(storage.get_regret(descendant_key, 0), 0);
+        assert_eq!(
+            storage.negative_action_telemetry().blocked_traversal_skips,
+            1
+        );
+    }
+
+    #[timed_test]
+    fn lazy_negative_action_opponent_mask_does_not_count_non_sampled_skips() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let mut rng = SmallRng::seed_from_u64(44);
+        let deal = sample_deal(2, &mut rng);
+        let buckets = test_buckets(&deal, [10, 10, 10, 10]);
+        let root = game.root_state();
+        let root_bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
+        let root_history = LazyHistory::default();
+        let root_key = root_history.key(root, root_bucket);
+        let action_idx = 0;
+
+        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+
+        let (value, _stats) = traverse_external_lazy(
+            &game,
+            &storage,
+            &buckets,
+            Seat::from_raw((root.to_act.index() + 1) % root.num_players),
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            -250,
+            NegativeActionTraversalConfig {
+                enabled: true,
+                prune_below: -1,
+                reactivate_at: 0,
+            },
+        );
+
+        assert!(value.is_finite());
+        assert!(storage.is_negative_action_edge_blocked(root_key, action_idx));
+        assert_eq!(
+            storage.negative_action_telemetry().blocked_traversal_skips,
+            0
+        );
     }
 }
