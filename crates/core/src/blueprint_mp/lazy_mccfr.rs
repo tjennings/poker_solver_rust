@@ -466,7 +466,7 @@ fn traverse_traverser(
     }
     // A concurrent worker may block an edge after this snapshot. Keep any
     // already-started traversal value rather than replacing it with an
-    // artificial zero; later gate transitions can still purge descendants.
+    // artificial zero; physical purge is deferred to the discount boundary.
     let mut eligible_strategy = [0.0; MAX_ACTIONS];
     if !mask_strategy_to_unblocked(
         &strategy[..num_actions],
@@ -591,7 +591,7 @@ fn traverse_opponent(
     let child_history = history.append(sampled);
     // Opponent nodes only attempt the sampled child. Use a read-only current
     // edge check here so telemetry cannot count blocked non-sampled actions or
-    // perturb traversal/purge behavior with a second gate transition.
+    // perturb traversal blocking with a second gate transition.
     if negative_action.enabled && storage.is_negative_action_edge_blocked(key, sampled) {
         storage.record_negative_action_blocked_traversal_skip();
     }
@@ -1873,7 +1873,7 @@ mod tests {
     }
 
     #[timed_test]
-    fn lazy_negative_action_gate_purges_descendants_and_skips_reallocation() {
+    fn lazy_negative_action_gate_blocks_without_traversal_time_purge() {
         let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
         let storage = SparseMpStorage::with_shards(8);
         let mut rng = SmallRng::seed_from_u64(43);
@@ -1911,7 +1911,7 @@ mod tests {
 
         assert!(value.is_finite());
         assert!(storage.is_negative_action_edge_blocked(root_key, action_idx));
-        assert_eq!(storage.get_regret(descendant_key, 0), 0);
+        assert_eq!(storage.get_regret(descendant_key, 0), 17);
         assert_eq!(
             storage.negative_action_telemetry().blocked_traversal_skips,
             1

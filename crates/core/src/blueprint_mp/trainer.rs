@@ -337,6 +337,7 @@ fn training_loop_lazy(
         if should_discount(meta_iter, config) {
             let discount_started = Instant::now();
             apply_dcfr_discount_lazy(storage, meta_iter, config);
+            purge_negative_action_subtrees_after_discount(storage, config);
             LAZY_DISCOUNT_NANOS.fetch_add(nanos_since(discount_started), Ordering::Relaxed);
         }
     }
@@ -635,6 +636,21 @@ fn apply_dcfr_discount_lazy(storage: &SparseMpStorage, meta_iter: u64, config: &
     let d_strat = strategy_discount_factor(epoch, config.dcfr_gamma);
 
     storage.discount(d_pos, d_neg, d_strat);
+}
+
+fn purge_negative_action_subtrees_after_discount(
+    storage: &SparseMpStorage,
+    config: &MpTrainingConfig,
+) {
+    if !config.negative_action_subtree_purge_enabled {
+        return;
+    }
+    if config.negative_action_purge_mode != MpNegativeActionPurgeMode::ScanHistoryPrefix {
+        return;
+    }
+    storage.purge_blocked_negative_action_subtrees_after_discount(
+        config.negative_action_reactivate_at,
+    );
 }
 
 fn regret_discount_factors(epoch: u64, alpha: f64, beta: f64) -> (f64, f64) {
