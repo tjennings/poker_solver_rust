@@ -113,6 +113,9 @@ enum Commands {
         /// Number of rows to show per hand-class audit section (default 10)
         #[arg(long, default_value = "10")]
         hand_class_audit_top: usize,
+        /// Write a machine-readable bucket audit scorecard to this JSON file
+        #[arg(long)]
+        scorecard_json: Option<PathBuf>,
     },
     /// Pre-compute the equity+delta lookup cache for fast expected-delta bucketing.
     /// Generates turn table first (averaging over river cards), then flop table
@@ -1044,6 +1047,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             hand_class_audit,
             hand_class_audit_boards,
             hand_class_audit_top,
+            scorecard_json,
         } => {
             use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
             use poker_solver_core::blueprint_v2::cluster_diagnostics::{
@@ -1055,6 +1059,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 poker_solver_core::blueprint_v2::cluster_diagnostics::diagnose_cluster_dir(
                     &cluster_dir,
                 )?;
+            let mut hand_class_reports = Vec::new();
             if reports.is_empty() {
                 eprintln!("No .buckets files found in {}", cluster_dir.display());
             } else {
@@ -1151,8 +1156,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                             hand_class_audit_top,
                         );
                         eprintln!("{}", report.summary());
+                        hand_class_reports.push(report);
                     }
                 }
+            }
+            if let Some(path) = scorecard_json {
+                let scorecard =
+                    build_cluster_scorecard_json(&cluster_dir, &reports, &hand_class_reports);
+                let json = serde_json::to_string_pretty(&scorecard)?;
+                std::fs::write(&path, json)?;
+                eprintln!("\nWrote bucket audit scorecard to {}", path.display());
             }
             // Per-flop bucket file diagnostics
             let per_flop_marker = cluster_dir.join("flop_0000.buckets");
@@ -3493,6 +3506,202 @@ fn next_snapshot_index(output_dir: &Path) -> std::io::Result<u32> {
         }
     }
     Ok(next)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn build_cluster_scorecard_json(
+    cluster_dir: &Path,
+    reports: &[poker_solver_core::blueprint_v2::cluster_diagnostics::ClusterReport],
+    hand_class_reports: &[poker_solver_core::blueprint_v2::cluster_diagnostics::HandClassBucketAuditReport],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "cluster_dir": cluster_dir.display().to_string(),
+        "cluster_reports": reports.iter().map(cluster_report_scorecard_json).collect::<Vec<_>>(),
+        "hand_class_audits": hand_class_reports
+            .iter()
+            .map(hand_class_audit_scorecard_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn cluster_report_scorecard_json(
+    report: &poker_solver_core::blueprint_v2::cluster_diagnostics::ClusterReport,
+) -> serde_json::Value {
+    let mean = report.size_stats.mean;
+    let max_to_mean = if mean > 0.0 {
+        report.size_stats.max as f64 / mean
+    } else {
+        0.0
+    };
+    let std_to_mean = if mean > 0.0 {
+        report.size_stats.std_dev / mean
+    } else {
+        0.0
+    };
+    let empty_buckets = report
+        .bucket_sizes
+        .iter()
+        .filter(|&&count| count == 0)
+        .count();
+
+    serde_json::json!({
+        "street": &report.street,
+        "bucket_count": report.bucket_count,
+        "board_count": report.board_count,
+        "combos_per_board": report.combos_per_board,
+        "total_entries": report.total_entries,
+        "bucket_size": {
+            "min": report.size_stats.min,
+            "p50": percentile_usize(&report.bucket_sizes, 0.50),
+            "p90": percentile_usize(&report.bucket_sizes, 0.90),
+            "p99": percentile_usize(&report.bucket_sizes, 0.99),
+            "max": report.size_stats.max,
+            "mean": report.size_stats.mean,
+            "std_dev": report.size_stats.std_dev,
+            "max_to_mean": max_to_mean,
+            "std_to_mean": std_to_mean,
+            "empty_buckets": empty_buckets,
+        },
+    })
+}
+
+fn hand_class_audit_scorecard_json(
+    report: &poker_solver_core::blueprint_v2::cluster_diagnostics::HandClassBucketAuditReport,
+) -> serde_json::Value {
+    let max_distinct_buckets = report
+        .class_strength_groups
+        .iter()
+        .map(|group| group.distinct_buckets)
+        .max()
+        .unwrap_or(0);
+    let max_bucket_entropy = report
+        .class_strength_groups
+        .iter()
+        .map(|group| group.bucket_entropy)
+        .fold(0.0_f64, f64::max);
+    let max_class_entropy = report
+        .bucket_mixes
+        .iter()
+        .map(|mix| mix.class_entropy)
+        .fold(0.0_f64, f64::max);
+    let max_equity_span = report
+        .bucket_mixes
+        .iter()
+        .map(|mix| mix.max_equity - mix.min_equity)
+        .fold(0.0_f64, f64::max);
+    let max_inversion_delta = report
+        .strength_inversions
+        .iter()
+        .map(|inversion| inversion.delta_buckets)
+        .fold(0.0_f64, f64::max);
+
+    serde_json::json!({
+        "street": &report.street,
+        "bucket_count": report.bucket_count,
+        "sample_boards": report.sample_boards,
+        "assignments": report.assignments,
+        "skipped_lookups": report.skipped_lookups,
+        "summary": {
+            "class_strength_group_count": report.class_strength_groups.len(),
+            "bucket_mix_count": report.bucket_mixes.len(),
+            "strength_inversion_count": report.strength_inversions.len(),
+            "max_distinct_buckets": max_distinct_buckets,
+            "max_bucket_entropy": max_bucket_entropy,
+            "max_class_entropy": max_class_entropy,
+            "max_equity_span": max_equity_span,
+            "max_inversion_delta": max_inversion_delta,
+        },
+        "worst_class_strength_spreads": report
+            .class_strength_groups
+            .iter()
+            .take(report.top_n)
+            .map(class_strength_group_scorecard_json)
+            .collect::<Vec<_>>(),
+        "worst_mixed_buckets": report
+            .bucket_mixes
+            .iter()
+            .take(report.top_n)
+            .map(bucket_mix_scorecard_json)
+            .collect::<Vec<_>>(),
+        "strength_inversions": report
+            .strength_inversions
+            .iter()
+            .take(report.top_n)
+            .map(strength_inversion_scorecard_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn class_strength_group_scorecard_json(
+    group: &poker_solver_core::blueprint_v2::cluster_diagnostics::HandClassStrengthBucketStats,
+) -> serde_json::Value {
+    serde_json::json!({
+        "contribution": &group.contribution,
+        "hand_class": &group.hand_class,
+        "strength": group.strength,
+        "equity_decile": group.equity_decile,
+        "count": group.count,
+        "distinct_buckets": group.distinct_buckets,
+        "bucket_entropy": group.bucket_entropy,
+        "mean_bucket": group.mean_bucket,
+        "top_buckets": group.top_buckets.iter().map(|bucket| {
+            serde_json::json!({
+                "bucket_id": bucket.bucket_id,
+                "count": bucket.count,
+                "share": bucket.share,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn bucket_mix_scorecard_json(
+    mix: &poker_solver_core::blueprint_v2::cluster_diagnostics::BucketHandClassMixStats,
+) -> serde_json::Value {
+    serde_json::json!({
+        "bucket_id": mix.bucket_id,
+        "count": mix.count,
+        "dominant_class": &mix.dominant_class,
+        "dominant_share": mix.dominant_share,
+        "class_entropy": mix.class_entropy,
+        "mean_equity": mix.mean_equity,
+        "min_equity": mix.min_equity,
+        "max_equity": mix.max_equity,
+        "equity_span": mix.max_equity - mix.min_equity,
+        "top_classes": mix.top_classes.iter().map(|class| {
+            serde_json::json!({
+                "class_label": &class.class_label,
+                "count": class.count,
+                "share": class.share,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn strength_inversion_scorecard_json(
+    inversion: &poker_solver_core::blueprint_v2::cluster_diagnostics::HandClassStrengthInversion,
+) -> serde_json::Value {
+    serde_json::json!({
+        "contribution": &inversion.contribution,
+        "hand_class": &inversion.hand_class,
+        "weaker_strength": inversion.weaker_strength,
+        "weaker_mean_bucket": inversion.weaker_mean_bucket,
+        "stronger_strength": inversion.stronger_strength,
+        "stronger_mean_bucket": inversion.stronger_mean_bucket,
+        "delta_buckets": inversion.delta_buckets,
+    })
+}
+
+fn percentile_usize(values: &[usize], percentile: f64) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let idx = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 fn mp_strategy_from_storage(
