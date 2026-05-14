@@ -7,7 +7,7 @@
 //! equity for every combo, and reports per-bucket equity statistics to
 //! verify that hands within the same bucket share similar equity profiles.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -25,6 +25,7 @@ use super::cluster_pipeline::{
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::hand_class::{HandClass, classify, intra_class_strength};
 use crate::showdown_equity;
+use crate::showdown_equity::{rank_hand, rank_to_ordinal};
 
 /// Size distribution statistics for bucket assignments.
 #[derive(Debug)]
@@ -409,6 +410,34 @@ pub struct HandClassStrengthInversion {
     pub delta_buckets: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BucketNutDistanceStats {
+    pub bucket_id: u16,
+    pub count: usize,
+    pub min_class_gap: u16,
+    pub max_class_gap: u16,
+    pub mean_class_gap: f64,
+    pub min_dominance_margin: f64,
+    pub max_dominance_margin: f64,
+    pub mean_dominance_margin: f64,
+    pub min_global_rank_percentile: f64,
+    pub max_global_rank_percentile: f64,
+    pub mean_global_rank_percentile: f64,
+    pub blocker_to_nuts_share: f64,
+    pub top_classes: Vec<HandClassShare>,
+}
+
+#[derive(Debug)]
+pub struct RiverNutDistanceAuditReport {
+    pub street: String,
+    pub bucket_count: u16,
+    pub sample_boards: usize,
+    pub assignments: usize,
+    pub skipped_lookups: usize,
+    pub top_n: usize,
+    pub bucket_stats: Vec<BucketNutDistanceStats>,
+}
+
 #[derive(Debug)]
 pub struct HandClassBucketAuditReport {
     pub street: String,
@@ -566,6 +595,48 @@ impl BucketClassAcc {
             max_equity: f64::NEG_INFINITY,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct BucketNutAcc {
+    count: usize,
+    class_counts: Vec<usize>,
+    sum_class_gap: f64,
+    min_class_gap: u16,
+    max_class_gap: u16,
+    sum_dominance_margin: f64,
+    min_dominance_margin: f64,
+    max_dominance_margin: f64,
+    sum_global_rank_percentile: f64,
+    min_global_rank_percentile: f64,
+    max_global_rank_percentile: f64,
+    blocker_to_nuts: usize,
+}
+
+impl BucketNutAcc {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            class_counts: vec![0; HandClass::NUM_MADE],
+            sum_class_gap: 0.0,
+            min_class_gap: u16::MAX,
+            max_class_gap: 0,
+            sum_dominance_margin: 0.0,
+            min_dominance_margin: f64::INFINITY,
+            max_dominance_margin: f64::NEG_INFINITY,
+            sum_global_rank_percentile: 0.0,
+            min_global_rank_percentile: f64::INFINITY,
+            max_global_rank_percentile: f64::NEG_INFINITY,
+            blocker_to_nuts: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RiverComboNutInfo {
+    combo: [Card; 2],
+    class_id: u8,
+    ordinal: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -879,6 +950,226 @@ fn detect_strength_inversions(
     inversions
 }
 
+/// Audit river buckets for nut-distance consistency.
+///
+/// For each sampled river board this precomputes all board-legal combo ranks,
+/// then aggregates each observed combo's same-family nut gap, same-family
+/// dominance margin, global rank percentile, and nut-blocker status by bucket.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn audit_river_nut_distance(
+    bf: &BucketFile,
+    num_sample_boards: usize,
+    seed: u64,
+    top_n: usize,
+) -> RiverNutDistanceAuditReport {
+    if bf.header.street != Street::River || num_sample_boards == 0 {
+        return RiverNutDistanceAuditReport {
+            street: format!("{:?}", bf.header.street),
+            bucket_count: bf.header.bucket_count,
+            sample_boards: 0,
+            assignments: 0,
+            skipped_lookups: 0,
+            top_n,
+            bucket_stats: Vec::new(),
+        };
+    }
+
+    let bucket_count = bf.header.bucket_count as usize;
+    let deck = build_deck();
+    let board_map = bf.board_index_map();
+    let boards = sample_n_card_boards(&deck, 5, num_sample_boards, seed);
+    let mut buckets = vec![BucketNutAcc::new(); bucket_count];
+    let mut assignments = 0_usize;
+    let mut skipped_lookups = 0_usize;
+
+    for board in boards {
+        let infos = board_legal_river_combo_infos(&deck, &board);
+        let nut_ord = infos.iter().map(|info| info.ordinal).max().unwrap_or(0);
+
+        for hero in &infos {
+            let Some(bucket) = canonicalized_combo_bucket(bf, &board_map, &board, hero.combo)
+            else {
+                skipped_lookups += 1;
+                continue;
+            };
+            let bucket_idx = bucket as usize;
+            if bucket_idx >= bucket_count {
+                skipped_lookups += 1;
+                continue;
+            }
+
+            let features = river_combo_nut_features(*hero, &infos, nut_ord);
+            let acc = &mut buckets[bucket_idx];
+            acc.count += 1;
+            acc.class_counts[hero.class_id as usize] += 1;
+            acc.sum_class_gap += f64::from(features.class_gap);
+            acc.min_class_gap = acc.min_class_gap.min(features.class_gap);
+            acc.max_class_gap = acc.max_class_gap.max(features.class_gap);
+            acc.sum_dominance_margin += features.dominance_margin;
+            acc.min_dominance_margin = acc.min_dominance_margin.min(features.dominance_margin);
+            acc.max_dominance_margin = acc.max_dominance_margin.max(features.dominance_margin);
+            acc.sum_global_rank_percentile += features.global_rank_percentile;
+            acc.min_global_rank_percentile = acc
+                .min_global_rank_percentile
+                .min(features.global_rank_percentile);
+            acc.max_global_rank_percentile = acc
+                .max_global_rank_percentile
+                .max(features.global_rank_percentile);
+            acc.blocker_to_nuts += usize::from(features.blocker_to_nuts);
+            assignments += 1;
+        }
+    }
+
+    let mut bucket_stats = buckets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(bucket_id, acc)| build_nut_distance_stats(bucket_id, acc, top_n))
+        .collect::<Vec<_>>();
+    bucket_stats.sort_by(|a, b| {
+        let a_gap = a.max_class_gap.saturating_sub(a.min_class_gap);
+        let b_gap = b.max_class_gap.saturating_sub(b.min_class_gap);
+        b_gap
+            .cmp(&a_gap)
+            .then_with(|| {
+                (b.max_dominance_margin - b.min_dominance_margin)
+                    .partial_cmp(&(a.max_dominance_margin - a.min_dominance_margin))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.count.cmp(&a.count))
+    });
+
+    RiverNutDistanceAuditReport {
+        street: "River".to_string(),
+        bucket_count: bf.header.bucket_count,
+        sample_boards: num_sample_boards,
+        assignments,
+        skipped_lookups,
+        top_n,
+        bucket_stats,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RiverComboNutFeatures {
+    class_gap: u16,
+    dominance_margin: f64,
+    global_rank_percentile: f64,
+    blocker_to_nuts: bool,
+}
+
+fn board_legal_river_combo_infos(deck: &[Card], board: &[Card]) -> Vec<RiverComboNutInfo> {
+    let mut infos = Vec::with_capacity(1081);
+    for i in 0..deck.len() {
+        if board.contains(&deck[i]) {
+            continue;
+        }
+        for j in i + 1..deck.len() {
+            if board.contains(&deck[j]) {
+                continue;
+            }
+            let combo = [deck[i], deck[j]];
+            let Some(classification) = classify(combo, board).ok() else {
+                continue;
+            };
+            let class_id = classification.strongest_made_id();
+            if !HandClass::is_made_hand_id(class_id) {
+                continue;
+            }
+            infos.push(RiverComboNutInfo {
+                combo,
+                class_id,
+                ordinal: rank_to_ordinal(rank_hand(combo, board)),
+            });
+        }
+    }
+    infos
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn river_combo_nut_features(
+    hero: RiverComboNutInfo,
+    infos: &[RiverComboNutInfo],
+    nut_ord: u32,
+) -> RiverComboNutFeatures {
+    let mut wins = 0_u32;
+    let mut ties = 0_u32;
+    let mut legal_opponents = 0_u32;
+    let mut same_family_total = 0_u32;
+    let mut same_family_beaters = 0_u32;
+    let mut stronger_same_family_ordinals = BTreeSet::new();
+    let mut blocker_to_nuts = false;
+
+    for opp in infos {
+        if opp.combo.contains(&hero.combo[0]) || opp.combo.contains(&hero.combo[1]) {
+            if opp.ordinal == nut_ord {
+                blocker_to_nuts = true;
+            }
+            continue;
+        }
+
+        legal_opponents += 1;
+        match hero.ordinal.cmp(&opp.ordinal) {
+            std::cmp::Ordering::Greater => wins += 1,
+            std::cmp::Ordering::Equal => ties += 1,
+            std::cmp::Ordering::Less => {}
+        }
+
+        if opp.class_id == hero.class_id {
+            same_family_total += 1;
+            if opp.ordinal > hero.ordinal {
+                same_family_beaters += 1;
+                stronger_same_family_ordinals.insert(opp.ordinal);
+            }
+        }
+    }
+
+    let global_rank_percentile = if legal_opponents == 0 {
+        0.5
+    } else {
+        (wins as f64 + ties as f64 * 0.5) / legal_opponents as f64
+    };
+    let dominance_margin = if same_family_total == 0 {
+        0.0
+    } else {
+        same_family_beaters as f64 / same_family_total as f64
+    };
+
+    RiverComboNutFeatures {
+        class_gap: stronger_same_family_ordinals.len() as u16,
+        dominance_margin,
+        global_rank_percentile,
+        blocker_to_nuts,
+    }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn build_nut_distance_stats(
+    bucket_id: usize,
+    acc: BucketNutAcc,
+    top_n: usize,
+) -> Option<BucketNutDistanceStats> {
+    if acc.count == 0 {
+        return None;
+    }
+
+    Some(BucketNutDistanceStats {
+        bucket_id: bucket_id as u16,
+        count: acc.count,
+        min_class_gap: acc.min_class_gap,
+        max_class_gap: acc.max_class_gap,
+        mean_class_gap: acc.sum_class_gap / acc.count as f64,
+        min_dominance_margin: acc.min_dominance_margin,
+        max_dominance_margin: acc.max_dominance_margin,
+        mean_dominance_margin: acc.sum_dominance_margin / acc.count as f64,
+        min_global_rank_percentile: acc.min_global_rank_percentile,
+        max_global_rank_percentile: acc.max_global_rank_percentile,
+        mean_global_rank_percentile: acc.sum_global_rank_percentile / acc.count as f64,
+        blocker_to_nuts_share: acc.blocker_to_nuts as f64 / acc.count as f64,
+        top_classes: top_made_class_shares(&acc.class_counts, acc.count, top_n),
+    })
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn top_bucket_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<BucketShare> {
     let mut shares = counts
@@ -917,6 +1208,32 @@ fn top_class_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<HandCla
             #[allow(clippy::cast_possible_truncation)]
             Some(HandClassShare {
                 class_label: contribution_class_label(class_id),
+                count,
+                share: count as f64 / total as f64,
+            })
+        })
+        .collect::<Vec<_>>();
+    shares.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.class_label.cmp(&b.class_label))
+    });
+    shares.truncate(top_n);
+    shares
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn top_made_class_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<HandClassShare> {
+    let mut shares = counts
+        .iter()
+        .enumerate()
+        .filter_map(|(class_id, &count)| {
+            if count == 0 {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(HandClassShare {
+                class_label: hand_class_name(class_id as u8),
                 count,
                 share: count as f64 / total as f64,
             })

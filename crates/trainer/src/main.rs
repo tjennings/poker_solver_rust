@@ -1249,8 +1249,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             if let Some(path) = scorecard_json {
-                let scorecard =
-                    build_cluster_scorecard_json(&cluster_dir, &reports, &hand_class_reports)?;
+                let scorecard = build_cluster_scorecard_json(
+                    &cluster_dir,
+                    &reports,
+                    &hand_class_reports,
+                    hand_class_audit_boards,
+                    hand_class_audit_top,
+                )?;
                 let json = serde_json::to_string_pretty(&scorecard)?;
                 std::fs::write(&path, json)?;
                 eprintln!("\nWrote bucket audit scorecard to {}", path.display());
@@ -3608,6 +3613,8 @@ fn build_cluster_scorecard_json(
     cluster_dir: &Path,
     reports: &[poker_solver_core::blueprint_v2::cluster_diagnostics::ClusterReport],
     hand_class_reports: &[poker_solver_core::blueprint_v2::cluster_diagnostics::HandClassBucketAuditReport],
+    river_nut_distance_boards: usize,
+    top_n: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     Ok(serde_json::json!({
         "schema_version": 1,
@@ -3618,6 +3625,11 @@ fn build_cluster_scorecard_json(
             .map(hand_class_audit_scorecard_json)
             .collect::<Vec<_>>(),
         "selected_suited_hand_profiles": selected_suited_hand_profiles(cluster_dir)?,
+        "river_nut_distance_audit": river_nut_distance_scorecard_json(
+            cluster_dir,
+            river_nut_distance_boards,
+            top_n,
+        )?,
     }))
 }
 
@@ -3786,6 +3798,102 @@ fn strength_inversion_scorecard_json(
         "stronger_strength": inversion.stronger_strength,
         "stronger_mean_bucket": inversion.stronger_mean_bucket,
         "delta_buckets": inversion.delta_buckets,
+    })
+}
+
+fn river_nut_distance_scorecard_json(
+    cluster_dir: &Path,
+    sample_boards: usize,
+    top_n: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let river_path = cluster_dir.join("river.buckets");
+    if !river_path.exists() || sample_boards == 0 {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let bucket_file = poker_solver_core::blueprint_v2::bucket_file::BucketFile::load(&river_path)?;
+    let report = poker_solver_core::blueprint_v2::cluster_diagnostics::audit_river_nut_distance(
+        &bucket_file,
+        sample_boards,
+        42,
+        top_n,
+    );
+    Ok(river_nut_distance_report_scorecard_json(&report))
+}
+
+fn river_nut_distance_report_scorecard_json(
+    report: &poker_solver_core::blueprint_v2::cluster_diagnostics::RiverNutDistanceAuditReport,
+) -> serde_json::Value {
+    let max_class_gap_span = report
+        .bucket_stats
+        .iter()
+        .map(|bucket| bucket.max_class_gap.saturating_sub(bucket.min_class_gap))
+        .max()
+        .unwrap_or(0);
+    let max_dominance_margin_span = report
+        .bucket_stats
+        .iter()
+        .map(|bucket| bucket.max_dominance_margin - bucket.min_dominance_margin)
+        .fold(0.0_f64, f64::max);
+    let max_global_rank_percentile_span = report
+        .bucket_stats
+        .iter()
+        .map(|bucket| bucket.max_global_rank_percentile - bucket.min_global_rank_percentile)
+        .fold(0.0_f64, f64::max);
+
+    serde_json::json!({
+        "street": &report.street,
+        "bucket_count": report.bucket_count,
+        "sample_boards": report.sample_boards,
+        "assignments": report.assignments,
+        "skipped_lookups": report.skipped_lookups,
+        "summary": {
+            "bucket_count_observed": report.bucket_stats.len(),
+            "max_class_gap_span": max_class_gap_span,
+            "max_dominance_margin_span": max_dominance_margin_span,
+            "max_global_rank_percentile_span": max_global_rank_percentile_span,
+        },
+        "worst_buckets": report
+            .bucket_stats
+            .iter()
+            .take(report.top_n)
+            .map(river_nut_bucket_scorecard_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn river_nut_bucket_scorecard_json(
+    bucket: &poker_solver_core::blueprint_v2::cluster_diagnostics::BucketNutDistanceStats,
+) -> serde_json::Value {
+    serde_json::json!({
+        "bucket_id": bucket.bucket_id,
+        "count": bucket.count,
+        "class_gap": {
+            "min": bucket.min_class_gap,
+            "max": bucket.max_class_gap,
+            "span": bucket.max_class_gap.saturating_sub(bucket.min_class_gap),
+            "mean": bucket.mean_class_gap,
+        },
+        "dominance_margin": {
+            "min": bucket.min_dominance_margin,
+            "max": bucket.max_dominance_margin,
+            "span": bucket.max_dominance_margin - bucket.min_dominance_margin,
+            "mean": bucket.mean_dominance_margin,
+        },
+        "global_rank_percentile": {
+            "min": bucket.min_global_rank_percentile,
+            "max": bucket.max_global_rank_percentile,
+            "span": bucket.max_global_rank_percentile - bucket.min_global_rank_percentile,
+            "mean": bucket.mean_global_rank_percentile,
+        },
+        "blocker_to_nuts_share": bucket.blocker_to_nuts_share,
+        "top_classes": bucket.top_classes.iter().map(|class| {
+            serde_json::json!({
+                "class_label": &class.class_label,
+                "count": class.count,
+                "share": class.share,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
