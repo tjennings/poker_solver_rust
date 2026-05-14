@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-etzw
 title: 'CFVNet IO: normalize evaluator inference ranges'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:10:39Z
-updated_at: 2026-05-14T01:10:39Z
+updated_at: 2026-05-14T01:22:55Z
 parent: poker_solver_rust-8e9f
 blocked_by:
     - poker_solver_rust-kai4
