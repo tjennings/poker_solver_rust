@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-gv8m
 title: 'CFVNet IO: update architecture and training docs'
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-05-14T01:11:04Z
-updated_at: 2026-05-14T01:11:04Z
+updated_at: 2026-05-14T01:36:19Z
 parent: poker_solver_rust-8e9f
 ---
 
