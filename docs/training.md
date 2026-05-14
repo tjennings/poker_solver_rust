@@ -336,7 +336,7 @@ Clustering config parameters (in the `clustering` section of the YAML):
 | `<street>.metric.nut_distance_weight` | `0.0` | Sampled nut-distance-gap weight when the experimental metric is enabled |
 | `<street>.metric.nut_sample_boards` | `200` | River boards sampled to estimate bucket nut-distance scores for the experimental metric |
 
-The experimental metric is opt-in per clustering street. Defaults preserve the existing potential-aware EMD behavior. A typical first candidate is to enable it on `turn` and/or `flop` with `equity_weight: 1.0`, a small `nut_distance_weight`, and `potential_weight: 0.0`; this keeps potential distributions primary while making adjacent child buckets farther apart when they differ sharply in nut hierarchy.
+The experimental metric is opt-in per clustering street. Defaults preserve the existing potential-aware EMD behavior. When enabled, potential, equity-gap, and nut-distance-gap channels are each normalized by their mean positive adjacent gap before weights are applied, so weights are comparable across bucket builds. Clustering writes `metric_scales.json` beside the bucket files, and `diag-clusters --scorecard-json` includes it when present. A typical first candidate is to enable it on `turn` and/or `flop` with `equity_weight: 1.0`, a small `nut_distance_weight`, and `potential_weight: 0.0`; this keeps potential distributions primary while making adjacent child buckets farther apart when they differ sharply in nut hierarchy.
 
 ### Heuristic V3 Algorithm
 
@@ -400,7 +400,7 @@ Options:
 - `--hand-class-audit` -- Sample flop/turn/river boards and trace bucket assignments by private-card contribution (`board`, `1h`, `2h`), made hand class, rank-like intra-class strength, and equity decile. Reports contribution/class/strength groups that scatter across many buckets, buckets that mix incompatible populations, and possible strength-order inversions.
 - `--hand-class-audit-boards <N>` -- Number of boards to sample for hand-class audit (default: 10)
 - `--hand-class-audit-top <N>` -- Rows to show in each hand-class audit section (default: 10)
-- `--scorecard-json <PATH>` -- Write a stable JSON scorecard for regression comparison. Includes bucket-size skew metrics for every loaded street, selected Kxs/Qxs suited-hand profiles, and a sampled river nut-distance audit using `--hand-class-audit-boards`/`--hand-class-audit-top` for sample size/detail. When `--hand-class-audit` is enabled, also includes skipped lookup counts, class/strength spread metrics, mixed-bucket entropy/equity spans, and strength-order inversion summaries.
+- `--scorecard-json <PATH>` -- Write a stable JSON scorecard for regression comparison. Includes bucket-size skew metrics for every loaded street, selected Kxs/Qxs suited-hand profiles, `metric_scales.json` when present, and a sampled river nut-distance audit using `--hand-class-audit-boards`/`--hand-class-audit-top` for sample size/detail. When `--hand-class-audit` is enabled, also includes skipped lookup counts, class/strength spread metrics, mixed-bucket entropy/equity spans, and strength-order inversion summaries.
 - `--sample-bucket <STREET> <BUCKET_ID>` -- Show 10 sample hands from the given bucket
 - `--centroid-emd <STREET>` -- Placeholder; centroid EMD requires feature vectors not stored in bucket files
 

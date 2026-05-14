@@ -31,6 +31,7 @@ use rustc_hash::FxHashMap;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
+use serde::Serialize;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
@@ -940,37 +941,121 @@ pub(crate) fn record_size_for_board(board_size: u8) -> usize {
     1 + board_size as usize + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MetricChannelScale {
+    raw_mean_positive: f64,
+    raw_p95_positive: f64,
+    divisor: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MetricGapScaleReport {
+    street: String,
+    enabled: bool,
+    potential_weight: f64,
+    equity_weight: f64,
+    nut_distance_weight: f64,
+    potential: MetricChannelScale,
+    equity: MetricChannelScale,
+    nut_distance: MetricChannelScale,
+    output: MetricChannelScale,
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn metric_channel_scale(values: &[f64]) -> MetricChannelScale {
+    let mut positive = values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v > f64::EPSILON)
+        .collect::<Vec<_>>();
+    positive.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    if positive.is_empty() {
+        return MetricChannelScale {
+            raw_mean_positive: 0.0,
+            raw_p95_positive: 0.0,
+            divisor: 1.0,
+        };
+    }
+
+    let raw_mean_positive = positive.iter().sum::<f64>() / positive.len() as f64;
+    let p95_idx = ((positive.len() - 1) as f64 * 0.95).round() as usize;
+    let raw_p95_positive = positive[p95_idx.min(positive.len() - 1)];
+    MetricChannelScale {
+        raw_mean_positive,
+        raw_p95_positive,
+        divisor: raw_mean_positive.max(f64::EPSILON),
+    }
+}
+
+fn normalize_gap(value: f64, scale: &MetricChannelScale) -> f64 {
+    value / scale.divisor
+}
+
 fn combined_child_gaps(
+    street: Street,
     child_evs: &[f64],
     base_gaps: &[f64],
     child_nut_scores: &[f64],
     metric: &BucketMetricConfig,
-) -> Vec<f64> {
+) -> (Vec<f64>, Option<MetricGapScaleReport>) {
     if !metric.enabled {
-        return base_gaps.to_vec();
+        return (base_gaps.to_vec(), None);
     }
 
     if child_evs.len() < 2 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let has_nut_scores = child_nut_scores.len() == child_evs.len();
-    (0..child_evs.len() - 1)
+    let potential_gaps = vec![1.0_f64; child_evs.len() - 1];
+    let equity_gaps = (0..child_evs.len() - 1)
         .map(|i| {
-            let equity_gap = base_gaps
+            base_gaps
                 .get(i)
                 .copied()
-                .unwrap_or_else(|| (child_evs[i + 1] - child_evs[i]).abs());
-            let nut_gap = if has_nut_scores {
+                .unwrap_or_else(|| (child_evs[i + 1] - child_evs[i]).abs())
+        })
+        .collect::<Vec<_>>();
+    let nut_gaps = (0..child_evs.len() - 1)
+        .map(|i| {
+            if has_nut_scores {
                 (child_nut_scores[i + 1] - child_nut_scores[i]).abs()
             } else {
                 0.0
-            };
-            metric.potential_weight
-                + metric.equity_weight * equity_gap
-                + metric.nut_distance_weight * nut_gap
+            }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let potential_scale = metric_channel_scale(&potential_gaps);
+    let equity_scale = metric_channel_scale(&equity_gaps);
+    let nut_scale = metric_channel_scale(&nut_gaps);
+    let gaps = potential_gaps
+        .iter()
+        .zip(&equity_gaps)
+        .zip(&nut_gaps)
+        .map(|((potential_gap, equity_gap), nut_gap)| {
+            metric.potential_weight * normalize_gap(*potential_gap, &potential_scale)
+                + metric.equity_weight * normalize_gap(*equity_gap, &equity_scale)
+                + metric.nut_distance_weight * normalize_gap(*nut_gap, &nut_scale)
+        })
+        .collect::<Vec<_>>();
+    let output_scale = metric_channel_scale(&gaps);
+
+    (
+        gaps,
+        Some(MetricGapScaleReport {
+            street: format!("{street:?}"),
+            enabled: true,
+            potential_weight: metric.potential_weight,
+            equity_weight: metric.equity_weight,
+            nut_distance_weight: metric.nut_distance_weight,
+            potential: potential_scale,
+            equity: equity_scale,
+            nut_distance: nut_scale,
+            output: output_scale,
+        }),
+    )
 }
 
 fn centroid_expected_scores(centroids: &[Vec<f64>], child_scores: &[f64]) -> Vec<f64> {
@@ -1122,7 +1207,8 @@ pub fn run_clustering_pipeline(
     } else {
         Vec::new()
     };
-    let river_metric_gaps = combined_child_gaps(
+    let (river_metric_gaps, turn_metric_scales) = combined_child_gaps(
+        Street::Turn,
         &river_evs,
         &river_gaps,
         &river_nut_scores,
@@ -1156,8 +1242,13 @@ pub fn run_clustering_pipeline(
         .collect();
     let turn_gaps = compute_centroid_gaps(&turn_evs);
     let turn_nut_scores = centroid_expected_scores(turn_centroids.centroids(), &river_nut_scores);
-    let turn_metric_gaps =
-        combined_child_gaps(&turn_evs, &turn_gaps, &turn_nut_scores, &config.flop.metric);
+    let (turn_metric_gaps, flop_metric_scales) = combined_child_gaps(
+        Street::Flop,
+        &turn_evs,
+        &turn_gaps,
+        &turn_nut_scores,
+        &config.flop.metric,
+    );
     let (flop, flop_centroids) = cluster_flop_exhaustive(
         &turn,
         config.flop.buckets,
@@ -1177,6 +1268,15 @@ pub fn run_clustering_pipeline(
     progress("preflop", "mapping", 0.0);
     let preflop = cluster_preflop(|phase, p| progress("preflop", phase, p));
     preflop.save(&output_dir.join("preflop.buckets"))?;
+
+    let metric_scales = [turn_metric_scales, flop_metric_scales]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if !metric_scales.is_empty() {
+        let json = serde_json::to_string_pretty(&metric_scales)?;
+        std::fs::write(output_dir.join("metric_scales.json"), json)?;
+    }
 
     Ok(())
 }
@@ -2013,12 +2113,19 @@ mod tests {
     #[test]
     fn combined_child_gaps_preserves_default_metric_when_disabled() {
         let metric = BucketMetricConfig::default();
-        let gaps = combined_child_gaps(&[0.1, 0.3, 0.6], &[0.2, 0.3], &[0.0, 0.5, 1.0], &metric);
+        let (gaps, scales) = combined_child_gaps(
+            Street::Turn,
+            &[0.1, 0.3, 0.6],
+            &[0.2, 0.3],
+            &[0.0, 0.5, 1.0],
+            &metric,
+        );
         assert_eq!(gaps, vec![0.2, 0.3]);
+        assert!(scales.is_none());
     }
 
     #[test]
-    fn combined_child_gaps_blends_enabled_channels() {
+    fn combined_child_gaps_normalizes_enabled_channels() {
         let metric = BucketMetricConfig {
             enabled: true,
             potential_weight: 0.1,
@@ -2026,9 +2133,18 @@ mod tests {
             nut_distance_weight: 0.5,
             nut_sample_boards: 10,
         };
-        let gaps = combined_child_gaps(&[0.1, 0.3, 0.6], &[0.2, 0.3], &[0.0, 0.4, 1.0], &metric);
-        assert!((gaps[0] - 0.7).abs() < 1e-12);
-        assert!((gaps[1] - 1.0).abs() < 1e-12);
+        let (gaps, scales) = combined_child_gaps(
+            Street::Turn,
+            &[0.1, 0.3, 0.6],
+            &[0.2, 0.3],
+            &[0.0, 0.4, 1.0],
+            &metric,
+        );
+        assert!((gaps[0] - 2.1).abs() < 1e-12);
+        assert!((gaps[1] - 3.1).abs() < 1e-12);
+        let scales = scales.expect("enabled metric should report scales");
+        assert!((scales.equity.divisor - 0.25).abs() < 1e-12);
+        assert!((scales.nut_distance.divisor - 0.5).abs() < 1e-12);
     }
 
     #[test]

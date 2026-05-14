@@ -3630,7 +3630,18 @@ fn build_cluster_scorecard_json(
             river_nut_distance_boards,
             top_n,
         )?,
+        "metric_scales": metric_scales_scorecard_json(cluster_dir)?,
     }))
+}
+
+fn metric_scales_scorecard_json(cluster_dir: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    let path = cluster_dir.join("metric_scales.json");
+    if !path.exists() {
+        return Ok(serde_json::Value::Null);
+    }
+    let text = std::fs::read_to_string(path)?;
+    let value = serde_json::from_str(&text)?;
+    Ok(value)
 }
 
 #[allow(clippy::cast_precision_loss)]
