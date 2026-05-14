@@ -189,6 +189,7 @@ fn build_mccfr_config(
         delta_bins: None,
         expected_delta: false,
         sample_boards: None,
+        metric: Default::default(),
     };
 
     let postflop_sizes = parse_bet_sizes(&config.bet_sizes);

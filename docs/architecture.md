@@ -123,7 +123,7 @@ The clustering pipeline computes card abstractions by running bottom-up from riv
 
 **Histogram construction (`build_bucket_histogram_u8`):** For each possible next-street card, extends the board, canonicalizes it via `canonical_key()`, looks up the board index in the previous street's `BucketFile` via `board_index_map()`, and increments the count for that combo's bucket ID. Returns raw u8 counts.
 
-**Clustering:** Turn, flop, and preflop use weighted EMD (Earth Mover's Distance) k-means over these bucket-ID histograms (`kmeans_emd_weighted_u8`). River uses equity-based 1-D k-means.
+**Clustering:** Turn and flop use weighted EMD (Earth Mover's Distance) k-means over these bucket-ID histograms. By default, child-bucket ground distances are adjacent child centroid equity gaps, and sampled centroid training plus exhaustive assignment use the same metric. An opt-in per-street experimental metric can blend uniform potential movement, child centroid equity gaps, and sampled river nut-distance gaps through `<street>.metric.*` config weights. River uses equity-based 1-D k-means; preflop is a deterministic 169 canonical-hand map because the strategic abstraction starts postflop.
 
 **Variants:** Each street has three clustering variants:
 - **Canonical** (`cluster_*_canonical`): exhaustive enumeration of isomorphic boards with combinatorial weights

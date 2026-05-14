@@ -34,9 +34,10 @@ use rayon::prelude::*;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::flops::all_flops;
+use crate::hand_class::{HandClass, classify};
 use crate::hands::CanonicalHand;
 use crate::poker::{ALL_SUITS, ALL_VALUES, Card, Suit, Value};
-use crate::showdown_equity::rank_hand;
+use crate::showdown_equity::{rank_hand, rank_to_ordinal};
 
 use super::Street;
 use super::bucket_file::{BucketFile, BucketFileHeader, PackedBoard, VERSION};
@@ -46,7 +47,7 @@ use super::clustering::{
     elkan_emd_weighted_u8_with_gaps, fast_kmeans_1d, kmeans_1d, nearest_centroid_1d,
     nearest_centroid_u8, nearest_centroid_u8_weighted, sort_centroids_by_ev,
 };
-use super::config::ClusteringConfig;
+use super::config::{BucketMetricConfig, ClusteringConfig};
 use super::per_flop_bucket_file::PerFlopBucketFile;
 
 /// Number of sample 5-card boards for river clustering when no explicit count
@@ -939,6 +940,120 @@ pub(crate) fn record_size_for_board(board_size: u8) -> usize {
     1 + board_size as usize + 4 + 4 + 1 + 4 + 1326 * 4 + 1326 * 4 + 1326 * 4 + 1326
 }
 
+fn combined_child_gaps(
+    child_evs: &[f64],
+    base_gaps: &[f64],
+    child_nut_scores: &[f64],
+    metric: &BucketMetricConfig,
+) -> Vec<f64> {
+    if !metric.enabled {
+        return base_gaps.to_vec();
+    }
+
+    if child_evs.len() < 2 {
+        return Vec::new();
+    }
+
+    let has_nut_scores = child_nut_scores.len() == child_evs.len();
+    (0..child_evs.len() - 1)
+        .map(|i| {
+            let equity_gap = base_gaps
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| (child_evs[i + 1] - child_evs[i]).abs());
+            let nut_gap = if has_nut_scores {
+                (child_nut_scores[i + 1] - child_nut_scores[i]).abs()
+            } else {
+                0.0
+            };
+            metric.potential_weight
+                + metric.equity_weight * equity_gap
+                + metric.nut_distance_weight * nut_gap
+        })
+        .collect()
+}
+
+fn centroid_expected_scores(centroids: &[Vec<f64>], child_scores: &[f64]) -> Vec<f64> {
+    if child_scores.is_empty() {
+        return vec![0.0; centroids.len()];
+    }
+    centroids
+        .iter()
+        .map(|centroid| compute_centroid_ev(centroid, child_scores))
+        .collect()
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn estimate_river_bucket_nut_scores(
+    river: &BucketFile,
+    sample_boards: usize,
+    seed: u64,
+) -> Vec<f64> {
+    let bucket_count = river.header.bucket_count as usize;
+    let mut sums = vec![0.0_f64; bucket_count];
+    let mut counts = vec![0_usize; bucket_count];
+    if bucket_count == 0 || sample_boards == 0 || river.header.street != Street::River {
+        return sums;
+    }
+
+    let deck = build_deck();
+    let combos = enumerate_combos(&deck);
+    let all_canonical = enumerate_canonical_rivers();
+    let (boards, _) = sample_canonical(&all_canonical, sample_boards, seed);
+    let board_map = river.board_index_map();
+
+    for board in boards {
+        let Some(&board_idx) = board_map.get(&canonical_key(&board)) else {
+            continue;
+        };
+
+        let mut combo_info = Vec::with_capacity(TOTAL_COMBOS as usize);
+        let mut class_ordinals = vec![Vec::<u32>::new(); HandClass::NUM_MADE];
+        for (combo_idx, combo) in combos.iter().enumerate() {
+            if cards_overlap(*combo, &board) {
+                continue;
+            }
+            let Ok(classification) = classify(*combo, &board) else {
+                continue;
+            };
+            let class_id = classification.strongest_made_id();
+            if !HandClass::is_made_hand_id(class_id) {
+                continue;
+            }
+            let ordinal = rank_to_ordinal(rank_hand(*combo, &board));
+            class_ordinals[class_id as usize].push(ordinal);
+            combo_info.push((combo_idx, class_id as usize, ordinal));
+        }
+
+        for ordinals in &mut class_ordinals {
+            ordinals.sort_unstable();
+            ordinals.dedup();
+        }
+
+        for (combo_idx, class_id, ordinal) in combo_info {
+            let ordinals = &class_ordinals[class_id];
+            let stronger = ordinals.partition_point(|&ord| ord <= ordinal);
+            let stronger_count = ordinals.len().saturating_sub(stronger);
+            let denom = ordinals.len().saturating_sub(1).max(1);
+            let nut_distance = stronger_count as f64 / denom as f64;
+            let bucket = river.get_bucket(board_idx, combo_idx as u16) as usize;
+            if bucket < bucket_count {
+                sums[bucket] += nut_distance;
+                counts[bucket] += 1;
+            }
+        }
+    }
+
+    sums.into_iter()
+        .zip(counts)
+        .map(
+            |(sum, count)| {
+                if count == 0 { 0.0 } else { sum / count as f64 }
+            },
+        )
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Full pipeline orchestrator
 // ---------------------------------------------------------------------------
@@ -994,6 +1109,25 @@ pub fn run_clustering_pipeline(
     let sample_turn = config.turn.sample_boards.unwrap_or(DEFAULT_TURN_BOARDS);
     let river_evs: Vec<f64> = river_centroids.centroids().iter().map(|c| c[0]).collect();
     let river_gaps = compute_centroid_gaps(&river_evs);
+    let river_nut_scores = if config.turn.metric.enabled || config.flop.metric.enabled {
+        estimate_river_bucket_nut_scores(
+            &river,
+            config
+                .turn
+                .metric
+                .nut_sample_boards
+                .max(config.flop.metric.nut_sample_boards),
+            config.seed ^ 0x9e37_79b9_7f4a_7c15,
+        )
+    } else {
+        Vec::new()
+    };
+    let river_metric_gaps = combined_child_gaps(
+        &river_evs,
+        &river_gaps,
+        &river_nut_scores,
+        &config.turn.metric,
+    );
     let (turn, turn_centroids) = cluster_turn_exhaustive(
         &river,
         config.turn.buckets,
@@ -1001,7 +1135,7 @@ pub fn run_clustering_pipeline(
         config.seed,
         sample_turn,
         &river_evs,
-        &river_gaps,
+        &river_metric_gaps,
         |phase, p| progress("turn", phase, p),
     );
     turn.save(&output_dir.join("turn.buckets"))?;
@@ -1021,6 +1155,9 @@ pub fn run_clustering_pipeline(
         .map(|c| compute_centroid_ev(c, &river_evs))
         .collect();
     let turn_gaps = compute_centroid_gaps(&turn_evs);
+    let turn_nut_scores = centroid_expected_scores(turn_centroids.centroids(), &river_nut_scores);
+    let turn_metric_gaps =
+        combined_child_gaps(&turn_evs, &turn_gaps, &turn_nut_scores, &config.flop.metric);
     let (flop, flop_centroids) = cluster_flop_exhaustive(
         &turn,
         config.flop.buckets,
@@ -1028,7 +1165,7 @@ pub fn run_clustering_pipeline(
         config.seed,
         sample_flop,
         &turn_evs,
-        &turn_gaps,
+        &turn_metric_gaps,
         |phase, p| progress("flop", phase, p),
     );
     flop.save(&output_dir.join("flop.buckets"))?;
@@ -1872,6 +2009,27 @@ fn sample_flop_boards(deck: &[Card], n: usize, seed: u64) -> Vec<[Card; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_child_gaps_preserves_default_metric_when_disabled() {
+        let metric = BucketMetricConfig::default();
+        let gaps = combined_child_gaps(&[0.1, 0.3, 0.6], &[0.2, 0.3], &[0.0, 0.5, 1.0], &metric);
+        assert_eq!(gaps, vec![0.2, 0.3]);
+    }
+
+    #[test]
+    fn combined_child_gaps_blends_enabled_channels() {
+        let metric = BucketMetricConfig {
+            enabled: true,
+            potential_weight: 0.1,
+            equity_weight: 2.0,
+            nut_distance_weight: 0.5,
+            nut_sample_boards: 10,
+        };
+        let gaps = combined_child_gaps(&[0.1, 0.3, 0.6], &[0.2, 0.3], &[0.0, 0.4, 1.0], &metric);
+        assert!((gaps[0] - 0.7).abs() < 1e-12);
+        assert!((gaps[1] - 1.0).abs() < 1e-12);
+    }
 
     #[test]
     fn test_enumerate_combos_count() {

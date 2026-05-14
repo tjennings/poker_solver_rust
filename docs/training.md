@@ -330,6 +330,13 @@ Clustering config parameters (in the `clustering` section of the YAML):
 | `preflop.buckets` | -- | Number of preflop buckets |
 | `kmeans_iterations` | 100 | K-means iterations per street |
 | `seed` | 42 | Random seed for board sampling |
+| `<street>.metric.enabled` | `false` | Enable experimental combined ground distance for turn/flop clustering |
+| `<street>.metric.potential_weight` | `0.0` | Uniform adjacent-bucket movement weight when the experimental metric is enabled |
+| `<street>.metric.equity_weight` | `1.0` | Child centroid equity-gap weight when the experimental metric is enabled |
+| `<street>.metric.nut_distance_weight` | `0.0` | Sampled nut-distance-gap weight when the experimental metric is enabled |
+| `<street>.metric.nut_sample_boards` | `200` | River boards sampled to estimate bucket nut-distance scores for the experimental metric |
+
+The experimental metric is opt-in per clustering street. Defaults preserve the existing potential-aware EMD behavior. A typical first candidate is to enable it on `turn` and/or `flop` with `equity_weight: 1.0`, a small `nut_distance_weight`, and `potential_weight: 0.0`; this keeps potential distributions primary while making adjacent child buckets farther apart when they differ sharply in nut hierarchy.
 
 ### Heuristic V3 Algorithm
 

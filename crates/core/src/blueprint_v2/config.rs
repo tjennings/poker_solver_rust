@@ -124,6 +124,40 @@ pub struct StreetClusterConfig {
     /// default for each street (river: 10000, turn: 5000, flop: all 1755 canonical).
     #[serde(default)]
     pub sample_boards: Option<usize>,
+    /// Optional experimental distance weighting for potential-aware clustering.
+    ///
+    /// Disabled by default to preserve the current metric exactly. When enabled
+    /// for turn/flop clustering, adjacent child-bucket ground distances are a
+    /// weighted blend of uniform potential movement, child centroid equity gaps,
+    /// and sampled nut-distance gaps.
+    #[serde(default)]
+    pub metric: BucketMetricConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketMetricConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub potential_weight: f64,
+    #[serde(default = "default_metric_equity_weight")]
+    pub equity_weight: f64,
+    #[serde(default)]
+    pub nut_distance_weight: f64,
+    #[serde(default = "default_metric_nut_sample_boards")]
+    pub nut_sample_boards: usize,
+}
+
+impl Default for BucketMetricConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            potential_weight: 0.0,
+            equity_weight: default_metric_equity_weight(),
+            nut_distance_weight: 0.0,
+            nut_sample_boards: default_metric_nut_sample_boards(),
+        }
+    }
 }
 
 /// Action abstraction: allowed bet sizes per street and raise cap.
@@ -301,6 +335,14 @@ pub struct SnapshotConfig {
 // ── Default value functions ──────────────────────────────────────────
 
 const fn default_per_flop_buckets() -> u16 {
+    200
+}
+
+fn default_metric_equity_weight() -> f64 {
+    1.0
+}
+
+const fn default_metric_nut_sample_boards() -> usize {
     200
 }
 
@@ -510,24 +552,28 @@ snapshots:
                     delta_bins: None,
                     expected_delta: false,
                     sample_boards: None,
+                    metric: Default::default(),
                 },
                 flop: StreetClusterConfig {
                     buckets: 500,
                     delta_bins: None,
                     expected_delta: false,
                     sample_boards: None,
+                    metric: Default::default(),
                 },
                 turn: StreetClusterConfig {
                     buckets: 500,
                     delta_bins: None,
                     expected_delta: false,
                     sample_boards: None,
+                    metric: Default::default(),
                 },
                 river: StreetClusterConfig {
                     buckets: 500,
                     delta_bins: None,
                     expected_delta: false,
                     sample_boards: None,
+                    metric: Default::default(),
                 },
                 seed: 123,
                 kmeans_iterations: 50,
@@ -1204,5 +1250,59 @@ snapshots:
             serde_yaml::from_str(&serialized).expect("failed to deserialize round-tripped");
         assert!(restored.training.use_baselines);
         assert!((restored.training.baseline_alpha - 0.02).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cluster_metric_config_deserializes() {
+        let yaml = r#"
+game:
+  name: "Metric Config"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+    metric:
+      enabled: true
+      potential_weight: 0.05
+      equity_weight: 1.0
+      nut_distance_weight: 0.25
+      nut_sample_boards: 50
+  turn:
+    buckets: 100
+  river:
+    buckets: 100
+
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+
+training:
+  iterations: 100
+
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+        let cfg: BlueprintV2Config =
+            serde_yaml::from_str(yaml).expect("failed to parse metric config");
+        assert!(cfg.clustering.flop.metric.enabled);
+        assert!((cfg.clustering.flop.metric.potential_weight - 0.05).abs() < f64::EPSILON);
+        assert!((cfg.clustering.flop.metric.equity_weight - 1.0).abs() < f64::EPSILON);
+        assert!((cfg.clustering.flop.metric.nut_distance_weight - 0.25).abs() < f64::EPSILON);
+        assert_eq!(cfg.clustering.flop.metric.nut_sample_boards, 50);
+        assert!(!cfg.clustering.turn.metric.enabled);
     }
 }
