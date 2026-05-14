@@ -849,6 +849,8 @@ The current local direct checkpoint was exported from the Python BoundaryNet tra
 
 BoundaryNet is designed as a depth-boundary evaluator for the range-solver, enabling turn solving with neural network leaf values at river boundaries.
 
+At runtime, BoundaryNet/CFVNet values are treated as conditional boundary values. The model input ranges are normalized to sum to 1 after blockers, and the range-solver applies the live, blocker-aware opponent reach when it consumes the evaluator output. The raw-CFV evaluator path is reserved for exact/oracle evaluators that already return opponent-reach-integrated chip CFVs.
+
 #### Train a BoundaryNet
 
 Use direct turn-boundary data generated with the turn-boundary pipeline. The data must store bcfv targets, not pot-relative EV/share values:
