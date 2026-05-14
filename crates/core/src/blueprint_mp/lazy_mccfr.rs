@@ -459,10 +459,17 @@ fn traverse_traverser(
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
-    for (action_idx, _) in actions.iter().enumerate() {
+    for (action_idx, action) in actions.iter().copied().enumerate() {
         let child_history = history.append(action_idx);
-        blocked[action_idx] =
-            negative_action_blocks(storage, negative_action, key, action_idx, child_history);
+        let action_is_aggressive = action_increments_raise_count(&state, action);
+        blocked[action_idx] = negative_action_blocks(
+            storage,
+            negative_action,
+            action_is_aggressive,
+            key,
+            action_idx,
+            child_history,
+        );
     }
     // A concurrent worker may block an edge after this snapshot. Keep any
     // already-started traversal value rather than replacing it with an
@@ -528,9 +535,11 @@ fn traverse_traverser(
         storage.add_regret(key, num_actions, action_idx, delta);
         let regret = storage.get_regret(key, action_idx);
         let child_history = history.append(action_idx);
+        let action_is_aggressive = action_increments_raise_count(&state, actions[action_idx]);
         let _ = transition_negative_action_gate(
             storage,
             negative_action,
+            action_is_aggressive,
             key,
             action_idx,
             regret,
@@ -567,10 +576,17 @@ fn traverse_opponent(
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
-    for (action_idx, _) in actions.iter().enumerate() {
+    for (action_idx, action) in actions.iter().copied().enumerate() {
         let child_history = history.append(action_idx);
-        blocked[action_idx] =
-            negative_action_blocks(storage, negative_action, key, action_idx, child_history);
+        let action_is_aggressive = action_increments_raise_count(&state, action);
+        blocked[action_idx] = negative_action_blocks(
+            storage,
+            negative_action,
+            action_is_aggressive,
+            key,
+            action_idx,
+            child_history,
+        );
     }
     // See traverser-side note: the eligibility snapshot gates descent, but a
     // racing block after descent must not bias the sampled value to zero.
@@ -592,7 +608,10 @@ fn traverse_opponent(
     // Opponent nodes only attempt the sampled child. Use a read-only current
     // edge check here so telemetry cannot count blocked non-sampled actions or
     // perturb traversal blocking with a second gate transition.
-    if negative_action.enabled && storage.is_negative_action_edge_blocked(key, sampled) {
+    if negative_action.enabled
+        && action_increments_raise_count(&state, actions[sampled])
+        && storage.is_negative_action_edge_blocked(key, sampled)
+    {
         storage.record_negative_action_blocked_traversal_skip();
     }
     let (value, stats) = traverse_node(
@@ -615,26 +634,37 @@ fn traverse_opponent(
 fn negative_action_blocks(
     storage: &SparseMpStorage,
     config: NegativeActionTraversalConfig,
+    action_is_aggressive: bool,
     key: MpInfosetKey,
     action: usize,
     child_history: LazyHistory,
 ) -> bool {
-    if !config.enabled {
+    if !config.enabled || !action_is_aggressive {
         return false;
     }
     let regret = storage.get_regret(key, action);
-    transition_negative_action_gate(storage, config, key, action, regret, child_history).blocked
+    transition_negative_action_gate(
+        storage,
+        config,
+        action_is_aggressive,
+        key,
+        action,
+        regret,
+        child_history,
+    )
+    .blocked
 }
 
 fn transition_negative_action_gate(
     storage: &SparseMpStorage,
     config: NegativeActionTraversalConfig,
+    action_is_aggressive: bool,
     key: MpInfosetKey,
     action: usize,
     regret: i32,
     child_history: LazyHistory,
 ) -> super::sparse_storage::NegativeActionGateResult {
-    if !config.enabled {
+    if !config.enabled || !action_is_aggressive {
         return super::sparse_storage::NegativeActionGateResult::default();
     }
     storage.transition_negative_action_edge(
@@ -1858,6 +1888,7 @@ mod tests {
                 prune_below: -1,
                 reactivate_at: 0,
             },
+            true,
             root_key,
             action_idx,
             child_history
@@ -1873,22 +1904,63 @@ mod tests {
     }
 
     #[timed_test]
-    fn lazy_negative_action_gate_blocks_without_traversal_time_purge() {
+    fn negative_action_gate_ignores_passive_edges() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let root = game.root_state();
+        let actions = game.actions(&root);
+        let root_history = LazyHistory::default();
+        let root_key = root_history.key(root, 10);
+        let action_idx = actions
+            .iter()
+            .position(|action| !action_increments_raise_count(&root, *action))
+            .expect("root should have a passive action");
+        let child_history = root_history.append(action_idx);
+        let descendant_history = child_history.append(0);
+        let descendant_key = descendant_history.key(root, 10);
+
+        storage.add_regret(root_key, actions.len(), action_idx, -200);
+        storage.add_regret(descendant_key, 2, 0, 17);
+
+        assert!(!negative_action_blocks(
+            &storage,
+            NegativeActionTraversalConfig {
+                enabled: true,
+                prune_below: -1,
+                reactivate_at: 0,
+            },
+            false,
+            root_key,
+            action_idx,
+            child_history
+        ));
+
+        assert!(!storage.is_negative_action_edge_blocked(root_key, action_idx));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+        assert_eq!(storage.get_regret(descendant_key, 0), 17);
+    }
+
+    #[timed_test]
+    fn lazy_negative_action_gate_blocks_aggressive_edge_without_traversal_time_purge() {
         let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
         let storage = SparseMpStorage::with_shards(8);
         let mut rng = SmallRng::seed_from_u64(43);
         let deal = sample_deal(2, &mut rng);
         let buckets = test_buckets(&deal, [10, 10, 10, 10]);
         let root = game.root_state();
+        let actions = game.actions(&root);
         let root_bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
         let root_history = LazyHistory::default();
         let root_key = root_history.key(root, root_bucket);
-        let action_idx = 0;
+        let action_idx = actions
+            .iter()
+            .position(|action| action_increments_raise_count(&root, *action))
+            .expect("root should have an aggressive action");
         let child_history = root_history.append(action_idx);
         let descendant_history = child_history.append(0);
         let descendant_key = descendant_history.key(root, root_bucket);
 
-        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+        storage.add_regret(root_key, actions.len(), action_idx, -2);
         storage.add_regret(descendant_key, 2, 0, 17);
         assert_eq!(storage.get_regret(descendant_key, 0), 17);
 
@@ -1929,9 +2001,13 @@ mod tests {
         let root_bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
         let root_history = LazyHistory::default();
         let root_key = root_history.key(root, root_bucket);
-        let action_idx = 0;
+        let actions = game.actions(&root);
+        let action_idx = actions
+            .iter()
+            .position(|action| action_increments_raise_count(&root, *action))
+            .expect("root should have an aggressive action");
 
-        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+        storage.add_regret(root_key, actions.len(), action_idx, -2);
 
         let (value, _stats) = traverse_external_lazy(
             &game,
