@@ -243,6 +243,7 @@ fn legacy_scaled_bcfv_to_bcfv(normalized: &[f32], pot: f32, effective_stack: f32
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundaryOutputUnit {
+    #[allow(dead_code)]
     ChipEv,
     LegacyHalfPotBcfv,
 }
@@ -457,32 +458,15 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
 
     fn compute_raw_cfvs_both(
         &self,
-        pot: i32,
-        remaining_stack: f64,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
+        _pot: i32,
+        _remaining_stack: f64,
+        _oop_reach: &[f32],
+        _ip_reach: &[f32],
         _num_oop: usize,
         _num_ip: usize,
         _continuation_index: usize,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
-        Some((
-            self.forward_for_player(
-                0,
-                pot,
-                remaining_stack,
-                oop_reach,
-                ip_reach,
-                BoundaryOutputUnit::ChipEv,
-            ),
-            self.forward_for_player(
-                1,
-                pot,
-                remaining_stack,
-                oop_reach,
-                ip_reach,
-                BoundaryOutputUnit::ChipEv,
-            ),
-        ))
+        None
     }
 }
 
@@ -740,21 +724,15 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
 
     fn compute_raw_cfvs_both(
         &self,
-        pot: i32,
-        remaining_stack: f64,
-        oop_reach: &[f32],
-        ip_reach: &[f32],
+        _pot: i32,
+        _remaining_stack: f64,
+        _oop_reach: &[f32],
+        _ip_reach: &[f32],
         _num_oop: usize,
         _num_ip: usize,
         _continuation_index: usize,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
-        Some(self.forward_for_both_players(
-            pot,
-            remaining_stack,
-            oop_reach,
-            ip_reach,
-            BoundaryOutputUnit::ChipEv,
-        ))
+        None
     }
 }
 
@@ -1357,6 +1335,31 @@ mod tests {
         assert_eq!(direct.inference_mode, BoundaryInferenceMode::Direct);
     }
 
+    #[cfg(not(feature = "onnx"))]
+    #[test]
+    fn neural_evaluator_does_not_advertise_raw_cfv_path() {
+        use crate::model::boundary_net::BoundaryNet;
+        use burn::backend::NdArray;
+        use range_solver::game::BoundaryEvaluator;
+
+        let device = Default::default();
+        let board = vec![0u8, 4, 8, 12];
+        let private_cards = [vec![(1u8, 2u8)], vec![(5u8, 6u8)]];
+        let evaluator = NeuralBoundaryEvaluator::new_with_inference_mode(
+            BoundaryNet::<NdArray>::new(&device, 2, 64),
+            board,
+            private_cards,
+            BoundaryInferenceMode::Direct,
+        );
+
+        let raw = evaluator.compute_raw_cfvs_both(100, 150.0, &[1.0], &[1.0], 1, 1, 0);
+
+        assert!(
+            raw.is_none(),
+            "neural outputs are conditional values; range-solver must apply opponent reach"
+        );
+    }
+
     #[test]
     fn normalized_outputs_map_to_game_hands_in_requested_units() {
         let private_cards = [vec![(1_u8, 2_u8), (3, 5)], vec![(6_u8, 7_u8), (9, 10)]];
@@ -1462,19 +1465,20 @@ mod tests {
             "IP CFV count should match p1 hand count"
         );
 
-        let (oop_raw, ip_raw) = evaluator
-            .compute_raw_cfvs_both(
-                100,
-                150.0,
-                &oop_reach,
-                &ip_reach,
-                private_cards_p0.len(),
-                private_cards_p1.len(),
-                0,
-            )
-            .expect("neural evaluator should support raw chip CFVs");
-        assert_eq!(oop_raw.len(), private_cards_p0.len());
-        assert_eq!(ip_raw.len(), private_cards_p1.len());
+        assert!(
+            evaluator
+                .compute_raw_cfvs_both(
+                    100,
+                    150.0,
+                    &oop_reach,
+                    &ip_reach,
+                    private_cards_p0.len(),
+                    private_cards_p1.len(),
+                    0,
+                )
+                .is_none(),
+            "neural evaluator must leave opponent-reach integration to range-solver"
+        );
     }
 
     #[cfg(not(feature = "onnx"))]

@@ -1,5 +1,6 @@
 use rand::Rng;
 
+use super::blueprint_ranges::BlueprintRangeGenerator;
 use super::precompute_ranges::PrecomputedRanges;
 use super::range_gen::{NUM_COMBOS, compute_hand_strengths, generate_rsp_range_with_strengths};
 use crate::config::DatagenConfig;
@@ -105,6 +106,39 @@ pub fn sample_situation_with_blueprint<R: Rng>(
         effective_stack,
         ranges: [oop_range, ip_range],
     }
+}
+
+/// Sample a concrete reached river spot from a full blueprint bundle.
+///
+/// The blueprint walk supplies line-conditioned ranges, pot, and remaining
+/// effective stack. The board itself is still sampled uniformly so the river
+/// network sees broad public-card coverage while ranges come from actual
+/// reached river histories.
+pub fn sample_situation_with_river_spot<R: Rng>(
+    _config: &DatagenConfig,
+    initial_stack: i32,
+    board_size: usize,
+    generator: &BlueprintRangeGenerator,
+    rng: &mut R,
+) -> Option<Situation> {
+    if board_size != 5 {
+        return None;
+    }
+
+    let board = sample_board(board_size, rng);
+    let board_5 = [board[0], board[1], board[2], board[3], board[4]];
+    let spot = generator.sample_river_spot(&board_5, rng)?;
+    let scale = f64::from(initial_stack) / generator.starting_stack().max(1.0);
+    let pot = (spot.pot * scale).round().max(1.0) as i32;
+    let effective_stack = (spot.effective_stack * scale).round().max(1.0) as i32;
+
+    Some(Situation {
+        board,
+        board_size,
+        pot,
+        effective_stack,
+        ranges: [spot.oop_range, spot.ip_range],
+    })
 }
 
 /// Sample `num_cards` unique cards from 0..52 for the board.
@@ -237,6 +271,8 @@ mod tests {
             river_output: None,
             per_file: None,
             blueprint_path: None,
+            blueprint_bundle_path: None,
+            sampled_river_spots: false,
             turn_output: None,
             backend: "cpu".into(),
             gpu_batch_size: None,

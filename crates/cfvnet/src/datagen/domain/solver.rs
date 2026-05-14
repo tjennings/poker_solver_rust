@@ -27,6 +27,14 @@ impl Default for SolverConfig {
 pub struct SolvedGame {
     pub game: Game,
     pub exploitability: f32,
+    pub iterations: u32,
+    pub completion_reason: SolverCompletionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverCompletionReason {
+    MaxIterations,
+    TargetExploitability,
 }
 
 impl SolvedGame {
@@ -146,7 +154,7 @@ impl Solver {
 
         // Check if done by max iterations.
         if self.iteration >= self.config.max_iterations {
-            return Some(self.finish());
+            return Some(self.finish(SolverCompletionReason::MaxIterations));
         }
 
         // Check exploitability target (every 10 iterations to avoid overhead).
@@ -162,7 +170,7 @@ impl Solver {
                 let exploit = game.compute_exploitability();
                 let abs_target = target * game.situation().pot as f32;
                 if exploit <= abs_target {
-                    return Some(self.finish());
+                    return Some(self.finish(SolverCompletionReason::TargetExploitability));
                 }
             }
         }
@@ -170,7 +178,7 @@ impl Solver {
         None
     }
 
-    fn finish(&mut self) -> SolvedGame {
+    fn finish(&mut self, completion_reason: SolverCompletionReason) -> SolvedGame {
         let mut game = self.game.take().expect("finish called twice");
 
         // Ensure boundaries are set for final exploitability computation.
@@ -190,6 +198,8 @@ impl Solver {
         SolvedGame {
             game,
             exploitability: exploit,
+            iterations: self.iteration,
+            completion_reason,
         }
     }
 }
@@ -302,7 +312,38 @@ mod tests {
             assert!(solver.step().is_none());
         }
         // 10th step should return SolvedGame
-        assert!(solver.step().is_some());
+        let solved = solver.step().expect("10th step should finish");
+        assert_eq!(solved.iterations, 10);
+        assert_eq!(
+            solved.completion_reason,
+            SolverCompletionReason::MaxIterations
+        );
+    }
+
+    #[test]
+    fn solver_reports_target_exploitability_completion() {
+        range_solver::set_force_sequential(true);
+        let game = build_test_game();
+        let strategy = depth_limited_strategy();
+        let solver_config = SolverConfig {
+            max_iterations: 50,
+            target_exploitability: Some(1_000_000.0),
+            ..Default::default()
+        };
+        let mut solver = Solver::new(game, &solver_config, strategy);
+
+        let solved = loop {
+            match solver.step() {
+                None => continue,
+                Some(sg) => break sg,
+            }
+        };
+
+        assert_eq!(solved.iterations, 10);
+        assert_eq!(
+            solved.completion_reason,
+            SolverCompletionReason::TargetExploitability
+        );
     }
 
     #[test]

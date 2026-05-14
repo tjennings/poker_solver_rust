@@ -453,7 +453,9 @@ Options:
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
 - `--subgame-iters <N>` -- Hidden diagnostic override for subgame solve iterations; defaults to `--iters`.
-- `--dump-boundary-cfvs` -- Hidden boundary diagnostic. Before the subgame solve, forces a seeded boundary evaluation pass, compares root action CFVs and regret-input pressure for the injected candidate boundary against `exact_oracle`, compares each boundary contribution against `exact_oracle` raw CFVs, prints an `exact_subtree` raw-control comparison, then prints the cached evaluator CFV stats.
+- `--dump-boundary-cfvs` -- Hidden boundary diagnostic. Before the subgame solve, forces a seeded boundary evaluation pass, compares root action CFVs and regret-input pressure for the injected candidate boundary against `exact_oracle`, compares each boundary contribution against `exact_oracle` raw CFVs, prints an `exact_subtree` raw-control comparison, and prints aggregate buckets by player/all-in state, pot, SPR, reach density, and oracle magnitude before the cached evaluator CFV stats.
+- `--boundary-cfv-max-mean-abs <F>` -- Hidden diagnostic gate for `--dump-boundary-cfvs`. Fails the run if either player's aggregate candidate-vs-oracle boundary CFV mean absolute error exceeds `F`.
+- `--boundary-cfv-min-corr <F>` -- Hidden diagnostic gate for `--dump-boundary-cfvs`. Fails the run if either player's aggregate candidate-vs-oracle boundary CFV correlation is below `F`.
 - `--oracle-iteration-aligned` -- Hidden `exact_oracle` diagnostic. Runs exact and subgame in lockstep and evaluates each subgame boundary against the exact continuation at the same iteration. Requires matching `--exact-iters` and `--subgame-iters`.
 - `--root-update-trace-iters <csv>` -- Hidden diagnostic for `--oracle-iteration-aligned`. Prints exact/subgame root action CFV gaps and root regret-update gaps for the listed zero-based iterations.
 
@@ -731,6 +733,41 @@ game:
 
 The `a` token is preserved as an explicit all-in action in the generated range-solver tree. `datagen.bet_size_fuzz` perturbs only pot-relative sizes; all-in remains exact and unfuzzed.
 
+To generate river data from actual reached blueprint spots, use
+`sample_configurations/river_cfvnet_sampled_spots.yaml`. Set
+`datagen.sampled_river_spots: true` and point `datagen.blueprint_bundle_path`
+at a full blueprint bundle. This samples a concrete river board, walks the
+blueprint strategy through preflop/flop/turn, and uses the reached river pot,
+effective stack, and line-conditioned OOP/IP ranges as the river subgame input.
+Those ranges are board-blocked and normalized before writing records.
+
+```bash
+cargo run -p cfvnet --release -- generate \
+  --config sample_configurations/river_cfvnet_sampled_spots.yaml \
+  --output local_data/cfvnet/river_sampled_spots_v1 \
+  --num-samples 1000000 \
+  --threads 16 \
+  --per-file 10000
+```
+
+To verify that more DCFR iterations improve the exact same sampled spots,
+run the fixed-spot convergence diagnostic. It samples the river spots once,
+then resolves those same spots at each iteration cap. By default it disables
+`datagen.target_exploitability`, so the table measures the iteration ceiling
+rather than early stopping:
+
+```bash
+cargo run -p cfvnet --release -- sampled-river-convergence \
+  --config sample_configurations/river_cfvnet_sampled_spots.yaml \
+  --num-spots 5 \
+  --iterations 50,100,250,500,1000,2500,5000
+```
+
+Add `--respect-target` to test production early-stop behavior. If
+`avg_iter` stays well below the iteration cap, increasing
+`datagen.solver_iterations` will not improve the output for those spots unless
+`datagen.target_exploitability` is lowered or disabled.
+
 **GPU requirements:**
 - NVIDIA GPU with CUDA 12.1+ and compute capability ≥ 6.0
 - Build with `--features gpu-datagen` to enable the GPU dependency
@@ -845,7 +882,11 @@ BoundaryNet is a sibling model to CfvNet that outputs **solver-native boundary C
 
 The current local direct checkpoint was exported from the Python BoundaryNet trainer, which stores the target as `bcfv * pot / (pot + effective_stack)`. Use `direct_normalized_legacy` for that checkpoint; it applies `bcfv = output * (pot + effective_stack) / pot` at inference.
 
+Python model exports write `model_artifact.yaml` with `model.output_unit` and `model.recommended_model_kind`. `compare-solve` validates that artifact when it is present and rejects incompatible model-kind choices, for example using `direct` on a Python checkpoint that declares `bcfv_scaled_by_pot_over_total_stake`.
+
 BoundaryNet is designed as a depth-boundary evaluator for the range-solver, enabling turn solving with neural network leaf values at river boundaries.
+
+At runtime, BoundaryNet/CFVNet values are treated as conditional boundary values. The model input ranges are normalized to sum to 1 after blockers, and the range-solver applies the live, blocker-aware opponent reach when it consumes the evaluator output. The raw-CFV evaluator path is reserved for exact/oracle evaluators that already return opponent-reach-integrated chip CFVs.
 
 #### Train a BoundaryNet
 
@@ -933,7 +974,10 @@ See `sample_configurations/river_cfvnet.yaml` for all options. Key parameters:
 | `datagen.backend` | `"cpu"` | Solver backend: `"cpu"` or `"gpu"` (GPU requires `--features gpu-datagen`) |
 | `datagen.gpu_batch_size` | 142 | Subgames per GPU kernel launch (only with `backend: "gpu"`) |
 | `datagen.num_samples` | 1,000,000 | Training situations to generate |
+| `datagen.sampled_river_spots` | `false` | For `street: "river"`, walk a blueprint bundle to reached river decisions instead of using random/RSP or precomputed preflop-only ranges |
+| `datagen.blueprint_bundle_path` | none | Full blueprint bundle directory used when `sampled_river_spots` is enabled |
 | `datagen.solver_iterations` | 1000 | DCFR iterations per situation |
+| `datagen.target_exploitability` | none | Optional early-stop threshold as a pot fraction: stop when exploitability in chips is `<= target_exploitability * pot`; at 100bb/200-chip stacks, `0.01` means roughly `5 * pot` mbb/h |
 | `game.river_model_path` | none | Path to trained river model for turn generation, or direct turn-boundary ONNX for `flop_boundary` |
 | `training.hidden_layers` | 7 | MLP depth |
 | `training.hidden_size` | 500 | Hidden layer width |

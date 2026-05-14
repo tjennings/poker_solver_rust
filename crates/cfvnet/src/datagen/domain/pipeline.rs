@@ -12,7 +12,7 @@ use super::evaluator::SolveStrategy;
 use super::game::GameBuilder;
 use super::neural_net_evaluator::NeuralNetEvaluator;
 use super::situation::SituationGenerator;
-use super::solver::{Solver, SolverConfig};
+use super::solver::{Solver, SolverCompletionReason, SolverConfig};
 use super::writer::RecordWriter;
 
 /// Coordinates the domain datagen pipeline: generate -> build -> solve -> write.
@@ -98,6 +98,16 @@ impl DomainPipeline {
             target_exploitability: config.datagen.target_exploitability,
             leaf_eval_interval: config.datagen.leaf_eval_interval,
         };
+        match solver_config.target_exploitability {
+            Some(target) => eprintln!(
+                "[domain] solver controls: max_iterations={} target_exploitability={} (stop when exploitability <= target * pot chips)",
+                solver_config.max_iterations, target
+            ),
+            None => eprintln!(
+                "[domain] solver controls: max_iterations={} target_exploitability=disabled",
+                solver_config.max_iterations
+            ),
+        }
 
         let writer = Arc::new(Mutex::new(RecordWriter::create(
             output_path,
@@ -115,6 +125,9 @@ impl DomainPipeline {
         // Shared exploitability counters (scaled by 100 for AtomicU64 storage).
         let exploit_sum = Arc::new(AtomicU64::new(0));
         let exploit_count = Arc::new(AtomicU64::new(0));
+        let iteration_sum = Arc::new(AtomicU64::new(0));
+        let target_stop_count = Arc::new(AtomicU64::new(0));
+        let max_iter_stop_count = Arc::new(AtomicU64::new(0));
 
         // Shared situation generator.
         let sit_gen = Mutex::new(sit_gen);
@@ -132,6 +145,9 @@ impl DomainPipeline {
                 let pb = Arc::clone(&pb);
                 let exploit_sum = Arc::clone(&exploit_sum);
                 let exploit_count = Arc::clone(&exploit_count);
+                let iteration_sum = Arc::clone(&iteration_sum);
+                let target_stop_count = Arc::clone(&target_stop_count);
+                let max_iter_stop_count = Arc::clone(&max_iter_stop_count);
                 let first_error = &first_error;
 
                 s.spawn(move || {
@@ -177,6 +193,16 @@ impl DomainPipeline {
                             exploit_sum.fetch_add((mbb as f64 * 100.0) as u64, Ordering::Relaxed);
                             exploit_count.fetch_add(1, Ordering::Relaxed);
                         }
+                        iteration_sum
+                            .fetch_add(u64::from(solved.iterations), Ordering::Relaxed);
+                        match solved.completion_reason {
+                            SolverCompletionReason::TargetExploitability => {
+                                target_stop_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            SolverCompletionReason::MaxIterations => {
+                                max_iter_stop_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
 
                         let records = solved.extract_records();
 
@@ -202,7 +228,16 @@ impl DomainPipeline {
                         } else {
                             0.0
                         };
-                        pb.set_message(format!("expl:{avg_exploit:.1} mbb/h  written:{wc}",));
+                        let avg_iter = if ec > 0 {
+                            iteration_sum.load(Ordering::Relaxed) as f64 / ec as f64
+                        } else {
+                            0.0
+                        };
+                        let target_stops = target_stop_count.load(Ordering::Relaxed);
+                        let max_stops = max_iter_stop_count.load(Ordering::Relaxed);
+                        pb.set_message(format!(
+                            "expl:{avg_exploit:.1} mbb/h iter_avg:{avg_iter:.1} target:{target_stops} max:{max_stops} written:{wc}",
+                        ));
                     }
                 });
             }
@@ -221,7 +256,23 @@ impl DomainPipeline {
 
         pb.finish_with_message("done");
 
-        eprintln!("Wrote {total} records to {}", output_path.display());
+        let games = exploit_count.load(Ordering::Relaxed);
+        let avg_exploit = if games > 0 {
+            (exploit_sum.load(Ordering::Relaxed) as f64 / 100.0) / games as f64
+        } else {
+            0.0
+        };
+        let avg_iter = if games > 0 {
+            iteration_sum.load(Ordering::Relaxed) as f64 / games as f64
+        } else {
+            0.0
+        };
+        let target_stops = target_stop_count.load(Ordering::Relaxed);
+        let max_stops = max_iter_stop_count.load(Ordering::Relaxed);
+        eprintln!(
+            "Wrote {total} records to {} (games={games}, avg_expl={avg_exploit:.1} mbb/h, avg_iter={avg_iter:.1}, target_stops={target_stops}, max_iter_stops={max_stops})",
+            output_path.display()
+        );
         Ok(())
     }
 

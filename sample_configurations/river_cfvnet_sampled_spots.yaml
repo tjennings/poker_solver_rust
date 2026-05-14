@@ -1,0 +1,50 @@
+# River CFVNet datagen from actual reached blueprint river spots.
+#
+# This mode samples a concrete river board, walks the full blueprint strategy
+# through preflop/flop/turn, and uses the reached river pot, stack, and
+# line-conditioned ranges as the river subgame input.
+#
+# Run:
+#   cargo run -p cfvnet --release -- generate \
+#     -c sample_configurations/river_cfvnet_sampled_spots.yaml \
+#     -o local_data/cfvnet/river_sampled_spots_v1 \
+#     --num-samples 1000000 \
+#     --threads 16 \
+#     --per-file 10000
+
+game:
+  initial_stack: 200
+  bet_sizes:
+    - ["25%", "50%", "100%", "a"]
+    - ["50%", "100%", "a"]
+    - ["a"]
+  board_size: 5
+
+datagen:
+  street: "river"
+  mode: "exact"
+  sampled_river_spots: true
+  blueprint_bundle_path: "local_data/blueprints/1k_100bb_brdcfr_v2"
+  num_samples: 1000000
+  per_file: 10000
+  bet_size_fuzz: 0.10
+  solver_iterations: 350
+  target_exploitability: 0.01
+  threads: 16
+
+training:
+  hidden_layers: 7
+  hidden_size: 768
+  batch_size: 32000
+  epochs: 500
+  learning_rate: 0.006
+  lr_min: 0.00004
+  huber_delta: 1.0
+  aux_loss_weight: 0.1
+  validation_split: 0.05
+  checkpoint_every_n_epochs: 10
+  shuffle_buffer_size: 262144
+  prefetch_depth: 4
+  encoder_threads: 14
+  gpu_prefetch: 3
+  grad_clip_norm: 1.0

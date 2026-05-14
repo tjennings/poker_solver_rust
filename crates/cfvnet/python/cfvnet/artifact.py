@@ -32,6 +32,11 @@ def write_model_artifact(
                 _file_entry(output_dir, path)
                 for path in sorted(output_dir.glob(f"{onnx_path.name}.*"))
             ],
+            # Current Python BoundaryNet training stores targets as
+            # bcfv * pot / (pot + effective_stack). Rust must evaluate these
+            # checkpoints with direct_normalized_legacy, not direct.
+            "output_unit": "bcfv_scaled_by_pot_over_total_stake",
+            "recommended_model_kind": "direct_normalized_legacy",
         },
         "config": {
             "path": str(config_path),

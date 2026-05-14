@@ -118,6 +118,26 @@ enum Commands {
         #[arg(long, default_value = "1")]
         threads: usize,
     },
+    /// Check same-spot river solve convergence across iteration caps.
+    #[command(name = "sampled-river-convergence")]
+    SampledRiverConvergence {
+        /// Path to the YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Number of sampled situations to hold fixed across all iteration caps.
+        #[arg(long, default_value = "5")]
+        num_spots: usize,
+        /// Comma-separated max-iteration caps to compare.
+        #[arg(long, default_value = "50,100,250,500,1000,2500,5000")]
+        iterations: String,
+        /// Override datagen.seed for the sampled spots.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Keep config target_exploitability enabled. By default it is disabled
+        /// so this measures fixed-cap convergence instead of early stopping.
+        #[arg(long)]
+        respect_target: bool,
+    },
     /// Train the BoundaryNet model (direct bcfv output for range-solver integration)
     TrainBoundary {
         #[arg(short, long)]
@@ -322,6 +342,15 @@ fn main() {
             threads,
         } => {
             cmd_bench_solve(config, num_samples, threads);
+        }
+        Commands::SampledRiverConvergence {
+            config,
+            num_spots,
+            iterations,
+            seed,
+            respect_target,
+        } => {
+            cmd_sampled_river_convergence(config, num_spots, &iterations, seed, respect_target);
         }
         Commands::DiagnoseBoundary {
             model,
@@ -791,6 +820,206 @@ fn cmd_bench_solve(config_path: PathBuf, num_samples: u64, threads: usize) {
         "Solved {} situations in {:.2?} ({:.1} solves/sec, {:.2?}/solve)",
         num_samples, elapsed, solves_per_sec, per_solve,
     );
+}
+
+fn parse_iteration_caps(iterations: &str) -> Vec<u32> {
+    let mut caps: Vec<u32> = iterations
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u32>().unwrap_or_else(|e| {
+                eprintln!("invalid iteration cap {s:?}: {e}");
+                std::process::exit(1);
+            })
+        })
+        .filter(|&n| n > 0)
+        .collect();
+    caps.sort_unstable();
+    caps.dedup();
+    if caps.is_empty() {
+        eprintln!("iterations must contain at least one positive integer");
+        std::process::exit(1);
+    }
+    caps
+}
+
+fn load_cfvnet_config(config_path: &Path) -> cfvnet::config::CfvnetConfig {
+    let yaml = std::fs::read_to_string(config_path).unwrap_or_else(|e| {
+        eprintln!("failed to read config {}: {e}", config_path.display());
+        std::process::exit(1);
+    });
+    let cfg: cfvnet::config::CfvnetConfig = serde_yaml::from_str(&yaml).unwrap_or_else(|e| {
+        eprintln!("failed to parse config: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = cfg.game.validate() {
+        eprintln!("invalid game config: {e}");
+        std::process::exit(1);
+    }
+    cfg
+}
+
+fn cmd_sampled_river_convergence(
+    config_path: PathBuf,
+    num_spots: usize,
+    iterations: &str,
+    seed_override: Option<u64>,
+    respect_target: bool,
+) {
+    use cfvnet::datagen::domain::game_tree::parse_bet_sizes_all;
+    use cfvnet::datagen::domain::solver::SolverCompletionReason;
+    use cfvnet::datagen::domain::{
+        GameBuilder, RangeSource, SituationGenerator, SolveStrategy, Solver, SolverConfig,
+    };
+    use rand::SeedableRng;
+
+    let cfg = load_cfvnet_config(&config_path);
+    let caps = parse_iteration_caps(iterations);
+    let seed = seed_override.unwrap_or_else(|| cfvnet::config::resolve_seed(cfg.datagen.seed));
+    let board_size = cfvnet::config::board_cards_for_street(&cfg.datagen.street);
+    if board_size != 5 {
+        eprintln!(
+            "sampled-river-convergence expects a river config; got street={}",
+            cfg.datagen.street
+        );
+        std::process::exit(1);
+    }
+
+    let range_source = RangeSource::from_config(&cfg.datagen).unwrap_or_else(|e| {
+        eprintln!("failed to configure situation generator: {e}");
+        std::process::exit(1);
+    });
+    let sample_budget = (num_spots as u64).saturating_mul(20).max(num_spots as u64);
+    let situations: Vec<_> = SituationGenerator::new(
+        &cfg.datagen,
+        cfg.game.initial_stack,
+        board_size,
+        seed,
+        sample_budget,
+    )
+    .with_range_source(range_source)
+    .take(num_spots)
+    .collect();
+
+    if situations.is_empty() {
+        eprintln!("sampled no usable river spots");
+        std::process::exit(1);
+    }
+    if situations.len() < num_spots {
+        eprintln!(
+            "warning: requested {num_spots} spots but sampled only {} usable spots",
+            situations.len()
+        );
+    }
+
+    let strategy = SolveStrategy::Exact;
+    let bet_sizes = parse_bet_sizes_all(&cfg.game.bet_sizes);
+    let builder = GameBuilder::new(bet_sizes, &strategy).with_fuzz(cfg.datagen.bet_size_fuzz);
+    let bb = cfg.game.initial_stack as f32 / 100.0;
+    let target = if respect_target {
+        cfg.datagen.target_exploitability
+    } else {
+        None
+    };
+
+    println!(
+        "Same-spot river convergence: spots={} seed={} target={} bet_size_fuzz={:.4}",
+        situations.len(),
+        seed,
+        target
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "disabled".to_string()),
+        cfg.datagen.bet_size_fuzz
+    );
+    println!(
+        "{:>10} {:>8} {:>12} {:>12} {:>12} {:>12} {:>10} {:>6} {:>6}",
+        "max_iter",
+        "solved",
+        "avg_chips",
+        "avg_mbb/h",
+        "avg_pot%",
+        "max_mbb/h",
+        "avg_iter",
+        "target",
+        "max"
+    );
+
+    let mut previous_avg_mbb: Option<f32> = None;
+    for cap in caps {
+        let solver_config = SolverConfig {
+            max_iterations: cap,
+            target_exploitability: target,
+            leaf_eval_interval: cfg.datagen.leaf_eval_interval,
+        };
+        let mut solved_count = 0_u32;
+        let mut exploit_chips_sum = 0.0_f32;
+        let mut exploit_mbb_sum = 0.0_f32;
+        let mut exploit_pot_frac_sum = 0.0_f32;
+        let mut max_mbb = 0.0_f32;
+        let mut iter_sum = 0_u64;
+        let mut target_stops = 0_u32;
+        let mut max_stops = 0_u32;
+
+        for (spot_idx, sit) in situations.iter().enumerate() {
+            let mut rng =
+                rand_chacha::ChaCha8Rng::seed_from_u64(seed.wrapping_add(10_000 + spot_idx as u64));
+            let Some(game) = builder.build(sit, &mut rng) else {
+                continue;
+            };
+            let mut solver = Solver::new(game, &solver_config, strategy.clone());
+            let solved = loop {
+                match solver.step() {
+                    Some(solved) => break solved,
+                    None => continue,
+                }
+            };
+            if !solved.exploitability.is_finite() {
+                continue;
+            }
+            let mbb = if bb > 0.0 {
+                solved.exploitability / bb * 1000.0
+            } else {
+                0.0
+            };
+            let pot_frac = if sit.pot > 0 {
+                solved.exploitability / sit.pot as f32
+            } else {
+                0.0
+            };
+            solved_count += 1;
+            exploit_chips_sum += solved.exploitability;
+            exploit_mbb_sum += mbb;
+            exploit_pot_frac_sum += pot_frac;
+            max_mbb = max_mbb.max(mbb);
+            iter_sum += u64::from(solved.iterations);
+            match solved.completion_reason {
+                SolverCompletionReason::TargetExploitability => target_stops += 1,
+                SolverCompletionReason::MaxIterations => max_stops += 1,
+            }
+        }
+
+        if solved_count == 0 {
+            println!(
+                "{cap:>10} {:>8} {:>12} {:>12} {:>12} {:>12} {:>10} {:>6} {:>6}",
+                0, "-", "-", "-", "-", "-", "-", "-"
+            );
+            continue;
+        }
+
+        let n = solved_count as f32;
+        let avg_mbb = exploit_mbb_sum / n;
+        let delta = previous_avg_mbb.map_or(0.0, |prev| avg_mbb - prev);
+        previous_avg_mbb = Some(avg_mbb);
+        println!(
+            "{cap:>10} {solved_count:>8} {:>12.6} {:>12.1} {:>12.4} {:>12.1} {:>10.1} {target_stops:>6} {max_stops:>6}  delta={delta:+.1}",
+            exploit_chips_sum / n,
+            avg_mbb,
+            (exploit_pot_frac_sum / n) * 100.0,
+            max_mbb,
+            iter_sum as f32 / n,
+        );
+    }
 }
 
 fn cmd_inspect_preflop_ranges(path: PathBuf) {
