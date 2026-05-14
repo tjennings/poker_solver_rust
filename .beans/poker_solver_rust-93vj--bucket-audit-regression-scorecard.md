@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-93vj
 title: Bucket audit regression scorecard
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:14:02Z
-updated_at: 2026-05-14T01:14:02Z
+updated_at: 2026-05-14T01:14:36Z
 parent: poker_solver_rust-03j0
 ---
 
