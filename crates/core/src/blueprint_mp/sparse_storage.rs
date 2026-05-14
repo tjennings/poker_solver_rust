@@ -7,8 +7,8 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -244,7 +244,7 @@ struct NegativeActionEdgeKey {
     action: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NegativeActionBlockedEdge {
     child_history_hi: u64,
     child_history_lo: u64,
@@ -693,7 +693,7 @@ impl SparseMpStorage {
         reactivate_at: i32,
     ) -> SparsePurgeStats {
         let blocked_edges = self.snapshot_blocked_negative_action_edges();
-        let mut total = SparsePurgeStats::default();
+        let mut purge_prefixes = Vec::new();
 
         for (edge, blocked_edge) in blocked_edges {
             let regret = self.get_regret(edge.parent, usize::from(edge.action));
@@ -708,17 +708,10 @@ impl SparseMpStorage {
                 continue;
             }
 
-            let stats = self.purge_subtree_with_history_prefix(
-                blocked_edge.child_history_hi,
-                blocked_edge.child_history_lo,
-                blocked_edge.child_history_len,
-            );
-            total.rows_purged += stats.rows_purged;
-            total.regret_slots_purged += stats.regret_slots_purged;
-            total.strategy_slots_purged += stats.strategy_slots_purged;
+            purge_prefixes.push(blocked_edge);
         }
 
-        total
+        self.purge_subtrees_with_history_prefixes(purge_prefixes)
     }
 
     /// Whether a negative-action subtree gate is currently blocking an edge.
@@ -1047,6 +1040,76 @@ impl SparseMpStorage {
         }
         edges
     }
+
+    fn purge_subtrees_with_history_prefixes(
+        &self,
+        prefixes: impl IntoIterator<Item = NegativeActionBlockedEdge>,
+    ) -> SparsePurgeStats {
+        let mut prefixes_by_len: Vec<HashSet<(u64, u64)>> =
+            (0..=usize::from(PACKED_HISTORY_ACTION_SLOTS))
+                .map(|_| HashSet::new())
+                .collect();
+        for prefix in prefixes {
+            if prefix.child_history_len > PACKED_HISTORY_ACTION_SLOTS {
+                continue;
+            }
+            prefixes_by_len[usize::from(prefix.child_history_len)].insert(
+                packed_history_prefix_key(
+                    prefix.child_history_hi,
+                    prefix.child_history_lo,
+                    prefix.child_history_len,
+                ),
+            );
+        }
+
+        let active_lengths = prefixes_by_len
+            .iter()
+            .enumerate()
+            .filter_map(|(len, prefixes)| {
+                (!prefixes.is_empty()).then_some(
+                    u16::try_from(len).expect("packed history prefix length fits in u16"),
+                )
+            })
+            .collect::<Vec<_>>();
+        if active_lengths.is_empty() {
+            return SparsePurgeStats::default();
+        }
+
+        let started = Instant::now();
+        let mut stats = SparsePurgeStats::default();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            let mut guard = lock_entries(shard);
+            let mut shard_rows_purged = 0_usize;
+            let mut shard_slots_purged = 0_usize;
+            guard.retain(|key, node| {
+                let purge = active_lengths.iter().any(|&prefix_len| {
+                    key.history_len >= prefix_len
+                        && prefixes_by_len[usize::from(prefix_len)].contains(
+                            &packed_history_prefix_key(key.history_hi, key.history_lo, prefix_len),
+                        )
+                });
+                if purge {
+                    shard_rows_purged += 1;
+                    shard_slots_purged += node.action_count();
+                    false
+                } else {
+                    true
+                }
+            });
+            if shard_rows_purged > 0 {
+                self.entry_count
+                    .fetch_sub(shard_rows_purged, Ordering::Relaxed);
+                self.slot_count
+                    .fetch_sub(shard_slots_purged, Ordering::Relaxed);
+                self.shard_entry_counts[shard_idx].fetch_sub(shard_rows_purged, Ordering::Relaxed);
+                stats.rows_purged += shard_rows_purged;
+                stats.regret_slots_purged += shard_slots_purged;
+                stats.strategy_slots_purged += shard_slots_purged;
+            }
+        }
+        self.record_negative_action_purge_scan(stats, started);
+        stats
+    }
 }
 
 fn load_atomic_array<const N: usize>(atoms: &[AtomicU64; N]) -> [u64; N] {
@@ -1124,6 +1187,29 @@ fn packed_history_has_prefix(
         (1_u64 << hi_bits) - 1
     };
     history_lo == prefix_lo && history_hi & hi_mask == prefix_hi & hi_mask
+}
+
+fn packed_history_prefix_key(history_hi: u64, history_lo: u64, prefix_len: u16) -> (u64, u64) {
+    debug_assert!(prefix_len <= PACKED_HISTORY_ACTION_SLOTS);
+    let prefix_bits = prefix_len * ACTION_BITS;
+    if prefix_bits == 0 {
+        return (0, 0);
+    }
+    if prefix_bits < u64::BITS as u16 {
+        let mask = (1_u64 << prefix_bits) - 1;
+        return (0, history_lo & mask);
+    }
+    if prefix_bits == u64::BITS as u16 {
+        return (0, history_lo);
+    }
+
+    let hi_bits = prefix_bits - u64::BITS as u16;
+    let hi_mask = if hi_bits == u64::BITS as u16 {
+        u64::MAX
+    } else {
+        (1_u64 << hi_bits) - 1
+    };
+    (history_hi & hi_mask, history_lo)
 }
 
 fn lock_entries(shard: &Shard) -> MutexGuard<'_, HashMap<MpInfosetKey, Arc<SparseNode>>> {
@@ -1723,6 +1809,64 @@ mod tests {
         assert_eq!(storage.get_regret(reactivated_child, 0), 11);
         assert_eq!(storage.get_regret(purged_child, 0), 0);
         assert_eq!(storage.get_regret(sibling, 0), 33);
+    }
+
+    #[timed_test]
+    fn negative_action_discount_boundary_batches_prefix_purge_scan() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent_a = history_key(1, &[1]);
+        let parent_b = history_key(2, &[2]);
+        let child_a = history_key(3, &[1, 3]);
+        let grandchild_a = history_key(4, &[1, 3, 4]);
+        let child_b = history_key(5, &[2, 2]);
+        let sibling = history_key(6, &[9, 1]);
+        let (child_a_hi, child_a_lo) = pack_history(&[1, 3]);
+        let (child_b_hi, child_b_lo) = pack_history(&[2, 2]);
+
+        storage.add_regret(parent_a, 4, 3, -6);
+        storage.add_regret(parent_b, 4, 2, -7);
+        storage.add_regret(child_a, 2, 0, 11);
+        storage.add_regret(grandchild_a, 2, 0, 22);
+        storage.add_regret(child_b, 2, 0, 33);
+        storage.add_regret(sibling, 2, 0, 44);
+
+        assert!(
+            storage
+                .transition_negative_action_edge(
+                    parent_a,
+                    3,
+                    -6,
+                    -5,
+                    0,
+                    (child_a_hi, child_a_lo, 2)
+                )
+                .blocked
+        );
+        assert!(
+            storage
+                .transition_negative_action_edge(
+                    parent_b,
+                    2,
+                    -7,
+                    -5,
+                    0,
+                    (child_b_hi, child_b_lo, 2)
+                )
+                .blocked
+        );
+
+        let purged = storage.purge_blocked_negative_action_subtrees_after_discount(0);
+        let telemetry = storage.negative_action_telemetry();
+
+        assert_eq!(purged.rows_purged, 3);
+        assert_eq!(
+            telemetry.subtree_purge_calls, 1,
+            "multiple blocked edges should be purged in one boundary scan"
+        );
+        assert_eq!(storage.get_regret(child_a, 0), 0);
+        assert_eq!(storage.get_regret(grandchild_a, 0), 0);
+        assert_eq!(storage.get_regret(child_b, 0), 0);
+        assert_eq!(storage.get_regret(sibling, 0), 44);
     }
 
     #[timed_test]
