@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-5554
 title: 'CFVNet IO: make inference mode explicit and street-safe'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:10:52Z
-updated_at: 2026-05-14T01:10:52Z
+updated_at: 2026-05-14T01:30:39Z
 parent: poker_solver_rust-8e9f
 ---
 
