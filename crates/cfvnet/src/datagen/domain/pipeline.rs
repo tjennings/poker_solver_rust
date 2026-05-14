@@ -239,7 +239,7 @@ impl DomainPipeline {
         use crate::datagen::range_gen::NUM_COMBOS;
         use crate::datagen::storage::TrainingRecord;
         use gpu_range_solver::extract::{extract_terminal_data, extract_topology};
-        use gpu_range_solver::{compute_evs_from_strategy_sum, GpuBatchSolver, SubgameSpec};
+        use gpu_range_solver::{GpuBatchSolver, SubgameSpec, compute_evs_from_strategy_sum};
         use range_solver::card::card_pair_to_index;
 
         let num_samples = config.datagen.num_samples;
@@ -446,8 +446,8 @@ impl DomainPipeline {
     /// Requires `river_model_path` in config — there is no zero-CFV fallback.
     #[cfg(feature = "gpu-turn-datagen")]
     fn run_gpu_turn(config: &CfvnetConfig, output_path: &Path) -> Result<(), String> {
-        use gpu_range_solver::extract::extract_topology;
         use gpu_range_solver::GpuBatchSolver;
+        use gpu_range_solver::extract::extract_topology;
 
         let num_samples = config.datagen.num_samples;
         let seed = crate::config::resolve_seed(config.datagen.seed);
@@ -1230,7 +1230,7 @@ impl DomainPipeline {
         specs: &[gpu_range_solver::SubgameSpec],
         sits: &[crate::datagen::sampler::Situation],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
-        use crate::datagen::gpu_boundary_eval::{evaluate_boundaries_batched, BoundaryEvalRequest};
+        use crate::datagen::gpu_boundary_eval::{BoundaryEvalRequest, evaluate_boundaries_batched};
         use crate::datagen::range_gen::NUM_COMBOS;
         use gpu_range_solver::compute_reach_at_nodes;
 
@@ -1330,7 +1330,7 @@ impl DomainPipeline {
         specs: &[gpu_range_solver::SubgameSpec],
         sits: &[crate::datagen::sampler::Situation],
     ) -> Result<(Vec<f32>, Vec<f32>), String> {
-        use crate::datagen::gpu_boundary_eval::{evaluate_boundaries_batched, BoundaryEvalRequest};
+        use crate::datagen::gpu_boundary_eval::{BoundaryEvalRequest, evaluate_boundaries_batched};
         use crate::datagen::range_gen::NUM_COMBOS;
         use gpu_range_solver::compute_reach_at_nodes;
 
@@ -2169,8 +2169,8 @@ mod tests {
         fn layer_a_batched_matches_per_sit_within_tolerance() {
             use crate::datagen::range_gen::NUM_COMBOS;
             use crate::datagen::sampler::Situation;
-            use gpu_range_solver::extract::extract_topology;
             use gpu_range_solver::SubgameSpec;
+            use gpu_range_solver::extract::extract_topology;
             use range_solver::card::index_to_card_pair;
 
             let model_path =
@@ -2304,8 +2304,8 @@ mod tests {
         fn layer_bc_parallel_matches_serial_exact() {
             use crate::datagen::range_gen::NUM_COMBOS;
             use crate::datagen::sampler::Situation;
-            use gpu_range_solver::extract::extract_topology;
             use gpu_range_solver::SubgameSpec;
+            use gpu_range_solver::extract::extract_topology;
             use range_solver::card::index_to_card_pair;
 
             let model_path =

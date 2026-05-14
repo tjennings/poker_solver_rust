@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::datagen::domain::RecordWriter;
 use crate::datagen::manifest::{
-    DatasetManifest, ManifestIoError, ManifestValidationError, SourceMetadata, TargetSource,
-    TURN_BOUNDARY_BOARD_SIZE,
+    DatasetManifest, ManifestIoError, ManifestValidationError, SourceMetadata,
+    TURN_BOUNDARY_BOARD_SIZE, TargetSource,
 };
-use crate::datagen::storage::{record_size, TrainingRecord};
+use crate::datagen::storage::{TrainingRecord, record_size};
 
 /// Writes turn-boundary oracle records and their manifest as one dataset.
 pub struct TurnBoundaryDatasetWriter {

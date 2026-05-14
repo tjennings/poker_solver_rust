@@ -51,7 +51,7 @@ training:
   cluster_path: "./local_data/buckets/500f_100t_100r_v1"
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 300000
-  prune_after_iterations: 100000
+  prune_after_iterations: 600000
   prune_threshold: -5
   batch_size: 500
   dcfr_alpha: 1.5
@@ -64,7 +64,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/mp_6max_20bb_simplified_actions_500f_100t_100r_v1"
+  output_dir: "./local_data/blueprints/mp_6max_20bb_simplified_actions_500f_100t_100r_v2"
 
 tui:
   enabled: true

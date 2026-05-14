@@ -14,16 +14,16 @@ use rayon::prelude::*;
 
 use crate::poker::{Card, Hand, Rank, Rankable};
 
+use super::Street;
 use super::bucket_file::BucketFile;
 use super::centroid_file::CentroidFile;
 use super::cluster_pipeline::{
     build_deck, canonical_key, combo_index, compute_board_equities, enumerate_combos,
     sample_boards, sample_n_card_boards,
 };
-use super::Street;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
-use crate::hand_class::{classify, intra_class_strength, HandClass};
+use crate::hand_class::{HandClass, classify, intra_class_strength};
 use crate::showdown_equity;
 
 /// Size distribution statistics for bucket assignments.
@@ -1383,11 +1383,7 @@ pub fn mean_pairwise_centroid_emd(centroids: &[Vec<f64>]) -> f64 {
         }
     }
     #[allow(clippy::cast_precision_loss)]
-    if count > 0 {
-        total / count as f64
-    } else {
-        0.0
-    }
+    if count > 0 { total / count as f64 } else { 0.0 }
 }
 
 /// 1-D Earth Mover's Distance between two probability distributions.
@@ -1646,8 +1642,8 @@ pub fn audit_cfvnet_buckets(
     progress: impl Fn(f64),
 ) -> Result<EquityAuditReport, Box<dyn std::error::Error>> {
     use super::cluster_pipeline::{
-        build_cfvnet_to_core_combo_map, canonical_key, cfvnet_card_to_core, collect_bin_files,
-        read_cfv_as_equity, record_size_for_board, CFVNET_RIVER_RECORD_SIZE, CFV_FIELD_OFFSET,
+        CFV_FIELD_OFFSET, CFVNET_RIVER_RECORD_SIZE, build_cfvnet_to_core_combo_map, canonical_key,
+        cfvnet_card_to_core, collect_bin_files, read_cfv_as_equity, record_size_for_board,
     };
 
     let combo_map = build_cfvnet_to_core_combo_map();
@@ -2362,8 +2358,8 @@ pub fn diff_bucket_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
     use crate::blueprint_v2::Street;
+    use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
 
     fn make_test_bucket_file(bucket_count: u16, buckets: Vec<u16>) -> BucketFile {
         #[allow(clippy::cast_possible_truncation)]

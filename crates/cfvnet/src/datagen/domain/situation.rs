@@ -1,6 +1,6 @@
 use crate::config::DatagenConfig;
 use crate::datagen::precompute_ranges::PrecomputedRanges;
-use crate::datagen::sampler::{sample_situation, sample_situation_with_blueprint, Situation};
+use crate::datagen::sampler::{Situation, sample_situation, sample_situation_with_blueprint};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::path::Path;
@@ -156,8 +156,8 @@ mod tests {
         let config = DatagenConfig::default();
         let mut sit_gen = SituationGenerator::new(&config, 200, 4, 42, 1);
         let _first = sit_gen.next(); // consume the one item (or skip degenerate)
-                                     // After count is exhausted, should always return None
-                                     // (may return None on first call too if degenerate)
+        // After count is exhausted, should always return None
+        // (may return None on first call too if degenerate)
         for _ in 0..5 {
             assert!(sit_gen.next().is_none());
         }

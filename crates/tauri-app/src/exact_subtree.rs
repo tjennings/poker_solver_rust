@@ -251,10 +251,7 @@ fn solve_subtree_raw(
     (oop_out, ip_out)
 }
 
-fn weighted_num_combinations(
-    private_cards: &[Vec<(u8, u8)>; 2],
-    weights: &[Vec<f32>; 2],
-) -> f64 {
+fn weighted_num_combinations(private_cards: &[Vec<(u8, u8)>; 2], weights: &[Vec<f32>; 2]) -> f64 {
     let mut n = 0.0;
     for (i, &(o1, o2)) in private_cards[0].iter().enumerate() {
         let oop_weight = f64::from(weights[0].get(i).copied().unwrap_or(0.0));

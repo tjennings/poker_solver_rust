@@ -10,8 +10,8 @@ use range_solver::bet_size::BetSizeOptions;
 
 use super::range_gen::NUM_COMBOS;
 use super::sampler::sample_situation;
-use super::solver::{solve_situation, SolveConfig, SolveResult};
-use super::storage::{write_record, TrainingRecord};
+use super::solver::{SolveConfig, SolveResult, solve_situation};
+use super::storage::{TrainingRecord, write_record};
 use crate::config::CfvnetConfig;
 
 /// Number of situations to generate, solve, and write per chunk.

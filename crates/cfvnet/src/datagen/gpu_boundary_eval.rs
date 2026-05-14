@@ -75,7 +75,7 @@ impl GpuBoundaryEvaluator {
     ///
     /// Attempts TensorRT EP first, then CUDA EP, then falls back to CPU.
     pub fn load(model_path: &Path) -> Result<Self, String> {
-        use ort::session::{builder::GraphOptimizationLevel, Session};
+        use ort::session::{Session, builder::GraphOptimizationLevel};
 
         let session = Session::builder()
             .map_err(|e| format!("ort session builder: {e}"))?

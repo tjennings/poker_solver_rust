@@ -5,8 +5,8 @@
 //! `game_deal_card`, `game_back`, `game_solve`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
@@ -19,9 +19,9 @@ use poker_solver_core::blueprint_v2::game_tree::{
 };
 use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
 
-use range_solver::card::{NOT_DEALT, card_to_string};
+use range_solver::card::{card_to_string, NOT_DEALT};
 use range_solver::interface::Game;
-use range_solver::{PostFlopGame, compute_exploitability, finalize, solve_step};
+use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -197,11 +197,11 @@ fn boundary_evaluator_log_line(
 }
 
 use crate::exploration::{
-    ActionInfo, BucketLookup, RANKS, blueprint_sizes_to_range_solver, board_for_street_slice,
-    build_canonical_to_combo_map, canonical_hand_index_from_ranks, hand_label_from_matrix,
-    parse_board, pot_at_v2_node,
+    blueprint_sizes_to_range_solver, board_for_street_slice, build_canonical_to_combo_map,
+    canonical_hand_index_from_ranks, hand_label_from_matrix, parse_board, pot_at_v2_node,
+    ActionInfo, BucketLookup, RANKS,
 };
-use crate::postflop::{CbvContext, RolloutLeafEvaluator, parse_rs_poker_card};
+use crate::postflop::{parse_rs_poker_card, CbvContext, RolloutLeafEvaluator};
 
 // ---------------------------------------------------------------------------
 // Types returned to the frontend
@@ -540,7 +540,11 @@ impl GameSession {
 
     /// Map V2 player to weight index: BB/OOP = 0, SB/IP = 1.
     fn weight_index(&self, v2_player: u8) -> usize {
-        if v2_player == self.tree.dealer { 1 } else { 0 }
+        if v2_player == self.tree.dealer {
+            1
+        } else {
+            0
+        }
     }
 
     /// Get the street at the current node.
@@ -1133,9 +1137,7 @@ impl GameSession {
                     pot += actual;
                 }
                 TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
-                    let additional = (*amount - street_bets[player])
-                        .max(0.0)
-                        .min(stacks[player]);
+                    let additional = (*amount - street_bets[player]).max(0.0).min(stacks[player]);
                     stacks[player] -= additional;
                     street_bets[player] += additional;
                     pot += additional;
@@ -1184,8 +1186,7 @@ impl GameSession {
         let matched_amount = street_bets[0].min(street_bets[1]);
         let current_pot = self.compute_pot();
         debug_assert!((state.pot - f64::from(current_pot)).abs() < 1.0);
-        let street_start_pot =
-            (current_pot - street_bets[0] - street_bets[1]).max(1);
+        let street_start_pot = (current_pot - street_bets[0] - street_bets[1]).max(1);
 
         let (initial_prev_action, initial_prev_amount, initial_num_bets) = if to_call > 0 {
             let prev_amount = street_bets[opponent];
@@ -1469,9 +1470,7 @@ fn action_amount_bb_from_label(label: &str) -> Option<i32> {
 
 fn semantic_action_from_tree_action(action: &TreeAction) -> SemanticAction {
     let amount_bb = match action {
-        TreeAction::Bet(amount) | TreeAction::Raise(amount) => {
-            Some((amount / 2.0).round() as i32)
-        }
+        TreeAction::Bet(amount) | TreeAction::Raise(amount) => Some((amount / 2.0).round() as i32),
         _ => None,
     };
 
@@ -3764,16 +3763,14 @@ mod tests {
     fn game_session_state_has_dual_solve_states() {
         let gss = GameSessionState::default();
         // Both subgame_solve and exact_solve should exist and default to not solving
-        assert!(
-            !gss.subgame_solve
-                .solving
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-        assert!(
-            !gss.exact_solve
-                .solving
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!gss
+            .subgame_solve
+            .solving
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!gss
+            .exact_solve
+            .solving
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
@@ -4091,45 +4088,39 @@ mod tests {
     #[test]
     fn cancel_solve_sets_cancel_flag_subgame() {
         let gss = GameSessionState::default();
-        assert!(
-            !gss.subgame_solve
-                .cancel
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!gss
+            .subgame_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         game_cancel_solve_core(&gss, None).unwrap();
-        assert!(
-            gss.subgame_solve
-                .cancel
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(gss
+            .subgame_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         // exact_solve should be unaffected
-        assert!(
-            !gss.exact_solve
-                .cancel
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!gss
+            .exact_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
     fn cancel_solve_sets_cancel_flag_exact() {
         let gss = GameSessionState::default();
-        assert!(
-            !gss.exact_solve
-                .cancel
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!gss
+            .exact_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         game_cancel_solve_core(&gss, Some("exact".to_string())).unwrap();
-        assert!(
-            gss.exact_solve
-                .cancel
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(gss
+            .exact_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
         // subgame_solve should be unaffected
-        assert!(
-            !gss.subgame_solve
-                .cancel
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!gss
+            .subgame_solve
+            .cancel
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // -------------------------------------------------------------------
@@ -4421,7 +4412,7 @@ mod tests {
     fn build_solve_matrix_from_postflop_game() {
         // Build a tiny PostFlopGame and verify matrix extraction
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{NOT_DEALT, flop_from_str};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::range::Range;
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
@@ -5999,10 +5990,10 @@ mod tests {
             vec![],
             make_cached_node_with_actions("ROOT", root_actions, "SB"),
         );
-        gss.subgame_solve
-            .solve_cache
-            .write()
-            .insert(vec![0], make_cached_node("CHILD_BET", &["Fold", "Call"], "BB"));
+        gss.subgame_solve.solve_cache.write().insert(
+            vec![0],
+            make_cached_node("CHILD_BET", &["Fold", "Call"], "BB"),
+        );
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         let state = game_play_action_core(&gss, "0", Some("subgame".to_string())).unwrap();
@@ -6032,10 +6023,10 @@ mod tests {
             vec![],
             make_cached_node_with_actions("ROOT", root_actions, "BB"),
         );
-        gss.subgame_solve.solve_cache.write().insert(
-            vec![0],
-            make_cached_node("CHILD_CALL", &["Check"], "SB"),
-        );
+        gss.subgame_solve
+            .solve_cache
+            .write()
+            .insert(vec![0], make_cached_node("CHILD_CALL", &["Check"], "SB"));
         gss.subgame_solve.iteration.store(100, Ordering::Relaxed);
 
         let state = game_play_action_core(&gss, "1", Some("subgame".to_string())).unwrap();
@@ -6390,7 +6381,7 @@ mod tests {
     #[test]
     fn build_solve_cache_contains_root_and_children() {
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{NOT_DEALT, flop_from_str};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::range::Range;
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
@@ -6460,7 +6451,7 @@ mod tests {
     #[test]
     fn build_solve_matrix_at_current_works_without_back_to_root() {
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{NOT_DEALT, flop_from_str};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::range::Range;
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 

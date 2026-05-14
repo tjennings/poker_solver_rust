@@ -132,12 +132,12 @@ pub use game_session::{
     GameAction,
     GameMatrix,
     GameMatrixCell,
-    SolveGameRoot,
     // Types
     GameSession,
     GameSessionState,
     GameState,
     SolveBoundaryEvaluator,
+    SolveGameRoot,
     StreetBoundaryConfig,
     StreetBoundaryMode,
 };

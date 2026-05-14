@@ -1,4 +1,4 @@
-use crate::datagen::storage::{record_size, TrainingRecord, NUM_COMBOS};
+use crate::datagen::storage::{NUM_COMBOS, TrainingRecord, record_size};
 use crate::model::network::INPUT_SIZE;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

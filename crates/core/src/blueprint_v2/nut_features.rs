@@ -62,10 +62,7 @@ pub struct NutFeatures {
 ///
 /// Returns [`NutFeatureError::InvalidBoardSize`] unless `board.len() == 5`, or
 /// [`NutFeatureError::Classification`] if local hand classification fails.
-pub fn river_nut_features(
-    hole: [Card; 2],
-    board: &[Card],
-) -> Result<NutFeatures, NutFeatureError> {
+pub fn river_nut_features(hole: [Card; 2], board: &[Card]) -> Result<NutFeatures, NutFeatureError> {
     if board.len() != 5 {
         return Err(NutFeatureError::InvalidBoardSize(board.len()));
     }

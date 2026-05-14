@@ -996,7 +996,8 @@ mod tests {
         // One hand, edges are sorted by parent depth: root actions then node-1 actions.
         let strategy_sum = vec![0.25, 0.75, 0.20, 0.80];
         let initial_weights = [vec![0.60], vec![0.40]];
-        let reach = compute_reach_at_nodes(&topo, &strategy_sum, &initial_weights, 1, &[1, 2, 3, 4]);
+        let reach =
+            compute_reach_at_nodes(&topo, &strategy_sum, &initial_weights, 1, &[1, 2, 3, 4]);
 
         // For P0 traversal, reach is P1/opponent reach: P0 actions do not
         // attenuate it, P1 actions do.

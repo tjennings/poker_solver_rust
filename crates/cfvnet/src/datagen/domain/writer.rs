@@ -3,9 +3,9 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use crate::datagen::manifest::{
-    manifest_shard_path, ManifestValidationError, ShardMetadata, TargetSource,
+    ManifestValidationError, ShardMetadata, TargetSource, manifest_shard_path,
 };
-use crate::datagen::storage::{write_record, TrainingRecord};
+use crate::datagen::storage::{TrainingRecord, write_record};
 
 /// Writes training records to binary files with count tracking and optional per-file rotation.
 pub struct RecordWriter {
@@ -346,9 +346,11 @@ mod tests {
         assert_eq!(shards[2].records, 3);
         assert_eq!(shards[3].path, "data_00003.bin");
         assert_eq!(shards[3].records, 1);
-        assert!(shards
-            .iter()
-            .all(|shard| shard.target_source == Some(TargetSource::RiverNet)));
+        assert!(
+            shards
+                .iter()
+                .all(|shard| shard.target_source == Some(TargetSource::RiverNet))
+        );
     }
 
     #[test]

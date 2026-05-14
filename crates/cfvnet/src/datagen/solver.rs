@@ -1,11 +1,12 @@
 use crate::datagen::range_gen::NUM_COMBOS;
 use crate::datagen::sampler::Situation;
 use range_solver::{
+    CardConfig, PostFlopGame,
     action_tree::{ActionTree, BoardState, TreeConfig},
     bet_size::BetSizeOptions,
-    card::{card_pair_to_index, Card},
+    card::{Card, card_pair_to_index},
     range::Range,
-    solve, CardConfig, PostFlopGame,
+    solve,
 };
 
 /// Configuration for the range-solver wrapper.

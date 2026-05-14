@@ -1,7 +1,7 @@
 use rand::Rng;
 
 use super::precompute_ranges::PrecomputedRanges;
-use super::range_gen::{compute_hand_strengths, generate_rsp_range_with_strengths, NUM_COMBOS};
+use super::range_gen::{NUM_COMBOS, compute_hand_strengths, generate_rsp_range_with_strengths};
 use crate::config::DatagenConfig;
 
 /// A single training situation before solving.
