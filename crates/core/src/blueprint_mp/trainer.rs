@@ -302,7 +302,6 @@ fn training_loop_lazy(
     let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
         .round() as i32;
-    let negative_action = negative_action_traversal_config(config);
     let mut meta_iter = 0;
     let mut rng = SmallRng::seed_from_u64(0xC0DE_5EED_1234_5678);
 
@@ -317,6 +316,7 @@ fn training_loop_lazy(
         }
 
         let prune = should_prune(meta_iter, config, &mut rng);
+        let negative_action = negative_action_traversal_config(config, meta_iter);
         run_lazy_batch(
             game,
             storage,
@@ -526,9 +526,13 @@ fn run_lazy_batch(
     PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
 }
 
-fn negative_action_traversal_config(config: &MpTrainingConfig) -> NegativeActionTraversalConfig {
+fn negative_action_traversal_config(
+    config: &MpTrainingConfig,
+    meta_iter: u64,
+) -> NegativeActionTraversalConfig {
     NegativeActionTraversalConfig {
         enabled: config.negative_action_subtree_purge_enabled
+            && meta_iter >= config.prune_after_iterations
             && matches!(
                 config.negative_action_purge_mode,
                 MpNegativeActionPurgeMode::ScanHistoryPrefix
@@ -1023,6 +1027,26 @@ mod tests {
         assert!(should_prune(500, &config, &mut rng));
         // After warmup
         assert!(should_prune(1000, &config, &mut rng));
+    }
+
+    #[timed_test]
+    fn negative_action_traversal_config_respects_prune_warmup() {
+        let mut config = toy_training_config(1000);
+        config.negative_action_subtree_purge_enabled = true;
+        config.prune_after_iterations = 500;
+
+        assert!(!negative_action_traversal_config(&config, 499).enabled);
+        assert!(negative_action_traversal_config(&config, 500).enabled);
+        assert!(negative_action_traversal_config(&config, 1000).enabled);
+    }
+
+    #[timed_test]
+    fn negative_action_traversal_config_still_defaults_disabled_after_warmup() {
+        let mut config = toy_training_config(1000);
+        config.negative_action_subtree_purge_enabled = false;
+        config.prune_after_iterations = 500;
+
+        assert!(!negative_action_traversal_config(&config, 1000).enabled);
     }
 
     // -- regret_discount_factors tests --

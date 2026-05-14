@@ -669,11 +669,12 @@ When enabled, the opponent traversal uses learned baselines to reduce sampling v
 
 **Important for SAPCFR+**: Since RM+ floors negative regrets to 0, they can't accumulate below the prune threshold. Set `prune_threshold: 0` to effectively disable pruning, or use a small negative value as a safety margin.
 
-**Negative-action subtree purge experiment**: The training parser accepts `negative_action_subtree_purge_enabled`, `negative_action_prune_below`, `negative_action_reactivate_at`, and `negative_action_purge_mode` under `training:`. These keys are configured for the negative-action subtree purge experiment; configs that run the experiment should also disable batch-level prune exploration with `prune_explore_pct: 0.0` so randomly explored pruned actions do not mask purge behavior. The current sample experiment config is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`.
+**Negative-action subtree purge experiment**: The training parser accepts `negative_action_subtree_purge_enabled`, `negative_action_prune_below`, `negative_action_reactivate_at`, and `negative_action_purge_mode` under `training:`. These keys are configured for the negative-action subtree purge experiment. Purge/block behavior is inactive until `prune_after_iterations`; before that warmup boundary, negative regrets do not drop nodes. Configs that run the experiment should also disable batch-level prune exploration with `prune_explore_pct: 0.0` so randomly explored pruned actions do not mask purge behavior. The current sample experiment config is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`.
 
 ```yaml
 training:
   backend: lazy_sparse
+  prune_after_iterations: 600000
   prune_explore_pct: 0.0
   negative_action_subtree_purge_enabled: true
   negative_action_prune_below: -1
@@ -681,7 +682,7 @@ training:
   negative_action_purge_mode: scan_history_prefix
 ```
 
-With `negative_action_subtree_purge_enabled: true`, lazy traversal checks each action edge's cumulative regret. If regret is below `negative_action_prune_below`, the edge is marked blocked and sparse storage scans for the child action-history prefix, purging the child row and all already visited descendants while preserving sibling histories. Traversal skips blocked edges instead of allocating more rows below them. A blocked edge remains blocked until the parent action regret reaches `negative_action_reactivate_at`; on reactivation, the edge is unblocked and its stale child subtree is purged again. Future visits below that edge allocate fresh sparse rows, so descendants resume with first-visit/default behavior: zero cumulative regrets and uniform strategy until new updates arrive.
+With `negative_action_subtree_purge_enabled: true`, lazy traversal starts checking action-edge cumulative regret only once `meta_iter >= prune_after_iterations`. If regret is below `negative_action_prune_below`, the edge is marked blocked and sparse storage scans for the child action-history prefix, purging the child row and all already visited descendants while preserving sibling histories. Traversal skips blocked edges instead of allocating more rows below them. A blocked edge remains blocked until the parent action regret reaches `negative_action_reactivate_at`; on reactivation, the edge is unblocked and its stale child subtree is purged again. Future visits below that edge allocate fresh sparse rows, so descendants resume with first-visit/default behavior: zero cumulative regrets and uniform strategy until new updates arrive.
 
 For this experiment, use `prune_explore_pct: 0.0`. The normal batch-level prune exploration path deliberately revisits pruned actions, which makes it harder to read the experimental subtree purge effect. The current 6-max experiment is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`; run it with the `train-blueprint-mp` command shown above in the Blueprint MP section.
 
