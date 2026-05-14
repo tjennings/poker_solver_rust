@@ -1162,7 +1162,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if let Some(path) = scorecard_json {
                 let scorecard =
-                    build_cluster_scorecard_json(&cluster_dir, &reports, &hand_class_reports);
+                    build_cluster_scorecard_json(&cluster_dir, &reports, &hand_class_reports)?;
                 let json = serde_json::to_string_pretty(&scorecard)?;
                 std::fs::write(&path, json)?;
                 eprintln!("\nWrote bucket audit scorecard to {}", path.display());
@@ -3513,8 +3513,8 @@ fn build_cluster_scorecard_json(
     cluster_dir: &Path,
     reports: &[poker_solver_core::blueprint_v2::cluster_diagnostics::ClusterReport],
     hand_class_reports: &[poker_solver_core::blueprint_v2::cluster_diagnostics::HandClassBucketAuditReport],
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(serde_json::json!({
         "schema_version": 1,
         "cluster_dir": cluster_dir.display().to_string(),
         "cluster_reports": reports.iter().map(cluster_report_scorecard_json).collect::<Vec<_>>(),
@@ -3522,7 +3522,8 @@ fn build_cluster_scorecard_json(
             .iter()
             .map(hand_class_audit_scorecard_json)
             .collect::<Vec<_>>(),
-    })
+        "selected_suited_hand_profiles": selected_suited_hand_profiles(cluster_dir)?,
+    }))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -3694,6 +3695,113 @@ fn strength_inversion_scorecard_json(
 }
 
 fn percentile_usize(values: &[usize], percentile: f64) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let idx = ((sorted.len() - 1) as f64 * percentile).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn selected_suited_hand_profiles(
+    cluster_dir: &Path,
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    let mut profiles = Vec::new();
+    for (street_name, board_cards) in [("flop", 3_usize), ("turn", 4), ("river", 5)] {
+        let path = cluster_dir.join(format!("{street_name}.buckets"));
+        if !path.exists() {
+            continue;
+        }
+        let bucket_file = poker_solver_core::blueprint_v2::bucket_file::BucketFile::load(&path)?;
+        for (label, high, low) in selected_suited_hands() {
+            let buckets = suited_hand_bucket_values(&bucket_file, board_cards, high, low);
+            profiles.push(serde_json::json!({
+                "street": street_name,
+                "hand": label,
+                "count": buckets.len(),
+                "bucket_count": bucket_file.header.bucket_count,
+                "mean_bucket": mean_u16(&buckets),
+                "normalized_mean_bucket": normalized_mean_u16(&buckets, bucket_file.header.bucket_count),
+                "min_bucket": buckets.iter().copied().min().unwrap_or(0),
+                "p10_bucket": percentile_u16(&buckets, 0.10),
+                "p50_bucket": percentile_u16(&buckets, 0.50),
+                "p90_bucket": percentile_u16(&buckets, 0.90),
+                "max_bucket": buckets.iter().copied().max().unwrap_or(0),
+            }));
+        }
+    }
+    Ok(profiles)
+}
+
+fn selected_suited_hands() -> Vec<(
+    &'static str,
+    poker_solver_core::poker::Value,
+    poker_solver_core::poker::Value,
+)> {
+    use poker_solver_core::poker::Value;
+    vec![
+        ("KTs", Value::King, Value::Ten),
+        ("K9s", Value::King, Value::Nine),
+        ("K8s", Value::King, Value::Eight),
+        ("K7s", Value::King, Value::Seven),
+        ("K6s", Value::King, Value::Six),
+        ("K5s", Value::King, Value::Five),
+        ("K4s", Value::King, Value::Four),
+        ("K3s", Value::King, Value::Three),
+        ("K2s", Value::King, Value::Two),
+        ("Q6s", Value::Queen, Value::Six),
+        ("Q5s", Value::Queen, Value::Five),
+        ("Q4s", Value::Queen, Value::Four),
+    ]
+}
+
+fn suited_hand_bucket_values(
+    bucket_file: &poker_solver_core::blueprint_v2::bucket_file::BucketFile,
+    board_cards: usize,
+    high: poker_solver_core::poker::Value,
+    low: poker_solver_core::poker::Value,
+) -> Vec<u16> {
+    use poker_solver_core::blueprint_v2::cluster_pipeline::combo_index;
+    use poker_solver_core::poker::{Card, Suit};
+
+    let suits = [Suit::Spade, Suit::Heart, Suit::Diamond, Suit::Club];
+    let holes = suits.map(|suit| [Card::new(high, suit), Card::new(low, suit)]);
+    let combo_indices = holes.map(|hole| combo_index(hole[0], hole[1]));
+    let mut buckets = Vec::new();
+
+    for (board_idx, packed_board) in bucket_file.boards.iter().enumerate() {
+        let board = packed_board.to_cards(board_cards);
+        for (hole, &combo_idx) in holes.iter().zip(combo_indices.iter()) {
+            if board.contains(&hole[0]) || board.contains(&hole[1]) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            buckets.push(bucket_file.get_bucket(board_idx as u32, combo_idx));
+        }
+    }
+
+    buckets
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mean_u16(values: &[u16]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().map(|&value| f64::from(value)).sum::<f64>() / values.len() as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn normalized_mean_u16(values: &[u16], bucket_count: u16) -> f64 {
+    if bucket_count <= 1 {
+        return 0.0;
+    }
+    mean_u16(values) / f64::from(bucket_count - 1)
+}
+
+fn percentile_u16(values: &[u16], percentile: f64) -> u16 {
     if values.is_empty() {
         return 0;
     }

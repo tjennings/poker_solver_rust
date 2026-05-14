@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:14:02Z
-updated_at: 2026-05-14T01:19:41Z
+updated_at: 2026-05-14T01:22:50Z
 parent: poker_solver_rust-03j0
 ---
 
@@ -17,4 +17,4 @@ Started implementation with a stable `diag-clusters --scorecard-json <PATH>` out
 
 Verified with `cargo check -p poker-solver-trainer` and a smoke run against `local_data/buckets/500f_100t_100r_v1` using 20 sampled hand-class boards.
 
-Remaining in this task: add Kxs/Qxs sanity profile, nut-distance span metrics, and potential-consistency/distortion once those signals are exposed.
+Added selected Kxs/Qxs suited-hand profiles to the scorecard. Remaining in this task: add nut-distance span metrics and potential-consistency/distortion once those signals are exposed.

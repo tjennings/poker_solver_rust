@@ -393,7 +393,7 @@ Options:
 - `--hand-class-audit` -- Sample flop/turn/river boards and trace bucket assignments by private-card contribution (`board`, `1h`, `2h`), made hand class, rank-like intra-class strength, and equity decile. Reports contribution/class/strength groups that scatter across many buckets, buckets that mix incompatible populations, and possible strength-order inversions.
 - `--hand-class-audit-boards <N>` -- Number of boards to sample for hand-class audit (default: 10)
 - `--hand-class-audit-top <N>` -- Rows to show in each hand-class audit section (default: 10)
-- `--scorecard-json <PATH>` -- Write a stable JSON scorecard for regression comparison. Includes bucket-size skew metrics for every loaded street and, when `--hand-class-audit` is enabled, skipped lookup counts, class/strength spread metrics, mixed-bucket entropy/equity spans, and strength-order inversion summaries.
+- `--scorecard-json <PATH>` -- Write a stable JSON scorecard for regression comparison. Includes bucket-size skew metrics for every loaded street, selected Kxs/Qxs suited-hand profiles, and, when `--hand-class-audit` is enabled, skipped lookup counts, class/strength spread metrics, mixed-bucket entropy/equity spans, and strength-order inversion summaries.
 - `--sample-bucket <STREET> <BUCKET_ID>` -- Show 10 sample hands from the given bucket
 - `--centroid-emd <STREET>` -- Placeholder; centroid EMD requires feature vectors not stored in bucket files
 
