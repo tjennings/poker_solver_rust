@@ -1,0 +1,56 @@
+# Blueprint V2 clustering config: 500/100/100 with low normalized nut-distance weight.
+game:
+  name: "shared 500f 100t 100r buckets nut low"
+  players: 2
+  stack_depth: 40
+  small_blind: 1
+  big_blind: 2
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+    metric:
+      enabled: true
+      potential_weight: 0.0
+      equity_weight: 1.0
+      nut_distance_weight: 0.10
+      nut_sample_boards: 500
+  turn:
+    buckets: 100
+    sample_boards: 16432
+    metric:
+      enabled: true
+      potential_weight: 0.0
+      equity_weight: 1.0
+      nut_distance_weight: 0.10
+      nut_sample_boards: 500
+  river:
+    buckets: 100
+    sample_boards: 500000
+
+action_abstraction:
+  preflop:
+    - ["2bb"]
+  flop:
+    - [0.33]
+  turn:
+    - [0.5]
+  river:
+    - [0.5]
+
+training:
+  cluster_path: "./local_data/buckets/500f_100t_100r_nut_low_v1"
+  time_limit_minutes: 7200
+  lcfr_warmup_iterations: 300000
+  prune_after_iterations: 100000
+  prune_threshold: -50
+  batch_size: 2000
+
+snapshots:
+  resume: true
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "./local_data/blueprints/shared_500f_100t_100r_nut_low"
