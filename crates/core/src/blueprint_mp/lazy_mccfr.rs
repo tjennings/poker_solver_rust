@@ -36,6 +36,14 @@ static ACTION_OVER_CONFIG_AGGRESSIONS: [AtomicU64; LAZY_ACTION_STREET_COUNT] =
 static ACTION_ALL_IN_AGGRESSIONS: [AtomicU64; LAZY_ACTION_STREET_COUNT] =
     [const { AtomicU64::new(0) }; LAZY_ACTION_STREET_COUNT];
 
+/// Hysteresis settings for negative-action subtree gating during lazy traversal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NegativeActionTraversalConfig {
+    pub enabled: bool,
+    pub prune_below: i32,
+    pub reactivate_at: i32,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PreflopSize {
     Absolute(f64),
@@ -339,6 +347,7 @@ pub fn traverse_external_lazy(
     rake_cap: Chips,
     prune: bool,
     prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
 ) -> (f64, PruneStats) {
     traverse_node(
         game,
@@ -352,6 +361,7 @@ pub fn traverse_external_lazy(
         rake_cap,
         prune,
         prune_threshold,
+        negative_action,
     )
 }
 
@@ -367,6 +377,7 @@ fn traverse_node(
     rake_cap: Chips,
     prune: bool,
     prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
 ) -> (f64, PruneStats) {
     match normalize_node(node) {
         LazyNode::Terminal {
@@ -403,6 +414,7 @@ fn traverse_node(
                     rake_cap,
                     prune,
                     prune_threshold,
+                    negative_action,
                 )
             } else {
                 traverse_opponent(
@@ -419,6 +431,7 @@ fn traverse_node(
                     rake_cap,
                     prune,
                     prune_threshold,
+                    negative_action,
                 )
             }
         }
@@ -439,11 +452,29 @@ fn traverse_traverser(
     rake_cap: Chips,
     prune: bool,
     prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
 ) -> (f64, PruneStats) {
     let num_actions = actions.len();
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
+    let mut blocked = [false; MAX_ACTIONS];
+    for (action_idx, _) in actions.iter().enumerate() {
+        let child_history = history.append(action_idx);
+        blocked[action_idx] =
+            negative_action_blocks(storage, negative_action, key, action_idx, child_history);
+    }
+    // A concurrent worker may block an edge after this snapshot. Keep any
+    // already-started traversal value rather than replacing it with an
+    // artificial zero; later gate transitions can still purge descendants.
+    let mut eligible_strategy = [0.0; MAX_ACTIONS];
+    if !mask_strategy_to_unblocked(
+        &strategy[..num_actions],
+        &blocked[..num_actions],
+        &mut eligible_strategy[..num_actions],
+    ) {
+        return (0.0, PruneStats::default());
+    }
 
     let mut values = [0.0; MAX_ACTIONS];
     let mut pruned = [false; MAX_ACTIONS];
@@ -451,6 +482,11 @@ fn traverse_traverser(
     let mut prune_stats = PruneStats::default();
 
     for (action_idx, action) in actions.iter().copied().enumerate() {
+        let child_history = history.append(action_idx);
+        if blocked[action_idx] {
+            pruned[action_idx] = true;
+            continue;
+        }
         if should_prune_lazy(
             storage,
             prune,
@@ -469,15 +505,16 @@ fn traverse_traverser(
             deal,
             traverser,
             child,
-            history.append(action_idx),
+            child_history,
             rng,
             rake_rate,
             rake_cap,
             prune,
             prune_threshold,
+            negative_action,
         );
         values[action_idx] = value;
-        node_value += strategy[action_idx] * value;
+        node_value += eligible_strategy[action_idx] * value;
         prune_stats.merge(child_stats);
     }
 
@@ -488,8 +525,18 @@ fn traverse_traverser(
         let raw = (value - node_value) * REGRET_SCALE;
         let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)).round() as i32;
         storage.add_regret(key, num_actions, action_idx, delta);
+        let regret = storage.get_regret(key, action_idx);
+        let child_history = history.append(action_idx);
+        let _ = transition_negative_action_gate(
+            storage,
+            negative_action,
+            key,
+            action_idx,
+            regret,
+            child_history,
+        );
     }
-    for (action_idx, prob) in strategy[..num_actions].iter().enumerate() {
+    for (action_idx, prob) in eligible_strategy[..num_actions].iter().enumerate() {
         let raw = prob * STRATEGY_SCALE;
         let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
         storage.add_strategy_sum(key, num_actions, action_idx, delta);
@@ -512,29 +559,84 @@ fn traverse_opponent(
     rake_cap: Chips,
     prune: bool,
     prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
 ) -> (f64, PruneStats) {
     let num_actions = actions.len();
     debug_assert!(num_actions <= MAX_ACTIONS);
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
-    let sampled = sample_action(&strategy[..num_actions], rng);
+    let mut blocked = [false; MAX_ACTIONS];
+    for (action_idx, _) in actions.iter().enumerate() {
+        let child_history = history.append(action_idx);
+        blocked[action_idx] =
+            negative_action_blocks(storage, negative_action, key, action_idx, child_history);
+    }
+    // See traverser-side note: the eligibility snapshot gates descent, but a
+    // racing block after descent must not bias the sampled value to zero.
+    let mut eligible_strategy = [0.0; MAX_ACTIONS];
+    if !mask_strategy_to_unblocked(
+        &strategy[..num_actions],
+        &blocked[..num_actions],
+        &mut eligible_strategy[..num_actions],
+    ) {
+        return (0.0, PruneStats::default());
+    }
+    let sampled = sample_action(&eligible_strategy[..num_actions], rng);
 
-    let raw = strategy[sampled] * STRATEGY_SCALE;
+    let raw = eligible_strategy[sampled] * STRATEGY_SCALE;
     let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
     storage.add_strategy_sum(key, num_actions, sampled, delta);
 
-    traverse_node(
+    let child_history = history.append(sampled);
+    let (value, stats) = traverse_node(
         game,
         storage,
         deal,
         traverser,
         apply_action(state, actions[sampled]),
-        history.append(sampled),
+        child_history,
         rng,
         rake_rate,
         rake_cap,
         prune,
         prune_threshold,
+        negative_action,
+    );
+    (value, stats)
+}
+
+fn negative_action_blocks(
+    storage: &SparseMpStorage,
+    config: NegativeActionTraversalConfig,
+    key: MpInfosetKey,
+    action: usize,
+    child_history: LazyHistory,
+) -> bool {
+    if !config.enabled {
+        return false;
+    }
+    let regret = storage.get_regret(key, action);
+    transition_negative_action_gate(storage, config, key, action, regret, child_history).blocked
+}
+
+fn transition_negative_action_gate(
+    storage: &SparseMpStorage,
+    config: NegativeActionTraversalConfig,
+    key: MpInfosetKey,
+    action: usize,
+    regret: i32,
+    child_history: LazyHistory,
+) -> super::sparse_storage::NegativeActionGateResult {
+    if !config.enabled {
+        return super::sparse_storage::NegativeActionGateResult::default();
+    }
+    storage.transition_negative_action_edge(
+        key,
+        action,
+        regret,
+        config.prune_below,
+        config.reactivate_at,
+        (child_history.hi, child_history.lo, child_history.len),
     )
 }
 
@@ -567,6 +669,36 @@ fn sample_action(strategy: &[f64], rng: &mut impl Rng) -> usize {
         }
     }
     strategy.len() - 1
+}
+
+fn mask_strategy_to_unblocked(strategy: &[f64], blocked: &[bool], out: &mut [f64]) -> bool {
+    debug_assert_eq!(strategy.len(), blocked.len());
+    debug_assert_eq!(strategy.len(), out.len());
+    out.fill(0.0);
+    let total: f64 = strategy
+        .iter()
+        .zip(blocked)
+        .filter_map(|(probability, is_blocked)| (!is_blocked).then_some(*probability))
+        .sum();
+    let eligible = blocked.iter().filter(|is_blocked| !**is_blocked).count();
+    if eligible == 0 {
+        return false;
+    }
+    if total > 0.0 {
+        for (idx, (probability, is_blocked)) in strategy.iter().zip(blocked).enumerate() {
+            if !*is_blocked {
+                out[idx] = probability / total;
+            }
+        }
+    } else {
+        let uniform = 1.0 / eligible as f64;
+        for (idx, is_blocked) in blocked.iter().enumerate() {
+            if !*is_blocked {
+                out[idx] = uniform;
+            }
+        }
+    }
+    true
 }
 
 fn normalize_node(node: LazyNode) -> LazyNode {
@@ -1666,9 +1798,76 @@ mod tests {
             Chips::ZERO,
             false,
             -250,
+            NegativeActionTraversalConfig::default(),
         );
 
         assert!(value.is_finite());
         assert!(storage.entry_count() > 0);
+    }
+
+    #[timed_test]
+    fn negative_action_masked_strategy_falls_back_to_uniform_eligible_actions() {
+        let strategy = [1.0, 0.0, 0.0, 0.0];
+        let blocked = [true, false, true, false];
+        let mut masked = [42.0; 4];
+
+        assert!(mask_strategy_to_unblocked(&strategy, &blocked, &mut masked));
+
+        assert_eq!(masked, [0.0, 0.5, 0.0, 0.5]);
+    }
+
+    #[timed_test]
+    fn negative_action_masked_strategy_renormalizes_remaining_mass() {
+        let strategy = [0.7, 0.2, 0.1];
+        let blocked = [true, false, false];
+        let mut masked = [0.0; 3];
+
+        assert!(mask_strategy_to_unblocked(&strategy, &blocked, &mut masked));
+
+        assert!((masked[0] - 0.0).abs() < 1e-12);
+        assert!((masked[1] - (2.0 / 3.0)).abs() < 1e-12);
+        assert!((masked[2] - (1.0 / 3.0)).abs() < 1e-12);
+    }
+
+    #[timed_test]
+    fn lazy_negative_action_gate_purges_descendants_and_skips_reallocation() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let mut rng = SmallRng::seed_from_u64(43);
+        let deal = sample_deal(2, &mut rng);
+        let buckets = test_buckets(&deal, [10, 10, 10, 10]);
+        let root = game.root_state();
+        let root_bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
+        let root_history = LazyHistory::default();
+        let root_key = root_history.key(root, root_bucket);
+        let action_idx = 0;
+        let child_history = root_history.append(action_idx);
+        let descendant_history = child_history.append(0);
+        let descendant_key = descendant_history.key(root, root_bucket);
+
+        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+        storage.add_regret(descendant_key, 2, 0, 17);
+        assert_eq!(storage.get_regret(descendant_key, 0), 17);
+
+        let (value, _stats) = traverse_external_lazy(
+            &game,
+            &storage,
+            &buckets,
+            root.to_act,
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            -250,
+            NegativeActionTraversalConfig {
+                enabled: true,
+                prune_below: -1,
+                reactivate_at: 0,
+            },
+        );
+
+        assert!(value.is_finite());
+        assert!(storage.is_negative_action_edge_blocked(root_key, action_idx));
+        assert_eq!(storage.get_regret(descendant_key, 0), 0);
     }
 }

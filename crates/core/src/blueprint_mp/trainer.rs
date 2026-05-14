@@ -37,9 +37,9 @@ use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
 use super::MAX_PLAYERS;
-use super::config::{BlueprintMpConfig, MpGameConfig, MpTrainingConfig};
+use super::config::{BlueprintMpConfig, MpGameConfig, MpNegativeActionPurgeMode, MpTrainingConfig};
 use super::game_tree::MpGameTree;
-use super::lazy_mccfr::{LazyMpGame, traverse_external_lazy};
+use super::lazy_mccfr::{LazyMpGame, NegativeActionTraversalConfig, traverse_external_lazy};
 use super::mccfr::{sample_deal, traverse_external};
 use super::sparse_storage::SparseMpStorage;
 use super::storage::{MpStorage, REGRET_SCALE};
@@ -302,6 +302,7 @@ fn training_loop_lazy(
     let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
         .round() as i32;
+    let negative_action = negative_action_traversal_config(config);
     let mut meta_iter = 0;
     let mut rng = SmallRng::seed_from_u64(0xC0DE_5EED_1234_5678);
 
@@ -328,6 +329,7 @@ fn training_loop_lazy(
             meta_iter,
             prune,
             scaled_threshold,
+            negative_action,
         );
         meta_iter += batch;
         iterations.store(meta_iter, Ordering::Relaxed);
@@ -419,6 +421,7 @@ fn run_lazy_batch(
     base_iter: u64,
     prune: bool,
     prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
 ) {
     use super::mccfr::PruneStats;
     let batch_started = Instant::now();
@@ -457,6 +460,7 @@ fn run_lazy_batch(
                     rake_cap,
                     prune,
                     prune_threshold,
+                    negative_action,
                 );
                 let traverser_nanos = nanos_since(traverser_started);
                 if traverser_nanos > max_traverser_nanos {
@@ -520,6 +524,18 @@ fn run_lazy_batch(
     LAZY_SLOW_TRAVERSERS.fetch_add(timing.slow_traversers, Ordering::Relaxed);
     PRUNE_HITS.fetch_add(batch_stats.hits, Ordering::Relaxed);
     PRUNE_TOTAL.fetch_add(batch_stats.total, Ordering::Relaxed);
+}
+
+fn negative_action_traversal_config(config: &MpTrainingConfig) -> NegativeActionTraversalConfig {
+    NegativeActionTraversalConfig {
+        enabled: config.negative_action_subtree_purge_enabled
+            && matches!(
+                config.negative_action_purge_mode,
+                MpNegativeActionPurgeMode::ScanHistoryPrefix
+            ),
+        prune_below: config.negative_action_prune_below,
+        reactivate_at: config.negative_action_reactivate_at,
+    }
 }
 
 #[derive(Clone, Copy, Default)]

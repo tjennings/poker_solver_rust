@@ -7,8 +7,8 @@
 
 #![allow(clippy::cast_precision_loss)]
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -139,6 +139,14 @@ pub struct SparsePurgeStats {
     pub strategy_slots_purged: usize,
 }
 
+/// Result of applying negative-action subtree gate hysteresis to one edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NegativeActionGateResult {
+    pub blocked: bool,
+    pub reactivated: bool,
+    pub purge_stats: SparsePurgeStats,
+}
+
 /// Cumulative sparse storage activity counters for throughput diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SparseStorageActivity {
@@ -216,11 +224,24 @@ struct Shard {
     entries: Mutex<HashMap<MpInfosetKey, Arc<SparseNode>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NegativeActionEdgeKey {
+    parent: MpInfosetKey,
+    action: u8,
+}
+
+#[derive(Default)]
+struct BlockedEdgeShard {
+    edges: Mutex<HashSet<NegativeActionEdgeKey>>,
+}
+
 /// Thread-safe sparse regret and average-strategy storage for lazy MP CFR.
 pub struct SparseMpStorage {
     shards: Box<[Shard]>,
+    blocked_edge_shards: Box<[BlockedEdgeShard]>,
     shard_entry_counts: Box<[AtomicUsize]>,
     entry_count: AtomicUsize,
+    blocked_edge_count: AtomicUsize,
     slot_count: AtomicUsize,
     read_probes: AtomicU64,
     read_hits: AtomicU64,
@@ -258,14 +279,20 @@ impl SparseMpStorage {
             .map(|_| Shard::default())
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let blocked_edge_shards = (0..shard_count)
+            .map(|_| BlockedEdgeShard::default())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let shard_entry_counts = (0..shard_count)
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
             shards,
+            blocked_edge_shards,
             shard_entry_counts,
             entry_count: AtomicUsize::new(0),
+            blocked_edge_count: AtomicUsize::new(0),
             slot_count: AtomicUsize::new(0),
             read_probes: AtomicU64::new(0),
             read_hits: AtomicU64::new(0),
@@ -452,6 +479,31 @@ impl SparseMpStorage {
         prefix_lo: u64,
         prefix_len: u16,
     ) -> SparsePurgeStats {
+        self.purge_history_prefix(prefix_hi, prefix_lo, prefix_len, false)
+    }
+
+    /// Purge all visited infosets at or below a packed action-history prefix.
+    ///
+    /// Unlike [`Self::purge_descendants_with_history_prefix`], this removes
+    /// rows whose history exactly equals the prefix as well as strict
+    /// descendants. It is used for action-edge purges where the prefix is the
+    /// child history, not the parent infoset history.
+    pub fn purge_subtree_with_history_prefix(
+        &self,
+        prefix_hi: u64,
+        prefix_lo: u64,
+        prefix_len: u16,
+    ) -> SparsePurgeStats {
+        self.purge_history_prefix(prefix_hi, prefix_lo, prefix_len, true)
+    }
+
+    fn purge_history_prefix(
+        &self,
+        prefix_hi: u64,
+        prefix_lo: u64,
+        prefix_len: u16,
+        include_prefix: bool,
+    ) -> SparsePurgeStats {
         if prefix_len > PACKED_HISTORY_ACTION_SLOTS {
             return SparsePurgeStats::default();
         }
@@ -462,7 +514,12 @@ impl SparseMpStorage {
             let mut shard_rows_purged = 0_usize;
             let mut shard_slots_purged = 0_usize;
             guard.retain(|key, node| {
-                let purge = key.history_len > prefix_len
+                let length_matches = if include_prefix {
+                    key.history_len >= prefix_len
+                } else {
+                    key.history_len > prefix_len
+                };
+                let purge = length_matches
                     && packed_history_has_prefix(
                         key.history_hi,
                         key.history_lo,
@@ -490,6 +547,95 @@ impl SparseMpStorage {
             }
         }
         stats
+    }
+
+    /// Apply hysteresis for one negative-action subtree gate.
+    ///
+    /// An unblocked edge becomes blocked when its parent action regret drops
+    /// below `prune_below`; that transition purges currently visited rows at or
+    /// below `child_history`. A blocked edge stays blocked until the regret
+    /// reaches `reactivate_at`.
+    pub fn transition_negative_action_edge(
+        &self,
+        parent_key: MpInfosetKey,
+        action: usize,
+        regret: i32,
+        prune_below: i32,
+        reactivate_at: i32,
+        child_history: (u64, u64, u16),
+    ) -> NegativeActionGateResult {
+        let Ok(action) = u8::try_from(action) else {
+            return NegativeActionGateResult::default();
+        };
+        let (prefix_hi, prefix_lo, prefix_len) = child_history;
+        if prefix_len > PACKED_HISTORY_ACTION_SLOTS {
+            return NegativeActionGateResult::default();
+        }
+        let edge = NegativeActionEdgeKey {
+            parent: parent_key,
+            action,
+        };
+        let shard_idx = self.blocked_edge_shard_index_for(edge);
+
+        {
+            let mut guard = lock_blocked_edges(&self.blocked_edge_shards[shard_idx]);
+
+            if guard.contains(&edge) {
+                if regret >= reactivate_at {
+                    let purge_stats =
+                        self.purge_subtree_with_history_prefix(prefix_hi, prefix_lo, prefix_len);
+                    guard.remove(&edge);
+                    self.blocked_edge_count.fetch_sub(1, Ordering::Release);
+                    return NegativeActionGateResult {
+                        reactivated: true,
+                        purge_stats,
+                        ..NegativeActionGateResult::default()
+                    };
+                }
+                drop(guard);
+                let purge_stats =
+                    self.purge_subtree_with_history_prefix(prefix_hi, prefix_lo, prefix_len);
+                return NegativeActionGateResult {
+                    blocked: true,
+                    reactivated: false,
+                    purge_stats,
+                };
+            }
+
+            if regret >= prune_below {
+                return NegativeActionGateResult::default();
+            }
+
+            guard.insert(edge);
+            self.blocked_edge_count.fetch_add(1, Ordering::Release);
+        }
+
+        let purge_stats = self.purge_subtree_with_history_prefix(prefix_hi, prefix_lo, prefix_len);
+        NegativeActionGateResult {
+            blocked: true,
+            reactivated: false,
+            purge_stats,
+        }
+    }
+
+    /// Whether a negative-action subtree gate is currently blocking an edge.
+    #[must_use]
+    pub fn is_negative_action_edge_blocked(&self, parent_key: MpInfosetKey, action: usize) -> bool {
+        let Ok(action) = u8::try_from(action) else {
+            return false;
+        };
+        let edge = NegativeActionEdgeKey {
+            parent: parent_key,
+            action,
+        };
+        let shard = &self.blocked_edge_shards[self.blocked_edge_shard_index_for(edge)];
+        lock_blocked_edges(shard).contains(&edge)
+    }
+
+    /// Number of currently blocked negative-action edges.
+    #[must_use]
+    pub fn negative_action_blocked_edge_count(&self) -> usize {
+        self.blocked_edge_count.load(Ordering::Acquire)
     }
 
     /// Read a regret value. Missing entries or out-of-range actions return zero.
@@ -695,6 +841,9 @@ impl SparseMpStorage {
         if num_actions == 0 {
             return None;
         }
+        // Allocation cannot be gated from a sparse key alone: the key has the
+        // public child history and bucket, but not the blocked parent edge.
+        // Traversal owns edge-specific gating before descent.
         let shard_idx = self.shard_index_for(key);
         let shard = &self.shards[shard_idx];
         let mut guard = lock_entries(shard);
@@ -749,6 +898,15 @@ impl SparseMpStorage {
         let shard_count = u64::try_from(self.shards.len()).expect("shard count fits in u64");
         usize::try_from(hasher.finish() % shard_count)
             .expect("bounded sparse shard index fits in usize")
+    }
+
+    fn blocked_edge_shard_index_for(&self, edge: NegativeActionEdgeKey) -> usize {
+        let mut hasher = DefaultHasher::new();
+        edge.hash(&mut hasher);
+        let shard_count =
+            u64::try_from(self.blocked_edge_shards.len()).expect("shard count fits in u64");
+        usize::try_from(hasher.finish() % shard_count)
+            .expect("bounded blocked-edge shard index fits in usize")
     }
 }
 
@@ -824,6 +982,13 @@ fn packed_history_has_prefix(
 fn lock_entries(shard: &Shard) -> MutexGuard<'_, HashMap<MpInfosetKey, Arc<SparseNode>>> {
     shard
         .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_blocked_edges(shard: &BlockedEdgeShard) -> MutexGuard<'_, HashSet<NegativeActionEdgeKey>> {
+    shard
+        .edges
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -1202,6 +1367,214 @@ mod tests {
         assert_eq!(stats, SparsePurgeStats::default());
         assert_eq!(storage.entry_count(), 1);
         assert_eq!(storage.get_regret(descendant, 0), 99);
+    }
+
+    #[timed_test]
+    fn negative_action_gate_purges_once_and_reactivates_with_hysteresis() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[7]);
+        let child = history_key(2, &[7, 3]);
+        let grandchild = history_key(3, &[7, 3, 4]);
+        let sibling = history_key(4, &[7, 2]);
+        let (child_hi, child_lo) = pack_history(&[7, 3]);
+
+        storage.add_regret(parent, 4, 3, -6);
+        storage.add_regret(child, 2, 0, 22);
+        storage.add_regret(grandchild, 2, 0, 33);
+        storage.add_regret(sibling, 2, 0, 44);
+
+        let first =
+            storage.transition_negative_action_edge(parent, 3, -6, -5, 0, (child_hi, child_lo, 2));
+
+        assert!(first.blocked);
+        assert!(!first.reactivated);
+        assert_eq!(first.purge_stats.rows_purged, 2);
+        assert_eq!(storage.negative_action_blocked_edge_count(), 1);
+        assert!(storage.is_negative_action_edge_blocked(parent, 3));
+        assert_eq!(storage.get_regret(parent, 3), -6);
+        assert_eq!(storage.get_regret(child, 0), 0);
+        assert_eq!(storage.get_regret(grandchild, 0), 0);
+        assert_eq!(storage.get_regret(sibling, 0), 44);
+
+        let still_blocked =
+            storage.transition_negative_action_edge(parent, 3, -1, -5, 0, (child_hi, child_lo, 2));
+        assert!(still_blocked.blocked);
+        assert_eq!(still_blocked.purge_stats, SparsePurgeStats::default());
+        assert_eq!(storage.negative_action_blocked_edge_count(), 1);
+
+        let reactivated =
+            storage.transition_negative_action_edge(parent, 3, 0, -5, 0, (child_hi, child_lo, 2));
+        assert!(!reactivated.blocked);
+        assert!(reactivated.reactivated);
+        assert!(!storage.is_negative_action_edge_blocked(parent, 3));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+    }
+
+    #[timed_test]
+    fn negative_action_gate_repurges_already_blocked_stale_descendants() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[7]);
+        let descendant = history_key(2, &[7, 3, 4]);
+        let sibling = history_key(3, &[7, 2]);
+        let (child_hi, child_lo) = pack_history(&[7, 3]);
+
+        storage.add_regret(parent, 4, 3, -6);
+
+        let first =
+            storage.transition_negative_action_edge(parent, 3, -6, -5, 0, (child_hi, child_lo, 2));
+        assert!(first.blocked);
+        assert_eq!(first.purge_stats, SparsePurgeStats::default());
+        assert_eq!(storage.negative_action_blocked_edge_count(), 1);
+
+        storage.add_regret(parent, 4, 3, 5);
+        storage.add_regret(descendant, 2, 0, 33);
+        storage.add_strategy_sum(descendant, 2, 1, 77);
+        storage.add_regret(sibling, 2, 0, 44);
+
+        assert_eq!(storage.get_regret(parent, 3), -1);
+        assert_eq!(storage.get_regret(descendant, 0), 33);
+        assert_eq!(storage.get_strategy_sum(descendant, 1), 77);
+        assert_eq!(storage.entry_count(), 3);
+        assert!(storage.is_negative_action_edge_blocked(parent, 3));
+
+        let second =
+            storage.transition_negative_action_edge(parent, 3, -1, -5, 0, (child_hi, child_lo, 2));
+
+        assert!(second.blocked);
+        assert!(!second.reactivated);
+        assert_eq!(second.purge_stats.rows_purged, 1);
+        assert_eq!(second.purge_stats.regret_slots_purged, 2);
+        assert_eq!(second.purge_stats.strategy_slots_purged, 2);
+        assert!(storage.is_negative_action_edge_blocked(parent, 3));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 1);
+        assert_eq!(storage.get_regret(parent, 3), -1);
+        assert_eq!(storage.get_regret(descendant, 0), 0);
+        assert_eq!(storage.get_strategy_sum(descendant, 1), 0);
+        assert_eq!(storage.get_regret(sibling, 0), 44);
+        assert_eq!(storage.entry_count(), 2);
+    }
+
+    #[timed_test]
+    fn negative_action_gate_reactivation_purges_stale_descendants() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[7]);
+        let child = history_key(2, &[7, 3]);
+        let grandchild = history_key(3, &[7, 3, 4]);
+        let sibling = history_key(4, &[7, 2]);
+        let (child_hi, child_lo) = pack_history(&[7, 3]);
+
+        storage.add_regret(parent, 4, 3, -6);
+
+        let first =
+            storage.transition_negative_action_edge(parent, 3, -6, -5, 0, (child_hi, child_lo, 2));
+        assert!(first.blocked);
+        assert!(!first.reactivated);
+        assert_eq!(storage.negative_action_blocked_edge_count(), 1);
+
+        storage.add_regret(parent, 4, 1, 11);
+        storage.add_regret(parent, 4, 3, 6);
+        storage.add_regret(child, 2, 0, 22);
+        storage.add_strategy_sum(child, 2, 1, 55);
+        storage.add_regret(grandchild, 3, 2, 33);
+        storage.add_strategy_sum(grandchild, 3, 0, 66);
+        storage.add_regret(sibling, 2, 0, 44);
+
+        assert_eq!(storage.get_regret(parent, 1), 11);
+        assert_eq!(storage.get_regret(parent, 3), 0);
+        assert_eq!(storage.get_regret(child, 0), 22);
+        assert_eq!(storage.get_strategy_sum(child, 1), 55);
+        assert_eq!(storage.get_regret(grandchild, 2), 33);
+        assert_eq!(storage.get_strategy_sum(grandchild, 0), 66);
+        assert_eq!(storage.get_regret(sibling, 0), 44);
+        assert_eq!(storage.entry_count(), 4);
+        assert!(storage.is_negative_action_edge_blocked(parent, 3));
+
+        let reactivated =
+            storage.transition_negative_action_edge(parent, 3, 0, -5, 0, (child_hi, child_lo, 2));
+
+        assert!(!reactivated.blocked);
+        assert!(reactivated.reactivated);
+        assert_eq!(reactivated.purge_stats.rows_purged, 2);
+        assert_eq!(reactivated.purge_stats.regret_slots_purged, 5);
+        assert_eq!(reactivated.purge_stats.strategy_slots_purged, 5);
+        assert!(!storage.is_negative_action_edge_blocked(parent, 3));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+        assert_eq!(storage.get_regret(parent, 1), 11);
+        assert_eq!(storage.get_regret(parent, 3), 0);
+        assert_eq!(storage.get_regret(child, 0), 0);
+        assert_eq!(storage.get_strategy_sum(child, 1), 0);
+        assert_eq!(storage.get_regret(grandchild, 2), 0);
+        assert_eq!(storage.get_strategy_sum(grandchild, 0), 0);
+        assert_eq!(storage.get_regret(sibling, 0), 44);
+        assert_eq!(storage.entry_count(), 2);
+    }
+
+    #[timed_test]
+    fn negative_action_gate_allows_allocation_for_different_parent_with_same_public_prefix() {
+        let storage = SparseMpStorage::with_shards(4);
+        let blocked_parent = history_key(1, &[7]);
+        let eligible_parent = history_key(2, &[7]);
+        let eligible_child = history_key(2, &[7, 3]);
+        let blocked_sibling = history_key(3, &[7, 2]);
+        let (child_hi, child_lo) = pack_history(&[7, 3]);
+
+        storage.add_regret(blocked_parent, 4, 3, -6);
+
+        let blocked = storage.transition_negative_action_edge(
+            blocked_parent,
+            3,
+            -6,
+            -5,
+            0,
+            (child_hi, child_lo, 2),
+        );
+        assert!(blocked.blocked);
+        assert_eq!(storage.negative_action_blocked_edge_count(), 1);
+
+        assert!(storage.is_negative_action_edge_blocked(blocked_parent, 3));
+        assert!(!storage.is_negative_action_edge_blocked(eligible_parent, 3));
+
+        storage.add_regret(eligible_child, 2, 0, 22);
+        storage.add_regret(blocked_sibling, 2, 0, 44);
+
+        assert_eq!(storage.get_regret(blocked_parent, 3), -6);
+        assert_eq!(storage.get_regret(eligible_child, 0), 22);
+        assert_eq!(storage.get_regret(blocked_sibling, 0), 44);
+        assert_eq!(storage.entry_count(), 3);
+    }
+
+    #[timed_test]
+    fn negative_action_gate_ignores_histories_beyond_packed_capacity() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[3]);
+        let descendant = history_key(2, &[3, 1, 4]);
+
+        storage.add_regret(parent, 2, 0, -6);
+        storage.add_regret(descendant, 2, 0, 77);
+
+        let result = storage.transition_negative_action_edge(parent, 0, -6, -5, 0, (0, 0, 33));
+
+        assert_eq!(result, NegativeActionGateResult::default());
+        assert!(!storage.is_negative_action_edge_blocked(parent, 0));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+        assert_eq!(storage.get_regret(descendant, 0), 77);
+    }
+
+    #[timed_test]
+    fn negative_action_gate_does_not_block_before_prune_threshold() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[1]);
+        let child = history_key(2, &[1, 0]);
+        let (child_hi, child_lo) = pack_history(&[1, 0]);
+
+        storage.add_regret(child, 2, 0, 22);
+
+        let result =
+            storage.transition_negative_action_edge(parent, 0, -5, -5, 0, (child_hi, child_lo, 2));
+
+        assert_eq!(result, NegativeActionGateResult::default());
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+        assert_eq!(storage.get_regret(child, 0), 22);
     }
 
     #[timed_test]
