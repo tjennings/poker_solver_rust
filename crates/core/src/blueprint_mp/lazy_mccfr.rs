@@ -970,7 +970,7 @@ fn generate_actions(config: &LazyActionConfig, state: &LazyPublicState) -> Vec<T
         actions.push(TreeAction::Fold);
     }
     if is_unopened_preflop && state.facing_bet {
-        if config.allow_preflop_limp && preflop_call_allowed(config.max_flop_players, state) {
+        if unopened_preflop_call_allowed(config, state) {
             actions.push(TreeAction::Call);
         }
     } else {
@@ -1012,6 +1012,13 @@ fn add_check_or_call(
     } else {
         actions.push(TreeAction::Check);
     }
+}
+
+fn unopened_preflop_call_allowed(config: &LazyActionConfig, state: &LazyPublicState) -> bool {
+    let actor = state.to_act.index() as usize;
+    let actor_has_blind_posted = state.street_bets[actor] > Chips(SIZE_EPSILON);
+    (config.allow_preflop_limp || actor_has_blind_posted)
+        && preflop_call_allowed(config.max_flop_players, state)
 }
 
 fn add_sized_actions(
@@ -1697,25 +1704,47 @@ mod tests {
         game_config.allow_preflop_limp = false;
         let game = LazyMpGame::new(&game_config, &action_config());
 
-        let root = game.root_state();
-        let actions = game.actions(&root);
+        let mut state = game.root_state();
+        for position in ["UTG", "HJ", "CO", "BTN"] {
+            let actions = game.actions(&state);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, TreeAction::Call)),
+                "{position} should not include a cold limp when limps are disabled, got {actions:?}"
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON)),
+                "{position} should keep configured opens when limps are disabled, got {actions:?}"
+            );
 
+            let LazyNode::Decision(next_state) =
+                normalize_node(apply_action(state, TreeAction::Fold))
+            else {
+                panic!("{position} fold should route to next unopened preflop decision");
+            };
+            state = next_state;
+        }
+
+        let sb_actions = game.actions(&state);
         assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, TreeAction::Fold))
-        );
-        assert!(
-            !actions
+            sb_actions
                 .iter()
                 .any(|action| matches!(action, TreeAction::Call)),
-            "Unopened root should not include Call/limp when disabled, got {actions:?}"
+            "SB should keep completion/call when limps are disabled, got {sb_actions:?}"
         );
+        let LazyNode::Decision(bb_state) = normalize_node(apply_action(state, TreeAction::Call))
+        else {
+            panic!("SB completion should route to BB decision");
+        };
+        let bb_actions = game.actions(&bb_state);
         assert!(
-            actions
+            bb_actions
                 .iter()
-                .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON)),
-            "Unopened root should keep configured opens when limps are disabled, got {actions:?}"
+                .any(|action| matches!(action, TreeAction::Check)),
+            "BB should be able to check after SB completion, got {bb_actions:?}"
         );
     }
 

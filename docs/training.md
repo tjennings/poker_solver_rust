@@ -598,7 +598,7 @@ See `sample_configurations/blueprint_mp_6player_ante.yaml` for a full 12-scenari
 
 ## Blueprint Training Configuration
 
-All `game:` section values are in **chips** (1 BB = 2 chips). Example: `stack_depth: 200` = 100 BB, `small_blind: 1`, `big_blind: 2`. `allow_preflop_limp` defaults to `true`; set it to `false` to remove unopened preflop calls/limps while keeping folds and configured open sizes. Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` = raise to 5 chips (2.5 BB). Display converts to BB at the UI/CLI boundary only (dividing by 2). See `docs/architecture.md` for full unit convention.
+All `game:` section values are in **chips** (1 BB = 2 chips). Example: `stack_depth: 200` = 100 BB, `small_blind: 1`, `big_blind: 2`. `allow_preflop_limp` defaults to `true`; set it to `false` to remove unopened cold limps while keeping folds, configured open sizes, SB completion, and BB checks. Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` = raise to 5 chips (2.5 BB). Display converts to BB at the UI/CLI boundary only (dividing by 2). See `docs/architecture.md` for full unit convention.
 
 The `training:` section of the blueprint YAML config controls the MCCFR training loop. Key parameters:
 

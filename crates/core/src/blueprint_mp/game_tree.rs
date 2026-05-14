@@ -371,7 +371,7 @@ fn generate_actions(config: &TreeBuildConfig, state: &BuildState) -> Vec<TreeAct
     }
 
     if is_unopened_preflop && state.facing_bet {
-        if config.allow_preflop_limp && preflop_call_allowed(config.max_flop_players, state) {
+        if unopened_preflop_call_allowed(config, state) {
             actions.push(TreeAction::Call);
         }
     } else {
@@ -388,6 +388,13 @@ fn generate_actions(config: &TreeBuildConfig, state: &BuildState) -> Vec<TreeAct
 
 fn is_unopened_preflop(state: &BuildState) -> bool {
     state.street == Street::Preflop && state.raise_count == 0
+}
+
+fn unopened_preflop_call_allowed(config: &TreeBuildConfig, state: &BuildState) -> bool {
+    let actor = state.to_act.index() as usize;
+    let actor_has_blind_posted = state.street_bets[actor] > Chips(SIZE_EPSILON);
+    (config.allow_preflop_limp || actor_has_blind_posted)
+        && preflop_call_allowed(config.max_flop_players, state)
 }
 
 fn add_check_or_call(config: &TreeBuildConfig, state: &BuildState, actions: &mut Vec<TreeAction>) {
@@ -1560,23 +1567,57 @@ mod tests {
         game.allow_preflop_limp = false;
         let tree = MpGameTree::build(&game, &action_cfg);
 
-        let MpGameNode::Decision { actions, .. } = &tree.nodes[tree.root as usize] else {
-            panic!("Root should be an unopened preflop Decision node");
-        };
+        let mut node_idx = tree.root;
+        for position in ["UTG", "HJ", "CO", "BTN"] {
+            let MpGameNode::Decision {
+                actions, children, ..
+            } = &tree.nodes[node_idx as usize]
+            else {
+                panic!("{position} should be an unopened preflop Decision node");
+            };
 
+            assert!(
+                !actions.iter().any(|a| matches!(a, TreeAction::Call)),
+                "{position} should not include a cold limp when limps are disabled, got {actions:?}"
+            );
+            assert!(
+                actions.iter().any(
+                    |a| matches!(a, TreeAction::Lead(chips) if (*chips - 4.0).abs() < SIZE_EPSILON)
+                ),
+                "{position} should keep configured opens when limps are disabled, got {actions:?}"
+            );
+            let fold_idx = actions
+                .iter()
+                .position(|a| matches!(a, TreeAction::Fold))
+                .expect("unopened preflop node should have Fold");
+            node_idx = children[fold_idx];
+        }
+
+        let MpGameNode::Decision {
+            actions, children, ..
+        } = &tree.nodes[node_idx as usize]
+        else {
+            panic!("SB should be an unopened preflop Decision node");
+        };
         assert!(
-            actions.iter().any(|a| matches!(a, TreeAction::Fold)),
-            "Unopened root should keep Fold when limps are disabled, got {actions:?}"
+            actions.iter().any(|a| matches!(a, TreeAction::Call)),
+            "SB should keep completion/call when limps are disabled, got {actions:?}"
         );
+        let call_idx = actions
+            .iter()
+            .position(|a| matches!(a, TreeAction::Call))
+            .expect("SB should have completion/call");
+        let bb_node = &tree.nodes[children[call_idx] as usize];
+        let MpGameNode::Decision {
+            actions: bb_actions,
+            ..
+        } = bb_node
+        else {
+            panic!("BB should act after SB completion");
+        };
         assert!(
-            !actions.iter().any(|a| matches!(a, TreeAction::Call)),
-            "Unopened root should not include Call/limp when disabled, got {actions:?}"
-        );
-        assert!(
-            actions.iter().any(
-                |a| matches!(a, TreeAction::Lead(chips) if (*chips - 4.0).abs() < SIZE_EPSILON)
-            ),
-            "Unopened root should keep configured opens when limps are disabled, got {actions:?}"
+            bb_actions.iter().any(|a| matches!(a, TreeAction::Check)),
+            "BB should be able to check after SB completion, got {bb_actions:?}"
         );
     }
 
