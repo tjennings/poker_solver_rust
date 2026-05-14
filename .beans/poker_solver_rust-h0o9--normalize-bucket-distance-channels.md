@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-h0o9
 title: Normalize bucket distance channels
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-05-14T01:14:02Z
-updated_at: 2026-05-14T01:14:02Z
+updated_at: 2026-05-14T03:16:41Z
 parent: poker_solver_rust-03j0
 ---
 
