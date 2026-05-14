@@ -1837,6 +1837,42 @@ mod tests {
     }
 
     #[timed_test]
+    fn negative_action_gate_disabled_preserves_default_traversal_storage_behavior() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let root = game.root_state();
+        let root_history = LazyHistory::default();
+        let root_key = root_history.key(root, 10);
+        let action_idx = 0;
+        let child_history = root_history.append(action_idx);
+        let descendant_history = child_history.append(0);
+        let descendant_key = descendant_history.key(root, 10);
+
+        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+        storage.add_regret(descendant_key, 2, 0, 17);
+
+        assert!(!negative_action_blocks(
+            &storage,
+            NegativeActionTraversalConfig {
+                enabled: false,
+                prune_below: -1,
+                reactivate_at: 0,
+            },
+            root_key,
+            action_idx,
+            child_history
+        ));
+
+        assert!(!storage.is_negative_action_edge_blocked(root_key, action_idx));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+        assert_eq!(storage.get_regret(descendant_key, 0), 17);
+        assert_eq!(
+            storage.negative_action_telemetry(),
+            crate::blueprint_mp::sparse_storage::SparseNegativeActionTelemetry::default()
+        );
+    }
+
+    #[timed_test]
     fn lazy_negative_action_gate_purges_descendants_and_skips_reallocation() {
         let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
         let storage = SparseMpStorage::with_shards(8);
