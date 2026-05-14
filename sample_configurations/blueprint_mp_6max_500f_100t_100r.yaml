@@ -53,6 +53,11 @@ training:
   lcfr_warmup_iterations: 300000
   prune_after_iterations: 600000
   prune_threshold: -1
+  prune_explore_pct: 0.0
+  negative_action_subtree_purge_enabled: true
+  negative_action_prune_below: -1
+  negative_action_reactivate_at: 0
+  negative_action_purge_mode: scan_history_prefix
   batch_size: 500
   dcfr_alpha: 1.5
   dcfr_beta: 0.0

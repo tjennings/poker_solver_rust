@@ -2892,11 +2892,14 @@ struct MpNoTuiHeartbeat {
     last_sparse_bytes: usize,
     last_sparse_activity: SparseStorageActivity,
     last_sparse_insert_attribution: SparseInsertAttribution,
+    last_sparse_negative_action: SparseNegativeActionTelemetry,
 }
 
 type SparseStorageActivity = poker_solver_core::blueprint_mp::sparse_storage::SparseStorageActivity;
 type SparseInsertAttribution =
     poker_solver_core::blueprint_mp::sparse_storage::SparseInsertAttribution;
+type SparseNegativeActionTelemetry =
+    poker_solver_core::blueprint_mp::sparse_storage::SparseNegativeActionTelemetry;
 type SparseTelemetrySample = poker_solver_core::blueprint_mp::sparse_storage::SparseTelemetrySample;
 type LazyActionLimitSnapshot = poker_solver_core::blueprint_mp::lazy_mccfr::LazyActionLimitSnapshot;
 const STREET_LABELS: [&str; 4] = ["pf", "f", "t", "r"];
@@ -2918,6 +2921,7 @@ impl MpNoTuiHeartbeat {
             last_sparse_bytes: 0,
             last_sparse_activity: Default::default(),
             last_sparse_insert_attribution: Default::default(),
+            last_sparse_negative_action: Default::default(),
         }
     }
 
@@ -3009,6 +3013,9 @@ impl MpNoTuiHeartbeat {
             insert_attribution,
             self.last_sparse_insert_attribution,
         );
+        let negative_action = storage.negative_action_telemetry();
+        let negative_action_delta =
+            sparse_negative_action_delta(negative_action, self.last_sparse_negative_action);
         let stats_nanos = u64::try_from(stats_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let entries_since_last = stats.entries.saturating_sub(self.last_sparse_entries);
         let bytes_since_last = stats.approx_bytes.saturating_sub(self.last_sparse_bytes);
@@ -3033,10 +3040,16 @@ impl MpNoTuiHeartbeat {
         let read_hit_pct = percent(activity_delta.read_hits, activity_delta.read_probes);
         let write_hit_pct = percent(activity_delta.write_hits, activity_delta.write_probes);
         let insert_by_text = format_sparse_insert_attribution(insert_attribution_delta, since_last);
+        let negative_action_text = format_sparse_negative_action(
+            negative_action,
+            negative_action_delta,
+            storage.negative_action_blocked_edge_count(),
+            since_last,
+        );
         let action_limit_text = format_lazy_action_limit(action_limit, since_last);
         let prune_pct = take_mp_prune_pct();
         eprintln!(
-            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] {} {} timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
+            "  iter={} ips={:.0} avg_ips={:.0} elapsed={} sparse[entries={} (+{:.0}/s), regret_slots={}, strategy_slots={}, approx={} (+{}/s), shards={}/{}, avg_shard={:.0}, max_shard={}] activity[read={:.0}/s hit={:.1}%, write={:.0}/s hit={:.1}%, inserts={:.0}/s] {} {} {} timing[batch_wall={}, deal={}, buckets={}, traverse={}, discount={}, stats={}] tail[traversals={}, max_job={}@iter{}, slow_jobs={}, max_trav={}@iter{}/p{}, slow_trav={}] prune={:.1}%",
             iters,
             interval_rate,
             avg_rate,
@@ -3057,6 +3070,7 @@ impl MpNoTuiHeartbeat {
             write_hit_pct,
             insert_rate,
             insert_by_text,
+            negative_action_text,
             action_limit_text,
             format_nanos_millis(loop_timing.batch_wall_nanos),
             format_nanos_millis(loop_timing.deal_nanos),
@@ -3080,6 +3094,7 @@ impl MpNoTuiHeartbeat {
         self.last_sparse_bytes = stats.approx_bytes;
         self.last_sparse_activity = activity;
         self.last_sparse_insert_attribution = insert_attribution;
+        self.last_sparse_negative_action = negative_action;
     }
 }
 
@@ -3113,6 +3128,36 @@ fn sparse_insert_attribution_delta(
             .action_count_sum
             .saturating_sub(previous.action_count_sum),
         action_count_max: current.action_count_max,
+    }
+}
+
+fn sparse_negative_action_delta(
+    current: SparseNegativeActionTelemetry,
+    previous: SparseNegativeActionTelemetry,
+) -> SparseNegativeActionTelemetry {
+    SparseNegativeActionTelemetry {
+        actions_newly_pruned: current
+            .actions_newly_pruned
+            .saturating_sub(previous.actions_newly_pruned),
+        actions_reactivated: current
+            .actions_reactivated
+            .saturating_sub(previous.actions_reactivated),
+        subtree_purge_calls: current
+            .subtree_purge_calls
+            .saturating_sub(previous.subtree_purge_calls),
+        rows_purged: current.rows_purged.saturating_sub(previous.rows_purged),
+        regret_slots_purged: current
+            .regret_slots_purged
+            .saturating_sub(previous.regret_slots_purged),
+        strategy_slots_purged: current
+            .strategy_slots_purged
+            .saturating_sub(previous.strategy_slots_purged),
+        blocked_traversal_skips: current
+            .blocked_traversal_skips
+            .saturating_sub(previous.blocked_traversal_skips),
+        purge_scan_nanos: current
+            .purge_scan_nanos
+            .saturating_sub(previous.purge_scan_nanos),
     }
 }
 
@@ -3152,6 +3197,34 @@ fn format_sparse_insert_attribution(
         attribution.action_count_max,
         ACTION_COUNT_BIN_LABELS[action_idx],
         per_second(action_count, elapsed_secs),
+    )
+}
+
+fn format_sparse_negative_action(
+    current: SparseNegativeActionTelemetry,
+    delta: SparseNegativeActionTelemetry,
+    blocked_edges: usize,
+    elapsed_secs: f64,
+) -> String {
+    format!(
+        "neg_action[blocked_edges={}, new_pruned={} ({:.0}/s), reactivated={} ({:.0}/s), purge_calls={} ({:.0}/s), rows_purged={} (+{:.0}/s), regret_slots_purged={} (+{:.0}/s), strategy_slots_purged={} (+{:.0}/s), blocked_skips={} ({:.0}/s), purge_scan={}/{}]",
+        blocked_edges,
+        current.actions_newly_pruned,
+        per_second(delta.actions_newly_pruned, elapsed_secs),
+        current.actions_reactivated,
+        per_second(delta.actions_reactivated, elapsed_secs),
+        current.subtree_purge_calls,
+        per_second(delta.subtree_purge_calls, elapsed_secs),
+        current.rows_purged,
+        per_second(delta.rows_purged, elapsed_secs),
+        current.regret_slots_purged,
+        per_second(delta.regret_slots_purged, elapsed_secs),
+        current.strategy_slots_purged,
+        per_second(delta.strategy_slots_purged, elapsed_secs),
+        current.blocked_traversal_skips,
+        per_second(delta.blocked_traversal_skips, elapsed_secs),
+        format_nanos_millis(delta.purge_scan_nanos),
+        format_nanos_millis(current.purge_scan_nanos),
     )
 }
 
@@ -4232,7 +4305,9 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
 
 #[cfg(test)]
 mod tests {
-    use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, MpTrainingBackend};
+    use poker_solver_core::blueprint_mp::config::{
+        BlueprintMpConfig, MpNegativeActionPurgeMode, MpTrainingBackend,
+    };
     use poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig;
     use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
     use test_macros::timed_test;
@@ -4804,6 +4879,10 @@ snapshots:
                 prune_after_iterations: 1_000_000,
                 prune_threshold: -250,
                 prune_explore_pct: 0.05,
+                negative_action_subtree_purge_enabled: false,
+                negative_action_prune_below: -1,
+                negative_action_reactivate_at: 0,
+                negative_action_purge_mode: MpNegativeActionPurgeMode::ScanHistoryPrefix,
                 batch_size: 1,
                 dcfr_alpha: 1.5,
                 dcfr_beta: 0.0,
@@ -4933,6 +5012,42 @@ snapshots:
             *metrics.strategy_delta_history.lock().unwrap(),
             vec![0.0, 0.25]
         );
+    }
+
+    #[test]
+    fn sparse_negative_action_format_reports_cumulative_and_delta_purge_metrics() {
+        let current = super::SparseNegativeActionTelemetry {
+            actions_newly_pruned: 10,
+            actions_reactivated: 3,
+            subtree_purge_calls: 15,
+            rows_purged: 120,
+            regret_slots_purged: 900,
+            strategy_slots_purged: 900,
+            blocked_traversal_skips: 40,
+            purge_scan_nanos: 2_500_000,
+        };
+        let delta = super::SparseNegativeActionTelemetry {
+            actions_newly_pruned: 2,
+            actions_reactivated: 1,
+            subtree_purge_calls: 4,
+            rows_purged: 20,
+            regret_slots_purged: 100,
+            strategy_slots_purged: 100,
+            blocked_traversal_skips: 8,
+            purge_scan_nanos: 500_000,
+        };
+
+        let text = super::format_sparse_negative_action(current, delta, 7, 2.0);
+
+        assert!(text.contains("blocked_edges=7"));
+        assert!(text.contains("new_pruned=10 (1/s)"));
+        assert!(text.contains("reactivated=3 (0/s)"));
+        assert!(text.contains("purge_calls=15 (2/s)"));
+        assert!(text.contains("rows_purged=120 (+10/s)"));
+        assert!(text.contains("regret_slots_purged=900 (+50/s)"));
+        assert!(text.contains("strategy_slots_purged=900 (+50/s)"));
+        assert!(text.contains("blocked_skips=40 (4/s)"));
+        assert!(text.contains("purge_scan=0.5ms/2.5ms"));
     }
 
     #[test]

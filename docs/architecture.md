@@ -198,12 +198,19 @@ crates/core/src/blueprint_mp/
 - **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
 - **Sparse visited-infoset storage** for the planned lazy backend: unvisited infosets read as zero/uniform, visited infosets allocate sharded atomic regret and strategy counters, and snapshots export only touched entries
 - **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
+- **Experimental negative-action subtree purge** for lazy sparse traversal: action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; the storage layer scans packed action-history prefixes to remove the child row and already visited descendants while preserving sibling subtrees
 - **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ### 100bb MP Scaling Plan
 
 The current `blueprint_mp` backend eagerly materializes the full public betting tree and dense `(node, bucket, action)` storage. Normal 100bb 6-max configs with multiple preflop raise depths can exceed hundreds of millions of public nodes and hundreds of GB of virtual storage. The intended 100bb path is a lazy/sparse backend: traverse compact public states on demand, key regrets by stable infoset/action-history keys, and store only visited infosets. See `docs/plans/2026-05-07-blueprint-mp-100bb-design.md`.
+
+### Lazy Sparse Negative-Action Purge
+
+The negative-action subtree purge is an opt-in experiment layered on the lazy sparse backend. It is not part of eager `blueprint_mp` storage. During traversal, each legal action edge can be gated by cumulative regret. If the parent action regret drops below `negative_action_prune_below`, the edge is inserted into a sharded blocked-edge set and the sparse storage scans its packed child action-history prefix. Matching rows at or below that child prefix are removed, which purges the child subtree while leaving the parent infoset and non-matching sibling histories intact.
+
+Blocked edges are skipped by traversal before child allocation, so sparse storage stops growing below persistently negative actions. The gate has hysteresis: an edge stays blocked until the same parent action regret reaches `negative_action_reactivate_at`. Reactivation removes the edge from the blocked set and purges any stale rows below the child prefix again. Later visits below the reactivated edge allocate fresh sparse rows; descendants therefore restart from the same first-visit defaults as any unseen infoset: zero regrets, zero strategy sums, and regret-matched uniform action probabilities until updated.
 
 ## Range Solver (Exact Postflop Solver)
 

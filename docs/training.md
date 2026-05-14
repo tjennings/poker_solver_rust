@@ -129,7 +129,7 @@ Set `action_abstraction.max_flop_players` to cap how many active players can con
 
 Lazy sparse DCFR discounting runs in parallel across sparse storage shards. The `discount` timing field in no-TUI telemetry is the wall-clock measurement to watch when checking whether discount passes are still causing single-core pauses.
 
-In `--no-tui` mode, lazy sparse progress is reported once per minute with sparse entries, slot counts, approximate storage, allocation growth rates, shard distribution, storage activity, insert attribution, action-limit audit fields, timing buckets for batch wall time, deal sampling, bucket lookup, traversal, DCFR discounting, and console stats collection, plus long-tail traversal telemetry (`max_job`, `max_trav`, and slow counts). Sparse entries, slots, and shard occupancy are maintained with live counters, so heartbeat stats stay O(shards) instead of scanning every visited infoset. The `activity[...]` block reports sparse read probe rate, read hit rate, write probe rate, write hit rate, and insert rate for the heartbeat interval. The `insert_by[...]` block attributes newly allocated infosets by street, top seat, top history-length bin, and action-count shape. Lazy sparse strategy keys use seat, a street-namespaced abstract bucket, and action history; SPR is not part of storage identity. River SPR-0 states suppress new lead/raise/all-in aggression while preserving check, fold, call, and all-in-call resolution, which keeps low-SPR river histories from expanding into many strategically similar betting branches. The `action_limit[...]` block audits max observed per-street raise counts and any decisions/aggressive actions beyond configured raise rows plus one all-in aggression allowance. These fields help diagnose whether throughput dips line up with sparse storage growth, shard imbalance, compute phases, reporting overhead, new allocation pressure, lookup pressure, action-history/key explosion, action-limit escape, or a single long traversal holding the batch barrier.
+In `--no-tui` mode, lazy sparse progress is reported once per minute with sparse entries, slot counts, approximate storage, allocation growth rates, shard distribution, storage activity, insert attribution, action-limit audit fields, timing buckets for batch wall time, deal sampling, bucket lookup, traversal, DCFR discounting, and console stats collection, plus long-tail traversal telemetry (`max_job`, `max_trav`, and slow counts). Sparse entries, slots, and shard occupancy are maintained with live counters, so heartbeat stats stay O(shards) instead of scanning every visited infoset. The `activity[...]` block reports sparse read probe rate, read hit rate, write probe rate, write hit rate, and insert rate for the heartbeat interval. The `insert_by[...]` block attributes newly allocated infosets by street, top seat, top history-length bin, and action-count shape. Lazy sparse strategy keys use seat, a street-namespaced abstract bucket, and action history; SPR is not part of storage identity. River SPR-0 states suppress new lead/raise/all-in aggression while preserving check, fold, call, and all-in-call resolution, which keeps low-SPR river histories from expanding into many strategically similar betting branches. The `action_limit[...]` block audits max observed per-street raise counts and any decisions/aggressive actions beyond configured raise rows plus one all-in aggression allowance. When the negative-action subtree purge experiment is enabled, the `neg_action[...]` block reports `blocked_edges`, cumulative and per-second `new_pruned`, `reactivated`, `purge_calls`, `rows_purged`, `regret_slots_purged`, `strategy_slots_purged`, `blocked_skips`, and purge scan time as `purge_scan=<interval>/<total>`. These fields help diagnose whether throughput dips line up with sparse storage growth, shard imbalance, compute phases, reporting overhead, new allocation pressure, lookup pressure, action-history/key explosion, action-limit escape, purge scans, or a single long traversal holding the batch barrier.
 
 When `tui.enabled: true`, lazy sparse MP training launches the multiplayer TUI instead of no-TUI logs. The lazy sparse TUI shows live iterations, throughput, sampled regret telemetry, prune percentage, sampled strategy-delta movement, and configured scenario hand grids without materializing the dense public tree. Scenario grids resolve configured spots against the lazy public state and read average strategy from sparse infoset keys. Pressing `s` in lazy sparse TUI writes a sparse snapshot containing `sparse_entries.bin` and `metadata.json`.
 
@@ -658,11 +658,32 @@ When enabled, the opponent traversal uses learned baselines to reduce sampling v
 | `lcfr_discount_interval` | `1` | Iterations between discount applications |
 | `prune_after_iterations` | `0` | Iterations before action pruning starts |
 | `prune_threshold` | `-300` | Cumulative regret threshold for pruning. Actions below this are skipped |
+| `prune_explore_pct` | `0.05` | Fraction of post-warmup batches that disable pruning and explore all actions |
+| `negative_action_subtree_purge_enabled` | `false` | Opt in to the parsed/configured negative-action subtree purge experiment |
+| `negative_action_prune_below` | `-1` | Negative-action purge candidate threshold for cumulative regret |
+| `negative_action_reactivate_at` | `0` | Cumulative regret value at or above which a purged action can reactivate |
+| `negative_action_purge_mode` | `scan_history_prefix` | Purge candidate detection mode. Currently only `scan_history_prefix` is supported |
 | `batch_size` | `200` | Deals per parallel batch |
 | `time_limit_minutes` | `0` | Stop after this many minutes (0 = unlimited) |
 | `purify_threshold` | `0.0` | Purify strategies with probability below this threshold (0 = disabled) |
 
 **Important for SAPCFR+**: Since RM+ floors negative regrets to 0, they can't accumulate below the prune threshold. Set `prune_threshold: 0` to effectively disable pruning, or use a small negative value as a safety margin.
+
+**Negative-action subtree purge experiment**: The training parser accepts `negative_action_subtree_purge_enabled`, `negative_action_prune_below`, `negative_action_reactivate_at`, and `negative_action_purge_mode` under `training:`. These keys are configured for the negative-action subtree purge experiment; configs that run the experiment should also disable batch-level prune exploration with `prune_explore_pct: 0.0` so randomly explored pruned actions do not mask purge behavior. The current sample experiment config is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`.
+
+```yaml
+training:
+  backend: lazy_sparse
+  prune_explore_pct: 0.0
+  negative_action_subtree_purge_enabled: true
+  negative_action_prune_below: -1
+  negative_action_reactivate_at: 0
+  negative_action_purge_mode: scan_history_prefix
+```
+
+With `negative_action_subtree_purge_enabled: true`, lazy traversal checks each action edge's cumulative regret. If regret is below `negative_action_prune_below`, the edge is marked blocked and sparse storage scans for the child action-history prefix, purging the child row and all already visited descendants while preserving sibling histories. Traversal skips blocked edges instead of allocating more rows below them. A blocked edge remains blocked until the parent action regret reaches `negative_action_reactivate_at`; on reactivation, the edge is unblocked and its stale child subtree is purged again. Future visits below that edge allocate fresh sparse rows, so descendants resume with first-visit/default behavior: zero cumulative regrets and uniform strategy until new updates arrive.
+
+For this experiment, use `prune_explore_pct: 0.0`. The normal batch-level prune exploration path deliberately revisits pruned actions, which makes it harder to read the experimental subtree purge effect. The current 6-max experiment is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`; run it with the `train-blueprint-mp` command shown above in the Blueprint MP section.
 
 **Regret overflow**: Regrets are stored as `i32` (×1000 scaling, max ~2.1M). If `lcfr_discount_interval` is too large, regrets overflow and the trainer panics with a clear message. For SAPCFR+ (which only accumulates positive regrets), keep the discount interval reasonable (e.g., 1M-10M).
 
