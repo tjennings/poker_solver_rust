@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-634k
 title: Nut-distance feature signal
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:14:02Z
-updated_at: 2026-05-14T01:14:02Z
+updated_at: 2026-05-14T01:50:09Z
 parent: poker_solver_rust-03j0
 ---
 
