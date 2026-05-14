@@ -367,6 +367,11 @@ pub struct NeuralBoundaryEvaluator {
 
 #[cfg(not(feature = "onnx"))]
 impl NeuralBoundaryEvaluator {
+    /// Legacy constructor for river-model adapter behavior.
+    ///
+    /// Prefer [`NeuralBoundaryEvaluator::new_with_inference_mode`] for new
+    /// call sites so direct turn/flop models opt into
+    /// [`BoundaryInferenceMode::Direct`] explicitly.
     pub fn new(
         model: BoundaryNet<NdArray>,
         board: Vec<u8>,
@@ -376,7 +381,7 @@ impl NeuralBoundaryEvaluator {
             model,
             board,
             private_cards,
-            BoundaryInferenceMode::default(),
+            BoundaryInferenceMode::RiverEnumeratedTurn,
         )
     }
 
@@ -618,10 +623,11 @@ impl NeuralBoundaryEvaluator {
 /// The model directory must contain `config.yaml` (with `training.hidden_layers`
 /// and `training.hidden_size`) and the model checkpoint file.
 #[cfg(not(feature = "onnx"))]
-pub fn load_neural_boundary_evaluator(
+pub fn load_neural_boundary_evaluator_with_mode(
     model_dir: &Path,
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
+    inference_mode: BoundaryInferenceMode,
 ) -> Result<NeuralBoundaryEvaluator, String> {
     let config_path = model_dir.join("config.yaml");
     let yaml = std::fs::read_to_string(&config_path)
@@ -645,7 +651,30 @@ pub fn load_neural_boundary_evaluator(
     .load_file(&model_path, &recorder, &device)
     .map_err(|e| format!("load model from {}: {e}", model_path.display()))?;
 
-    Ok(NeuralBoundaryEvaluator::new(model, board, private_cards))
+    Ok(NeuralBoundaryEvaluator::new_with_inference_mode(
+        model,
+        board,
+        private_cards,
+        inference_mode,
+    ))
+}
+
+/// Legacy loader for river-model adapter behavior.
+///
+/// Prefer [`load_neural_boundary_evaluator_with_mode`] for new call sites so
+/// the model's street contract is explicit.
+#[cfg(not(feature = "onnx"))]
+pub fn load_neural_boundary_evaluator(
+    model_dir: &Path,
+    board: Vec<u8>,
+    private_cards: [Vec<(u8, u8)>; 2],
+) -> Result<NeuralBoundaryEvaluator, String> {
+    load_neural_boundary_evaluator_with_mode(
+        model_dir,
+        board,
+        private_cards,
+        BoundaryInferenceMode::RiverEnumeratedTurn,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -908,18 +937,37 @@ impl NeuralBoundaryEvaluator {
 /// Load a trained model from an `.onnx` file and wrap it as a
 /// `NeuralBoundaryEvaluator` ready for range-solver integration.
 #[cfg(feature = "onnx")]
-pub fn load_neural_boundary_evaluator(
+pub fn load_neural_boundary_evaluator_with_mode(
     model_path: &Path,
     board: Vec<u8>,
     private_cards: [Vec<(u8, u8)>; 2],
+    inference_mode: BoundaryInferenceMode,
 ) -> Result<NeuralBoundaryEvaluator, String> {
     let session = load_shared_onnx_session(model_path)?;
     Ok(NeuralBoundaryEvaluator {
         session,
         board,
         private_cards,
-        inference_mode: BoundaryInferenceMode::default(),
+        inference_mode,
     })
+}
+
+/// Legacy loader for river-model adapter behavior.
+///
+/// Prefer [`load_neural_boundary_evaluator_with_mode`] for new call sites so
+/// direct turn/flop models pass [`BoundaryInferenceMode::Direct`] explicitly.
+#[cfg(feature = "onnx")]
+pub fn load_neural_boundary_evaluator(
+    model_path: &Path,
+    board: Vec<u8>,
+    private_cards: [Vec<(u8, u8)>; 2],
+) -> Result<NeuralBoundaryEvaluator, String> {
+    load_neural_boundary_evaluator_with_mode(
+        model_path,
+        board,
+        private_cards,
+        BoundaryInferenceMode::RiverEnumeratedTurn,
+    )
 }
 
 /// Load an ONNX session from a model file, returning it wrapped in `Arc`.
@@ -946,6 +994,9 @@ pub fn load_shared_onnx_session(model_path: &Path) -> Result<Arc<ort::session::S
 /// Each boundary in a depth-limited solve has a different board (e.g., flop +
 /// different turn card). This constructor avoids reloading the ONNX model for
 /// each boundary.
+///
+/// This is the legacy river-model adapter constructor. Prefer
+/// [`neural_boundary_evaluator_from_shared_with_mode`] for new call sites.
 #[cfg(feature = "onnx")]
 pub fn neural_boundary_evaluator_from_shared(
     session: Arc<ort::session::Session>,
@@ -956,7 +1007,7 @@ pub fn neural_boundary_evaluator_from_shared(
         session,
         board,
         private_cards,
-        BoundaryInferenceMode::default(),
+        BoundaryInferenceMode::RiverEnumeratedTurn,
     )
 }
 
@@ -1275,6 +1326,35 @@ mod tests {
             normalized_ev_to_legacy_halfpot_bcfv(normalized_ev, 0.0, effective_stack),
             0.0
         );
+    }
+
+    #[cfg(not(feature = "onnx"))]
+    #[test]
+    fn burn_constructor_modes_are_explicit() {
+        use crate::model::boundary_net::BoundaryNet;
+        use burn::backend::NdArray;
+
+        let device = Default::default();
+        let board = vec![0u8, 4, 8, 12];
+        let private_cards = [vec![(1u8, 2u8)], vec![(5u8, 6u8)]];
+
+        let legacy = NeuralBoundaryEvaluator::new(
+            BoundaryNet::<NdArray>::new(&device, 2, 64),
+            board.clone(),
+            private_cards.clone(),
+        );
+        assert_eq!(
+            legacy.inference_mode,
+            BoundaryInferenceMode::RiverEnumeratedTurn
+        );
+
+        let direct = NeuralBoundaryEvaluator::new_with_inference_mode(
+            BoundaryNet::<NdArray>::new(&device, 2, 64),
+            board,
+            private_cards,
+            BoundaryInferenceMode::Direct,
+        );
+        assert_eq!(direct.inference_mode, BoundaryInferenceMode::Direct);
     }
 
     #[test]

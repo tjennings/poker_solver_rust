@@ -403,8 +403,8 @@ enum Commands {
         #[arg(long)]
         flop_model: Option<String>,
 
-        /// Flop cfvnet inference mode: "river_enumerated_turn", "direct", or "direct_normalized_legacy"
-        #[arg(long, default_value = "river_enumerated_turn")]
+        /// Flop cfvnet inference mode: "direct", "river_enumerated_turn", or "direct_normalized_legacy"
+        #[arg(long, default_value = "direct")]
         flop_model_kind: String,
 
         /// Turn boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
@@ -415,8 +415,8 @@ enum Commands {
         #[arg(long)]
         turn_model: Option<String>,
 
-        /// Turn cfvnet inference mode: "river_enumerated_turn", "direct", or "direct_normalized_legacy"
-        #[arg(long, default_value = "river_enumerated_turn")]
+        /// Turn cfvnet inference mode: "direct", "river_enumerated_turn", or "direct_normalized_legacy"
+        #[arg(long, default_value = "direct")]
         turn_model_kind: String,
 
         /// River boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
@@ -427,8 +427,8 @@ enum Commands {
         #[arg(long)]
         river_model: Option<String>,
 
-        /// River cfvnet inference mode: "river_enumerated_turn", "direct", or "direct_normalized_legacy"
-        #[arg(long, default_value = "river_enumerated_turn")]
+        /// River cfvnet inference mode: "direct", "river_enumerated_turn", or "direct_normalized_legacy"
+        #[arg(long, default_value = "direct")]
         river_model_kind: String,
 
         /// Diagnostic exact_oracle CFV orientation transform.
@@ -4929,21 +4929,28 @@ snapshots:
 
         if let super::Commands::CompareSolve {
             flop_boundary,
+            flop_model_kind,
             turn_boundary,
+            turn_model_kind,
             river_boundary,
             river_model,
+            river_model_kind,
             ..
         } = cli.unwrap().command
         {
             assert_eq!(flop_boundary, "exact");
+            assert_eq!(flop_model_kind, "direct");
             assert_eq!(turn_boundary, "exact");
+            assert_eq!(turn_model_kind, "direct");
             assert_eq!(river_boundary, "exact");
+            assert_eq!(river_model_kind, "direct");
             assert!(river_model.is_none());
         } else {
             panic!("expected CompareSolve variant");
         }
 
-        // River cfvnet with model path
+        // River cfvnet defaults to direct model inference unless the caller
+        // explicitly requests the legacy river-enumerated turn adapter.
         let cli2 = super::Cli::try_parse_from([
             "poker-solver-trainer",
             "compare-solve",
@@ -4955,8 +4962,6 @@ snapshots:
             "cfvnet",
             "--river-model",
             "/path/to/model.onnx",
-            "--river-model-kind",
-            "direct",
         ]);
         assert!(
             cli2.is_ok(),
@@ -4974,6 +4979,40 @@ snapshots:
             assert_eq!(river_boundary, "cfvnet");
             assert_eq!(river_model.as_deref(), Some("/path/to/model.onnx"));
             assert_eq!(river_model_kind, "direct");
+        } else {
+            panic!("expected CompareSolve variant");
+        }
+
+        let cli2_legacy = super::Cli::try_parse_from([
+            "poker-solver-trainer",
+            "compare-solve",
+            "--bundle",
+            "/tmp/test",
+            "--spot",
+            "sb:2bb,bb:call|Jd9d7d",
+            "--turn-boundary",
+            "cfvnet",
+            "--turn-model",
+            "/path/to/river-model.onnx",
+            "--turn-model-kind",
+            "river_enumerated_turn",
+        ]);
+        assert!(
+            cli2_legacy.is_ok(),
+            "legacy river-enumerated adapter must still parse: {:?}",
+            cli2_legacy.err()
+        );
+
+        if let super::Commands::CompareSolve {
+            turn_boundary,
+            turn_model,
+            turn_model_kind,
+            ..
+        } = cli2_legacy.unwrap().command
+        {
+            assert_eq!(turn_boundary, "cfvnet");
+            assert_eq!(turn_model.as_deref(), Some("/path/to/river-model.onnx"));
+            assert_eq!(turn_model_kind, "river_enumerated_turn");
         } else {
             panic!("expected CompareSolve variant");
         }
