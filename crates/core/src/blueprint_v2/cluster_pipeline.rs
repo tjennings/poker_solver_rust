@@ -48,7 +48,7 @@ use super::clustering::{
     elkan_emd_weighted_u8_with_gaps, fast_kmeans_1d, kmeans_1d, nearest_centroid_1d,
     nearest_centroid_u8, nearest_centroid_u8_weighted, sort_centroids_by_ev,
 };
-use super::config::{BucketMetricConfig, ClusteringConfig};
+use super::config::{BucketMetricConfig, ClusteringConfig, NutDistanceTransform};
 use super::per_flop_bucket_file::PerFlopBucketFile;
 
 /// Number of sample 5-card boards for river clustering when no explicit count
@@ -955,6 +955,8 @@ struct MetricGapScaleReport {
     potential_weight: f64,
     equity_weight: f64,
     nut_distance_weight: f64,
+    nut_distance_transform: NutDistanceTransform,
+    nut_distance_cap: Option<f64>,
     potential: MetricChannelScale,
     equity: MetricChannelScale,
     nut_distance: MetricChannelScale,
@@ -990,6 +992,18 @@ fn metric_channel_scale(values: &[f64]) -> MetricChannelScale {
 
 fn normalize_gap(value: f64, scale: &MetricChannelScale) -> f64 {
     value / scale.divisor
+}
+
+fn shaped_nut_distance_gap(value: f64, metric: &BucketMetricConfig) -> f64 {
+    let capped = metric
+        .nut_distance_cap
+        .map_or(value, |cap| value.min(cap.max(0.0)))
+        .max(0.0);
+    match metric.nut_distance_transform {
+        NutDistanceTransform::Linear => capped,
+        NutDistanceTransform::Sqrt => capped.sqrt(),
+        NutDistanceTransform::Log1p => capped.ln_1p(),
+    }
 }
 
 fn combined_child_gaps(
@@ -1035,9 +1049,10 @@ fn combined_child_gaps(
         .zip(&equity_gaps)
         .zip(&nut_gaps)
         .map(|((potential_gap, equity_gap), nut_gap)| {
+            let nut_gap = shaped_nut_distance_gap(normalize_gap(*nut_gap, &nut_scale), metric);
             metric.potential_weight * normalize_gap(*potential_gap, &potential_scale)
                 + metric.equity_weight * normalize_gap(*equity_gap, &equity_scale)
-                + metric.nut_distance_weight * normalize_gap(*nut_gap, &nut_scale)
+                + metric.nut_distance_weight * nut_gap
         })
         .collect::<Vec<_>>();
     let output_scale = metric_channel_scale(&gaps);
@@ -1050,6 +1065,8 @@ fn combined_child_gaps(
             potential_weight: metric.potential_weight,
             equity_weight: metric.equity_weight,
             nut_distance_weight: metric.nut_distance_weight,
+            nut_distance_transform: metric.nut_distance_transform,
+            nut_distance_cap: metric.nut_distance_cap,
             potential: potential_scale,
             equity: equity_scale,
             nut_distance: nut_scale,
@@ -2132,6 +2149,7 @@ mod tests {
             equity_weight: 2.0,
             nut_distance_weight: 0.5,
             nut_sample_boards: 10,
+            ..Default::default()
         };
         let (gaps, scales) = combined_child_gaps(
             Street::Turn,
@@ -2145,6 +2163,31 @@ mod tests {
         let scales = scales.expect("enabled metric should report scales");
         assert!((scales.equity.divisor - 0.25).abs() < 1e-12);
         assert!((scales.nut_distance.divisor - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn combined_child_gaps_shapes_nut_distance_channel_after_normalization() {
+        let metric = BucketMetricConfig {
+            enabled: true,
+            equity_weight: 0.0,
+            nut_distance_weight: 1.0,
+            nut_distance_transform: NutDistanceTransform::Sqrt,
+            nut_distance_cap: Some(0.25),
+            ..Default::default()
+        };
+        let (gaps, scales) = combined_child_gaps(
+            Street::Turn,
+            &[0.1, 0.2, 0.3],
+            &[0.01, 0.01],
+            &[0.0, 100.0, 200.0],
+            &metric,
+        );
+        assert_eq!(gaps.len(), 2);
+        assert!((gaps[0] - 0.5).abs() < 1e-12);
+        assert!((gaps[1] - 0.5).abs() < 1e-12);
+        let scales = scales.expect("enabled metric should report scales");
+        assert_eq!(scales.nut_distance_transform, NutDistanceTransform::Sqrt);
+        assert_eq!(scales.nut_distance_cap, Some(0.25));
     }
 
     #[test]

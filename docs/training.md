@@ -334,9 +334,11 @@ Clustering config parameters (in the `clustering` section of the YAML):
 | `<street>.metric.potential_weight` | `0.0` | Uniform adjacent-bucket movement weight when the experimental metric is enabled |
 | `<street>.metric.equity_weight` | `1.0` | Child centroid equity-gap weight when the experimental metric is enabled |
 | `<street>.metric.nut_distance_weight` | `0.0` | Sampled nut-distance-gap weight when the experimental metric is enabled |
+| `<street>.metric.nut_distance_transform` | `linear` | Shape applied to the normalized nut-distance channel: `linear`, `sqrt`, or `log1p` |
+| `<street>.metric.nut_distance_cap` | unset | Optional cap applied to the normalized nut-distance channel before `nut_distance_transform` |
 | `<street>.metric.nut_sample_boards` | `200` | River boards sampled to estimate bucket nut-distance scores for the experimental metric |
 
-The experimental metric is opt-in per clustering street. Defaults preserve the existing potential-aware EMD behavior. When enabled, potential, equity-gap, and nut-distance-gap channels are each normalized by their mean positive adjacent gap before weights are applied, so weights are comparable across bucket builds. Clustering writes `metric_scales.json` beside the bucket files, and `diag-clusters --scorecard-json` includes it when present. A typical first candidate is to enable it on `turn` and/or `flop` with `equity_weight: 1.0`, a small `nut_distance_weight`, and `potential_weight: 0.0`; this keeps potential distributions primary while making adjacent child buckets farther apart when they differ sharply in nut hierarchy.
+The experimental metric is opt-in per clustering street. Defaults preserve the existing potential-aware EMD behavior. When enabled, potential, equity-gap, and nut-distance-gap channels are each normalized by their mean positive adjacent gap before weights are applied, so weights are comparable across bucket builds. The nut-distance channel can also be capped and shaped after normalization; this lets it act as a guardrail for nut hierarchy without letting rare extreme gaps dominate the potential-aware child-bucket distribution. Clustering writes `metric_scales.json` beside the bucket files, and `diag-clusters --scorecard-json` includes it when present. A typical first candidate is to enable it on `turn` and/or `flop` with `equity_weight: 1.0`, a small `nut_distance_weight`, and `potential_weight: 0.0`; use `nut_distance_cap` when the audit shows improved turn hierarchy but worse flop tail spread.
 
 ### Heuristic V3 Algorithm
 

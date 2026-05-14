@@ -144,6 +144,10 @@ pub struct BucketMetricConfig {
     pub equity_weight: f64,
     #[serde(default)]
     pub nut_distance_weight: f64,
+    #[serde(default)]
+    pub nut_distance_transform: NutDistanceTransform,
+    #[serde(default)]
+    pub nut_distance_cap: Option<f64>,
     #[serde(default = "default_metric_nut_sample_boards")]
     pub nut_sample_boards: usize,
 }
@@ -155,9 +159,20 @@ impl Default for BucketMetricConfig {
             potential_weight: 0.0,
             equity_weight: default_metric_equity_weight(),
             nut_distance_weight: 0.0,
+            nut_distance_transform: NutDistanceTransform::default(),
+            nut_distance_cap: None,
             nut_sample_boards: default_metric_nut_sample_boards(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NutDistanceTransform {
+    #[default]
+    Linear,
+    Sqrt,
+    Log1p,
 }
 
 /// Action abstraction: allowed bet sizes per street and raise cap.
@@ -1272,6 +1287,8 @@ clustering:
       potential_weight: 0.05
       equity_weight: 1.0
       nut_distance_weight: 0.25
+      nut_distance_transform: sqrt
+      nut_distance_cap: 1.5
       nut_sample_boards: 50
   turn:
     buckets: 100
@@ -1302,6 +1319,11 @@ snapshots:
         assert!((cfg.clustering.flop.metric.potential_weight - 0.05).abs() < f64::EPSILON);
         assert!((cfg.clustering.flop.metric.equity_weight - 1.0).abs() < f64::EPSILON);
         assert!((cfg.clustering.flop.metric.nut_distance_weight - 0.25).abs() < f64::EPSILON);
+        assert_eq!(
+            cfg.clustering.flop.metric.nut_distance_transform,
+            NutDistanceTransform::Sqrt
+        );
+        assert_eq!(cfg.clustering.flop.metric.nut_distance_cap, Some(1.5));
         assert_eq!(cfg.clustering.flop.metric.nut_sample_boards, 50);
         assert!(!cfg.clustering.turn.metric.enabled);
     }

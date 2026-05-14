@@ -73,9 +73,14 @@ def metric_scale_summary(card: dict[str, Any]) -> str:
         street = str(item.get("street", "?")).lower()
         nw = num(item.get("nut_distance_weight"))
         ew = num(item.get("equity_weight"))
+        nt = item.get("nut_distance_transform", "linear")
+        nc = item.get("nut_distance_cap")
         nut_div = get_path(item, "nut_distance.divisor")
         eq_div = get_path(item, "equity.divisor")
-        parts.append(f"{street}:e={ew:.2f},n={nw:.2f},eq_div={eq_div:.4g},nut_div={nut_div:.4g}")
+        cap = "" if nc is None else f",cap={num(nc):.2f}"
+        parts.append(
+            f"{street}:e={ew:.2f},n={nw:.2f},{nt}{cap},eq_div={eq_div:.4g},nut_div={nut_div:.4g}"
+        )
     return "; ".join(parts)
 
 
