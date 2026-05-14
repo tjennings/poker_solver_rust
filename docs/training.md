@@ -448,7 +448,7 @@ Options:
 - `--flop-model <PATH>` -- ONNX model path (required when `--flop-boundary=cfvnet`)
 - `--turn-model <PATH>` -- ONNX model path (required when `--turn-boundary=cfvnet`)
 - `--river-model <PATH>` -- ONNX model path (required when `--river-boundary=cfvnet`)
-- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `river_enumerated_turn` (default) preserves the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. `direct` evaluates the supplied boundary board as-is and expects the ONNX output to already be solver-native bcfv values. `direct_normalized_legacy` evaluates the supplied boundary board as-is but converts the current Python-exported direct checkpoint output from `bcfv * pot / (pot + effective_stack)` into bcfv before range-solver consumes it.
+- `--flop-model-kind <MODE>` / `--turn-model-kind <MODE>` / `--river-model-kind <MODE>` -- Cfvnet inference contract. `direct` (default) evaluates the supplied boundary board as-is and is required for direct BoundaryNet models trained on that street with normalized EV output (`chip_ev / (pot + effective_stack)`). `river_enumerated_turn` is the legacy adapter: 4-card turn boards enumerate all valid river runouts and average a river model. Use it only when intentionally applying a river model at a turn boundary. `direct_normalized_legacy` evaluates the supplied boundary board as-is but adapts the current Python-exported direct checkpoint output from `bcfv * pot / (pot + effective_stack)` into the evaluator's expected runtime units.
 - `--oracle-orientation <MODE>` -- Hidden `exact_oracle` diagnostic. Accepted values are `current`, `swap`, `sign-flip`, and `swap-sign-flip`; use only to audit OOP/IP and sign orientation at the raw boundary-CFV handoff.
 - `--oracle-scale <FLOAT>` -- Hidden `exact_oracle` diagnostic. Multiplies raw oracle CFVs before boundary injection; default `1.0`.
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
@@ -682,6 +682,8 @@ See `sample_configurations/blueprint_v2_1kbkt_sapcfr.yaml` for the full config.
 ## CFVnet Training Pipeline
 
 The `cfvnet` crate trains Deep Counterfactual Value Networks following the Supremus/DeepStack approach: solve random subgames, extract per-combo counterfactual values, and train a neural network to predict them. Networks are trained bottom-up: river first, then turn-boundary, then flop-boundary.
+
+BoundaryNet uses one canonical model IO contract across training and inference: OOP range (1326) + IP range (1326) + board one-hot (52) + rank presence (13) + `pot/(pot+stack)` + `stack/(pot+stack)` + player. Ranges are in canonical combo order, public-board-blocked combos are zeroed, and remaining finite non-negative mass is normalized to sum 1 after blockers. The model output is `chip_cfv / (pot + effective_stack)`. Some dataset records store CFVs as `chip_cfv / pot`; loaders convert that storage unit into the normalized BoundaryNet target. Range-solver half-pot BCFV units are a legacy runtime adapter only.
 
 ### River Network
 

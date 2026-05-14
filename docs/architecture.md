@@ -260,9 +260,11 @@ Input(2720) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
 ```
 Input(2720) -> [Linear(500) -> BatchNorm -> PReLU] x 7 -> Linear(1326)
 ```
-- Input: same layout as CfvNet, but pot and stack encoded as `pot/(pot+stack)` and `stack/(pot+stack)`
-- Output: 1326 solver-native bcfv values. `0.0` is the break-even half-pot baseline, `+1.0` is one half-pot above break-even, and `-1.0` is one half-pot below.
-- At inference: native `direct` ONNX output is mapped directly back into range-solver private-card order. The temporary `direct_normalized_legacy` mode supports the current Python-exported local checkpoint by converting `bcfv * pot / (pot + effective_stack)` to bcfv before mapping values into the solver.
+- Input: OOP range (1326) + IP range (1326) + board one-hot (52) + rank presence (13) + `pot/(pot+stack)` + `stack/(pot+stack)` + player
+- Range contract: canonical 1326-combo order; public-board-blocked combos zeroed; remaining finite non-negative mass normalized to sum 1 after blockers. River-enumerated adapters repeat this normalization after each candidate river blocker is removed.
+- Output: 1326 normalized EVs (`chip_ev / (pot + effective_stack)`)
+- At inference: `chip_ev[h] = normalized_ev[h] * (pot + effective_stack)`
+- Dataset records may store CFVs as `chip_ev / pot`; that is a storage format only. Training loaders convert those records to the BoundaryNet target unit above.
 
 Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game-value constraint. ~2.9M parameters (default 7x500).
 
@@ -270,9 +272,9 @@ Both use: Huber loss (masked for board-blocked combos) + lambda x auxiliary game
 
 **CfvNet** provides standalone river value predictions for evaluation and comparison.
 
-**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. The evaluator supports three runtime contracts. `river_enumerated_turn` preserves the legacy river-net adapter by evaluating every valid river runout from a 4-card turn board and averaging the river outputs. `direct` sends the supplied boundary board directly to ONNX, which is the contract for turn-boundary models trained on 4-card boards with solver-native bcfv output. `direct_normalized_legacy` also sends the supplied board directly to ONNX, then converts the current Python-exported scaled-bcfv output to bcfv. The ONNX evaluator batches OOP/IP rows together for each boundary cache fill, so direct modes perform one session run per boundary rather than one run per player.
+**BoundaryNet** is wired into the range-solver as a depth-boundary evaluator via `NeuralBoundaryEvaluator`. The evaluator supports three explicit inference modes. `direct` sends the supplied boundary board directly to the model, which is the canonical contract for direct flop/turn/river BoundaryNet models and expects normalized EV output (`chip_ev / (pot + effective_stack)`). `river_enumerated_turn` is a legacy river-model adapter: on a 4-card turn board it evaluates every valid river runout and averages the river outputs. `direct_normalized_legacy` also sends the supplied boundary board directly to ONNX, but adapts the current Python-exported scaled-bcfv checkpoint output (`bcfv * pot / (pot + effective_stack)`) into the units required by the selected evaluator path. The ONNX evaluator batches OOP/IP rows together for each boundary cache fill, so direct modes perform one session run per boundary rather than one run per player.
 
-Depth-boundary evaluators have two value conventions. Legacy evaluators return normalized boundary CFVs, and the range-solver converts them through the standard half-pot and opponent-reach formula before regret updates. Raw CFV evaluators return already reach-integrated per-combination chip CFVs. For raw evaluators, each boundary visit caches only the current traverser's value slot; the opposite player is computed on that player's own traversal after their current opponent reach has been recorded.
+Depth-boundary evaluators have two value conventions. Legacy evaluators return half-pot BCFV units (`chip_cfv / (pot / 2)`), and the range-solver converts them through the standard half-pot and opponent-reach formula before regret updates. Raw CFV evaluators return already reach-integrated per-combination chip CFVs. `NeuralBoundaryEvaluator` supports the raw path and converts BoundaryNet output directly to chip EVs there; its legacy path exists only as an adapter for callers that still require half-pot BCFV units. For raw evaluators, each boundary visit caches only the current traverser's value slot; the opposite player is computed on that player's own traversal after their current opponent reach has been recorded.
 
 ### Key Files
 
