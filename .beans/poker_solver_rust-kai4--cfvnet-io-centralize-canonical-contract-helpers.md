@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-kai4
 title: 'CFVNet IO: centralize canonical contract helpers'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T01:10:31Z
-updated_at: 2026-05-14T01:10:31Z
+updated_at: 2026-05-14T01:18:29Z
 parent: poker_solver_rust-8e9f
 ---
 
