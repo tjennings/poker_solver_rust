@@ -395,6 +395,14 @@ enum Commands {
         #[arg(long)]
         dump_boundary_cfvs: bool,
 
+        /// Diagnostic boundary CFV gate: fail when aggregate candidate-vs-oracle mean_abs exceeds this value.
+        #[arg(long, hide = true)]
+        boundary_cfv_max_mean_abs: Option<f32>,
+
+        /// Diagnostic boundary CFV gate: fail when aggregate candidate-vs-oracle correlation falls below this value.
+        #[arg(long, hide = true)]
+        boundary_cfv_min_corr: Option<f32>,
+
         /// Flop boundary mode: "exact", "cfvnet", "exact_subtree", or "exact_oracle"
         #[arg(long, default_value = "exact")]
         flop_boundary: String,
@@ -1520,6 +1528,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             subgame_iters,
             verbose,
             dump_boundary_cfvs,
+            boundary_cfv_max_mean_abs,
+            boundary_cfv_min_corr,
             flop_boundary,
             flop_model,
             flop_model_kind,
@@ -1616,6 +1626,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 subgame_iters,
                 verbose,
                 dump_boundary_cfvs,
+                boundary_cfv_max_mean_abs,
+                boundary_cfv_min_corr,
                 sbc,
                 oracle_boundary_flags,
                 oracle_orientation,

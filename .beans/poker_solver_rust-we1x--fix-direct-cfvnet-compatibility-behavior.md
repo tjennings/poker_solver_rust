@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-we1x
 title: Fix Direct CFVNet compatibility behavior
-status: in-progress
+status: completed
 type: bug
 priority: critical
 created_at: 2026-05-08T20:47:13Z
-updated_at: 2026-05-09T02:36:25Z
+updated_at: 2026-05-14T03:16:28Z
 ---
 
 Direct CFVNet compatibility conversion makes subgame behavior worse: subgame bets/shoves 100% while exact checks 100%. Audit model target units, bcfv conversion, sign/player orientation, and boundary evaluator handoff; patch only once the solver convention is verified.
@@ -17,7 +17,7 @@ Direct CFVNet compatibility conversion makes subgame behavior worse: subgame bet
 - [x] Run focused and full verification
 - [x] Commit corrected unit-conversion patch
 - [x] Compare exact vs Direct boundary CFVs for reported policy-diff spots
-- [ ] Decide whether to gate current checkpoint, retrain, or add a stronger runtime diagnostic
+- [x] Decide whether to gate current checkpoint, retrain, or add a stronger runtime diagnostic
 
 ## Notes
 
@@ -52,3 +52,7 @@ The Direct checkpoint itself is value-wrong on this spot:
 - worst boundaries predict strongly positive CFVs for combos where exact oracle is negative, especially `3x7x` style board-interaction combos.
 
 Conclusion: this residual mismatch is not a scalar unit conversion issue. Current checkpoint should not be trusted for subgame policy decisions on this turn class without retraining or a broader training/distribution audit.
+
+## Summary of Changes
+
+Added compare-solve boundary CFV diagnostic gates so candidate CFVNet boundary values can be failed against exact/oracle aggregate mean absolute error and correlation thresholds before trusting a checkpoint for policy decisions. This chooses the stronger runtime diagnostic path rather than hard-coding a checkpoint-specific ban or retraining decision in evaluator code.

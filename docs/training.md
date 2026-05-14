@@ -454,6 +454,8 @@ Options:
 - `--exact-iters <N>` -- Hidden diagnostic override for exact solve iterations; defaults to `--iters`.
 - `--subgame-iters <N>` -- Hidden diagnostic override for subgame solve iterations; defaults to `--iters`.
 - `--dump-boundary-cfvs` -- Hidden boundary diagnostic. Before the subgame solve, forces a seeded boundary evaluation pass, compares root action CFVs and regret-input pressure for the injected candidate boundary against `exact_oracle`, compares each boundary contribution against `exact_oracle` raw CFVs, prints an `exact_subtree` raw-control comparison, then prints the cached evaluator CFV stats.
+- `--boundary-cfv-max-mean-abs <F>` -- Hidden diagnostic gate for `--dump-boundary-cfvs`. Fails the run if either player's aggregate candidate-vs-oracle boundary CFV mean absolute error exceeds `F`.
+- `--boundary-cfv-min-corr <F>` -- Hidden diagnostic gate for `--dump-boundary-cfvs`. Fails the run if either player's aggregate candidate-vs-oracle boundary CFV correlation is below `F`.
 - `--oracle-iteration-aligned` -- Hidden `exact_oracle` diagnostic. Runs exact and subgame in lockstep and evaluates each subgame boundary against the exact continuation at the same iteration. Requires matching `--exact-iters` and `--subgame-iters`.
 - `--root-update-trace-iters <csv>` -- Hidden diagnostic for `--oracle-iteration-aligned`. Prints exact/subgame root action CFV gaps and root regret-update gaps for the listed zero-based iterations.
 

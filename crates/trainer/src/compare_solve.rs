@@ -60,6 +60,18 @@ struct BoundaryCfvDeltaStats {
     magnitude_ratio: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BoundaryCfvGate {
+    pub max_mean_abs: Option<f32>,
+    pub min_corr: Option<f32>,
+}
+
+impl BoundaryCfvGate {
+    fn is_enabled(self) -> bool {
+        self.max_mean_abs.is_some() || self.min_corr.is_some()
+    }
+}
+
 impl BoundaryCfvStats {
     /// Compute summary statistics from a slice of per-hand CFVs.
     pub fn from_slice(cfvs: &[f32]) -> Self {
@@ -168,6 +180,30 @@ fn cfv_delta_stats(candidate: &[f32], reference: &[f32]) -> BoundaryCfvDeltaStat
         corr,
         magnitude_ratio: cfv_magnitude(&cand_stats) / cfv_magnitude(&ref_stats),
     }
+}
+
+fn check_boundary_cfv_gate(
+    gate: BoundaryCfvGate,
+    oop_mean_abs: f32,
+    ip_mean_abs: f32,
+    oop_corr: f32,
+    ip_corr: f32,
+) -> Result<(), String> {
+    if let Some(max_mean_abs) = gate.max_mean_abs {
+        if oop_mean_abs > max_mean_abs || ip_mean_abs > max_mean_abs {
+            return Err(format!(
+                "boundary CFV gate failed: aggregate mean_abs OOP={oop_mean_abs:.6} IP={ip_mean_abs:.6} exceeds max {max_mean_abs:.6}"
+            ));
+        }
+    }
+    if let Some(min_corr) = gate.min_corr {
+        if oop_corr < min_corr || ip_corr < min_corr {
+            return Err(format!(
+                "boundary CFV gate failed: aggregate corr OOP={oop_corr:.4} IP={ip_corr:.4} below min {min_corr:.4}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check if any CFV exceeds the expected chip range.
@@ -1748,10 +1784,16 @@ fn print_boundary_cfv_comparison(
     oracle_scale: f32,
     exact_subtree_iters: u32,
     exact_subtree_target_exp: f32,
+    gate: BoundaryCfvGate,
 ) -> Result<(), String> {
     let n_boundaries = game.num_boundary_nodes();
     if n_boundaries == 0 || game.per_boundary_evaluators.is_empty() {
         println!("=== Boundary CFV comparison skipped: no per-boundary evaluators ===");
+        if gate.is_enabled() {
+            return Err(
+                "boundary CFV gate requires at least one per-boundary evaluator".to_string(),
+            );
+        }
         return Ok(());
     }
 
@@ -1911,28 +1953,33 @@ fn print_boundary_cfv_comparison(
         let avg = |values: &[BoundaryCfvDeltaStats], f: fn(&BoundaryCfvDeltaStats) -> f32| {
             values.iter().map(f).sum::<f32>() / values.len() as f32
         };
+        let oop_mean_abs = avg(&all_oop, |s| s.mean_abs);
+        let oop_rmse = avg(&all_oop, |s| s.rmse);
+        let oop_corr = avg(&all_oop, |s| s.corr);
+        let oop_mag_ratio = avg(&all_oop, |s| s.magnitude_ratio);
+        let ip_mean_abs = avg(&all_ip, |s| s.mean_abs);
+        let ip_rmse = avg(&all_ip, |s| s.rmse);
+        let ip_corr = avg(&all_ip, |s| s.corr);
+        let ip_mag_ratio = avg(&all_ip, |s| s.magnitude_ratio);
+        let subtree_oop_mean_abs = avg(&all_subtree_oop, |s| s.mean_abs);
+        let subtree_oop_corr = avg(&all_subtree_oop, |s| s.corr);
+        let subtree_ip_mean_abs = avg(&all_subtree_ip, |s| s.mean_abs);
+        let subtree_ip_corr = avg(&all_subtree_ip, |s| s.corr);
+
         println!("=== Boundary CFV comparison aggregate ===");
         println!(
             "OOP avg: mean_abs={:.6} rmse={:.6} corr={:.4} mag_ratio={:.3}",
-            avg(&all_oop, |s| s.mean_abs),
-            avg(&all_oop, |s| s.rmse),
-            avg(&all_oop, |s| s.corr),
-            avg(&all_oop, |s| s.magnitude_ratio),
+            oop_mean_abs, oop_rmse, oop_corr, oop_mag_ratio,
         );
         println!(
             "IP  avg: mean_abs={:.6} rmse={:.6} corr={:.4} mag_ratio={:.3}",
-            avg(&all_ip, |s| s.mean_abs),
-            avg(&all_ip, |s| s.rmse),
-            avg(&all_ip, |s| s.corr),
-            avg(&all_ip, |s| s.magnitude_ratio),
+            ip_mean_abs, ip_rmse, ip_corr, ip_mag_ratio,
         );
         println!(
             "exact_subtree raw control avg: OOP mean_abs={:.6} corr={:.4}; IP mean_abs={:.6} corr={:.4}",
-            avg(&all_subtree_oop, |s| s.mean_abs),
-            avg(&all_subtree_oop, |s| s.corr),
-            avg(&all_subtree_ip, |s| s.mean_abs),
-            avg(&all_subtree_ip, |s| s.corr),
+            subtree_oop_mean_abs, subtree_oop_corr, subtree_ip_mean_abs, subtree_ip_corr,
         );
+        check_boundary_cfv_gate(gate, oop_mean_abs, ip_mean_abs, oop_corr, ip_corr)?;
     }
     println!();
 
@@ -2293,6 +2340,8 @@ pub fn run(
     subgame_iters: Option<u32>,
     verbose: bool,
     dump_boundary_cfvs: bool,
+    boundary_cfv_max_mean_abs: Option<f32>,
+    boundary_cfv_min_corr: Option<f32>,
     street_boundary_config: StreetBoundaryConfig,
     oracle_boundary_flags: [bool; 3],
     oracle_orientation: OracleCfvOrientation,
@@ -2308,6 +2357,16 @@ pub fn run(
 ) -> Result<(), String> {
     let exact_iters = exact_iters.unwrap_or(iters);
     let subgame_iters = subgame_iters.unwrap_or(iters);
+    let boundary_cfv_gate = BoundaryCfvGate {
+        max_mean_abs: boundary_cfv_max_mean_abs,
+        min_corr: boundary_cfv_min_corr,
+    };
+    if boundary_cfv_gate.is_enabled() && !dump_boundary_cfvs {
+        return Err(
+            "--boundary-cfv-max-mean-abs/--boundary-cfv-min-corr require --dump-boundary-cfvs"
+                .to_string(),
+        );
+    }
     let root_update_trace_iters = parse_root_update_trace_iters(root_update_trace_iters)?;
     let mode = gadget_mode_label(gadget, gadget_clamp);
     eprintln!("gadget mode: {mode}");
@@ -2633,6 +2692,7 @@ pub fn run(
                 oracle_scale,
                 subgame_iters,
                 3.0,
+                boundary_cfv_gate,
             )?;
             let _ = compute_current_ev(&subgame_game);
             dump_boundary_cfv_stats(&subgame_game, pot, eff_stack);
@@ -3502,6 +3562,37 @@ mod tests {
         assert!(stats.mean_abs > 0.0);
         assert!(stats.corr < -0.99);
         assert!((stats.magnitude_ratio - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn boundary_cfv_gate_accepts_metrics_within_thresholds() {
+        let gate = BoundaryCfvGate {
+            max_mean_abs: Some(0.5),
+            min_corr: Some(0.9),
+        };
+        assert!(check_boundary_cfv_gate(gate, 0.2, 0.3, 0.95, 0.91).is_ok());
+    }
+
+    #[test]
+    fn boundary_cfv_gate_rejects_high_mean_abs() {
+        let gate = BoundaryCfvGate {
+            max_mean_abs: Some(0.5),
+            min_corr: None,
+        };
+        let err = check_boundary_cfv_gate(gate, 0.2, 0.6, 0.95, 0.95)
+            .expect_err("IP mean_abs should fail the gate");
+        assert!(err.contains("mean_abs"));
+    }
+
+    #[test]
+    fn boundary_cfv_gate_rejects_low_correlation() {
+        let gate = BoundaryCfvGate {
+            max_mean_abs: None,
+            min_corr: Some(0.9),
+        };
+        let err = check_boundary_cfv_gate(gate, 0.2, 0.3, 0.95, 0.7)
+            .expect_err("IP correlation should fail the gate");
+        assert!(err.contains("corr"));
     }
 
     #[test]
