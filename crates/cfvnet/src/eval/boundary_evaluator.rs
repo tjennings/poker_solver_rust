@@ -124,10 +124,97 @@ fn blocker_adjust_ranges(oop_1326: &[f32], ip_1326: &[f32], river: u8) -> (Vec<f
     (oop, ip)
 }
 
-/// Convert normalized EVs back to chip EVs.
+fn combo_contains_any_board_card(combo_idx: usize, board: &[u8]) -> bool {
+    let (c1, c2) = index_to_card_pair(combo_idx);
+    board.iter().any(|&card| c1 == card || c2 == card)
+}
+
+/// Sanitize one canonical 1326-combo range for BoundaryNet inference.
+///
+/// The canonical range contract is:
+/// - exactly 1326 entries in `card_pair_to_index`/`index_to_card_pair` order;
+/// - every entry is finite and non-negative;
+/// - combos blocked by the public board are forced to zero;
+/// - remaining mass is normalized to sum to 1.0.
+///
+/// Returns `Ok(true)` when positive unblocked mass remains after blockers,
+/// `Ok(false)` when the sanitized range has zero mass, and `Err` for malformed
+/// inputs.
+pub fn sanitize_canonical_range_after_blockers(
+    range_1326: &mut [f32],
+    board: &[u8],
+) -> Result<bool, String> {
+    if range_1326.len() != NUM_COMBOS {
+        return Err(format!(
+            "canonical range must have {NUM_COMBOS} entries, got {}",
+            range_1326.len()
+        ));
+    }
+    for &card in board {
+        if card as usize >= DECK_SIZE {
+            return Err(format!("board card out of range: {card}"));
+        }
+    }
+
+    let mut mass = 0.0_f32;
+    for (combo_idx, value) in range_1326.iter_mut().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "range contains non-finite value at combo {combo_idx}"
+            ));
+        }
+        if *value < 0.0 {
+            return Err(format!(
+                "range contains negative value at combo {combo_idx}"
+            ));
+        }
+        if combo_contains_any_board_card(combo_idx, board) {
+            *value = 0.0;
+        } else {
+            mass += *value;
+        }
+    }
+
+    if mass <= 0.0 {
+        return Ok(false);
+    }
+    for value in range_1326 {
+        *value /= mass;
+    }
+    Ok(true)
+}
+
+/// BoundaryNet normalizes chip CFV targets by `pot + effective_stack`.
+pub fn boundary_ev_normalization_scale(pot: f32, effective_stack: f32) -> f32 {
+    pot + effective_stack
+}
+
+/// Convert one BoundaryNet normalized EV to chip EV.
+pub fn normalized_ev_to_chip_ev(normalized_ev: f32, pot: f32, effective_stack: f32) -> f32 {
+    normalized_ev * boundary_ev_normalization_scale(pot, effective_stack)
+}
+
+/// Convert one BoundaryNet normalized EV to the legacy half-pot BCFV unit.
+///
+/// `legacy_halfpot_bcfv = chip_cfv / (pot / 2)`.
+pub fn normalized_ev_to_legacy_halfpot_bcfv(
+    normalized_ev: f32,
+    pot: f32,
+    effective_stack: f32,
+) -> f32 {
+    if pot > 0.0 {
+        normalized_ev_to_chip_ev(normalized_ev, pot, effective_stack) / (pot / 2.0)
+    } else {
+        0.0
+    }
+}
+
+/// Convert BoundaryNet normalized EVs back to chip EVs.
 pub fn denormalize_ev(normalized: &[f32], pot: f32, effective_stack: f32) -> Vec<f32> {
-    let total = pot + effective_stack;
-    normalized.iter().map(|&v| v * total).collect()
+    normalized
+        .iter()
+        .map(|&v| normalized_ev_to_chip_ev(v, pot, effective_stack))
+        .collect()
 }
 
 /// Convert the legacy Python-exported direct BoundaryNet output contract
@@ -876,6 +963,77 @@ mod tests {
             (out[1] - 1.0).abs() < 1e-6,
             "one half-pot output: {}",
             out[1]
+        );
+    }
+
+    #[test]
+    fn sanitize_canonical_range_rejects_malformed_values() {
+        let board = vec![0u8, 4, 8, 12, 16];
+
+        let mut short = vec![0.0_f32; NUM_COMBOS - 1];
+        assert!(sanitize_canonical_range_after_blockers(&mut short, &board).is_err());
+
+        let mut non_finite = vec![1.0_f32; NUM_COMBOS];
+        non_finite[card_pair_to_index(1, 2)] = f32::NAN;
+        assert!(sanitize_canonical_range_after_blockers(&mut non_finite, &board).is_err());
+
+        let mut negative = vec![1.0_f32; NUM_COMBOS];
+        negative[card_pair_to_index(1, 2)] = -0.01;
+        assert!(sanitize_canonical_range_after_blockers(&mut negative, &board).is_err());
+
+        let mut invalid_board = vec![1.0_f32; NUM_COMBOS];
+        assert!(sanitize_canonical_range_after_blockers(&mut invalid_board, &[52]).is_err());
+    }
+
+    #[test]
+    fn sanitize_canonical_range_zeroes_blockers_and_normalizes() {
+        let board = vec![0u8, 4, 8, 12, 16];
+        let mut range = vec![1.0_f32; NUM_COMBOS];
+
+        let has_mass = sanitize_canonical_range_after_blockers(&mut range, &board).unwrap();
+
+        assert!(has_mass);
+        assert_eq!(range[card_pair_to_index(0, 1)], 0.0);
+        assert_eq!(range[card_pair_to_index(4, 5)], 0.0);
+        assert_eq!(
+            range[card_pair_to_index(20, 21)],
+            range[card_pair_to_index(22, 23)]
+        );
+        let mass: f32 = range.iter().sum();
+        assert!((mass - 1.0).abs() < 1e-5, "normalized mass was {mass}");
+    }
+
+    #[test]
+    fn sanitize_canonical_range_reports_zero_unblocked_mass() {
+        let board = vec![0u8, 4, 8, 12, 16];
+        let mut range = vec![0.0_f32; NUM_COMBOS];
+        range[card_pair_to_index(0, 1)] = 1.0;
+        range[card_pair_to_index(4, 5)] = 2.0;
+
+        let has_mass = sanitize_canonical_range_after_blockers(&mut range, &board).unwrap();
+
+        assert!(!has_mass);
+        assert_eq!(range.iter().sum::<f32>(), 0.0);
+    }
+
+    #[test]
+    fn boundary_ev_unit_conversions_match_contract() {
+        let normalized_ev = 0.25_f32;
+        let pot = 100.0_f32;
+        let effective_stack = 300.0_f32;
+
+        assert_eq!(boundary_ev_normalization_scale(pot, effective_stack), 400.0);
+        assert_eq!(
+            normalized_ev_to_chip_ev(normalized_ev, pot, effective_stack),
+            100.0
+        );
+        assert_eq!(
+            normalized_ev_to_legacy_halfpot_bcfv(normalized_ev, pot, effective_stack),
+            2.0
+        );
+        assert_eq!(
+            normalized_ev_to_legacy_halfpot_bcfv(normalized_ev, 0.0, effective_stack),
+            0.0
         );
     }
 
