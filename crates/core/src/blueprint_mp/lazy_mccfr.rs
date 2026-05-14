@@ -1300,12 +1300,23 @@ fn take_atomic_array<const N: usize>(atoms: &[AtomicU64; N]) -> [u64; N] {
 mod tests {
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
+    use std::sync::{Mutex, MutexGuard};
     use test_macros::timed_test;
 
     use super::*;
     use crate::blueprint_mp::config::{ForcedBet, MpStreetSizes, MpStreetSizes as StreetSizes};
     use crate::blueprint_mp::mccfr::sample_deal;
     use crate::blueprint_mp::types::{Bucket, Deal};
+
+    static LAZY_ACTION_LIMIT_AUDIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_lazy_action_limit_audit_for_test() -> MutexGuard<'static, ()> {
+        let guard = LAZY_ACTION_LIMIT_AUDIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = take_lazy_action_limit_snapshot();
+        guard
+    }
 
     fn game_config(num_players: u8, stack_depth: f64) -> MpGameConfig {
         MpGameConfig {
@@ -1571,7 +1582,7 @@ mod tests {
     #[timed_test]
     fn lazy_action_limit_audit_allows_one_all_in_aggression_past_raise_rows() {
         let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
-        let _ = take_lazy_action_limit_snapshot();
+        let _audit_guard = reset_lazy_action_limit_audit_for_test();
         let state = postflop_audit_state(Street::Flop, true, 1);
 
         let actions = game.actions(&state);
@@ -1591,7 +1602,7 @@ mod tests {
     #[timed_test]
     fn lazy_action_limit_audit_flags_decisions_past_allowed_extra_all_in() {
         let game = LazyMpGame::new(&game_config(2, 200.0), &action_config());
-        let _ = take_lazy_action_limit_snapshot();
+        let _audit_guard = reset_lazy_action_limit_audit_for_test();
         let state = postflop_audit_state(Street::Flop, false, 3);
 
         let actions = game.actions(&state);
