@@ -10,7 +10,7 @@ import torch
 from cfvnet.config import TrainConfig
 from cfvnet.constants import NUM_COMBOS
 from cfvnet.data import LazyBoundaryDataset
-from cfvnet.train import _maybe_resume, _split_dataset, train_boundary
+from cfvnet.train import _gpu_refresh_count, _maybe_resume, _split_dataset, train_boundary
 
 
 def _write_test_data(path: Path, n: int = 32) -> None:
@@ -71,6 +71,12 @@ def test_training_reduces_loss():
         )
 
     assert result.final_train_loss < 0.1, f"expected loss < 0.1, got {result.final_train_loss}"
+
+
+def test_gpu_refresh_count_is_half_pool():
+    """GPU buffer refresh should replace 50% of the active pool per epoch."""
+    assert _gpu_refresh_count(1_000_000) == 500_000
+    assert _gpu_refresh_count(101) == 50
 
 
 def test_maybe_resume_picks_numerically_latest_checkpoint():

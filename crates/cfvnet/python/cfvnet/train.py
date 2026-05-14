@@ -98,8 +98,7 @@ def _train_with_gpu_buffer(
 
     from cfvnet.gpu_buffer import GpuRingBuffer
 
-    # Refresh 10% of the pool per epoch, overlapped with training.
-    refresh_count = buffer_size // 10
+    refresh_count = _gpu_refresh_count(buffer_size)
 
     buf = GpuRingBuffer(
         data_path,
@@ -195,6 +194,11 @@ def _train_with_gpu_buffer(
         prep_thread.join()
 
     return final_loss
+
+
+def _gpu_refresh_count(buffer_size: int) -> int:
+    """Refresh 50% of the GPU ring buffer per epoch."""
+    return buffer_size // 2
 
 
 def _train_epoch_buffer(
