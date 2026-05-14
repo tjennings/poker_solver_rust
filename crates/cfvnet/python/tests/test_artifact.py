@@ -69,6 +69,8 @@ validation_indices:
     assert raw["schema_version"] == 1
     assert raw["model"]["onnx"]["sha256"] == sha256_file(onnx)
     assert raw["model"]["onnx_external_data"][0]["path"] == "model.onnx.data"
+    assert raw["model"]["output_unit"] == "bcfv_scaled_by_pot_over_total_stake"
+    assert raw["model"]["recommended_model_kind"] == "direct_normalized_legacy"
     assert raw["config"]["training"]["street"] == "turn_boundary"
     assert raw["dataset"]["manifest"]["street"] == "turn_boundary"
     assert raw["dataset"]["manifest"]["total_records"] == 2

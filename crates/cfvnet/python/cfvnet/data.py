@@ -115,9 +115,10 @@ class BoundaryItem:
 
 
 def encode_boundary_record(rec: TrainingRecord) -> BoundaryItem:
-    """Encode a TrainingRecord with normalized pot/stack and EV targets.
+    """Encode a TrainingRecord with normalized pot/stack and legacy-scaled targets.
 
-    Matches Rust's encode_boundary_record() exactly.
+    Current Python checkpoints output ``bcfv * pot / (pot + effective_stack)``.
+    Rust inference must consume these artifacts with ``direct_normalized_legacy``.
 
     Args:
         rec: Raw training record from binary file.

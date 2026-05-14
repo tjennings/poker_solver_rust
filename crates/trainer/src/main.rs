@@ -32,12 +32,92 @@ use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, MpTrainingBacke
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
 
+use cfvnet::eval::boundary_evaluator::BoundaryInferenceMode;
+
 #[derive(Parser)]
 #[command(name = "poker-solver-trainer")]
 #[command(about = "Poker solver training tools: blueprint training, clustering, range solving")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CfvnetModelArtifact {
+    model: Option<CfvnetArtifactModel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CfvnetArtifactModel {
+    output_unit: Option<String>,
+    recommended_model_kind: Option<String>,
+}
+
+fn cfvnet_artifact_path_for_model(model_path: &Path) -> Option<PathBuf> {
+    let candidate = model_path.parent()?.join("model_artifact.yaml");
+    candidate.is_file().then_some(candidate)
+}
+
+fn validate_cfvnet_model_kind_against_artifact(
+    model_path: &Path,
+    inference_mode: BoundaryInferenceMode,
+    street: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(artifact_path) = cfvnet_artifact_path_for_model(model_path) else {
+        return Ok(());
+    };
+
+    let yaml = std::fs::read_to_string(&artifact_path)?;
+    let artifact: CfvnetModelArtifact = serde_yaml::from_str(&yaml).map_err(|e| {
+        format!(
+            "failed to parse CFVNet model artifact {}: {e}",
+            artifact_path.display()
+        )
+    })?;
+    let Some(model) = artifact.model else {
+        return Ok(());
+    };
+    let Some(output_unit) = model.output_unit.as_deref() else {
+        return Ok(());
+    };
+
+    let expected_mode = match output_unit {
+        "bcfv_scaled_by_pot_over_total_stake"
+        | "bcfv_times_pot_over_total_stake"
+        | "legacy_scaled_bcfv" => BoundaryInferenceMode::DirectNormalizedLegacy,
+        "chip_ev_over_total_stake" | "normalized_chip_ev" => BoundaryInferenceMode::Direct,
+        other => {
+            return Err(format!(
+                "CFVNet model artifact {} declares unsupported model.output_unit '{other}'",
+                artifact_path.display()
+            )
+            .into());
+        }
+    };
+
+    if inference_mode != expected_mode {
+        let recommended = model
+            .recommended_model_kind
+            .as_deref()
+            .unwrap_or_else(|| cfvnet_model_kind_name(expected_mode));
+        return Err(format!(
+            "--{street}-model-kind '{}' is incompatible with CFVNet artifact {} \
+             (model.output_unit='{output_unit}'); use --{street}-model-kind '{recommended}'",
+            cfvnet_model_kind_name(inference_mode),
+            artifact_path.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn cfvnet_model_kind_name(mode: BoundaryInferenceMode) -> &'static str {
+    match mode {
+        BoundaryInferenceMode::RiverEnumeratedTurn => "river_enumerated_turn",
+        BoundaryInferenceMode::Direct => "direct",
+        BoundaryInferenceMode::DirectNormalizedLegacy => "direct_normalized_legacy",
+    }
 }
 
 #[derive(Parser)]
@@ -1568,13 +1648,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             })?;
                             let inference_mode = match model_kind {
                                 "river_enumerated_turn" | "river-enumerated-turn" => {
-                                    cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::RiverEnumeratedTurn
+                                    BoundaryInferenceMode::RiverEnumeratedTurn
                                 }
-                                "direct" => {
-                                    cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct
-                                }
+                                "direct" => BoundaryInferenceMode::Direct,
                                 "direct_normalized_legacy" | "direct-normalized-legacy" => {
-                                    cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy
+                                    BoundaryInferenceMode::DirectNormalizedLegacy
                                 }
                                 other => {
                                     return Err(format!(
@@ -1585,6 +1663,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     .into());
                                 }
                             };
+                            validate_cfvnet_model_kind_against_artifact(
+                                Path::new(&path),
+                                inference_mode,
+                                street,
+                            )?;
                             Ok(poker_solver_tauri::StreetBoundaryMode::Cfvnet {
                                 model_path: path,
                                 inference_mode,
@@ -5057,6 +5140,73 @@ snapshots:
         } else {
             panic!("expected CompareSolve variant");
         }
+    }
+
+    #[test]
+    fn cfvnet_artifact_guard_rejects_legacy_scaled_output_as_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        std::fs::write(&model_path, b"onnx").unwrap();
+        std::fs::write(
+            dir.path().join("model_artifact.yaml"),
+            r#"
+schema_version: 1
+model:
+  output_unit: bcfv_scaled_by_pot_over_total_stake
+  recommended_model_kind: direct_normalized_legacy
+"#,
+        )
+        .unwrap();
+
+        let err = super::validate_cfvnet_model_kind_against_artifact(
+            &model_path,
+            cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct,
+            "river",
+        )
+        .expect_err("direct must reject legacy-scaled Python checkpoints");
+
+        assert!(
+            err.to_string().contains("direct_normalized_legacy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cfvnet_artifact_guard_accepts_recommended_legacy_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        std::fs::write(&model_path, b"onnx").unwrap();
+        std::fs::write(
+            dir.path().join("model_artifact.yaml"),
+            r#"
+schema_version: 1
+model:
+  output_unit: bcfv_scaled_by_pot_over_total_stake
+  recommended_model_kind: direct_normalized_legacy
+"#,
+        )
+        .unwrap();
+
+        super::validate_cfvnet_model_kind_against_artifact(
+            &model_path,
+            cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy,
+            "river",
+        )
+        .expect("recommended legacy-normalized mode should pass");
+    }
+
+    #[test]
+    fn cfvnet_artifact_guard_is_noop_without_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        std::fs::write(&model_path, b"onnx").unwrap();
+
+        super::validate_cfvnet_model_kind_against_artifact(
+            &model_path,
+            cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct,
+            "river",
+        )
+        .expect("models without artifacts remain accepted");
     }
 
     /// compare-solve should accept --trace-boundaries, --trace-iters, --trace-dir flags.

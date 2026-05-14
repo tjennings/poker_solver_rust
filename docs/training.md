@@ -847,6 +847,8 @@ BoundaryNet is a sibling model to CfvNet that outputs **solver-native boundary C
 
 The current local direct checkpoint was exported from the Python BoundaryNet trainer, which stores the target as `bcfv * pot / (pot + effective_stack)`. Use `direct_normalized_legacy` for that checkpoint; it applies `bcfv = output * (pot + effective_stack) / pot` at inference.
 
+Python model exports write `model_artifact.yaml` with `model.output_unit` and `model.recommended_model_kind`. `compare-solve` validates that artifact when it is present and rejects incompatible model-kind choices, for example using `direct` on a Python checkpoint that declares `bcfv_scaled_by_pot_over_total_stake`.
+
 BoundaryNet is designed as a depth-boundary evaluator for the range-solver, enabling turn solving with neural network leaf values at river boundaries.
 
 At runtime, BoundaryNet/CFVNet values are treated as conditional boundary values. The model input ranges are normalized to sum to 1 after blockers, and the range-solver applies the live, blocker-aware opponent reach when it consumes the evaluator output. The raw-CFV evaluator path is reserved for exact/oracle evaluators that already return opponent-reach-integrated chip CFVs.
