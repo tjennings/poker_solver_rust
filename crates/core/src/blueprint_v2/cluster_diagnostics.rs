@@ -12,18 +12,18 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::poker::Card;
+use crate::poker::{Card, Hand, Rank, Rankable};
 
-use super::Street;
 use super::bucket_file::BucketFile;
 use super::centroid_file::CentroidFile;
 use super::cluster_pipeline::{
     build_deck, canonical_key, combo_index, compute_board_equities, enumerate_combos,
     sample_boards, sample_n_card_boards,
 };
+use super::Street;
 
 use crate::abstraction::isomorphism::CanonicalBoard;
-use crate::hand_class::{HandClass, classify, intra_class_strength};
+use crate::hand_class::{classify, intra_class_strength, HandClass};
 use crate::showdown_equity;
 
 /// Size distribution statistics for bucket assignments.
@@ -352,13 +352,14 @@ pub struct BucketShare {
 
 #[derive(Debug, Clone)]
 pub struct HandClassShare {
-    pub hand_class: String,
+    pub class_label: String,
     pub count: usize,
     pub share: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct HandClassTraceExample {
+    pub contribution: String,
     pub hand_class: String,
     /// Rank-like strength within the hand class, 14 high and 1 low.
     pub strength: u8,
@@ -371,6 +372,7 @@ pub struct HandClassTraceExample {
 
 #[derive(Debug, Clone)]
 pub struct HandClassStrengthBucketStats {
+    pub contribution: String,
     pub hand_class: String,
     /// Rank-like strength within the hand class, 14 high and 1 low.
     pub strength: u8,
@@ -398,6 +400,7 @@ pub struct BucketHandClassMixStats {
 
 #[derive(Debug, Clone)]
 pub struct HandClassStrengthInversion {
+    pub contribution: String,
     pub hand_class: String,
     pub weaker_strength: u8,
     pub weaker_mean_bucket: f64,
@@ -445,7 +448,8 @@ impl HandClassBucketAuditReport {
                 .join(", ");
             let _ = writeln!(
                 s,
-                "    {:<14} str={:>2} eq_decile={} n={:<6} distinct={:<4} entropy={:.2} mean_bucket={:.1} top=[{}]",
+                "    {:<5} {:<14} str={:>2} eq_decile={} n={:<6} distinct={:<4} entropy={:.2} mean_bucket={:.1} top=[{}]",
+                g.contribution,
                 g.hand_class,
                 g.strength,
                 g.equity_decile,
@@ -458,8 +462,8 @@ impl HandClassBucketAuditReport {
             for ex in &g.examples {
                 let _ = writeln!(
                     s,
-                    "      ex bucket={} eq={:.3} {} on {}",
-                    ex.bucket, ex.equity, ex.hand, ex.board,
+                    "      ex {} bucket={} eq={:.3} {} on {}",
+                    ex.contribution, ex.bucket, ex.equity, ex.hand, ex.board,
                 );
             }
         }
@@ -469,7 +473,7 @@ impl HandClassBucketAuditReport {
             let classes = b
                 .top_classes
                 .iter()
-                .map(|c| format!("{}:{:.1}%/{}", c.hand_class, c.share * 100.0, c.count))
+                .map(|c| format!("{}:{:.1}%/{}", c.class_label, c.share * 100.0, c.count))
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = writeln!(
@@ -494,7 +498,8 @@ impl HandClassBucketAuditReport {
             for inv in self.strength_inversions.iter().take(self.top_n) {
                 let _ = writeln!(
                     s,
-                    "    {:<14} weaker str={} mean_bucket={:.1} > stronger str={} mean_bucket={:.1} delta={:.1}",
+                    "    {:<5} {:<14} weaker str={} mean_bucket={:.1} > stronger str={} mean_bucket={:.1} delta={:.1}",
+                    inv.contribution,
                     inv.hand_class,
                     inv.weaker_strength,
                     inv.weaker_mean_bucket,
@@ -511,6 +516,7 @@ impl HandClassBucketAuditReport {
 
 #[derive(Debug, Clone)]
 struct HandClassGroupAcc {
+    contribution: HoleContribution,
     class_id: u8,
     strength: u8,
     equity_decile: u8,
@@ -521,8 +527,15 @@ struct HandClassGroupAcc {
 }
 
 impl HandClassGroupAcc {
-    fn new(class_id: u8, strength: u8, equity_decile: u8, bucket_count: usize) -> Self {
+    fn new(
+        contribution: HoleContribution,
+        class_id: u8,
+        strength: u8,
+        equity_decile: u8,
+        bucket_count: usize,
+    ) -> Self {
         Self {
+            contribution,
             class_id,
             strength,
             equity_decile,
@@ -547,7 +560,7 @@ impl BucketClassAcc {
     fn new() -> Self {
         Self {
             count: 0,
-            class_counts: vec![0; HandClass::NUM_MADE],
+            class_counts: vec![0; HandClass::NUM_MADE * HoleContribution::COUNT],
             sum_equity: 0.0,
             min_equity: f64::INFINITY,
             max_equity: f64::NEG_INFINITY,
@@ -555,14 +568,38 @@ impl BucketClassAcc {
     }
 }
 
-type HandClassAuditSample = (u8, u8, u8, u16, f64, String, String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum HoleContribution {
+    BoardOnly = 0,
+    OneHole = 1,
+    TwoHole = 2,
+}
+
+impl HoleContribution {
+    const COUNT: usize = 3;
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::BoardOnly => "board",
+            Self::OneHole => "1h",
+            Self::TwoHole => "2h",
+        }
+    }
+}
+
+type HandClassAuditSample = (HoleContribution, u8, u8, u8, u16, f64, String, String);
 
 /// Audit how postflop bucket assignments line up with hand class and
 /// within-class strength.
 ///
-/// The grouping key is `(made hand class, rank-like strength, equity decile)`.
+/// The grouping key is `(hole contribution, made hand class, rank-like strength,
+/// equity decile)`.
 /// The rank-like strength is 14 high and 1 low, so nut flushes and ace-high
 /// straights appear above king-high or lower variants inside the same class.
+/// Hole contribution separates board-played made hands from hands that need one
+/// or both private cards, avoiding false class-mix alarms on paired or straight
+/// boards.
 ///
 /// Preflop bucket files are intentionally skipped because preflop assignment
 /// has no board-dependent made hand class.
@@ -624,10 +661,12 @@ pub fn audit_hand_class_bucket_assignments(
                         return None;
                     }
                     let class = HandClass::from_discriminant(class_id)?;
+                    let contribution = hole_contribution(combo, board);
                     let strength = class_strength_high_is_strong(combo, board, class);
                     let equity = showdown_equity::compute_equity(combo, board);
                     let equity_decile = equity_decile(equity);
                     Some(Ok((
+                        contribution,
                         class_id,
                         strength,
                         equity_decile,
@@ -648,19 +687,26 @@ pub fn audit_hand_class_bucket_assignments(
 
     let assignments = samples.len();
 
-    let mut groups: HashMap<(u8, u8, u8), HandClassGroupAcc> = HashMap::new();
+    let mut groups: HashMap<(HoleContribution, u8, u8, u8), HandClassGroupAcc> = HashMap::new();
     let mut buckets = vec![BucketClassAcc::new(); bucket_count];
 
-    for (class_id, strength, equity_decile, bucket, equity, hand, board) in samples {
-        let key = (class_id, strength, equity_decile);
+    for (contribution, class_id, strength, equity_decile, bucket, equity, hand, board) in samples {
+        let key = (contribution, class_id, strength, equity_decile);
         let group = groups.entry(key).or_insert_with(|| {
-            HandClassGroupAcc::new(class_id, strength, equity_decile, bucket_count)
+            HandClassGroupAcc::new(
+                contribution,
+                class_id,
+                strength,
+                equity_decile,
+                bucket_count,
+            )
         });
         group.count += 1;
         group.sum_bucket += f64::from(bucket);
         group.bucket_counts[bucket as usize] += 1;
         if group.examples.len() < 2 {
             group.examples.push(HandClassTraceExample {
+                contribution: contribution.label().to_string(),
                 hand_class: hand_class_name(class_id),
                 strength,
                 equity_decile,
@@ -673,7 +719,7 @@ pub fn audit_hand_class_bucket_assignments(
 
         let bucket_acc = &mut buckets[bucket as usize];
         bucket_acc.count += 1;
-        bucket_acc.class_counts[class_id as usize] += 1;
+        bucket_acc.class_counts[contribution_class_index(contribution, class_id)] += 1;
         bucket_acc.sum_equity += equity;
         bucket_acc.min_equity = bucket_acc.min_equity.min(equity);
         bucket_acc.max_equity = bucket_acc.max_equity.max(equity);
@@ -733,6 +779,7 @@ fn build_group_stats(g: HandClassGroupAcc, top_n: usize) -> HandClassStrengthBuc
     let distinct_buckets = g.bucket_counts.iter().filter(|&&count| count > 0).count();
     let bucket_entropy = entropy(g.bucket_counts.iter().copied(), g.count);
     HandClassStrengthBucketStats {
+        contribution: g.contribution.label().to_string(),
         hand_class: hand_class_name(g.class_id),
         strength: g.strength,
         equity_decile: g.equity_decile,
@@ -764,7 +811,7 @@ fn build_bucket_mix_stats(
     Some(BucketHandClassMixStats {
         bucket_id: bucket_id as u16,
         count: acc.count,
-        dominant_class: dominant.hand_class.clone(),
+        dominant_class: dominant.class_label.clone(),
         dominant_share: dominant.share,
         class_entropy: entropy(acc.class_counts.iter().copied(), acc.count),
         mean_equity: acc.sum_equity / acc.count as f64,
@@ -779,35 +826,40 @@ fn detect_strength_inversions(
     groups: &[HandClassStrengthBucketStats],
     bucket_count: u16,
 ) -> Vec<HandClassStrengthInversion> {
-    let mut by_class_strength: HashMap<(String, u8), (f64, usize)> = HashMap::new();
+    let mut by_class_strength: HashMap<(String, String, u8), (f64, usize)> = HashMap::new();
     for group in groups {
         let entry = by_class_strength
-            .entry((group.hand_class.clone(), group.strength))
+            .entry((
+                group.contribution.clone(),
+                group.hand_class.clone(),
+                group.strength,
+            ))
             .or_insert((0.0, 0));
         entry.0 += group.mean_bucket * group.count as f64;
         entry.1 += group.count;
     }
 
-    let mut by_class: HashMap<String, Vec<(u8, f64)>> = HashMap::new();
-    for ((class, strength), (weighted_sum, count)) in by_class_strength {
+    let mut by_class: HashMap<(String, String), Vec<(u8, f64)>> = HashMap::new();
+    for ((contribution, class, strength), (weighted_sum, count)) in by_class_strength {
         if count == 0 {
             continue;
         }
         by_class
-            .entry(class)
+            .entry((contribution, class))
             .or_default()
             .push((strength, weighted_sum / count as f64));
     }
 
     let threshold = (f64::from(bucket_count) * 0.02).max(1.0);
     let mut inversions = Vec::new();
-    for (class, mut strengths) in by_class {
+    for ((contribution, class), mut strengths) in by_class {
         strengths.sort_by_key(|(strength, _)| *strength);
         for (i, &(weaker_strength, weaker_mean)) in strengths.iter().enumerate() {
             for &(stronger_strength, stronger_mean) in &strengths[i + 1..] {
                 let delta = weaker_mean - stronger_mean;
                 if delta > threshold {
                     inversions.push(HandClassStrengthInversion {
+                        contribution: contribution.clone(),
                         hand_class: class.clone(),
                         weaker_strength,
                         weaker_mean_bucket: weaker_mean,
@@ -864,7 +916,7 @@ fn top_class_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<HandCla
             }
             #[allow(clippy::cast_possible_truncation)]
             Some(HandClassShare {
-                hand_class: hand_class_name(class_id as u8),
+                class_label: contribution_class_label(class_id),
                 count,
                 share: count as f64 / total as f64,
             })
@@ -873,7 +925,7 @@ fn top_class_shares(counts: &[usize], total: usize, top_n: usize) -> Vec<HandCla
     shares.sort_by(|a, b| {
         b.count
             .cmp(&a.count)
-            .then_with(|| a.hand_class.cmp(&b.hand_class))
+            .then_with(|| a.class_label.cmp(&b.class_label))
     });
     shares.truncate(top_n);
     shares
@@ -896,6 +948,46 @@ fn entropy(counts: impl Iterator<Item = usize>, total: usize) -> f64 {
 fn hand_class_name(class_id: u8) -> String {
     HandClass::from_discriminant(class_id)
         .map_or_else(|| "Unknown".to_string(), |class| class.to_string())
+}
+
+fn contribution_class_index(contribution: HoleContribution, class_id: u8) -> usize {
+    contribution as usize * HandClass::NUM_MADE + class_id as usize
+}
+
+fn contribution_class_label(index: usize) -> String {
+    let contribution_idx = index / HandClass::NUM_MADE;
+    let class_id = index % HandClass::NUM_MADE;
+    let contribution = match contribution_idx {
+        0 => HoleContribution::BoardOnly,
+        1 => HoleContribution::OneHole,
+        _ => HoleContribution::TwoHole,
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let class_id = class_id as u8;
+    format!("{}:{}", contribution.label(), hand_class_name(class_id))
+}
+
+fn hole_contribution(hole: [Card; 2], board: &[Card]) -> HoleContribution {
+    let full_rank = rank_cards(hole.iter().copied().chain(board.iter().copied()));
+    if board.len() >= 5 && rank_cards(board.iter().copied()) == full_rank {
+        return HoleContribution::BoardOnly;
+    }
+
+    if rank_cards(std::iter::once(hole[0]).chain(board.iter().copied())) == full_rank
+        || rank_cards(std::iter::once(hole[1]).chain(board.iter().copied())) == full_rank
+    {
+        return HoleContribution::OneHole;
+    }
+
+    HoleContribution::TwoHole
+}
+
+fn rank_cards(cards: impl IntoIterator<Item = Card>) -> Rank {
+    let mut hand = Hand::default();
+    for card in cards {
+        hand.insert(card);
+    }
+    hand.rank()
 }
 
 fn class_strength_high_is_strong(hole: [Card; 2], board: &[Card], class: HandClass) -> u8 {
@@ -1291,7 +1383,11 @@ pub fn mean_pairwise_centroid_emd(centroids: &[Vec<f64>]) -> f64 {
         }
     }
     #[allow(clippy::cast_precision_loss)]
-    if count > 0 { total / count as f64 } else { 0.0 }
+    if count > 0 {
+        total / count as f64
+    } else {
+        0.0
+    }
 }
 
 /// 1-D Earth Mover's Distance between two probability distributions.
@@ -1550,8 +1646,8 @@ pub fn audit_cfvnet_buckets(
     progress: impl Fn(f64),
 ) -> Result<EquityAuditReport, Box<dyn std::error::Error>> {
     use super::cluster_pipeline::{
-        CFV_FIELD_OFFSET, CFVNET_RIVER_RECORD_SIZE, build_cfvnet_to_core_combo_map, canonical_key,
-        cfvnet_card_to_core, collect_bin_files, read_cfv_as_equity, record_size_for_board,
+        build_cfvnet_to_core_combo_map, canonical_key, cfvnet_card_to_core, collect_bin_files,
+        read_cfv_as_equity, record_size_for_board, CFVNET_RIVER_RECORD_SIZE, CFV_FIELD_OFFSET,
     };
 
     let combo_map = build_cfvnet_to_core_combo_map();
@@ -2266,8 +2362,8 @@ pub fn diff_bucket_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blueprint_v2::Street;
     use crate::blueprint_v2::bucket_file::{BucketFileHeader, PackedBoard};
+    use crate::blueprint_v2::Street;
 
     fn make_test_bucket_file(bucket_count: u16, buckets: Vec<u16>) -> BucketFile {
         #[allow(clippy::cast_possible_truncation)]
@@ -2533,6 +2629,59 @@ mod tests {
         assert!(
             class_strength_high_is_strong(nut_flush, &board, HandClass::Flush)
                 > class_strength_high_is_strong(queen_high_flush, &board, HandClass::Flush)
+        );
+    }
+
+    #[test]
+    fn hole_contribution_distinguishes_board_and_private_cards() {
+        use crate::poker::{Suit, Value};
+
+        let board_full_house = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+        ];
+        let air = [
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Three, Suit::Club),
+        ];
+        assert_eq!(
+            hole_contribution(air, &board_full_house),
+            HoleContribution::BoardOnly
+        );
+
+        let four_heart_board = [
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Eight, Suit::Heart),
+            Card::new(Value::Four, Suit::Heart),
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Seven, Suit::Diamond),
+        ];
+        let ace_heart = [
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::Three, Suit::Club),
+        ];
+        assert_eq!(
+            hole_contribution(ace_heart, &four_heart_board),
+            HoleContribution::OneHole
+        );
+
+        let broadway_draw = [
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Jack, Suit::Spade),
+            Card::new(Value::Ten, Suit::Diamond),
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Three, Suit::Heart),
+        ];
+        let ace_king = [
+            Card::new(Value::Ace, Suit::Diamond),
+            Card::new(Value::King, Suit::Club),
+        ];
+        assert_eq!(
+            hole_contribution(ace_king, &broadway_draw),
+            HoleContribution::TwoHole
         );
     }
 
