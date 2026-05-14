@@ -24,6 +24,8 @@ pub const SPARSE_INSERT_HISTORY_LEN_BIN_COUNT: usize = 8;
 pub const SPARSE_INSERT_ACTION_COUNT_BIN_COUNT: usize = 8;
 const LOCAL_BUCKET_BITS: u16 = 14;
 const LOCAL_BUCKET_MASK: u16 = (1 << LOCAL_BUCKET_BITS) - 1;
+const PACKED_HISTORY_ACTION_SLOTS: u16 = 32;
+const ACTION_BITS: u16 = 4;
 
 /// Stable key for one lazy MP infoset.
 ///
@@ -127,6 +129,14 @@ pub struct SparseStorageStats {
     pub shard_count: usize,
     pub nonempty_shards: usize,
     pub max_entries_per_shard: usize,
+}
+
+/// Accounting for rows removed by a sparse descendant purge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparsePurgeStats {
+    pub rows_purged: usize,
+    pub regret_slots_purged: usize,
+    pub strategy_slots_purged: usize,
 }
 
 /// Cumulative sparse storage activity counters for throughput diagnostics.
@@ -429,6 +439,59 @@ impl SparseMpStorage {
         }
     }
 
+    /// Purge all visited infosets strictly below a packed action-history prefix.
+    ///
+    /// This compares only the exact 4-bit packed action codes in
+    /// `history_hi`/`history_lo`; `history_hash` is intentionally ignored
+    /// because it is cumulative and not prefix-searchable. Prefixes longer
+    /// than the 32 packed action slots are handled conservatively by purging
+    /// nothing.
+    pub fn purge_descendants_with_history_prefix(
+        &self,
+        prefix_hi: u64,
+        prefix_lo: u64,
+        prefix_len: u16,
+    ) -> SparsePurgeStats {
+        if prefix_len > PACKED_HISTORY_ACTION_SLOTS {
+            return SparsePurgeStats::default();
+        }
+
+        let mut stats = SparsePurgeStats::default();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            let mut guard = lock_entries(shard);
+            let mut shard_rows_purged = 0_usize;
+            let mut shard_slots_purged = 0_usize;
+            guard.retain(|key, node| {
+                let purge = key.history_len > prefix_len
+                    && packed_history_has_prefix(
+                        key.history_hi,
+                        key.history_lo,
+                        prefix_hi,
+                        prefix_lo,
+                        prefix_len,
+                    );
+                if purge {
+                    shard_rows_purged += 1;
+                    shard_slots_purged += node.action_count();
+                    false
+                } else {
+                    true
+                }
+            });
+            if shard_rows_purged > 0 {
+                self.entry_count
+                    .fetch_sub(shard_rows_purged, Ordering::Relaxed);
+                self.slot_count
+                    .fetch_sub(shard_slots_purged, Ordering::Relaxed);
+                self.shard_entry_counts[shard_idx].fetch_sub(shard_rows_purged, Ordering::Relaxed);
+                stats.rows_purged += shard_rows_purged;
+                stats.regret_slots_purged += shard_slots_purged;
+                stats.strategy_slots_purged += shard_slots_purged;
+            }
+        }
+        stats
+    }
+
     /// Read a regret value. Missing entries or out-of-range actions return zero.
     #[must_use]
     pub fn get_regret(&self, key: MpInfosetKey, action: usize) -> i32 {
@@ -729,6 +792,35 @@ fn sparse_key_fingerprint_weight(key: MpInfosetKey) -> f64 {
     (mixed % 1_000_003) as f64 / 1_000_003.0
 }
 
+fn packed_history_has_prefix(
+    history_hi: u64,
+    history_lo: u64,
+    prefix_hi: u64,
+    prefix_lo: u64,
+    prefix_len: u16,
+) -> bool {
+    debug_assert!(prefix_len <= PACKED_HISTORY_ACTION_SLOTS);
+    let prefix_bits = prefix_len * ACTION_BITS;
+    if prefix_bits == 0 {
+        return true;
+    }
+    if prefix_bits < u64::BITS as u16 {
+        let mask = (1_u64 << prefix_bits) - 1;
+        return history_lo & mask == prefix_lo & mask;
+    }
+    if prefix_bits == u64::BITS as u16 {
+        return history_lo == prefix_lo;
+    }
+
+    let hi_bits = prefix_bits - u64::BITS as u16;
+    let hi_mask = if hi_bits == u64::BITS as u16 {
+        u64::MAX
+    } else {
+        (1_u64 << hi_bits) - 1
+    };
+    history_lo == prefix_lo && history_hi & hi_mask == prefix_hi & hi_mask
+}
+
 fn lock_entries(shard: &Shard) -> MutexGuard<'_, HashMap<MpInfosetKey, Arc<SparseNode>>> {
     shard
         .entries
@@ -787,6 +879,36 @@ mod tests {
             0xCC,
             4,
         )
+    }
+
+    fn history_key(bucket: u16, actions: &[u8]) -> MpInfosetKey {
+        let (history_hi, history_lo) = pack_history(actions);
+        MpInfosetKey::from_street_bucket(
+            Seat::from_raw(2),
+            Street::Flop,
+            bucket,
+            history_hi,
+            history_lo,
+            actions.iter().fold(0_u64, |hash, action| {
+                hash.wrapping_mul(31).wrapping_add(u64::from(*action))
+            }),
+            u16::try_from(actions.len()).expect("test action history length fits in u16"),
+        )
+    }
+
+    fn pack_history(actions: &[u8]) -> (u64, u64) {
+        let mut history_hi = 0_u64;
+        let mut history_lo = 0_u64;
+        for (idx, action) in actions.iter().enumerate() {
+            let bit = u32::try_from(idx).expect("test action index fits in u32") * 4;
+            let code = u64::from(*action) & 0xF;
+            if bit < 64 {
+                history_lo |= code << bit;
+            } else {
+                history_hi |= code << (bit - 64);
+            }
+        }
+        (history_hi, history_lo)
     }
 
     fn assert_strategy_close(actual: &[f64], expected: &[f64]) {
@@ -954,6 +1076,132 @@ mod tests {
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.regret_slots, 3);
         assert_eq!(stats.strategy_slots, 3);
+    }
+
+    #[timed_test]
+    fn purge_descendants_with_history_prefix_removes_matching_descendants_only() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[3, 1]);
+        let child = history_key(2, &[3, 1, 4]);
+        let grandchild = history_key(3, &[3, 1, 4, 2]);
+        let sibling = history_key(4, &[3, 2, 4]);
+        let non_matching_root = history_key(5, &[8]);
+        let (prefix_hi, prefix_lo) = pack_history(&[3, 1]);
+
+        storage.add_regret(parent, 2, 0, 11);
+        storage.add_strategy_sum(child, 3, 0, 22);
+        storage.add_regret(grandchild, 4, 0, 33);
+        storage.add_regret(sibling, 5, 0, 44);
+        storage.add_regret(non_matching_root, 6, 0, 55);
+
+        let stats = storage.purge_descendants_with_history_prefix(prefix_hi, prefix_lo, 2);
+
+        assert_eq!(
+            stats,
+            SparsePurgeStats {
+                rows_purged: 2,
+                regret_slots_purged: 7,
+                strategy_slots_purged: 7,
+            }
+        );
+        assert_eq!(storage.entry_count(), 3);
+        assert_eq!(storage.get_regret(parent, 0), 11);
+        assert_eq!(storage.get_strategy_sum(child, 0), 0);
+        assert_eq!(storage.get_regret(grandchild, 0), 0);
+        assert_eq!(storage.get_regret(sibling, 0), 44);
+        assert_eq!(storage.get_regret(non_matching_root, 0), 55);
+    }
+
+    #[timed_test]
+    fn purge_descendants_with_history_prefix_updates_counters() {
+        let storage = SparseMpStorage::with_shards(8);
+        let parent = history_key(1, &[1]);
+        let child_a = history_key(2, &[1, 2]);
+        let child_b = history_key(3, &[1, 3]);
+        let sibling = history_key(4, &[2, 3]);
+        let (prefix_hi, prefix_lo) = pack_history(&[1]);
+
+        storage.add_regret(parent, 2, 0, 1);
+        storage.add_regret(child_a, 3, 0, 1);
+        storage.add_regret(child_b, 4, 0, 1);
+        storage.add_regret(sibling, 5, 0, 1);
+        let before = storage.stats();
+        assert_eq!(before.entries, 4);
+        assert_eq!(before.regret_slots, 14);
+        assert_eq!(before.strategy_slots, 14);
+
+        let purge_stats = storage.purge_descendants_with_history_prefix(prefix_hi, prefix_lo, 1);
+        let after = storage.stats();
+
+        assert_eq!(purge_stats.rows_purged, 2);
+        assert_eq!(purge_stats.regret_slots_purged, 7);
+        assert_eq!(purge_stats.strategy_slots_purged, 7);
+        assert_eq!(after.entries, 2);
+        assert_eq!(after.regret_slots, 7);
+        assert_eq!(after.strategy_slots, 7);
+        assert_eq!(storage.entry_count(), 2);
+        assert_eq!(
+            storage
+                .shard_entry_counts
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[timed_test]
+    fn purge_descendants_with_history_prefix_preserves_parent_row() {
+        let storage = SparseMpStorage::with_shards(4);
+        let parent = history_key(1, &[9, 5, 2]);
+        let (prefix_hi, prefix_lo) = pack_history(&[9, 5, 2]);
+
+        storage.add_regret(parent, 2, 1, 77);
+
+        let stats = storage.purge_descendants_with_history_prefix(prefix_hi, prefix_lo, 3);
+
+        assert_eq!(stats, SparsePurgeStats::default());
+        assert_eq!(storage.entry_count(), 1);
+        assert_eq!(storage.get_regret(parent, 1), 77);
+    }
+
+    #[timed_test]
+    fn purge_descendants_with_history_prefix_matches_hi_word_prefix_bits() {
+        let storage = SparseMpStorage::with_shards(4);
+        let prefix = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1, 2, 3];
+        let mut descendant_actions = prefix.to_vec();
+        descendant_actions.push(4);
+        let mut sibling_actions = prefix;
+        sibling_actions[16] = 5;
+        let descendant = history_key(1, &descendant_actions);
+        let sibling = history_key(2, &sibling_actions);
+        let (prefix_hi, prefix_lo) = pack_history(&prefix);
+
+        storage.add_regret(descendant, 2, 0, 88);
+        storage.add_regret(sibling, 3, 0, 99);
+
+        let stats = storage.purge_descendants_with_history_prefix(prefix_hi, prefix_lo, 17);
+
+        assert_eq!(stats.rows_purged, 1);
+        assert_eq!(stats.regret_slots_purged, 2);
+        assert_eq!(stats.strategy_slots_purged, 2);
+        assert_eq!(storage.entry_count(), 1);
+        assert_eq!(storage.get_regret(descendant, 0), 0);
+        assert_eq!(storage.get_regret(sibling, 0), 99);
+    }
+
+    #[timed_test]
+    fn purge_descendants_with_history_prefix_longer_than_packed_capacity_is_conservative() {
+        let storage = SparseMpStorage::with_shards(4);
+        let descendant = history_key(1, &[1, 2, 3]);
+
+        storage.add_regret(descendant, 2, 0, 99);
+
+        let stats = storage.purge_descendants_with_history_prefix(0, 0, 33);
+
+        assert_eq!(stats, SparsePurgeStats::default());
+        assert_eq!(storage.entry_count(), 1);
+        assert_eq!(storage.get_regret(descendant, 0), 99);
     }
 
     #[timed_test]
