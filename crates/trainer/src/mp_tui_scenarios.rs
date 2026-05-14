@@ -412,6 +412,7 @@ mod tests {
             name: "test".into(),
             num_players: 6,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -450,6 +451,7 @@ mod tests {
             name: "shallow".into(),
             num_players: 6,
             stack_depth: 10.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -782,6 +784,7 @@ mod tests {
             name: "2p-grid-test".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,

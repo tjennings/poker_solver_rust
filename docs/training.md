@@ -46,6 +46,7 @@ game:
   name: "6-max 100bb BB-ante"
   num_players: 6
   stack_depth: 200        # chips (1 BB = 2 chips)
+  allow_preflop_limp: false
   blinds:
     - seat: 0
       type: small_blind
@@ -597,7 +598,7 @@ See `sample_configurations/blueprint_mp_6player_ante.yaml` for a full 12-scenari
 
 ## Blueprint Training Configuration
 
-All `game:` section values are in **chips** (1 BB = 2 chips). Example: `stack_depth: 200` = 100 BB, `small_blind: 1`, `big_blind: 2`. Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` = raise to 5 chips (2.5 BB). Display converts to BB at the UI/CLI boundary only (dividing by 2). See `docs/architecture.md` for full unit convention.
+All `game:` section values are in **chips** (1 BB = 2 chips). Example: `stack_depth: 200` = 100 BB, `small_blind: 1`, `big_blind: 2`. `allow_preflop_limp` defaults to `true`; set it to `false` to remove unopened preflop calls/limps while keeping folds and configured open sizes. Preflop action sizes use chip amounts with a `bb` suffix: `"5bb"` = raise to 5 chips (2.5 BB). Display converts to BB at the UI/CLI boundary only (dividing by 2). See `docs/architecture.md` for full unit convention.
 
 The `training:` section of the blueprint YAML config controls the MCCFR training loop. Key parameters:
 
@@ -657,7 +658,7 @@ When enabled, the opponent traversal uses learned baselines to reduce sampling v
 | `lcfr_warmup_iterations` | `0` | Iterations before discounting starts |
 | `lcfr_discount_interval` | `1` | Iterations between discount applications |
 | `prune_after_iterations` | `0` | Iterations before action pruning starts |
-| `prune_threshold` | `-300` | Cumulative regret threshold for pruning. In lazy sparse training, only aggressive actions below this are skipped; passive structural actions remain traversable |
+| `prune_threshold` | `-300` | Cumulative regret threshold for traversal pruning. In lazy sparse training, immediate terminal children are protected, but nonterminal branches below this threshold can be skipped |
 | `prune_explore_pct` | `0.05` | Fraction of post-warmup batches that disable pruning and explore all actions |
 | `negative_action_subtree_purge_enabled` | `false` | Opt in to the parsed/configured negative-action subtree purge experiment |
 | `negative_action_prune_below` | `-1` | Negative-action purge candidate threshold for cumulative regret |
@@ -682,7 +683,7 @@ training:
   negative_action_purge_mode: scan_history_prefix
 ```
 
-With `negative_action_subtree_purge_enabled: true`, lazy traversal starts checking aggressive action-edge cumulative regret only once `meta_iter >= prune_after_iterations`. Passive actions (`Fold`, `Check`, `Call`, and all-in calls that do not increase the current max bet) are never persistent subtree-purge candidates, because in multiplayer trees they can contain later players' decision nodes. Normal lazy traversal pruning also leaves those passive structural actions traversable even when their regret is below `prune_threshold`; `prune_threshold` only skips aggressive branches. If an aggressive action regret is below `negative_action_prune_below`, the edge is marked blocked and its child action-history prefix is retained for a later boundary sweep. Traversal skips blocked aggressive edges instead of allocating more rows below them, but ordinary traversal does not physically delete descendant sparse rows. Immediately after each lazy DCFR discount, storage scans the currently blocked edge set and rereads each parent action regret after discounting. A blocked edge whose regret reaches `negative_action_reactivate_at` is unblocked without purging its child subtree. Edges that remain blocked are batched into one sparse-storage scan; the child row and all already visited descendants below any stored prefix are purged while sibling histories are preserved. Future visits below an edge whose subtree was purged allocate fresh sparse rows, so descendants resume with first-visit/default behavior: zero cumulative regrets and uniform strategy until new updates arrive.
+With `negative_action_subtree_purge_enabled: true`, lazy traversal starts checking aggressive action-edge cumulative regret only once `meta_iter >= prune_after_iterations`. Passive actions (`Fold`, `Check`, `Call`, and all-in calls that do not increase the current max bet) are never persistent subtree-purge candidates, because in multiplayer trees they can contain later players' decision nodes. Normal lazy traversal pruning is separate and mirrors eager MCCFR: immediate terminal children are protected, but any nonterminal branch below `prune_threshold` can be skipped. If an aggressive action regret is below `negative_action_prune_below`, the edge is marked blocked and its child action-history prefix is retained for a later boundary sweep. Traversal skips blocked aggressive edges instead of allocating more rows below them, but ordinary traversal does not physically delete descendant sparse rows. Immediately after each lazy DCFR discount, storage scans the currently blocked edge set and rereads each parent action regret after discounting. A blocked edge whose regret reaches `negative_action_reactivate_at` is unblocked without purging its child subtree. Edges that remain blocked are batched into one sparse-storage scan; the child row and all already visited descendants below any stored prefix are purged while sibling histories are preserved. Future visits below an edge whose subtree was purged allocate fresh sparse rows, so descendants resume with first-visit/default behavior: zero cumulative regrets and uniform strategy until new updates arrive.
 
 For this experiment, use `prune_explore_pct: 0.0`. The normal batch-level prune exploration path deliberately revisits pruned actions, which makes it harder to read the experimental subtree purge effect. The current 6-max experiment is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`; run it with the `train-blueprint-mp` command shown above in the Blueprint MP section.
 

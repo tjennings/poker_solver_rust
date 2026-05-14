@@ -212,7 +212,7 @@ The negative-action subtree purge is an opt-in experiment layered on the lazy sp
 
 Physical purge runs immediately after lazy DCFR discounting. The boundary sweep scans the currently blocked edge set, rereads each parent action regret after discounting, and gives DCFR the first chance to soften or reactivate the edge. Edges whose regret reaches `negative_action_reactivate_at` are removed from the blocked set without deleting their child subtree. Remaining blocked child prefixes are batched into one sparse-storage scan for the discount boundary; matching rows at or below any stored child prefix are removed, preserving sibling histories while dropping already visited descendants below blocked actions.
 
-The normal lazy traversal-pruning gate also only skips aggressive actions. Passive structural actions remain traversable even when their regret is below `prune_threshold`, matching the eager solver's protection for high-leverage terminal/routing branches.
+The normal lazy traversal-pruning gate mirrors the eager solver: immediate terminal children are never pruned, but any nonterminal branch whose cumulative action regret is below `prune_threshold` can be skipped. Persistent negative-action subtree purge remains stricter: it only blocks and purges aggressive edges, because passive routing edges can contain later players' decision nodes.
 
 ## Range Solver (Exact Postflop Solver)
 

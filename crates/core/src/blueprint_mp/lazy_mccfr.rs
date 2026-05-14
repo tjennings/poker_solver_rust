@@ -65,6 +65,7 @@ impl PreflopSize {
 
 struct LazyActionConfig {
     max_flop_players: Option<u8>,
+    allow_preflop_limp: bool,
     preflop_lead: Vec<PreflopSize>,
     preflop_raise: Vec<Vec<PreflopSize>>,
     flop_lead: Vec<f64>,
@@ -79,6 +80,7 @@ impl LazyActionConfig {
     fn from_action_config(config: &MpActionAbstractionConfig) -> Self {
         Self {
             max_flop_players: config.max_flop_players,
+            allow_preflop_limp: true,
             preflop_lead: parse_preflop_values(&config.preflop.lead),
             preflop_raise: parse_preflop_raise_depths(&config.preflop.raise),
             flop_lead: parse_f64_values(&config.flop.lead),
@@ -88,6 +90,12 @@ impl LazyActionConfig {
             river_lead: parse_f64_values(&config.river.lead),
             river_raise: parse_f64_raise_depths(&config.river.raise),
         }
+    }
+
+    fn from_configs(game: &MpGameConfig, config: &MpActionAbstractionConfig) -> Self {
+        let mut actions = Self::from_action_config(config);
+        actions.allow_preflop_limp = game.allow_preflop_limp;
+        actions
     }
 
     fn lead_sizes(&self, street: Street) -> LeadSizes<'_> {
@@ -164,7 +172,7 @@ impl LazyMpGame {
     pub fn new(game: &MpGameConfig, action_config: &MpActionAbstractionConfig) -> Self {
         let stack = Chips(game.stack_depth);
         Self {
-            actions: LazyActionConfig::from_action_config(action_config),
+            actions: LazyActionConfig::from_configs(game, action_config),
             root: init_public_state(game, stack),
             num_players: game.num_players,
             starting_stack: stack,
@@ -495,11 +503,13 @@ fn traverse_traverser(
             pruned[action_idx] = true;
             continue;
         }
+        let child = apply_action(state, action);
+        let child_is_terminal = matches!(&child, LazyNode::Terminal { .. });
         if should_prune_lazy(
             storage,
             prune,
             prune_threshold,
-            action_increments_raise_count(&state, action),
+            child_is_terminal,
             key,
             action_idx,
             &mut prune_stats,
@@ -507,7 +517,6 @@ fn traverse_traverser(
             pruned[action_idx] = true;
             continue;
         }
-        let child = apply_action(state, action);
         let (value, child_stats) = traverse_node(
             game,
             storage,
@@ -682,12 +691,12 @@ fn should_prune_lazy(
     storage: &SparseMpStorage,
     prune: bool,
     prune_threshold: i32,
-    action_is_aggressive: bool,
+    child_is_terminal: bool,
     key: MpInfosetKey,
     action: usize,
     stats: &mut PruneStats,
 ) -> bool {
-    if !prune || !action_is_aggressive {
+    if !prune || child_is_terminal {
         return false;
     }
     stats.total += 1;
@@ -960,11 +969,10 @@ fn generate_actions(config: &LazyActionConfig, state: &LazyPublicState) -> Vec<T
     if state.facing_bet {
         actions.push(TreeAction::Fold);
     }
-    if is_unopened_preflop
-        && state.facing_bet
-        && preflop_call_allowed(config.max_flop_players, state)
-    {
-        actions.push(TreeAction::Call);
+    if is_unopened_preflop && state.facing_bet {
+        if config.allow_preflop_limp && preflop_call_allowed(config.max_flop_players, state) {
+            actions.push(TreeAction::Call);
+        }
     } else {
         add_check_or_call(config, state, &mut actions);
     }
@@ -1494,6 +1502,7 @@ mod tests {
             name: "lazy test".to_string(),
             num_players,
             stack_depth,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -1679,6 +1688,34 @@ mod tests {
             actions
                 .iter()
                 .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON))
+        );
+    }
+
+    #[timed_test]
+    fn lazy_root_honors_no_limp_config() {
+        let mut game_config = game_config(6, 200.0);
+        game_config.allow_preflop_limp = false;
+        let game = LazyMpGame::new(&game_config, &action_config());
+
+        let root = game.root_state();
+        let actions = game.actions(&root);
+
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Fold))
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call)),
+            "Unopened root should not include Call/limp when disabled, got {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON)),
+            "Unopened root should keep configured opens when limps are disabled, got {actions:?}"
         );
     }
 
@@ -1869,7 +1906,7 @@ mod tests {
     }
 
     #[timed_test]
-    fn lazy_pruning_ignores_passive_actions() {
+    fn lazy_pruning_ignores_terminal_children() {
         let storage = SparseMpStorage::with_shards(8);
         let key =
             MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
@@ -1878,14 +1915,14 @@ mod tests {
         storage.add_regret(key, 2, 0, -10_000);
 
         assert!(!should_prune_lazy(
-            &storage, true, -1, false, key, 0, &mut stats
+            &storage, true, -1, true, key, 0, &mut stats
         ));
         assert_eq!(stats.total, 0);
         assert_eq!(stats.hits, 0);
     }
 
     #[timed_test]
-    fn lazy_pruning_still_skips_negative_aggressive_actions() {
+    fn lazy_pruning_skips_negative_nonterminal_actions() {
         let storage = SparseMpStorage::with_shards(8);
         let key =
             MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
@@ -1894,7 +1931,7 @@ mod tests {
         storage.add_regret(key, 2, 1, -10_000);
 
         assert!(should_prune_lazy(
-            &storage, true, -1, true, key, 1, &mut stats
+            &storage, true, -1, false, key, 1, &mut stats
         ));
         assert_eq!(stats.total, 1);
         assert_eq!(stats.hits, 1);

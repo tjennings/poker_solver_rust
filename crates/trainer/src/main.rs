@@ -4841,6 +4841,7 @@ snapshots:
                 name: "snapshot test".into(),
                 num_players: 2,
                 stack_depth: 6.0,
+                allow_preflop_limp: true,
                 blinds: vec![
                     ForcedBet {
                         seat: 0,
@@ -5114,6 +5115,7 @@ snapshots:
             name: "test".into(),
             num_players: 6,
             stack_depth: 40.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -5176,6 +5178,7 @@ snapshots:
             name: "test".into(),
             num_players: 6,
             stack_depth: 40.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,

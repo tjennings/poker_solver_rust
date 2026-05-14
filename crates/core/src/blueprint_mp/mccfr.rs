@@ -459,6 +459,7 @@ mod tests {
             name: format!("{num_players}-player mccfr test"),
             num_players,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,

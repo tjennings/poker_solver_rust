@@ -20,11 +20,17 @@ pub struct MpGameConfig {
     pub name: String,
     pub num_players: u8,
     pub stack_depth: f64,
+    #[serde(default = "default_allow_preflop_limp")]
+    pub allow_preflop_limp: bool,
     pub blinds: Vec<ForcedBet>,
     #[serde(default)]
     pub rake_rate: f64,
     #[serde(default)]
     pub rake_cap: f64,
+}
+
+fn default_allow_preflop_limp() -> bool {
+    true
 }
 
 impl MpGameConfig {
@@ -486,6 +492,7 @@ snapshots:
         assert!(matches!(cfg.game.blinds[0].kind, ForcedBetKind::SmallBlind));
         assert!(matches!(cfg.game.blinds[1].kind, ForcedBetKind::BigBlind));
         assert!((cfg.game.stack_depth - 100.0).abs() < f64::EPSILON);
+        assert!(cfg.game.allow_preflop_limp);
     }
 
     #[timed_test]
@@ -495,6 +502,7 @@ game:
   name: "Split Test"
   num_players: 2
   stack_depth: 100.0
+  allow_preflop_limp: false
   blinds:
     - seat: 0
       type: small_blind
@@ -551,6 +559,7 @@ snapshots:
         // Flop: 3 lead sizes, 1 raise depth
         assert_eq!(cfg.action_abstraction.flop.lead.len(), 3);
         assert_eq!(cfg.action_abstraction.flop.raise.len(), 1);
+        assert!(!cfg.game.allow_preflop_limp);
     }
 
     #[timed_test]
@@ -559,6 +568,7 @@ snapshots:
             name: "Too many".into(),
             num_players: 9,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -583,6 +593,7 @@ snapshots:
             name: "Solo".into(),
             num_players: 1,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![ForcedBet {
                 seat: 0,
                 kind: ForcedBetKind::SmallBlind,
@@ -600,6 +611,7 @@ snapshots:
             name: "Forced bets".into(),
             num_players: 6,
             stack_depth: 200.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -640,6 +652,7 @@ snapshots:
             name: "Min".into(),
             num_players: 2,
             stack_depth: 50.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -664,6 +677,7 @@ snapshots:
             name: "Max".into(),
             num_players: 8,
             stack_depth: 200.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -688,6 +702,7 @@ snapshots:
             name: "Zero stack".into(),
             num_players: 2,
             stack_depth: 0.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -712,6 +727,7 @@ snapshots:
             name: "Bad seat".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -736,6 +752,7 @@ snapshots:
             name: "Zero blind".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -837,6 +854,7 @@ output_dir: "/tmp/out"
             name: "No blinds".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![],
             rake_rate: 0.0,
             rake_cap: 0.0,

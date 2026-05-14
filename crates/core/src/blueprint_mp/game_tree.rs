@@ -88,6 +88,7 @@ impl PreflopSize {
 
 struct TreeBuildConfig {
     max_flop_players: Option<u8>,
+    allow_preflop_limp: bool,
     preflop_lead: Vec<PreflopSize>,
     preflop_raise: Vec<Vec<PreflopSize>>,
     flop_lead: Vec<f64>,
@@ -102,6 +103,7 @@ impl TreeBuildConfig {
     fn from_action_config(ac: &MpActionAbstractionConfig) -> Self {
         Self {
             max_flop_players: ac.max_flop_players,
+            allow_preflop_limp: true,
             preflop_lead: parse_preflop_values(&ac.preflop.lead),
             preflop_raise: parse_preflop_raise_depths(&ac.preflop.raise),
             flop_lead: parse_f64_values(&ac.flop.lead),
@@ -111,6 +113,12 @@ impl TreeBuildConfig {
             river_lead: parse_f64_values(&ac.river.lead),
             river_raise: parse_f64_raise_depths(&ac.river.raise),
         }
+    }
+
+    fn from_configs(game: &MpGameConfig, ac: &MpActionAbstractionConfig) -> Self {
+        let mut config = Self::from_action_config(ac);
+        config.allow_preflop_limp = game.allow_preflop_limp;
+        config
     }
 
     fn lead_sizes(&self, street: Street) -> LeadSizes<'_> {
@@ -227,7 +235,7 @@ impl MpGameTree {
     /// Build a game tree from game and action abstraction configs.
     #[must_use]
     pub fn build(config: &MpGameConfig, action_config: &MpActionAbstractionConfig) -> Self {
-        let tree_config = TreeBuildConfig::from_action_config(action_config);
+        let tree_config = TreeBuildConfig::from_configs(config, action_config);
         let stack = Chips(config.stack_depth);
         let state = init_build_state(config, stack);
         let mut builder = TreeBuilder {
@@ -362,11 +370,10 @@ fn generate_actions(config: &TreeBuildConfig, state: &BuildState) -> Vec<TreeAct
         actions.push(TreeAction::Fold);
     }
 
-    if is_unopened_preflop
-        && state.facing_bet
-        && preflop_call_allowed(config.max_flop_players, state)
-    {
-        actions.push(TreeAction::Call);
+    if is_unopened_preflop && state.facing_bet {
+        if config.allow_preflop_limp && preflop_call_allowed(config.max_flop_players, state) {
+            actions.push(TreeAction::Call);
+        }
     } else {
         add_check_or_call(config, state, &mut actions);
     }
@@ -971,6 +978,7 @@ mod tests {
             name: format!("{num_players}-player test"),
             num_players,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -1048,6 +1056,7 @@ mod tests {
             name: "6-max unopened".into(),
             num_players: 6,
             stack_depth: 10.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -1090,6 +1099,7 @@ mod tests {
             name: "6-max response".into(),
             num_players: 6,
             stack_depth: 30.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -1130,6 +1140,7 @@ mod tests {
             name: format!("{num_players}-player minimal"),
             num_players,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -1473,6 +1484,7 @@ mod tests {
             // Stack = 10 chips. SB posts 1, has 9 left.
             // 5bb raise = 10 chips = all-in.
             stack_depth: 10.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -1540,6 +1552,32 @@ mod tests {
                 .expect("unopened preflop node should have Fold");
             node_idx = children[fold_idx];
         }
+    }
+
+    #[timed_test]
+    fn build_6_player_unopened_positions_honor_no_limp_config() {
+        let (mut game, action_cfg) = six_player_unopened_config();
+        game.allow_preflop_limp = false;
+        let tree = MpGameTree::build(&game, &action_cfg);
+
+        let MpGameNode::Decision { actions, .. } = &tree.nodes[tree.root as usize] else {
+            panic!("Root should be an unopened preflop Decision node");
+        };
+
+        assert!(
+            actions.iter().any(|a| matches!(a, TreeAction::Fold)),
+            "Unopened root should keep Fold when limps are disabled, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, TreeAction::Call)),
+            "Unopened root should not include Call/limp when disabled, got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, TreeAction::Lead(chips) if (*chips - 4.0).abs() < SIZE_EPSILON)
+            ),
+            "Unopened root should keep configured opens when limps are disabled, got {actions:?}"
+        );
     }
 
     #[timed_test(3)]
@@ -1883,6 +1921,7 @@ mod tests {
             name: "straddle-test".into(),
             num_players: 4,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
