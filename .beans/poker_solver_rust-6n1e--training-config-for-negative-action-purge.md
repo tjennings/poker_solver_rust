@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-6n1e
 title: Training config for negative-action purge
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-05-14T14:31:40Z
-updated_at: 2026-05-14T14:31:40Z
+updated_at: 2026-05-14T14:35:20Z
 parent: poker_solver_rust-xl3h
 ---
 
