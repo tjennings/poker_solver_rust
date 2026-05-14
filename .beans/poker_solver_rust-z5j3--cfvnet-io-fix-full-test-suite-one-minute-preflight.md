@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-z5j3
 title: 'CFVNet IO: fix full test suite one-minute preflight'
-status: todo
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-14T01:14:26Z
-updated_at: 2026-05-14T01:14:26Z
+updated_at: 2026-05-14T01:14:59Z
 parent: poker_solver_rust-8e9f
 ---
 
