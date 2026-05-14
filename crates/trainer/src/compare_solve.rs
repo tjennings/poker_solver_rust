@@ -3,6 +3,7 @@
 //!
 //! Built to debug bean izod — subgame converging worse than its blueprint seed.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -58,6 +59,129 @@ struct BoundaryCfvDeltaStats {
     rmse: f32,
     corr: f32,
     magnitude_ratio: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BoundaryCfvBucketSummary {
+    count: usize,
+    sum_mean_abs: f32,
+    sum_rmse: f32,
+    sum_corr: f32,
+    sum_mag_ratio: f32,
+}
+
+impl BoundaryCfvBucketSummary {
+    fn add(&mut self, stats: &BoundaryCfvDeltaStats) {
+        self.count += 1;
+        self.sum_mean_abs += stats.mean_abs;
+        self.sum_rmse += stats.rmse;
+        self.sum_corr += stats.corr;
+        self.sum_mag_ratio += stats.magnitude_ratio;
+    }
+
+    fn mean_abs(&self) -> f32 {
+        self.mean(self.sum_mean_abs)
+    }
+
+    fn rmse(&self) -> f32 {
+        self.mean(self.sum_rmse)
+    }
+
+    fn corr(&self) -> f32 {
+        self.mean(self.sum_corr)
+    }
+
+    fn mag_ratio(&self) -> f32 {
+        self.mean(self.sum_mag_ratio)
+    }
+
+    fn mean(&self, sum: f32) -> f32 {
+        if self.count == 0 {
+            0.0
+        } else {
+            sum / self.count as f32
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BoundaryCfvBuckets {
+    by_player_allin: BTreeMap<String, BoundaryCfvBucketSummary>,
+    by_player_pot: BTreeMap<String, BoundaryCfvBucketSummary>,
+    by_player_spr: BTreeMap<String, BoundaryCfvBucketSummary>,
+    by_player_reach: BTreeMap<String, BoundaryCfvBucketSummary>,
+    by_player_target: BTreeMap<String, BoundaryCfvBucketSummary>,
+}
+
+impl BoundaryCfvBuckets {
+    fn add(
+        &mut self,
+        player: &str,
+        stats: &BoundaryCfvDeltaStats,
+        pot: i32,
+        remaining: f64,
+        player_reach: &[f32],
+        oracle: &[f32],
+    ) {
+        let allin = if remaining <= 0.0 {
+            "all-in"
+        } else {
+            "non-all-in"
+        };
+        let spr = if pot > 0 {
+            remaining / f64::from(pot)
+        } else {
+            0.0
+        };
+        let target_mean_abs = mean_abs(oracle);
+        let reach_active_fraction = active_fraction(player_reach);
+
+        Self::add_to(
+            &mut self.by_player_allin,
+            format!("{player} {allin}"),
+            stats,
+        );
+        Self::add_to(
+            &mut self.by_player_pot,
+            format!("{player} pot={pot}"),
+            stats,
+        );
+        Self::add_to(
+            &mut self.by_player_spr,
+            format!("{player} spr={}", spr_bucket(spr)),
+            stats,
+        );
+        Self::add_to(
+            &mut self.by_player_reach,
+            format!("{player} reach={}", reach_bucket(reach_active_fraction)),
+            stats,
+        );
+        Self::add_to(
+            &mut self.by_player_target,
+            format!(
+                "{player} target={}",
+                target_magnitude_bucket(target_mean_abs)
+            ),
+            stats,
+        );
+    }
+
+    fn add_to(
+        map: &mut BTreeMap<String, BoundaryCfvBucketSummary>,
+        key: String,
+        stats: &BoundaryCfvDeltaStats,
+    ) {
+        map.entry(key).or_default().add(stats);
+    }
+
+    fn print(&self) {
+        println!("=== Boundary CFV comparison buckets ===");
+        print_bucket_group("by player/all-in", &self.by_player_allin);
+        print_bucket_group("by player/pot", &self.by_player_pot);
+        print_bucket_group("by player/SPR", &self.by_player_spr);
+        print_bucket_group("by player/reach density", &self.by_player_reach);
+        print_bucket_group("by player/oracle magnitude", &self.by_player_target);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -122,6 +246,74 @@ impl BoundaryCfvStats {
 
 fn cfv_magnitude(stats: &BoundaryCfvStats) -> f32 {
     stats.mean.abs().max(stats.stddev.abs()).max(1e-10)
+}
+
+fn mean_abs(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().map(|v| v.abs()).sum::<f32>() / values.len() as f32
+}
+
+fn active_fraction(reach: &[f32]) -> f32 {
+    if reach.is_empty() {
+        return 0.0;
+    }
+    let active = reach.iter().filter(|&&v| v > 1e-8).count();
+    active as f32 / reach.len() as f32
+}
+
+fn spr_bucket(spr: f64) -> &'static str {
+    if spr <= 0.0 {
+        "0"
+    } else if spr < 0.5 {
+        "<0.5"
+    } else if spr < 1.0 {
+        "0.5-1"
+    } else if spr < 2.0 {
+        "1-2"
+    } else {
+        ">=2"
+    }
+}
+
+fn reach_bucket(active_fraction: f32) -> &'static str {
+    if active_fraction <= 0.05 {
+        "<=5%"
+    } else if active_fraction <= 0.15 {
+        "5-15%"
+    } else if active_fraction <= 0.30 {
+        "15-30%"
+    } else {
+        ">30%"
+    }
+}
+
+fn target_magnitude_bucket(mean_abs: f32) -> &'static str {
+    if mean_abs < 0.05 {
+        "<0.05"
+    } else if mean_abs < 0.25 {
+        "0.05-0.25"
+    } else if mean_abs < 0.75 {
+        "0.25-0.75"
+    } else {
+        ">=0.75"
+    }
+}
+
+fn print_bucket_group(label: &str, buckets: &BTreeMap<String, BoundaryCfvBucketSummary>) {
+    println!("{label}:");
+    for (key, bucket) in buckets {
+        println!(
+            "  {:<28} n={:<3} mean_abs={:.6} rmse={:.6} corr={:.4} mag_ratio={:.3}",
+            key,
+            bucket.count,
+            bucket.mean_abs(),
+            bucket.rmse(),
+            bucket.corr(),
+            bucket.mag_ratio(),
+        );
+    }
 }
 
 fn cfv_delta_stats(candidate: &[f32], reference: &[f32]) -> BoundaryCfvDeltaStats {
@@ -1837,6 +2029,7 @@ fn print_boundary_cfv_comparison(
     let mut all_ip = Vec::new();
     let mut all_subtree_oop = Vec::new();
     let mut all_subtree_ip = Vec::new();
+    let mut buckets = BoundaryCfvBuckets::default();
 
     for ordinal in 0..n_boundaries {
         let Some(board) = boundary_boards.get(ordinal) else {
@@ -1914,6 +2107,15 @@ fn print_boundary_cfv_comparison(
         all_ip.push(ip_delta.clone());
         all_subtree_oop.push(subtree_oop_delta.clone());
         all_subtree_ip.push(subtree_ip_delta.clone());
+        buckets.add(
+            "OOP",
+            &oop_delta,
+            pot_at,
+            remaining,
+            oop_reach_ref,
+            &oracle_oop,
+        );
+        buckets.add("IP", &ip_delta, pot_at, remaining, ip_reach_ref, &oracle_ip);
 
         println!(
             "--- boundary {ordinal}: pot={pot_at} remaining={remaining:.1} turn={turn_str} river={river_str} ---"
@@ -1979,6 +2181,7 @@ fn print_boundary_cfv_comparison(
             "exact_subtree raw control avg: OOP mean_abs={:.6} corr={:.4}; IP mean_abs={:.6} corr={:.4}",
             subtree_oop_mean_abs, subtree_oop_corr, subtree_ip_mean_abs, subtree_ip_corr,
         );
+        buckets.print();
         check_boundary_cfv_gate(gate, oop_mean_abs, ip_mean_abs, oop_corr, ip_corr)?;
     }
     println!();
@@ -3562,6 +3765,50 @@ mod tests {
         assert!(stats.mean_abs > 0.0);
         assert!(stats.corr < -0.99);
         assert!((stats.magnitude_ratio - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn boundary_cfv_bucket_helpers_classify_runtime_shape() {
+        assert_eq!(spr_bucket(0.0), "0");
+        assert_eq!(spr_bucket(0.25), "<0.5");
+        assert_eq!(spr_bucket(0.75), "0.5-1");
+        assert_eq!(spr_bucket(1.5), "1-2");
+        assert_eq!(spr_bucket(2.0), ">=2");
+
+        assert_eq!(reach_bucket(0.05), "<=5%");
+        assert_eq!(reach_bucket(0.10), "5-15%");
+        assert_eq!(reach_bucket(0.25), "15-30%");
+        assert_eq!(reach_bucket(0.50), ">30%");
+
+        assert_eq!(target_magnitude_bucket(0.01), "<0.05");
+        assert_eq!(target_magnitude_bucket(0.20), "0.05-0.25");
+        assert_eq!(target_magnitude_bucket(0.50), "0.25-0.75");
+        assert_eq!(target_magnitude_bucket(1.00), ">=0.75");
+    }
+
+    #[test]
+    fn boundary_cfv_bucket_summary_averages_delta_stats() {
+        let mut summary = BoundaryCfvBucketSummary::default();
+        summary.add(&BoundaryCfvDeltaStats {
+            mean_abs: 0.2,
+            max_abs: 0.4,
+            rmse: 0.3,
+            corr: 0.8,
+            magnitude_ratio: 1.2,
+        });
+        summary.add(&BoundaryCfvDeltaStats {
+            mean_abs: 0.4,
+            max_abs: 0.8,
+            rmse: 0.5,
+            corr: 0.6,
+            magnitude_ratio: 0.8,
+        });
+
+        assert_eq!(summary.count, 2);
+        assert!((summary.mean_abs() - 0.3).abs() < 1e-6);
+        assert!((summary.rmse() - 0.4).abs() < 1e-6);
+        assert!((summary.corr() - 0.7).abs() < 1e-6);
+        assert!((summary.mag_ratio() - 1.0).abs() < 1e-6);
     }
 
     #[test]
