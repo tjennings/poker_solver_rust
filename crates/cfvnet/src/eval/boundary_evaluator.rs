@@ -241,6 +241,92 @@ fn legacy_scaled_bcfv_to_bcfv(normalized: &[f32], pot: f32, effective_stack: f32
     normalized.iter().map(|&v| v * scale).collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryOutputUnit {
+    ChipEv,
+    LegacyHalfPotBcfv,
+}
+
+fn convert_normalized_ev(
+    normalized_ev: f32,
+    pot: f32,
+    effective_stack: f32,
+    unit: BoundaryOutputUnit,
+) -> f32 {
+    match unit {
+        BoundaryOutputUnit::ChipEv => normalized_ev_to_chip_ev(normalized_ev, pot, effective_stack),
+        BoundaryOutputUnit::LegacyHalfPotBcfv => {
+            normalized_ev_to_legacy_halfpot_bcfv(normalized_ev, pot, effective_stack)
+        }
+    }
+}
+
+fn build_game_order_ranges(
+    private_cards: &[Vec<(u8, u8)>; 2],
+    oop_reach_game: &[f32],
+    ip_reach_game: &[f32],
+    board: &[u8],
+) -> (Vec<f32>, Vec<f32>) {
+    let mut oop_range_1326 = vec![0.0_f32; NUM_COMBOS];
+    for (i, &(c1, c2)) in private_cards[0].iter().enumerate() {
+        if i < oop_reach_game.len() {
+            oop_range_1326[card_pair_to_index(c1, c2)] = oop_reach_game[i];
+        }
+    }
+    let mut ip_range_1326 = vec![0.0_f32; NUM_COMBOS];
+    for (i, &(c1, c2)) in private_cards[1].iter().enumerate() {
+        if i < ip_reach_game.len() {
+            ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
+        }
+    }
+    sanitize_canonical_inference_ranges(&mut oop_range_1326, &mut ip_range_1326, board)
+        .expect("mapped game-order boundary inference ranges must be valid");
+    (oop_range_1326, ip_range_1326)
+}
+
+fn map_normalized_outputs_to_game_hands(
+    private_cards: &[Vec<(u8, u8)>; 2],
+    normalized_1326: &[f32],
+    player: usize,
+    pot: f32,
+    effective_stack: f32,
+    unit: BoundaryOutputUnit,
+) -> Vec<f32> {
+    let hands = &private_cards[player];
+    let mut cfvs = Vec::with_capacity(hands.len());
+    for &(c1, c2) in hands {
+        let normalized_ev = normalized_1326[card_pair_to_index(c1, c2)];
+        cfvs.push(convert_normalized_ev(
+            normalized_ev,
+            pot,
+            effective_stack,
+            unit,
+        ));
+    }
+    cfvs
+}
+
+fn map_legacy_scaled_outputs_to_game_hands(
+    private_cards: &[Vec<(u8, u8)>; 2],
+    normalized_1326: &[f32],
+    player: usize,
+    pot: f32,
+    effective_stack: f32,
+    unit: BoundaryOutputUnit,
+) -> Vec<f32> {
+    let legacy_bcfv_1326 = legacy_scaled_bcfv_to_bcfv(normalized_1326, pot, effective_stack);
+    let hands = &private_cards[player];
+    let mut cfvs = Vec::with_capacity(hands.len());
+    for &(c1, c2) in hands {
+        let bcfv = legacy_bcfv_1326[card_pair_to_index(c1, c2)];
+        cfvs.push(match unit {
+            BoundaryOutputUnit::LegacyHalfPotBcfv => bcfv,
+            BoundaryOutputUnit::ChipEv => bcfv * (pot / 2.0),
+        });
+    }
+    cfvs
+}
+
 /// Runtime inference contract for a cfvnet boundary model.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -345,9 +431,53 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         _num_ip: usize,
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        let oop_cfvs = self.forward_for_player(0, pot, remaining_stack, oop_reach, ip_reach);
-        let ip_cfvs = self.forward_for_player(1, pot, remaining_stack, oop_reach, ip_reach);
+        let oop_cfvs = self.forward_for_player(
+            0,
+            pot,
+            remaining_stack,
+            oop_reach,
+            ip_reach,
+            BoundaryOutputUnit::LegacyHalfPotBcfv,
+        );
+        let ip_cfvs = self.forward_for_player(
+            1,
+            pot,
+            remaining_stack,
+            oop_reach,
+            ip_reach,
+            BoundaryOutputUnit::LegacyHalfPotBcfv,
+        );
         (oop_cfvs, ip_cfvs)
+    }
+
+    fn compute_raw_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        Some((
+            self.forward_for_player(
+                0,
+                pot,
+                remaining_stack,
+                oop_reach,
+                ip_reach,
+                BoundaryOutputUnit::ChipEv,
+            ),
+            self.forward_for_player(
+                1,
+                pot,
+                remaining_stack,
+                oop_reach,
+                ip_reach,
+                BoundaryOutputUnit::ChipEv,
+            ),
+        ))
     }
 }
 
@@ -362,22 +492,14 @@ impl NeuralBoundaryEvaluator {
         remaining_stack: f64,
         oop_reach_game: &[f32],
         ip_reach_game: &[f32],
+        output_unit: BoundaryOutputUnit,
     ) -> Vec<f32> {
-        // Build 1326-element range vectors from game ordering for BOTH sides.
-        let mut oop_range_1326 = vec![0.0_f32; NUM_COMBOS];
-        for (i, &(c1, c2)) in self.private_cards[0].iter().enumerate() {
-            if i < oop_reach_game.len() {
-                oop_range_1326[card_pair_to_index(c1, c2)] = oop_reach_game[i];
-            }
-        }
-        let mut ip_range_1326 = vec![0.0_f32; NUM_COMBOS];
-        for (i, &(c1, c2)) in self.private_cards[1].iter().enumerate() {
-            if i < ip_reach_game.len() {
-                ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
-            }
-        }
-        sanitize_canonical_inference_ranges(&mut oop_range_1326, &mut ip_range_1326, &self.board)
-            .expect("mapped game-order boundary inference ranges must be valid");
+        let (oop_range_1326, ip_range_1326) = build_game_order_ranges(
+            &self.private_cards,
+            oop_reach_game,
+            ip_reach_game,
+            &self.board,
+        );
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
@@ -385,7 +507,7 @@ impl NeuralBoundaryEvaluator {
         // Board-size branch. The river cfvnet was trained on 5-card boards;
         // feeding a 4-card (turn) board is OOD. For turn boundaries, average
         // the net's output over all valid river cards.
-        let cfvs_1326 = match (self.inference_mode, self.board.len()) {
+        let normalized_1326 = match (self.inference_mode, self.board.len()) {
             (BoundaryInferenceMode::Direct, 4 | 5)
             | (BoundaryInferenceMode::RiverEnumeratedTurn, 5) => self.burn_forward(
                 &oop_range_1326,
@@ -396,7 +518,7 @@ impl NeuralBoundaryEvaluator {
                 player as u8,
             ),
             (BoundaryInferenceMode::DirectNormalizedLegacy, 4 | 5) => {
-                let normalized = self.burn_forward(
+                let legacy_scaled = self.burn_forward(
                     &oop_range_1326,
                     &ip_range_1326,
                     &self.board,
@@ -404,7 +526,14 @@ impl NeuralBoundaryEvaluator {
                     eff_stack_f32,
                     player as u8,
                 );
-                legacy_scaled_bcfv_to_bcfv(&normalized, pot_f32, eff_stack_f32)
+                return map_legacy_scaled_outputs_to_game_hands(
+                    &self.private_cards,
+                    &legacy_scaled,
+                    player,
+                    pot_f32,
+                    eff_stack_f32,
+                    output_unit,
+                );
             }
             (BoundaryInferenceMode::RiverEnumeratedTurn, 4) => self.burn_river_enumerated(
                 &oop_range_1326,
@@ -418,13 +547,14 @@ impl NeuralBoundaryEvaluator {
             }
         };
 
-        // Map 1326-combo ordering back to game private_cards ordering.
-        let hands = &self.private_cards[player];
-        let mut cfvs = Vec::with_capacity(hands.len());
-        for &(c1, c2) in hands {
-            cfvs.push(cfvs_1326[card_pair_to_index(c1, c2)]);
-        }
-        cfvs
+        map_normalized_outputs_to_game_hands(
+            &self.private_cards,
+            &normalized_1326,
+            player,
+            pot_f32,
+            eff_stack_f32,
+            output_unit,
+        )
     }
 
     /// Single forward pass over a given 5-card board.
@@ -570,7 +700,32 @@ impl range_solver::game::BoundaryEvaluator for NeuralBoundaryEvaluator {
         _num_ip: usize,
         _continuation_index: usize,
     ) -> (Vec<f32>, Vec<f32>) {
-        self.forward_for_both_players(pot, remaining_stack, oop_reach, ip_reach)
+        self.forward_for_both_players(
+            pot,
+            remaining_stack,
+            oop_reach,
+            ip_reach,
+            BoundaryOutputUnit::LegacyHalfPotBcfv,
+        )
+    }
+
+    fn compute_raw_cfvs_both(
+        &self,
+        pot: i32,
+        remaining_stack: f64,
+        oop_reach: &[f32],
+        ip_reach: &[f32],
+        _num_oop: usize,
+        _num_ip: usize,
+        _continuation_index: usize,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        Some(self.forward_for_both_players(
+            pot,
+            remaining_stack,
+            oop_reach,
+            ip_reach,
+            BoundaryOutputUnit::ChipEv,
+        ))
     }
 }
 
@@ -581,30 +736,12 @@ impl NeuralBoundaryEvaluator {
         oop_reach_game: &[f32],
         ip_reach_game: &[f32],
     ) -> (Vec<f32>, Vec<f32>) {
-        let mut oop_range_1326 = vec![0.0_f32; NUM_COMBOS];
-        for (i, &(c1, c2)) in self.private_cards[0].iter().enumerate() {
-            if i < oop_reach_game.len() {
-                oop_range_1326[card_pair_to_index(c1, c2)] = oop_reach_game[i];
-            }
-        }
-        let mut ip_range_1326 = vec![0.0_f32; NUM_COMBOS];
-        for (i, &(c1, c2)) in self.private_cards[1].iter().enumerate() {
-            if i < ip_reach_game.len() {
-                ip_range_1326[card_pair_to_index(c1, c2)] = ip_reach_game[i];
-            }
-        }
-        sanitize_canonical_inference_ranges(&mut oop_range_1326, &mut ip_range_1326, &self.board)
-            .expect("mapped game-order boundary inference ranges must be valid");
-        (oop_range_1326, ip_range_1326)
-    }
-
-    fn map_outputs_to_game_hands(&self, cfvs_1326: &[f32], player: usize) -> Vec<f32> {
-        let hands = &self.private_cards[player];
-        let mut cfvs = Vec::with_capacity(hands.len());
-        for &(c1, c2) in hands {
-            cfvs.push(cfvs_1326[card_pair_to_index(c1, c2)]);
-        }
-        cfvs
+        build_game_order_ranges(
+            &self.private_cards,
+            oop_reach_game,
+            ip_reach_game,
+            &self.board,
+        )
     }
 
     fn forward_for_both_players(
@@ -613,13 +750,14 @@ impl NeuralBoundaryEvaluator {
         remaining_stack: f64,
         oop_reach_game: &[f32],
         ip_reach_game: &[f32],
+        output_unit: BoundaryOutputUnit,
     ) -> (Vec<f32>, Vec<f32>) {
         let (oop_range_1326, ip_range_1326) = self.build_1326_ranges(oop_reach_game, ip_reach_game);
 
         let pot_f32 = pot as f32;
         let eff_stack_f32 = remaining_stack as f32;
 
-        let (oop_cfvs, ip_cfvs) = match (self.inference_mode, self.board.len()) {
+        let (normalized_oop, normalized_ip) = match (self.inference_mode, self.board.len()) {
             (BoundaryInferenceMode::Direct, 4 | 5)
             | (BoundaryInferenceMode::RiverEnumeratedTurn, 5) => self.onnx_forward_both_players(
                 &oop_range_1326,
@@ -629,17 +767,31 @@ impl NeuralBoundaryEvaluator {
                 eff_stack_f32,
             ),
             (BoundaryInferenceMode::DirectNormalizedLegacy, 4 | 5) => {
-                let (oop_normalized, ip_normalized) = self.onnx_forward_both_players(
+                let (oop_legacy_scaled, ip_legacy_scaled) = self.onnx_forward_both_players(
                     &oop_range_1326,
                     &ip_range_1326,
                     &self.board,
                     pot_f32,
                     eff_stack_f32,
                 );
-                (
-                    legacy_scaled_bcfv_to_bcfv(&oop_normalized, pot_f32, eff_stack_f32),
-                    legacy_scaled_bcfv_to_bcfv(&ip_normalized, pot_f32, eff_stack_f32),
-                )
+                return (
+                    map_legacy_scaled_outputs_to_game_hands(
+                        &self.private_cards,
+                        &oop_legacy_scaled,
+                        0,
+                        pot_f32,
+                        eff_stack_f32,
+                        output_unit,
+                    ),
+                    map_legacy_scaled_outputs_to_game_hands(
+                        &self.private_cards,
+                        &ip_legacy_scaled,
+                        1,
+                        pot_f32,
+                        eff_stack_f32,
+                        output_unit,
+                    ),
+                );
             }
             (BoundaryInferenceMode::RiverEnumeratedTurn, 4) => self
                 .onnx_river_enumerated_both_players(
@@ -657,8 +809,22 @@ impl NeuralBoundaryEvaluator {
         };
 
         (
-            self.map_outputs_to_game_hands(&oop_cfvs, 0),
-            self.map_outputs_to_game_hands(&ip_cfvs, 1),
+            map_normalized_outputs_to_game_hands(
+                &self.private_cards,
+                &normalized_oop,
+                0,
+                pot_f32,
+                eff_stack_f32,
+                output_unit,
+            ),
+            map_normalized_outputs_to_game_hands(
+                &self.private_cards,
+                &normalized_ip,
+                1,
+                pot_f32,
+                eff_stack_f32,
+                output_unit,
+            ),
         )
     }
 
@@ -1112,6 +1278,39 @@ mod tests {
     }
 
     #[test]
+    fn normalized_outputs_map_to_game_hands_in_requested_units() {
+        let private_cards = [vec![(1_u8, 2_u8), (3, 5)], vec![(6_u8, 7_u8), (9, 10)]];
+        let mut normalized = vec![0.0_f32; NUM_COMBOS];
+        normalized[card_pair_to_index(1, 2)] = 0.25;
+        normalized[card_pair_to_index(3, 5)] = -0.10;
+        normalized[card_pair_to_index(6, 7)] = 0.05;
+        normalized[card_pair_to_index(9, 10)] = -0.20;
+
+        let pot = 100.0_f32;
+        let effective_stack = 300.0_f32;
+
+        let oop_chip = map_normalized_outputs_to_game_hands(
+            &private_cards,
+            &normalized,
+            0,
+            pot,
+            effective_stack,
+            BoundaryOutputUnit::ChipEv,
+        );
+        assert_eq!(oop_chip, vec![100.0, -40.0]);
+
+        let ip_legacy = map_normalized_outputs_to_game_hands(
+            &private_cards,
+            &normalized,
+            1,
+            pot,
+            effective_stack,
+            BoundaryOutputUnit::LegacyHalfPotBcfv,
+        );
+        assert_eq!(ip_legacy, vec![0.4, -1.6]);
+    }
+
+    #[test]
     fn encode_boundary_input_from_ranges() {
         let oop_range = vec![0.5; 1326];
         let ip_range = vec![0.5; 1326];
@@ -1182,6 +1381,20 @@ mod tests {
             private_cards_p1.len(),
             "IP CFV count should match p1 hand count"
         );
+
+        let (oop_raw, ip_raw) = evaluator
+            .compute_raw_cfvs_both(
+                100,
+                150.0,
+                &oop_reach,
+                &ip_reach,
+                private_cards_p0.len(),
+                private_cards_p1.len(),
+                0,
+            )
+            .expect("neural evaluator should support raw chip CFVs");
+        assert_eq!(oop_raw.len(), private_cards_p0.len());
+        assert_eq!(ip_raw.len(), private_cards_p1.len());
     }
 
     #[cfg(not(feature = "onnx"))]
