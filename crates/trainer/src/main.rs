@@ -4232,7 +4232,9 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
 
 #[cfg(test)]
 mod tests {
-    use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, MpTrainingBackend};
+    use poker_solver_core::blueprint_mp::config::{
+        BlueprintMpConfig, MpNegativeActionPurgeMode, MpTrainingBackend,
+    };
     use poker_solver_core::blueprint_v2::cluster_pipeline::PerFlopClusteringConfig;
     use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
     use test_macros::timed_test;
@@ -4804,6 +4806,10 @@ snapshots:
                 prune_after_iterations: 1_000_000,
                 prune_threshold: -250,
                 prune_explore_pct: 0.05,
+                negative_action_subtree_purge_enabled: false,
+                negative_action_prune_below: -1,
+                negative_action_reactivate_at: 0,
+                negative_action_purge_mode: MpNegativeActionPurgeMode::ScanHistoryPrefix,
                 batch_size: 1,
                 dcfr_alpha: 1.5,
                 dcfr_beta: 0.0,

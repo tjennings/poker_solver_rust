@@ -173,6 +173,14 @@ pub struct MpTrainingConfig {
     pub prune_threshold: i32,
     #[serde(default = "default_prune_explore")]
     pub prune_explore_pct: f64,
+    #[serde(default)]
+    pub negative_action_subtree_purge_enabled: bool,
+    #[serde(default = "default_negative_action_prune_below")]
+    pub negative_action_prune_below: i32,
+    #[serde(default = "default_negative_action_reactivate_at")]
+    pub negative_action_reactivate_at: i32,
+    #[serde(default = "default_negative_action_purge_mode")]
+    pub negative_action_purge_mode: MpNegativeActionPurgeMode,
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
     #[serde(default = "default_dcfr_alpha")]
@@ -199,6 +207,14 @@ pub enum MpTrainingBackend {
     Eager,
     /// Traverse public states on demand and store only visited sparse infosets.
     LazySparse,
+}
+
+/// Strategy for identifying negative-action subtrees eligible for purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MpNegativeActionPurgeMode {
+    /// Scan the public action history prefix for negative-action candidates.
+    ScanHistoryPrefix,
 }
 
 // ── Snapshot config ──────────────────────────────────────────────────
@@ -239,6 +255,18 @@ const fn default_prune_threshold() -> i32 {
 
 fn default_prune_explore() -> f64 {
     0.05
+}
+
+const fn default_negative_action_prune_below() -> i32 {
+    -1
+}
+
+const fn default_negative_action_reactivate_at() -> i32 {
+    0
+}
+
+const fn default_negative_action_purge_mode() -> MpNegativeActionPurgeMode {
+    MpNegativeActionPurgeMode::ScanHistoryPrefix
 }
 
 const fn default_batch_size() -> u64 {
@@ -737,6 +765,13 @@ snapshots:
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
         assert_eq!(cfg.prune_threshold, -250);
         assert!((cfg.prune_explore_pct - 0.05).abs() < f64::EPSILON);
+        assert!(!cfg.negative_action_subtree_purge_enabled);
+        assert_eq!(cfg.negative_action_prune_below, -1);
+        assert_eq!(cfg.negative_action_reactivate_at, 0);
+        assert_eq!(
+            cfg.negative_action_purge_mode,
+            MpNegativeActionPurgeMode::ScanHistoryPrefix
+        );
         assert_eq!(cfg.batch_size, 200);
         assert!((cfg.dcfr_alpha - 1.5).abs() < f64::EPSILON);
         assert!((cfg.dcfr_beta).abs() < f64::EPSILON);
@@ -745,6 +780,26 @@ snapshots:
         assert!((cfg.purify_threshold).abs() < f64::EPSILON);
         assert_eq!(cfg.exploitability_interval_minutes, 0);
         assert_eq!(cfg.exploitability_samples, 100_000);
+    }
+
+    #[timed_test]
+    fn training_negative_action_purge_keys_parse() {
+        let yaml = r#"
+negative_action_subtree_purge_enabled: true
+negative_action_prune_below: -25
+negative_action_reactivate_at: 10
+negative_action_purge_mode: scan_history_prefix
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse purge training config");
+
+        assert!(cfg.negative_action_subtree_purge_enabled);
+        assert_eq!(cfg.negative_action_prune_below, -25);
+        assert_eq!(cfg.negative_action_reactivate_at, 10);
+        assert_eq!(
+            cfg.negative_action_purge_mode,
+            MpNegativeActionPurgeMode::ScanHistoryPrefix
+        );
     }
 
     #[timed_test]

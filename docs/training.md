@@ -658,11 +658,18 @@ When enabled, the opponent traversal uses learned baselines to reduce sampling v
 | `lcfr_discount_interval` | `1` | Iterations between discount applications |
 | `prune_after_iterations` | `0` | Iterations before action pruning starts |
 | `prune_threshold` | `-300` | Cumulative regret threshold for pruning. Actions below this are skipped |
+| `prune_explore_pct` | `0.05` | Fraction of post-warmup batches that disable pruning and explore all actions |
+| `negative_action_subtree_purge_enabled` | `false` | Opt in to the parsed/configured negative-action subtree purge experiment |
+| `negative_action_prune_below` | `-1` | Negative-action purge candidate threshold for cumulative regret |
+| `negative_action_reactivate_at` | `0` | Cumulative regret value at or above which a purged action can reactivate |
+| `negative_action_purge_mode` | `scan_history_prefix` | Purge candidate detection mode. Currently only `scan_history_prefix` is supported |
 | `batch_size` | `200` | Deals per parallel batch |
 | `time_limit_minutes` | `0` | Stop after this many minutes (0 = unlimited) |
 | `purify_threshold` | `0.0` | Purify strategies with probability below this threshold (0 = disabled) |
 
 **Important for SAPCFR+**: Since RM+ floors negative regrets to 0, they can't accumulate below the prune threshold. Set `prune_threshold: 0` to effectively disable pruning, or use a small negative value as a safety margin.
+
+**Negative-action subtree purge experiment**: The training parser accepts `negative_action_subtree_purge_enabled`, `negative_action_prune_below`, `negative_action_reactivate_at`, and `negative_action_purge_mode` under `training:`. These keys are configured for the negative-action subtree purge experiment; configs that run the experiment should also disable batch-level prune exploration with `prune_explore_pct: 0.0` so randomly explored pruned actions do not mask purge behavior. The current sample experiment config is `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml`.
 
 **Regret overflow**: Regrets are stored as `i32` (×1000 scaling, max ~2.1M). If `lcfr_discount_interval` is too large, regrets overflow and the trainer panics with a clear message. For SAPCFR+ (which only accumulates positive regrets), keep the discount interval reasonable (e.g., 1M-10M).
 

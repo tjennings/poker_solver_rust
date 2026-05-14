@@ -692,8 +692,8 @@ mod tests {
     use super::*;
     use crate::blueprint_mp::config::{
         BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig,
-        MpGameConfig, MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingBackend,
-        MpTrainingConfig,
+        MpGameConfig, MpNegativeActionPurgeMode, MpSnapshotConfig, MpStreetCluster, MpStreetSizes,
+        MpTrainingBackend, MpTrainingConfig,
     };
     use crate::blueprint_mp::game_tree::MpGameTree;
     use crate::blueprint_mp::mccfr::sample_deal;
@@ -747,6 +747,10 @@ mod tests {
             prune_after_iterations: 1_000_000,
             prune_threshold: -250,
             prune_explore_pct: 0.05,
+            negative_action_subtree_purge_enabled: false,
+            negative_action_prune_below: -1,
+            negative_action_reactivate_at: 0,
+            negative_action_purge_mode: MpNegativeActionPurgeMode::ScanHistoryPrefix,
             batch_size: 10,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.0,
@@ -804,6 +808,10 @@ mod tests {
             prune_after_iterations: 1_000_000,
             prune_threshold: -250,
             prune_explore_pct: 0.05,
+            negative_action_subtree_purge_enabled: false,
+            negative_action_prune_below: -1,
+            negative_action_reactivate_at: 0,
+            negative_action_purge_mode: MpNegativeActionPurgeMode::ScanHistoryPrefix,
             batch_size: 10,
             dcfr_alpha: 1.5,
             dcfr_beta: 0.0,
