@@ -556,11 +556,7 @@ fn traverse_traverser(
             child_history,
         );
     }
-    for (action_idx, prob) in eligible_strategy[..num_actions].iter().enumerate() {
-        let raw = prob * STRATEGY_SCALE;
-        let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
-        storage.add_strategy_sum(key, num_actions, action_idx, delta);
-    }
+    update_strategy_sums(storage, key, num_actions, &eligible_strategy);
 
     (node_value, prune_stats)
 }
@@ -610,9 +606,7 @@ fn traverse_opponent(
     }
     let sampled = sample_action(&eligible_strategy[..num_actions], rng);
 
-    let raw = eligible_strategy[sampled] * STRATEGY_SCALE;
-    let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
-    storage.add_strategy_sum(key, num_actions, sampled, delta);
+    update_strategy_sums(storage, key, num_actions, &eligible_strategy);
 
     let child_history = history.append(sampled);
     // Opponent nodes only attempt the sampled child. Use a read-only current
@@ -639,6 +633,19 @@ fn traverse_opponent(
         negative_action,
     );
     (value, stats)
+}
+
+fn update_strategy_sums(
+    storage: &SparseMpStorage,
+    key: MpInfosetKey,
+    num_actions: usize,
+    strategy: &[f64; MAX_ACTIONS],
+) {
+    for (action_idx, prob) in strategy[..num_actions].iter().enumerate() {
+        let raw = prob * STRATEGY_SCALE;
+        let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+        storage.add_strategy_sum(key, num_actions, action_idx, delta);
+    }
 }
 
 fn negative_action_blocks(
@@ -1908,6 +1915,40 @@ mod tests {
 
         assert!(value.is_finite());
         assert!(storage.entry_count() > 0);
+    }
+
+    #[timed_test]
+    fn lazy_opponent_traversal_updates_full_average_strategy_vector() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let deal = sample_deal(2, &mut rng);
+        let buckets = test_buckets(&deal, [10, 10, 10, 10]);
+        let root = game.root_state();
+        let actions = game.actions(&root);
+        let bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
+        let key = LazyHistory::default().key(root, bucket);
+
+        let (value, _stats) = traverse_external_lazy(
+            &game,
+            &storage,
+            &buckets,
+            Seat::from_raw(1),
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            -250,
+            NegativeActionTraversalConfig::default(),
+        );
+
+        assert!(value.is_finite());
+        for action_idx in 0..actions.len() {
+            assert!(
+                storage.get_strategy_sum(key, action_idx) > 0,
+                "opponent average update should record every root action"
+            );
+        }
     }
 
     #[timed_test]

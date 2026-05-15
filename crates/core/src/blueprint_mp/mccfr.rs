@@ -228,7 +228,7 @@ fn traverse_traverser(
         &pruned,
         node_value,
     );
-    update_traverser_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
+    update_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
     (node_value, stats)
 }
 
@@ -280,7 +280,7 @@ fn update_regrets_with_pruning(
     }
 }
 
-fn update_traverser_strategy_sums(
+fn update_strategy_sums(
     storage: &MpStorage,
     node_idx: u32,
     bucket: u16,
@@ -316,10 +316,7 @@ fn traverse_opponent(
 
     let sampled = sample_action(&strategy[..num_actions], rng);
 
-    // Update strategy sums for the sampled action
-    let raw = strategy[sampled] * STRATEGY_SCALE;
-    let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-    storage.add_strategy_sum(node_idx, bucket, sampled, delta);
+    update_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
 
     traverse_external(
         tree,
@@ -439,6 +436,7 @@ mod tests {
     };
     use crate::blueprint_mp::game_tree::MpGameTree;
     use crate::blueprint_mp::storage::MpStorage;
+    use crate::blueprint_mp::types::Street;
     use crate::blueprint_mp::types::{Bucket, Seat};
     use test_macros::timed_test;
 
@@ -622,6 +620,41 @@ mod tests {
             any_nonzero,
             "at least one strategy sum should be non-zero after traversal"
         );
+    }
+
+    #[timed_test]
+    fn opponent_traversal_updates_full_average_strategy_vector() {
+        let tree = minimal_tree(2);
+        let bucket_counts = [10u16, 10, 10, 10];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        let mut rng = rand::thread_rng();
+        let deal = sample_deal(2, &mut rng);
+        let dwb = trivial_buckets(&deal, bucket_counts);
+        let bucket = dwb.buckets[0][Street::Preflop.index()].0;
+
+        let MpGameNode::Decision { actions, .. } = &tree.nodes[tree.root as usize] else {
+            panic!("root should be a decision node");
+        };
+
+        traverse_external(
+            &tree,
+            &storage,
+            &dwb,
+            Seat::from_raw(1),
+            tree.root,
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            0,
+        );
+
+        for action_idx in 0..actions.len() {
+            assert!(
+                storage.get_strategy_sum(tree.root, bucket, action_idx) > 0,
+                "opponent average update should record every root action"
+            );
+        }
     }
 
     #[timed_test]

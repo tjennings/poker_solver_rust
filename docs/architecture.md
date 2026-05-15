@@ -199,7 +199,7 @@ crates/core/src/blueprint_mp/
 - **Sparse visited-infoset storage** for the planned lazy backend: unvisited infosets read as zero/uniform, visited infosets allocate sharded atomic regret and strategy counters, and snapshots export only touched entries
 - **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
 - **Experimental negative-action subtree purge** for lazy sparse traversal: aggressive action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; normal traversal masks blocked aggressive edges, while physical sparse-row deletion is deferred until the DCFR discount boundary, where post-discount regrets decide whether blocked child subtrees are purged or reactivated
-- **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
+- **External-sampling average strategy updates**: every visited decision infoset records the full current strategy vector; opponent actions are sampled only for recursion, not for average-strategy accounting
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ### 100bb MP Scaling Plan
