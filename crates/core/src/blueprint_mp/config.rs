@@ -173,10 +173,15 @@ pub struct MpTrainingConfig {
     pub lcfr_warmup_iterations: u64,
     #[serde(default = "default_discount_interval")]
     pub lcfr_discount_interval: u64,
+    /// Warmup boundary for opt-in negative-action subtree purge.
+    ///
+    /// Ordinary regret-threshold traversal pruning is disabled for MP training.
     #[serde(default = "default_prune_after")]
     pub prune_after_iterations: u64,
+    /// Legacy ordinary traversal-pruning threshold; currently ignored by MP training.
     #[serde(default = "default_prune_threshold")]
     pub prune_threshold: i32,
+    /// Legacy ordinary traversal-pruning exploration rate; currently ignored by MP training.
     #[serde(default = "default_prune_explore")]
     pub prune_explore_pct: f64,
     #[serde(default)]

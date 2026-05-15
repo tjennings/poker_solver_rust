@@ -348,17 +348,15 @@ fn training_loop_lazy(
     }
 }
 
-/// Determine whether the current batch should use pruning.
+/// Determine whether the current batch should use ordinary traversal pruning.
 ///
-/// Pruning activates after `prune_after_iterations` have elapsed and
-/// applies to `1 - prune_explore_pct` of batches (the rest explore
-/// all actions to avoid permanently losing information).
-fn should_prune(meta_iter: u64, config: &MpTrainingConfig, rng: &mut impl Rng) -> bool {
-    if meta_iter < config.prune_after_iterations {
-        return false;
-    }
-    let explore: f64 = rng.random();
-    explore >= config.prune_explore_pct
+/// This is deliberately disabled for multiplayer training. The old
+/// regret-threshold traversal gate could prune almost all MP branches once
+/// rows became deterministic, starving later re-entry and corrupting average
+/// strategies. `prune_after_iterations` still gates the explicit
+/// negative-action subtree purge experiment.
+fn should_prune(_meta_iter: u64, _config: &MpTrainingConfig, _rng: &mut impl Rng) -> bool {
+    false
 }
 
 fn run_batch(
@@ -1008,19 +1006,18 @@ mod tests {
     fn should_prune_false_before_warmup() {
         let mut config = toy_training_config(1000);
         config.prune_after_iterations = 100;
-        config.prune_explore_pct = 0.0; // never explore => always prune if past warmup
+        config.prune_explore_pct = 0.0;
         let mut rng = SmallRng::seed_from_u64(42);
-        // iter 50 < prune_after_iterations=100 => never prune
         assert!(!should_prune(50, &config, &mut rng));
     }
 
     #[timed_test]
-    fn should_prune_true_after_warmup_no_explore() {
+    fn should_prune_false_after_warmup_no_explore() {
         let mut config = toy_training_config(1000);
         config.prune_after_iterations = 100;
-        config.prune_explore_pct = 0.0; // explore_pct=0 => always prune
+        config.prune_explore_pct = 0.0;
         let mut rng = SmallRng::seed_from_u64(42);
-        assert!(should_prune(200, &config, &mut rng));
+        assert!(!should_prune(200, &config, &mut rng));
     }
 
     #[timed_test]
@@ -1029,22 +1026,18 @@ mod tests {
         config.prune_after_iterations = 0;
         config.prune_explore_pct = 1.0; // explore_pct=1 => never prune
         let mut rng = SmallRng::seed_from_u64(42);
-        // rng.random() is in [0,1), always < 1.0, so always explores
         assert!(!should_prune(200, &config, &mut rng));
     }
 
     #[timed_test]
-    fn should_prune_respects_warmup() {
+    fn should_prune_disabled_even_after_warmup() {
         let mut config = toy_training_config(1000);
         config.prune_after_iterations = 500;
         config.prune_explore_pct = 0.0;
         let mut rng = SmallRng::seed_from_u64(42);
-        // Before warmup
         assert!(!should_prune(499, &config, &mut rng));
-        // At warmup boundary
-        assert!(should_prune(500, &config, &mut rng));
-        // After warmup
-        assert!(should_prune(1000, &config, &mut rng));
+        assert!(!should_prune(500, &config, &mut rng));
+        assert!(!should_prune(1000, &config, &mut rng));
     }
 
     #[timed_test]
