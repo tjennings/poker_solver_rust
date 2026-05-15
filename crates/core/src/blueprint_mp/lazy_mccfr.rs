@@ -23,6 +23,7 @@ use super::types::{Chips, DealWithBuckets, PlayerSet, Seat, Street};
 
 const SIZE_EPSILON: f64 = 0.01;
 const MAX_ACTIONS: usize = 16;
+const PRUNE_STRATEGY_EPSILON: f64 = 1e-12;
 const ACTION_BITS: u16 = 4;
 const PACKED_ACTION_SLOTS: u16 = 32;
 pub const LAZY_ACTION_STREET_COUNT: usize = 4;
@@ -512,6 +513,7 @@ fn traverse_traverser(
             child_is_terminal,
             key,
             action_idx,
+            eligible_strategy[action_idx],
             &mut prune_stats,
         ) {
             pruned[action_idx] = true;
@@ -701,9 +703,13 @@ fn should_prune_lazy(
     child_is_terminal: bool,
     key: MpInfosetKey,
     action: usize,
+    action_probability: f64,
     stats: &mut PruneStats,
 ) -> bool {
     if !prune || child_is_terminal {
+        return false;
+    }
+    if action_probability > PRUNE_STRATEGY_EPSILON {
         return false;
     }
     stats.total += 1;
@@ -1985,7 +1991,7 @@ mod tests {
         storage.add_regret(key, 2, 0, -10_000);
 
         assert!(!should_prune_lazy(
-            &storage, true, -1, true, key, 0, &mut stats
+            &storage, true, -1, true, key, 0, 0.0, &mut stats
         ));
         assert_eq!(stats.total, 0);
         assert_eq!(stats.hits, 0);
@@ -2001,10 +2007,26 @@ mod tests {
         storage.add_regret(key, 2, 1, -10_000);
 
         assert!(should_prune_lazy(
-            &storage, true, -1, false, key, 1, &mut stats
+            &storage, true, -1, false, key, 1, 0.0, &mut stats
         ));
         assert_eq!(stats.total, 1);
         assert_eq!(stats.hits, 1);
+    }
+
+    #[timed_test]
+    fn lazy_pruning_keeps_actions_with_current_strategy_mass() {
+        let storage = SparseMpStorage::with_shards(8);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(key, 2, 1, -10_000);
+
+        assert!(!should_prune_lazy(
+            &storage, true, -1, false, key, 1, 0.5, &mut stats
+        ));
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.hits, 0);
     }
 
     #[timed_test]

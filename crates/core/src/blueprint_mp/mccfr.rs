@@ -22,6 +22,7 @@ use crate::poker::{Card, FlatDeck, Hand, Rank, Rankable};
 
 /// Maximum actions at any decision node (stack-allocated buffers).
 const MAX_ACTIONS: usize = 16;
+const PRUNE_STRATEGY_EPSILON: f64 = 1e-12;
 
 /// Prune statistics accumulated during a single traversal.
 ///
@@ -197,6 +198,7 @@ fn traverse_traverser(
             node_idx,
             bucket,
             a,
+            strategy[a],
             &mut stats,
         ) {
             pruned[a] = true;
@@ -244,9 +246,13 @@ fn should_prune_action(
     node_idx: u32,
     bucket: u16,
     action: usize,
+    action_probability: f64,
     stats: &mut PruneStats,
 ) -> bool {
     if !prune {
+        return false;
+    }
+    if action_probability > PRUNE_STRATEGY_EPSILON {
         return false;
     }
     let child_is_terminal = matches!(tree.nodes[child_idx as usize], MpGameNode::Terminal { .. });
@@ -434,7 +440,7 @@ mod tests {
     use crate::blueprint_mp::config::{
         ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpGameConfig, MpStreetSizes,
     };
-    use crate::blueprint_mp::game_tree::MpGameTree;
+    use crate::blueprint_mp::game_tree::{MpGameTree, TreeAction};
     use crate::blueprint_mp::storage::MpStorage;
     use crate::blueprint_mp::types::Street;
     use crate::blueprint_mp::types::{Bucket, Seat};
@@ -550,6 +556,56 @@ mod tests {
             false,
             0,
         );
+    }
+
+    #[timed_test]
+    fn pruning_keeps_actions_with_current_strategy_mass() {
+        let tree = minimal_tree(2);
+        let bucket_counts = [10u16, 10, 10, 10];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        let MpGameNode::Decision {
+            actions, children, ..
+        } = &tree.nodes[tree.root as usize]
+        else {
+            panic!("root should be a decision node");
+        };
+        let call_idx = actions
+            .iter()
+            .position(|action| matches!(action, TreeAction::Call))
+            .expect("minimal tree root should have a call action");
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(tree.root, 0, call_idx, -10_000);
+
+        assert!(!should_prune_action(
+            &tree,
+            &storage,
+            true,
+            -1,
+            children[call_idx],
+            tree.root,
+            0,
+            call_idx,
+            0.5,
+            &mut stats,
+        ));
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.hits, 0);
+
+        assert!(should_prune_action(
+            &tree,
+            &storage,
+            true,
+            -1,
+            children[call_idx],
+            tree.root,
+            0,
+            call_idx,
+            0.0,
+            &mut stats,
+        ));
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.hits, 1);
     }
 
     #[timed_test]
