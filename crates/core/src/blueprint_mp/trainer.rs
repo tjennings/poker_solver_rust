@@ -11,7 +11,7 @@
 )]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Global prune counters — accumulated per batch, read+reset by TUI bridge.
@@ -29,6 +29,7 @@ static LAZY_SLOW_JOBS: AtomicU64 = AtomicU64::new(0);
 static LAZY_MAX_TRAVERSER_NANOS: AtomicU64 = AtomicU64::new(0);
 static LAZY_MAX_TRAVERSER_CONTEXT: AtomicU64 = AtomicU64::new(0);
 static LAZY_SLOW_TRAVERSERS: AtomicU64 = AtomicU64::new(0);
+const SERIAL_DCFR_DISCOUNT_SLOTS: usize = 4_096;
 const SLOW_LAZY_JOB_NANOS: u64 = 1_000_000_000;
 const SLOW_LAZY_TRAVERSER_NANOS: u64 = 1_000_000_000;
 
@@ -609,19 +610,41 @@ fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingC
     let (d_pos, d_neg) = regret_discount_factors(epoch, config.dcfr_alpha, config.dcfr_beta);
     let d_strat = strategy_discount_factor(epoch, config.dcfr_gamma);
 
-    storage.regrets.par_iter().for_each(|atom| {
-        let v = atom.load(Ordering::Relaxed);
-        let d = if v >= 0 { d_pos } else { d_neg };
-        let discounted = (f64::from(v) * d)
-            .round()
-            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
-        atom.store(discounted, Ordering::Relaxed);
-    });
-    storage.strategy_sums.par_iter().for_each(|atom| {
-        let v = atom.load(Ordering::Relaxed);
-        let discounted = ((v as f64) * d_strat).clamp(0.0, u64::MAX as f64) as u64;
-        atom.store(discounted, Ordering::Relaxed);
-    });
+    if storage.regrets.len() <= SERIAL_DCFR_DISCOUNT_SLOTS {
+        storage
+            .regrets
+            .iter()
+            .for_each(|atom| discount_regret_atom(atom, d_pos, d_neg));
+        storage
+            .strategy_sums
+            .iter()
+            .for_each(|atom| discount_strategy_sum_atom(atom, d_strat));
+        return;
+    }
+
+    storage
+        .regrets
+        .par_iter()
+        .for_each(|atom| discount_regret_atom(atom, d_pos, d_neg));
+    storage
+        .strategy_sums
+        .par_iter()
+        .for_each(|atom| discount_strategy_sum_atom(atom, d_strat));
+}
+
+fn discount_regret_atom(atom: &AtomicI32, d_pos: f64, d_neg: f64) {
+    let v = atom.load(Ordering::Relaxed);
+    let d = if v >= 0 { d_pos } else { d_neg };
+    let discounted = (f64::from(v) * d)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    atom.store(discounted, Ordering::Relaxed);
+}
+
+fn discount_strategy_sum_atom(atom: &AtomicU64, d_strat: f64) {
+    let v = atom.load(Ordering::Relaxed);
+    let discounted = ((v as f64) * d_strat).clamp(0.0, u64::MAX as f64) as u64;
+    atom.store(discounted, Ordering::Relaxed);
 }
 
 fn apply_dcfr_discount_lazy(storage: &SparseMpStorage, meta_iter: u64, config: &MpTrainingConfig) {
@@ -711,9 +734,10 @@ mod tests {
         MpGameConfig, MpNegativeActionPurgeMode, MpSnapshotConfig, MpStreetCluster, MpStreetSizes,
         MpTrainingBackend, MpTrainingConfig,
     };
-    use crate::blueprint_mp::game_tree::MpGameTree;
+    use crate::blueprint_mp::game_tree::{MpGameNode, MpGameTree, TreeAction};
     use crate::blueprint_mp::mccfr::sample_deal;
     use crate::blueprint_mp::storage::MpStorage;
+    use crate::blueprint_mp::types::Street;
 
     fn toy_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         let blinds = vec![
@@ -1154,6 +1178,52 @@ mod tests {
     }
 
     #[timed_test]
+    fn dcfr_discount_serial_path_runs_at_threshold() {
+        let tree = single_decision_tree();
+        let bucket_counts = [SERIAL_DCFR_DISCOUNT_SLOTS as u16, 1, 1, 1];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        assert_eq!(storage.regrets.len(), SERIAL_DCFR_DISCOUNT_SLOTS);
+        let node = tree.root;
+        storage.add_strategy_sum(node, 0, 0, 10_000);
+        let config = toy_training_config(1000);
+
+        apply_dcfr_discount(&storage, 100, &config);
+
+        let after = storage.get_strategy_sum(node, 0, 0);
+        assert!(
+            after < 10_000,
+            "serial path should discount strategy sum, got {after}"
+        );
+        assert!(
+            after > 0,
+            "serial path should keep strategy sum positive, got {after}"
+        );
+    }
+
+    #[timed_test]
+    fn dcfr_discount_parallel_path_runs_above_threshold() {
+        let tree = single_decision_tree();
+        let bucket_counts = [(SERIAL_DCFR_DISCOUNT_SLOTS + 1) as u16, 1, 1, 1];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        assert_eq!(storage.regrets.len(), SERIAL_DCFR_DISCOUNT_SLOTS + 1);
+        let node = tree.root;
+        storage.add_strategy_sum(node, 0, 0, 10_000);
+        let config = toy_training_config(1000);
+
+        apply_dcfr_discount(&storage, 100, &config);
+
+        let after = storage.get_strategy_sum(node, 0, 0);
+        assert!(
+            after < 10_000,
+            "parallel path should discount strategy sum, got {after}"
+        );
+        assert!(
+            after > 0,
+            "parallel path should keep strategy sum positive, got {after}"
+        );
+    }
+
+    #[timed_test]
     fn dcfr_discount_preserves_u64_strategy_sums_above_i32_max() {
         let tree = minimal_tree(2);
         let bucket_counts = [10u16, 10, 10, 10];
@@ -1369,6 +1439,20 @@ mod tests {
         let mut ab = AllBuckets::new(bucket_counts, [None, None, None, None]);
         ab.equity_fallback = true;
         ab
+    }
+
+    fn single_decision_tree() -> MpGameTree {
+        MpGameTree {
+            nodes: vec![MpGameNode::Decision {
+                seat: Seat::from_raw(0),
+                street: Street::Preflop,
+                actions: vec![TreeAction::Check],
+                children: vec![],
+            }],
+            root: 0,
+            num_players: 2,
+            starting_stack: Chips(20.0),
+        }
     }
 
     fn first_decision_node(tree: &MpGameTree) -> u32 {
