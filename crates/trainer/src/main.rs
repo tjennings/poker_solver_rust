@@ -3510,9 +3510,16 @@ fn bridge_mp_iterations<T>(
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
+            metrics.mark_snapshot_writing();
             match save_mp_snapshot(snapshot_config, storage, tree, iters, started.elapsed()) {
-                Ok(path) => eprintln!("  MP snapshot saved to {}", path.display()),
-                Err(e) => eprintln!("  Warning: failed to save MP snapshot: {e}"),
+                Ok(path) => {
+                    metrics.mark_snapshot_saved(&path);
+                    eprintln!("  MP snapshot saved to {}", path.display());
+                }
+                Err(e) => {
+                    metrics.mark_snapshot_failed(&e);
+                    eprintln!("  Warning: failed to save MP snapshot: {e}");
+                }
             }
         }
         if last_telemetry.elapsed() >= telemetry_interval {
@@ -3565,9 +3572,16 @@ fn bridge_mp_lazy_iterations<T>(
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
+            metrics.mark_snapshot_writing();
             match save_lazy_mp_snapshot(snapshot_config, storage, iters, started.elapsed()) {
-                Ok(path) => eprintln!("  Lazy MP snapshot saved to {}", path.display()),
-                Err(e) => eprintln!("  Warning: failed to save lazy MP snapshot: {e}"),
+                Ok(path) => {
+                    metrics.mark_snapshot_saved(&path);
+                    eprintln!("  Lazy MP snapshot saved to {}", path.display());
+                }
+                Err(e) => {
+                    metrics.mark_snapshot_failed(&e);
+                    eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
+                }
             }
         }
         if last_telemetry.elapsed() >= telemetry_interval {

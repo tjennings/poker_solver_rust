@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +13,17 @@ use crate::blueprint_tui_widgets::CellStrategy;
 
 /// Maximum number of monitored scenarios.
 pub const MAX_SCENARIOS: usize = 16;
+const SNAPSHOT_STATUS_DETAIL_CHARS: usize = 48;
+
+/// One-line status for manual TUI snapshot requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    Idle,
+    Queued,
+    Writing,
+    Saved(String),
+    Failed(String),
+}
 
 /// State for the random-scenario carousel display.
 #[derive(Debug, Clone)]
@@ -48,6 +60,7 @@ pub struct BlueprintTuiMetrics {
     pub snapshot_trigger: Arc<AtomicBool>,
     pub strategy_refresh_trigger: Arc<AtomicBool>,
     pub config_reload_trigger: Arc<AtomicBool>,
+    pub snapshot_status: Mutex<SnapshotStatus>,
 
     /// Reloaded TUI state pushed by the trainer after a config reload.
     pub reloaded_tui_state: Mutex<Option<ReloadedTuiState>>,
@@ -106,6 +119,7 @@ impl BlueprintTuiMetrics {
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
             strategy_refresh_trigger: Arc::new(AtomicBool::new(false)),
             config_reload_trigger: Arc::new(AtomicBool::new(false)),
+            snapshot_status: Mutex::new(SnapshotStatus::Idle),
             reloaded_tui_state: Mutex::new(None),
 
             strategy_snapshots: Mutex::new(snapshots),
@@ -141,6 +155,47 @@ impl BlueprintTuiMetrics {
 
     pub fn request_snapshot(&self) {
         self.snapshot_trigger.store(true, Ordering::Relaxed);
+        self.set_snapshot_status(SnapshotStatus::Queued);
+    }
+
+    pub fn mark_snapshot_writing(&self) {
+        self.set_snapshot_status(SnapshotStatus::Writing);
+    }
+
+    pub fn mark_snapshot_saved(&self, path: &Path) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| path.display().to_string(), ToOwned::to_owned);
+        self.set_snapshot_status(SnapshotStatus::Saved(truncate_status_detail(&name)));
+    }
+
+    pub fn mark_snapshot_failed(&self, error: impl std::fmt::Display) {
+        self.set_snapshot_status(SnapshotStatus::Failed(truncate_status_detail(
+            &error.to_string(),
+        )));
+    }
+
+    pub fn snapshot_status_text(&self) -> Option<String> {
+        let status = self
+            .snapshot_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &*status {
+            SnapshotStatus::Idle => None,
+            SnapshotStatus::Queued => Some("snapshot: queued".to_string()),
+            SnapshotStatus::Writing => Some("snapshot: writing".to_string()),
+            SnapshotStatus::Saved(path) => Some(format!("snapshot: saved {path}")),
+            SnapshotStatus::Failed(error) => Some(format!("snapshot: failed {error}")),
+        }
+    }
+
+    fn set_snapshot_status(&self, status: SnapshotStatus) {
+        let mut current = self
+            .snapshot_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *current = status;
     }
 
     pub fn request_strategy_refresh(&self) {
@@ -339,6 +394,15 @@ impl BlueprintTuiMetrics {
     }
 }
 
+fn truncate_status_detail(detail: &str) -> String {
+    let mut chars = detail.chars();
+    let mut truncated: String = chars.by_ref().take(SNAPSHOT_STATUS_DETAIL_CHARS).collect();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +416,7 @@ mod tests {
         assert!(!m.paused.load(Ordering::Relaxed));
         assert!(!m.quit_requested.load(Ordering::Relaxed));
         assert!(!m.take_snapshot_trigger());
+        assert_eq!(m.snapshot_status_text(), None);
         assert_eq!(m.target_iterations, Some(1000));
     }
 
@@ -403,9 +468,41 @@ mod tests {
         // Set and consume.
         m.request_snapshot();
         assert!(m.take_snapshot_trigger());
+        assert_eq!(
+            m.snapshot_status_text(),
+            Some("snapshot: queued".to_string())
+        );
 
         // Consumed -- second take returns false.
         assert!(!m.take_snapshot_trigger());
+    }
+
+    #[timed_test(10)]
+    fn snapshot_status_lifecycle() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.request_snapshot();
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: queued")
+        );
+
+        m.mark_snapshot_writing();
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: writing")
+        );
+
+        m.mark_snapshot_saved(Path::new("/tmp/snapshot_0007"));
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: saved snapshot_0007")
+        );
+
+        m.mark_snapshot_failed("permission denied");
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: failed permission denied")
+        );
     }
 
     #[timed_test(10)]

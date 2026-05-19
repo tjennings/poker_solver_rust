@@ -299,7 +299,13 @@ impl MpTuiApp {
         } else {
             String::new()
         };
-        let text = format!("[p]ause [s]napshot \u{2190}/\u{2192} page [q]uit{page_indicator}");
+        let snapshot_status = self
+            .metrics
+            .snapshot_status_text()
+            .map_or_else(String::new, |status| format!(" | {status}"));
+        let text = format!(
+            "[p]ause [s]napshot \u{2190}/\u{2192} page [q]uit{page_indicator}{snapshot_status}"
+        );
         let p = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, area);
     }
