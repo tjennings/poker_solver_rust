@@ -867,17 +867,55 @@ mod tests {
         let storage = MpStorage::new(&tree, bucket_counts);
         let mut rng = rand::thread_rng();
 
-        // Force very negative regrets at all decision nodes, all buckets
-        set_all_regrets_negative(&tree, &storage, bucket_counts);
-
         let deal = sample_deal(2, &mut rng);
         let dwb = trivial_buckets(&deal, bucket_counts);
+        let node_idx = first_decision_node(&tree);
+        assert_eq!(
+            node_idx, tree.root,
+            "minimal tree should begin at the traverser's decision"
+        );
+        let MpGameNode::Decision {
+            seat,
+            street,
+            actions,
+            children,
+        } = &tree.nodes[node_idx as usize]
+        else {
+            panic!("root should be a decision node");
+        };
+        assert_eq!(
+            *seat,
+            Seat::from_raw(0),
+            "root should belong to the traverser for this regression"
+        );
+        let call_idx = actions
+            .iter()
+            .position(|action| matches!(action, TreeAction::Call))
+            .expect("minimal tree root should have a call action");
+        assert!(
+            !matches!(
+                tree.nodes[children[call_idx] as usize],
+                MpGameNode::Terminal { .. }
+            ),
+            "call should be a non-terminal action so pruning can apply"
+        );
+
+        // Pruning only applies to actions that already have zero current
+        // strategy mass. Make call negative while another action is positive,
+        // so regret matching assigns call probability 0 instead of falling
+        // back to the all-nonpositive uniform strategy.
+        let bucket = dwb.buckets[seat.index() as usize][street.index()].0;
+        for action_idx in 0..actions.len() {
+            storage.add_regret(node_idx, bucket, action_idx, 30_000);
+        }
+        storage.add_regret(node_idx, bucket, call_idx, -60_000);
+
         let (_val, stats) = traverse_external(
             &tree,
             &storage,
             &dwb,
             Seat::from_raw(0),
-            tree.root,
+            node_idx,
             &mut rng,
             0.0,
             Chips::ZERO,
