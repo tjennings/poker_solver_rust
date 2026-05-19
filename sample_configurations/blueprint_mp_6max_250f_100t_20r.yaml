@@ -55,7 +55,7 @@ training:
   prune_after_iterations: 4000000
   traversal_pruning_enabled: true
   prune_threshold: -100
-  prune_explore_pct: 0.0
+  prune_explore_pct: 0.05
   negative_action_subtree_purge_enabled: false
   negative_action_prune_below: -100
   negative_action_reactivate_at: 0
