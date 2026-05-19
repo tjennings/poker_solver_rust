@@ -8,7 +8,7 @@ tags:
     - range-solver
     - compare
 created_at: 2026-05-19T15:46:05Z
-updated_at: 2026-05-19T15:56:42Z
+updated_at: 2026-05-19T15:59:43Z
 ---
 
 Add deterministic low-SPR 4-bet flop parity smoke coverage to the range-solver-compare harness.
@@ -17,7 +17,7 @@ Checklist:
 - [x] Commit this bean tracking state before implementation.
 - [x] Run the full test suite baseline and confirm it passes in under one minute. Skipped for this session by user request because training is running; initial baseline failed in 27.41s due existing `blueprint_mp::trainer` wall-clock timed-test overruns under load, not compare-harness failures.
 - [x] Dispatch research/brainstorming on low-SPR 4-bet flop parity dimensions and scope. Result: represent 4-bet low-SPR as flop roots with large pot/small stack, add two deterministic narrow-range spots, use 20 iterations, reuse tolerant smoke comparator, and collect variance table outside normal test output.
-- [ ] Dispatch Rust implementation in a separate worktree.
+- [x] Dispatch Rust implementation in a separate worktree. Worker added flop smoke in `crates/range-solver-compare/tests/identity.rs`; targeted flop/turn/river smoke passed in the worker tree.
 - [ ] Dispatch review before integration.
 - [ ] Integrate accepted changes into the feature branch.
 - [ ] Run flop smoke compare tests and existing turn/river compare smoke tests. Full-suite performance gate skipped for this session by user request.
