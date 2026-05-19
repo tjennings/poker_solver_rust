@@ -22,6 +22,7 @@ use super::mccfr::{PruneStats, terminal_value};
 use super::sparse_storage::{MpInfosetKey, SparseMpStorage};
 use super::storage::{REGRET_SCALE, STRATEGY_SCALE};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat, Street};
+use crate::poker::Card;
 
 const SIZE_EPSILON: f64 = 0.01;
 const MAX_ACTIONS: usize = 16;
@@ -45,6 +46,39 @@ pub struct NegativeActionTraversalConfig {
     pub enabled: bool,
     pub prune_below: i32,
     pub reactivate_at: i32,
+}
+
+/// Precomputed exact public-card continuations for one sampled private/flop prefix.
+#[derive(Debug, Clone, Default)]
+pub struct ExactChanceRunouts {
+    pub turns: Vec<ExactTurnRunout>,
+}
+
+impl ExactChanceRunouts {
+    fn is_empty(&self) -> bool {
+        self.turns.is_empty()
+    }
+
+    fn river_deals_for_turn(&self, turn: Card) -> Option<&[DealWithBuckets]> {
+        self.turns
+            .iter()
+            .find(|runout| runout.turn == turn)
+            .map(|runout| runout.river_deals.as_slice())
+    }
+
+    fn all_river_deals(&self) -> impl Iterator<Item = &DealWithBuckets> {
+        self.turns
+            .iter()
+            .flat_map(|runout| runout.river_deals.iter())
+    }
+}
+
+/// Exact river continuations for a single turn card.
+#[derive(Debug, Clone)]
+pub struct ExactTurnRunout {
+    pub turn: Card,
+    pub turn_deal: DealWithBuckets,
+    pub river_deals: Vec<DealWithBuckets>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -360,7 +394,7 @@ pub fn traverse_external_lazy(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
-    exact_river_runouts: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
     chance_mode: MpChanceContinuationMode,
     traverser: Seat,
     rng: &mut impl Rng,
@@ -374,9 +408,9 @@ pub fn traverse_external_lazy(
         game,
         storage,
         deal,
-        exact_river_runouts,
+        exact_runouts,
         chance_mode,
-        chance_mode == MpChanceContinuationMode::SampledFullDeal,
+        sampled_prefix_street(chance_mode),
         traverser,
         LazyNode::Decision(game.root_state()),
         LazyHistory::default(),
@@ -393,9 +427,9 @@ fn traverse_node(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
-    exact_river_runouts: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
     chance_mode: MpChanceContinuationMode,
-    river_resolved: bool,
+    resolved_street: Street,
     traverser: Seat,
     node: LazyNode,
     history: LazyHistory,
@@ -415,9 +449,9 @@ fn traverse_node(
                 &kind,
                 &contributions,
                 deal,
-                exact_river_runouts,
+                exact_runouts,
                 chance_mode,
-                river_resolved,
+                resolved_street,
                 traverser,
                 game.num_players,
                 rake_rate,
@@ -429,9 +463,9 @@ fn traverse_node(
             game,
             storage,
             deal,
-            exact_river_runouts,
+            exact_runouts,
             chance_mode,
-            river_resolved,
+            resolved_street,
             traverser,
             state,
             next_street,
@@ -452,9 +486,9 @@ fn traverse_node(
                     game,
                     storage,
                     deal,
-                    exact_river_runouts,
+                    exact_runouts,
                     chance_mode,
-                    river_resolved,
+                    resolved_street,
                     traverser,
                     state,
                     history,
@@ -472,9 +506,9 @@ fn traverse_node(
                     game,
                     storage,
                     deal,
-                    exact_river_runouts,
+                    exact_runouts,
                     chance_mode,
-                    river_resolved,
+                    resolved_street,
                     traverser,
                     state,
                     history,
@@ -496,9 +530,9 @@ fn traverse_chance(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
-    exact_river_runouts: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
     chance_mode: MpChanceContinuationMode,
-    river_resolved: bool,
+    resolved_street: Street,
     traverser: Seat,
     state: LazyPublicState,
     next_street: Street,
@@ -510,23 +544,15 @@ fn traverse_chance(
     prune_threshold: i32,
     negative_action: NegativeActionTraversalConfig,
 ) -> (f64, PruneStats) {
-    if chance_mode == MpChanceContinuationMode::SampledTurnExactRiver
-        && next_street == Street::River
-        && !river_resolved
-        && !exact_river_runouts.is_empty()
-    {
-        let mut value_sum = 0.0;
-        let mut stats = PruneStats::default();
-        for river_deal in exact_river_runouts {
-            let (value, child_stats) = traverse_node(
+    if next_street.index() > resolved_street.index() && !exact_runouts.is_empty() {
+        return match next_street {
+            Street::Turn => traverse_exact_turn_chance(
                 game,
                 storage,
-                river_deal,
-                exact_river_runouts,
+                exact_runouts,
                 chance_mode,
-                true,
                 traverser,
-                LazyNode::Decision(new_street_state(state, next_street)),
+                state,
                 history,
                 rng,
                 rake_rate,
@@ -534,20 +560,116 @@ fn traverse_chance(
                 prune,
                 prune_threshold,
                 negative_action,
-            );
-            value_sum += value;
-            stats.merge(child_stats);
-        }
-        return (value_sum / exact_river_runouts.len() as f64, stats);
+            ),
+            Street::River => {
+                let Some(river_deals) = exact_runouts.river_deals_for_turn(deal.deal.board[3])
+                else {
+                    return traverse_sampled_chance(
+                        game,
+                        storage,
+                        deal,
+                        exact_runouts,
+                        chance_mode,
+                        resolved_street,
+                        traverser,
+                        state,
+                        next_street,
+                        history,
+                        rng,
+                        rake_rate,
+                        rake_cap,
+                        prune,
+                        prune_threshold,
+                        negative_action,
+                    );
+                };
+                traverse_exact_river_chance(
+                    game,
+                    storage,
+                    river_deals,
+                    exact_runouts,
+                    chance_mode,
+                    traverser,
+                    state,
+                    history,
+                    rng,
+                    rake_rate,
+                    rake_cap,
+                    prune,
+                    prune_threshold,
+                    negative_action,
+                )
+            }
+            Street::Preflop | Street::Flop => traverse_sampled_chance(
+                game,
+                storage,
+                deal,
+                exact_runouts,
+                chance_mode,
+                resolved_street,
+                traverser,
+                state,
+                next_street,
+                history,
+                rng,
+                rake_rate,
+                rake_cap,
+                prune,
+                prune_threshold,
+                negative_action,
+            ),
+        };
     }
 
+    traverse_sampled_chance(
+        game,
+        storage,
+        deal,
+        exact_runouts,
+        chance_mode,
+        resolved_street,
+        traverser,
+        state,
+        next_street,
+        history,
+        rng,
+        rake_rate,
+        rake_cap,
+        prune,
+        prune_threshold,
+        negative_action,
+    )
+}
+
+fn traverse_sampled_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
+    traverser: Seat,
+    state: LazyPublicState,
+    next_street: Street,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
     traverse_node(
         game,
         storage,
         deal,
-        exact_river_runouts,
+        exact_runouts,
         chance_mode,
-        river_resolved || next_street == Street::River,
+        if next_street.index() > resolved_street.index() {
+            next_street
+        } else {
+            resolved_street
+        },
         traverser,
         LazyNode::Decision(new_street_state(state, next_street)),
         history,
@@ -560,27 +682,129 @@ fn traverse_chance(
     )
 }
 
+fn traverse_exact_turn_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    traverser: Seat,
+    state: LazyPublicState,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
+    let mut value_sum = 0.0;
+    let mut stats = PruneStats::default();
+    for turn in &exact_runouts.turns {
+        let (value, child_stats) = traverse_node(
+            game,
+            storage,
+            &turn.turn_deal,
+            exact_runouts,
+            chance_mode,
+            Street::Turn,
+            traverser,
+            LazyNode::Decision(new_street_state(state, Street::Turn)),
+            history,
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
+            negative_action,
+        );
+        value_sum += value;
+        stats.merge(child_stats);
+    }
+    (value_sum / exact_runouts.turns.len() as f64, stats)
+}
+
+fn traverse_exact_river_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    river_deals: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    traverser: Seat,
+    state: LazyPublicState,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
+    let mut value_sum = 0.0;
+    let mut stats = PruneStats::default();
+    for river_deal in river_deals {
+        let (value, child_stats) = traverse_node(
+            game,
+            storage,
+            river_deal,
+            exact_runouts,
+            chance_mode,
+            Street::River,
+            traverser,
+            LazyNode::Decision(new_street_state(state, Street::River)),
+            history,
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
+            negative_action,
+        );
+        value_sum += value;
+        stats.merge(child_stats);
+    }
+    (value_sum / river_deals.len() as f64, stats)
+}
+
 fn terminal_or_exact_river_value(
     kind: &TerminalKind,
     contributions: &[Chips; MAX_PLAYERS],
     deal: &DealWithBuckets,
-    exact_river_runouts: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
     chance_mode: MpChanceContinuationMode,
-    river_resolved: bool,
+    resolved_street: Street,
     traverser: Seat,
     num_players: u8,
     rake_rate: f64,
     rake_cap: Chips,
 ) -> f64 {
-    if chance_mode == MpChanceContinuationMode::SampledTurnExactRiver
-        && !river_resolved
-        && !exact_river_runouts.is_empty()
+    if chance_mode != MpChanceContinuationMode::SampledFullDeal
+        && resolved_street != Street::River
+        && !exact_runouts.is_empty()
         && matches!(kind, TerminalKind::Showdown { .. })
     {
-        let value_sum = exact_river_runouts
-            .iter()
-            .map(|river_deal| {
-                terminal_value(
+        if resolved_street == Street::Turn {
+            if let Some(river_deals) = exact_runouts.river_deals_for_turn(deal.deal.board[3]) {
+                let value_sum = river_deals
+                    .iter()
+                    .map(|river_deal| {
+                        terminal_value(
+                            kind,
+                            contributions,
+                            river_deal,
+                            traverser,
+                            num_players,
+                            rake_rate,
+                            rake_cap,
+                        )
+                    })
+                    .sum::<f64>();
+                return value_sum / river_deals.len() as f64;
+            }
+        } else if resolved_street == Street::Flop {
+            let mut value_sum = 0.0;
+            let mut count = 0usize;
+            for river_deal in exact_runouts.all_river_deals() {
+                value_sum += terminal_value(
                     kind,
                     contributions,
                     river_deal,
@@ -588,10 +812,49 @@ fn terminal_or_exact_river_value(
                     num_players,
                     rake_rate,
                     rake_cap,
-                )
-            })
-            .sum::<f64>();
-        return value_sum / exact_river_runouts.len() as f64;
+                );
+                count += 1;
+            }
+            if count > 0 {
+                return value_sum / count as f64;
+            }
+        }
+
+        if let Some(river_deals) = exact_runouts.river_deals_for_turn(deal.deal.board[3]) {
+            let value_sum = river_deals
+                .iter()
+                .map(|river_deal| {
+                    terminal_value(
+                        kind,
+                        contributions,
+                        river_deal,
+                        traverser,
+                        num_players,
+                        rake_rate,
+                        rake_cap,
+                    )
+                })
+                .sum::<f64>();
+            return value_sum / river_deals.len() as f64;
+        }
+
+        let mut value_sum = 0.0;
+        let mut count = 0usize;
+        for river_deal in exact_runouts.all_river_deals() {
+            value_sum += terminal_value(
+                kind,
+                contributions,
+                river_deal,
+                traverser,
+                num_players,
+                rake_rate,
+                rake_cap,
+            );
+            count += 1;
+        }
+        if count > 0 {
+            return value_sum / count as f64;
+        }
     }
 
     terminal_value(
@@ -605,13 +868,21 @@ fn terminal_or_exact_river_value(
     )
 }
 
+fn sampled_prefix_street(chance_mode: MpChanceContinuationMode) -> Street {
+    match chance_mode {
+        MpChanceContinuationMode::SampledFullDeal => Street::River,
+        MpChanceContinuationMode::SampledTurnExactRiver => Street::Turn,
+        MpChanceContinuationMode::SampledFlopExactTurnRiver => Street::Flop,
+    }
+}
+
 fn traverse_traverser(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
-    exact_river_runouts: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
     chance_mode: MpChanceContinuationMode,
-    river_resolved: bool,
+    resolved_street: Street,
     traverser: Seat,
     state: LazyPublicState,
     history: LazyHistory,
@@ -684,9 +955,9 @@ fn traverse_traverser(
             game,
             storage,
             deal,
-            exact_river_runouts,
+            exact_runouts,
             chance_mode,
-            river_resolved,
+            resolved_street,
             traverser,
             child,
             child_history,
@@ -731,9 +1002,9 @@ fn traverse_opponent(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
-    exact_river_runouts: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
     chance_mode: MpChanceContinuationMode,
-    river_resolved: bool,
+    resolved_street: Street,
     traverser: Seat,
     state: LazyPublicState,
     history: LazyHistory,
@@ -791,9 +1062,9 @@ fn traverse_opponent(
         game,
         storage,
         deal,
-        exact_river_runouts,
+        exact_runouts,
         chance_mode,
-        river_resolved,
+        resolved_street,
         traverser,
         apply_action(state, actions[sampled]),
         child_history,
@@ -2078,7 +2349,7 @@ mod tests {
             &game,
             &storage,
             &buckets,
-            &[],
+            &ExactChanceRunouts::default(),
             MpChanceContinuationMode::SampledFullDeal,
             Seat::from_raw(0),
             &mut rng,
@@ -2109,7 +2380,7 @@ mod tests {
             &game,
             &storage,
             &buckets,
-            &[],
+            &ExactChanceRunouts::default(),
             MpChanceContinuationMode::SampledFullDeal,
             Seat::from_raw(1),
             &mut rng,
@@ -2303,7 +2574,7 @@ mod tests {
             &game,
             &storage,
             &buckets,
-            &[],
+            &ExactChanceRunouts::default(),
             MpChanceContinuationMode::SampledFullDeal,
             root.to_act,
             &mut rng,
@@ -2350,7 +2621,7 @@ mod tests {
             &game,
             &storage,
             &buckets,
-            &[],
+            &ExactChanceRunouts::default(),
             MpChanceContinuationMode::SampledFullDeal,
             Seat::from_raw((root.to_act.index() + 1) % root.num_players),
             &mut rng,

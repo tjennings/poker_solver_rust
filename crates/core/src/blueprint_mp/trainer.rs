@@ -42,7 +42,10 @@ use super::config::{
     MpTrainingConfig,
 };
 use super::game_tree::MpGameTree;
-use super::lazy_mccfr::{LazyMpGame, NegativeActionTraversalConfig, traverse_external_lazy};
+use super::lazy_mccfr::{
+    ExactChanceRunouts, ExactTurnRunout, LazyMpGame, NegativeActionTraversalConfig,
+    traverse_external_lazy,
+};
 use super::mccfr::{sample_deal, traverse_external};
 use super::sparse_storage::SparseMpStorage;
 use super::storage::{MpStorage, REGRET_SCALE};
@@ -449,8 +452,8 @@ fn run_lazy_batch(
 
             let bucket_started = Instant::now();
             let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
-            let exact_river_runouts =
-                exact_river_runouts_for_deal(&deal, all_buckets, bucket_counts, chance_mode);
+            let exact_runouts =
+                exact_chance_runouts_for_deal(&deal, all_buckets, bucket_counts, chance_mode);
             let bucket_nanos = nanos_since(bucket_started);
 
             let mut local = PruneStats::default();
@@ -464,7 +467,7 @@ fn run_lazy_batch(
                     game,
                     storage,
                     &buckets,
-                    &exact_river_runouts,
+                    &exact_runouts,
                     chance_mode,
                     Seat::from_raw(traverser),
                     &mut rng,
@@ -709,37 +712,75 @@ fn compute_deal_buckets(
     }
 }
 
-fn exact_river_runouts_for_deal(
+fn exact_chance_runouts_for_deal(
     deal: &Deal,
     all_buckets: &AllBuckets,
     bucket_counts: [u16; 4],
     chance_mode: MpChanceContinuationMode,
-) -> Vec<DealWithBuckets> {
-    if chance_mode != MpChanceContinuationMode::SampledTurnExactRiver {
-        return Vec::new();
+) -> ExactChanceRunouts {
+    match chance_mode {
+        MpChanceContinuationMode::SampledFullDeal => ExactChanceRunouts::default(),
+        MpChanceContinuationMode::SampledTurnExactRiver => {
+            let turn_deal = compute_deal_buckets(deal, all_buckets, bucket_counts);
+            let river_deals =
+                legal_river_deals_for_turn_prefix(deal, all_buckets, bucket_counts, deal.board[3]);
+            ExactChanceRunouts {
+                turns: vec![ExactTurnRunout {
+                    turn: deal.board[3],
+                    turn_deal,
+                    river_deals,
+                }],
+            }
+        }
+        MpChanceContinuationMode::SampledFlopExactTurnRiver => {
+            let turns = full_deck()
+                .into_iter()
+                .filter(|card| !deal_uses_hole_or_board_prefix(deal, *card, 3))
+                .filter_map(|turn| {
+                    let river_deals =
+                        legal_river_deals_for_turn_prefix(deal, all_buckets, bucket_counts, turn);
+                    let turn_deal = river_deals.first().cloned()?;
+                    Some(ExactTurnRunout {
+                        turn,
+                        turn_deal,
+                        river_deals,
+                    })
+                })
+                .collect();
+            ExactChanceRunouts { turns }
+        }
     }
+}
 
+fn legal_river_deals_for_turn_prefix(
+    deal: &Deal,
+    all_buckets: &AllBuckets,
+    bucket_counts: [u16; 4],
+    turn: Card,
+) -> Vec<DealWithBuckets> {
     full_deck()
         .into_iter()
-        .filter(|card| !deal_prefix_uses_card(deal, *card))
+        .filter(|card| !deal_uses_hole_or_board_prefix(deal, *card, 3) && *card != turn)
         .map(|river| {
             let mut river_deal = deal.clone();
+            river_deal.board[3] = turn;
             river_deal.board[4] = river;
             compute_deal_buckets(&river_deal, all_buckets, bucket_counts)
         })
         .collect()
 }
 
-fn deal_prefix_uses_card(deal: &Deal, card: Card) -> bool {
+fn deal_uses_hole_or_board_prefix(deal: &Deal, card: Card, board_len: usize) -> bool {
     deal.hole_cards
         .iter()
         .take(deal.num_players as usize)
         .flatten()
         .any(|used| *used == card)
-        || deal.board[..4].iter().any(|used| *used == card)
+        || deal.board[..board_len].iter().any(|used| *used == card)
 }
 
 /// Trivial fallback bucketing (for tests without cluster files).
+#[cfg(test)]
 fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuckets {
     use crate::hands::CanonicalHand;
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
@@ -987,6 +1028,18 @@ mod tests {
         assert_eq!(result.meta_iterations, 1);
     }
 
+    #[timed_test(10)]
+    fn lazy_train_sampled_flop_exact_turn_river_completes() {
+        let mut config = toy_config(2, 1);
+        config.training.batch_size = 1;
+        config.training.chance_continuation_mode =
+            MpChanceContinuationMode::SampledFlopExactTurnRiver;
+
+        let result = train_blueprint_mp_lazy(&config);
+
+        assert_eq!(result.meta_iterations, 1);
+    }
+
     #[timed_test]
     fn lazy_timing_snapshot_tracks_compute_components() {
         let _ = take_lazy_mp_timing_snapshot();
@@ -1227,19 +1280,21 @@ mod tests {
         let mut all_buckets = AllBuckets::new(counts, [None, None, None, None]);
         all_buckets.equity_fallback = true;
 
-        let runouts = exact_river_runouts_for_deal(
+        let runouts = exact_chance_runouts_for_deal(
             &deal,
             &all_buckets,
             counts,
             MpChanceContinuationMode::SampledTurnExactRiver,
         );
 
-        assert_eq!(runouts.len(), 36);
-        let mut rivers = Vec::with_capacity(runouts.len());
-        for runout in runouts {
+        assert_eq!(runouts.turns.len(), 1);
+        assert_eq!(runouts.turns[0].turn, deal.board[3]);
+        assert_eq!(runouts.turns[0].river_deals.len(), 36);
+        let mut rivers = Vec::with_capacity(runouts.turns[0].river_deals.len());
+        for runout in &runouts.turns[0].river_deals {
             assert_eq!(runout.deal.board[..4], deal.board[..4]);
             let river = runout.deal.board[4];
-            assert!(!deal_prefix_uses_card(&deal, river));
+            assert!(!deal_uses_hole_or_board_prefix(&deal, river, 4));
             assert!(!rivers.contains(&river));
             rivers.push(river);
             for seat in 0..deal.num_players as usize {
@@ -1247,13 +1302,58 @@ mod tests {
             }
         }
 
-        let sampled = exact_river_runouts_for_deal(
+        let sampled = exact_chance_runouts_for_deal(
             &deal,
             &all_buckets,
             counts,
             MpChanceContinuationMode::SampledFullDeal,
         );
-        assert!(sampled.is_empty());
+        assert!(sampled.turns.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn exact_chance_runouts_enumerate_legal_turn_rivers_for_flop_prefix() {
+        let mut rng = SmallRng::seed_from_u64(0xC0FF_EE17);
+        let deal = sample_deal(6, &mut rng);
+        let counts = [10u16, 10, 10, 10];
+        let mut all_buckets = AllBuckets::new(counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        let runouts = exact_chance_runouts_for_deal(
+            &deal,
+            &all_buckets,
+            counts,
+            MpChanceContinuationMode::SampledFlopExactTurnRiver,
+        );
+
+        assert_eq!(runouts.turns.len(), 37);
+        let mut turns = Vec::with_capacity(runouts.turns.len());
+        let mut total_rivers = 0usize;
+        for turn_runout in &runouts.turns {
+            let turn = turn_runout.turn;
+            assert!(!deal_uses_hole_or_board_prefix(&deal, turn, 3));
+            assert!(!turns.contains(&turn));
+            turns.push(turn);
+            assert_eq!(turn_runout.river_deals.len(), 36);
+            assert_eq!(turn_runout.turn_deal.deal.board[3], turn);
+            total_rivers += turn_runout.river_deals.len();
+
+            let mut rivers = Vec::with_capacity(turn_runout.river_deals.len());
+            for runout in &turn_runout.river_deals {
+                assert_eq!(runout.deal.board[..3], deal.board[..3]);
+                assert_eq!(runout.deal.board[3], turn);
+                let river = runout.deal.board[4];
+                assert_ne!(river, turn);
+                assert!(!deal_uses_hole_or_board_prefix(&deal, river, 3));
+                assert!(!rivers.contains(&river));
+                rivers.push(river);
+                for seat in 0..deal.num_players as usize {
+                    assert!(runout.buckets[seat][Street::Turn.index()].0 < counts[2]);
+                    assert!(runout.buckets[seat][Street::River.index()].0 < counts[3]);
+                }
+            }
+        }
+        assert_eq!(total_rivers, 1_332);
     }
 
     // -- apply_dcfr_discount tests --

@@ -663,7 +663,7 @@ When enabled, the opponent traversal uses learned baselines to reduce sampling v
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `chance_continuation_mode` | `sampled_full_deal` | Lazy MP chance-continuation mode. `sampled_full_deal` samples a complete board up front; `sampled_turn_exact_river` samples through the turn and averages values over all legal rivers at river chance/showdown boundaries |
+| `chance_continuation_mode` | `sampled_full_deal` | Lazy MP chance-continuation mode. `sampled_full_deal` samples a complete board up front; `sampled_turn_exact_river` samples through the turn and averages values over all legal rivers at river chance/showdown boundaries; `sampled_flop_exact_turn_river` samples through the flop and averages over all legal turn/river continuations |
 | `lcfr_warmup_iterations` | `0` | Iterations before discounting starts |
 | `lcfr_discount_interval` | `1` | Iterations between discount applications |
 | `prune_after_iterations` | `0` | Warmup boundary before opt-in MP traversal pruning and negative-action subtree purge can start |

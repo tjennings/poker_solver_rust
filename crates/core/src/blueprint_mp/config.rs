@@ -237,6 +237,8 @@ pub enum MpChanceContinuationMode {
     SampledFullDeal,
     /// Sample through the turn, then average values over all legal rivers.
     SampledTurnExactRiver,
+    /// Sample through the flop, then average values over all legal turn/river runouts.
+    SampledFlopExactTurnRiver,
 }
 
 /// Strategy for identifying negative-action subtrees eligible for purge.
@@ -843,6 +845,17 @@ chance_continuation_mode: sampled_turn_exact_river
         assert_eq!(
             cfg.chance_continuation_mode,
             MpChanceContinuationMode::SampledTurnExactRiver
+        );
+
+        let yaml = r#"
+chance_continuation_mode: sampled_flop_exact_turn_river
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse flop exact continuation mode");
+
+        assert_eq!(
+            cfg.chance_continuation_mode,
+            MpChanceContinuationMode::SampledFlopExactTurnRiver
         );
     }
 
