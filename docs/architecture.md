@@ -208,6 +208,15 @@ The current `blueprint_mp` backend eagerly materializes the full public betting 
 
 ### Lazy Sparse Negative-Action Purge
 
+Lazy sparse MP training supports an opt-in sampled-prefix chance continuation
+mode via `training.chance_continuation_mode`. The default `sampled_full_deal`
+keeps the original full-board sampling behavior. `sampled_turn_exact_river`
+samples private cards, flop, and turn as usual, precomputes every legal river
+runout for that sampled turn prefix, and averages values over those river
+runouts at turn-to-river chance boundaries and pre-river showdown terminals.
+Regret updates use the averaged value, not the sum, so DCFR and pruning
+thresholds remain on the same scale as sampled training.
+
 The negative-action subtree purge is an opt-in experiment layered on the lazy sparse backend. It is not part of eager `blueprint_mp` storage, and it remains inactive until the configured warmup boundary (`meta_iter >= prune_after_iterations`). Ordinary regret-threshold traversal pruning is also opt-in via `traversal_pruning_enabled`; it only skips eligible traverser-side action branches for a batch and does not physically remove sparse rows or strategy sums. During post-warmup traversal, aggressive action edges can be gated by cumulative regret when the negative-action experiment is enabled. Passive actions (`Fold`, `Check`, `Call`, and all-in calls that do not increase the current max bet) are never persistent subtree-purge candidates, because their child histories can contain other players' future decisions. If an aggressive parent action regret drops below `negative_action_prune_below`, the edge is inserted into a sharded blocked-edge set with its packed child action-history prefix. Traversal skips blocked aggressive edges before child allocation, but it does not physically delete already visited descendant rows during ordinary traversal.
 
 Physical purge runs immediately after lazy DCFR discounting. The boundary sweep scans the currently blocked edge set, rereads each parent action regret after discounting, and gives DCFR the first chance to soften or reactivate the edge. Edges whose regret reaches `negative_action_reactivate_at` are removed from the blocked set without deleting their child subtree. Remaining blocked child prefixes are batched into one sparse-storage scan for the discount boundary; matching rows at or below any stored child prefix are removed, preserving sibling histories while dropping already visited descendants below blocked actions.

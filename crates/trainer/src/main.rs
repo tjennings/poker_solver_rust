@@ -4872,6 +4872,8 @@ snapshots:
             },
             training: MpTrainingConfig {
                 backend: MpTrainingBackend::Eager,
+                chance_continuation_mode:
+                    poker_solver_core::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
                 cluster_path: None,
                 iterations: Some(1),
                 time_limit_minutes: None,

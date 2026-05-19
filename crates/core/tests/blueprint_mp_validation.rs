@@ -100,6 +100,7 @@ fn build_full_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
     };
     let training = MpTrainingConfig {
         backend: MpTrainingBackend::Eager,
+        chance_continuation_mode: MpChanceContinuationMode::SampledFullDeal,
         cluster_path: None,
         iterations: Some(iterations),
         time_limit_minutes: None,

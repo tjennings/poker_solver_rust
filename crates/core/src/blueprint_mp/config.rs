@@ -163,6 +163,8 @@ pub struct MpStreetCluster {
 pub struct MpTrainingConfig {
     #[serde(default = "default_training_backend")]
     pub backend: MpTrainingBackend,
+    #[serde(default = "default_chance_continuation_mode")]
+    pub chance_continuation_mode: MpChanceContinuationMode,
     #[serde(default)]
     pub cluster_path: Option<String>,
     #[serde(default)]
@@ -227,6 +229,16 @@ pub enum MpTrainingBackend {
     LazySparse,
 }
 
+/// Chance sampling/averaging mode for lazy MP training.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MpChanceContinuationMode {
+    /// Current behavior: sample a full board up front.
+    SampledFullDeal,
+    /// Sample through the turn, then average values over all legal rivers.
+    SampledTurnExactRiver,
+}
+
 /// Strategy for identifying negative-action subtrees eligible for purge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +265,10 @@ pub struct MpSnapshotConfig {
 
 const fn default_training_backend() -> MpTrainingBackend {
     MpTrainingBackend::Eager
+}
+
+const fn default_chance_continuation_mode() -> MpChanceContinuationMode {
+    MpChanceContinuationMode::SampledFullDeal
 }
 
 const fn default_lcfr_warmup() -> u64 {
@@ -789,6 +805,10 @@ snapshots:
         let cfg: MpTrainingConfig =
             serde_yaml::from_str(yaml).expect("failed to parse empty training");
 
+        assert_eq!(
+            cfg.chance_continuation_mode,
+            MpChanceContinuationMode::SampledFullDeal
+        );
         assert_eq!(cfg.lcfr_warmup_iterations, 5_000_000);
         assert_eq!(cfg.lcfr_discount_interval, 500_000);
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
@@ -810,6 +830,20 @@ snapshots:
         assert!((cfg.purify_threshold).abs() < f64::EPSILON);
         assert_eq!(cfg.exploitability_interval_minutes, 0);
         assert_eq!(cfg.exploitability_samples, 100_000);
+    }
+
+    #[timed_test]
+    fn training_chance_continuation_mode_parses() {
+        let yaml = r#"
+chance_continuation_mode: sampled_turn_exact_river
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse chance continuation mode");
+
+        assert_eq!(
+            cfg.chance_continuation_mode,
+            MpChanceContinuationMode::SampledTurnExactRiver
+        );
     }
 
     #[timed_test]

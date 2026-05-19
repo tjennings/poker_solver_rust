@@ -37,7 +37,10 @@ use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
 use super::MAX_PLAYERS;
-use super::config::{BlueprintMpConfig, MpGameConfig, MpNegativeActionPurgeMode, MpTrainingConfig};
+use super::config::{
+    BlueprintMpConfig, MpChanceContinuationMode, MpGameConfig, MpNegativeActionPurgeMode,
+    MpTrainingConfig,
+};
 use super::game_tree::MpGameTree;
 use super::lazy_mccfr::{LazyMpGame, NegativeActionTraversalConfig, traverse_external_lazy};
 use super::mccfr::{sample_deal, traverse_external};
@@ -46,6 +49,7 @@ use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
 use crate::blueprint_v2::mccfr::AllBuckets;
 use crate::blueprint_v2::trainer::load_bucket_files;
+use crate::poker::{Card, full_deck};
 
 /// Result of a training run.
 pub struct TrainResult {
@@ -330,6 +334,7 @@ fn training_loop_lazy(
             prune,
             scaled_threshold,
             negative_action,
+            config.chance_continuation_mode,
         );
         meta_iter += batch;
         iterations.store(meta_iter, Ordering::Relaxed);
@@ -424,6 +429,7 @@ fn run_lazy_batch(
     prune: bool,
     prune_threshold: i32,
     negative_action: NegativeActionTraversalConfig,
+    chance_mode: MpChanceContinuationMode,
 ) {
     use super::mccfr::PruneStats;
     let batch_started = Instant::now();
@@ -443,6 +449,8 @@ fn run_lazy_batch(
 
             let bucket_started = Instant::now();
             let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
+            let exact_river_runouts =
+                exact_river_runouts_for_deal(&deal, all_buckets, bucket_counts, chance_mode);
             let bucket_nanos = nanos_since(bucket_started);
 
             let mut local = PruneStats::default();
@@ -456,6 +464,8 @@ fn run_lazy_batch(
                     game,
                     storage,
                     &buckets,
+                    &exact_river_runouts,
+                    chance_mode,
                     Seat::from_raw(traverser),
                     &mut rng,
                     rake_rate,
@@ -699,6 +709,36 @@ fn compute_deal_buckets(
     }
 }
 
+fn exact_river_runouts_for_deal(
+    deal: &Deal,
+    all_buckets: &AllBuckets,
+    bucket_counts: [u16; 4],
+    chance_mode: MpChanceContinuationMode,
+) -> Vec<DealWithBuckets> {
+    if chance_mode != MpChanceContinuationMode::SampledTurnExactRiver {
+        return Vec::new();
+    }
+
+    full_deck()
+        .into_iter()
+        .filter(|card| !deal_prefix_uses_card(deal, *card))
+        .map(|river| {
+            let mut river_deal = deal.clone();
+            river_deal.board[4] = river;
+            compute_deal_buckets(&river_deal, all_buckets, bucket_counts)
+        })
+        .collect()
+}
+
+fn deal_prefix_uses_card(deal: &Deal, card: Card) -> bool {
+    deal.hole_cards
+        .iter()
+        .take(deal.num_players as usize)
+        .flatten()
+        .any(|used| *used == card)
+        || deal.board[..4].iter().any(|used| *used == card)
+}
+
 /// Trivial fallback bucketing (for tests without cluster files).
 fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuckets {
     use crate::hands::CanonicalHand;
@@ -724,17 +764,20 @@ fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuck
 mod tests {
     use std::sync::atomic::Ordering;
 
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
     use test_macros::timed_test;
 
     use super::*;
     use crate::blueprint_mp::config::{
-        BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig,
-        MpGameConfig, MpNegativeActionPurgeMode, MpSnapshotConfig, MpStreetCluster, MpStreetSizes,
-        MpTrainingBackend, MpTrainingConfig,
+        BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig,
+        MpChanceContinuationMode, MpClusteringConfig, MpGameConfig, MpNegativeActionPurgeMode,
+        MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingBackend, MpTrainingConfig,
     };
     use crate::blueprint_mp::game_tree::MpGameTree;
     use crate::blueprint_mp::mccfr::sample_deal;
     use crate::blueprint_mp::storage::MpStorage;
+    use crate::blueprint_mp::types::Street;
 
     fn toy_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         let blinds = vec![
@@ -777,6 +820,8 @@ mod tests {
         };
         let training = MpTrainingConfig {
             backend: MpTrainingBackend::Eager,
+            chance_continuation_mode:
+                crate::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
             cluster_path: None,
             iterations: Some(iterations),
             time_limit_minutes: None,
@@ -839,6 +884,8 @@ mod tests {
     fn toy_training_config(iterations: u64) -> MpTrainingConfig {
         MpTrainingConfig {
             backend: MpTrainingBackend::Eager,
+            chance_continuation_mode:
+                crate::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
             cluster_path: None,
             iterations: Some(iterations),
             time_limit_minutes: None,
@@ -927,6 +974,17 @@ mod tests {
         let config = toy_config(2, 10);
         let result = train_blueprint_mp_lazy(&config);
         assert_eq!(result.meta_iterations, 10);
+    }
+
+    #[timed_test]
+    fn lazy_train_sampled_turn_exact_river_completes() {
+        let mut config = toy_config(2, 1);
+        config.training.batch_size = 1;
+        config.training.chance_continuation_mode = MpChanceContinuationMode::SampledTurnExactRiver;
+
+        let result = train_blueprint_mp_lazy(&config);
+
+        assert_eq!(result.meta_iterations, 1);
     }
 
     #[timed_test]
@@ -1159,6 +1217,43 @@ mod tests {
         let dwb = compute_buckets_trivial(&deal, counts);
         assert_eq!(dwb.deal.num_players, 3);
         assert_eq!(dwb.deal.board, deal.board);
+    }
+
+    #[timed_test]
+    fn exact_river_runouts_enumerate_legal_rivers_for_turn_prefix() {
+        let mut rng = SmallRng::seed_from_u64(0xE2AC_7A11);
+        let deal = sample_deal(6, &mut rng);
+        let counts = [10u16, 10, 10, 10];
+        let mut all_buckets = AllBuckets::new(counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        let runouts = exact_river_runouts_for_deal(
+            &deal,
+            &all_buckets,
+            counts,
+            MpChanceContinuationMode::SampledTurnExactRiver,
+        );
+
+        assert_eq!(runouts.len(), 36);
+        let mut rivers = Vec::with_capacity(runouts.len());
+        for runout in runouts {
+            assert_eq!(runout.deal.board[..4], deal.board[..4]);
+            let river = runout.deal.board[4];
+            assert!(!deal_prefix_uses_card(&deal, river));
+            assert!(!rivers.contains(&river));
+            rivers.push(river);
+            for seat in 0..deal.num_players as usize {
+                assert!(runout.buckets[seat][Street::River.index()].0 < counts[3]);
+            }
+        }
+
+        let sampled = exact_river_runouts_for_deal(
+            &deal,
+            &all_buckets,
+            counts,
+            MpChanceContinuationMode::SampledFullDeal,
+        );
+        assert!(sampled.is_empty());
     }
 
     // -- apply_dcfr_discount tests --
