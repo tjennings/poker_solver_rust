@@ -3,6 +3,7 @@ use rand_chacha::ChaCha8Rng;
 
 /// Configuration for a single comparison test.
 pub struct TestConfig {
+    pub name: String,
     pub oop_range: String,
     pub ip_range: String,
     pub flop: [u8; 3],
@@ -17,6 +18,8 @@ pub struct TestConfig {
 /// Collected results from a solve for comparison.
 pub struct SolveResult {
     pub exploitability: f32,
+    pub private_hand_counts: [usize; 2],
+    pub root_actions: Vec<String>,
     pub root_strategy: Vec<f32>,
     pub ev_oop: Vec<f32>,
     pub ev_ip: Vec<f32>,
@@ -84,6 +87,7 @@ pub fn generate_configs(n: usize, seed: u64) -> Vec<TestConfig> {
         raise_pcts.dedup();
 
         configs.push(TestConfig {
+            name: format!("random_mixed_{:04}", configs.len()),
             oop_range,
             ip_range,
             flop: flop_arr,
@@ -131,6 +135,7 @@ pub fn generate_river_configs(n: usize, seed: u64) -> Vec<TestConfig> {
         raise_pcts.dedup();
 
         configs.push(TestConfig {
+            name: format!("random_river_{:04}", configs.len()),
             oop_range,
             ip_range,
             flop,
@@ -192,7 +197,11 @@ pub fn run_ours(config: &TestConfig, iterations: u32) -> SolveResult {
         (Some(_), Some(_)) => BoardState::River,
     };
 
-    let bet_sizes = BetSizeOptions::try_from((bet_str(&config.bet_pcts).as_str(), raise_str(&config.raise_pcts).as_str())).unwrap();
+    let bet_sizes = BetSizeOptions::try_from((
+        bet_str(&config.bet_pcts).as_str(),
+        raise_str(&config.raise_pcts).as_str(),
+    ))
+    .unwrap();
 
     let card_config = CardConfig {
         range: [
@@ -208,6 +217,12 @@ pub fn run_ours(config: &TestConfig, iterations: u32) -> SolveResult {
         initial_state,
         starting_pot: config.pot,
         effective_stack: config.stack,
+        initial_player: PLAYER_OOP,
+        initial_stacks: None,
+        initial_prev_action: Action::None,
+        initial_prev_amount: 0,
+        initial_amount: 0,
+        initial_num_bets: 0,
         rake_rate: 0.0,
         rake_cap: 0.0,
         flop_bet_sizes: [bet_sizes.clone(), bet_sizes.clone()],
@@ -225,6 +240,13 @@ pub fn run_ours(config: &TestConfig, iterations: u32) -> SolveResult {
     let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
     game.allocate_memory(false);
 
+    let private_hand_counts = [game.private_cards(0).len(), game.private_cards(1).len()];
+    let root_actions = game
+        .available_actions()
+        .iter()
+        .map(|action| format!("{action:?}"))
+        .collect();
+
     let exploitability = solve(&mut game, iterations, 0.0, false);
 
     game.cache_normalized_weights();
@@ -236,6 +258,8 @@ pub fn run_ours(config: &TestConfig, iterations: u32) -> SolveResult {
 
     SolveResult {
         exploitability,
+        private_hand_counts,
+        root_actions,
         root_strategy,
         ev_oop,
         ev_ip,
@@ -257,7 +281,11 @@ pub fn run_original(config: &TestConfig, iterations: u32) -> SolveResult {
         (Some(_), Some(_)) => BoardState::River,
     };
 
-    let bet_sizes = BetSizeOptions::try_from((bet_str(&config.bet_pcts).as_str(), raise_str(&config.raise_pcts).as_str())).unwrap();
+    let bet_sizes = BetSizeOptions::try_from((
+        bet_str(&config.bet_pcts).as_str(),
+        raise_str(&config.raise_pcts).as_str(),
+    ))
+    .unwrap();
 
     let card_config = CardConfig {
         range: [
@@ -283,12 +311,18 @@ pub fn run_original(config: &TestConfig, iterations: u32) -> SolveResult {
         add_allin_threshold: 1.5,
         force_allin_threshold: 0.15,
         merging_threshold: 0.1,
-        depth_limit: None,
     };
 
     let action_tree = ActionTree::new(tree_config).unwrap();
     let mut game = PostFlopGame::with_config(card_config, action_tree).unwrap();
     game.allocate_memory(false);
+
+    let private_hand_counts = [game.private_cards(0).len(), game.private_cards(1).len()];
+    let root_actions = game
+        .available_actions()
+        .iter()
+        .map(|action| format!("{action:?}"))
+        .collect();
 
     let exploitability = solve(&mut game, iterations, 0.0, false);
 
@@ -301,6 +335,8 @@ pub fn run_original(config: &TestConfig, iterations: u32) -> SolveResult {
 
     SolveResult {
         exploitability,
+        private_hand_counts,
+        root_actions,
         root_strategy,
         ev_oop,
         ev_ip,
