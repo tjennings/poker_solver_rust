@@ -1,14 +1,14 @@
 ---
 # poker_solver_rust-84f8
 title: Low-SPR 4-bet flop parity smoke for range-solver-compare
-status: in-progress
+status: completed
 type: task
 priority: high
 tags:
     - range-solver
     - compare
 created_at: 2026-05-19T15:46:05Z
-updated_at: 2026-05-19T16:04:21Z
+updated_at: 2026-05-19T16:04:46Z
 ---
 
 Add deterministic low-SPR 4-bet flop parity smoke coverage to the range-solver-compare harness.
@@ -21,4 +21,8 @@ Checklist:
 - [x] Dispatch review before integration. Review found no issues.
 - [x] Integrate accepted changes into the feature branch. Commit `3080422a` adds low-SPR flop parity smoke coverage.
 - [x] Run flop smoke compare tests and existing turn/river compare smoke tests. Full-suite performance gate skipped for this session by user request. Verified targeted flop, turn, river, and 50-river identity compare tests under scoped `RUSTFLAGS`; scratch variance report showed no structural variance and zero numeric deltas at reported precision.
-- [ ] Complete the bean and commit the final tracking update.
+- [x] Complete the bean and commit the final tracking update.
+
+## Summary of Changes
+
+Added Part 3 low-SPR 4-bet flop parity smoke coverage to `crates/range-solver-compare/tests/identity.rs`. The new smoke uses two deterministic flop-root proxy spots with large pots, small stacks, narrow ranges, one bet size, one raise size, and 20 solve iterations. It reuses the shared structural/numeric smoke comparator from the river and turn slices. Targeted compare verification passed for flop, turn, river, and 50-river identity under scoped `RUSTFLAGS='-A dangerous-implicit-autorefs'`. Full-suite timing was intentionally skipped for this session at user request because a training run was active.
