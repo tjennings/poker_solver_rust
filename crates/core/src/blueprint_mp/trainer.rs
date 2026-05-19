@@ -350,13 +350,16 @@ fn training_loop_lazy(
 
 /// Determine whether the current batch should use ordinary traversal pruning.
 ///
-/// This is deliberately disabled for multiplayer training. The old
-/// regret-threshold traversal gate could prune almost all MP branches once
-/// rows became deterministic, starving later re-entry and corrupting average
-/// strategies. `prune_after_iterations` still gates the explicit
-/// negative-action subtree purge experiment.
-fn should_prune(_meta_iter: u64, _config: &MpTrainingConfig, _rng: &mut impl Rng) -> bool {
-    false
+/// This only skips eligible traverser-side action branches for the current
+/// batch; it does not physically remove sparse rows or strategy sums. Keep it
+/// opt-in because the previous always-on MP traversal-pruning path could starve
+/// branches when configured too aggressively.
+fn should_prune(meta_iter: u64, config: &MpTrainingConfig, rng: &mut impl Rng) -> bool {
+    if !config.traversal_pruning_enabled || meta_iter < config.prune_after_iterations {
+        return false;
+    }
+    let explore: f64 = rng.random();
+    explore >= config.prune_explore_pct
 }
 
 fn run_batch(
@@ -780,6 +783,7 @@ mod tests {
             lcfr_warmup_iterations: 0,
             lcfr_discount_interval: 50,
             prune_after_iterations: 1_000_000,
+            traversal_pruning_enabled: false,
             prune_threshold: -250,
             prune_explore_pct: 0.05,
             negative_action_subtree_purge_enabled: false,
@@ -841,6 +845,7 @@ mod tests {
             lcfr_warmup_iterations: 100,
             lcfr_discount_interval: 50,
             prune_after_iterations: 1_000_000,
+            traversal_pruning_enabled: false,
             prune_threshold: -250,
             prune_explore_pct: 0.05,
             negative_action_subtree_purge_enabled: false,
@@ -1021,8 +1026,19 @@ mod tests {
     }
 
     #[timed_test]
+    fn should_prune_true_after_warmup_when_enabled_no_explore() {
+        let mut config = toy_training_config(1000);
+        config.traversal_pruning_enabled = true;
+        config.prune_after_iterations = 100;
+        config.prune_explore_pct = 0.0;
+        let mut rng = SmallRng::seed_from_u64(42);
+        assert!(should_prune(200, &config, &mut rng));
+    }
+
+    #[timed_test]
     fn should_prune_false_when_explore_pct_is_one() {
         let mut config = toy_training_config(1000);
+        config.traversal_pruning_enabled = true;
         config.prune_after_iterations = 0;
         config.prune_explore_pct = 1.0; // explore_pct=1 => never prune
         let mut rng = SmallRng::seed_from_u64(42);

@@ -34,17 +34,16 @@ action_abstraction:
   flop:
     lead: [0.25, 0.50, 0.75]
     raise:
-      - [0.5, 1.0]
-      - [0.5, 1.0]
+      - [1.0]
+      - [1.0]
   turn:
     lead: [0.25, 0.50, 0.75]
     raise:
-      - [0.5, 1.0]
-      - [0.5, 1.0]
+      - [1.0]
+      - [1.0]
   river:
     lead: [0.25, 0.50, 0.75]
     raise:
-      - [0.5, 1.0, 1.5]
       - [0.5, 1.0, 1.5]
 
 training:
@@ -54,7 +53,8 @@ training:
   lcfr_discount_interval: 3000000
   lcfr_warmup_iterations: 3000000
   prune_after_iterations: 4000000
-  prune_threshold: -1
+  traversal_pruning_enabled: true
+  prune_threshold: -100
   prune_explore_pct: 0.0
   negative_action_subtree_purge_enabled: false
   negative_action_prune_below: -100

@@ -175,13 +175,20 @@ pub struct MpTrainingConfig {
     pub lcfr_discount_interval: u64,
     /// Warmup boundary for opt-in negative-action subtree purge.
     ///
-    /// Ordinary regret-threshold traversal pruning is disabled for MP training.
+    /// Ordinary regret-threshold traversal pruning also waits for this boundary
+    /// when `traversal_pruning_enabled` is true.
     #[serde(default = "default_prune_after")]
     pub prune_after_iterations: u64,
-    /// Legacy ordinary traversal-pruning threshold; currently ignored by MP training.
+    /// Opt in to ordinary regret-threshold traversal pruning.
+    ///
+    /// This skips eligible traverser-side action branches during a batch, but it
+    /// does not physically purge sparse rows or strategy sums.
+    #[serde(default)]
+    pub traversal_pruning_enabled: bool,
+    /// Ordinary traversal-pruning cumulative regret threshold.
     #[serde(default = "default_prune_threshold")]
     pub prune_threshold: i32,
-    /// Legacy ordinary traversal-pruning exploration rate; currently ignored by MP training.
+    /// Fraction of post-warmup batches that disable ordinary traversal pruning.
     #[serde(default = "default_prune_explore")]
     pub prune_explore_pct: f64,
     #[serde(default)]
@@ -785,6 +792,7 @@ snapshots:
         assert_eq!(cfg.lcfr_warmup_iterations, 5_000_000);
         assert_eq!(cfg.lcfr_discount_interval, 500_000);
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
+        assert!(!cfg.traversal_pruning_enabled);
         assert_eq!(cfg.prune_threshold, -250);
         assert!((cfg.prune_explore_pct - 0.05).abs() < f64::EPSILON);
         assert!(!cfg.negative_action_subtree_purge_enabled);
@@ -822,6 +830,23 @@ negative_action_purge_mode: scan_history_prefix
             cfg.negative_action_purge_mode,
             MpNegativeActionPurgeMode::ScanHistoryPrefix
         );
+    }
+
+    #[timed_test]
+    fn training_traversal_pruning_key_parses() {
+        let yaml = r#"
+traversal_pruning_enabled: true
+prune_after_iterations: 4000000
+prune_threshold: -100
+prune_explore_pct: 0.0
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse traversal pruning config");
+
+        assert!(cfg.traversal_pruning_enabled);
+        assert_eq!(cfg.prune_after_iterations, 4_000_000);
+        assert_eq!(cfg.prune_threshold, -100);
+        assert!((cfg.prune_explore_pct).abs() < f64::EPSILON);
     }
 
     #[timed_test]

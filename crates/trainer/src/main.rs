@@ -4878,6 +4878,7 @@ snapshots:
                 lcfr_warmup_iterations: 0,
                 lcfr_discount_interval: 50,
                 prune_after_iterations: 1_000_000,
+                traversal_pruning_enabled: false,
                 prune_threshold: -250,
                 prune_explore_pct: 0.05,
                 negative_action_subtree_purge_enabled: false,
