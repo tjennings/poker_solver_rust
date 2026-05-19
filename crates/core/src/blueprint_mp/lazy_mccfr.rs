@@ -1087,6 +1087,9 @@ fn update_strategy_sums(
     for (action_idx, prob) in strategy[..num_actions].iter().enumerate() {
         let raw = prob * STRATEGY_SCALE;
         let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+        if delta == 0 {
+            continue;
+        }
         storage.add_strategy_sum(key, num_actions, action_idx, delta);
     }
 }
@@ -2362,6 +2365,26 @@ mod tests {
 
         assert!(value.is_finite());
         assert!(storage.entry_count() > 0);
+    }
+
+    #[timed_test]
+    fn zero_strategy_sum_update_does_not_allocate_sparse_row() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let root = game.root_state();
+        let key = LazyHistory::default().key(root, 0);
+        let mut strategy = [0.0; MAX_ACTIONS];
+
+        update_strategy_sums(&storage, key, 2, &strategy);
+
+        assert_eq!(storage.entry_count(), 0);
+
+        strategy[0] = 1.0;
+        update_strategy_sums(&storage, key, 2, &strategy);
+
+        assert_eq!(storage.entry_count(), 1);
+        assert_eq!(storage.get_strategy_sum(key, 0), STRATEGY_SCALE as u64);
+        assert_eq!(storage.get_strategy_sum(key, 1), 0);
     }
 
     #[timed_test]
