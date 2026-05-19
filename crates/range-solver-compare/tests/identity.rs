@@ -4,6 +4,7 @@ use range_solver_compare::*;
 
 const RIVER_SMOKE_ITERATIONS: u32 = 200;
 const TURN_SMOKE_ITERATIONS: u32 = 50;
+const FLOP_SMOKE_ITERATIONS: u32 = 20;
 // Exploitability is a scalar f32 returned after a fixed deterministic solve.
 // 1e-4 chips is tight enough to catch solver drift while allowing harmless
 // floating-point accumulation differences across the two implementations.
@@ -32,6 +33,18 @@ fn turn_smoke_structural_and_numeric_parity() {
     for spot in &spots {
         let ours = run_ours(spot, TURN_SMOKE_ITERATIONS);
         let original = run_original(spot, TURN_SMOKE_ITERATIONS);
+        assert_smoke_parity(spot, &ours, &original);
+    }
+}
+
+/// Deterministic hand-authored low-SPR 4-bet flop spots.
+#[test]
+fn flop_smoke_structural_and_numeric_parity() {
+    let spots = flop_smoke_spots();
+
+    for spot in &spots {
+        let ours = run_ours(spot, FLOP_SMOKE_ITERATIONS);
+        let original = run_original(spot, FLOP_SMOKE_ITERATIONS);
         assert_smoke_parity(spot, &ours, &original);
     }
 }
@@ -301,6 +314,31 @@ fn turn_smoke_spots() -> Vec<TestConfig> {
     ]
 }
 
+fn flop_smoke_spots() -> Vec<TestConfig> {
+    vec![
+        flop_spot(
+            "four_bet_ak_high_low_spr",
+            "AA-QQ,AKs,AKo",
+            "QQ-TT,AKs,AQs,AKo",
+            "As7d2c",
+            420,
+            280,
+            vec![0.33],
+            vec![2.0],
+        ),
+        flop_spot(
+            "four_bet_paired_low_low_spr",
+            "AA-JJ,AKs,AKo",
+            "QQ-TT,AKs,AQs,KQs,AKo",
+            "8h8d3c",
+            360,
+            300,
+            vec![0.33],
+            vec![2.0],
+        ),
+    ]
+}
+
 fn river_spot(
     name: &str,
     oop_range: &str,
@@ -344,6 +382,30 @@ fn turn_spot(
         ip_range: ip_range.to_string(),
         flop: range_solver::card::flop_from_str(flop).unwrap(),
         turn: Some(range_solver::card::card_from_str(turn).unwrap()),
+        river: None,
+        pot,
+        stack,
+        bet_pcts,
+        raise_pcts,
+    }
+}
+
+fn flop_spot(
+    name: &str,
+    oop_range: &str,
+    ip_range: &str,
+    flop: &str,
+    pot: i32,
+    stack: i32,
+    bet_pcts: Vec<f64>,
+    raise_pcts: Vec<f64>,
+) -> TestConfig {
+    TestConfig {
+        name: name.to_string(),
+        oop_range: oop_range.to_string(),
+        ip_range: ip_range.to_string(),
+        flop: range_solver::card::flop_from_str(flop).unwrap(),
+        turn: None,
         river: None,
         pot,
         stack,
