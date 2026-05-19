@@ -154,8 +154,8 @@ impl BlueprintTuiMetrics {
     }
 
     pub fn request_snapshot(&self) {
-        self.snapshot_trigger.store(true, Ordering::Relaxed);
         self.set_snapshot_status(SnapshotStatus::Queued);
+        self.snapshot_trigger.store(true, Ordering::Release);
     }
 
     pub fn mark_snapshot_writing(&self) {
@@ -209,7 +209,7 @@ impl BlueprintTuiMetrics {
     /// Consume the snapshot trigger, returning `true` if it was set.
     #[allow(dead_code)]
     pub fn take_snapshot_trigger(&self) -> bool {
-        self.snapshot_trigger.swap(false, Ordering::Relaxed)
+        self.snapshot_trigger.swap(false, Ordering::Acquire)
     }
 
     /// Update the strategy snapshot for a scenario, computing the L1 delta
@@ -407,6 +407,9 @@ fn truncate_status_detail(detail: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use test_macros::timed_test;
 
     #[timed_test(10)]
@@ -502,6 +505,37 @@ mod tests {
         assert_eq!(
             m.snapshot_status_text().as_deref(),
             Some("snapshot: failed permission denied")
+        );
+    }
+
+    #[timed_test(10)]
+    fn request_snapshot_sets_status_before_publishing_trigger() {
+        let m = Arc::new(BlueprintTuiMetrics::new(None, None));
+        let status_guard = m.snapshot_status.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker_metrics = Arc::clone(&m);
+
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_metrics.request_snapshot();
+        });
+        started_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {
+            assert!(
+                !m.snapshot_trigger.load(Ordering::Acquire),
+                "snapshot trigger was published before queued status was stored"
+            );
+            thread::yield_now();
+        }
+
+        drop(status_guard);
+        worker.join().unwrap();
+        assert!(m.take_snapshot_trigger());
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: queued")
         );
     }
 
