@@ -3,6 +3,7 @@ use std::time::Instant;
 use range_solver_compare::*;
 
 const RIVER_SMOKE_ITERATIONS: u32 = 200;
+const TURN_SMOKE_ITERATIONS: u32 = 50;
 // Exploitability is a scalar f32 returned after a fixed deterministic solve.
 // 1e-4 chips is tight enough to catch solver drift while allowing harmless
 // floating-point accumulation differences across the two implementations.
@@ -19,7 +20,19 @@ fn river_smoke_structural_and_numeric_parity() {
     for spot in &spots {
         let ours = run_ours(spot, RIVER_SMOKE_ITERATIONS);
         let original = run_original(spot, RIVER_SMOKE_ITERATIONS);
-        assert_river_smoke_parity(spot, &ours, &original);
+        assert_smoke_parity(spot, &ours, &original);
+    }
+}
+
+/// Deterministic hand-authored turn spots covering structural and numeric parity.
+#[test]
+fn turn_smoke_structural_and_numeric_parity() {
+    let spots = turn_smoke_spots();
+
+    for spot in &spots {
+        let ours = run_ours(spot, TURN_SMOKE_ITERATIONS);
+        let original = run_original(spot, TURN_SMOKE_ITERATIONS);
+        assert_smoke_parity(spot, &ours, &original);
     }
 }
 
@@ -190,15 +203,22 @@ fn test_performance_parity() {
 }
 
 fn config_summary(config: &TestConfig) -> String {
-    let street = match (config.turn, config.river) {
+    format!(
+        "{} {} pot={} stack={} bets={:?}",
+        config.name,
+        street_name(config),
+        config.pot,
+        config.stack,
+        config.bet_pcts
+    )
+}
+
+fn street_name(config: &TestConfig) -> &'static str {
+    match (config.turn, config.river) {
         (None, _) => "flop",
         (Some(_), None) => "turn",
         (Some(_), Some(_)) => "river",
-    };
-    format!(
-        "{} {} pot={} stack={} bets={:?}",
-        config.name, street, config.pot, config.stack, config.bet_pcts
-    )
+    }
 }
 
 fn river_smoke_spots() -> Vec<TestConfig> {
@@ -254,6 +274,33 @@ fn river_smoke_spots() -> Vec<TestConfig> {
     ]
 }
 
+fn turn_smoke_spots() -> Vec<TestConfig> {
+    vec![
+        turn_spot(
+            "turn_monotone_broadway_iso",
+            "AA-QQ,AKs,AQs,KQs,AKo",
+            "JJ-99,AQs-AJs,KQs,QJs,JTs,AQo,KQo",
+            "AhKhQh",
+            "2c",
+            120,
+            900,
+            vec![0.50],
+            vec![2.5],
+        ),
+        turn_spot(
+            "turn_paired_double_broadway",
+            "AA-99,AQs,KQs,QJs,AQo,KQo",
+            "JJ-66,AQs-ATs,KQs-KTs,QJs,JTs,AQo,KQo,QJo",
+            "QsQd7h",
+            "2c",
+            180,
+            720,
+            vec![0.33],
+            vec![2.5],
+        ),
+    ]
+}
+
 fn river_spot(
     name: &str,
     oop_range: &str,
@@ -280,7 +327,32 @@ fn river_spot(
     }
 }
 
-fn assert_river_smoke_parity(spot: &TestConfig, ours: &SolveResult, original: &SolveResult) {
+fn turn_spot(
+    name: &str,
+    oop_range: &str,
+    ip_range: &str,
+    flop: &str,
+    turn: &str,
+    pot: i32,
+    stack: i32,
+    bet_pcts: Vec<f64>,
+    raise_pcts: Vec<f64>,
+) -> TestConfig {
+    TestConfig {
+        name: name.to_string(),
+        oop_range: oop_range.to_string(),
+        ip_range: ip_range.to_string(),
+        flop: range_solver::card::flop_from_str(flop).unwrap(),
+        turn: Some(range_solver::card::card_from_str(turn).unwrap()),
+        river: None,
+        pot,
+        stack,
+        bet_pcts,
+        raise_pcts,
+    }
+}
+
+fn assert_smoke_parity(spot: &TestConfig, ours: &SolveResult, original: &SolveResult) {
     let mut failures = Vec::new();
 
     compare_private_hand_counts(spot, ours, original, &mut failures);
@@ -338,7 +410,8 @@ fn assert_river_smoke_parity(spot: &TestConfig, ours: &SolveResult, original: &S
 
     assert!(
         failures.is_empty(),
-        "river smoke parity failed:\n{}",
+        "{} smoke parity failed:\n{}",
+        street_name(spot),
         failures.join("\n")
     );
 }
