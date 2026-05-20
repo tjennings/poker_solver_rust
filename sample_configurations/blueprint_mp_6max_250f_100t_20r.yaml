@@ -80,6 +80,7 @@ tui:
   telemetry:
     strategy_delta_interval_seconds: 120
     sparkline_window: 60
+  strategy_probe_hands: ["A2s", "A3s", "A4s", "A5s", "ATs", "AJs", "AQs", "K9s", "22", "72o"]
   scenarios:
     - name: "UTG open"
       spot: ""
@@ -93,3 +94,7 @@ tui:
       spot: "utg:fold,hj:fold,co:fold,btn:fold"
     - name: "BB vs limp"
       spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:call"
+    - name: "BTN vs CO"
+      spot: "utg:fold,hj:fold,co:5bb"
+    - name: "BB vs SB"
+      spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:5bb"
