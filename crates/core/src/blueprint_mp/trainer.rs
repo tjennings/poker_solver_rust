@@ -819,6 +819,11 @@ mod tests {
     use crate::blueprint_mp::mccfr::sample_deal;
     use crate::blueprint_mp::storage::MpStorage;
     use crate::blueprint_mp::types::Street;
+    use crate::blueprint_v2::Street as V2Street;
+    use crate::blueprint_v2::bucket_file::{BucketFile, BucketFileHeader};
+    use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
+    use crate::poker::{Suit, Value};
+    use crate::{abstraction::isomorphism::CanonicalBoard, blueprint_v2::bucket_file};
 
     fn toy_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         let blinds = vec![
@@ -1356,6 +1361,103 @@ mod tests {
         assert_eq!(total_rivers, 1_332);
     }
 
+    #[timed_test]
+    fn compute_deal_buckets_preserves_suit_isomorphic_a2_flush_draw_texture() {
+        let all_buckets = a2_texture_test_buckets();
+
+        let flush_draw_cases = [
+            (
+                [card(Value::Ace, Suit::Spade), card(Value::Two, Suit::Spade)],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Heart), card(Value::Two, Suit::Heart)],
+                [
+                    card(Value::King, Suit::Heart),
+                    card(Value::Seven, Suit::Heart),
+                    card(Value::Three, Suit::Diamond),
+                ],
+            ),
+            (
+                [
+                    card(Value::Ace, Suit::Diamond),
+                    card(Value::Two, Suit::Diamond),
+                ],
+                [
+                    card(Value::King, Suit::Diamond),
+                    card(Value::Seven, Suit::Diamond),
+                    card(Value::Three, Suit::Club),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Club), card(Value::Two, Suit::Club)],
+                [
+                    card(Value::King, Suit::Club),
+                    card(Value::Seven, Suit::Club),
+                    card(Value::Three, Suit::Spade),
+                ],
+            ),
+        ];
+
+        for (hole, flop) in flush_draw_cases {
+            assert_eq!(
+                flop_bucket_for(hole, flop, &all_buckets),
+                7,
+                "A2s with the two-tone board suit should canonicalize to the flush-draw bucket"
+            );
+        }
+
+        let no_draw_cases = [
+            (
+                [card(Value::Ace, Suit::Heart), card(Value::Two, Suit::Heart)],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [
+                    card(Value::Ace, Suit::Diamond),
+                    card(Value::Two, Suit::Diamond),
+                ],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Club), card(Value::Two, Suit::Club)],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Spade), card(Value::Two, Suit::Spade)],
+                [
+                    card(Value::King, Suit::Heart),
+                    card(Value::Seven, Suit::Heart),
+                    card(Value::Three, Suit::Diamond),
+                ],
+            ),
+        ];
+
+        for (hole, flop) in no_draw_cases {
+            assert_eq!(
+                flop_bucket_for(hole, flop, &all_buckets),
+                3,
+                "A2s without the two-tone board suit should canonicalize to the no-draw bucket"
+            );
+        }
+    }
+
     // -- apply_dcfr_discount tests --
 
     #[timed_test]
@@ -1615,6 +1717,90 @@ mod tests {
         let mut ab = AllBuckets::new(bucket_counts, [None, None, None, None]);
         ab.equity_fallback = true;
         ab
+    }
+
+    fn a2_texture_test_buckets() -> AllBuckets {
+        let canonical_flop = canonical_a2_texture_flop();
+        let mut buckets = vec![0_u16; 1326];
+
+        set_a2_texture_bucket(
+            &mut buckets,
+            &canonical_flop,
+            [card(Value::Ace, Suit::Spade), card(Value::Two, Suit::Spade)],
+            7,
+        );
+        for suit in [Suit::Heart, Suit::Diamond, Suit::Club] {
+            set_a2_texture_bucket(
+                &mut buckets,
+                &canonical_flop,
+                [card(Value::Ace, suit), card(Value::Two, suit)],
+                3,
+            );
+        }
+
+        let bucket_file = BucketFile {
+            header: BucketFileHeader {
+                street: V2Street::Flop,
+                bucket_count: 10,
+                board_count: 1,
+                combos_per_board: 1326,
+                version: bucket_file::VERSION,
+            },
+            boards: vec![canonical_key(&canonical_flop.cards)],
+            buckets,
+        };
+        AllBuckets::new([169, 10, 10, 10], [None, Some(bucket_file), None, None])
+    }
+
+    fn canonical_a2_texture_flop() -> CanonicalBoard {
+        CanonicalBoard::from_cards(&[
+            card(Value::King, Suit::Spade),
+            card(Value::Seven, Suit::Spade),
+            card(Value::Three, Suit::Heart),
+        ])
+        .expect("valid flop")
+    }
+
+    fn set_a2_texture_bucket(
+        buckets: &mut [u16],
+        canonical_flop: &CanonicalBoard,
+        hole: [Card; 2],
+        bucket: u16,
+    ) {
+        let (h0, h1) = canonical_flop.canonicalize_holding(hole[0], hole[1]);
+        buckets[combo_index(h0, h1) as usize] = bucket;
+    }
+
+    fn flop_bucket_for(hole: [Card; 2], flop: [Card; 3], all_buckets: &AllBuckets) -> u16 {
+        let deal = Deal {
+            hole_cards: [
+                hole,
+                [
+                    card(Value::Queen, Suit::Heart),
+                    card(Value::Jack, Suit::Diamond),
+                ],
+                [card(Value::Ten, Suit::Club); 2],
+                [card(Value::Ten, Suit::Diamond); 2],
+                [card(Value::Nine, Suit::Club); 2],
+                [card(Value::Nine, Suit::Diamond); 2],
+                [card(Value::Eight, Suit::Club); 2],
+                [card(Value::Eight, Suit::Diamond); 2],
+            ],
+            board: [
+                flop[0],
+                flop[1],
+                flop[2],
+                card(Value::Six, Suit::Club),
+                card(Value::Five, Suit::Diamond),
+            ],
+            num_players: 2,
+        };
+        compute_deal_buckets(&deal, all_buckets, [169, 10, 10, 10]).buckets[0][Street::Flop.index()]
+            .0
+    }
+
+    fn card(value: Value, suit: Suit) -> Card {
+        Card::new(value, suit)
     }
 
     fn first_decision_node(tree: &MpGameTree) -> u32 {
