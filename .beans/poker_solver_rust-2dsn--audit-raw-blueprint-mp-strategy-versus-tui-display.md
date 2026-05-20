@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-05-20T15:11:24Z
+updated_at: 2026-05-20T15:42:14Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -39,3 +39,7 @@ The 250f/100t/20r run uses sampled flop with exact turn/river continuation, givi
 ## Implementation Notes
 
 Extended live lazy-sparse TUI probe cells to show dominant average action, dominant current regret-matched action, and total strategy-sum mass from the same LazyStrategyRow. Probe cells now use the format hand:state:a<avg>/c<current>/s<mass>, which should distinguish normal DCFR average-lag progression from current-strategy fold collapse or low-mass starvation.
+
+## Probe Observation
+
+Current-vs-average probe output shows a mixed picture with multi-million strategy-sum mass per opener row. Some suspicious hands look like plausible DCFR average lag, e.g. HJ A3s:P:aF94/cB81/s3m. Others are current-strategy folds with substantial mass, e.g. UTG A2s/A3s/A4s current F100 with s3m, HJ A5s current F100 with s2m, and CO A2s/A4s/A5s current F100 with s2m, while nearby hands like CO A3s, CO K9s, and CO 22 are current raises. This narrows the next audit to raw row internals: action labels, bucket/key, regrets, and per-action strategy sums for adjacent suited Ax hands and comparison hands.
