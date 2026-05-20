@@ -278,7 +278,8 @@ impl MpTuiApp {
             "Strategy probes: waiting for lazy sparse telemetry".to_string()
         } else {
             let visible = area.height.saturating_sub(1) as usize;
-            let mut out = String::from("Strategy probes avg dominant (P=stored M=missing Z=zero):");
+            let mut out =
+                String::from("Strategy probes a=avg c=current s=sum (P=stored M=missing Z=zero):");
             for line in lines.iter().take(visible.max(1)) {
                 out.push('\n');
                 out.push_str(line);

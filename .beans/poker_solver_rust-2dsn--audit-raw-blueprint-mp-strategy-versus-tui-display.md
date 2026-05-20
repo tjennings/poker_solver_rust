@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-05-20T15:07:57Z
+updated_at: 2026-05-20T15:11:24Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -35,3 +35,7 @@ Live TUI probes reported all sampled UTG/HJ/CO opener hands as present sparse ro
 ## Effective Sample Correction
 
 The 250f/100t/20r run uses sampled flop with exact turn/river continuation, giving roughly 300 * 1337 full-board deals per meta-iteration. That makes the suspect preflop probe output much less dismissible as merely early-training noise: exact continuation substantially lowers downstream value variance for each evaluated preflop branch. Remaining uncertainty should focus on whether suspect preflop actions are being evaluated with meaningful strategy-sum mass/regret evidence or starved/skipped by traversal pruning/keying/action-legality behavior.
+
+## Implementation Notes
+
+Extended live lazy-sparse TUI probe cells to show dominant average action, dominant current regret-matched action, and total strategy-sum mass from the same LazyStrategyRow. Probe cells now use the format hand:state:a<avg>/c<current>/s<mass>, which should distinguish normal DCFR average-lag progression from current-strategy fold collapse or low-mass starvation.

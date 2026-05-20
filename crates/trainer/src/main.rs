@@ -4310,22 +4310,44 @@ fn format_strategy_probe_cell(label: &str, row: &mp_tui_scenarios::LazyStrategyR
         mp_tui_scenarios::LazyStrategyRowState::MissingUniform => "M",
         mp_tui_scenarios::LazyStrategyRowState::ZeroSumUniform => "Z",
     };
+    let (avg_action, avg_freq) = dominant_probe_action(&row.action_labels, &row.average_strategy);
+    let (current_action, current_freq) =
+        dominant_probe_action(&row.action_labels, &row.current_strategy);
+    let strategy_sum_total = row.strategy_sums.iter().sum();
+    format!(
+        "{label}:{state}:a{avg_action}{:.0}/c{current_action}{:.0}/s{}",
+        (avg_freq * 100.0).round(),
+        (current_freq * 100.0).round(),
+        format_probe_mass(strategy_sum_total),
+    )
+}
+
+fn dominant_probe_action(action_labels: &[String], strategy: &[f64]) -> (&'static str, f64) {
     let mut action_idx = 0;
     let mut freq = 0.0;
-    for (idx, candidate) in row.average_strategy.iter().copied().enumerate() {
+    for (idx, candidate) in strategy.iter().copied().enumerate() {
         if candidate > freq {
             action_idx = idx;
             freq = candidate;
         }
     }
-    let action = row
-        .action_labels
+    let action = action_labels
         .get(action_idx)
         .map_or("?", |label| compact_mp_action_label(label));
-    format!("{label}:{state}:{action}{:.0}", (freq * 100.0).round())
+    (action, freq)
 }
 
-fn compact_mp_action_label(label: &str) -> &str {
+fn format_probe_mass(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{}m", value / 1_000_000)
+    } else if value >= 10_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_mp_action_label(label: &str) -> &'static str {
     if label == "fold" {
         "F"
     } else if label == "call" {
@@ -5425,15 +5447,24 @@ snapshots:
         let lines = metrics.strategy_probe_lines.lock().unwrap();
         assert_eq!(lines.len(), 1);
         assert!(
-            lines[0].contains("A5s:P:B70"),
-            "stored A5s row should report dominant bet: {}",
+            lines[0].contains("A5s:P:aB70/cF33/s100"),
+            "stored A5s row should report average, current, and strategy mass: {}",
             lines[0]
         );
         assert!(
-            lines[0].contains("72o:M:F33"),
-            "missing 72o row should report missing uniform fold tie-break: {}",
+            lines[0].contains("72o:M:aF33/cF33/s0"),
+            "missing 72o row should report missing uniform average/current tie-break: {}",
             lines[0]
         );
+    }
+
+    #[timed_test(10)]
+    fn format_probe_mass_compacts_large_values() {
+        assert_eq!(super::format_probe_mass(0), "0");
+        assert_eq!(super::format_probe_mass(9_999), "9999");
+        assert_eq!(super::format_probe_mass(10_000), "10k");
+        assert_eq!(super::format_probe_mass(999_999), "999k");
+        assert_eq!(super::format_probe_mass(1_000_000), "1m");
     }
 
     #[timed_test(10)]
