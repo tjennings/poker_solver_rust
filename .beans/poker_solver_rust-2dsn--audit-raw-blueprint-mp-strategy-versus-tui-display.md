@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-05-20T14:09:56Z
+updated_at: 2026-05-20T15:07:57Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -31,3 +31,7 @@ Updated sample_configurations/blueprint_mp_6max_250f_100t_20r.yaml to make the l
 ## Probe Observation
 
 Live TUI probes reported all sampled UTG/HJ/CO opener hands as present sparse rows (P), including suspicious folds such as UTG A4s:P:F91, UTG K9s:P:F98, HJ A3s:P:F99, HJ A5s:P:F81, HJ AJs:P:F53, and CO A5s:P:F81. This rules out missing-row uniform fallback for those spots and makes the current failure class more likely to be stored strategy/training/keying/action-legality than pure TUI rendering drift.
+
+## Effective Sample Correction
+
+The 250f/100t/20r run uses sampled flop with exact turn/river continuation, giving roughly 300 * 1337 full-board deals per meta-iteration. That makes the suspect preflop probe output much less dismissible as merely early-training noise: exact continuation substantially lowers downstream value variance for each evaluated preflop branch. Remaining uncertainty should focus on whether suspect preflop actions are being evaluated with meaningful strategy-sum mass/regret evidence or starved/skipped by traversal pruning/keying/action-legality behavior.
