@@ -48,19 +48,20 @@ action_abstraction:
 
 training:
   backend: lazy_sparse
+  chance_continuation_mode: sampled_flop_exact_turn_river
   cluster_path: "./local_data/buckets/250f_100t_20r_nut_high_cap_0p5_v1"
   time_limit_minutes: 7200
-  lcfr_discount_interval: 3000000
-  lcfr_warmup_iterations: 3000000
-  prune_after_iterations: 4000000
+  lcfr_discount_interval: 10000
+  lcfr_warmup_iterations: 30000
+  prune_after_iterations: 35000
   traversal_pruning_enabled: true
-  prune_threshold: -100
-  prune_explore_pct: 0.05
+  prune_threshold: -1
+  prune_explore_pct: 0.02
   negative_action_subtree_purge_enabled: false
   negative_action_prune_below: -100
   negative_action_reactivate_at: 0
   negative_action_purge_mode: scan_history_prefix
-  batch_size: 500
+  batch_size: 100
   dcfr_alpha: 1.5
   dcfr_beta: 0.0
   dcfr_gamma: 2.0
