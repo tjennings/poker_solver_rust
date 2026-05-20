@@ -756,6 +756,16 @@ impl SparseMpStorage {
             .map_or(0, |atom| atom.load(Ordering::Relaxed))
     }
 
+    /// Return the stored action count for a visited infoset.
+    ///
+    /// Missing rows return `None`; callers can use this to distinguish a
+    /// genuinely stored zero-sum row from the uniform strategy fallback used
+    /// for unvisited sparse infosets.
+    #[must_use]
+    pub fn infoset_action_count(&self, key: MpInfosetKey) -> Option<usize> {
+        self.get_node(key).map(|node| node.action_count())
+    }
+
     /// Add a regret delta, allocating the infoset if needed.
     pub fn add_regret(&self, key: MpInfosetKey, num_actions: usize, action: usize, delta: i32) {
         if action >= num_actions {
