@@ -1,7 +1,7 @@
-# Blueprint MP Config - 6-max, 250/100/20 postflop buckets, simplified actions
-# Uses the full-run training schedule with the 250f_100t_20r_nut_high_cap_0p5_v1 bucket files.
+# Blueprint MP Config - 6-max, 500/500/500 postflop buckets, simplified actions
+# Uses the full-run training schedule with the 500f_500t_500r_v2 bucket files.
 game:
-  name: "6-max simplified actions 250f 100t 20r"
+  name: "6-max simplified actions 500f 500t 500r"
   num_players: 6
   stack_depth: 200
   allow_preflop_limp: false
@@ -17,11 +17,11 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 250
+    buckets: 500
   turn:
-    buckets: 100
+    buckets: 500
   river:
-    buckets: 20
+    buckets: 500
 
 action_abstraction:
   max_flop_players: 3
@@ -49,7 +49,7 @@ action_abstraction:
 training:
   backend: lazy_sparse
   chance_continuation_mode: sampled_flop_exact_turn_river
-  cluster_path: "./local_data/buckets/250f_100t_20r_nut_high_cap_0p5_v1"
+  cluster_path: "./local_data/buckets/500f_500t_500r_v2"
   time_limit_minutes: 7200
   lcfr_discount_interval: 10000
   lcfr_warmup_iterations: 30000
@@ -72,7 +72,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/250f_100t_20r_nut_high_cap_0p5_v1"
+  output_dir: "./local_data/blueprints/500f_500t_500r_v2"
 
 tui:
   enabled: true
