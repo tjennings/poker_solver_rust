@@ -436,6 +436,9 @@ fn rank_to_u32(rank: Rank) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
     use super::*;
     use crate::blueprint_mp::config::{
         ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpGameConfig, MpStreetSizes,
@@ -710,6 +713,36 @@ mod tests {
                 storage.get_strategy_sum(tree.root, bucket, action_idx) > 0,
                 "opponent average update should record every root action"
             );
+        }
+    }
+
+    #[timed_test]
+    fn opponent_sample_action_matches_strategy_distribution() {
+        let strategy = [0.10, 0.25, 0.65];
+        let mut counts = [0_u32; 3];
+        let mut rng = SmallRng::seed_from_u64(0x5A11_CEED);
+        let samples = 50_000_u32;
+
+        for _ in 0..samples {
+            counts[sample_action(&strategy, &mut rng)] += 1;
+        }
+
+        for (idx, (&actual, &expected)) in counts.iter().zip(strategy.iter()).enumerate() {
+            let frequency = f64::from(actual) / f64::from(samples);
+            assert!(
+                (frequency - expected).abs() < 0.01,
+                "action {idx} sampled at {frequency:.4}, expected {expected:.4}"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn opponent_sample_action_never_selects_zero_probability_action() {
+        let strategy = [0.0, 1.0, 0.0];
+        let mut rng = SmallRng::seed_from_u64(0x51A7_E5E1);
+
+        for _ in 0..1_000 {
+            assert_eq!(sample_action(&strategy, &mut rng), 1);
         }
     }
 
