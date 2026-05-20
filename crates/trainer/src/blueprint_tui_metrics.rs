@@ -76,6 +76,8 @@ pub struct BlueprintTuiMetrics {
 
     /// Latest regret audit snapshots, ready for the TUI to consume.
     pub regret_audit_snapshots: Mutex<Option<Vec<AuditSnapshot>>>,
+    /// Compact raw-strategy probe lines rendered in the MP TUI metrics panel.
+    pub strategy_probe_lines: Mutex<Vec<String>>,
 
     // --- sparkline history ---
     pub strategy_delta_history: Mutex<Vec<f64>>,
@@ -129,6 +131,7 @@ impl BlueprintTuiMetrics {
 
             strategy_grids: Mutex::new(grids),
             regret_audit_snapshots: Mutex::new(None),
+            strategy_probe_lines: Mutex::new(Vec::new()),
             strategy_delta_history: Mutex::new(Vec::new()),
             leaf_movement_history: Mutex::new(Vec::new()),
             min_regret_history: Mutex::new(Vec::new()),
@@ -260,6 +263,15 @@ impl BlueprintTuiMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *data = Some(snapshots);
+    }
+
+    /// Replace the compact raw-strategy probe lines shown by the MP TUI.
+    pub fn update_strategy_probe_lines(&self, lines: Vec<String>) {
+        let mut data = self
+            .strategy_probe_lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *data = lines;
     }
 
     /// Take the latest audit snapshots (returns None if none pending).
@@ -568,6 +580,14 @@ mod tests {
         m.update_scenario_grid(0, grid);
         let grids = m.strategy_grids.lock().unwrap();
         assert!(grids[0].is_some());
+    }
+
+    #[timed_test(10)]
+    fn strategy_probe_lines_update() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.update_strategy_probe_lines(vec!["UTG A5s:P:B97".into()]);
+        let lines = m.strategy_probe_lines.lock().unwrap();
+        assert_eq!(lines.as_slice(), ["UTG A5s:P:B97"]);
     }
 
     #[timed_test(10)]

@@ -138,7 +138,7 @@ impl MpTuiApp {
                 Constraint::Length(2), // max neg regret sparkline
                 Constraint::Length(2), // avg pos regret sparkline
                 Constraint::Length(2), // prune % sparkline
-                Constraint::Min(0),
+                Constraint::Min(0),    // raw strategy probes
             ])
             .split(area);
         self.render_iterations(frame, chunks[0]);
@@ -150,6 +150,7 @@ impl MpTuiApp {
         self.render_min_regret(frame, chunks[6]);
         self.render_avg_pos_regret(frame, chunks[7]);
         self.render_prune_sparkline(frame, chunks[8]);
+        self.render_strategy_probes(frame, chunks[9]);
     }
 
     fn render_iterations(&self, frame: &mut Frame, area: Rect) {
@@ -262,6 +263,30 @@ impl MpTuiApp {
             .data(&self.prune_history)
             .style(Style::default().fg(Color::Magenta));
         frame.render_widget(sparkline, area);
+    }
+
+    fn render_strategy_probes(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let lines = self
+            .metrics
+            .strategy_probe_lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let text = if lines.is_empty() {
+            "Strategy probes: waiting for lazy sparse telemetry".to_string()
+        } else {
+            let visible = area.height.saturating_sub(1) as usize;
+            let mut out = String::from("Strategy probes avg dominant (P=stored M=missing Z=zero):");
+            for line in lines.iter().take(visible.max(1)) {
+                out.push('\n');
+                out.push_str(line);
+            }
+            out
+        };
+        let p = Paragraph::new(text).style(Style::default().fg(Color::Gray));
+        frame.render_widget(p, area);
     }
 }
 
