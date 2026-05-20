@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-05-20T14:06:51Z
+updated_at: 2026-05-20T14:09:56Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -27,3 +27,7 @@ Added a shared lazy strategy row query for TUI cells and diagnostics so lazy MP 
 Added live lazy-sparse TUI probe lines for the configured scenario set. The probes are driven directly by the shared LazyStrategyRow sparse-storage lookup, so the displayed probe state now reports the same row source as the hand grid: present (P), missing uniform fallback (M), or zero-sum uniform fallback (Z). The default probe hands cover the selected suited Ax/K9s/22/72o set, and the list is configurable with tui.strategy_probe_hands.
 
 Updated sample_configurations/blueprint_mp_6max_250f_100t_20r.yaml to make the live probe setup explicit: configured the suspect hand list and added BTN vs CO plus BB vs SB response scenarios alongside the existing opener scenarios.
+
+## Probe Observation
+
+Live TUI probes reported all sampled UTG/HJ/CO opener hands as present sparse rows (P), including suspicious folds such as UTG A4s:P:F91, UTG K9s:P:F98, HJ A3s:P:F99, HJ A5s:P:F81, HJ AJs:P:F53, and CO A5s:P:F81. This rules out missing-row uniform fallback for those spots and makes the current failure class more likely to be stored strategy/training/keying/action-legality than pure TUI rendering drift.
