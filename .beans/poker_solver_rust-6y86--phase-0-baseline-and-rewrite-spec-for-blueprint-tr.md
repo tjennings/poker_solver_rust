@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-6y86
 title: 'Phase 0: baseline and rewrite spec for blueprint trainer lazy tree'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-03T18:10:49Z
-updated_at: 2026-06-03T18:10:49Z
+updated_at: 2026-06-03T18:14:15Z
 parent: poker_solver_rust-34kn
 blocking:
     - poker_solver_rust-zgkr
