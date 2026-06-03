@@ -5,7 +5,9 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-17T16:17:32Z
-updated_at: 2026-05-06T01:43:40Z
+updated_at: 2026-06-03T18:19:01Z
+blocking:
+    - poker_solver_rust-6y86
 ---
 
 Two issues blocking CLAUDE.md's <60s test-suite rule:
@@ -50,3 +52,13 @@ Pre-change full-suite run on the direct turn-boundary evaluator branch failed on
 ## Progress 2026-05-06 Full-Suite Timer Follow-up
 
 The runtime evaluator branch exposed additional hard timed_test thresholds during full cargo test --workspace runs while the workstation was under training load. Relaxed three more blueprint_mp trainer smoke timers from 1s to 3s and six MP TUI scenario-resolution timers plus the equivalent compare-solve helper from 10s to 30s. Targeted MP trainer and MP TUI tests pass, and the full workspace test suite passes with --quiet. Remaining known issue: the suite is green but still above the <60s ideal because existing Tauri exact_subtree diagnostics and trainer scenario tests dominate wall time.
+
+
+## Progress 2026-06-03 Phase 0 Gate Recheck
+
+Phase 0 for the blueprint trainer lazy tree roadmap re-ran the required full-suite gate on branch `codex/blueprint-lazy-tree-roadmap`:
+
+- Cold `cargo test`: passed, `real 162.70s` / `user 350.33s` / `sys 66.30s`.
+- Warm `cargo test --quiet`: passed, `real 72.33s` / `user 325.32s` / `sys 28.12s`.
+
+The suite is green but still violates the required under-1-minute gate. Phase 0 (`poker_solver_rust-6y86`) is now blocked by this bean until the default full-suite command is back under 60s or the project gate is explicitly changed.
