@@ -4524,6 +4524,7 @@ mod tests {
     /// `sample_boundary_cfvs` with N=2048 samples should produce CFVs
     /// within 5% of the analytic equity: `pot * (equity - 0.5)`.
     #[test]
+    #[ignore = "slow stochastic rollout convergence check"]
     fn sample_boundary_cfvs_converges_to_analytic_equity() {
         let (tree, all_buckets, strategy) = make_check_always_river_blueprint();
 

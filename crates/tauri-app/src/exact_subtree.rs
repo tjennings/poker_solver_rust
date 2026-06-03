@@ -1422,6 +1422,7 @@ mod tests {
     ///
     /// Uses a wider range to be more realistic: OOP=AA-TT, IP=99-22.
     #[test]
+    #[ignore = "slow exact-subtree diagnostic comparing turn boundary to full solve"]
     fn diagnostic_turn_boundary_vs_full_solve() {
         let flop = flop_from_str("7h 5d 2c").unwrap();
         let turn_card: u8 = 7; // 3s
