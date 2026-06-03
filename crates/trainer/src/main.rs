@@ -3446,6 +3446,7 @@ fn run_mp_with_tui_lazy(
     let storage = Arc::clone(&ctx.storage);
     let game = Arc::clone(&ctx.game);
     let bucket_counts = ctx.bucket_counts;
+    let lazy_scenario_names: Vec<String> = scenarios.iter().map(|s| s.name.clone()).collect();
     let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
     let train_config = config.clone();
     let train_handle = std::thread::spawn(move || {
@@ -3456,8 +3457,10 @@ fn run_mp_with_tui_lazy(
         &shared_iters,
         &storage,
         &game,
+        &lazy_scenario_names,
         &lazy_scenario_spots,
         bucket_counts,
+        &tui_config.strategy_probe_hands,
         &metrics,
         &quit_flag,
         &train_handle,
@@ -3510,9 +3513,16 @@ fn bridge_mp_iterations<T>(
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
+            metrics.mark_snapshot_writing();
             match save_mp_snapshot(snapshot_config, storage, tree, iters, started.elapsed()) {
-                Ok(path) => eprintln!("  MP snapshot saved to {}", path.display()),
-                Err(e) => eprintln!("  Warning: failed to save MP snapshot: {e}"),
+                Ok(path) => {
+                    metrics.mark_snapshot_saved(&path);
+                    eprintln!("  MP snapshot saved to {}", path.display());
+                }
+                Err(e) => {
+                    metrics.mark_snapshot_failed(&e);
+                    eprintln!("  Warning: failed to save MP snapshot: {e}");
+                }
             }
         }
         if last_telemetry.elapsed() >= telemetry_interval {
@@ -3549,8 +3559,10 @@ fn bridge_mp_lazy_iterations<T>(
     source: &Arc<AtomicU64>,
     storage: &Arc<poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage>,
     game: &Arc<poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame>,
+    scenario_names: &[String],
     scenario_spots: &[poker_solver_core::blueprint_mp::lazy_mccfr::LazyResolvedSpot],
     bucket_counts: [u16; 4],
+    strategy_probe_hands: &[String],
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
@@ -3565,9 +3577,16 @@ fn bridge_mp_lazy_iterations<T>(
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
+            metrics.mark_snapshot_writing();
             match save_lazy_mp_snapshot(snapshot_config, storage, iters, started.elapsed()) {
-                Ok(path) => eprintln!("  Lazy MP snapshot saved to {}", path.display()),
-                Err(e) => eprintln!("  Warning: failed to save lazy MP snapshot: {e}"),
+                Ok(path) => {
+                    metrics.mark_snapshot_saved(&path);
+                    eprintln!("  Lazy MP snapshot saved to {}", path.display());
+                }
+                Err(e) => {
+                    metrics.mark_snapshot_failed(&e);
+                    eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
+                }
             }
         }
         if last_telemetry.elapsed() >= telemetry_interval {
@@ -3580,6 +3599,15 @@ fn bridge_mp_lazy_iterations<T>(
                 bucket_counts,
                 metrics,
                 iters,
+            );
+            push_lazy_mp_strategy_probes(
+                storage,
+                game,
+                scenario_names,
+                scenario_spots,
+                bucket_counts,
+                strategy_probe_hands,
+                metrics,
             );
             metrics.push_prune_fraction(take_mp_prune_pct());
             last_telemetry = Instant::now();
@@ -4230,6 +4258,113 @@ fn push_lazy_mp_strategy_grids(
     }
 }
 
+fn push_lazy_mp_strategy_probes(
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    game: &poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame,
+    scenario_names: &[String],
+    scenario_spots: &[poker_solver_core::blueprint_mp::lazy_mccfr::LazyResolvedSpot],
+    bucket_counts: [u16; 4],
+    hand_labels: &[String],
+    metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
+) {
+    let hands: Vec<(String, poker_solver_core::hands::CanonicalHand)> = hand_labels
+        .iter()
+        .filter_map(|label| {
+            poker_solver_core::hands::CanonicalHand::parse(label)
+                .ok()
+                .map(|hand| (label.clone(), hand))
+        })
+        .collect();
+    if hands.is_empty() {
+        metrics.update_strategy_probe_lines(Vec::new());
+        return;
+    }
+
+    let mut lines = Vec::new();
+    for (idx, spot) in scenario_spots.iter().copied().enumerate() {
+        let name = scenario_names
+            .get(idx)
+            .map_or_else(|| format!("spot {idx}"), Clone::clone);
+        let mut parts = Vec::with_capacity(hands.len() + 1);
+        parts.push(format!("{name}:"));
+        for (label, hand) in &hands {
+            match mp_tui_scenarios::resolve_lazy_strategy_row(
+                game,
+                storage,
+                spot,
+                *hand,
+                bucket_counts,
+            ) {
+                Some(row) => parts.push(format_strategy_probe_cell(label, &row)),
+                None => parts.push(format!("{label}:--")),
+            }
+        }
+        lines.push(parts.join(" "));
+    }
+    metrics.update_strategy_probe_lines(lines);
+}
+
+fn format_strategy_probe_cell(label: &str, row: &mp_tui_scenarios::LazyStrategyRow) -> String {
+    let state = match row.row_state {
+        mp_tui_scenarios::LazyStrategyRowState::Present => "P",
+        mp_tui_scenarios::LazyStrategyRowState::MissingUniform => "M",
+        mp_tui_scenarios::LazyStrategyRowState::ZeroSumUniform => "Z",
+    };
+    let (avg_action, avg_freq) = dominant_probe_action(&row.action_labels, &row.average_strategy);
+    let (current_action, current_freq) =
+        dominant_probe_action(&row.action_labels, &row.current_strategy);
+    let strategy_sum_total = row.strategy_sums.iter().sum();
+    format!(
+        "{label}:{state}:a{avg_action}{:.0}/c{current_action}{:.0}/s{}",
+        (avg_freq * 100.0).round(),
+        (current_freq * 100.0).round(),
+        format_probe_mass(strategy_sum_total),
+    )
+}
+
+fn dominant_probe_action(action_labels: &[String], strategy: &[f64]) -> (&'static str, f64) {
+    let mut action_idx = 0;
+    let mut freq = 0.0;
+    for (idx, candidate) in strategy.iter().copied().enumerate() {
+        if candidate > freq {
+            action_idx = idx;
+            freq = candidate;
+        }
+    }
+    let action = action_labels
+        .get(action_idx)
+        .map_or("?", |label| compact_mp_action_label(label));
+    (action, freq)
+}
+
+fn format_probe_mass(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{}m", value / 1_000_000)
+    } else if value >= 10_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_mp_action_label(label: &str) -> &'static str {
+    if label == "fold" {
+        "F"
+    } else if label == "call" {
+        "C"
+    } else if label == "check" {
+        "X"
+    } else if label == "all-in" {
+        "AI"
+    } else if label.starts_with("bet ") {
+        "B"
+    } else if label.starts_with("raise ") {
+        "R"
+    } else {
+        "?"
+    }
+}
+
 fn resolve_tui_scenarios(
     tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
     configs: &[blueprint_tui_config::ScenarioConfig],
@@ -4841,6 +4976,7 @@ snapshots:
                 name: "snapshot test".into(),
                 num_players: 2,
                 stack_depth: 6.0,
+                allow_preflop_limp: true,
                 blinds: vec![
                     ForcedBet {
                         seat: 0,
@@ -4871,12 +5007,15 @@ snapshots:
             },
             training: MpTrainingConfig {
                 backend: MpTrainingBackend::Eager,
+                chance_continuation_mode:
+                    poker_solver_core::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
                 cluster_path: None,
                 iterations: Some(1),
                 time_limit_minutes: None,
                 lcfr_warmup_iterations: 0,
                 lcfr_discount_interval: 50,
                 prune_after_iterations: 1_000_000,
+                traversal_pruning_enabled: false,
                 prune_threshold: -250,
                 prune_explore_pct: 0.05,
                 negative_action_subtree_purge_enabled: false,
@@ -5114,6 +5253,7 @@ snapshots:
             name: "test".into(),
             num_players: 6,
             stack_depth: 40.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -5176,6 +5316,7 @@ snapshots:
             name: "test".into(),
             num_players: 6,
             stack_depth: 40.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -5238,6 +5379,102 @@ snapshots:
         assert_eq!(resolved[1].name, "HJ vs UTG");
         assert!(!resolved[0].grid.cells[0][0].actions.is_empty());
         assert!(!resolved[1].grid.cells[0][0].actions.is_empty());
+    }
+
+    #[timed_test(20)]
+    fn lazy_strategy_probes_report_raw_row_state_and_dominant_action() {
+        use poker_solver_core::blueprint_mp::config::*;
+        use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
+        use poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage;
+        use poker_solver_core::hands::CanonicalHand;
+
+        let game = MpGameConfig {
+            name: "test".into(),
+            num_players: 6,
+            stack_depth: 40.0,
+            allow_preflop_limp: true,
+            blinds: vec![
+                ForcedBet {
+                    seat: 4,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("5bb".into())],
+            raise: vec![],
+        };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action = MpActionAbstractionConfig {
+            max_flop_players: None,
+            preflop,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        let lazy_game = LazyMpGame::new(&game, &action);
+        let spot = LazyResolvedSpot::root(&lazy_game);
+        let storage = SparseMpStorage::with_shards(4);
+        let hand = CanonicalHand::parse("A5s").unwrap();
+        let key = spot.key_for_bucket(hand.index() as u16);
+        let num_actions = spot.actions(&lazy_game).len();
+        storage.add_strategy_sum(key, num_actions, 0, 10);
+        storage.add_strategy_sum(key, num_actions, 1, 20);
+        storage.add_strategy_sum(key, num_actions, 2, 70);
+
+        let metrics = crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(None, None);
+        super::push_lazy_mp_strategy_probes(
+            &storage,
+            &lazy_game,
+            &["UTG open".to_string()],
+            &[spot],
+            [169, 50, 50, 50],
+            &["A5s".to_string(), "72o".to_string()],
+            &metrics,
+        );
+
+        let lines = metrics.strategy_probe_lines.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("A5s:P:aB70/cF33/s100"),
+            "stored A5s row should report average, current, and strategy mass: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("72o:M:aF33/cF33/s0"),
+            "missing 72o row should report missing uniform average/current tie-break: {}",
+            lines[0]
+        );
+    }
+
+    #[timed_test(10)]
+    fn format_probe_mass_compacts_large_values() {
+        assert_eq!(super::format_probe_mass(0), "0");
+        assert_eq!(super::format_probe_mass(9_999), "9999");
+        assert_eq!(super::format_probe_mass(10_000), "10k");
+        assert_eq!(super::format_probe_mass(999_999), "999k");
+        assert_eq!(super::format_probe_mass(1_000_000), "1m");
+    }
+
+    #[timed_test(10)]
+    fn compact_mp_action_labels() {
+        assert_eq!(super::compact_mp_action_label("fold"), "F");
+        assert_eq!(super::compact_mp_action_label("call"), "C");
+        assert_eq!(super::compact_mp_action_label("check"), "X");
+        assert_eq!(super::compact_mp_action_label("all-in"), "AI");
+        assert_eq!(super::compact_mp_action_label("bet 5bb"), "B");
+        assert_eq!(super::compact_mp_action_label("raise 12bb"), "R");
     }
 
     /// compare-solve should accept per-street boundary flags.

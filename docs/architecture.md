@@ -198,8 +198,8 @@ crates/core/src/blueprint_mp/
 - **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
 - **Sparse visited-infoset storage** for the planned lazy backend: unvisited infosets read as zero/uniform, visited infosets allocate sharded atomic regret and strategy counters, and snapshots export only touched entries
 - **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
-- **Experimental negative-action subtree purge** for lazy sparse traversal: action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; the storage layer scans packed action-history prefixes to remove the child row and already visited descendants while preserving sibling subtrees
-- **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
+- **Experimental negative-action subtree purge** for lazy sparse traversal: aggressive action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; normal traversal masks blocked aggressive edges, while physical sparse-row deletion is deferred until the DCFR discount boundary, where post-discount regrets decide whether blocked child subtrees are purged or reactivated
+- **External-sampling average strategy updates**: every visited decision infoset records the full current strategy vector; opponent actions are sampled only for recursion, not for average-strategy accounting
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ### 100bb MP Scaling Plan
@@ -208,9 +208,23 @@ The current `blueprint_mp` backend eagerly materializes the full public betting 
 
 ### Lazy Sparse Negative-Action Purge
 
-The negative-action subtree purge is an opt-in experiment layered on the lazy sparse backend. It is not part of eager `blueprint_mp` storage, and it remains inactive until the normal pruning warmup boundary (`meta_iter >= prune_after_iterations`). During post-warmup traversal, each legal action edge can be gated by cumulative regret. If the parent action regret drops below `negative_action_prune_below`, the edge is inserted into a sharded blocked-edge set and the sparse storage scans its packed child action-history prefix. Matching rows at or below that child prefix are removed, which purges the child subtree while leaving the parent infoset and non-matching sibling histories intact.
+Lazy sparse MP training supports an opt-in sampled-prefix chance continuation
+mode via `training.chance_continuation_mode`. The default `sampled_full_deal`
+keeps the original full-board sampling behavior. `sampled_turn_exact_river`
+samples private cards, flop, and turn as usual, precomputes every legal river
+runout for that sampled turn prefix, and averages values over those river
+runout for that sampled turn prefix. `sampled_flop_exact_turn_river` samples
+private cards and flop, precomputes every legal turn/river runout for that flop
+prefix, and averages values at flop-to-turn chance boundaries, turn-to-river
+chance boundaries, and pre-river showdown terminals. Regret updates use the
+averaged value, not the sum, so DCFR and pruning thresholds remain on the same
+scale as sampled training.
 
-Blocked edges are skipped by traversal before child allocation, so sparse storage stops growing below persistently negative actions. The gate has hysteresis: an edge stays blocked until the same parent action regret reaches `negative_action_reactivate_at`. Reactivation removes the edge from the blocked set and purges any stale rows below the child prefix again. Later visits below the reactivated edge allocate fresh sparse rows; descendants therefore restart from the same first-visit defaults as any unseen infoset: zero regrets, zero strategy sums, and regret-matched uniform action probabilities until updated.
+The negative-action subtree purge is an opt-in experiment layered on the lazy sparse backend. It is not part of eager `blueprint_mp` storage, and it remains inactive until the configured warmup boundary (`meta_iter >= prune_after_iterations`). Ordinary regret-threshold traversal pruning is also opt-in via `traversal_pruning_enabled`; it only skips eligible traverser-side action branches for a batch and does not physically remove sparse rows or strategy sums. During post-warmup traversal, aggressive action edges can be gated by cumulative regret when the negative-action experiment is enabled. Passive actions (`Fold`, `Check`, `Call`, and all-in calls that do not increase the current max bet) are never persistent subtree-purge candidates, because their child histories can contain other players' future decisions. If an aggressive parent action regret drops below `negative_action_prune_below`, the edge is inserted into a sharded blocked-edge set with its packed child action-history prefix. Traversal skips blocked aggressive edges before child allocation, but it does not physically delete already visited descendant rows during ordinary traversal.
+
+Physical purge runs immediately after lazy DCFR discounting. The boundary sweep scans the currently blocked edge set, rereads each parent action regret after discounting, and gives DCFR the first chance to soften or reactivate the edge. Edges whose regret reaches `negative_action_reactivate_at` are removed from the blocked set without deleting their child subtree. Remaining blocked child prefixes are batched into one sparse-storage scan for the discount boundary; matching rows at or below any stored child prefix are removed, preserving sibling histories while dropping already visited descendants below blocked actions.
+
+Persistent negative-action subtree purge only blocks and purges aggressive edges, because passive routing edges can contain later players' decision nodes. `prune_threshold` and `prune_explore_pct` control only ordinary traversal pruning when `traversal_pruning_enabled` is true; they do not enable physical subtree deletion.
 
 ## Range Solver (Exact Postflop Solver)
 

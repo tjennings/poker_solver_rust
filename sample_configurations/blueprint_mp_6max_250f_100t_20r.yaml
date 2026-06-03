@@ -1,7 +1,7 @@
-# Blueprint MP Config - 20BB 6-max, 500/100/100 postflop buckets, simplified actions
-# Uses the full-run training schedule with the 500f_100t_100r_v1 bucket files.
+# Blueprint MP Config - 6-max, 500/500/500 postflop buckets, simplified actions
+# Uses the full-run training schedule with the 500f_500t_500r_v2 bucket files.
 game:
-  name: "6-max 20bb simplified actions 500f 100t 100r"
+  name: "6-max simplified actions 500f 500t 500r"
   num_players: 6
   stack_depth: 200
   allow_preflop_limp: false
@@ -19,9 +19,9 @@ clustering:
   flop:
     buckets: 500
   turn:
-    buckets: 100
+    buckets: 500
   river:
-    buckets: 100
+    buckets: 500
 
 action_abstraction:
   max_flop_players: 3
@@ -34,33 +34,34 @@ action_abstraction:
   flop:
     lead: [0.25, 0.50, 0.75]
     raise:
-      - [0.5, 1.0]
-      - [0.5, 1.0]
+      - [1.0]
+      - [1.0]
   turn:
     lead: [0.25, 0.50, 0.75]
     raise:
-      - [0.5, 1.0]
-      - [0.5, 1.0]
+      - [1.0]
+      - [1.0]
   river:
     lead: [0.25, 0.50, 0.75]
     raise:
       - [0.5, 1.0, 1.5]
-      - [0.5, 1.0, 1.5]
 
 training:
   backend: lazy_sparse
-  cluster_path: "./local_data/buckets/500f_100t_100r_nut_high_cap_0p5_v1"
+  chance_continuation_mode: sampled_flop_exact_turn_river
+  cluster_path: "./local_data/buckets/500f_500t_500r_v2"
   time_limit_minutes: 7200
-  lcfr_discount_interval: 3000000
-  lcfr_warmup_iterations: 3000000
-  prune_after_iterations: 4000000
-  prune_threshold: -1
-  prune_explore_pct: 0.0
+  lcfr_discount_interval: 10000
+  lcfr_warmup_iterations: 30000
+  prune_after_iterations: 35000
+  traversal_pruning_enabled: true
+  prune_threshold: -100
+  prune_explore_pct: 0.10
   negative_action_subtree_purge_enabled: false
   negative_action_prune_below: -100
   negative_action_reactivate_at: 0
   negative_action_purge_mode: scan_history_prefix
-  batch_size: 500
+  batch_size: 100
   dcfr_alpha: 1.5
   dcfr_beta: 0.0
   dcfr_gamma: 2.0
@@ -71,7 +72,7 @@ snapshots:
   resume: true
   warmup_minutes: 60
   snapshot_every_minutes: 30
-  output_dir: "./local_data/blueprints/500f_100t_100r_nut_high_cap_0p5_v1"
+  output_dir: "./local_data/blueprints/500f_500t_500r_v2"
 
 tui:
   enabled: true
@@ -79,6 +80,7 @@ tui:
   telemetry:
     strategy_delta_interval_seconds: 120
     sparkline_window: 60
+  strategy_probe_hands: ["A2s", "A3s", "A4s", "A5s", "ATs", "AJs", "AQs", "K9s", "22", "72o"]
   scenarios:
     - name: "UTG open"
       spot: ""
@@ -92,3 +94,7 @@ tui:
       spot: "utg:fold,hj:fold,co:fold,btn:fold"
     - name: "BB vs limp"
       spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:call"
+    - name: "BTN vs CO"
+      spot: "utg:fold,hj:fold,co:5bb"
+    - name: "BB vs SB"
+      spot: "utg:fold,hj:fold,co:fold,btn:fold,sb:5bb"

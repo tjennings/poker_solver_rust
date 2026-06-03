@@ -37,15 +37,22 @@ use rand::rngs::SmallRng;
 use rayon::prelude::*;
 
 use super::MAX_PLAYERS;
-use super::config::{BlueprintMpConfig, MpGameConfig, MpNegativeActionPurgeMode, MpTrainingConfig};
+use super::config::{
+    BlueprintMpConfig, MpChanceContinuationMode, MpGameConfig, MpNegativeActionPurgeMode,
+    MpTrainingConfig,
+};
 use super::game_tree::MpGameTree;
-use super::lazy_mccfr::{LazyMpGame, NegativeActionTraversalConfig, traverse_external_lazy};
+use super::lazy_mccfr::{
+    ExactChanceRunouts, ExactTurnRunout, LazyMpGame, NegativeActionTraversalConfig,
+    traverse_external_lazy,
+};
 use super::mccfr::{sample_deal, traverse_external};
 use super::sparse_storage::SparseMpStorage;
 use super::storage::{MpStorage, REGRET_SCALE};
 use super::types::{Bucket, Chips, Deal, DealWithBuckets, Seat};
 use crate::blueprint_v2::mccfr::AllBuckets;
 use crate::blueprint_v2::trainer::load_bucket_files;
+use crate::poker::{Card, full_deck};
 
 /// Result of a training run.
 pub struct TrainResult {
@@ -330,6 +337,7 @@ fn training_loop_lazy(
             prune,
             scaled_threshold,
             negative_action,
+            config.chance_continuation_mode,
         );
         meta_iter += batch;
         iterations.store(meta_iter, Ordering::Relaxed);
@@ -337,6 +345,7 @@ fn training_loop_lazy(
         if should_discount(meta_iter, config) {
             let discount_started = Instant::now();
             apply_dcfr_discount_lazy(storage, meta_iter, config);
+            purge_negative_action_subtrees_after_discount(storage, config);
             LAZY_DISCOUNT_NANOS.fetch_add(nanos_since(discount_started), Ordering::Relaxed);
         }
     }
@@ -347,13 +356,14 @@ fn training_loop_lazy(
     }
 }
 
-/// Determine whether the current batch should use pruning.
+/// Determine whether the current batch should use ordinary traversal pruning.
 ///
-/// Pruning activates after `prune_after_iterations` have elapsed and
-/// applies to `1 - prune_explore_pct` of batches (the rest explore
-/// all actions to avoid permanently losing information).
+/// This only skips eligible traverser-side action branches for the current
+/// batch; it does not physically remove sparse rows or strategy sums. Keep it
+/// opt-in because the previous always-on MP traversal-pruning path could starve
+/// branches when configured too aggressively.
 fn should_prune(meta_iter: u64, config: &MpTrainingConfig, rng: &mut impl Rng) -> bool {
-    if meta_iter < config.prune_after_iterations {
+    if !config.traversal_pruning_enabled || meta_iter < config.prune_after_iterations {
         return false;
     }
     let explore: f64 = rng.random();
@@ -422,6 +432,7 @@ fn run_lazy_batch(
     prune: bool,
     prune_threshold: i32,
     negative_action: NegativeActionTraversalConfig,
+    chance_mode: MpChanceContinuationMode,
 ) {
     use super::mccfr::PruneStats;
     let batch_started = Instant::now();
@@ -441,6 +452,8 @@ fn run_lazy_batch(
 
             let bucket_started = Instant::now();
             let buckets = compute_deal_buckets(&deal, all_buckets, bucket_counts);
+            let exact_runouts =
+                exact_chance_runouts_for_deal(&deal, all_buckets, bucket_counts, chance_mode);
             let bucket_nanos = nanos_since(bucket_started);
 
             let mut local = PruneStats::default();
@@ -454,6 +467,8 @@ fn run_lazy_batch(
                     game,
                     storage,
                     &buckets,
+                    &exact_runouts,
+                    chance_mode,
                     Seat::from_raw(traverser),
                     &mut rng,
                     rake_rate,
@@ -637,6 +652,21 @@ fn apply_dcfr_discount_lazy(storage: &SparseMpStorage, meta_iter: u64, config: &
     storage.discount(d_pos, d_neg, d_strat);
 }
 
+fn purge_negative_action_subtrees_after_discount(
+    storage: &SparseMpStorage,
+    config: &MpTrainingConfig,
+) {
+    if !config.negative_action_subtree_purge_enabled {
+        return;
+    }
+    if config.negative_action_purge_mode != MpNegativeActionPurgeMode::ScanHistoryPrefix {
+        return;
+    }
+    storage.purge_blocked_negative_action_subtrees_after_discount(
+        config.negative_action_reactivate_at,
+    );
+}
+
 fn regret_discount_factors(epoch: u64, alpha: f64, beta: f64) -> (f64, f64) {
     let t = epoch as f64;
     let ta = t.powf(alpha);
@@ -682,7 +712,75 @@ fn compute_deal_buckets(
     }
 }
 
+fn exact_chance_runouts_for_deal(
+    deal: &Deal,
+    all_buckets: &AllBuckets,
+    bucket_counts: [u16; 4],
+    chance_mode: MpChanceContinuationMode,
+) -> ExactChanceRunouts {
+    match chance_mode {
+        MpChanceContinuationMode::SampledFullDeal => ExactChanceRunouts::default(),
+        MpChanceContinuationMode::SampledTurnExactRiver => {
+            let turn_deal = compute_deal_buckets(deal, all_buckets, bucket_counts);
+            let river_deals =
+                legal_river_deals_for_turn_prefix(deal, all_buckets, bucket_counts, deal.board[3]);
+            ExactChanceRunouts {
+                turns: vec![ExactTurnRunout {
+                    turn: deal.board[3],
+                    turn_deal,
+                    river_deals,
+                }],
+            }
+        }
+        MpChanceContinuationMode::SampledFlopExactTurnRiver => {
+            let turns = full_deck()
+                .into_iter()
+                .filter(|card| !deal_uses_hole_or_board_prefix(deal, *card, 3))
+                .filter_map(|turn| {
+                    let river_deals =
+                        legal_river_deals_for_turn_prefix(deal, all_buckets, bucket_counts, turn);
+                    let turn_deal = river_deals.first().cloned()?;
+                    Some(ExactTurnRunout {
+                        turn,
+                        turn_deal,
+                        river_deals,
+                    })
+                })
+                .collect();
+            ExactChanceRunouts { turns }
+        }
+    }
+}
+
+fn legal_river_deals_for_turn_prefix(
+    deal: &Deal,
+    all_buckets: &AllBuckets,
+    bucket_counts: [u16; 4],
+    turn: Card,
+) -> Vec<DealWithBuckets> {
+    full_deck()
+        .into_iter()
+        .filter(|card| !deal_uses_hole_or_board_prefix(deal, *card, 3) && *card != turn)
+        .map(|river| {
+            let mut river_deal = deal.clone();
+            river_deal.board[3] = turn;
+            river_deal.board[4] = river;
+            compute_deal_buckets(&river_deal, all_buckets, bucket_counts)
+        })
+        .collect()
+}
+
+fn deal_uses_hole_or_board_prefix(deal: &Deal, card: Card, board_len: usize) -> bool {
+    deal.hole_cards
+        .iter()
+        .take(deal.num_players as usize)
+        .flatten()
+        .any(|used| *used == card)
+        || deal.board[..board_len].iter().any(|used| *used == card)
+}
+
 /// Trivial fallback bucketing (for tests without cluster files).
+#[cfg(test)]
 fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuckets {
     use crate::hands::CanonicalHand;
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
@@ -707,17 +805,25 @@ fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuck
 mod tests {
     use std::sync::atomic::Ordering;
 
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
     use test_macros::timed_test;
 
     use super::*;
     use crate::blueprint_mp::config::{
-        BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig,
-        MpGameConfig, MpNegativeActionPurgeMode, MpSnapshotConfig, MpStreetCluster, MpStreetSizes,
-        MpTrainingBackend, MpTrainingConfig,
+        BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig,
+        MpChanceContinuationMode, MpClusteringConfig, MpGameConfig, MpNegativeActionPurgeMode,
+        MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingBackend, MpTrainingConfig,
     };
     use crate::blueprint_mp::game_tree::MpGameTree;
     use crate::blueprint_mp::mccfr::sample_deal;
     use crate::blueprint_mp::storage::MpStorage;
+    use crate::blueprint_mp::types::Street;
+    use crate::blueprint_v2::Street as V2Street;
+    use crate::blueprint_v2::bucket_file::{BucketFile, BucketFileHeader};
+    use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
+    use crate::poker::{Suit, Value};
+    use crate::{abstraction::isomorphism::CanonicalBoard, blueprint_v2::bucket_file};
 
     fn toy_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         let blinds = vec![
@@ -736,6 +842,7 @@ mod tests {
             name: format!("{num_players}-player trainer test"),
             num_players,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -759,12 +866,15 @@ mod tests {
         };
         let training = MpTrainingConfig {
             backend: MpTrainingBackend::Eager,
+            chance_continuation_mode:
+                crate::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
             cluster_path: None,
             iterations: Some(iterations),
             time_limit_minutes: None,
             lcfr_warmup_iterations: 0,
             lcfr_discount_interval: 50,
             prune_after_iterations: 1_000_000,
+            traversal_pruning_enabled: false,
             prune_threshold: -250,
             prune_explore_pct: 0.05,
             negative_action_subtree_purge_enabled: false,
@@ -820,12 +930,15 @@ mod tests {
     fn toy_training_config(iterations: u64) -> MpTrainingConfig {
         MpTrainingConfig {
             backend: MpTrainingBackend::Eager,
+            chance_continuation_mode:
+                crate::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
             cluster_path: None,
             iterations: Some(iterations),
             time_limit_minutes: None,
             lcfr_warmup_iterations: 100,
             lcfr_discount_interval: 50,
             prune_after_iterations: 1_000_000,
+            traversal_pruning_enabled: false,
             prune_threshold: -250,
             prune_explore_pct: 0.05,
             negative_action_subtree_purge_enabled: false,
@@ -860,6 +973,7 @@ mod tests {
             name: format!("{num_players}-player trainer tree"),
             num_players,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -906,6 +1020,29 @@ mod tests {
         let config = toy_config(2, 10);
         let result = train_blueprint_mp_lazy(&config);
         assert_eq!(result.meta_iterations, 10);
+    }
+
+    #[timed_test]
+    fn lazy_train_sampled_turn_exact_river_completes() {
+        let mut config = toy_config(2, 1);
+        config.training.batch_size = 1;
+        config.training.chance_continuation_mode = MpChanceContinuationMode::SampledTurnExactRiver;
+
+        let result = train_blueprint_mp_lazy(&config);
+
+        assert_eq!(result.meta_iterations, 1);
+    }
+
+    #[timed_test(10)]
+    fn lazy_train_sampled_flop_exact_turn_river_completes() {
+        let mut config = toy_config(2, 1);
+        config.training.batch_size = 1;
+        config.training.chance_continuation_mode =
+            MpChanceContinuationMode::SampledFlopExactTurnRiver;
+
+        let result = train_blueprint_mp_lazy(&config);
+
+        assert_eq!(result.meta_iterations, 1);
     }
 
     #[timed_test]
@@ -990,17 +1127,26 @@ mod tests {
     fn should_prune_false_before_warmup() {
         let mut config = toy_training_config(1000);
         config.prune_after_iterations = 100;
-        config.prune_explore_pct = 0.0; // never explore => always prune if past warmup
+        config.prune_explore_pct = 0.0;
         let mut rng = SmallRng::seed_from_u64(42);
-        // iter 50 < prune_after_iterations=100 => never prune
         assert!(!should_prune(50, &config, &mut rng));
     }
 
     #[timed_test]
-    fn should_prune_true_after_warmup_no_explore() {
+    fn should_prune_false_after_warmup_no_explore() {
         let mut config = toy_training_config(1000);
         config.prune_after_iterations = 100;
-        config.prune_explore_pct = 0.0; // explore_pct=0 => always prune
+        config.prune_explore_pct = 0.0;
+        let mut rng = SmallRng::seed_from_u64(42);
+        assert!(!should_prune(200, &config, &mut rng));
+    }
+
+    #[timed_test]
+    fn should_prune_true_after_warmup_when_enabled_no_explore() {
+        let mut config = toy_training_config(1000);
+        config.traversal_pruning_enabled = true;
+        config.prune_after_iterations = 100;
+        config.prune_explore_pct = 0.0;
         let mut rng = SmallRng::seed_from_u64(42);
         assert!(should_prune(200, &config, &mut rng));
     }
@@ -1008,25 +1154,22 @@ mod tests {
     #[timed_test]
     fn should_prune_false_when_explore_pct_is_one() {
         let mut config = toy_training_config(1000);
+        config.traversal_pruning_enabled = true;
         config.prune_after_iterations = 0;
         config.prune_explore_pct = 1.0; // explore_pct=1 => never prune
         let mut rng = SmallRng::seed_from_u64(42);
-        // rng.random() is in [0,1), always < 1.0, so always explores
         assert!(!should_prune(200, &config, &mut rng));
     }
 
     #[timed_test]
-    fn should_prune_respects_warmup() {
+    fn should_prune_disabled_even_after_warmup() {
         let mut config = toy_training_config(1000);
         config.prune_after_iterations = 500;
         config.prune_explore_pct = 0.0;
         let mut rng = SmallRng::seed_from_u64(42);
-        // Before warmup
         assert!(!should_prune(499, &config, &mut rng));
-        // At warmup boundary
-        assert!(should_prune(500, &config, &mut rng));
-        // After warmup
-        assert!(should_prune(1000, &config, &mut rng));
+        assert!(!should_prune(500, &config, &mut rng));
+        assert!(!should_prune(1000, &config, &mut rng));
     }
 
     #[timed_test]
@@ -1132,6 +1275,187 @@ mod tests {
         let dwb = compute_buckets_trivial(&deal, counts);
         assert_eq!(dwb.deal.num_players, 3);
         assert_eq!(dwb.deal.board, deal.board);
+    }
+
+    #[timed_test]
+    fn exact_river_runouts_enumerate_legal_rivers_for_turn_prefix() {
+        let mut rng = SmallRng::seed_from_u64(0xE2AC_7A11);
+        let deal = sample_deal(6, &mut rng);
+        let counts = [10u16, 10, 10, 10];
+        let mut all_buckets = AllBuckets::new(counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        let runouts = exact_chance_runouts_for_deal(
+            &deal,
+            &all_buckets,
+            counts,
+            MpChanceContinuationMode::SampledTurnExactRiver,
+        );
+
+        assert_eq!(runouts.turns.len(), 1);
+        assert_eq!(runouts.turns[0].turn, deal.board[3]);
+        assert_eq!(runouts.turns[0].river_deals.len(), 36);
+        let mut rivers = Vec::with_capacity(runouts.turns[0].river_deals.len());
+        for runout in &runouts.turns[0].river_deals {
+            assert_eq!(runout.deal.board[..4], deal.board[..4]);
+            let river = runout.deal.board[4];
+            assert!(!deal_uses_hole_or_board_prefix(&deal, river, 4));
+            assert!(!rivers.contains(&river));
+            rivers.push(river);
+            for seat in 0..deal.num_players as usize {
+                assert!(runout.buckets[seat][Street::River.index()].0 < counts[3]);
+            }
+        }
+
+        let sampled = exact_chance_runouts_for_deal(
+            &deal,
+            &all_buckets,
+            counts,
+            MpChanceContinuationMode::SampledFullDeal,
+        );
+        assert!(sampled.turns.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn exact_chance_runouts_enumerate_legal_turn_rivers_for_flop_prefix() {
+        let mut rng = SmallRng::seed_from_u64(0xC0FF_EE17);
+        let deal = sample_deal(6, &mut rng);
+        let counts = [10u16, 10, 10, 10];
+        let mut all_buckets = AllBuckets::new(counts, [None, None, None, None]);
+        all_buckets.equity_fallback = true;
+
+        let runouts = exact_chance_runouts_for_deal(
+            &deal,
+            &all_buckets,
+            counts,
+            MpChanceContinuationMode::SampledFlopExactTurnRiver,
+        );
+
+        assert_eq!(runouts.turns.len(), 37);
+        let mut turns = Vec::with_capacity(runouts.turns.len());
+        let mut total_rivers = 0usize;
+        for turn_runout in &runouts.turns {
+            let turn = turn_runout.turn;
+            assert!(!deal_uses_hole_or_board_prefix(&deal, turn, 3));
+            assert!(!turns.contains(&turn));
+            turns.push(turn);
+            assert_eq!(turn_runout.river_deals.len(), 36);
+            assert_eq!(turn_runout.turn_deal.deal.board[3], turn);
+            total_rivers += turn_runout.river_deals.len();
+
+            let mut rivers = Vec::with_capacity(turn_runout.river_deals.len());
+            for runout in &turn_runout.river_deals {
+                assert_eq!(runout.deal.board[..3], deal.board[..3]);
+                assert_eq!(runout.deal.board[3], turn);
+                let river = runout.deal.board[4];
+                assert_ne!(river, turn);
+                assert!(!deal_uses_hole_or_board_prefix(&deal, river, 3));
+                assert!(!rivers.contains(&river));
+                rivers.push(river);
+                for seat in 0..deal.num_players as usize {
+                    assert!(runout.buckets[seat][Street::Turn.index()].0 < counts[2]);
+                    assert!(runout.buckets[seat][Street::River.index()].0 < counts[3]);
+                }
+            }
+        }
+        assert_eq!(total_rivers, 1_332);
+    }
+
+    #[timed_test]
+    fn compute_deal_buckets_preserves_suit_isomorphic_a2_flush_draw_texture() {
+        let all_buckets = a2_texture_test_buckets();
+
+        let flush_draw_cases = [
+            (
+                [card(Value::Ace, Suit::Spade), card(Value::Two, Suit::Spade)],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Heart), card(Value::Two, Suit::Heart)],
+                [
+                    card(Value::King, Suit::Heart),
+                    card(Value::Seven, Suit::Heart),
+                    card(Value::Three, Suit::Diamond),
+                ],
+            ),
+            (
+                [
+                    card(Value::Ace, Suit::Diamond),
+                    card(Value::Two, Suit::Diamond),
+                ],
+                [
+                    card(Value::King, Suit::Diamond),
+                    card(Value::Seven, Suit::Diamond),
+                    card(Value::Three, Suit::Club),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Club), card(Value::Two, Suit::Club)],
+                [
+                    card(Value::King, Suit::Club),
+                    card(Value::Seven, Suit::Club),
+                    card(Value::Three, Suit::Spade),
+                ],
+            ),
+        ];
+
+        for (hole, flop) in flush_draw_cases {
+            assert_eq!(
+                flop_bucket_for(hole, flop, &all_buckets),
+                7,
+                "A2s with the two-tone board suit should canonicalize to the flush-draw bucket"
+            );
+        }
+
+        let no_draw_cases = [
+            (
+                [card(Value::Ace, Suit::Heart), card(Value::Two, Suit::Heart)],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [
+                    card(Value::Ace, Suit::Diamond),
+                    card(Value::Two, Suit::Diamond),
+                ],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Club), card(Value::Two, Suit::Club)],
+                [
+                    card(Value::King, Suit::Spade),
+                    card(Value::Seven, Suit::Spade),
+                    card(Value::Three, Suit::Heart),
+                ],
+            ),
+            (
+                [card(Value::Ace, Suit::Spade), card(Value::Two, Suit::Spade)],
+                [
+                    card(Value::King, Suit::Heart),
+                    card(Value::Seven, Suit::Heart),
+                    card(Value::Three, Suit::Diamond),
+                ],
+            ),
+        ];
+
+        for (hole, flop) in no_draw_cases {
+            assert_eq!(
+                flop_bucket_for(hole, flop, &all_buckets),
+                3,
+                "A2s without the two-tone board suit should canonicalize to the no-draw bucket"
+            );
+        }
     }
 
     // -- apply_dcfr_discount tests --
@@ -1393,6 +1717,90 @@ mod tests {
         let mut ab = AllBuckets::new(bucket_counts, [None, None, None, None]);
         ab.equity_fallback = true;
         ab
+    }
+
+    fn a2_texture_test_buckets() -> AllBuckets {
+        let canonical_flop = canonical_a2_texture_flop();
+        let mut buckets = vec![0_u16; 1326];
+
+        set_a2_texture_bucket(
+            &mut buckets,
+            &canonical_flop,
+            [card(Value::Ace, Suit::Spade), card(Value::Two, Suit::Spade)],
+            7,
+        );
+        for suit in [Suit::Heart, Suit::Diamond, Suit::Club] {
+            set_a2_texture_bucket(
+                &mut buckets,
+                &canonical_flop,
+                [card(Value::Ace, suit), card(Value::Two, suit)],
+                3,
+            );
+        }
+
+        let bucket_file = BucketFile {
+            header: BucketFileHeader {
+                street: V2Street::Flop,
+                bucket_count: 10,
+                board_count: 1,
+                combos_per_board: 1326,
+                version: bucket_file::VERSION,
+            },
+            boards: vec![canonical_key(&canonical_flop.cards)],
+            buckets,
+        };
+        AllBuckets::new([169, 10, 10, 10], [None, Some(bucket_file), None, None])
+    }
+
+    fn canonical_a2_texture_flop() -> CanonicalBoard {
+        CanonicalBoard::from_cards(&[
+            card(Value::King, Suit::Spade),
+            card(Value::Seven, Suit::Spade),
+            card(Value::Three, Suit::Heart),
+        ])
+        .expect("valid flop")
+    }
+
+    fn set_a2_texture_bucket(
+        buckets: &mut [u16],
+        canonical_flop: &CanonicalBoard,
+        hole: [Card; 2],
+        bucket: u16,
+    ) {
+        let (h0, h1) = canonical_flop.canonicalize_holding(hole[0], hole[1]);
+        buckets[combo_index(h0, h1) as usize] = bucket;
+    }
+
+    fn flop_bucket_for(hole: [Card; 2], flop: [Card; 3], all_buckets: &AllBuckets) -> u16 {
+        let deal = Deal {
+            hole_cards: [
+                hole,
+                [
+                    card(Value::Queen, Suit::Heart),
+                    card(Value::Jack, Suit::Diamond),
+                ],
+                [card(Value::Ten, Suit::Club); 2],
+                [card(Value::Ten, Suit::Diamond); 2],
+                [card(Value::Nine, Suit::Club); 2],
+                [card(Value::Nine, Suit::Diamond); 2],
+                [card(Value::Eight, Suit::Club); 2],
+                [card(Value::Eight, Suit::Diamond); 2],
+            ],
+            board: [
+                flop[0],
+                flop[1],
+                flop[2],
+                card(Value::Six, Suit::Club),
+                card(Value::Five, Suit::Diamond),
+            ],
+            num_players: 2,
+        };
+        compute_deal_buckets(&deal, all_buckets, [169, 10, 10, 10]).buckets[0][Street::Flop.index()]
+            .0
+    }
+
+    fn card(value: Value, suit: Suit) -> Card {
+        Card::new(value, suit)
     }
 
     fn first_decision_node(tree: &MpGameTree) -> u32 {
