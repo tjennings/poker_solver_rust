@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-zgkr
 title: 'Phase 1 prep: differential harness for blueprint trainer tree migration'
-status: completed
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-03T18:10:21Z
-updated_at: 2026-06-03T18:44:54Z
+updated_at: 2026-06-03T18:48:19Z
 parent: poker_solver_rust-34kn
 blocking:
     - poker_solver_rust-kqpn
@@ -58,3 +58,15 @@ Primary implementation target: `cargo test -p poker-solver-core blueprint_v2::mc
 - `cargo test -p poker-solver-core blueprint_v2::mccfr::tests::differential_harness_eager_dense_self_check --quiet` passed.
 - `cargo test -p poker-solver-core blueprint_v2::mccfr --quiet` passed: 73 passed.
 - `/usr/bin/time -p cargo test --quiet` passed warm in `real 40.60`.
+
+
+## Review Findings 2026-06-03
+
+Independent review found the first harness increment is not sufficient to complete this bean. Required follow-up before Phase 1 can proceed:
+
+- Add an actual backend/adapter trait or equivalent candidate injection point so the harness can accept a future lazy/sparse backend instead of only comparing two concrete `DenseMccfrHarnessBackend` instances.
+- Trace and compare sampled opponent actions under fixed RNG, not only final EV/deltas.
+- Improve legal-action/public-state comparison so it is not purely dense arena-index based and includes child/terminal semantic context where practical.
+- Improve traversal mismatch diagnostics with strategy vectors and utility/action-value context at the point of failure.
+
+The bean was reopened from completed to in-progress until these review items are addressed.
