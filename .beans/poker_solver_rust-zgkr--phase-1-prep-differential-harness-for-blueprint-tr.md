@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-06-03T18:10:21Z
-updated_at: 2026-06-03T18:33:18Z
+updated_at: 2026-06-03T18:36:49Z
 parent: poker_solver_rust-34kn
 blocking:
     - poker_solver_rust-kqpn
@@ -30,3 +30,18 @@ This is a hard correctness guard before the lazy tree rewrite is allowed to repl
 ## Phase 0 Scope Correction
 
 Phase 0 found that HU `blueprint_v2` already traverses an eager arena-style `GameTree`; the primary dense pressure point is CFR row allocation plus dense snapshot/export/resume compatibility. For this prep harness, treat the current eager+dense `blueprint_v2` backend as the oracle. The harness should compare current eager/dense behavior against future lazy/sparse behavior at legal actions, terminal values, bucket lookup, regret/strategy-sum deltas, and dense export output. Do not assume there is a hot-path map lookup in HU `blueprint_v2` that must be replaced.
+
+
+## Implementation Plan
+
+Research/brainstorming result for the first harness increment:
+
+- Build around `blueprint_v2::mccfr::traverse_external`, not `BlueprintTrainer::train`, because trainer execution is parallel/atomic and can obscure exact differential comparisons.
+- Start in `crates/core/src/blueprint_v2/mccfr.rs` inside the existing test module so the harness can reuse private fixtures and terminal helpers.
+- Add a small test-only backend/comparison shape that compares eager+dense against eager+dense today and can accept a lazy/sparse adapter later.
+- Use a tiny deterministic HU fixture: toy tree, `[10, 10, 10, 10]` buckets, fixed deals, fixed traversers, fixed RNG seeds, pruning/baselines disabled.
+- Seed oracle and candidate storage with identical deterministic non-zero regrets so uniform strategies do not mask row/action-coordinate bugs.
+- Compare legal action order before traversal, then traversal EV, regret deltas, strategy-sum deltas, dense average-strategy export, and dense regret save/load round trip.
+- Keep this in the default suite and verify it remains fast.
+
+Primary implementation target: `cargo test -p poker-solver-core blueprint_v2::mccfr::tests::differential_harness --quiet` or an equivalent focused filter.
