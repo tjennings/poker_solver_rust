@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-zgkr
 title: 'Phase 1 prep: differential harness for blueprint trainer tree migration'
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-03T18:10:21Z
-updated_at: 2026-06-03T18:36:49Z
+updated_at: 2026-06-03T18:44:54Z
 parent: poker_solver_rust-34kn
 blocking:
     - poker_solver_rust-kqpn
@@ -45,3 +45,16 @@ Research/brainstorming result for the first harness increment:
 - Keep this in the default suite and verify it remains fast.
 
 Primary implementation target: `cargo test -p poker-solver-core blueprint_v2::mccfr::tests::differential_harness --quiet` or an equivalent focused filter.
+
+## Summary of Changes
+
+- Added `blueprint_v2::mccfr::tests::differential_harness_eager_dense_self_check`, a deterministic eager+dense self-check around `traverse_external`.
+- The harness seeds oracle and candidate dense storage with identical non-zero regrets and strategy sums, compares legal action order before traversal, then checks traversal EV, prune/sample stats, regret deltas, strategy-sum deltas, dense average-strategy export, and dense `regrets.bin` save/load round trip.
+- Failure diagnostics decode dense slots back to node/history, player, street, board, bucket, action index, and action label so future lazy/sparse adapter mismatches are actionable.
+- Kept the change scoped to `crates/core/src/blueprint_v2/mccfr.rs`; no storage, bundle, docs, or lazy backend changes were needed.
+
+## Verification
+
+- `cargo test -p poker-solver-core blueprint_v2::mccfr::tests::differential_harness_eager_dense_self_check --quiet` passed.
+- `cargo test -p poker-solver-core blueprint_v2::mccfr --quiet` passed: 73 passed.
+- `/usr/bin/time -p cargo test --quiet` passed warm in `real 40.60`.
