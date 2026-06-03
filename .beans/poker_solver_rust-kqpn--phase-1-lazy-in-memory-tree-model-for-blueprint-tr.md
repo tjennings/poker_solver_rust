@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-06-03T18:08:59Z
-updated_at: 2026-06-03T19:31:27Z
+updated_at: 2026-06-03T19:33:14Z
 parent: poker_solver_rust-34kn
 ---
 
@@ -28,3 +28,9 @@ Acceptance criteria:
 - Instrumentation makes resident tree/storage growth visible during a small trainer run.
 
 Implementation must be delegated to rust-developer/worker agents; manager does not write Rust directly.
+
+## Phase 1 Entry Gate
+
+- Working tree was clean before Phase 1 implementation planning.
+- `/usr/bin/time -p cargo test --quiet` passed on 2026-06-03 in `real 41.46`, under the one-minute project gate.
+- Required research/architecture brainstorming has been dispatched before implementation.
