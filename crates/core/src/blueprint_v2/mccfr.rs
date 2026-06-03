@@ -2941,13 +2941,32 @@ mod tests {
             oracle_backend.diagnostic_tree(),
         );
 
-        let loaded = oracle_backend.dense_regret_save_load_round_trip();
         let precomputed = last_precomputed.expect("at least one differential run");
         let oracle_dense = oracle_backend.dense_storage_projection();
+        let candidate_dense = candidate_backend.dense_storage_projection();
         assert_storage_equal(
-            "dense save/load round trip",
+            "dense oracle vs candidate projection",
+            &oracle_dense,
+            &candidate_dense,
+            &storage_coords,
+            oracle_backend.diagnostic_tree(),
+            &precomputed,
+        );
+
+        let loaded = oracle_backend.dense_regret_save_load_round_trip();
+        assert_storage_equal(
+            "oracle dense save/load round trip",
             &oracle_dense,
             &loaded,
+            &storage_coords,
+            oracle_backend.diagnostic_tree(),
+            &precomputed,
+        );
+        let candidate_loaded = candidate_backend.dense_regret_save_load_round_trip();
+        assert_storage_equal(
+            "candidate dense projection save/load round trip",
+            &candidate_dense,
+            &candidate_loaded,
             &storage_coords,
             oracle_backend.diagnostic_tree(),
             &precomputed,

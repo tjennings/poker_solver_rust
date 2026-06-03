@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-skcd
 title: 'Phase 1 slice: blueprint_v2 sparse CFR storage backend'
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-03T19:36:06Z
-updated_at: 2026-06-03T19:53:33Z
+updated_at: 2026-06-03T20:00:33Z
 parent: poker_solver_rust-kqpn
 ---
 
@@ -54,3 +54,17 @@ Review verification passed, but the recommendation is fix before proceeding:
 - `cargo test -p poker-solver-core differential_harness_eager_dense_vs_sparse_candidate --quiet` passed.
 - `cargo test -p poker-solver-core differential_harness_eager_dense_self_check --quiet` passed.
 - `/usr/bin/time -p cargo test --quiet` passed in `real 41.31` in the review workspace.
+
+## Corrective Patch 2026-06-03
+
+- Preserved prediction-aware current-strategy semantics for sparse storage by adding sparse optimizer attachment, prediction reads, and row-local optimizer delegation. Dense `current_strategy` now delegates to the same optimizer-aware implementation as `current_strategy_into`.
+- Added sparse regret-floor plumbing with clamped `add_regret` behavior and regression coverage.
+- Strengthened sparse dense-projection confidence by validating the supplied tree against the construction-time node/action schema before projecting or converting to dense storage; added a mismatch rejection test.
+- Extended the MCCFR differential harness to compare final dense oracle/candidate projections and to save/load round-trip the candidate projection, including sparse candidates.
+
+## Corrective Verification
+
+- `cargo test -p poker-solver-core blueprint_v2::sparse_storage --quiet` passed.
+- `cargo test -p poker-solver-core differential_harness_eager_dense_vs_sparse_candidate --quiet` passed.
+- `cargo test -p poker-solver-core differential_harness_eager_dense_self_check --quiet` passed.
+- `/usr/bin/time -p cargo test --quiet` passed warm in `real 44.03`. A cold post-edit run also passed but measured `real 101.24` due to recompilation.

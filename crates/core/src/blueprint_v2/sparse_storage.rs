@@ -3,6 +3,8 @@
 //! Missing rows have the same semantics as a dense all-zero row: regrets,
 //! strategy sums, predictions, and baselines read as zero, while current and
 //! average strategy fall back to uniform. Reads do not realize rows; writes do.
+//! Dense projection validates the supplied tree against the layout captured at
+//! construction time before interpreting sparse row keys.
 
 #![allow(clippy::cast_possible_truncation)]
 
@@ -16,6 +18,7 @@ use super::game_tree::{GameNode, GameTree};
 use super::storage::{
     BlueprintCfrStorage, BlueprintStorage, CfrStorageStats, REGRET_SCALE, action_schema_fingerprint,
 };
+use crate::cfr::optimizer::CfrOptimizer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseStorageError {
@@ -26,6 +29,10 @@ pub enum SparseStorageError {
         node_idx: u32,
         bucket: u16,
         bucket_count: u16,
+    },
+    TreeShapeMismatch {
+        expected_nodes: usize,
+        actual_nodes: usize,
     },
     SchemaMismatch {
         node_idx: u32,
@@ -49,6 +56,13 @@ impl fmt::Display for SparseStorageError {
             } => write!(
                 f,
                 "bucket {bucket} is out of range for node {node_idx}; bucket_count={bucket_count}"
+            ),
+            Self::TreeShapeMismatch {
+                expected_nodes,
+                actual_nodes,
+            } => write!(
+                f,
+                "tree node-count mismatch: expected {expected_nodes}, got {actual_nodes}"
             ),
             Self::SchemaMismatch {
                 node_idx,
@@ -77,7 +91,8 @@ pub struct SparseBlueprintStorage {
     baselines_enabled: AtomicBool,
     predictions_enabled: AtomicBool,
     predictions_locked: AtomicBool,
-    regret_floor: i32,
+    regret_floor: AtomicI32,
+    optimizer: Option<Arc<dyn CfrOptimizer>>,
     stats: SparseStats,
 }
 
@@ -157,9 +172,19 @@ impl SparseBlueprintStorage {
             baselines_enabled: AtomicBool::new(use_baselines),
             predictions_enabled: AtomicBool::new(false),
             predictions_locked: AtomicBool::new(false),
-            regret_floor: i32::MIN,
+            regret_floor: AtomicI32::new(i32::MIN),
+            optimizer: None,
             stats: SparseStats::default(),
         }
+    }
+
+    pub fn set_optimizer(&mut self, optimizer: Arc<dyn CfrOptimizer>) {
+        self.optimizer = Some(optimizer);
+    }
+
+    /// Set the lower bound applied to cumulative regret updates.
+    pub fn set_regret_floor(&self, floor: i32) {
+        self.regret_floor.store(floor, Ordering::Relaxed);
     }
 
     pub fn enable_predictions(&self) {
@@ -236,8 +261,18 @@ impl SparseBlueprintStorage {
         self.project_dense_regrets_and_sums(tree)
     }
 
+    pub fn try_dense_regrets_and_sums(
+        &self,
+        tree: &GameTree,
+    ) -> Result<(Vec<i32>, Vec<i64>), SparseStorageError> {
+        self.validate_tree_schema(tree)?;
+        Ok(self.project_dense_regrets_and_sums_unchecked(tree))
+    }
+
     #[must_use]
     pub fn to_dense_storage(&self, tree: &GameTree) -> BlueprintStorage {
+        self.validate_tree_schema(tree)
+            .unwrap_or_else(|err| panic!("{err}"));
         let dense = BlueprintStorage::new(tree, self.bucket_counts);
         let rows = self.rows.read().expect("sparse storage rows lock");
         for (key, row) in rows.iter() {
@@ -254,6 +289,46 @@ impl SparseBlueprintStorage {
             }
         }
         dense
+    }
+
+    fn validate_tree_schema(&self, tree: &GameTree) -> Result<(), SparseStorageError> {
+        if tree.nodes.len() != self.layout.len() {
+            return Err(SparseStorageError::TreeShapeMismatch {
+                expected_nodes: self.layout.len(),
+                actual_nodes: tree.nodes.len(),
+            });
+        }
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            let layout = self.layout[node_idx];
+            match node {
+                GameNode::Decision {
+                    street, actions, ..
+                } => {
+                    let actual_fingerprint = action_schema_fingerprint(actions);
+                    let actual_num_actions = actions.len() as u16;
+                    if layout.num_actions != actual_num_actions
+                        || layout.street_idx != *street as u8
+                        || layout.schema_fingerprint != actual_fingerprint
+                    {
+                        return Err(SparseStorageError::SchemaMismatch {
+                            node_idx: node_idx as u32,
+                            expected_fingerprint: layout.schema_fingerprint,
+                            actual_fingerprint,
+                            expected_num_actions: layout.num_actions,
+                            actual_num_actions,
+                        });
+                    }
+                }
+                GameNode::Chance { .. } | GameNode::Terminal { .. } => {
+                    if layout.num_actions != 0 {
+                        return Err(SparseStorageError::NonDecisionNode {
+                            node_idx: node_idx as u32,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn checked_layout(
@@ -407,14 +482,15 @@ impl BlueprintCfrStorage for SparseBlueprintStorage {
         let layout = self.layout_or_panic(node_idx, bucket);
         let (row, _) = self.get_or_insert_row(node_idx, bucket, layout);
         let atom = &row.regrets[action];
-        if self.regret_floor == i32::MIN {
+        let floor = self.regret_floor.load(Ordering::Relaxed);
+        if floor == i32::MIN {
             atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(old.saturating_add(delta))
             })
             .ok();
         } else {
             atom.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                Some(old.saturating_add(delta).max(self.regret_floor))
+                Some(old.saturating_add(delta).max(floor))
             })
             .ok();
         }
@@ -453,6 +529,15 @@ impl BlueprintCfrStorage for SparseBlueprintStorage {
         row.baselines[action].store((new_val * REGRET_SCALE) as i32, Ordering::Relaxed);
     }
 
+    fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+        if !self.predictions_enabled.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let layout = self.layout_or_panic(node_idx, bucket);
+        self.get_row(node_idx, bucket, layout)
+            .map_or(0, |row| row.predictions[action].load(Ordering::Relaxed))
+    }
+
     fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32) {
         if !self.predictions_enabled.load(Ordering::Relaxed)
             || self.predictions_locked.load(Ordering::Relaxed)
@@ -488,6 +573,15 @@ impl BlueprintCfrStorage for SparseBlueprintStorage {
             out.fill(1.0 / num_actions as f64);
             return;
         };
+
+        if let Some(ref opt) = self.optimizer {
+            let predictions = self
+                .predictions_enabled
+                .load(Ordering::Relaxed)
+                .then_some(row.predictions.as_slice());
+            opt.current_strategy(&row.regrets, predictions, 0, num_actions, out);
+            return;
+        }
 
         let mut positive_sum = 0.0;
         for (action_idx, slot) in out.iter_mut().enumerate() {
@@ -544,6 +638,14 @@ impl BlueprintCfrStorage for SparseBlueprintStorage {
     }
 
     fn project_dense_regrets_and_sums(&self, tree: &GameTree) -> (Vec<i32>, Vec<i64>) {
+        self.validate_tree_schema(tree)
+            .unwrap_or_else(|err| panic!("{err}"));
+        self.project_dense_regrets_and_sums_unchecked(tree)
+    }
+}
+
+impl SparseBlueprintStorage {
+    fn project_dense_regrets_and_sums_unchecked(&self, tree: &GameTree) -> (Vec<i32>, Vec<i64>) {
         let mut regrets = Vec::with_capacity(self.dense_equivalent_slots);
         let mut sums = Vec::with_capacity(self.dense_equivalent_slots);
         let rows = self.rows.read().expect("sparse storage rows lock");
@@ -578,6 +680,8 @@ impl BlueprintCfrStorage for SparseBlueprintStorage {
 mod tests {
     use super::*;
     use crate::blueprint_v2::game_tree::GameTree;
+    use crate::cfr::optimizer::SapcfrPlusOptimizer;
+    use std::sync::Arc;
 
     fn toy_tree() -> GameTree {
         GameTree::build(
@@ -612,6 +716,7 @@ mod tests {
         assert_eq!(storage.get_regret(node_idx, 0, 0), 0);
         assert_eq!(storage.get_strategy_sum(node_idx, 0, 0), 0);
         assert_eq!(storage.get_baseline(node_idx, 0, 0), 0.0);
+        assert_eq!(storage.get_prediction(node_idx, 0, 0), 0);
         assert!(!storage.is_realized(node_idx, 0));
         assert_eq!(storage.storage_stats().realized_rows, 0);
     }
@@ -666,5 +771,70 @@ mod tests {
         let second = sparse.dense_regrets_and_sums(&tree);
         assert_eq!(first, expected);
         assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn prediction_aware_optimizer_matches_dense_strategy() {
+        let tree = toy_tree();
+        let mut dense = BlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let mut sparse = SparseBlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let node_idx = first_decision(&tree);
+        assert!(dense.num_actions(node_idx) >= 2);
+
+        dense.enable_predictions();
+        sparse.enable_predictions();
+        dense.set_optimizer(Arc::new(SapcfrPlusOptimizer {
+            alpha: 1.5,
+            gamma: 2.0,
+            eta: 1.0,
+        }));
+        sparse.set_optimizer(Arc::new(SapcfrPlusOptimizer {
+            alpha: 1.5,
+            gamma: 2.0,
+            eta: 1.0,
+        }));
+
+        dense.add_regret(node_idx, 0, 0, 100);
+        sparse.add_regret(node_idx, 0, 0, 100);
+        dense.set_prediction(node_idx, 0, 1, 200);
+        sparse.set_prediction(node_idx, 0, 1, 200);
+
+        assert_eq!(sparse.get_prediction(node_idx, 0, 1), 200);
+        assert_eq!(
+            dense.current_strategy(node_idx, 0),
+            sparse.current_strategy(node_idx, 0)
+        );
+    }
+
+    #[test]
+    fn regret_floor_clamps_sparse_updates() {
+        let tree = toy_tree();
+        let storage = SparseBlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let node_idx = first_decision(&tree);
+
+        storage.set_regret_floor(-1_000);
+        storage.add_regret(node_idx, 0, 0, -5_000);
+
+        assert_eq!(storage.get_regret(node_idx, 0, 0), -1_000);
+    }
+
+    #[test]
+    fn dense_projection_rejects_mismatched_tree_schema() {
+        let tree = toy_tree();
+        let storage = SparseBlueprintStorage::new(&tree, [10, 10, 10, 10]);
+        let node_idx = first_decision(&tree);
+        storage.add_regret(node_idx, 0, 0, 100);
+
+        let mut mismatched = tree.clone();
+        let GameNode::Decision { actions, .. } = &mut mismatched.nodes[node_idx as usize] else {
+            panic!("expected decision node");
+        };
+        assert!(actions.len() >= 2);
+        actions.swap(0, 1);
+
+        let err = storage
+            .try_dense_regrets_and_sums(&mismatched)
+            .expect_err("projection should reject action schema mismatch");
+        assert!(matches!(err, SparseStorageError::SchemaMismatch { .. }));
     }
 }

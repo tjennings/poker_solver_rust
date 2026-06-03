@@ -145,6 +145,7 @@ pub trait BlueprintCfrStorage: Send + Sync {
 
     fn get_baseline(&self, node_idx: u32, bucket: u16, action: usize) -> f64;
     fn update_baseline(&self, node_idx: u32, bucket: u16, action: usize, value: f64, alpha: f64);
+    fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32;
     fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32);
     fn add_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32);
 
@@ -371,6 +372,11 @@ impl BlueprintStorage {
         self.optimizer = Some(optimizer);
     }
 
+    /// Set the lower bound applied to cumulative regret updates.
+    pub fn set_regret_floor(&mut self, floor: i32) {
+        self.regret_floor = floor;
+    }
+
     /// Allocate the prediction buffer (same size as regrets, zeroed).
     pub fn enable_predictions(&mut self) {
         let total = self.regrets.len();
@@ -452,21 +458,9 @@ impl BlueprintStorage {
     pub fn current_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64> {
         let nl = &self.layout[node_idx as usize];
         let num_actions = nl.num_actions as usize;
-        let start = Self::slot_offset(nl, bucket);
-
-        let mut positive_sum = 0.0_f64;
-        let mut positives = Vec::with_capacity(num_actions);
-        for i in 0..num_actions {
-            let r = self.regrets[start + i].load(Ordering::Relaxed).max(0) as f64;
-            positives.push(r);
-            positive_sum += r;
-        }
-
-        if positive_sum > 0.0 {
-            positives.iter().map(|&r| r / positive_sum).collect()
-        } else {
-            vec![1.0 / num_actions as f64; num_actions]
-        }
+        let mut strategy = vec![0.0; num_actions];
+        self.current_strategy_into(node_idx, bucket, &mut strategy);
+        strategy
     }
 
     /// Write the current regret-matched strategy into a caller-supplied buffer.
@@ -845,6 +839,10 @@ impl BlueprintCfrStorage for BlueprintStorage {
 
     fn update_baseline(&self, node_idx: u32, bucket: u16, action: usize, value: f64, alpha: f64) {
         Self::update_baseline(self, node_idx, bucket, action, value, alpha);
+    }
+
+    fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+        Self::get_prediction(self, node_idx, bucket, action)
     }
 
     fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32) {
