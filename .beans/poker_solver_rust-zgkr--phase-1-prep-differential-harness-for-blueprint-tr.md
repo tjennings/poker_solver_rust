@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-zgkr
 title: 'Phase 1 prep: differential harness for blueprint trainer tree migration'
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-03T18:10:21Z
-updated_at: 2026-06-03T18:48:19Z
+updated_at: 2026-06-03T18:58:32Z
 parent: poker_solver_rust-34kn
 blocking:
     - poker_solver_rust-kqpn
@@ -70,3 +70,17 @@ Independent review found the first harness increment is not sufficient to comple
 - Improve traversal mismatch diagnostics with strategy vectors and utility/action-value context at the point of failure.
 
 The bean was reopened from completed to in-progress until these review items are addressed.
+
+## Corrective Patch Summary
+
+- Reworked the differential harness around a test-only `MccfrHarnessBackend` trait so oracle/candidate comparison is no longer tied to two concrete `DenseMccfrHarnessBackend` values.
+- Added `cfg(test)` traversal trace collection at opponent sampling and traverser action-value computation. The harness now compares sampled opponent action index, RNG threshold, strategy vector, sampled utility, returned utility, traverser strategy vectors, per-action utilities, pruned flags, and node values.
+- Replaced arena-index zip legal-action checks with semantic public decision schemas keyed by public action history, including player, street, ordered actions, child kind, and terminal pot/stacks payload where applicable. Dense node debug context is diagnostic-only, not part of equality.
+- Improved traversal mismatch diagnostics to include public key/history, node, player, street, board, bucket, actions, strategy vectors, action values, sampled values, and trace tails.
+- Kept implementation scoped to `crates/core/src/blueprint_v2/mccfr.rs`; no lazy backend, storage backend, docs, or CLI changes were added.
+
+## Corrective Verification
+
+- `cargo test -p poker-solver-core blueprint_v2::mccfr::tests::differential_harness_eager_dense_self_check --quiet` passed.
+- `cargo test -p poker-solver-core blueprint_v2::mccfr --quiet` passed: 73 passed.
+- `/usr/bin/time -p cargo test --quiet` passed warm in `real 42.33`; first post-edit rebuild run also passed but took `real 94.40` due rebuild overhead.
