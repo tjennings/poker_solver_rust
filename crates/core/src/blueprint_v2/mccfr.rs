@@ -50,7 +50,7 @@ use super::bucket_file::{BucketFile, PackedBoard};
 use super::cluster_pipeline::{canonical_key, combo_index};
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::per_flop_bucket_file::PerFlopBucketFile;
-use super::storage::BlueprintStorage;
+use super::storage::{BlueprintCfrStorage, BlueprintStorage};
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::poker::{Card, Hand, Rankable};
 
@@ -638,16 +638,16 @@ impl ScenarioEvTracker {
 /// * `full_ev_tracker` - Optional full-tree EV tracker for all decision nodes
 /// * `baseline_alpha` - EMA learning rate for VR-MCCFR baselines (0.0 = disabled)
 #[allow(clippy::too_many_arguments)]
-pub fn traverse_external(
+pub fn traverse_external<S: BlueprintCfrStorage + ?Sized, R: Rng + ?Sized>(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    storage: &S,
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
     prune: bool,
     prune_threshold: i32,
     prune_streets: [bool; 4],
-    rng: &mut impl Rng,
+    rng: &mut R,
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
@@ -939,7 +939,7 @@ pub fn traverse_best_response(
 #[allow(clippy::too_many_arguments)]
 fn traverse_traverser(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    storage: &(impl BlueprintCfrStorage + ?Sized),
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -950,7 +950,7 @@ fn traverse_traverser(
     prune_threshold: i32,
     street: Street,
     prune_streets: [bool; 4],
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
@@ -1085,7 +1085,7 @@ fn baseline_corrected_value(
 #[allow(clippy::too_many_arguments)]
 fn traverse_opponent(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    storage: &(impl BlueprintCfrStorage + ?Sized),
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -1095,7 +1095,7 @@ fn traverse_opponent(
     prune: bool,
     prune_threshold: i32,
     prune_streets: [bool; 4],
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
@@ -1404,6 +1404,7 @@ mod tests {
     use super::*;
     use crate::blueprint_v2::bundle::BlueprintV2Strategy;
     use crate::blueprint_v2::game_tree::GameTree;
+    use crate::blueprint_v2::sparse_storage::SparseBlueprintStorage;
     use crate::blueprint_v2::storage::BlueprintStorage;
 
     // --- ScenarioEvTracker tests ---
@@ -1776,6 +1777,12 @@ mod tests {
         storage: BlueprintStorage,
     }
 
+    struct SparseMccfrHarnessBackend {
+        name: &'static str,
+        tree: GameTree,
+        storage: SparseBlueprintStorage,
+    }
+
     trait MccfrHarnessBackend {
         fn name(&self) -> &'static str;
         fn seed_deterministic_nonzero(&self);
@@ -1793,7 +1800,7 @@ mod tests {
         fn dense_average_strategy(&self) -> BlueprintV2Strategy;
         fn dense_regret_save_load_round_trip(&self) -> BlueprintStorage;
         fn diagnostic_tree(&self) -> &GameTree;
-        fn diagnostic_storage(&self) -> &BlueprintStorage;
+        fn dense_storage_projection(&self) -> BlueprintStorage;
     }
 
     #[derive(Clone, Debug)]
@@ -1830,6 +1837,18 @@ mod tests {
         }
     }
 
+    impl SparseMccfrHarnessBackend {
+        fn new(name: &'static str, bucket_counts: [u16; 4]) -> Self {
+            let tree = toy_tree();
+            let storage = SparseBlueprintStorage::new(&tree, bucket_counts);
+            Self {
+                name,
+                tree,
+                storage,
+            }
+        }
+    }
+
     impl MccfrHarnessBackend for DenseMccfrHarnessBackend {
         fn name(&self) -> &'static str {
             self.name
@@ -1840,39 +1859,7 @@ mod tests {
         }
 
         fn public_decisions(&self) -> Vec<PublicDecisionSchema> {
-            self.tree
-                .nodes
-                .iter()
-                .enumerate()
-                .filter_map(|(node_idx, node)| {
-                    let GameNode::Decision {
-                        player,
-                        street,
-                        actions,
-                        children,
-                        ..
-                    } = node
-                    else {
-                        return None;
-                    };
-                    Some(PublicDecisionSchema {
-                        public_key: action_history(&self.tree, node_idx as u32),
-                        debug: node_context(&self.tree, node_idx as u32, None, None, None),
-                        player: *player,
-                        street: *street,
-                        actions: actions
-                            .iter()
-                            .zip(children.iter())
-                            .enumerate()
-                            .map(|(action_idx, (action, &child_idx))| PublicActionSchema {
-                                action_idx,
-                                label: format!("{action:?}"),
-                                child_desc: mccfr_trace_child_desc(&self.tree, child_idx),
-                            })
-                            .collect(),
-                    })
-                })
-                .collect()
+            public_decisions_for_tree(&self.tree)
         }
 
         fn traverse_with_trace(
@@ -1907,11 +1894,11 @@ mod tests {
         }
 
         fn snapshot_regrets(&self) -> Vec<i32> {
-            snapshot_regrets(&self.storage)
+            snapshot_regrets(&self.storage, &self.tree)
         }
 
         fn snapshot_strategy_sums(&self) -> Vec<i64> {
-            snapshot_sums(&self.storage)
+            snapshot_sums(&self.storage, &self.tree)
         }
 
         fn storage_coords(&self) -> Vec<StorageCoord> {
@@ -1944,8 +1931,97 @@ mod tests {
             &self.tree
         }
 
-        fn diagnostic_storage(&self) -> &BlueprintStorage {
-            &self.storage
+        fn dense_storage_projection(&self) -> BlueprintStorage {
+            dense_storage_from_projection(&self.tree, &self.storage)
+        }
+    }
+
+    impl MccfrHarnessBackend for SparseMccfrHarnessBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn seed_deterministic_nonzero(&self) {
+            seed_deterministic_nonzero_storage(&self.storage, &self.tree);
+        }
+
+        fn public_decisions(&self) -> Vec<PublicDecisionSchema> {
+            public_decisions_for_tree(&self.tree)
+        }
+
+        fn traverse_with_trace(
+            &self,
+            deal: &DealWithBuckets,
+            traverser: u8,
+            seed: u64,
+        ) -> HarnessTraversalResult {
+            start_mccfr_test_trace();
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (ev, stats) = traverse_external(
+                &self.tree,
+                &self.storage,
+                deal,
+                traverser,
+                self.tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                None,
+                None,
+                0.0,
+            );
+            HarnessTraversalResult {
+                ev,
+                stats,
+                trace: take_mccfr_test_trace(),
+            }
+        }
+
+        fn snapshot_regrets(&self) -> Vec<i32> {
+            self.storage.project_dense_regrets_and_sums(&self.tree).0
+        }
+
+        fn snapshot_strategy_sums(&self) -> Vec<i64> {
+            self.storage.project_dense_regrets_and_sums(&self.tree).1
+        }
+
+        fn storage_coords(&self) -> Vec<StorageCoord> {
+            build_storage_coords(&self.tree, &self.storage)
+        }
+
+        fn strategy_coords(&self) -> Vec<StrategyCoord> {
+            build_strategy_coords(&self.tree, &self.storage)
+        }
+
+        fn dense_average_strategy(&self) -> BlueprintV2Strategy {
+            let dense = self.storage.to_dense_storage(&self.tree);
+            BlueprintV2Strategy::from_storage(&dense, &self.tree)
+        }
+
+        fn dense_regret_save_load_round_trip(&self) -> BlueprintStorage {
+            let dense = self.storage.to_dense_storage(&self.tree);
+            let tmp = std::env::temp_dir().join(format!(
+                "blueprint_v2_diff_harness_regrets_{}_{}.bin",
+                std::process::id(),
+                self.name
+            ));
+            dense.save_regrets(&tmp).expect("save sparse projection");
+            let loaded =
+                BlueprintStorage::load_regrets(&tmp, &self.tree, self.storage.bucket_counts)
+                    .expect("load sparse projection");
+            std::fs::remove_file(&tmp).ok();
+            loaded
+        }
+
+        fn diagnostic_tree(&self) -> &GameTree {
+            &self.tree
+        }
+
+        fn dense_storage_projection(&self) -> BlueprintStorage {
+            self.storage.to_dense_storage(&self.tree)
         }
     }
 
@@ -1970,23 +2046,15 @@ mod tests {
         action_label: String,
     }
 
-    fn snapshot_regrets(storage: &BlueprintStorage) -> Vec<i32> {
-        storage
-            .regrets
-            .iter()
-            .map(|slot| slot.load(Ordering::Relaxed))
-            .collect()
+    fn snapshot_regrets(storage: &impl BlueprintCfrStorage, tree: &GameTree) -> Vec<i32> {
+        storage.project_dense_regrets_and_sums(tree).0
     }
 
-    fn snapshot_sums(storage: &BlueprintStorage) -> Vec<i64> {
-        storage
-            .strategy_sums
-            .iter()
-            .map(|slot| slot.load(Ordering::Relaxed))
-            .collect()
+    fn snapshot_sums(storage: &impl BlueprintCfrStorage, tree: &GameTree) -> Vec<i64> {
+        storage.project_dense_regrets_and_sums(tree).1
     }
 
-    fn seed_deterministic_nonzero_storage(storage: &BlueprintStorage, tree: &GameTree) {
+    fn seed_deterministic_nonzero_storage(storage: &impl BlueprintCfrStorage, tree: &GameTree) {
         for (node_idx, node) in tree.nodes.iter().enumerate() {
             let GameNode::Decision {
                 street, actions, ..
@@ -1994,10 +2062,9 @@ mod tests {
             else {
                 continue;
             };
-            let buckets = storage.bucket_counts[*street as usize];
+            let buckets = storage.bucket_counts()[*street as usize];
             for bucket in 0..buckets {
                 for action_idx in 0..actions.len() {
-                    let slot = storage.slot_offset_for(node_idx as u32, bucket) + action_idx;
                     let base =
                         (node_idx as i32 + 1) * 37 + i32::from(bucket) * 11 + action_idx as i32 * 5;
                     let regret = if (node_idx + action_idx) % 2 == 0 {
@@ -2007,11 +2074,28 @@ mod tests {
                     };
                     let sum =
                         (node_idx as i64 + 3) * 101 + i64::from(bucket) * 17 + action_idx as i64;
-                    storage.regrets[slot].store(regret, Ordering::Relaxed);
-                    storage.strategy_sums[slot].store(sum, Ordering::Relaxed);
+                    storage.add_regret(node_idx as u32, bucket, action_idx, regret);
+                    storage.add_strategy_sum(node_idx as u32, bucket, action_idx, sum);
                 }
             }
         }
+    }
+
+    fn dense_storage_from_projection(
+        tree: &GameTree,
+        storage: &impl BlueprintCfrStorage,
+    ) -> BlueprintStorage {
+        let dense = BlueprintStorage::new(tree, storage.bucket_counts());
+        let (regrets, sums) = storage.project_dense_regrets_and_sums(tree);
+        assert_eq!(regrets.len(), dense.regrets.len());
+        assert_eq!(sums.len(), dense.strategy_sums.len());
+        for (slot, value) in regrets.into_iter().enumerate() {
+            dense.regrets[slot].store(value, Ordering::Relaxed);
+        }
+        for (slot, value) in sums.into_iter().enumerate() {
+            dense.strategy_sums[slot].store(value, Ordering::Relaxed);
+        }
+        dense
     }
 
     fn assert_legal_action_orders_match(
@@ -2076,8 +2160,48 @@ mod tests {
         map
     }
 
-    fn build_storage_coords(tree: &GameTree, storage: &BlueprintStorage) -> Vec<StorageCoord> {
-        let mut coords: Vec<Option<StorageCoord>> = vec![None; storage.regrets.len()];
+    fn public_decisions_for_tree(tree: &GameTree) -> Vec<PublicDecisionSchema> {
+        tree.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(node_idx, node)| {
+                let GameNode::Decision {
+                    player,
+                    street,
+                    actions,
+                    children,
+                    ..
+                } = node
+                else {
+                    return None;
+                };
+                Some(PublicDecisionSchema {
+                    public_key: action_history(tree, node_idx as u32),
+                    debug: node_context(tree, node_idx as u32, None, None, None),
+                    player: *player,
+                    street: *street,
+                    actions: actions
+                        .iter()
+                        .zip(children.iter())
+                        .enumerate()
+                        .map(|(action_idx, (action, &child_idx))| PublicActionSchema {
+                            action_idx,
+                            label: format!("{action:?}"),
+                            child_desc: mccfr_trace_child_desc(tree, child_idx),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    fn build_storage_coords(
+        tree: &GameTree,
+        storage: &impl BlueprintCfrStorage,
+    ) -> Vec<StorageCoord> {
+        let dense_slots = storage.storage_stats().dense_equivalent_slots;
+        let mut coords: Vec<Option<StorageCoord>> = vec![None; dense_slots];
+        let mut slot = 0usize;
         for (node_idx, node) in tree.nodes.iter().enumerate() {
             let GameNode::Decision {
                 player,
@@ -2088,10 +2212,9 @@ mod tests {
             else {
                 continue;
             };
-            let buckets = storage.bucket_counts[*street as usize];
+            let buckets = storage.bucket_counts()[*street as usize];
             for bucket in 0..buckets {
                 for (action_idx, action) in actions.iter().enumerate() {
-                    let slot = storage.slot_offset_for(node_idx as u32, bucket) + action_idx;
                     coords[slot] = Some(StorageCoord {
                         node_idx: node_idx as u32,
                         player: *player,
@@ -2100,6 +2223,7 @@ mod tests {
                         action_idx,
                         action_label: format!("{action:?}"),
                     });
+                    slot += 1;
                 }
             }
         }
@@ -2112,7 +2236,10 @@ mod tests {
             .collect()
     }
 
-    fn build_strategy_coords(tree: &GameTree, storage: &BlueprintStorage) -> Vec<StrategyCoord> {
+    fn build_strategy_coords(
+        tree: &GameTree,
+        storage: &impl BlueprintCfrStorage,
+    ) -> Vec<StrategyCoord> {
         let mut coords = Vec::new();
         let mut decision_idx = 0usize;
         for (node_idx, node) in tree.nodes.iter().enumerate() {
@@ -2125,7 +2252,7 @@ mod tests {
             else {
                 continue;
             };
-            let buckets = storage.bucket_counts[*street as usize];
+            let buckets = storage.bucket_counts()[*street as usize];
             for bucket in 0..buckets {
                 for (action_idx, action) in actions.iter().enumerate() {
                     coords.push(StrategyCoord {
@@ -2703,6 +2830,24 @@ mod tests {
         let candidate = DenseMccfrHarnessBackend::new("candidate_eager_dense", bucket_counts);
         let oracle_backend: &dyn MccfrHarnessBackend = &oracle;
         let candidate_backend: &dyn MccfrHarnessBackend = &candidate;
+        run_differential_harness(oracle_backend, candidate_backend, bucket_counts);
+    }
+
+    #[test]
+    fn differential_harness_eager_dense_vs_sparse_candidate() {
+        let bucket_counts = [10, 10, 10, 10];
+        let oracle = DenseMccfrHarnessBackend::new("oracle_eager_dense", bucket_counts);
+        let candidate = SparseMccfrHarnessBackend::new("candidate_sparse", bucket_counts);
+        let oracle_backend: &dyn MccfrHarnessBackend = &oracle;
+        let candidate_backend: &dyn MccfrHarnessBackend = &candidate;
+        run_differential_harness(oracle_backend, candidate_backend, bucket_counts);
+    }
+
+    fn run_differential_harness(
+        oracle_backend: &dyn MccfrHarnessBackend,
+        candidate_backend: &dyn MccfrHarnessBackend,
+        bucket_counts: [u16; 4],
+    ) {
         let buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
 
         oracle_backend.seed_deterministic_nonzero();
@@ -2798,9 +2943,10 @@ mod tests {
 
         let loaded = oracle_backend.dense_regret_save_load_round_trip();
         let precomputed = last_precomputed.expect("at least one differential run");
+        let oracle_dense = oracle_backend.dense_storage_projection();
         assert_storage_equal(
             "dense save/load round trip",
-            oracle_backend.diagnostic_storage(),
+            &oracle_dense,
             &loaded,
             &storage_coords,
             oracle_backend.diagnostic_tree(),

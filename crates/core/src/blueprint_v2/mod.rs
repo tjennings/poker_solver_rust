@@ -17,6 +17,7 @@ pub mod nut_features;
 pub mod per_flop_bucket_file;
 
 pub mod leaf_evaluator;
+pub mod sparse_storage;
 pub mod storage;
 pub mod subgame;
 pub mod subgame_cfr;
