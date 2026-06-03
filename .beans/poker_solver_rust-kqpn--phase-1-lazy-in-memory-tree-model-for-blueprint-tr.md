@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-06-03T18:08:59Z
-updated_at: 2026-06-03T19:33:14Z
+updated_at: 2026-06-03T19:35:27Z
 parent: poker_solver_rust-34kn
 ---
 
@@ -34,3 +34,24 @@ Implementation must be delegated to rust-developer/worker agents; manager does n
 - Working tree was clean before Phase 1 implementation planning.
 - `/usr/bin/time -p cargo test --quiet` passed on 2026-06-03 in `real 41.46`, under the one-minute project gate.
 - Required research/architecture brainstorming has been dispatched before implementation.
+
+## Phase 1 Implementation Plan
+
+Research/architecture consensus: do not rewrite HU `GameTree` in the first production slice. HU `blueprint_v2` already traverses an eager arena by stable node index; the memory pressure Phase 1 should address is eager dense CFR row allocation across every `(decision node, bucket, action)` slot.
+
+Planned implementation sequence:
+
+- Add a `blueprint_v2` CFR storage abstraction over the operations used by MCCFR traversal: current strategy, average strategy, regret read/write, strategy-sum read/write, baseline/prediction hooks where needed, dense projection, load/save compatibility hooks, and storage stats.
+- Keep existing `BlueprintStorage` as the dense implementation and preserve current behavior through the trait before adding sparse storage.
+- Add HU sparse/lazy row storage keyed by stable decision identity plus bucket and action-schema fingerprint. Missing rows must be equivalent to dense all-zero rows: zero regrets/sums/predictions/baselines and uniform current/average strategy.
+- Refactor the existing differential harness to compare dense oracle behavior against the sparse candidate using the completed trace/action/delta checks.
+- Preserve dense `strategy.bin` and dense-compatible snapshot/export behavior for Explorer/Tauri. Sparse internals remain an in-memory trainer detail in this phase.
+- Add instrumentation for realized rows/slots, inserts, read/write probes and hits, dense-equivalent slots/bytes, and approximate sparse resident bytes.
+- Defer lazy child realization, strategy pruning, sparse on-disk defaults, and disk eviction to later phases.
+
+First worker slice:
+
+- Implement the storage trait and dense implementation with no behavior change.
+- Add the HU sparse storage module with missing-row semantics, idempotent row realization, dense projection helpers, and stats.
+- Wire just enough MCCFR/test-harness code to run dense oracle vs sparse candidate on the deterministic fixture.
+- Add focused tests for missing-row uniform fallback, idempotent allocation, schema mismatch rejection, deterministic dense projection, and differential equivalence.
