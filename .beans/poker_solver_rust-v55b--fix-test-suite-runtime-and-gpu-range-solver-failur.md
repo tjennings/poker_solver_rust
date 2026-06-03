@@ -5,9 +5,7 @@ status: completed
 type: task
 priority: high
 created_at: 2026-04-17T16:17:32Z
-updated_at: 2026-06-03T18:28:04Z
-blocking:
-    - poker_solver_rust-6y86
+updated_at: 2026-06-03T18:31:47Z
 ---
 
 Two issues blocking CLAUDE.md's <60s test-suite rule:

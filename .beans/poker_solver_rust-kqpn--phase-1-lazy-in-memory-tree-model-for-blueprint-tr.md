@@ -5,11 +5,10 @@ status: todo
 type: feature
 priority: high
 created_at: 2026-06-03T18:08:59Z
-updated_at: 2026-06-03T18:10:49Z
+updated_at: 2026-06-03T18:31:46Z
 parent: poker_solver_rust-34kn
 blocked_by:
     - poker_solver_rust-zgkr
-    - poker_solver_rust-6y86
 ---
 
 Phase 1 of the blueprint trainer tree roadmap.

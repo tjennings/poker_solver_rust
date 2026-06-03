@@ -5,11 +5,10 @@ status: draft
 type: task
 priority: high
 created_at: 2026-06-03T18:09:40Z
-updated_at: 2026-06-03T18:10:49Z
+updated_at: 2026-06-03T18:31:46Z
 parent: poker_solver_rust-34kn
 blocked_by:
     - poker_solver_rust-kqpn
-    - poker_solver_rust-6y86
 ---
 
 Phase 2 of the blueprint trainer tree roadmap.

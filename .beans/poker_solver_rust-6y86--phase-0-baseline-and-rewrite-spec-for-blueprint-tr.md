@@ -5,14 +5,8 @@ status: completed
 type: task
 priority: high
 created_at: 2026-06-03T18:10:49Z
-updated_at: 2026-06-03T18:31:18Z
+updated_at: 2026-06-03T18:31:47Z
 parent: poker_solver_rust-34kn
-blocking:
-    - poker_solver_rust-zgkr
-    - poker_solver_rust-kqpn
-    - poker_solver_rust-l6r9
-    - poker_solver_rust-bgbz
-    - poker_solver_rust-i4fy
 ---
 
 Phase 0 planning/specification task for the blueprint trainer lazy tree roadmap.
