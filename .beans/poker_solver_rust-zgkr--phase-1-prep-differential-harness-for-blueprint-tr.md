@@ -5,10 +5,8 @@ status: completed
 type: task
 priority: high
 created_at: 2026-06-03T18:10:21Z
-updated_at: 2026-06-03T18:58:32Z
+updated_at: 2026-06-03T19:31:31Z
 parent: poker_solver_rust-34kn
-blocking:
-    - poker_solver_rust-kqpn
 ---
 
 Preparatory subtask for Phase 1 of the blueprint trainer tree roadmap.
