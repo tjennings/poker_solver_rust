@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-kqpn
 title: 'Phase 1: lazy in-memory tree model for blueprint trainer'
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-06-03T18:08:59Z
-updated_at: 2026-06-03T19:35:27Z
+updated_at: 2026-06-03T20:29:29Z
 parent: poker_solver_rust-34kn
 ---
 
@@ -55,3 +55,39 @@ First worker slice:
 - Add the HU sparse storage module with missing-row semantics, idempotent row realization, dense projection helpers, and stats.
 - Wire just enough MCCFR/test-harness code to run dense oracle vs sparse candidate on the deterministic fixture.
 - Add focused tests for missing-row uniform fallback, idempotent allocation, schema mismatch rejection, deterministic dense projection, and differential equivalence.
+
+## Summary of Changes
+
+Phase 1 is complete as an in-memory lazy/sparse CFR row model over the existing HU `blueprint_v2` eager arena `GameTree`. Phase 0 showed that rewriting HU traversal into a lazy `GameTree` would target the wrong pressure point; the implemented Phase 1 therefore keeps stable arena node identity for traversal and moves lazy realization into trainer storage rows.
+
+Delivered:
+
+- Added a `blueprint_v2` CFR storage abstraction used by MCCFR traversal.
+- Preserved existing dense `BlueprintStorage` behavior as the default backend.
+- Added `SparseBlueprintStorage` with lazy row realization, missing-row zero/uniform semantics, idempotent allocation, action-schema validation, prediction-aware optimizer support, regret-floor support, dense projection helpers, and resident/dense-equivalent storage stats.
+- Extended the deterministic differential harness to compare eager dense oracle behavior against sparse candidate behavior, including traces, deltas, dense projection, and candidate save/load round trip.
+- Added `training.storage_backend` with `dense` default and `sparse`/`lazy` opt-in for HU `blueprint_v2` training.
+- Wired `BlueprintTrainer` through the storage abstraction so sparse training runs without dense projection in the hot MCCFR loop.
+- Preserved dense `strategy.bin`/`regrets.bin` snapshot/export/resume compatibility for Explorer/Tauri consumers.
+- Mirrored optimizer, SAPCFR+ prediction, baseline, and regret-floor setup for sparse storage; sparse+BRCFR+ is explicitly rejected in this phase with test coverage.
+- Surfaced sparse storage instrumentation in trainer progress/logging.
+- Updated `docs/architecture.md` and `docs/training.md` for the new backend and limitations.
+
+Verification:
+
+- `cargo test -p poker-solver-core blueprint_v2::sparse_storage --quiet` passed.
+- `cargo test -p poker-solver-core differential_harness_eager_dense_vs_sparse_candidate --quiet` passed.
+- `cargo test -p poker-solver-core differential_harness_eager_dense_self_check --quiet` passed.
+- `cargo test -p poker-solver-core blueprint_v2::trainer::tests --quiet` passed.
+- `cargo test -p poker-solver-core blueprint_v2 --quiet` passed.
+- Manager full-suite gate: `/usr/bin/time -p cargo test --quiet` passed in `real 42.99`, under the one-minute requirement.
+
+Independent reviews completed:
+
+- Initial sparse storage slice review found blockers around prediction-aware strategy semantics, regret floors, schema validation confidence, and sparse candidate round-trip coverage; all were fixed in `8558fbfb`.
+- Corrective sparse storage review found no blockers and recommended proceeding.
+- Production trainer integration review found no blockers and recommended closing Phase 1.
+
+Known follow-up:
+
+- `poker_solver_rust-f14l` tracks a low-priority TUI startup display freshness gap in sparse resume mode. This is not a trainer traversal/export blocker and is deferred outside Phase 1.
