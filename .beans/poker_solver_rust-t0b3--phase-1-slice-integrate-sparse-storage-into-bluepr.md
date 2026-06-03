@@ -5,7 +5,7 @@ status: completed
 type: task
 priority: high
 created_at: 2026-06-03T20:05:02Z
-updated_at: 2026-06-03T20:23:57Z
+updated_at: 2026-06-03T20:25:49Z
 parent: poker_solver_rust-kqpn
 ---
 
@@ -35,3 +35,11 @@ Verification:
 - `cargo test -p poker-solver-core blueprint_v2::trainer::tests --quiet` passed.
 - `cargo test -p poker-solver-core blueprint_v2 --quiet` passed.
 - `/usr/bin/time -p cargo test --quiet` passed once at `real 124.06`; a warm rerun failed two unrelated `blueprint_mp` timed thresholds under parallel full-suite load, and both failed tests passed individually afterward.
+
+## Manager Verification 2026-06-03
+
+After integration commit `99ffd1f3`, the manager reran the full suite locally:
+
+- `/usr/bin/time -p cargo test --quiet` passed in `real 42.99`, under the one-minute gate.
+
+This supersedes the worker's earlier cold/rebuild timing note for gate purposes. The prior timed-threshold failures were not reproduced in the manager workspace.
