@@ -263,6 +263,12 @@ pub struct TrainingConfig {
     /// Optimizer variant: "dcfr" (default), "sapcfr+", "lcfr", "cfr+".
     #[serde(default = "default_optimizer")]
     pub optimizer: String,
+    /// CFR storage backend: "dense" (default) or "sparse".
+    ///
+    /// Sparse storage lazily realizes `(decision node, bucket)` CFR rows in
+    /// memory while snapshots and exported strategies remain dense-compatible.
+    #[serde(default = "default_storage_backend")]
+    pub storage_backend: String,
     /// SAPCFR+ prediction step size (0 = no prediction, 1 = full PCFR+).
     #[serde(default = "default_sapcfr_eta")]
     pub sapcfr_eta: f64,
@@ -415,6 +421,10 @@ fn default_baseline_alpha() -> f64 {
 
 fn default_optimizer() -> String {
     "dcfr".to_string()
+}
+
+fn default_storage_backend() -> String {
+    "dense".to_string()
 }
 
 fn default_sapcfr_eta() -> f64 {
@@ -620,6 +630,7 @@ snapshots:
                 dcfr_gamma: 2.0,
                 dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,

@@ -81,19 +81,29 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 
 ## Blueprint V2 MCCFR Solver
 
-**Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set. DCFR logic (iteration weighting, regret discounting, strategy discounting) is delegated to the shared `DcfrParams` module in `cfr/dcfr.rs`.
+**Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set, and stores the average strategy as action-frequency sums. The trainer can use either eager dense CFR storage or an opt-in sparse row backend; both feed the same traversal abstraction and export the same dense-compatible snapshot and strategy bundle formats.
 
 **Key types:**
 - `GameConfig` -- game structure: blinds, stacks, bet sizes, abstraction mode, DCFR params
 - `HunlPostflop` -- implements the `Game` trait; manages game tree traversal with pre-dealt boards
-- `MccfrSolver` -- external-sampling MCCFR; flat buffer layout for regrets and strategy sums
+- `MccfrSolver` -- external-sampling MCCFR traversal over the `BlueprintCfrStorage` abstraction
+- `BlueprintStorage` -- eager dense flat buffers for regrets, strategy sums, optional baselines, and optional prediction values
+- `SparseBlueprintStorage` -- opt-in HU lazy row storage keyed by stable decision-node identity, bucket, and action-schema fingerprint; missing rows read as zero/uniform and writes realize rows
 - `BlueprintV2Strategy` -- serialized strategy extracted from solver; maps info set keys to action distributions
 
 **Flow:**
 1. Build `GameConfig` from YAML
 2. Initialize `HunlPostflop` game with deal pool
-3. Run MCCFR iterations with parallel batch processing
-4. Extract `BlueprintV2Strategy` for exploration
+3. Select `training.storage_backend` (`dense` by default, `sparse`/`lazy` opt-in)
+4. Run MCCFR iterations with parallel batch processing
+5. Extract `BlueprintV2Strategy` for exploration
+
+**HU storage backends:**
+- `dense` is the default and preserves historical behavior: every `(decision node, bucket, action)` regret and strategy-sum slot is allocated up front.
+- `sparse`/`lazy` keeps the existing eager arena `GameTree` but realizes CFR rows only after traversal writes to a `(decision node, bucket)` pair. Reads of unrealized rows return zero regrets/sums/predictions/baselines and uniform current/average strategy.
+- Sparse training uses the same optimizer, SAPCFR+ prediction, baseline, and regret-floor plumbing as dense storage. BRCFR+ remains dense-only in the current HU slice because its best-response prediction pass is still implemented against dense buffers.
+- Snapshots and Explorer/Tauri bundles remain dense-compatible: sparse training projects to dense `regrets.bin` and `strategy.bin` at export/resume boundaries. There is no sparse on-disk snapshot format for HU `blueprint_v2`.
+- Sparse progress logging includes realized rows/slots, dense-equivalent slots/bytes, approximate sparse resident bytes, inserts, and read/write probe counters.
 
 **Abstractions:**
 - `HandClassV2` -- 19-class hand classification with intra-class strength and equity binning (28-bit hand field)
@@ -105,6 +115,7 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 - Config: `crates/core/src/blueprint_v2/config.rs`
 - MCCFR: `crates/core/src/blueprint_v2/mccfr.rs`
 - Storage: `crates/core/src/blueprint_v2/storage.rs`
+- Sparse storage: `crates/core/src/blueprint_v2/sparse_storage.rs`
 - Trainer: `crates/core/src/blueprint_v2/trainer.rs`
 
 ### Potential-Aware Clustering Pipeline

@@ -203,12 +203,7 @@ pub trait BlueprintCfrStorage: Send + Sync {
 }
 
 impl BlueprintStorage {
-    /// Build storage for a given tree and per-street bucket counts.
-    ///
-    /// Pre-allocates zeroed flat buffers sized to cover every
-    /// (decision node, bucket, action) triple.
-    #[must_use]
-    pub fn new(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+    fn build_layout(tree: &GameTree, bucket_counts: [u16; 4]) -> (Vec<NodeLayout>, usize) {
         let mut layout = vec![NodeLayout::default(); tree.nodes.len()];
         let mut total: usize = 0;
 
@@ -231,6 +226,31 @@ impl BlueprintStorage {
             }
         }
 
+        (layout, total)
+    }
+
+    pub(crate) fn new_unlogged(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+        let (layout, total) = Self::build_layout(tree, bucket_counts);
+        Self {
+            regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
+            strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
+            baselines: None,
+            predictions: None,
+            predictions_locked: AtomicBool::new(false),
+            optimizer: None,
+            bucket_counts,
+            layout,
+            regret_floor: i32::MIN,
+        }
+    }
+
+    /// Build storage for a given tree and per-street bucket counts.
+    ///
+    /// Pre-allocates zeroed flat buffers sized to cover every
+    /// (decision node, bucket, action) triple.
+    #[must_use]
+    pub fn new(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+        let (layout, total) = Self::build_layout(tree, bucket_counts);
         let regret_bytes = total * std::mem::size_of::<AtomicI32>();
         let strategy_bytes = total * std::mem::size_of::<AtomicI64>();
         eprintln!(
@@ -270,6 +290,28 @@ impl BlueprintStorage {
             storage.baselines = Some((0..total).map(|_| AtomicI32::new(0)).collect());
         }
         storage
+    }
+
+    /// Build dense-storage metadata without allocating dense slot buffers.
+    ///
+    /// Used as the public compatibility placeholder when the trainer's active
+    /// backend is sparse. Read-only strategy methods fall back to the same
+    /// all-zero/uniform semantics as a missing sparse row; mutation methods
+    /// must not be used on this placeholder.
+    #[must_use]
+    pub fn new_projection_stub(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+        let (layout, _) = Self::build_layout(tree, bucket_counts);
+        Self {
+            regrets: Vec::new(),
+            strategy_sums: Vec::new(),
+            baselines: None,
+            predictions: None,
+            predictions_locked: AtomicBool::new(false),
+            optimizer: None,
+            bucket_counts,
+            layout,
+            regret_floor: i32::MIN,
+        }
     }
 
     /// Flat-buffer index for a given (node, bucket, action) triple.
@@ -325,6 +367,9 @@ impl BlueprintStorage {
     pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        if self.regrets.is_empty() {
+            return 0;
+        }
         self.regrets[idx].load(Ordering::Relaxed)
     }
 
@@ -334,6 +379,10 @@ impl BlueprintStorage {
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        assert!(
+            !self.regrets.is_empty(),
+            "cannot mutate dense projection stub storage"
+        );
         let atom = &self.regrets[idx];
         if self.regret_floor == i32::MIN {
             // Fast path: no floor configured — still use saturating_add
@@ -356,6 +405,9 @@ impl BlueprintStorage {
     pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        if self.strategy_sums.is_empty() {
+            return 0;
+        }
         self.strategy_sums[idx].load(Ordering::Relaxed)
     }
 
@@ -364,6 +416,10 @@ impl BlueprintStorage {
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        assert!(
+            !self.strategy_sums.is_empty(),
+            "cannot mutate dense projection stub storage"
+        );
         self.strategy_sums[idx].fetch_add(delta, Ordering::Relaxed);
     }
 
@@ -459,6 +515,10 @@ impl BlueprintStorage {
         let nl = &self.layout[node_idx as usize];
         let num_actions = nl.num_actions as usize;
         let mut strategy = vec![0.0; num_actions];
+        if self.regrets.is_empty() {
+            strategy.fill(1.0 / num_actions as f64);
+            return strategy;
+        }
         self.current_strategy_into(node_idx, bucket, &mut strategy);
         strategy
     }
@@ -485,6 +545,11 @@ impl BlueprintStorage {
         );
         let out = &mut out[..num_actions];
         let start = Self::slot_offset(nl, bucket);
+
+        if self.regrets.is_empty() {
+            out.fill(1.0 / num_actions as f64);
+            return;
+        }
 
         if let Some(ref opt) = self.optimizer {
             opt.current_strategy(
@@ -521,6 +586,10 @@ impl BlueprintStorage {
         let nl = &self.layout[node_idx as usize];
         let num_actions = nl.num_actions as usize;
         let start = Self::slot_offset(nl, bucket);
+
+        if self.strategy_sums.is_empty() {
+            return vec![1.0 / num_actions as f64; num_actions];
+        }
 
         let mut total = 0.0_f64;
         let mut sums = Vec::with_capacity(num_actions);

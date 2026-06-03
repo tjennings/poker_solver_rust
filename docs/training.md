@@ -615,6 +615,7 @@ The `training:` section of the blueprint YAML config controls the MCCFR training
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `optimizer` | `"dcfr"` | CFR variant: `"dcfr"`, `"sapcfr+"`, `"brcfr+"`, `"lcfr"`, `"cfr+"` |
+| `storage_backend` | `"dense"` | HU blueprint_v2 CFR storage backend: `"dense"` or opt-in `"sparse"`/`"lazy"` |
 | `dcfr_alpha` | `1.5` | Positive regret discount exponent. Higher = retain positive regrets longer |
 | `dcfr_beta` | `0.0` | Negative regret discount exponent. Used by DCFR only (SAPCFR+ floors to 0) |
 | `dcfr_gamma` | `2.0` | Strategy sum discount exponent. Higher = weight recent strategies more |
@@ -633,6 +634,28 @@ The `training:` section of the blueprint YAML config controls the MCCFR training
 **CFR+**: Regret matching+ with negative regret flooring. No discounting.
 
 **BRCFR+**: Best-Response augmented DCFR+. Layers periodic best-response prediction passes on top of the standard DCFR+ optimizer. During the warmup phase (`brcfr_warmup_iterations`), behaves identically to DCFR+. After warmup, a full BR traversal runs every `brcfr_interval` iterations for both players. The BR-derived per-infoset regrets are stored in the prediction buffer and used in strategy computation as `R_tilde = max(0, R + eta * decay * v_br)`. The decay factor starts at 1.0 after each BR pass and decreases linearly to 0.0 over the refresh interval, so stale predictions fade naturally. When decay reaches 0, behavior is pure DCFR+. Exploitability is measured for free during each BR pass (no separate exploitability calculation needed). Requires the same prediction buffer as SAPCFR+ (~1.1 GB extra). Based on ideas from CFR-BR (Johanson 2012) with decay scheduling.
+
+### HU Storage Backend
+
+`train-blueprint` defaults to eager dense storage. Dense storage allocates every `(decision node, bucket, action)` regret and strategy-sum slot before training starts and is still the safest default for existing production configs.
+
+Set `training.storage_backend: "sparse"` to use the HU sparse row backend:
+
+```yaml
+training:
+  storage_backend: "sparse"
+  optimizer: "sapcfr+"
+  use_baselines: true
+  regret_floor: 0
+```
+
+Sparse storage keeps the current eager `blueprint_v2` game tree, but CFR rows are allocated only when traversal writes to a `(decision node, bucket)` pair. Missing rows behave exactly like all-zero dense rows: zero regrets, strategy sums, predictions, and baselines, with uniform current and average strategy. Sparse training uses the same SAPCFR+ prediction, baseline, and regret-floor settings as dense storage.
+
+`brcfr+` is dense-only for HU `blueprint_v2` in this slice. Configs that combine `storage_backend: "sparse"` with `optimizer: "brcfr+"` fail fast with an explicit error instead of silently changing semantics.
+
+Sparse internals are not exposed to Explorer/Tauri bundle consumers. Snapshots still write dense-compatible `strategy.bin`, `regrets.bin`, metadata, CBVs, and hand-EV files. Resume also remains dense-compatible: a sparse run can resume from a dense snapshot by loading `regrets.bin` and realizing only non-zero projected rows. There is no sparse HU on-disk snapshot default.
+
+In no-TUI progress output, sparse training adds a storage line with realized rows/slots, inserts, read/write probe and hit counters, dense-equivalent slots/bytes, and approximate sparse resident bytes.
 
 ### Example: BRCFR+ Configuration
 

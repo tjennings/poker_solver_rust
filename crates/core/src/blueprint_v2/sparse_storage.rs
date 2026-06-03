@@ -208,6 +208,28 @@ impl SparseBlueprintStorage {
         }
     }
 
+    pub fn apply_optimizer_discount(&self, iteration: u64) {
+        let Some(ref optimizer) = self.optimizer else {
+            return;
+        };
+        let predictions_enabled = self.predictions_enabled.load(Ordering::Relaxed);
+        let rows = self.rows.read().expect("sparse storage rows lock");
+        for row in rows.values() {
+            optimizer.apply_discount(
+                &row.regrets,
+                &row.strategy_sums,
+                predictions_enabled.then_some(row.predictions.as_slice()),
+                iteration,
+            );
+        }
+    }
+
+    pub fn set_optimizer_decay(&self, decay: f64) {
+        if let Some(ref optimizer) = self.optimizer {
+            optimizer.set_decay(decay);
+        }
+    }
+
     #[must_use]
     pub fn schema_fingerprint(&self, node_idx: u32) -> u64 {
         self.layout[node_idx as usize].schema_fingerprint
@@ -273,7 +295,7 @@ impl SparseBlueprintStorage {
     pub fn to_dense_storage(&self, tree: &GameTree) -> BlueprintStorage {
         self.validate_tree_schema(tree)
             .unwrap_or_else(|err| panic!("{err}"));
-        let dense = BlueprintStorage::new(tree, self.bucket_counts);
+        let dense = BlueprintStorage::new_unlogged(tree, self.bucket_counts);
         let rows = self.rows.read().expect("sparse storage rows lock");
         for (key, row) in rows.iter() {
             for action_idx in 0..usize::from(row.num_actions) {
@@ -289,6 +311,46 @@ impl SparseBlueprintStorage {
             }
         }
         dense
+    }
+
+    pub fn load_dense_projection(&self, tree: &GameTree, dense: &BlueprintStorage) {
+        self.validate_tree_schema(tree)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let mut dense_slot = 0usize;
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            let GameNode::Decision {
+                street, actions, ..
+            } = node
+            else {
+                continue;
+            };
+            for bucket in 0..self.bucket_counts[*street as usize] {
+                let mut row_has_data = false;
+                for action_idx in 0..actions.len() {
+                    if dense.regrets[dense_slot + action_idx].load(Ordering::Relaxed) != 0
+                        || dense.strategy_sums[dense_slot + action_idx].load(Ordering::Relaxed) != 0
+                    {
+                        row_has_data = true;
+                        break;
+                    }
+                }
+                if row_has_data {
+                    let layout = self.layout[node_idx];
+                    let (row, _) = self.get_or_insert_row(node_idx as u32, bucket, layout);
+                    for action_idx in 0..actions.len() {
+                        row.regrets[action_idx].store(
+                            dense.regrets[dense_slot + action_idx].load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                        row.strategy_sums[action_idx].store(
+                            dense.strategy_sums[dense_slot + action_idx].load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+                dense_slot += actions.len();
+            }
+        }
     }
 
     fn validate_tree_schema(&self, tree: &GameTree) -> Result<(), SparseStorageError> {

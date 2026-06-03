@@ -3343,6 +3343,7 @@ mod tests {
                 purify_threshold: 0.0,
                 equity_cache_path: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,

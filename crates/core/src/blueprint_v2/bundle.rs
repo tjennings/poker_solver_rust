@@ -454,6 +454,7 @@ mod tests {
                 dcfr_gamma: 1.0,
                 dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,

@@ -30,7 +30,8 @@ use super::mccfr::{
     AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PRUNE_HITS, PRUNE_TOTAL, PruneStats,
     ScenarioEvTracker, traverse_best_response, traverse_external,
 };
-use super::storage::BlueprintStorage;
+use super::sparse_storage::SparseBlueprintStorage;
+use super::storage::{BlueprintCfrStorage, BlueprintStorage, CfrStorageStats};
 use crate::cfr::optimizer::{BrcfrPlusOptimizer, CfrOptimizer, DcfrOptimizer, SapcfrPlusOptimizer};
 use crate::hands::CanonicalHand;
 use crate::poker::{ALL_SUITS, ALL_VALUES, Card};
@@ -129,7 +130,13 @@ type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree, &[[f64; 1
 /// periodic snapshots.
 pub struct BlueprintTrainer {
     pub tree: GameTree,
+    /// Dense storage when `training.storage_backend = "dense"`.
+    ///
+    /// When the active backend is sparse, this is a zero-slot compatibility
+    /// placeholder; use [`dense_storage_projection`](Self::dense_storage_projection)
+    /// to obtain a dense export/resume view.
     pub storage: BlueprintStorage,
+    sparse_storage: Option<SparseBlueprintStorage>,
     pub buckets: AllBuckets,
     pub config: BlueprintV2Config,
     pub rng: StdRng,
@@ -243,10 +250,186 @@ pub struct BlueprintTrainer {
 }
 
 impl BlueprintTrainer {
+    fn configured_storage_backend(config: &BlueprintV2Config) -> String {
+        config.training.storage_backend.trim().to_ascii_lowercase()
+    }
+
+    fn reject_unsupported_storage_backend(config: &BlueprintV2Config) {
+        let backend = Self::configured_storage_backend(config);
+        match backend.as_str() {
+            "dense" | "sparse" | "lazy" => {}
+            _ => panic!(
+                "unsupported blueprint_v2 storage_backend={}; expected \"dense\" or \"sparse\"",
+                config.training.storage_backend
+            ),
+        }
+
+        if matches!(backend.as_str(), "sparse" | "lazy")
+            && config
+                .training
+                .optimizer
+                .trim()
+                .eq_ignore_ascii_case("brcfr+")
+        {
+            panic!(
+                "blueprint_v2 sparse storage does not support brcfr+ in this slice; use storage_backend=\"dense\" or optimizer=\"dcfr\"/\"sapcfr+\""
+            );
+        }
+    }
+
+    fn new_optimizer(config: &BlueprintV2Config) -> Arc<dyn CfrOptimizer> {
+        if config.training.optimizer == "brcfr+" {
+            Arc::new(BrcfrPlusOptimizer::new(
+                config.training.dcfr_alpha,
+                config.training.dcfr_gamma,
+                config.training.brcfr_eta,
+            ))
+        } else if config.training.optimizer == "sapcfr+" {
+            Arc::new(SapcfrPlusOptimizer {
+                alpha: config.training.dcfr_alpha,
+                gamma: config.training.dcfr_gamma,
+                eta: config.training.sapcfr_eta,
+            })
+        } else {
+            Arc::new(DcfrOptimizer {
+                alpha: config.training.dcfr_alpha,
+                beta: config.training.dcfr_beta,
+                gamma: config.training.dcfr_gamma,
+            })
+        }
+    }
+
+    fn configure_optimizer(config: &BlueprintV2Config, optimizer: &Arc<dyn CfrOptimizer>) {
+        let samples = config.training.exploitability_samples.max(1) as f64;
+        let br_interval = config.training.brcfr_interval.max(1) as f64;
+        optimizer.set_br_scale(br_interval / samples);
+    }
+
+    fn scaled_regret_floor(config: &BlueprintV2Config) -> Option<i32> {
+        config
+            .training
+            .regret_floor
+            .map(|floor| (floor as f64 * super::storage::REGRET_SCALE) as i32)
+    }
+
+    fn configure_dense_storage(config: &BlueprintV2Config, storage: &mut BlueprintStorage) {
+        if let Some(scaled_floor) = Self::scaled_regret_floor(config) {
+            storage.set_regret_floor(scaled_floor);
+        }
+        let optimizer = Self::new_optimizer(config);
+        Self::configure_optimizer(config, &optimizer);
+        if optimizer.needs_predictions() {
+            storage.enable_predictions();
+        }
+        storage.set_optimizer(optimizer);
+    }
+
+    fn configure_sparse_storage(config: &BlueprintV2Config, storage: &mut SparseBlueprintStorage) {
+        if let Some(scaled_floor) = Self::scaled_regret_floor(config) {
+            storage.set_regret_floor(scaled_floor);
+        }
+        let optimizer = Self::new_optimizer(config);
+        Self::configure_optimizer(config, &optimizer);
+        if optimizer.needs_predictions() {
+            storage.enable_predictions();
+        }
+        storage.set_optimizer(optimizer);
+    }
+
+    fn build_sparse_storage(
+        tree: &GameTree,
+        bucket_counts: [u16; 4],
+        config: &BlueprintV2Config,
+    ) -> SparseBlueprintStorage {
+        let mut storage = SparseBlueprintStorage::new_with_baselines(
+            tree,
+            bucket_counts,
+            config.training.use_baselines,
+        );
+        Self::configure_sparse_storage(config, &mut storage);
+        storage
+    }
+
+    fn clamp_loaded_regrets(config: &BlueprintV2Config, storage: &BlueprintStorage) {
+        if let Some(floor) = config.training.regret_floor {
+            let scaled_floor = (floor as f64 * super::storage::REGRET_SCALE) as i32;
+            let mut clamped = 0u64;
+            for atom in &storage.regrets {
+                let v = atom.load(Ordering::Relaxed);
+                if v < scaled_floor {
+                    atom.store(scaled_floor, Ordering::Relaxed);
+                    clamped += 1;
+                }
+            }
+            if clamped > 0 {
+                eprintln!("  Clamped {clamped} regret values to floor ({floor} chips)");
+            }
+        }
+    }
+
+    fn active_storage(&self) -> &(dyn BlueprintCfrStorage + Sync) {
+        self.sparse_storage
+            .as_ref()
+            .map_or(&self.storage as &(dyn BlueprintCfrStorage + Sync), |s| {
+                s as &(dyn BlueprintCfrStorage + Sync)
+            })
+    }
+
+    #[must_use]
+    pub fn is_sparse_storage(&self) -> bool {
+        self.sparse_storage.is_some()
+    }
+
+    #[must_use]
+    pub fn storage_stats(&self) -> CfrStorageStats {
+        self.active_storage().storage_stats()
+    }
+
+    #[must_use]
+    pub fn dense_storage_projection(&self) -> BlueprintStorage {
+        if let Some(ref sparse) = self.sparse_storage {
+            return sparse.to_dense_storage(&self.tree);
+        }
+
+        let dense = BlueprintStorage::new_unlogged(&self.tree, self.storage.bucket_counts);
+        let (regrets, sums) = self.storage.project_dense_regrets_and_sums(&self.tree);
+        debug_assert_eq!(regrets.len(), dense.regrets.len());
+        debug_assert_eq!(sums.len(), dense.strategy_sums.len());
+        for (atom, value) in dense.regrets.iter().zip(regrets) {
+            atom.store(value, Ordering::Relaxed);
+        }
+        for (atom, value) in dense.strategy_sums.iter().zip(sums) {
+            atom.store(value, Ordering::Relaxed);
+        }
+        dense
+    }
+
+    fn with_dense_storage<R>(&self, f: impl FnOnce(&BlueprintStorage) -> R) -> R {
+        if self.sparse_storage.is_some() {
+            let dense = self.dense_storage_projection();
+            f(&dense)
+        } else {
+            f(&self.storage)
+        }
+    }
+
+    fn active_strategy_sums_snapshot(&self) -> Vec<i64> {
+        if self.sparse_storage.is_some() {
+            let (_, sums) = self
+                .active_storage()
+                .project_dense_regrets_and_sums(&self.tree);
+            sums
+        } else {
+            self.storage.snapshot_strategy_sums()
+        }
+    }
+
     /// Build a trainer from a config: constructs the game tree, allocates
     /// storage, and initialises timing state.
     #[must_use]
     pub fn new(config: BlueprintV2Config) -> Self {
+        Self::reject_unsupported_storage_backend(&config);
+
         let tree = GameTree::build_with_options(
             config.game.stack_depth,
             config.game.small_blind,
@@ -265,45 +448,22 @@ impl BlueprintTrainer {
             config.clustering.river.buckets,
         ];
 
-        let mut storage = BlueprintStorage::new_with_baselines(
-            &tree,
-            bucket_counts,
-            config.training.use_baselines,
-        );
-
-        // Apply regret floor if configured (value is in chip units, scale to match stored regrets).
-        if let Some(floor) = config.training.regret_floor {
-            storage.regret_floor = (floor as f64 * super::storage::REGRET_SCALE) as i32;
-        }
-
-        // Create the pluggable optimizer based on config.
-        let optimizer: Arc<dyn CfrOptimizer> = if config.training.optimizer == "brcfr+" {
-            Arc::new(BrcfrPlusOptimizer::new(
-                config.training.dcfr_alpha,
-                config.training.dcfr_gamma,
-                config.training.brcfr_eta,
-            ))
-        } else if config.training.optimizer == "sapcfr+" {
-            Arc::new(SapcfrPlusOptimizer {
-                alpha: config.training.dcfr_alpha,
-                gamma: config.training.dcfr_gamma,
-                eta: config.training.sapcfr_eta,
-            })
+        let backend = Self::configured_storage_backend(&config);
+        let (storage, sparse_storage) = if matches!(backend.as_str(), "sparse" | "lazy") {
+            let sparse_storage = Self::build_sparse_storage(&tree, bucket_counts, &config);
+            (
+                BlueprintStorage::new_projection_stub(&tree, bucket_counts),
+                Some(sparse_storage),
+            )
         } else {
-            Arc::new(DcfrOptimizer {
-                alpha: config.training.dcfr_alpha,
-                beta: config.training.dcfr_beta,
-                gamma: config.training.dcfr_gamma,
-            })
+            let mut storage = BlueprintStorage::new_with_baselines(
+                &tree,
+                bucket_counts,
+                config.training.use_baselines,
+            );
+            Self::configure_dense_storage(&config, &mut storage);
+            (storage, None)
         };
-        if optimizer.needs_predictions() {
-            storage.enable_predictions();
-        }
-        // Set BR scale factor: interval / samples.
-        let samples = config.training.exploitability_samples.max(1) as f64;
-        let br_interval = config.training.brcfr_interval.max(1) as f64;
-        optimizer.set_br_scale(br_interval / samples);
-        storage.set_optimizer(optimizer);
 
         let bucket_files = match &config.training.cluster_path {
             Some(path) => load_bucket_files(Path::new(path)),
@@ -366,6 +526,7 @@ impl BlueprintTrainer {
         Self {
             tree,
             storage,
+            sparse_storage,
             buckets,
             config,
             rng,
@@ -480,58 +641,28 @@ impl BlueprintTrainer {
             self.config.clustering.turn.buckets,
             self.config.clustering.river.buckets,
         ];
-        self.storage = BlueprintStorage::load_regrets(&regrets_path, &self.tree, bucket_counts)?;
+        let mut loaded = BlueprintStorage::load_regrets(&regrets_path, &self.tree, bucket_counts)?;
+        Self::clamp_loaded_regrets(&self.config, &loaded);
 
-        // Re-apply settings lost by load_regrets (which creates fresh storage).
-        if let Some(floor) = self.config.training.regret_floor {
-            let scaled_floor = (floor as f64 * super::storage::REGRET_SCALE) as i32;
-            self.storage.regret_floor = scaled_floor;
-            // Retroactively clamp loaded regrets that exceed the floor.
-            let mut clamped = 0u64;
-            for atom in &self.storage.regrets {
-                let v = atom.load(Ordering::Relaxed);
-                if v < scaled_floor {
-                    atom.store(scaled_floor, Ordering::Relaxed);
-                    clamped += 1;
-                }
-            }
-            if clamped > 0 {
-                eprintln!("  Clamped {clamped} regret values to floor ({floor} chips)");
-            }
-        }
-        let optimizer: Arc<dyn CfrOptimizer> = if self.config.training.optimizer == "brcfr+" {
-            Arc::new(BrcfrPlusOptimizer::new(
-                self.config.training.dcfr_alpha,
-                self.config.training.dcfr_gamma,
-                self.config.training.brcfr_eta,
-            ))
-        } else if self.config.training.optimizer == "sapcfr+" {
-            Arc::new(SapcfrPlusOptimizer {
-                alpha: self.config.training.dcfr_alpha,
-                gamma: self.config.training.dcfr_gamma,
-                eta: self.config.training.sapcfr_eta,
-            })
+        let backend = Self::configured_storage_backend(&self.config);
+        if matches!(backend.as_str(), "sparse" | "lazy") {
+            let sparse_storage =
+                Self::build_sparse_storage(&self.tree, bucket_counts, &self.config);
+            sparse_storage.load_dense_projection(&self.tree, &loaded);
+            self.storage = BlueprintStorage::new_projection_stub(&self.tree, bucket_counts);
+            self.sparse_storage = Some(sparse_storage);
         } else {
-            Arc::new(DcfrOptimizer {
-                alpha: self.config.training.dcfr_alpha,
-                beta: self.config.training.dcfr_beta,
-                gamma: self.config.training.dcfr_gamma,
-            })
-        };
-        if optimizer.needs_predictions() {
-            self.storage.enable_predictions();
-        }
-        let samples = self.config.training.exploitability_samples.max(1) as f64;
-        let br_interval = self.config.training.brcfr_interval.max(1) as f64;
-        optimizer.set_br_scale(br_interval / samples);
-        self.storage.set_optimizer(optimizer);
-        if self.config.training.use_baselines {
-            let total = self.storage.regrets.len();
-            self.storage.baselines = Some(
-                (0..total)
-                    .map(|_| std::sync::atomic::AtomicI32::new(0))
-                    .collect(),
-            );
+            Self::configure_dense_storage(&self.config, &mut loaded);
+            if self.config.training.use_baselines && loaded.baselines.is_none() {
+                let total = loaded.regrets.len();
+                loaded.baselines = Some(
+                    (0..total)
+                        .map(|_| std::sync::atomic::AtomicI32::new(0))
+                        .collect(),
+                );
+            }
+            self.storage = loaded;
+            self.sparse_storage = None;
         }
 
         // Load metadata for iteration count and elapsed time.
@@ -569,7 +700,7 @@ impl BlueprintTrainer {
 
         // Seed the strategy-delta baseline so the first check after resume
         // compares against the loaded state instead of producing zero.
-        self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
+        self.prev_strategy_sums = Some(self.active_strategy_sums_snapshot());
 
         eprintln!(
             "Resumed from {}: {} iterations, {:.0}min elapsed, mean_pos_regret={:.2}",
@@ -644,7 +775,7 @@ impl BlueprintTrainer {
             let prune_streets = self.config.training.prune_street_mask();
 
             let tree = &self.tree;
-            let storage = &self.storage;
+            let storage = self.active_storage();
             let buckets_ref = &self.buckets;
             let ev_tracker = &self.scenario_ev_tracker;
             let full_ev_tracker = &self.full_ev_tracker;
@@ -652,7 +783,7 @@ impl BlueprintTrainer {
 
             let rake_rate = self.config.game.rake_rate;
             let rake_cap = self.config.game.rake_cap;
-            let baseline_alpha = if self.storage.baselines.is_some() {
+            let baseline_alpha = if self.config.training.use_baselines {
                 self.config.training.baseline_alpha
             } else {
                 0.0
@@ -768,7 +899,13 @@ impl BlueprintTrainer {
     pub fn compute_exploitability(&self) -> f64 {
         let n = self.config.training.exploitability_samples.max(1);
         let tree = &self.tree;
-        let storage = &self.storage;
+        let projected_storage;
+        let storage = if self.sparse_storage.is_some() {
+            projected_storage = Some(self.dense_storage_projection());
+            projected_storage.as_ref().expect("projection exists")
+        } else {
+            &self.storage
+        };
         let buckets_ref = &self.buckets;
         let rake_rate = self.config.game.rake_rate;
         let rake_cap = self.config.game.rake_cap;
@@ -810,6 +947,10 @@ impl BlueprintTrainer {
     }
 
     fn run_br_prediction_pass(&mut self) -> f64 {
+        assert!(
+            self.sparse_storage.is_none(),
+            "brcfr+ prediction pass requires dense blueprint_v2 storage"
+        );
         let n = self.config.training.exploitability_samples.max(1);
         let tree = &self.tree;
         let storage = &self.storage;
@@ -975,8 +1116,13 @@ impl BlueprintTrainer {
 
         // Config reload: TUI-triggered.
         if self.config_reload_trigger.swap(false, Ordering::Relaxed) {
+            let projected_storage = self
+                .sparse_storage
+                .is_some()
+                .then(|| self.dense_storage_projection());
+            let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
             if let Some(ref mut reload_fn) = self.on_config_reload {
-                reload_fn(&self.tree, &self.storage);
+                reload_fn(&self.tree, callback_storage);
             }
             // Update scenario tracking if the callback provided new indices.
             if let Some(new_indices) = self.reloaded_node_indices.lock().unwrap().take() {
@@ -998,6 +1144,11 @@ impl BlueprintTrainer {
         // Strategy refresh for TUI.
         if refresh_due {
             let decision_map = self.tree.decision_index_map();
+            let projected_storage = self
+                .sparse_storage
+                .is_some()
+                .then(|| self.dense_storage_projection());
+            let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
             if let Some(ref callback) = self.on_strategy_refresh {
                 for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
                     let player = match &self.tree.nodes[node_idx as usize] {
@@ -1013,11 +1164,11 @@ impl BlueprintTrainer {
                     } else {
                         [0.0; 169]
                     };
-                    callback(i, node_idx, &self.storage, &self.tree, &hand_evs);
+                    callback(i, node_idx, callback_storage, &self.tree, &hand_evs);
                 }
             }
             if let Some(ref mut cb) = self.on_audit_refresh {
-                cb(&self.storage);
+                cb(callback_storage);
             }
             // Reset the scenario (windowed) EV tracker so TUI displays
             // only the most recent window. The full_ev_tracker is cumulative
@@ -1054,7 +1205,12 @@ impl BlueprintTrainer {
                     self.scenario_ev_tracker.hand_ev_array(0, 1),
                 ]
             };
-            callback(&self.storage, &self.tree, &hand_evs);
+            let projected_storage = self
+                .sparse_storage
+                .is_some()
+                .then(|| self.dense_storage_projection());
+            let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
+            callback(callback_storage, &self.tree, &hand_evs);
             self.last_random_scenario_min = elapsed_min;
         }
 
@@ -1088,7 +1244,9 @@ impl BlueprintTrainer {
                 let elapsed_iters = self.iterations.saturating_sub(self.last_br_iteration) as f64;
                 (1.0 - elapsed_iters / interval as f64).max(0.0)
             };
-            if let Some(ref opt) = self.storage.optimizer {
+            if let Some(ref sparse) = self.sparse_storage {
+                sparse.set_optimizer_decay(decay);
+            } else if let Some(ref opt) = self.storage.optimizer {
                 opt.set_decay(decay);
             }
         }
@@ -1113,7 +1271,9 @@ impl BlueprintTrainer {
             .dcfr_epoch_cap
             .map_or(t, |cap| t.min(cap));
 
-        if let Some(ref opt) = self.storage.optimizer {
+        if let Some(ref sparse) = self.sparse_storage {
+            sparse.apply_optimizer_discount(t);
+        } else if let Some(ref opt) = self.storage.optimizer {
             opt.apply_discount(
                 &self.storage.regrets,
                 &self.storage.strategy_sums,
@@ -1150,7 +1310,8 @@ impl BlueprintTrainer {
     /// Compute and store the strategy delta vs the previous snapshot.
     fn update_strategy_delta(&mut self) {
         if let Some(ref prev) = self.prev_strategy_sums {
-            let (delta, pct_moving) = self.storage.strategy_delta(prev);
+            let (delta, pct_moving) =
+                self.with_dense_storage(|storage| storage.strategy_delta(prev));
             self.last_strategy_delta = delta;
             self.last_pct_moving = pct_moving;
             if let Some(ref cb) = self.on_strategy_delta {
@@ -1172,7 +1333,7 @@ impl BlueprintTrainer {
                 cb(self.traversal_prune_rate());
             }
         }
-        self.prev_strategy_sums = Some(self.storage.snapshot_strategy_sums());
+        self.prev_strategy_sums = Some(self.active_strategy_sums_snapshot());
     }
 
     /// Log a one-line progress summary to stderr.
@@ -1199,19 +1360,37 @@ impl BlueprintTrainer {
             self.last_strategy_delta,
             self.last_pct_moving * 100.0,
         );
+
+        if self.sparse_storage.is_some() {
+            let stats = self.storage_stats();
+            eprintln!(
+                "  storage=sparse rows={} slots={} inserts={} reads={}/{} writes={}/{} dense_slots={} dense_bytes={} sparse_bytes={}",
+                stats.realized_rows,
+                stats.realized_slots,
+                stats.inserts,
+                stats.read_hits,
+                stats.read_probes,
+                stats.write_hits,
+                stats.write_probes,
+                stats.dense_equivalent_slots,
+                stats.dense_equivalent_bytes,
+                stats.sparse_resident_bytes,
+            );
+        }
     }
 
     /// The most-negative regret value across all info-set entries
     /// (in chip units, after dividing by `REGRET_SCALE`).
     #[must_use]
     pub fn min_regret(&self) -> f64 {
-        let min_raw = self
-            .storage
-            .regrets
-            .iter()
-            .map(|atom| atom.load(Ordering::Relaxed))
-            .min()
-            .unwrap_or(0);
+        let min_raw = self.with_dense_storage(|storage| {
+            storage
+                .regrets
+                .iter()
+                .map(|atom| atom.load(Ordering::Relaxed))
+                .min()
+                .unwrap_or(0)
+        });
         min_raw as f64 / super::storage::REGRET_SCALE
     }
 
@@ -1219,13 +1398,14 @@ impl BlueprintTrainer {
     /// (in chip units, after dividing by `REGRET_SCALE`).
     #[must_use]
     pub fn max_regret(&self) -> f64 {
-        let max_raw = self
-            .storage
-            .regrets
-            .iter()
-            .map(|atom| atom.load(Ordering::Relaxed))
-            .max()
-            .unwrap_or(0);
+        let max_raw = self.with_dense_storage(|storage| {
+            storage
+                .regrets
+                .iter()
+                .map(|atom| atom.load(Ordering::Relaxed))
+                .max()
+                .unwrap_or(0)
+        });
         max_raw as f64 / super::storage::REGRET_SCALE
     }
 
@@ -1237,14 +1417,15 @@ impl BlueprintTrainer {
         if self.iterations == 0 {
             return 0.0;
         }
-        let (sum, count) = self
-            .storage
-            .regrets
-            .iter()
-            .fold((0.0_f64, 0_u64), |(s, c), atom| {
-                let r = atom.load(Ordering::Relaxed);
-                if r > 0 { (s + r as f64, c + 1) } else { (s, c) }
-            });
+        let (sum, count) = self.with_dense_storage(|storage| {
+            storage
+                .regrets
+                .iter()
+                .fold((0.0_f64, 0_u64), |(s, c), atom| {
+                    let r = atom.load(Ordering::Relaxed);
+                    if r > 0 { (s + r as f64, c + 1) } else { (s, c) }
+                })
+        });
         if count > 0 {
             sum / count as f64 / self.iterations as f64 / super::storage::REGRET_SCALE
         } else {
@@ -1258,17 +1439,20 @@ impl BlueprintTrainer {
         // Config prune_threshold is in chip units; scale to match stored regrets.
         let threshold =
             (f64::from(self.config.training.prune_threshold) * super::storage::REGRET_SCALE) as i32;
-        let total = self.storage.regrets.len() as f64;
+        let (below, total) = self.with_dense_storage(|storage| {
+            let total = storage.regrets.len();
+            let below = storage
+                .regrets
+                .iter()
+                .filter(|atom| atom.load(Ordering::Relaxed) < threshold)
+                .count();
+            (below, total)
+        });
+        let total = total as f64;
         if total == 0.0 {
             return 0.0;
         }
-        let below = self
-            .storage
-            .regrets
-            .iter()
-            .filter(|atom| atom.load(Ordering::Relaxed) < threshold)
-            .count() as f64;
-        below / total
+        below as f64 / total
     }
 
     /// Actual traversal prune rate: fraction of traverser-node actions
@@ -1288,14 +1472,15 @@ impl BlueprintTrainer {
     /// Mean of all strictly-positive regret entries (in chip units).
     #[must_use]
     pub fn mean_positive_regret(&self) -> f64 {
-        let (sum, count) = self
-            .storage
-            .regrets
-            .iter()
-            .fold((0.0_f64, 0_u64), |(s, c), atom| {
-                let r = atom.load(Ordering::Relaxed);
-                if r > 0 { (s + r as f64, c + 1) } else { (s, c) }
-            });
+        let (sum, count) = self.with_dense_storage(|storage| {
+            storage
+                .regrets
+                .iter()
+                .fold((0.0_f64, 0_u64), |(s, c), atom| {
+                    let r = atom.load(Ordering::Relaxed);
+                    if r > 0 { (s + r as f64, c + 1) } else { (s, c) }
+                })
+        });
         if count > 0 {
             sum / count as f64 / super::storage::REGRET_SCALE
         } else {
@@ -1412,8 +1597,16 @@ impl BlueprintTrainer {
 
         let snapshot_dir = output_dir.join(format!("snapshot_{:04}", self.snapshot_count));
 
+        let projected_storage;
+        let storage = if self.sparse_storage.is_some() {
+            projected_storage = Some(self.dense_storage_projection());
+            projected_storage.as_ref().expect("projection exists")
+        } else {
+            &self.storage
+        };
+
         let mut strategy = BlueprintV2Strategy::from_storage_with_threshold(
-            &self.storage,
+            storage,
             &self.tree,
             self.config.training.purify_threshold,
         );
@@ -1427,7 +1620,7 @@ impl BlueprintTrainer {
             self.mean_positive_regret(),
         );
 
-        bundle::save_snapshot(&snapshot_dir, &strategy, &self.storage, &metadata)?;
+        bundle::save_snapshot(&snapshot_dir, &strategy, storage, &metadata)?;
 
         // Save full-tree EV tracker.
         self.full_ev_tracker
@@ -1436,7 +1629,7 @@ impl BlueprintTrainer {
         // Compute and save counterfactual boundary values (CBVs) for
         // real-time subgame solving. One table per player, indexed by
         // (chance_node, bucket).
-        let bucket_counts = self.storage.bucket_counts;
+        let bucket_counts = storage.bucket_counts;
         let transitions = crate::blueprint_v2::cbv_compute::build_transitions_from_buckets(
             &self.buckets.bucket_files,
         );
@@ -1644,6 +1837,7 @@ mod tests {
                 dcfr_gamma: 1.0,
                 dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,
@@ -1671,12 +1865,65 @@ mod tests {
         t
     }
 
+    fn tiny_training_config(storage_backend: &str) -> BlueprintV2Config {
+        let mut config = toy_config();
+        config.training.storage_backend = storage_backend.to_string();
+        config.training.iterations = Some(24);
+        config.training.batch_size = 1;
+        config.training.lcfr_warmup_iterations = 999_999;
+        config.training.prune_after_iterations = 999_999;
+        config.training.print_every_minutes = 999_999;
+        config.training.exploitability_interval_minutes = 0;
+        config.snapshots.warmup_minutes = 999_999;
+        config
+    }
+
+    fn dense_values(storage: &BlueprintStorage) -> (Vec<i32>, Vec<i64>) {
+        (
+            storage
+                .regrets
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect(),
+            storage
+                .strategy_sums
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect(),
+        )
+    }
+
     #[test]
     fn trainer_creation() {
         let config = toy_config();
         let trainer = BlueprintTrainer::new(config);
         assert_eq!(trainer.iterations, 0);
         assert!(!trainer.storage.regrets.is_empty());
+        assert!(!trainer.is_sparse_storage());
+    }
+
+    #[test]
+    fn trainer_creates_sparse_backend_from_config() {
+        let config = tiny_training_config("sparse");
+        let trainer = BlueprintTrainer::new(config);
+        assert!(trainer.is_sparse_storage());
+        assert!(
+            trainer.storage.regrets.is_empty(),
+            "public storage should be a dense compatibility placeholder"
+        );
+        let stats = trainer.storage_stats();
+        assert_eq!(stats.realized_rows, 0);
+        assert_eq!(stats.realized_slots, 0);
+        assert!(stats.dense_equivalent_slots > 0);
+        assert!(stats.dense_equivalent_bytes > 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sparse storage does not support brcfr+")]
+    fn sparse_storage_rejects_brcfr_plus() {
+        let mut config = tiny_training_config("sparse");
+        config.training.optimizer = "brcfr+".to_string();
+        let _ = BlueprintTrainer::new(config);
     }
 
     #[test]
@@ -1776,6 +2023,112 @@ mod tests {
                 .any(|r| r.load(Ordering::Relaxed) != 0),
             "regrets should be updated after training"
         );
+    }
+
+    #[test]
+    fn train_with_sparse_storage_reports_stats() {
+        let config = tiny_training_config("sparse");
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("sparse training should complete");
+
+        let stats = trainer.storage_stats();
+        assert!(stats.realized_rows > 0, "training should realize rows");
+        assert!(stats.realized_slots > 0, "training should realize slots");
+        assert!(stats.inserts > 0, "training should insert sparse rows");
+        assert!(stats.read_probes > 0, "training should probe sparse reads");
+        assert!(
+            stats.write_probes > 0,
+            "training should probe sparse writes"
+        );
+        assert!(stats.dense_equivalent_slots >= stats.realized_slots);
+        assert!(stats.sparse_resident_bytes > 0);
+    }
+
+    #[test]
+    fn dense_and_sparse_training_project_same_dense_values() {
+        let dense_config = tiny_training_config("dense");
+        let sparse_config = tiny_training_config("sparse");
+
+        let mut dense_trainer = toy_trainer(dense_config);
+        let mut sparse_trainer = toy_trainer(sparse_config);
+
+        dense_trainer
+            .train()
+            .expect("dense training should complete");
+        sparse_trainer
+            .train()
+            .expect("sparse training should complete");
+
+        let dense_projection = dense_trainer.dense_storage_projection();
+        let sparse_projection = sparse_trainer.dense_storage_projection();
+        assert_eq!(
+            dense_values(&dense_projection),
+            dense_values(&sparse_projection)
+        );
+
+        let dense_strategy =
+            BlueprintV2Strategy::from_storage(&dense_projection, &dense_trainer.tree);
+        let sparse_strategy =
+            BlueprintV2Strategy::from_storage(&sparse_projection, &sparse_trainer.tree);
+        assert_eq!(dense_strategy.action_probs, sparse_strategy.action_probs);
+        assert_eq!(
+            dense_strategy.node_action_counts,
+            sparse_strategy.node_action_counts
+        );
+    }
+
+    #[test]
+    fn sparse_snapshot_writes_dense_resume_compatible_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut config = tiny_training_config("sparse");
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = toy_trainer(config);
+
+        trainer.train().expect("sparse training should complete");
+        trainer.save_snapshot().expect("snapshot should save");
+
+        let snapshot_dir = dir.path().join("snapshot_0000");
+        assert!(snapshot_dir.join("strategy.bin").exists());
+        assert!(snapshot_dir.join("regrets.bin").exists());
+
+        let loaded = BlueprintStorage::load_regrets(
+            &snapshot_dir.join("regrets.bin"),
+            &trainer.tree,
+            trainer.storage.bucket_counts,
+        )
+        .expect("dense regrets should load");
+        let projected = trainer.dense_storage_projection();
+        assert_eq!(dense_values(&loaded), dense_values(&projected));
+
+        let strategy = BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin"))
+            .expect("strategy should load");
+        assert_eq!(strategy.bucket_counts, trainer.storage.bucket_counts);
+        assert!(!strategy.action_probs.is_empty());
+    }
+
+    #[test]
+    fn sparse_training_honors_prediction_baseline_and_regret_floor_config() {
+        let mut config = tiny_training_config("sparse");
+        config.training.optimizer = "sapcfr+".to_string();
+        config.training.use_baselines = true;
+        config.training.regret_floor = Some(0);
+        let mut trainer = toy_trainer(config);
+
+        trainer
+            .train()
+            .expect("sparse sapcfr+ baseline training should complete");
+
+        let projected = trainer.dense_storage_projection();
+        assert!(
+            projected
+                .regrets
+                .iter()
+                .all(|slot| slot.load(Ordering::Relaxed) >= 0),
+            "sparse regret floor should clamp projected regrets"
+        );
+        let stats = trainer.storage_stats();
+        assert!(stats.realized_rows > 0);
+        assert!(stats.sparse_resident_bytes > stats.realized_slots * 12);
     }
 
     #[test]
