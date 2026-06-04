@@ -1,29 +1,31 @@
 ---
 # poker_solver_rust-l6r9
 title: 'Phase 2: validate lazy tree trainer against known-good HU game'
-status: draft
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-03T18:09:40Z
-updated_at: 2026-06-03T18:31:46Z
+updated_at: 2026-06-04T02:58:00Z
 parent: poker_solver_rust-34kn
-blocked_by:
-    - poker_solver_rust-kqpn
 ---
 
-Phase 2 of the blueprint trainer tree roadmap.
+Phase 2 of the blueprint trainer lazy/sparse storage roadmap.
 
 Scope:
-- Ingest the small known-good heads-up game variant and expected output data supplied by the user.
-- Build a validation harness/runbook comparing the lazy tree trainer against the known-good baseline.
-- Validate strategy outputs, regret/strategy-sum evolution, legal action expansion, terminal utilities, and deterministic replay where applicable.
-- Capture tolerances explicitly: exact equality where deterministic/integer-like, numeric epsilon where floating-point CFR accumulation requires it.
-- Produce a short validation report suitable for keeping with docs or test fixtures.
+- Use the smallest supplied heads-up cEV baseline: `local_data/baselines/cash_hu_20bb_cev.json` (`game.stackDepthBb = 20`, heads-up cash cEV, 2.5x open size).
+- Train the smallest stack-size-equivalent HU blueprint configuration available in this repo, with pruning and disk eviction disabled.
+- Extend the blueprint trainer validation path to compare learned preflop strategy against the supplied baseline's preflop spots.
+- Extend the blueprint trainer TUI/progress surface to show convergence toward the baseline during training.
+- Display the top 5 worst baseline mismatches, with enough data for each spot to diagnose the mismatch: spot key/path/history, position to act, actions, aggregate action deltas, per-combo worst deltas, learned frequencies, baseline frequencies, and a scalar mismatch score.
+- Preserve Phase 1 dense export/resume compatibility and support the new sparse/lazy storage backend as an opt-in backend where practical.
+- Update `docs/architecture.md` and `docs/training.md` if new commands/config/TUI behavior are added.
 
 Acceptance criteria:
-- The Phase 1 lazy tree implementation matches the supplied HU baseline within documented tolerances.
-- The validation fixture is reproducible by command line.
-- Any mismatch produces actionable diagnostics: node path/history, infoset/bucket, legal actions, strategy, regret, utility delta.
-- No pruning or disk eviction is enabled during validation.
+- A reproducible CLI/TUI validation run can train the smallest stack-size-equivalent HU blueprint and report convergence toward `cash_hu_20bb_cev.json`.
+- Preflop strategy comparison uses documented action mapping/tolerances between trainer actions and baseline action labels.
+- The TUI/progress output includes a baseline convergence metric and top 5 worst spots with diagnostic detail.
+- Any mismatch report is actionable: spot/history, player/position, legal actions, baseline strategy, learned strategy, and score are visible.
+- Full test suite passes in under 1 minute, or any runtime violation is fixed/beaned before proceeding.
+- No Phase 3 pruning or Phase 4 disk eviction logic is enabled during validation.
 
-Blocked until Phase 1 exists and the user supplies the known-good HU data.
+Implementation must be delegated to rust-developer/worker agents; manager does not write Rust directly.
