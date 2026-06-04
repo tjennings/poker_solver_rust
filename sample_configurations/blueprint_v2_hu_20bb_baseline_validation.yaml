@@ -1,4 +1,6 @@
 # Blueprint V2 Config - 20bb HU cEV baseline strategy-frequency validation
+# Uses the existing 500/500/500 postflop bucket files so training can start
+# without generating a new 200/200/200 bucket set.
 game:
   name: "20bb HU cEV baseline validation"
   players: 2
@@ -12,11 +14,11 @@ clustering:
   preflop:
     buckets: 169
   flop:
-    buckets: 200
+    buckets: 500
   turn:
-    buckets: 200
+    buckets: 500
   river:
-    buckets: 200
+    buckets: 500
 
 action_abstraction:
   preflop:
@@ -33,6 +35,7 @@ action_abstraction:
     - [0.67, 1.0]
 
 training:
+  cluster_path: "./local_data/buckets/500f_500t_500r_v2"
   iterations: 10000
   batch_size: 100
   print_every_minutes: 1

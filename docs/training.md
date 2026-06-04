@@ -694,10 +694,13 @@ The current baseline integration is pinned to `local_data/baselines/cash_hu_20bb
 - `clustering.preflop.buckets: 169`
 - `action_abstraction.preflop` rows `["2.5bb"]` then `["5bb"]`
 
+The reproducible sample uses the existing `local_data/buckets/500f_500t_500r_v2` postflop bucket set (`500/500/500`) via `training.cluster_path`; the baseline comparison itself remains preflop-only.
+
 Example:
 
 ```yaml
 training:
+  cluster_path: "./local_data/buckets/500f_500t_500r_v2"
   baseline_validation:
     enabled: true
     baseline_path: "local_data/baselines/cash_hu_20bb_cev.json"
