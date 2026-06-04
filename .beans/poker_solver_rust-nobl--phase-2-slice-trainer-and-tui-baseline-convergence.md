@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-nobl
 title: 'Phase 2 slice: trainer and TUI baseline convergence'
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-04T03:48:24Z
-updated_at: 2026-06-04T03:49:43Z
+updated_at: 2026-06-04T04:03:10Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -25,9 +25,13 @@ Non-goals: no range-solver validation, no EV pass/fail, no pruning or disk evict
 
 ## Worker Checklist
 
-- [ ] Inspect reviewed baseline validator boundary and trainer/TUI integration points
-- [ ] Add disabled-by-default baseline validation config and parsing tests
-- [ ] Wire trainer cadence/reporting with config-derived game preconditions
-- [ ] Extend no-TUI/TUI metric formatting
-- [ ] Add 20bb sample config and docs
-- [ ] Run focused tests and feasible full-suite timing
+- [x] Inspect reviewed baseline validator boundary and trainer/TUI integration points
+- [x] Add disabled-by-default baseline validation config and parsing tests
+- [x] Wire trainer cadence/reporting with config-derived game preconditions
+- [x] Extend no-TUI/TUI metric formatting
+- [x] Add 20bb sample config and docs
+- [x] Run focused tests and feasible full-suite timing
+
+## Summary of Changes
+
+Implemented Phase 2 trainer/TUI baseline convergence integration. Added disabled-by-default `training.baseline_validation` config, wired trainer loading/cadence/reporting against `active_storage()` with trusted preconditions sourced from `GameConfig`, surfaced compact no-TUI and TUI diagnostics, added the 20bb validation sample config, updated architecture/training docs, and added focused integration/rendering tests. Full hot-cache workspace test passes under one minute.

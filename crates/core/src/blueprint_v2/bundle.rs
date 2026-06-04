@@ -461,6 +461,7 @@ mod tests {
                 brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                baseline_validation: Default::default(),
                 prune_streets: None,
                 regret_floor: None,
                 exploitability_interval_minutes: 0,

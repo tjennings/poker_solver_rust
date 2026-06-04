@@ -105,6 +105,13 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 - Snapshots and Explorer/Tauri bundles remain dense-compatible: sparse training projects to dense `regrets.bin` and `strategy.bin` at export/resume boundaries. There is no sparse on-disk snapshot format for HU `blueprint_v2`.
 - Sparse progress logging includes realized rows/slots, dense-equivalent slots/bytes, approximate sparse resident bytes, inserts, and read/write probe counters.
 
+**External baseline validation:**
+- `training.baseline_validation` is an opt-in trainer diagnostic that compares learned average strategy frequencies against a pinned external preflop baseline JSON. It is separate from VR-MCCFR `use_baselines`; it does not change traversal, regrets, or strategy sums.
+- The current validator is deliberately pinned to the 20bb HU cEV cash baseline at `local_data/baselines/cash_hu_20bb_cev.json`: stack 40 chips, blinds 1/2, no SB open limp, 169 preflop buckets, and preflop raise rows `2.5bb` then `5bb`.
+- Integration passes `BaselineGamePreconditions` from the original `GameConfig` used to build the tree. The validator refuses scoring if trusted config metadata, tree shape, preflop bucket count, or baseline document schema do not match the pinned target.
+- Reports read through the `BlueprintCfrStorage` provider boundary and call `average_strategy` on `active_storage()`. Sparse validation does not project the whole strategy to dense storage.
+- Metrics are strategy-frequency distances, not EV pass/fail results: aggregate total variation, root and first-response total variation, worst-spot total variation, coverage, skipped zero-mass rows, invalid rows, unsupported spots/actions, and worst combo rows.
+
 **Abstractions:**
 - `HandClassV2` -- 19-class hand classification with intra-class strength and equity binning (28-bit hand field)
 - `PotentialAwareEmd` -- True Pluribus-style potential-aware bucket abstraction (see below)

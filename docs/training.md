@@ -682,6 +682,43 @@ training:
 
 When enabled, the opponent traversal uses learned baselines to reduce sampling variance by up to 1000×. Each (node, bucket, action) gets an exponential moving average of observed counterfactual values. The baseline-corrected formula is unbiased and degenerates to standard sampling when baselines are zero. Requires extra ~1.1 GB for the baseline buffer (same size as regret buffer).
 
+### External Baseline Strategy-Frequency Validation
+
+`training.baseline_validation` enables periodic comparison of the learned average strategy against a fixed external preflop baseline. This is a convergence diagnostic only. It compares action frequencies with total-variation distance; it is not an EV pass/fail check and does not invoke the range solver.
+
+The current baseline integration is pinned to `local_data/baselines/cash_hu_20bb_cev.json` and requires the target config to match:
+
+- `game.stack_depth: 40` (20bb in repo chip units)
+- `game.small_blind: 1`, `game.big_blind: 2`
+- `game.allow_preflop_limp: false`
+- `clustering.preflop.buckets: 169`
+- `action_abstraction.preflop` rows `["2.5bb"]` then `["5bb"]`
+
+Example:
+
+```yaml
+training:
+  baseline_validation:
+    enabled: true
+    baseline_path: "local_data/baselines/cash_hu_20bb_cev.json"
+    interval_iterations: 1000
+    interval_minutes: 0
+    top_n_spots: 5
+    top_n_combos_per_spot: 5
+```
+
+Run the reproducible sample with:
+
+```bash
+cargo run -p poker-solver-trainer --release -- train-blueprint \
+  --config sample_configurations/blueprint_v2_hu_20bb_baseline_validation.yaml \
+  --no-tui
+```
+
+No-TUI logs and the TUI diagnostics panel report aggregate TV, root TV, first-response TV, worst-spot TV, coverage, skipped zero-mass rows, invalid rows, unsupported spots/actions, and the top worst spots/combo rows. Validation is cadence-bound by `interval_iterations` and/or `interval_minutes`; it does not run per traversal. Sparse/lazy storage is supported through `active_storage().average_strategy()` without dense projection.
+
+If the stack, blinds, limp policy, preflop buckets, tree actions, or baseline schema do not match the pinned 20bb cEV target, the trainer rejects the validation path before scoring rows.
+
 ### Schedule & Pruning
 
 | Parameter | Default | Description |

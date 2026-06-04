@@ -752,6 +752,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     metrics_for_spots.set_exploitable_spots(spots);
                 }));
 
+                let metrics_for_baseline = Arc::clone(&metrics);
+                trainer.on_baseline_validation = Some(Box::new(move |report| {
+                    metrics_for_baseline.set_baseline_validation_report(report);
+                }));
+
                 // Wire audit refresh callback.
                 {
                     let audits_for_refresh = Arc::clone(&shared_audits);

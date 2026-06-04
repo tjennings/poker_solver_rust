@@ -22,6 +22,11 @@ use rand::prelude::*;
 use rand::rngs::{SmallRng, StdRng};
 use rayon::prelude::*;
 
+use super::baseline_validation::{
+    BaselineDocument, BaselineGamePreconditions, BaselineValidationConfig,
+    BaselineValidationReport, format_baseline_validation_lines, parse_baseline_json,
+    validate_baseline,
+};
 use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
 use super::config::BlueprintV2Config;
@@ -122,6 +127,9 @@ type StrategyRefreshCallback =
 /// Receives per-position EV arrays `[position][hand_index]` so the callback
 /// can select the correct position based on the chosen node's player.
 type RandomScenarioCallback = Box<dyn Fn(&BlueprintStorage, &GameTree, &[[f64; 169]; 2]) + Send>;
+
+/// Callback type for pushing baseline convergence reports to the TUI.
+type BaselineValidationCallback = Box<dyn Fn(BaselineValidationReport) + Send>;
 
 /// Outer training driver for Blueprint V2.
 ///
@@ -238,6 +246,13 @@ pub struct BlueprintTrainer {
     pub on_exploitability_finish: Option<Box<dyn Fn() + Send>>,
     /// Last time (in minutes) an exploitability measurement was performed.
     last_exploitability_time: u64,
+
+    // --- External baseline validation ---
+    baseline_validation_document: Option<BaselineDocument>,
+    last_baseline_validation_iteration: u64,
+    last_baseline_validation_time: u64,
+    /// Callback to push baseline strategy-frequency validation reports to TUI.
+    pub on_baseline_validation: Option<BaselineValidationCallback>,
 
     // --- Config reload ---
     /// One-shot trigger: the TUI sets this to request a config reload.
@@ -576,6 +591,10 @@ impl BlueprintTrainer {
             on_exploitability_tick: None,
             on_exploitability_finish: None,
             last_exploitability_time: 0,
+            baseline_validation_document: None,
+            last_baseline_validation_iteration: 0,
+            last_baseline_validation_time: 0,
+            on_baseline_validation: None,
             config_reload_trigger: Arc::new(AtomicBool::new(false)),
             on_config_reload: None,
             reloaded_node_indices: Arc::new(std::sync::Mutex::new(None)),
@@ -721,6 +740,8 @@ impl BlueprintTrainer {
     /// fallback produces meaningless abstractions) or if a snapshot
     /// write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
+        self.initialize_baseline_validation()?;
+
         // Validate bucket files unless explicitly skipped or no cluster_path configured
         // (no cluster_path means intentional equity-only mode).
         if !self.skip_bucket_validation && self.config.training.cluster_path.is_some() {
@@ -863,6 +884,127 @@ impl BlueprintTrainer {
                 .store(self.iterations, Ordering::Relaxed);
             self.check_timed_actions()?;
         }
+        Ok(())
+    }
+
+    fn initialize_baseline_validation(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.config.training.baseline_validation.enabled {
+            return Ok(());
+        }
+        if self.baseline_validation_document.is_none() {
+            let path = self
+                .config
+                .training
+                .baseline_validation
+                .baseline_path
+                .as_ref()
+                .ok_or("training.baseline_validation.enabled requires baseline_path")?;
+            let raw = std::fs::read_to_string(path).map_err(|err| {
+                format!(
+                    "failed to read baseline validation file {}: {err}",
+                    path.display()
+                )
+            })?;
+            let document = parse_baseline_json(&raw)?;
+            self.baseline_validation_document = Some(document);
+            if !self.tui_active {
+                eprintln!("  Loaded baseline validation: {}", path.display());
+            }
+        }
+
+        self.run_baseline_validation("initial")?;
+        self.last_baseline_validation_iteration = self.iterations;
+        self.last_baseline_validation_time = self.elapsed_minutes();
+        Ok(())
+    }
+
+    fn should_run_baseline_validation(&self, elapsed_min: u64) -> bool {
+        if !self.config.training.baseline_validation.enabled
+            || self.baseline_validation_document.is_none()
+        {
+            return false;
+        }
+
+        let settings = &self.config.training.baseline_validation;
+        let iteration_due = settings.interval_iterations > 0
+            && self.iterations
+                >= self.last_baseline_validation_iteration + settings.interval_iterations;
+        let time_due = settings.interval_minutes > 0
+            && elapsed_min >= self.last_baseline_validation_time + settings.interval_minutes;
+        iteration_due || time_due
+    }
+
+    fn baseline_validation_preconditions(&self) -> BaselineGamePreconditions {
+        BaselineGamePreconditions {
+            starting_stack: self.config.game.stack_depth,
+            small_blind: self.config.game.small_blind,
+            big_blind: self.config.game.big_blind,
+            allow_preflop_limp: self.config.game.allow_preflop_limp,
+        }
+    }
+
+    /// Compute a validation report against the active storage backend.
+    ///
+    /// This intentionally reads through `BlueprintCfrStorage::average_strategy`
+    /// via the validator provider boundary and does not project sparse storage
+    /// to dense storage.
+    #[must_use]
+    pub fn baseline_validation_report(&self) -> Option<BaselineValidationReport> {
+        let baseline = self.baseline_validation_document.as_ref()?;
+        let settings = &self.config.training.baseline_validation;
+        let top_n = settings
+            .top_n_spots
+            .max(settings.top_n_combos_per_spot)
+            .max(1);
+        let mut report = validate_baseline(
+            baseline,
+            &self.tree,
+            self.active_storage(),
+            BaselineValidationConfig {
+                game: Some(self.baseline_validation_preconditions()),
+                top_n,
+            },
+        );
+        report.worst_spots.truncate(settings.top_n_spots);
+        report
+            .worst_combo_rows
+            .truncate(settings.top_n_combos_per_spot);
+        Some(report)
+    }
+
+    fn run_baseline_validation(&mut self, reason: &str) -> Result<(), Box<dyn Error>> {
+        let Some(report) = self.baseline_validation_report() else {
+            return Ok(());
+        };
+        let settings = &self.config.training.baseline_validation;
+
+        if !self.tui_active {
+            eprintln!(
+                "  Baseline validation ({reason}) at iter={}",
+                self.iterations
+            );
+            for line in format_baseline_validation_lines(
+                &report,
+                settings.top_n_spots,
+                settings.top_n_combos_per_spot,
+            ) {
+                eprintln!("{line}");
+            }
+        }
+
+        if let Some(ref cb) = self.on_baseline_validation {
+            cb(report.clone());
+        }
+
+        if !report.precondition_failures.is_empty() {
+            let first = &report.precondition_failures[0];
+            return Err(format!(
+                "baseline validation preconditions failed: {} expected={} actual={} ({})",
+                first.field, first.expected, first.actual, first.reason
+            )
+            .into());
+        }
+
         Ok(())
     }
 
@@ -1112,6 +1254,12 @@ impl BlueprintTrainer {
 
         if print_due {
             self.print_metrics();
+        }
+
+        if self.should_run_baseline_validation(elapsed_min) {
+            self.run_baseline_validation("cadence")?;
+            self.last_baseline_validation_iteration = self.iterations;
+            self.last_baseline_validation_time = elapsed_min;
         }
 
         // Config reload: TUI-triggered.
@@ -1758,6 +1906,7 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
     use test_macros::timed_test;
@@ -1844,6 +1993,7 @@ mod tests {
                 brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                baseline_validation: BaselineValidationTrainingConfig::default(),
                 prune_streets: None,
                 regret_floor: None,
                 exploitability_interval_minutes: 0,
@@ -1863,6 +2013,29 @@ mod tests {
         let mut t = BlueprintTrainer::new(config);
         t.skip_bucket_validation = true;
         t
+    }
+
+    fn baseline_validation_config() -> BlueprintV2Config {
+        let mut config = toy_config();
+        config.game.stack_depth = 40.0;
+        config.game.allow_preflop_limp = false;
+        config.clustering.preflop.buckets = 169;
+        config.action_abstraction.preflop =
+            vec![vec!["2.5bb".to_string()], vec!["5bb".to_string()]];
+        config.training.iterations = Some(0);
+        config.training.batch_size = 1;
+        config.training.baseline_validation = BaselineValidationTrainingConfig {
+            enabled: true,
+            baseline_path: Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../local_data/baselines/cash_hu_20bb_cev.json"),
+            ),
+            interval_iterations: 1,
+            interval_minutes: 0,
+            top_n_spots: 5,
+            top_n_combos_per_spot: 5,
+        };
+        config
     }
 
     fn tiny_training_config(storage_backend: &str) -> BlueprintV2Config {
@@ -1924,6 +2097,86 @@ mod tests {
         let mut config = tiny_training_config("sparse");
         config.training.optimizer = "brcfr+".to_string();
         let _ = BlueprintTrainer::new(config);
+    }
+
+    #[test]
+    fn baseline_validation_initial_report_uses_actual_config_preconditions() {
+        let config = baseline_validation_config();
+        let mut trainer = toy_trainer(config);
+
+        trainer.train().expect("baseline validation should pass");
+        let report = trainer
+            .baseline_validation_report()
+            .expect("baseline document should remain loaded");
+
+        assert_eq!(report.aggregate.precondition_failures, 0);
+        assert_eq!(report.aggregate.spots_total, 6);
+        assert_eq!(report.aggregate.spots_scored, 6);
+        assert!(report.aggregate.combo_rows_scored > 0);
+    }
+
+    #[test]
+    fn baseline_validation_rejects_actual_wrong_game_config() {
+        let mut config = baseline_validation_config();
+        config.game.small_blind = 3.0;
+        let mut trainer = toy_trainer(config);
+
+        let err = trainer
+            .train()
+            .expect_err("wrong trusted game config should be rejected");
+        let text = err.to_string();
+        assert!(text.contains("trusted_game.small_blind"), "{text}");
+        assert!(text.contains("actual=3.0"), "{text}");
+    }
+
+    #[test]
+    fn baseline_validation_cadence_is_batch_bound() {
+        let mut config = baseline_validation_config();
+        config.training.iterations = Some(3);
+        config.training.batch_size = 1;
+        config.training.baseline_validation.interval_iterations = 2;
+
+        let reports = Arc::new(AtomicU64::new(0));
+        let reports_for_callback = Arc::clone(&reports);
+        let mut trainer = toy_trainer(config);
+        trainer.on_baseline_validation = Some(Box::new(move |_report| {
+            reports_for_callback.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        trainer.train().expect("short training should complete");
+
+        assert_eq!(
+            reports.load(Ordering::Relaxed),
+            2,
+            "expected initial report plus one cadence report at iteration 2"
+        );
+    }
+
+    #[test]
+    fn baseline_validation_log_format_includes_required_diagnostics() {
+        let config = baseline_validation_config();
+        let mut trainer = toy_trainer(config);
+        trainer.train().expect("baseline validation should pass");
+        let report = trainer
+            .baseline_validation_report()
+            .expect("baseline document should remain loaded");
+        let text = format_baseline_validation_lines(&report, 5, 5).join("\n");
+
+        for needle in [
+            "aggregate_tv=",
+            "root_tv=",
+            "first_response_tv=",
+            "worst_spot_tv=",
+            "coverage=",
+            "skipped_zero_mass=",
+            "invalid_rows=",
+            "unsupported_spots=",
+            "unsupported_actions=",
+            "worst spots:",
+            "worst combo rows:",
+        ] {
+            assert!(text.contains(needle), "missing {needle} in {text}");
+        }
     }
 
     #[test]

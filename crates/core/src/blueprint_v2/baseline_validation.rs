@@ -478,6 +478,101 @@ where
     report
 }
 
+/// Build compact human-readable report lines for trainer logs and tests.
+#[must_use]
+pub fn format_baseline_validation_lines(
+    report: &BaselineValidationReport,
+    top_n_spots: usize,
+    top_n_combos: usize,
+) -> Vec<String> {
+    let aggregate = &report.aggregate;
+    let root_tv = spot_tv(report, "root");
+    let first_response_tv = spot_tv(report, "SB:r2.5");
+    let spot_coverage = if aggregate.spots_total > 0 {
+        aggregate.spots_scored as f64 / aggregate.spots_total as f64
+    } else {
+        0.0
+    };
+
+    let mut lines = vec![
+        format!(
+            "  Baseline convergence: aggregate_tv={:.4} root_tv={} first_response_tv={} worst_spot_tv={:.4} coverage={}/{} ({:.1}%)",
+            aggregate.mean_total_variation,
+            fmt_optional_tv(root_tv),
+            fmt_optional_tv(first_response_tv),
+            aggregate.worst_spot_total_variation,
+            aggregate.spots_scored,
+            aggregate.spots_total,
+            spot_coverage * 100.0,
+        ),
+        format!(
+            "    diagnostics: rows={} skipped_zero_mass={} invalid_rows={} unsupported_spots={} unsupported_actions={} precondition_failures={} unmapped_mass={:.4}",
+            aggregate.combo_rows_scored,
+            aggregate.combo_rows_skipped_zero_mass,
+            aggregate.combo_rows_invalid_hand,
+            aggregate.unsupported_spots,
+            aggregate.unsupported_actions,
+            aggregate.precondition_failures,
+            aggregate.mean_unmapped_candidate_mass,
+        ),
+    ];
+
+    if !report.precondition_failures.is_empty() {
+        for failure in report.precondition_failures.iter().take(top_n_spots.max(1)) {
+            lines.push(format!(
+                "    precondition {} expected={} actual={} ({})",
+                failure.field, failure.expected, failure.actual, failure.reason
+            ));
+        }
+        return lines;
+    }
+
+    if !report.worst_spots.is_empty() {
+        lines.push("    worst spots:".to_string());
+        for spot in report.worst_spots.iter().take(top_n_spots) {
+            lines.push(format!(
+                "      {} tv={:.4} rows={} skipped={} invalid={} unmapped={:.4}",
+                spot.spot_key,
+                spot.mean_total_variation,
+                spot.combo_rows_scored,
+                spot.combo_rows_skipped_zero_mass,
+                spot.combo_rows_invalid_hand,
+                spot.mean_unmapped_candidate_mass,
+            ));
+        }
+    }
+
+    if !report.worst_combo_rows.is_empty() {
+        lines.push("    worst combo rows:".to_string());
+        for row in report.worst_combo_rows.iter().take(top_n_combos) {
+            let comparisons = row
+                .action_frequencies
+                .iter()
+                .map(|freq| format!("{} {:.2}->{:.2}", freq.label, freq.baseline, freq.learned))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "      {} {} tv={:.4} weight={:.1} [{}]",
+                row.spot_key, row.hand, row.total_variation, row.combo_weight, comparisons
+            ));
+        }
+    }
+
+    lines
+}
+
+fn spot_tv(report: &BaselineValidationReport, spot_key: &str) -> Option<f64> {
+    report
+        .spots
+        .iter()
+        .find(|spot| spot.spot_key == spot_key)
+        .map(|spot| spot.mean_total_variation)
+}
+
+fn fmt_optional_tv(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}"))
+}
+
 fn validate_preconditions<P>(
     baseline: &BaselineDocument,
     tree: &GameTree,
