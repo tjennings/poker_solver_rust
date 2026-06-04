@@ -18,9 +18,14 @@ const ACTION_EPSILON: f64 = 0.01;
 const MASS_EPSILON: f64 = 1.0e-12;
 const EXPECTED_PREFLOP_BUCKETS: u16 = 169;
 const EXPECTED_STARTING_STACK: f64 = 40.0;
+const EXPECTED_SMALL_BLIND: f64 = 1.0;
 const EXPECTED_BIG_BLIND: f64 = 2.0;
 const EXPECTED_BASELINE_STACK_DEPTH_BB: f64 = 20.0;
 const EXPECTED_OPENING_SIZE: &str = "25X";
+const EXPECTED_EV_MODEL: &str = "CEV";
+const EXPECTED_GAME_FORMAT: &str = "CASH";
+const EXPECTED_TABLE_TYPE: &str = "HEADS-UP";
+const EXPECTED_PLAYERS: u8 = 2;
 const PREFLIGHT_SPOT_KEY: &str = "<preflight>";
 
 const EXPECTED_SPOT_SCHEMAS: &[(&str, &[&str], &[&str])] = &[
@@ -134,8 +139,12 @@ pub struct BaselineComboStrategy {
 /// Validation options.
 #[derive(Debug, Clone, Copy)]
 pub struct BaselineValidationConfig {
-    /// Big blind in repo chip units. The target Phase 2 config uses `2.0`.
-    pub big_blind: f64,
+    /// Trusted game configuration from the tree construction input.
+    ///
+    /// `GameTree` does not retain blinds or limp-policy metadata, so validator
+    /// integration must pass the original config values here. Scoring is
+    /// refused when this is absent.
+    pub game: Option<BaselineGamePreconditions>,
     /// Number of rows/spots to retain in worst-first summaries.
     pub top_n: usize,
 }
@@ -143,8 +152,29 @@ pub struct BaselineValidationConfig {
 impl Default for BaselineValidationConfig {
     fn default() -> Self {
         Self {
-            big_blind: 2.0,
+            game: None,
             top_n: 5,
+        }
+    }
+}
+
+/// Trusted game configuration required before scoring the pinned HU baseline.
+#[derive(Debug, Clone, Copy)]
+pub struct BaselineGamePreconditions {
+    pub starting_stack: f64,
+    pub small_blind: f64,
+    pub big_blind: f64,
+    pub allow_preflop_limp: bool,
+}
+
+impl BaselineGamePreconditions {
+    #[must_use]
+    pub const fn pinned_hu_20bb() -> Self {
+        Self {
+            starting_stack: EXPECTED_STARTING_STACK,
+            small_blind: EXPECTED_SMALL_BLIND,
+            big_blind: EXPECTED_BIG_BLIND,
+            allow_preflop_limp: false,
         }
     }
 }
@@ -362,7 +392,8 @@ where
 
     for (key, spot) in &baseline.spots {
         let spot_key = normalized_spot_key(key, spot);
-        let node_idx = match resolve_spot_path(tree, spot, config.big_blind) {
+        let big_blind = trusted_big_blind(config);
+        let node_idx = match resolve_spot_path(tree, spot, big_blind) {
             Ok(node_idx) => node_idx,
             Err(err) => {
                 report.unsupported_spots.push(UnsupportedSpot {
@@ -373,7 +404,7 @@ where
             }
         };
 
-        let mapping = match build_action_mapping(tree, node_idx, &spot.actions, config.big_blind) {
+        let mapping = match build_action_mapping(tree, node_idx, &spot.actions, big_blind) {
             Ok(mapping) => mapping,
             Err(err) => {
                 report.unsupported_spots.push(UnsupportedSpot {
@@ -472,13 +503,7 @@ where
         tree.starting_stack,
         "baseline all-in label RAI is defined for the 40-chip stack tree",
     );
-    push_f64_precondition(
-        &mut failures,
-        "validation.big_blind",
-        EXPECTED_BIG_BLIND,
-        config.big_blind,
-        "baseline raise labels are mapped from big-blind units to chip amounts",
-    );
+    validate_trusted_game_preconditions(tree, config.game, &mut failures);
 
     match baseline.game.stack_depth_bb {
         Some(stack_depth_bb) if approx_eq(stack_depth_bb, EXPECTED_BASELINE_STACK_DEPTH_BB) => {}
@@ -510,10 +535,122 @@ where
         });
     }
 
+    validate_optional_baseline_metadata(baseline, &mut failures);
     validate_document_action_metadata(baseline, &mut failures);
-    validate_expected_spot_schemas(baseline, tree, config.big_blind, &mut failures);
+    validate_expected_spot_schemas(baseline, tree, trusted_big_blind(config), &mut failures);
 
     failures
+}
+
+fn validate_trusted_game_preconditions(
+    tree: &GameTree,
+    game: Option<BaselineGamePreconditions>,
+    failures: &mut Vec<PreconditionFailure>,
+) {
+    let Some(game) = game else {
+        failures.push(PreconditionFailure {
+            field: "trusted_game".to_string(),
+            expected: "present".to_string(),
+            actual: "missing".to_string(),
+            reason: "GameTree does not retain blind or limp-policy metadata; pass original game config before scoring".to_string(),
+        });
+        return;
+    };
+
+    push_f64_precondition(
+        failures,
+        "trusted_game.starting_stack",
+        EXPECTED_STARTING_STACK,
+        game.starting_stack,
+        "trusted game config must match the pinned HU 20bb tree",
+    );
+    push_f64_precondition(
+        failures,
+        "trusted_game.small_blind",
+        EXPECTED_SMALL_BLIND,
+        game.small_blind,
+        "trusted blind metadata is required because GameTree stores chip actions but not blind semantics",
+    );
+    push_f64_precondition(
+        failures,
+        "trusted_game.big_blind",
+        EXPECTED_BIG_BLIND,
+        game.big_blind,
+        "baseline raise labels are mapped from big-blind units to chip amounts",
+    );
+    if game.allow_preflop_limp {
+        failures.push(PreconditionFailure {
+            field: "trusted_game.allow_preflop_limp".to_string(),
+            expected: "false".to_string(),
+            actual: "true".to_string(),
+            reason: "the supplied HU 20bb baseline root schema excludes SB open-limp".to_string(),
+        });
+    }
+    push_f64_precondition(
+        failures,
+        "tree.starting_stack_vs_trusted_game",
+        game.starting_stack,
+        tree.starting_stack,
+        "tree and trusted construction config disagree on starting stack",
+    );
+}
+
+fn validate_optional_baseline_metadata(
+    baseline: &BaselineDocument,
+    failures: &mut Vec<PreconditionFailure>,
+) {
+    if let Some(players) = baseline.game.players
+        && players != EXPECTED_PLAYERS
+    {
+        failures.push(PreconditionFailure {
+            field: "baseline.game.players".to_string(),
+            expected: EXPECTED_PLAYERS.to_string(),
+            actual: players.to_string(),
+            reason: "this validator is pinned to the heads-up baseline".to_string(),
+        });
+    }
+
+    validate_optional_uppercase_metadata(
+        failures,
+        "baseline.game.format",
+        baseline.game.game_format.as_deref(),
+        EXPECTED_GAME_FORMAT,
+        "this validator is pinned to the cash-game baseline",
+    );
+    validate_optional_uppercase_metadata(
+        failures,
+        "baseline.game.tableType",
+        baseline.game.table_type.as_deref(),
+        EXPECTED_TABLE_TYPE,
+        "this validator is pinned to the heads-up baseline",
+    );
+    validate_optional_uppercase_metadata(
+        failures,
+        "baseline.game.evModel",
+        baseline.game.ev_model.as_deref(),
+        EXPECTED_EV_MODEL,
+        "this validator compares against the cEV baseline only",
+    );
+}
+
+fn validate_optional_uppercase_metadata(
+    failures: &mut Vec<PreconditionFailure>,
+    field: &str,
+    actual: Option<&str>,
+    expected: &str,
+    reason: &str,
+) {
+    if let Some(actual) = actual {
+        let normalized = actual.trim().to_ascii_uppercase();
+        if normalized != expected {
+            failures.push(PreconditionFailure {
+                field: field.to_string(),
+                expected: expected.to_string(),
+                actual: normalized,
+                reason: reason.to_string(),
+            });
+        }
+    }
 }
 
 fn validate_document_action_metadata(
@@ -580,6 +717,22 @@ fn validate_expected_spot_schemas(
     big_blind: f64,
     failures: &mut Vec<PreconditionFailure>,
 ) {
+    let expected_keys: BTreeSet<&str> = EXPECTED_SPOT_SCHEMAS
+        .iter()
+        .map(|(spot_key, _, _)| *spot_key)
+        .collect();
+    for spot_key in baseline.spots.keys() {
+        if !expected_keys.contains(spot_key.as_str()) {
+            failures.push(PreconditionFailure {
+                field: format!("baseline.spots.{spot_key}"),
+                expected: "absent".to_string(),
+                actual: "present".to_string(),
+                reason: "the pinned HU 20bb validator accepts exactly the six known preflop spots"
+                    .to_string(),
+            });
+        }
+    }
+
     for (spot_key, expected_path, expected_actions) in EXPECTED_SPOT_SCHEMAS {
         let Some(spot) = baseline.spots.get(*spot_key) else {
             failures.push(PreconditionFailure {
@@ -1013,6 +1166,12 @@ fn approx_eq(left: f64, right: f64) -> bool {
     (left - right).abs() <= ACTION_EPSILON
 }
 
+fn trusted_big_blind(config: BaselineValidationConfig) -> f64 {
+    config
+        .game
+        .map_or(EXPECTED_BIG_BLIND, |game| game.big_blind)
+}
+
 fn normalized_spot_key(map_key: &str, spot: &BaselineSpot) -> String {
     if spot.spot_key.is_empty() {
         map_key.to_string()
@@ -1081,6 +1240,19 @@ mod tests {
         )
     }
 
+    fn wrong_blind_same_chip_action_tree() -> GameTree {
+        GameTree::build_with_options(
+            40.0,
+            0.5,
+            1.0,
+            &[vec!["5bb".to_string()], vec!["10bb".to_string()]],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+    }
+
     fn spot(spot_key: &str, path: &[&str], actions: &[&str]) -> BaselineSpot {
         BaselineSpot {
             spot_key: spot_key.to_string(),
@@ -1097,7 +1269,11 @@ mod tests {
             site: Some("gtowizard".to_string()),
             game: BaselineGameMetadata {
                 id: Some("cash_hu_20bb_cev".to_string()),
+                players: Some(2),
+                game_format: Some("cash".to_string()),
+                table_type: Some("heads-up".to_string()),
                 stack_depth_bb: Some(20.0),
+                ev_model: Some("cEV".to_string()),
                 opening_size: Some("25x".to_string()),
                 ..BaselineGameMetadata::default()
             },
@@ -1168,6 +1344,20 @@ mod tests {
                 ),
             ]),
             ..BaselineDocument::default()
+        }
+    }
+
+    fn target_validation_config() -> BaselineValidationConfig {
+        BaselineValidationConfig {
+            game: Some(BaselineGamePreconditions::pinned_hu_20bb()),
+            top_n: 5,
+        }
+    }
+
+    fn validation_config_with_game(game: BaselineGamePreconditions) -> BaselineValidationConfig {
+        BaselineValidationConfig {
+            game: Some(game),
+            top_n: 5,
         }
     }
 
@@ -1363,12 +1553,7 @@ mod tests {
         let tree = target_tree(false);
         let provider = fixed_provider(168, 3);
 
-        let report = validate_baseline(
-            &baseline,
-            &tree,
-            &provider,
-            BaselineValidationConfig::default(),
-        );
+        let report = validate_baseline(&baseline, &tree, &provider, target_validation_config());
 
         assert_eq!(report.aggregate.precondition_failures, 1);
         assert_eq!(report.aggregate.spots_scored, 0);
@@ -1391,12 +1576,7 @@ mod tests {
             .expect("wrong-stack root mapping builds");
         assert!(root_mapping.is_supported());
 
-        let report = validate_baseline(
-            &baseline,
-            &tree,
-            &provider,
-            BaselineValidationConfig::default(),
-        );
+        let report = validate_baseline(&baseline, &tree, &provider, target_validation_config());
 
         assert_eq!(report.aggregate.spots_scored, 0);
         assert!(
@@ -1415,12 +1595,7 @@ mod tests {
         let tree = target_tree(false);
         let provider = fixed_provider(169, 3);
 
-        let report = validate_baseline(
-            &baseline,
-            &tree,
-            &provider,
-            BaselineValidationConfig::default(),
-        );
+        let report = validate_baseline(&baseline, &tree, &provider, target_validation_config());
 
         assert_eq!(report.aggregate.spots_scored, 0);
         assert!(
@@ -1465,6 +1640,21 @@ mod tests {
         let tree = target_tree(false);
         let provider = fixed_provider(169, 3);
 
+        let report = validate_baseline(&baseline, &tree, &provider, target_validation_config());
+
+        assert_eq!(report.aggregate.precondition_failures, 0);
+        assert_eq!(report.aggregate.combo_rows_invalid_hand, 1);
+        assert_eq!(report.invalid_hand_rows.len(), 1);
+        assert_eq!(report.invalid_hand_rows[0].spot_key, "root");
+        assert_eq!(report.invalid_hand_rows[0].hand_label, "not-a-hand");
+    }
+
+    #[test]
+    fn missing_trusted_game_config_is_refused_before_scoring() {
+        let baseline = strict_baseline();
+        let tree = target_tree(false);
+        let provider = fixed_provider(169, 3);
+
         let report = validate_baseline(
             &baseline,
             &tree,
@@ -1472,10 +1662,100 @@ mod tests {
             BaselineValidationConfig::default(),
         );
 
-        assert_eq!(report.aggregate.precondition_failures, 0);
-        assert_eq!(report.aggregate.combo_rows_invalid_hand, 1);
-        assert_eq!(report.invalid_hand_rows.len(), 1);
-        assert_eq!(report.invalid_hand_rows[0].spot_key, "root");
-        assert_eq!(report.invalid_hand_rows[0].hand_label, "not-a-hand");
+        assert_eq!(report.aggregate.spots_scored, 0);
+        assert!(
+            report
+                .precondition_failures
+                .iter()
+                .any(|failure| failure.field == "trusted_game")
+        );
+    }
+
+    #[test]
+    fn wrong_blind_tree_with_same_chip_actions_is_refused_by_trusted_config() {
+        let baseline = strict_baseline();
+        let tree = wrong_blind_same_chip_action_tree();
+        let provider = fixed_provider(169, 3);
+        let wrong_game = BaselineGamePreconditions {
+            starting_stack: 40.0,
+            small_blind: 0.5,
+            big_blind: 1.0,
+            allow_preflop_limp: false,
+        };
+
+        let root = baseline.spots.get("root").expect("root spot");
+        let root_node = resolve_spot_path(&tree, root, 2.0)
+            .expect("old baseline-big-blind mapping would resolve");
+        let root_mapping = build_action_mapping(&tree, root_node, &root.actions, 2.0)
+            .expect("old baseline-big-blind mapping would build");
+        assert!(root_mapping.is_supported());
+
+        let report = validate_baseline(
+            &baseline,
+            &tree,
+            &provider,
+            validation_config_with_game(wrong_game),
+        );
+
+        assert_eq!(report.aggregate.spots_scored, 0);
+        assert!(
+            report
+                .precondition_failures
+                .iter()
+                .any(|failure| failure.field == "trusted_game.small_blind")
+        );
+        assert!(
+            report
+                .precondition_failures
+                .iter()
+                .any(|failure| failure.field == "trusted_game.big_blind")
+        );
+    }
+
+    #[test]
+    fn trusted_limp_enabled_config_is_refused_before_scoring() {
+        let baseline = strict_baseline();
+        let tree = target_tree(false);
+        let provider = fixed_provider(169, 3);
+        let limp_enabled_game = BaselineGamePreconditions {
+            allow_preflop_limp: true,
+            ..BaselineGamePreconditions::pinned_hu_20bb()
+        };
+
+        let report = validate_baseline(
+            &baseline,
+            &tree,
+            &provider,
+            validation_config_with_game(limp_enabled_game),
+        );
+
+        assert_eq!(report.aggregate.spots_scored, 0);
+        assert!(
+            report
+                .precondition_failures
+                .iter()
+                .any(|failure| failure.field == "trusted_game.allow_preflop_limp")
+        );
+    }
+
+    #[test]
+    fn extra_baseline_spots_are_refused_before_scoring() {
+        let mut baseline = strict_baseline();
+        baseline.spots.insert(
+            "SB:r2.5, BB:c".to_string(),
+            spot("SB:r2.5, BB:c", &["R2.5", "C"], &["Check"]),
+        );
+        let tree = target_tree(false);
+        let provider = fixed_provider(169, 3);
+
+        let report = validate_baseline(&baseline, &tree, &provider, target_validation_config());
+
+        assert_eq!(report.aggregate.spots_scored, 0);
+        assert!(
+            report
+                .precondition_failures
+                .iter()
+                .any(|failure| failure.field == "baseline.spots.SB:r2.5, BB:c")
+        );
     }
 }

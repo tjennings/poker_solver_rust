@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-28c2
 title: 'Phase 2 slice: core preflop baseline validator'
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-04T03:06:14Z
-updated_at: 2026-06-04T03:34:38Z
+updated_at: 2026-06-04T03:42:43Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -83,3 +83,21 @@ Additional fix:
 - The pinned baseline spot check must be exact. The current check verifies the six expected spots exist, but does not reject extra baseline spots; extra resolvable spots could pollute aggregate TV metrics.
 
 The review confirmed that non-169 bucket preflight and malformed-hand reporting now work, and previous action mapping behavior remains intact.
+
+## Second Corrective Patch Summary
+
+Addressed the second corrective review blockers for the core baseline validator:
+
+- Replaced blind inference from `GameTree` with a required trusted `BaselineGamePreconditions` input carrying original starting stack, small blind, big blind, and preflop limp policy.
+- Made `validate_baseline` refuse scoring when trusted game metadata is missing or does not match the pinned HU 20bb tuple: stack 40, SB 1, BB 2, limp disabled.
+- Kept tree starting-stack validation and added tree-vs-trusted starting-stack consistency.
+- Validated optional baseline metadata for HU cash cEV when present: `players`, `format`, `tableType`, and `evModel`.
+- Made the pinned spot schema exact by rejecting extra baseline spots before scoring.
+- Added regressions for missing trusted game metadata, wrong-blind trees with the same chip action amounts, trusted limp-enabled config, and extra baseline spots.
+
+Verification:
+
+- Pre-change `/usr/bin/time -p cargo test --quiet` passed at real 46.25s.
+- `cargo test -p poker-solver-core blueprint_v2::baseline_validation --quiet`
+- `cargo test -p poker-solver-core blueprint_v2 --quiet`
+- `/usr/bin/time -p cargo test --quiet` (first post-change full run passed at real 112.05s after rebuild; warmed run passed at real 44.82s)
