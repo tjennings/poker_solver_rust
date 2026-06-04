@@ -5,7 +5,7 @@ status: todo
 type: epic
 priority: high
 created_at: 2026-06-03T18:08:59Z
-updated_at: 2026-06-03T18:10:49Z
+updated_at: 2026-06-04T04:11:20Z
 ---
 
 Plan and deliver a staged rewrite of the blueprint trainer storage/traversal model.
@@ -14,7 +14,7 @@ Goal: move the trainer away from hot-path map-based node lookup toward a lazily 
 
 Phases:
 - [ ] Phase 1: Implement the lazy in-memory tree model only; no pruning or disk eviction.
-- [ ] Phase 2: Validate against a small known-good heads-up game variant supplied by the user.
+- [x] Phase 2: Validate against a small known-good heads-up game variant supplied by the user.
 - [ ] Phase 3: Add in-memory strategy pruning for persistently negative lines.
 - [ ] Phase 4: Add disk eviction for selected subtrees when resident node pressure exceeds configured limits.
 
