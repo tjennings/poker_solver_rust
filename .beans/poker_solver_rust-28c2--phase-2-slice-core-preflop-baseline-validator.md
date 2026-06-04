@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-28c2
 title: 'Phase 2 slice: core preflop baseline validator'
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-04T03:06:14Z
-updated_at: 2026-06-04T03:21:30Z
+updated_at: 2026-06-04T03:29:06Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -53,3 +53,19 @@ Additional fix:
 - Malformed/unparsable baseline hand rows must be reported, not silently dropped from aggregate TV/weights.
 
 Reviewer noted that under the exact target tree the six path tests and action mapping are directionally correct, including all-in-call mapping to `C`, but the missing guards can produce plausible-looking validation numbers for the wrong blueprint.
+
+## Corrective Patch Summary
+
+Addressed review blockers for the Phase 2 core baseline validator:
+
+- Added provider preflight validation for exact 169 preflop buckets before scoring.
+- Added global precondition failures to the validation report and refuse scoring when preconditions fail.
+- Validated the pinned HU 20bb baseline/tree tuple before scoring: tree starting stack 40 chips, validation big blind 2 chips, baseline `stackDepthBb: 20`, baseline `openingSize: 25x`, document action metadata, and the six expected preflop spot schemas/action mappings.
+- Reported malformed baseline hand labels through aggregate counters and `invalid_hand_rows` instead of silently dropping them.
+- Added regression coverage for non-169 providers, wrong-stack trees that still map root actions, bad baseline metadata, and malformed hand labels.
+
+Verification:
+
+- `cargo test -p poker-solver-core blueprint_v2::baseline_validation --quiet`
+- `cargo test -p poker-solver-core blueprint_v2 --quiet`
+- `/usr/bin/time -p cargo test --quiet` (first post-change full run passed at real 138.74s after rebuild; warmed run passed at real 47.91s)
