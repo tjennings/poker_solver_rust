@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-06-04T03:48:24Z
-updated_at: 2026-06-04T03:48:24Z
+updated_at: 2026-06-04T03:49:43Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -22,3 +22,12 @@ Scope:
 - Add tests for config defaults, enabled validation path, trusted preconditions sourced from actual config, no-TUI/TUI metric formatting as practical, and unsupported wrong config rejection.
 
 Non-goals: no range-solver validation, no EV pass/fail, no pruning or disk eviction, no sparse on-disk changes.
+
+## Worker Checklist
+
+- [ ] Inspect reviewed baseline validator boundary and trainer/TUI integration points
+- [ ] Add disabled-by-default baseline validation config and parsing tests
+- [ ] Wire trainer cadence/reporting with config-derived game preconditions
+- [ ] Extend no-TUI/TUI metric formatting
+- [ ] Add 20bb sample config and docs
+- [ ] Run focused tests and feasible full-suite timing
