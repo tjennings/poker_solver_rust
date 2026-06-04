@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-28c2
 title: 'Phase 2 slice: core preflop baseline validator'
-status: completed
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-04T03:06:14Z
-updated_at: 2026-06-04T03:29:06Z
+updated_at: 2026-06-04T03:34:38Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -69,3 +69,17 @@ Verification:
 - `cargo test -p poker-solver-core blueprint_v2::baseline_validation --quiet`
 - `cargo test -p poker-solver-core blueprint_v2 --quiet`
 - `/usr/bin/time -p cargo test --quiet` (first post-change full run passed at real 138.74s after rebuild; warmed run passed at real 47.91s)
+
+## Corrective Review Findings 2026-06-04
+
+Independent review of `b1c98416 Harden baseline validation preconditions` found two remaining issues before trainer/TUI integration can proceed.
+
+Blocking fix required:
+
+- Wrong-tree blind semantics can still pass preflight. `GameTree` does not retain the small/big blind values used at construction, and the validator only checks `BaselineValidationConfig.big_blind`. A tree built with different blinds but adjusted preflop size strings can expose the same chip raise amounts and pass schema checks while representing a different BB stack depth. The validator must receive and verify trusted game config/blind metadata, or otherwise make the trainer integration pass and validate the original `GameConfig` before scoring.
+
+Additional fix:
+
+- The pinned baseline spot check must be exact. The current check verifies the six expected spots exist, but does not reject extra baseline spots; extra resolvable spots could pollute aggregate TV metrics.
+
+The review confirmed that non-169 bucket preflight and malformed-hand reporting now work, and previous action mapping behavior remains intact.

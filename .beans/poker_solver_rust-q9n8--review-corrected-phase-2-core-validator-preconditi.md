@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-q9n8
 title: Review corrected Phase 2 core validator preconditions
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-04T03:30:20Z
-updated_at: 2026-06-04T03:30:20Z
+updated_at: 2026-06-04T03:34:38Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -18,3 +18,14 @@ Review focus:
 - Prior correct behavior remains intact: six target spots resolve, `C` all-in-call mapping works, aggressive `RAI` mapping works, zero-mass rows are skipped/reported, and API remains suitable for trainer/TUI integration over `average_strategy`.
 
 Reviewer should report blocking findings with file/line references and recommend whether trainer/TUI integration can proceed.
+
+## Summary of Review
+
+Review completed for `b1c98416 Harden baseline validation preconditions`.
+
+Findings:
+
+- P1: Wrong-tree blind semantics can still pass because `GameTree` does not retain construction blinds and the validator only checks supplied config big blind.
+- P2: The six expected baseline spot check is not exact; extra baseline spots are not rejected.
+
+Recommendation: fix before trainer/TUI integration.
