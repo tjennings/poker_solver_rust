@@ -1,3 +1,4 @@
+pub mod baseline_validation;
 pub mod bucket_file;
 pub mod bundle;
 pub mod cbv;
