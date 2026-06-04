@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-q95i
 title: Review final Phase 2 core validator guards
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-04T03:43:30Z
-updated_at: 2026-06-04T03:43:30Z
+updated_at: 2026-06-04T03:48:06Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -19,3 +19,26 @@ Review focus:
 - API remains suitable for trainer/TUI integration, where the integration layer can fill trusted preconditions from the original config.
 
 Reviewer should report blockers with file/line references and recommend whether trainer/TUI integration can proceed.
+
+## Summary of Review
+
+Final core-validator review completed for `041f8982 Require trusted baseline game preconditions`.
+
+Findings: no blocking findings. The reviewer confirmed:
+
+- Validation precondition failures are collected and returned before any spot scoring.
+- Trusted `BaselineGamePreconditions` are required and checked for starting stack, small blind, big blind, and limp policy.
+- Wrong-blind same-chip-action tree counterexample is rejected by trusted SB/BB validation.
+- Extra baseline spot keys are rejected by exact pinned schema enforcement.
+- Previous guards remain intact: non-169 provider rejection, malformed hand reporting, all-in-call to `C`, aggressive all-in to `RAI`, and zero-mass row skip/reporting.
+- API is suitable for trainer/TUI integration via public `BaselineGamePreconditions` and provider `preflop_bucket_count`.
+
+Review tests passed:
+
+- `cargo test -p poker-solver-core blueprint_v2::baseline_validation --quiet`
+- `cargo test -p poker-solver-core blueprint_v2 --quiet`
+- `/usr/bin/time -p cargo test --quiet` in `real 43.77`.
+
+Residual integration risk: the trainer/TUI layer must fill trusted preconditions from the actual original `GameConfig`, not fabricated pinned values. That must be covered in the integration slice.
+
+Recommendation: proceed to trainer/TUI integration.
