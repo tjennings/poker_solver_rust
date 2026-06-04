@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-28c2
 title: 'Phase 2 slice: core preflop baseline validator'
-status: completed
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-04T03:06:14Z
-updated_at: 2026-06-04T03:16:28Z
+updated_at: 2026-06-04T03:21:30Z
 parent: poker_solver_rust-l6r9
 ---
 
@@ -38,3 +38,18 @@ Verification:
 - `cargo test -p poker-solver-core blueprint_v2::baseline_validation --quiet`
 - `cargo test -p poker-solver-core blueprint_v2 --quiet`
 - `/usr/bin/time -p cargo test --quiet` (cached steady-state: real 45.27s)
+
+## Review Findings 2026-06-04
+
+Independent review of `d243086c Add blueprint baseline validation core` found the core slice is not ready for trainer/TUI integration.
+
+Blocking fixes required:
+
+- Add exact preflop bucket validation. The validator currently accepts a provider with only `average_strategy`, then uses canonical hand index directly as bucket. It must refuse non-169 preflop storage/config before scoring, or expose the bucket count through the provider boundary.
+- Add exact game/tree validation for the supplied baseline. The validator must refuse non-20bb-equivalent trees/configs, especially trees where `RAI` would mean a different all-in stack size. At minimum validate starting stack 40 chips, big blind 2 chips, and expected baseline metadata/action schema before scoring.
+
+Additional fix:
+
+- Malformed/unparsable baseline hand rows must be reported, not silently dropped from aggregate TV/weights.
+
+Reviewer noted that under the exact target tree the six path tests and action mapping are directionally correct, including all-in-call mapping to `C`, but the missing guards can produce plausible-looking validation numbers for the wrong blueprint.
