@@ -2,10 +2,10 @@
 # poker_solver_rust-l6r9
 title: 'Phase 2: validate lazy tree trainer against known-good HU game'
 status: in-progress
-type: task
+type: feature
 priority: high
 created_at: 2026-06-03T18:09:40Z
-updated_at: 2026-06-04T02:58:00Z
+updated_at: 2026-06-04T03:06:14Z
 parent: poker_solver_rust-34kn
 ---
 
@@ -29,3 +29,20 @@ Acceptance criteria:
 - No Phase 3 pruning or Phase 4 disk eviction logic is enabled during validation.
 
 Implementation must be delegated to rust-developer/worker agents; manager does not write Rust directly.
+
+## Phase 2 Implementation Plan
+
+Research/architecture consensus:
+
+- Validate preflop strategy against `local_data/baselines/cash_hu_20bb_cev.json` as a cheap baseline comparison over `BlueprintCfrStorage`, not via range-solver or postflop EV validation.
+- Use a 20bb-equivalent HU config in repo chip units: `stack_depth: 40`, `small_blind: 1`, `big_blind: 2`, `allow_preflop_limp: false`, `preflop.buckets: 169`, and preflop action rows `2.5bb` then `5bb`.
+- Map baseline labels contextually: `F` to fold, `R2.5` to raise-to 5 chips, `R5` to raise-to 10 chips, `RAI` to aggressive all-in, and `C` to call or all-in-call depending on tree context.
+- Compare only strategy frequencies in the first slice. Do not use baseline EV as a pass/fail signal because trainer EV and postflop abstraction assumptions differ.
+- Primary metric is total variation distance over canonical preflop hands and mapped legal actions, weighted by combo count. Report aggregate TV, root TV, first-response TV, worst spot TV, coverage, skipped zero-mass rows, and top 5 worst spots with worst combo rows.
+- Do not silently drop unsupported/unmapped actions; report unsupported spots or unmapped candidate mass.
+- Keep validation cheap: six preflop spots times 169 canonical hands, no deal sampling, no range solving, no sparse-to-dense projection in the hot validation path.
+
+Implementation split:
+
+- Core validator slice: parser, spot resolver, context-aware action mapping, TV metrics, top-N report structs, unit tests.
+- Trainer/TUI slice: config cadence, trainer progress/no-TUI logging, TUI metrics/rendering, sample 20bb validation config, docs, and integration tests.
