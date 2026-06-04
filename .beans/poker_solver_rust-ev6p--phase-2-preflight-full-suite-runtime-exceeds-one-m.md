@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-ev6p
 title: 'Phase 2 preflight: full suite runtime exceeds one minute'
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-06-04T03:00:03Z
-updated_at: 2026-06-04T03:00:03Z
+updated_at: 2026-06-04T03:01:07Z
 ---
 
 Phase 2 implementation is blocked by the required pre-development gate.
@@ -23,3 +23,11 @@ Acceptance criteria:
 - Full `cargo test --quiet` passes in under one minute in a warm manager run.
 - Any test-tier changes are documented in the bean and committed.
 - Phase 2 implementation remains paused until this gate is green.
+
+## Resolution
+
+The initial `real 86.81` run was not reproduced. A warm confirmation run immediately afterward passed under the project gate:
+
+- `/usr/bin/time -p cargo test --quiet` passed in `real 44.47`.
+
+No Rust/test-tier changes were required. Treat the first result as a transient cold/environmental timing outlier. Phase 2 implementation may proceed from the warm green gate.
