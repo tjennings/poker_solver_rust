@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-06-09T17:06:45Z
-updated_at: 2026-06-09T17:11:27Z
+updated_at: 2026-06-09T17:15:10Z
 parent: poker_solver_rust-tzv5
 ---
 
@@ -28,3 +28,23 @@ Research risks:
 - Avoid double-counting ctx.iterations vs RuntimeCounters.
 - Decide whether this slice moves lazy snapshot helpers into core or defers snapshot hooks until trainer-side integration.
 - Config resume exists but current lazy MP path starts fresh; adapter should not pretend resume is complete unless loader is implemented.
+
+## Architecture Notes
+
+Completed architecture/brainstorming pass for the MP lazy adapter.
+
+Decision: add `crates/core/src/blueprint_mp/training_runtime_adapter.rs` with `LazySparseMpTrainingRuntimeAdapter`, export it from `blueprint_mp::mod`, and extract a stateful lazy batch stepper from `blueprint_mp::trainer`.
+
+Key constraints:
+
+• Do not wrap `run_lazy_training` by repeatedly calling it; that would reset local `meta_iter`, pruning RNG, base iteration, and discount cadence.
+• Keep `run_lazy_training` as a compatibility wrapper over the same extracted runner.
+• Runtime unit is `TrainingUnit::MetaIteration`; do not multiply progress by player count.
+• Adapter reports `TrainingBackendKind::MultiplayerLazySparse`.
+• `RuntimeLimits.target_units` maps to `config.training.iterations`; `BatchBudget.remaining_target_units()` caps lazy batches.
+• Runtime owns `RuntimeCounters`; adapter updates `ctx.iterations` only for existing MP telemetry compatibility.
+• Bridge quit by sharing `RuntimeControls::quit_flag()` with `LazyTrainContext::quit`; pause remains runtime-owned between batches.
+• Snapshot/reload should be explicit unsupported without injected hooks; do not fake resume support.
+• Do not touch lazy traversal, sparse key identity, chance continuation semantics, or negative-action purge internals.
+
+Required focused tests: backend kind/unit, counter seeding from `ctx.iterations`, budget capping without overshoot, `run_until_stopped` target completion without double counting, zero-target no allocation, quit-before-batch, explicit unsupported snapshot without hook, and adapter execution for sampled exact chance modes.
