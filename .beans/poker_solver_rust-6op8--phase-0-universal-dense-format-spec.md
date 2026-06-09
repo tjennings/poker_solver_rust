@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-6op8
 title: 'Phase 0: universal dense format spec'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-09T18:41:22Z
+updated_at: 2026-06-09T19:59:21Z
 parent: poker_solver_rust-a29s
 ---
 
