@@ -28,6 +28,7 @@ pub mod info_key;
 pub mod range;
 pub mod showdown_equity;
 pub mod simulation;
+pub mod training_runtime;
 
 pub use agent::AgentConfig;
 pub use error::SolverError;
