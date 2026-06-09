@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-osss
 title: Unify HU and multiplayer blueprint trainers
-status: draft
+status: in-progress
 type: epic
 priority: high
 created_at: 2026-06-09T13:03:45Z
-updated_at: 2026-06-09T13:12:33Z
+updated_at: 2026-06-09T14:55:16Z
 ---
 
 There are currently separate HU blueprint_v2 and multiplayer/6-max trainer paths. Plan and eventually migrate toward one trainer architecture across all player counts. This is intentionally large and requires a detailed architecture plan before implementation. The plan must cover shared game/tree abstractions, storage/key identity, traversal/sampling, action abstraction, snapshot/bundle format, TUI/metrics, validation baselines, migration compatibility, and incremental rollout slices.
@@ -110,3 +110,12 @@ Recommended first child beans:
 - Golden tests: lock current HU baseline validation and MP lazy sparse smoke behavior.
 - Shared snapshot scheduler: extract and test common snapshot/resume semantics before touching traversal.
 - Config adapter: normalize HU and MP config into a shared audited game spec without changing training behavior.
+
+## Current Direction
+
+User requested starting the trainer merge now, with two explicit constraints:
+
+- Retain the new arena/lazy tree structure built in the recent blueprint trainer phase; do not collapse back to map-based/eager-only traversal as part of unification.
+- End with one TUI. The HU TUI can be kept as the base and iterated into the unified TUI rather than introducing a third dashboard.
+
+Workflow note: the project instructions call for `hex:brainstorming`, but no callable `hex`/brainstorming tool is available in this environment. Use delegated research/architecture agents plus bean planning as the fallback brainstorming record.
