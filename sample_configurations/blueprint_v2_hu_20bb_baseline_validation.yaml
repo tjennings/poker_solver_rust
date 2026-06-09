@@ -36,14 +36,14 @@ action_abstraction:
 
 training:
   cluster_path: "./local_data/buckets/500f_500t_500r_v2"
-  iterations: 10000
+  iterations: 3000000000
   batch_size: 100
   print_every_minutes: 1
-  lcfr_warmup_iterations: 100000000
-  lcfr_discount_interval: 100000000
-  prune_after_iterations: 100000000
-  prune_threshold: -300000
-  prune_explore_pct: 0.0
+  lcfr_warmup_iterations: 1000000
+  lcfr_discount_interval: 1000000
+  prune_after_iterations: 3000000
+  prune_threshold: -10000
+  prune_explore_pct: 0.05
   exploitability_interval_minutes: 0
   optimizer: "dcfr"
   storage_backend: "dense"
@@ -58,9 +58,9 @@ training:
   # storage_backend: "sparse"
 
 snapshots:
-  resume: false
-  warmup_minutes: 1000000
-  snapshot_every_minutes: 1000000
+  resume: true
+  warmup_minutes: 30
+  snapshot_every_minutes: 10
   output_dir: "./local_data/blueprints/hu_20bb_baseline_validation"
 
 tui:

@@ -642,6 +642,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.paused = Arc::clone(&metrics.paused);
                 trainer.quit_requested = Arc::clone(&metrics.quit_requested);
                 trainer.shared_iterations = Arc::clone(&metrics.iterations);
+                metrics
+                    .iterations
+                    .store(trainer.iterations, Ordering::Relaxed);
                 trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
                 trainer.strategy_refresh_trigger = Arc::clone(&metrics.strategy_refresh_trigger);
 

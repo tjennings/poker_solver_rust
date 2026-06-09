@@ -13,7 +13,7 @@
 )]
 
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -603,9 +603,11 @@ impl BlueprintTrainer {
 
     /// Attempt to resume from the latest snapshot in `output_dir`.
     ///
-    /// When `config.snapshots.resume` is `true`, scans for `snapshot_NNNN`
-    /// directories (and a `final/` directory), picks the one with the
-    /// highest number, and loads its `regrets.bin` and `metadata.json`.
+    /// When `config.snapshots.resume` is `true`, scans for valid
+    /// `snapshot_NNNN` directories and `final/`, picks the newest candidate
+    /// by metadata iteration, metadata elapsed minutes, final checkpoint
+    /// status, then snapshot number, and loads its `regrets.bin` and
+    /// `metadata.json`.
     ///
     /// Does nothing if `resume` is `false` or `output_dir` does not exist.
     ///
@@ -623,8 +625,11 @@ impl BlueprintTrainer {
             return Ok(());
         }
 
-        // Find the latest snapshot directory.
-        let mut best: Option<(u32, std::path::PathBuf)> = None;
+        // Find the latest valid snapshot directory. Metadata wins over
+        // directory naming so a stale `final/` cannot mask a newer numbered
+        // checkpoint, while an equal-or-newer `final/` is preferred.
+        let mut candidates = Vec::new();
+        let mut highest_numbered_snapshot = None;
 
         if let Ok(entries) = std::fs::read_dir(output_dir) {
             for entry in entries.flatten() {
@@ -632,25 +637,27 @@ impl BlueprintTrainer {
                 let name_str = name.to_string_lossy();
                 if let Some(num_str) = name_str.strip_prefix("snapshot_")
                     && let Ok(num) = num_str.parse::<u32>()
-                    && entry.path().join("regrets.bin").exists()
-                    && best.as_ref().is_none_or(|(n, _)| num > *n)
+                    && let Some(candidate) =
+                        ResumeCandidate::from_dir(entry.path(), Some(num), false)
                 {
-                    best = Some((num, entry.path()));
+                    highest_numbered_snapshot = Some(
+                        highest_numbered_snapshot.map_or(num, |highest: u32| highest.max(num)),
+                    );
+                    candidates.push(candidate);
                 }
             }
         }
 
-        // A `final/` directory always wins over numbered snapshots.
         let final_dir = output_dir.join("final");
-        if final_dir.join("regrets.bin").exists() {
-            let num = best.as_ref().map_or(0, |(n, _)| n + 1);
-            best = Some((num, final_dir));
+        if let Some(candidate) = ResumeCandidate::from_dir(final_dir, None, true) {
+            candidates.push(candidate);
         }
 
-        let Some((snapshot_num, snapshot_dir)) = best else {
+        let Some(candidate) = candidates.into_iter().max() else {
             eprintln!("Resume: no snapshots found in {}", output_dir.display());
             return Ok(());
         };
+        let snapshot_dir = candidate.path;
 
         // Load regrets.
         let regrets_path = snapshot_dir.join("regrets.bin");
@@ -701,10 +708,14 @@ impl BlueprintTrainer {
                 self.start_time = Instant::now()
                     .checked_sub(backdate)
                     .unwrap_or(self.start_time);
+                self.last_snapshot_time = prev_min;
             }
         }
 
-        self.snapshot_count = snapshot_num + 1;
+        self.snapshot_count = candidate.snapshot_num.map_or_else(
+            || highest_numbered_snapshot.map_or(1, |num| num + 1),
+            |num| num + 1,
+        );
 
         // Prevent spurious immediate discount: align last_discount_time
         // with the restored iteration count so the next discount waits
@@ -1904,6 +1915,52 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     num_str.parse().ok()
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ResumeCandidate {
+    path: PathBuf,
+    snapshot_num: Option<u32>,
+    iteration: u64,
+    elapsed_minutes: u64,
+    is_final: bool,
+}
+
+impl ResumeCandidate {
+    fn from_dir(path: PathBuf, snapshot_num: Option<u32>, is_final: bool) -> Option<Self> {
+        if !path.join("regrets.bin").exists() {
+            return None;
+        }
+
+        let metadata = std::fs::read_to_string(path.join("metadata.json")).ok()?;
+        let iteration = extract_json_u64(&metadata, "iteration")?;
+        let elapsed_minutes = extract_json_u64(&metadata, "elapsed_minutes")?;
+
+        Some(Self {
+            path,
+            snapshot_num,
+            iteration,
+            elapsed_minutes,
+            is_final,
+        })
+    }
+}
+
+impl Ord for ResumeCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.iteration
+            .cmp(&other.iteration)
+            .then_with(|| self.elapsed_minutes.cmp(&other.elapsed_minutes))
+            .then_with(|| self.is_final.cmp(&other.is_final))
+            .then_with(|| self.snapshot_num.cmp(&other.snapshot_num))
+            .then_with(|| self.path.cmp(&other.path))
+    }
+}
+
+impl PartialOrd for ResumeCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2064,6 +2121,61 @@ mod tests {
                 .map(|slot| slot.load(Ordering::Relaxed))
                 .collect(),
         )
+    }
+
+    fn clone_snapshot_regrets(source_snapshot: &Path, dest_snapshot: &Path) {
+        std::fs::create_dir_all(dest_snapshot).expect("create snapshot dir");
+        std::fs::copy(
+            source_snapshot.join("regrets.bin"),
+            dest_snapshot.join("regrets.bin"),
+        )
+        .expect("copy regrets fixture");
+    }
+
+    fn write_snapshot_metadata(snapshot_dir: &Path, iteration: u64, elapsed_minutes: u64) {
+        std::fs::write(
+            snapshot_dir.join("metadata.json"),
+            format!(
+                "{{\"iteration\": {iteration}, \"elapsed_minutes\": {elapsed_minutes}, \"mean_positive_regret\": 0.00}}"
+            ),
+        )
+        .expect("write metadata fixture");
+    }
+
+    #[test]
+    fn resume_candidate_final_ordering_requires_equal_or_newer_metadata() {
+        let numbered = ResumeCandidate {
+            path: PathBuf::from("snapshot_0011"),
+            snapshot_num: Some(11),
+            iteration: 200,
+            elapsed_minutes: 20,
+            is_final: false,
+        };
+        let stale_final = ResumeCandidate {
+            path: PathBuf::from("final"),
+            snapshot_num: None,
+            iteration: 199,
+            elapsed_minutes: 999,
+            is_final: true,
+        };
+        let tied_final = ResumeCandidate {
+            path: PathBuf::from("final"),
+            snapshot_num: None,
+            iteration: 200,
+            elapsed_minutes: 20,
+            is_final: true,
+        };
+        let newer_final = ResumeCandidate {
+            path: PathBuf::from("final"),
+            snapshot_num: None,
+            iteration: 200,
+            elapsed_minutes: 21,
+            is_final: true,
+        };
+
+        assert!(numbered > stale_final);
+        assert!(tied_final > numbered);
+        assert!(newer_final > numbered);
     }
 
     #[test]
@@ -2665,6 +2777,150 @@ mod tests {
 
         trainer2.train().expect("resumed training");
         assert_eq!(trainer2.iterations, 40, "should reach 40 total");
+    }
+
+    #[test]
+    fn resume_prefers_newer_numbered_snapshot_over_stale_final() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_snapshot = dir.path().join("snapshot_0000");
+
+        let mut config = toy_config();
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = toy_trainer(config.clone());
+        trainer.save_snapshot().expect("save fixture snapshot");
+
+        let newer_numbered = dir.path().join("snapshot_0011");
+        clone_snapshot_regrets(&source_snapshot, &newer_numbered);
+        write_snapshot_metadata(&newer_numbered, 2_961_501_400, 140);
+
+        let stale_final = dir.path().join("final");
+        clone_snapshot_regrets(&source_snapshot, &stale_final);
+        write_snapshot_metadata(&stale_final, 2_000_000_000, 999);
+
+        config.snapshots.resume = true;
+        let mut resumed = toy_trainer(config);
+        resumed.try_resume().expect("resume should succeed");
+
+        assert_eq!(resumed.iterations, 2_961_501_400);
+        assert_eq!(
+            resumed.snapshot_count, 12,
+            "numbered snapshot_0011 should drive the next snapshot index"
+        );
+    }
+
+    #[test]
+    fn resume_prefers_final_on_equal_metadata_and_keeps_next_numbered_index() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_snapshot = dir.path().join("snapshot_0000");
+
+        let mut config = toy_config();
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = toy_trainer(config.clone());
+        trainer.save_snapshot().expect("save fixture snapshot");
+
+        let tied_numbered = dir.path().join("snapshot_0001");
+        clone_snapshot_regrets(&source_snapshot, &tied_numbered);
+        write_snapshot_metadata(&tied_numbered, 700, 70);
+
+        let lower_metadata_high_index = dir.path().join("snapshot_0006");
+        clone_snapshot_regrets(&source_snapshot, &lower_metadata_high_index);
+        write_snapshot_metadata(&lower_metadata_high_index, 100, 10);
+
+        let tied_final = dir.path().join("final");
+        clone_snapshot_regrets(&source_snapshot, &tied_final);
+        write_snapshot_metadata(&tied_final, 700, 70);
+
+        config.snapshots.resume = true;
+        let mut resumed = toy_trainer(config);
+        resumed.try_resume().expect("resume should succeed");
+
+        assert_eq!(resumed.iterations, 700);
+        assert_eq!(resumed.last_snapshot_time, 70);
+        assert_eq!(
+            resumed.snapshot_count, 7,
+            "resuming from final should continue after the highest valid numbered snapshot"
+        );
+    }
+
+    #[test]
+    fn resume_sets_snapshot_count_after_selected_numbered_snapshot() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_snapshot = dir.path().join("snapshot_0000");
+
+        let mut config = toy_config();
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = toy_trainer(config.clone());
+        trainer.save_snapshot().expect("save fixture snapshot");
+
+        let selected = dir.path().join("snapshot_0006");
+        clone_snapshot_regrets(&source_snapshot, &selected);
+        write_snapshot_metadata(&selected, 600, 60);
+
+        config.snapshots.resume = true;
+        let mut resumed = toy_trainer(config);
+        resumed.try_resume().expect("resume should succeed");
+
+        assert_eq!(resumed.iterations, 600);
+        assert_eq!(resumed.snapshot_count, 7);
+    }
+
+    #[test]
+    fn resume_restores_last_snapshot_time_from_metadata() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_snapshot = dir.path().join("snapshot_0000");
+
+        let mut config = toy_config();
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = toy_trainer(config.clone());
+        trainer.save_snapshot().expect("save fixture snapshot");
+        write_snapshot_metadata(&source_snapshot, 321, 77);
+
+        config.snapshots.resume = true;
+        let mut resumed = toy_trainer(config);
+        resumed.try_resume().expect("resume should succeed");
+
+        assert_eq!(resumed.iterations, 321);
+        assert_eq!(resumed.last_snapshot_time, 77);
+    }
+
+    #[test]
+    fn resume_skips_snapshots_missing_metadata() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source_snapshot = dir.path().join("snapshot_0000");
+
+        let mut config = toy_config();
+        config.training.iterations = Some(20);
+        config.snapshots.output_dir = dir.path().to_string_lossy().to_string();
+        let mut trainer = toy_trainer(config.clone());
+        trainer.train().expect("initial training");
+        trainer.save_snapshot().expect("save fixture snapshot");
+
+        let metadata_missing = dir.path().join("snapshot_0009");
+        clone_snapshot_regrets(&source_snapshot, &metadata_missing);
+        std::fs::remove_dir_all(&source_snapshot).expect("remove valid source snapshot");
+
+        config.snapshots.resume = true;
+        let mut resumed = toy_trainer(config);
+        let before_regrets = resumed
+            .storage
+            .regrets
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+
+        resumed
+            .try_resume()
+            .expect("metadata-missing resume is skipped");
+
+        let after_regrets = resumed
+            .storage
+            .regrets
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        assert_eq!(resumed.iterations, 0);
+        assert_eq!(resumed.snapshot_count, 0);
+        assert_eq!(after_regrets, before_regrets);
     }
 
     #[test]
