@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-vh99
 title: Wire MP lazy trainer and TUI through shared runtime
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-09T17:47:52Z
-updated_at: 2026-06-09T17:53:17Z
+updated_at: 2026-06-09T18:11:04Z
 parent: poker_solver_rust-tzv5
 ---
 
@@ -48,3 +48,30 @@ Test plan:
 • Core adapter hook tests for snapshot, refresh, pause, quit, resume rejection, and no double-counting.
 • Trainer tests around sparse snapshot format/status and lazy runtime path where practical.
 • Focused trainer/core test runs plus full `cargo test --quiet` under one minute.
+
+## Implementation Notes
+
+Implemented lazy MP CLI/TUI routing through the shared training runtime.
+
+Changes:
+
+• Added optional trainer-owned hooks to `LazySparseMpTrainingRuntimeAdapter` for snapshot, telemetry refresh, and reload requests while keeping default snapshot/reload behavior explicitly unsupported without hooks.
+• Routed lazy sparse no-TUI training through `LazySparseMpTrainingRuntimeAdapter` plus `run_until_stopped`, preserving sparse heartbeat polling and final meta-iteration reporting.
+• Routed lazy sparse TUI training through the runtime adapter and bridged TUI controls into `RuntimeControls`: quit requests stop the runtime, pause now pauses between lazy batches, and runtime-level snapshot hooks remain available.
+• Preserved manual TUI snapshot reliability by saving queued `s` snapshots synchronously in the trainer bridge before checking finished/quit state. This fixes the review-found race where a runtime stop could otherwise drop a queued snapshot request.
+• Preserved lazy sparse snapshot format: `snapshot_NNNN/sparse_entries.bin` plus `metadata.json` with the existing fields.
+• Kept lazy sparse resume explicitly unsupported before spawning runtime threads, because current sparse snapshots do not persist blocked-edge purge state or full runtime/cadence metadata.
+• Updated `docs/training.md` for lazy sparse time-limit support, real TUI pause behavior, and unsupported lazy sparse resume.
+
+Review:
+
+• Review found one P1 snapshot-stop race; corrected by moving manual TUI snapshot execution back to the trainer bridge while retaining adapter hooks for runtime-level requests.
+• No evidence of runtime counter double-counting after review.
+
+Verification:
+
+• `cargo fmt --all --check`
+• `cargo test -p poker-solver-core blueprint_mp::training_runtime_adapter --quiet`
+• `cargo test -p poker-solver-trainer lazy_mp --quiet`
+• `git diff --check`
+• `cargo test --quiet` passed in 44.780s on warmed rerun, satisfying the under-one-minute project gate.

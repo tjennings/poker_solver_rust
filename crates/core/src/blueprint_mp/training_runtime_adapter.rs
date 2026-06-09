@@ -11,6 +11,8 @@ use crate::training_runtime::{
 use super::config::{BlueprintMpConfig, MpTrainingBackend};
 use super::trainer::{LazyMpTrainingStepper, LazyTrainContext, setup_lazy_training};
 
+type LazyRuntimeHook = Box<dyn FnMut(&LazyTrainContext) -> RuntimeResult<()> + Send + 'static>;
+
 /// Shared-runtime adapter for lazy sparse multiplayer blueprint training.
 pub struct LazySparseMpTrainingRuntimeAdapter {
     config: BlueprintMpConfig,
@@ -19,6 +21,9 @@ pub struct LazySparseMpTrainingRuntimeAdapter {
     controls: RuntimeControls,
     counters: RuntimeCounters,
     stepper: Option<LazyMpTrainingStepper>,
+    snapshot_hook: Option<LazyRuntimeHook>,
+    telemetry_refresh_hook: Option<LazyRuntimeHook>,
+    reload_hook: Option<LazyRuntimeHook>,
 }
 
 impl LazySparseMpTrainingRuntimeAdapter {
@@ -42,6 +47,9 @@ impl LazySparseMpTrainingRuntimeAdapter {
             controls,
             counters: RuntimeCounters::new(),
             stepper: None,
+            snapshot_hook: None,
+            telemetry_refresh_hook: None,
+            reload_hook: None,
         }
     }
 
@@ -61,6 +69,36 @@ impl LazySparseMpTrainingRuntimeAdapter {
     #[must_use]
     pub fn into_context(self) -> LazyTrainContext {
         self.ctx
+    }
+
+    /// Install a trainer-owned snapshot hook.
+    #[must_use]
+    pub fn with_snapshot_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnMut(&LazyTrainContext) -> RuntimeResult<()> + Send + 'static,
+    {
+        self.snapshot_hook = Some(Box::new(hook));
+        self
+    }
+
+    /// Install a trainer-owned telemetry refresh hook.
+    #[must_use]
+    pub fn with_telemetry_refresh_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnMut(&LazyTrainContext) -> RuntimeResult<()> + Send + 'static,
+    {
+        self.telemetry_refresh_hook = Some(Box::new(hook));
+        self
+    }
+
+    /// Install a trainer-owned config reload hook.
+    #[must_use]
+    pub fn with_reload_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnMut(&LazyTrainContext) -> RuntimeResult<()> + Send + 'static,
+    {
+        self.reload_hook = Some(Box::new(hook));
+        self
     }
 }
 
@@ -128,19 +166,28 @@ impl TrainingRuntimeBackend for LazySparseMpTrainingRuntimeAdapter {
     }
 
     fn snapshot_now(&mut self) -> RuntimeResult<()> {
-        Err(unsupported_error(
-            "lazy sparse MP runtime snapshots require trainer-side snapshot hooks",
-        ))
+        let Some(hook) = &mut self.snapshot_hook else {
+            return Err(unsupported_error(
+                "lazy sparse MP runtime snapshots require trainer-side snapshot hooks",
+            ));
+        };
+        hook(&self.ctx)
     }
 
     fn refresh_telemetry(&mut self) -> RuntimeResult<()> {
+        if let Some(hook) = &mut self.telemetry_refresh_hook {
+            hook(&self.ctx)?;
+        }
         Ok(())
     }
 
     fn reload_config(&mut self) -> RuntimeResult<()> {
-        Err(unsupported_error(
-            "lazy sparse MP runtime config reload requires trainer-side reload hooks",
-        ))
+        let Some(hook) = &mut self.reload_hook else {
+            return Err(unsupported_error(
+                "lazy sparse MP runtime config reload requires trainer-side reload hooks",
+            ));
+        };
+        hook(&self.ctx)
     }
 }
 
@@ -161,7 +208,10 @@ fn unsupported_error(message: &'static str) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use crate::blueprint_mp::config::{
         BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig,
@@ -365,6 +415,106 @@ mod tests {
             err.to_string().contains("snapshot hooks"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn snapshot_hook_is_invoked_by_runtime_request() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut adapter = LazySparseMpTrainingRuntimeAdapter::new(toy_config(10));
+        let controls = adapter.controls().clone();
+        let hook_controls = controls.clone();
+        let hook_calls = Arc::clone(&calls);
+        adapter = adapter.with_snapshot_hook(move |_| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            hook_controls.request_quit();
+            Ok(())
+        });
+        controls.request_snapshot();
+        let mut telemetry = Vec::new();
+
+        let reason = run_until_stopped(&mut adapter, &mut telemetry).expect("runtime completes");
+
+        assert_eq!(reason, RuntimeStopReason::QuitRequested);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.context().iterations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn refresh_hook_is_invoked_by_runtime_request() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut adapter = LazySparseMpTrainingRuntimeAdapter::new(toy_config(10));
+        let controls = adapter.controls().clone();
+        let hook_controls = controls.clone();
+        let hook_calls = Arc::clone(&calls);
+        adapter = adapter.with_telemetry_refresh_hook(move |_| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            hook_controls.request_quit();
+            Ok(())
+        });
+        controls.request_strategy_refresh();
+        let mut telemetry = Vec::new();
+
+        let reason = run_until_stopped(&mut adapter, &mut telemetry).expect("runtime completes");
+
+        assert_eq!(reason, RuntimeStopReason::QuitRequested);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.context().iterations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn runtime_pause_prevents_progress_until_resumed() {
+        let mut config = toy_config(50);
+        config.training.batch_size = 1;
+        let adapter = LazySparseMpTrainingRuntimeAdapter::new(config);
+        let controls = adapter.controls().clone();
+        let iterations = Arc::clone(&adapter.context().iterations);
+        controls.request_pause();
+
+        let handle = thread::spawn(move || {
+            let mut adapter = adapter;
+            let mut telemetry = Vec::new();
+            run_until_stopped(&mut adapter, &mut telemetry)
+        });
+
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(iterations.load(Ordering::Relaxed), 0);
+        controls.resume();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while iterations.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        controls.request_quit();
+        let reason = handle
+            .join()
+            .expect("runtime thread panicked")
+            .expect("runtime");
+
+        assert!(iterations.load(Ordering::Relaxed) > 0);
+        assert!(
+            matches!(
+                reason,
+                RuntimeStopReason::QuitRequested
+                    | RuntimeStopReason::TargetUnitsReached {
+                        current_units: 50,
+                        target_units: 50
+                    }
+            ),
+            "unexpected stop reason: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_quit_request_stops_before_work() {
+        let mut adapter = LazySparseMpTrainingRuntimeAdapter::new(toy_config(10));
+        adapter.controls().request_quit();
+        let mut telemetry = Vec::new();
+
+        let reason = run_until_stopped(&mut adapter, &mut telemetry).expect("runtime completes");
+
+        assert_eq!(reason, RuntimeStopReason::QuitRequested);
+        assert_eq!(adapter.context().iterations.load(Ordering::Relaxed), 0);
+        assert_eq!(adapter.context().storage.entry_count(), 0);
     }
 
     #[test]

@@ -2865,14 +2865,21 @@ fn run_mp_without_tui(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> 
 }
 
 fn run_mp_without_tui_lazy(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+    use poker_solver_core::blueprint_mp::training_runtime_adapter::LazySparseMpTrainingRuntimeAdapter;
+    use poker_solver_core::training_runtime::run_until_stopped;
 
-    let ctx = setup_lazy_training(config);
-    let shared_iters = Arc::clone(&ctx.iterations);
-    let storage = Arc::clone(&ctx.storage);
-    let train_config = config.clone();
+    reject_lazy_sparse_resume(config)?;
+
+    let adapter = LazySparseMpTrainingRuntimeAdapter::new(config.clone());
+    let shared_iters = Arc::clone(&adapter.context().iterations);
+    let storage = Arc::clone(&adapter.context().storage);
     let train_handle = std::thread::spawn(move || {
-        run_lazy_training(&ctx, &train_config.training, &train_config.game)
+        let mut adapter = adapter;
+        let mut telemetry = ();
+        run_until_stopped(&mut adapter, &mut telemetry)?;
+        Ok::<u64, poker_solver_core::training_runtime::RuntimeError>(
+            adapter.context().iterations.load(Ordering::Relaxed),
+        )
     });
 
     let mut heartbeat = MpNoTuiHeartbeat::new();
@@ -2884,11 +2891,24 @@ fn run_mp_without_tui_lazy(config: &BlueprintMpConfig) -> Result<(), Box<dyn Err
         }
     }
     heartbeat.print_sparse(&shared_iters, &storage);
-    let result = train_handle.join().expect("lazy training thread panicked");
+    let meta_iterations = train_handle
+        .join()
+        .expect("lazy training thread panicked")
+        .map_err(runtime_thread_error)?;
     eprintln!(
         "Lazy sparse training complete: {} meta-iterations",
-        result.meta_iterations
+        meta_iterations
     );
+    Ok(())
+}
+
+fn reject_lazy_sparse_resume(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
+    if config.snapshots.resume {
+        return Err(
+            "lazy_sparse MP resume is not implemented: sparse snapshots do not persist blocked-edge purge state or full runtime cadence metadata"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -3434,7 +3454,11 @@ fn run_mp_with_tui_lazy(
     config: &BlueprintMpConfig,
     tui_config: &blueprint_tui_config::BlueprintTuiConfig,
 ) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+    use poker_solver_core::blueprint_mp::trainer::setup_lazy_training;
+    use poker_solver_core::blueprint_mp::training_runtime_adapter::LazySparseMpTrainingRuntimeAdapter;
+    use poker_solver_core::training_runtime::{TrainingRuntimeBackend, run_until_stopped};
+
+    reject_lazy_sparse_resume(config)?;
 
     let ctx = setup_lazy_training(config);
     let (scenarios, lazy_scenario_spots) = resolve_lazy_tui_scenarios(
@@ -3450,15 +3474,21 @@ fn run_mp_with_tui_lazy(
         config.training.time_limit_minutes,
     ));
     let shared_iters = Arc::clone(&ctx.iterations);
-    let quit_flag = Arc::clone(&ctx.quit);
     let storage = Arc::clone(&ctx.storage);
     let game = Arc::clone(&ctx.game);
     let bucket_counts = ctx.bucket_counts;
     let lazy_scenario_names: Vec<String> = scenarios.iter().map(|s| s.name.clone()).collect();
     let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
-    let train_config = config.clone();
+    let started = Instant::now();
+    let adapter = LazySparseMpTrainingRuntimeAdapter::from_context(config.clone(), ctx);
+    let controls = adapter.controls().clone();
     let train_handle = std::thread::spawn(move || {
-        run_lazy_training(&ctx, &train_config.training, &train_config.game)
+        let mut adapter = adapter;
+        let mut telemetry = ();
+        run_until_stopped(&mut adapter, &mut telemetry)?;
+        Ok::<u64, poker_solver_core::training_runtime::RuntimeError>(
+            adapter.context().iterations.load(Ordering::Relaxed),
+        )
     });
 
     bridge_mp_lazy_iterations(
@@ -3470,20 +3500,30 @@ fn run_mp_with_tui_lazy(
         bucket_counts,
         &tui_config.strategy_probe_hands,
         &metrics,
-        &quit_flag,
+        &controls,
         &train_handle,
         &config.snapshots,
+        started,
     );
 
     metrics.quit_requested.store(true, Ordering::Relaxed);
-    quit_flag.store(true, Ordering::Relaxed);
-    let result = train_handle.join().expect("lazy training thread panicked");
+    controls.request_quit();
+    let meta_iterations = train_handle
+        .join()
+        .expect("lazy training thread panicked")
+        .map_err(runtime_thread_error)?;
     let _ = tui_handle.join();
     eprintln!(
         "Lazy sparse training complete: {} meta-iterations",
-        result.meta_iterations
+        meta_iterations
     );
     Ok(())
+}
+
+fn runtime_thread_error(
+    error: poker_solver_core::training_runtime::RuntimeError,
+) -> Box<dyn Error> {
+    Box::new(std::io::Error::other(error.to_string()))
 }
 
 fn spawn_mp_tui(
@@ -3572,30 +3612,31 @@ fn bridge_mp_lazy_iterations<T>(
     bucket_counts: [u16; 4],
     strategy_probe_hands: &[String],
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
-    quit_flag: &Arc<std::sync::atomic::AtomicBool>,
+    controls: &poker_solver_core::training_runtime::RuntimeControls,
     handle: &std::thread::JoinHandle<T>,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    started: Instant,
 ) {
     let mut last_telemetry = Instant::now();
     let telemetry_interval = Duration::from_secs(10);
-    let started = Instant::now();
     let mut previous_strategy_fingerprint = None;
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
-            metrics.mark_snapshot_writing();
-            match save_lazy_mp_snapshot(snapshot_config, storage, iters, started.elapsed()) {
-                Ok(path) => {
-                    metrics.mark_snapshot_saved(&path);
-                    eprintln!("  Lazy MP snapshot saved to {}", path.display());
-                }
-                Err(e) => {
-                    metrics.mark_snapshot_failed(&e);
-                    eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
-                }
-            }
+            let _ = save_lazy_mp_snapshot_for_tui(
+                snapshot_config,
+                metrics,
+                storage,
+                iters,
+                started.elapsed(),
+            );
+        }
+        if metrics.is_paused() && !controls.is_paused() {
+            controls.request_pause();
+        } else if !metrics.is_paused() && controls.is_paused() {
+            controls.resume();
         }
         if last_telemetry.elapsed() >= telemetry_interval {
             let sample = storage.telemetry_sample(LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES);
@@ -3627,10 +3668,31 @@ fn bridge_mp_lazy_iterations<T>(
             break;
         }
         if metrics.quit_requested.load(Ordering::Relaxed) {
-            quit_flag.store(true, Ordering::Relaxed);
+            controls.request_quit();
             break;
         }
     }
+}
+
+fn save_lazy_mp_snapshot_for_tui(
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    iterations: u64,
+    elapsed: Duration,
+) -> poker_solver_core::training_runtime::RuntimeResult<()> {
+    metrics.mark_snapshot_writing();
+    match save_lazy_mp_snapshot(snapshot_config, storage, iterations, elapsed) {
+        Ok(path) => {
+            metrics.mark_snapshot_saved(&path);
+            eprintln!("  Lazy MP snapshot saved to {}", path.display());
+        }
+        Err(e) => {
+            metrics.mark_snapshot_failed(&e);
+            eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
+        }
+    }
+    Ok(())
 }
 
 fn save_mp_snapshot(
@@ -5120,6 +5182,160 @@ snapshots:
         .unwrap();
         assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
         assert_eq!(metadata["iterations"], 456);
+        assert_eq!(metadata["entries"], 1);
+    }
+
+    #[test]
+    fn lazy_mp_tui_snapshot_helper_preserves_sparse_format_and_status() {
+        use poker_solver_core::blueprint_mp::config::MpSnapshotConfig;
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let metrics = crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(Some(10), None);
+        metrics.request_snapshot();
+        assert_eq!(
+            metrics.snapshot_status_text().as_deref(),
+            Some("snapshot: queued")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            warmup_minutes: 0,
+            snapshot_every_minutes: 1,
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            resume: false,
+            max_snapshots: None,
+        };
+
+        super::save_lazy_mp_snapshot_for_tui(
+            &snapshot_config,
+            &metrics,
+            &storage,
+            789,
+            std::time::Duration::from_secs(13),
+        )
+        .expect("TUI snapshot helper should keep runtime alive");
+
+        let snapshot_dir = dir.path().join("snapshot_0000");
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_eq!(
+            metrics.snapshot_status_text().as_deref(),
+            Some("snapshot: saved snapshot_0000")
+        );
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
+        assert_eq!(metadata["iterations"], 789);
+        assert_eq!(metadata["entries"], 1);
+    }
+
+    #[test]
+    fn lazy_mp_tui_bridge_saves_queued_snapshot_before_finished_exit() {
+        use poker_solver_core::blueprint_mp::config::{
+            ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpGameConfig, MpSnapshotConfig,
+            MpStreetSizes,
+        };
+        use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
+        use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+        use poker_solver_core::training_runtime::RuntimeControls;
+        use std::sync::atomic::AtomicU64;
+
+        let source = std::sync::Arc::new(AtomicU64::new(321));
+        let storage = std::sync::Arc::new(SparseMpStorage::with_shards(4));
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+
+        let game_config = MpGameConfig {
+            name: "bridge snapshot".into(),
+            num_players: 2,
+            stack_depth: 20.0,
+            allow_preflop_limp: true,
+            blinds: vec![
+                ForcedBet {
+                    seat: 0,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 1,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let empty_sizes = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action_config = MpActionAbstractionConfig {
+            max_flop_players: None,
+            preflop: empty_sizes.clone(),
+            flop: empty_sizes.clone(),
+            turn: empty_sizes.clone(),
+            river: empty_sizes,
+        };
+        let game = std::sync::Arc::new(LazyMpGame::new(&game_config, &action_config));
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            Some(10),
+            None,
+        ));
+        metrics.request_snapshot();
+        let controls = RuntimeControls::new();
+        let handle = std::thread::spawn(|| {});
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            warmup_minutes: 0,
+            snapshot_every_minutes: 1,
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            resume: false,
+            max_snapshots: None,
+        };
+
+        super::bridge_mp_lazy_iterations(
+            &source,
+            &storage,
+            &game,
+            &[],
+            &[],
+            [2, 2, 2, 2],
+            &[],
+            &metrics,
+            &controls,
+            &handle,
+            &snapshot_config,
+            std::time::Instant::now(),
+        );
+        handle.join().unwrap();
+
+        let snapshot_dir = dir.path().join("snapshot_0000");
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_eq!(
+            metrics.snapshot_status_text().as_deref(),
+            Some("snapshot: saved snapshot_0000")
+        );
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
+        assert_eq!(metadata["iterations"], 321);
         assert_eq!(metadata["entries"], 1);
     }
 
