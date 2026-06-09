@@ -751,6 +751,26 @@ impl BlueprintTrainer {
     /// fallback produces meaningless abstractions) or if a snapshot
     /// write fails.
     pub fn train(&mut self) -> Result<(), Box<dyn Error>> {
+        self.validate_training_startup()?;
+
+        while !self.should_stop() {
+            // Honour pause requests from the TUI.
+            while self.paused.load(Ordering::Relaxed) {
+                if self.quit_requested.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            if self.run_batch_with_budget(None)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run startup validations that must pass before any training batch executes.
+    pub(crate) fn validate_training_startup(&mut self) -> Result<(), Box<dyn Error>> {
         self.initialize_baseline_validation()?;
 
         // Validate bucket files unless explicitly skipped or no cluster_path configured
@@ -775,127 +795,126 @@ impl BlueprintTrainer {
             }
         }
 
+        Ok(())
+    }
+
+    /// Run one parallel MCCFR batch, capped by config and an optional runtime budget.
+    ///
+    /// Returns the number of completed iterations.
+    pub fn run_batch_with_budget(&mut self, max_units: Option<u64>) -> Result<u64, Box<dyn Error>> {
         let batch_size = self.config.training.batch_size;
 
-        while !self.should_stop() {
-            // Honour pause requests from the TUI.
-            while self.paused.load(Ordering::Relaxed) {
-                if self.quit_requested.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+        // Calculate how many iterations remain (respect iteration limit).
+        let remaining = self
+            .config
+            .training
+            .iterations
+            .map_or(batch_size, |max| max.saturating_sub(self.iterations));
+        let this_batch = max_units
+            .map_or(batch_size, |max| batch_size.min(max))
+            .min(remaining);
+        if this_batch == 0 {
+            return Ok(0);
+        }
 
-            // Calculate how many iterations remain (respect iteration limit).
-            let remaining = self
-                .config
-                .training
-                .iterations
-                .map_or(batch_size, |max| max.saturating_sub(self.iterations));
-            let this_batch = batch_size.min(remaining);
-            if this_batch == 0 {
-                break;
-            }
+        // Pre-seed per-deal RNGs from the main RNG (only sequential part).
+        let thread_seeds: Vec<u64> = (0..this_batch).map(|_| self.rng.random()).collect();
 
-            // Pre-seed per-deal RNGs from the main RNG (only sequential part).
-            let thread_seeds: Vec<u64> = (0..this_batch).map(|_| self.rng.random()).collect();
+        let prune = self.should_prune();
+        // Config prune_threshold is in chip units; scale to match stored regrets.
+        let threshold =
+            (f64::from(self.config.training.prune_threshold) * super::storage::REGRET_SCALE) as i32;
+        let prune_streets = self.config.training.prune_street_mask();
 
-            let prune = self.should_prune();
-            // Config prune_threshold is in chip units; scale to match stored regrets.
-            let threshold = (f64::from(self.config.training.prune_threshold)
-                * super::storage::REGRET_SCALE) as i32;
-            let prune_streets = self.config.training.prune_street_mask();
+        let tree = &self.tree;
+        let storage = self.active_storage();
+        let buckets_ref = &self.buckets;
+        let ev_tracker = &self.scenario_ev_tracker;
+        let full_ev_tracker = &self.full_ev_tracker;
+        let visit_counters = &self.bucket_visits;
 
-            let tree = &self.tree;
-            let storage = self.active_storage();
-            let buckets_ref = &self.buckets;
-            let ev_tracker = &self.scenario_ev_tracker;
-            let full_ev_tracker = &self.full_ev_tracker;
-            let visit_counters = &self.bucket_visits;
+        let rake_rate = self.config.game.rake_rate;
+        let rake_cap = self.config.game.rake_cap;
+        let baseline_alpha = if self.config.training.use_baselines {
+            self.config.training.baseline_alpha
+        } else {
+            0.0
+        };
 
-            let rake_rate = self.config.game.rake_rate;
-            let rake_cap = self.config.game.rake_cap;
-            let baseline_alpha = if self.config.training.use_baselines {
-                self.config.training.baseline_alpha
-            } else {
-                0.0
-            };
+        // Fully parallel: each thread samples its own deal, precomputes
+        // buckets, and traverses — no sequential deal generation.
+        let batch_prune_stats: PruneStats = thread_seeds
+            .into_par_iter()
+            .map(|seed| {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                let deal = sample_deal_with_rng(&mut rng);
+                let buckets = buckets_ref.precompute_buckets(&deal);
 
-            // Fully parallel: each thread samples its own deal, precomputes
-            // buckets, and traverses — no sequential deal generation.
-            let batch_prune_stats: PruneStats = thread_seeds
-                .into_par_iter()
-                .map(|seed| {
-                    let mut rng = SmallRng::seed_from_u64(seed);
-                    let deal = sample_deal_with_rng(&mut rng);
-                    let buckets = buckets_ref.precompute_buckets(&deal);
-
-                    // Count bucket visits (both players, all streets).
-                    for player_buckets in &buckets {
-                        for (street, &bucket) in player_buckets.iter().enumerate() {
-                            if (bucket as usize) < visit_counters[street].len() {
-                                visit_counters[street][bucket as usize]
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
+                // Count bucket visits (both players, all streets).
+                for player_buckets in &buckets {
+                    for (street, &bucket) in player_buckets.iter().enumerate() {
+                        if (bucket as usize) < visit_counters[street].len() {
+                            visit_counters[street][bucket as usize].fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                }
 
-                    let deal = DealWithBuckets { deal, buckets };
-                    let mut stats = PruneStats::default();
+                let deal = DealWithBuckets { deal, buckets };
+                let mut stats = PruneStats::default();
 
-                    let (_, s0) = traverse_external(
-                        tree,
-                        storage,
-                        &deal,
-                        0,
-                        tree.root,
-                        prune,
-                        threshold,
-                        prune_streets,
-                        &mut rng,
-                        rake_rate,
-                        rake_cap,
-                        Some(ev_tracker),
-                        Some(full_ev_tracker),
-                        baseline_alpha,
-                    );
-                    stats.merge(s0);
-                    let (_, s1) = traverse_external(
-                        tree,
-                        storage,
-                        &deal,
-                        1,
-                        tree.root,
-                        prune,
-                        threshold,
-                        prune_streets,
-                        &mut rng,
-                        rake_rate,
-                        rake_cap,
-                        Some(ev_tracker),
-                        Some(full_ev_tracker),
-                        baseline_alpha,
-                    );
-                    stats.merge(s1);
+                let (_, s0) = traverse_external(
+                    tree,
+                    storage,
+                    &deal,
+                    0,
+                    tree.root,
+                    prune,
+                    threshold,
+                    prune_streets,
+                    &mut rng,
+                    rake_rate,
+                    rake_cap,
+                    Some(ev_tracker),
+                    Some(full_ev_tracker),
+                    baseline_alpha,
+                );
+                stats.merge(s0);
+                let (_, s1) = traverse_external(
+                    tree,
+                    storage,
+                    &deal,
+                    1,
+                    tree.root,
+                    prune,
+                    threshold,
+                    prune_streets,
+                    &mut rng,
+                    rake_rate,
+                    rake_cap,
+                    Some(ev_tracker),
+                    Some(full_ev_tracker),
+                    baseline_alpha,
+                );
+                stats.merge(s1);
 
-                    stats
-                })
-                .reduce(PruneStats::default, |mut a, b| {
-                    a.merge(b);
-                    a
-                });
+                stats
+            })
+            .reduce(PruneStats::default, |mut a, b| {
+                a.merge(b);
+                a
+            });
 
-            // Single atomic update for the whole batch.
-            PRUNE_HITS.fetch_add(batch_prune_stats.hits, Ordering::Relaxed);
-            PRUNE_TOTAL.fetch_add(batch_prune_stats.total, Ordering::Relaxed);
+        // Single atomic update for the whole batch.
+        PRUNE_HITS.fetch_add(batch_prune_stats.hits, Ordering::Relaxed);
+        PRUNE_TOTAL.fetch_add(batch_prune_stats.total, Ordering::Relaxed);
 
-            // 3. Sequential: update counters and check timed actions.
-            self.iterations += this_batch;
-            self.shared_iterations
-                .store(self.iterations, Ordering::Relaxed);
-            self.check_timed_actions()?;
-        }
-        Ok(())
+        // 3. Sequential: update counters and check timed actions.
+        self.iterations += this_batch;
+        self.shared_iterations
+            .store(self.iterations, Ordering::Relaxed);
+        self.check_timed_actions()?;
+
+        Ok(this_batch)
     }
 
     fn initialize_baseline_validation(&mut self) -> Result<(), Box<dyn Error>> {
@@ -1208,6 +1227,14 @@ impl BlueprintTrainer {
         {
             return true;
         }
+        if self.trainer_specific_stop_reached() {
+            return true;
+        }
+        false
+    }
+
+    /// True when a trainer-owned stopping condition outside shared runtime limits is met.
+    pub(crate) fn trainer_specific_stop_reached(&self) -> bool {
         if let Some(target) = self.config.training.target_strategy_delta
             && self.last_strategy_delta <= target
         {
@@ -1275,19 +1302,7 @@ impl BlueprintTrainer {
 
         // Config reload: TUI-triggered.
         if self.config_reload_trigger.swap(false, Ordering::Relaxed) {
-            let projected_storage = self
-                .sparse_storage
-                .is_some()
-                .then(|| self.dense_storage_projection());
-            let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
-            if let Some(ref mut reload_fn) = self.on_config_reload {
-                reload_fn(&self.tree, callback_storage);
-            }
-            // Update scenario tracking if the callback provided new indices.
-            if let Some(new_indices) = self.reloaded_node_indices.lock().unwrap().take() {
-                self.scenario_node_indices = new_indices.clone();
-                self.scenario_ev_tracker.set_nodes(new_indices);
-            }
+            self.reload_config_now();
         }
 
         // Snapshot: either timed or TUI-triggered.
@@ -1302,38 +1317,7 @@ impl BlueprintTrainer {
 
         // Strategy refresh for TUI.
         if refresh_due {
-            let decision_map = self.tree.decision_index_map();
-            let projected_storage = self
-                .sparse_storage
-                .is_some()
-                .then(|| self.dense_storage_projection());
-            let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
-            if let Some(ref callback) = self.on_strategy_refresh {
-                for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
-                    let player = match &self.tree.nodes[node_idx as usize] {
-                        super::game_tree::GameNode::Decision { player, .. } => *player as usize,
-                        _ => 0,
-                    };
-                    // Read EVs from the full-tree tracker.
-                    // EVs are raw counterfactual values measured from hand start.
-                    // Blinds are included: fold at root = -0.5 BB for SB.
-                    let dec_idx = decision_map[node_idx as usize];
-                    let hand_evs = if dec_idx != u32::MAX {
-                        self.full_ev_tracker.hand_ev_array(dec_idx as usize, player)
-                    } else {
-                        [0.0; 169]
-                    };
-                    callback(i, node_idx, callback_storage, &self.tree, &hand_evs);
-                }
-            }
-            if let Some(ref mut cb) = self.on_audit_refresh {
-                cb(callback_storage);
-            }
-            // Reset the scenario (windowed) EV tracker so TUI displays
-            // only the most recent window. The full_ev_tracker is cumulative
-            // and must NOT be reset — it persists to hand_ev.bin at snapshot time.
-            self.scenario_ev_tracker.reset();
-            self.last_strategy_refresh_secs = elapsed_secs;
+            self.push_strategy_refresh(elapsed_secs);
         }
 
         // Exploitability measurement.
@@ -1411,6 +1395,64 @@ impl BlueprintTrainer {
         }
 
         Ok(())
+    }
+
+    /// Run the config-reload callback path without evaluating timed snapshot cadence.
+    pub fn reload_config_now(&mut self) {
+        let projected_storage = self
+            .sparse_storage
+            .is_some()
+            .then(|| self.dense_storage_projection());
+        let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
+        if let Some(ref mut reload_fn) = self.on_config_reload {
+            reload_fn(&self.tree, callback_storage);
+        }
+        // Update scenario tracking if the callback provided new indices.
+        if let Some(new_indices) = self.reloaded_node_indices.lock().unwrap().take() {
+            self.scenario_node_indices = new_indices.clone();
+            self.scenario_ev_tracker.set_nodes(new_indices);
+        }
+    }
+
+    /// Run the strategy refresh callback path without evaluating timed snapshot cadence.
+    pub fn refresh_strategy_telemetry_now(&mut self) {
+        self.update_strategy_delta();
+        self.push_strategy_refresh(self.start_time.elapsed().as_secs());
+    }
+
+    fn push_strategy_refresh(&mut self, elapsed_secs: u64) {
+        let decision_map = self.tree.decision_index_map();
+        let projected_storage = self
+            .sparse_storage
+            .is_some()
+            .then(|| self.dense_storage_projection());
+        let callback_storage = projected_storage.as_ref().unwrap_or(&self.storage);
+        if let Some(ref callback) = self.on_strategy_refresh {
+            for (i, &node_idx) in self.scenario_node_indices.iter().enumerate() {
+                let player = match &self.tree.nodes[node_idx as usize] {
+                    super::game_tree::GameNode::Decision { player, .. } => *player as usize,
+                    _ => 0,
+                };
+                // Read EVs from the full-tree tracker.
+                // EVs are raw counterfactual values measured from hand start.
+                // Blinds are included: fold at root = -0.5 BB for SB.
+                let dec_idx = decision_map[node_idx as usize];
+                let hand_evs = if dec_idx != u32::MAX {
+                    self.full_ev_tracker.hand_ev_array(dec_idx as usize, player)
+                } else {
+                    [0.0; 169]
+                };
+                callback(i, node_idx, callback_storage, &self.tree, &hand_evs);
+            }
+        }
+        if let Some(ref mut cb) = self.on_audit_refresh {
+            cb(callback_storage);
+        }
+        // Reset the scenario (windowed) EV tracker so TUI displays
+        // only the most recent window. The full_ev_tracker is cumulative
+        // and must NOT be reset — it persists to hand_ev.bin at snapshot time.
+        self.scenario_ev_tracker.reset();
+        self.last_strategy_refresh_secs = elapsed_secs;
     }
 
     /// Apply DCFR (Discounted CFR) discounting with separate exponents

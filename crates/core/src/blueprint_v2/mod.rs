@@ -23,6 +23,7 @@ pub mod storage;
 pub mod subgame;
 pub mod subgame_cfr;
 pub mod trainer;
+pub mod training_runtime_adapter;
 
 // Re-export subgame types at module level for convenience.
 pub use leaf_evaluator::LeafEvaluator;
