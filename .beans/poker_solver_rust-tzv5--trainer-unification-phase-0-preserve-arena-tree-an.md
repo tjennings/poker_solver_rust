@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-06-09T14:55:16Z
-updated_at: 2026-06-09T14:59:20Z
+updated_at: 2026-06-09T15:02:54Z
 parent: poker_solver_rust-osss
 ---
 
@@ -34,3 +34,42 @@ Golden tests recommended before migration:
 - HU baseline validation semantics remain unchanged.
 
 First slice recommendation: add a shared runtime seam/adapters for scheduling, stop/snapshot/metric reporting, and TUI-facing telemetry; do not move traversal logic yet.
+
+## Architecture / Brainstorming Notes
+
+Required architecture pass completed. It agrees with research: Phase 0 should add a shared runtime/scheduler layer that talks in generic training units while backend adapters continue to own poker semantics and call existing traversal engines unchanged.
+
+Proposed seam:
+
+- Add `crates/core/src/training_runtime.rs` for neutral runtime primitives: backend kind, training unit label, limits, controls, counters, batch outcome, telemetry sink, and runtime-backend trait.
+- Later add `blueprint_v2::runtime` and `blueprint_mp::runtime` adapters; those adapters call current HU and MP traversal code rather than merging it.
+- Later add trainer-side `unified_train.rs` and eventually a HU-TUI-based unified shell; initially keep `BlueprintTuiMetrics` as the shared bridge because HU and MP TUIs already use it.
+
+Compatibility requirements:
+
+- Preserve both CLI command names and config schemas in Phase 0.
+- Preserve HU dense/sparse bundle and snapshot formats.
+- Preserve MP eager and lazy snapshot formats.
+- Preserve HU arena-node/action-schema identity and MP semantic seat/bucket/history identity as opaque backend keys.
+- Preserve unit labels: HU iterations vs MP meta-iterations.
+
+Files to avoid rewriting in Phase 0:
+
+- `crates/core/src/blueprint_v2/mccfr.rs`
+- `crates/core/src/blueprint_mp/mccfr.rs`
+- `crates/core/src/blueprint_mp/lazy_mccfr.rs`
+- `crates/core/src/blueprint_v2/game_tree.rs`
+- `crates/core/src/blueprint_mp/game_tree.rs`
+- HU/MP storage key semantics in sparse storage modules.
+
+Child work slices:
+
+1. Runtime primitives and fake-backend tests.
+2. HU adapter around `BlueprintTrainer`, preserving arena/lazy tree and current traversal.
+3. MP lazy adapter around `LazyTrainContext`, preserving chance mode, sparse identity, and negative-action telemetry.
+4. MP eager adapter for compatibility only.
+5. Unified CLI entry while preserving command names/configs.
+6. HU-TUI-based unified shell with backend-specific scenario providers.
+7. Shared snapshot/telemetry trigger/status flow with backend-owned serialization.
+
+Decision for this turn: implement slice 1 only. Do not touch traversal logic or TUI shells yet.
