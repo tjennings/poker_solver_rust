@@ -32,6 +32,13 @@ curl -X POST http://localhost:3001/api/is_bundle_loaded -H 'Content-Type: applic
 
 Open the hamburger menu to choose a strategy source:
 
+The current Explorer loader is centered on legacy HU `blueprint_v2` bundles.
+The planned universal dense blueprint bundle is specified in
+`docs/blueprint_format.md`; Explorer support for that format is a later
+integration phase. Universal bundles will carry `num_players`, row identity,
+action-schema, and bucket fingerprints so the loader can reject incompatible
+strategies before rendering a matrix.
+
 ### Blueprint V2 Bundle
 Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
 
