@@ -105,6 +105,8 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 - Snapshots and Explorer/Tauri bundles remain dense-compatible: sparse training projects to dense `regrets.bin` and `strategy.bin` at export/resume boundaries. There is no sparse on-disk snapshot format for HU `blueprint_v2`.
 - Sparse progress logging includes realized rows/slots, dense-equivalent slots/bytes, approximate sparse resident bytes, inserts, and read/write probe counters.
 
+**Shared training runtime:** `crates/core/src/training_runtime.rs` defines the backend-neutral runtime contract used to converge the HU and MP trainers. Runtime units are explicit (`Iteration` for HU blueprint_v2, `MetaIteration` for MP), and the runtime owns stop checks, pause/quit controls, snapshot/refresh/reload requests, elapsed-time limits, and counter updates. Backend adapters seed counters from restored/current trainer state but must not mutate runtime counters while running a batch.
+
 **External baseline validation:**
 - `training.baseline_validation` is an opt-in trainer diagnostic that compares learned average strategy frequencies against a pinned external preflop baseline JSON. It is separate from VR-MCCFR `use_baselines`; it does not change traversal, regrets, or strategy sums.
 - The current validator is deliberately pinned to the 20bb HU cEV cash baseline at `local_data/baselines/cash_hu_20bb_cev.json`: stack 40 chips, blinds 1/2, no SB open limp, 169 preflop buckets, and preflop raise rows `2.5bb` then `5bb`.
@@ -202,6 +204,7 @@ crates/core/src/blueprint_mp/
 ├── lazy_mccfr.rs       # Dynamic public-state traversal over sparse infoset storage
 ├── mccfr.rs            # External-sampling MCCFR traversal (Pluribus-style)
 ├── trainer.rs          # Training loop with per-seat traverser cycling, DCFR
+├── training_runtime_adapter.rs # Shared-runtime adapter for lazy sparse MP
 └── exploitability.rs   # Per-seat best-response diagnostic
 ```
 
@@ -218,6 +221,7 @@ crates/core/src/blueprint_mp/
 - **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
 - **Experimental negative-action subtree purge** for lazy sparse traversal: aggressive action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; normal traversal masks blocked aggressive edges, while physical sparse-row deletion is deferred until the DCFR discount boundary, where post-discount regrets decide whether blocked child subtrees are purged or reactivated
 - **External-sampling average strategy updates**: every visited decision infoset records the full current strategy vector; opponent actions are sampled only for recursion, not for average-strategy accounting
+- **Shared-runtime lazy adapter**: `LazySparseMpTrainingRuntimeAdapter` wraps `LazyTrainContext` without changing lazy traversal or sparse key identity. Its unit is one MP meta-iteration: one sampled deal followed by one traversal per seat. `LazyMpTrainingStepper` preserves the old lazy loop's base-iteration, pruning RNG, chance-continuation, DCFR discount, and negative-action purge cadence while allowing the shared runtime to cap batches by `BatchBudget`. Snapshot, resume, and config reload hooks for lazy MP remain trainer-side work; the core adapter fails explicitly instead of faking support.
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ### 100bb MP Scaling Plan

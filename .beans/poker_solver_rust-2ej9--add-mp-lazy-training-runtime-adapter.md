@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-2ej9
 title: Add MP lazy training runtime adapter
-status: in-progress
+status: completed
 type: task
 priority: high
 created_at: 2026-06-09T17:06:45Z
-updated_at: 2026-06-09T17:15:10Z
+updated_at: 2026-06-09T17:29:15Z
 parent: poker_solver_rust-tzv5
 ---
 
@@ -48,3 +48,29 @@ Key constraints:
 • Do not touch lazy traversal, sparse key identity, chance continuation semantics, or negative-action purge internals.
 
 Required focused tests: backend kind/unit, counter seeding from `ctx.iterations`, budget capping without overshoot, `run_until_stopped` target completion without double counting, zero-target no allocation, quit-before-batch, explicit unsupported snapshot without hook, and adapter execution for sampled exact chance modes.
+
+## Implementation Notes
+
+Implemented the MP lazy sparse shared-runtime adapter slice.
+
+Changes:
+
+• Extracted `LazyMpTrainingStepper` from the old lazy training loop so lazy MP can run one capped batch at a time without resetting base iteration, pruning RNG cadence, chance-continuation mode, DCFR discount timing, or negative-action purge timing.
+• Kept `run_lazy_training` as the compatibility wrapper over the new stepper for current CLI/TUI paths.
+• Added `LazySparseMpTrainingRuntimeAdapter` implementing `TrainingRuntimeBackend` with `TrainingBackendKind::MultiplayerLazySparse` and `TrainingUnit::MetaIteration`.
+• Runtime limits map to MP training iterations/time limits; batch budgets cap meta-iterations; runtime counters are seeded from `ctx.iterations` and left under shared-runtime ownership.
+• Quit is bridged through the shared runtime control flag; pause remains runtime-owned between batches.
+• Snapshot, resume, and config reload remain explicit unsupported core-adapter hooks until trainer-side integration owns real sparse snapshot/resume plumbing.
+• Updated `docs/architecture.md` to document the shared runtime and lazy MP adapter boundary.
+
+Review:
+
+• Review agent found no correctness blockers. Residual risk is that the direct-vs-adapter parity test is shallow; code inspection covers the RNG/discount/purge sequencing more directly.
+
+Verification:
+
+• `cargo fmt --all --check`
+• `cargo test -p poker-solver-core blueprint_mp::training_runtime_adapter --quiet`
+• `cargo test -p poker-solver-core training_runtime --quiet`
+• `git diff --check`
+• `cargo test --quiet` passed in 43.578s locally, satisfying the under-one-minute project gate on this run.

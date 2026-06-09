@@ -9,6 +9,7 @@ pub mod sparse_storage;
 pub mod storage;
 pub mod terminal;
 pub mod trainer;
+pub mod training_runtime_adapter;
 pub mod types;
 
 /// Maximum number of players supported in multiplayer blueprints.

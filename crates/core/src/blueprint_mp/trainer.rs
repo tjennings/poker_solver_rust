@@ -204,18 +204,7 @@ pub fn run_lazy_training(
     training: &MpTrainingConfig,
     game: &MpGameConfig,
 ) -> TrainResult {
-    training_loop_lazy(
-        &ctx.game,
-        &ctx.storage,
-        &ctx.buckets,
-        training,
-        ctx.num_players,
-        ctx.bucket_counts,
-        game.rake_rate,
-        Chips(game.rake_cap),
-        &ctx.iterations,
-        &ctx.quit,
-    )
+    LazyMpTrainingStepper::from_context(ctx, training, game, 0).run_until_stopped()
 }
 
 /// Train an N-player blueprint strategy (convenience wrapper).
@@ -293,67 +282,168 @@ fn training_loop(
     }
 }
 
-fn training_loop_lazy(
-    game: &LazyMpGame,
-    storage: &SparseMpStorage,
-    all_buckets: &AllBuckets,
-    config: &MpTrainingConfig,
+/// Stateful batch runner for lazy sparse multiplayer blueprint training.
+///
+/// One completed unit is one meta-iteration: one sampled deal followed by one
+/// traversal for each seat. The runner owns the batch-local state that used to
+/// live inside `training_loop_lazy`, including the current base meta-iteration
+/// and pruning RNG cadence.
+pub struct LazyMpTrainingStepper {
+    game: Arc<LazyMpGame>,
+    storage: Arc<SparseMpStorage>,
+    buckets: Arc<AllBuckets>,
+    training: MpTrainingConfig,
     num_players: u8,
     bucket_counts: [u16; 4],
     rake_rate: f64,
     rake_cap: Chips,
-    iterations: &AtomicU64,
-    quit: &AtomicBool,
-) -> TrainResult {
-    let max_iters = config.iterations.unwrap_or(u64::MAX);
-    let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
-        .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
-        .round() as i32;
-    let mut meta_iter = 0;
-    let mut rng = SmallRng::seed_from_u64(0xC0DE_5EED_1234_5678);
+    iterations: Arc<AtomicU64>,
+    quit: Arc<AtomicBool>,
+    meta_iter: u64,
+    rng: SmallRng,
+    scaled_threshold: i32,
+}
 
-    loop {
-        if meta_iter >= max_iters || quit.load(Ordering::Relaxed) {
-            break;
-        }
-        let remaining = max_iters.saturating_sub(meta_iter);
-        let batch = config.batch_size.min(remaining);
-        if batch == 0 {
-            break;
-        }
+impl LazyMpTrainingStepper {
+    /// Build a stepper from an existing lazy training context.
+    #[must_use]
+    pub fn from_context(
+        ctx: &LazyTrainContext,
+        training: &MpTrainingConfig,
+        game: &MpGameConfig,
+        start_meta_iter: u64,
+    ) -> Self {
+        Self::new(
+            Arc::clone(&ctx.game),
+            Arc::clone(&ctx.storage),
+            Arc::clone(&ctx.buckets),
+            training.clone(),
+            ctx.num_players,
+            ctx.bucket_counts,
+            game.rake_rate,
+            Chips(game.rake_cap),
+            Arc::clone(&ctx.iterations),
+            Arc::clone(&ctx.quit),
+            start_meta_iter,
+        )
+    }
 
-        let prune = should_prune(meta_iter, config, &mut rng);
-        let negative_action = negative_action_traversal_config(config, meta_iter);
-        run_lazy_batch(
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        game: Arc<LazyMpGame>,
+        storage: Arc<SparseMpStorage>,
+        buckets: Arc<AllBuckets>,
+        training: MpTrainingConfig,
+        num_players: u8,
+        bucket_counts: [u16; 4],
+        rake_rate: f64,
+        rake_cap: Chips,
+        iterations: Arc<AtomicU64>,
+        quit: Arc<AtomicBool>,
+        start_meta_iter: u64,
+    ) -> Self {
+        let scaled_threshold = (f64::from(training.prune_threshold) * REGRET_SCALE)
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+            .round() as i32;
+        let rng = pruning_rng_at_meta_iter(start_meta_iter, &training);
+        iterations.store(start_meta_iter, Ordering::Relaxed);
+        Self {
             game,
             storage,
-            all_buckets,
+            buckets,
+            training,
             num_players,
             bucket_counts,
             rake_rate,
             rake_cap,
-            batch,
-            meta_iter,
-            prune,
+            iterations,
+            quit,
+            meta_iter: start_meta_iter,
+            rng,
             scaled_threshold,
-            negative_action,
-            config.chance_continuation_mode,
-        );
-        meta_iter += batch;
-        iterations.store(meta_iter, Ordering::Relaxed);
-
-        if should_discount(meta_iter, config) {
-            let discount_started = Instant::now();
-            apply_dcfr_discount_lazy(storage, meta_iter, config);
-            purge_negative_action_subtrees_after_discount(storage, config);
-            LAZY_DISCOUNT_NANOS.fetch_add(nanos_since(discount_started), Ordering::Relaxed);
         }
     }
 
-    TrainResult {
-        meta_iterations: meta_iter,
-        final_strategy_delta: 0.0,
+    /// Current completed lazy sparse meta-iterations.
+    #[must_use]
+    pub const fn meta_iterations(&self) -> u64 {
+        self.meta_iter
     }
+
+    /// Run at most one configured batch, optionally capped by a runtime budget.
+    ///
+    /// Returns the number of completed meta-iterations. Runtime adapters should
+    /// report this value to the shared runtime instead of mutating runtime
+    /// counters directly.
+    pub fn run_next_batch(&mut self, max_meta_iterations: Option<u64>) -> u64 {
+        let max_iters = self.training.iterations.unwrap_or(u64::MAX);
+        if self.meta_iter >= max_iters || self.quit.load(Ordering::Relaxed) {
+            return 0;
+        }
+
+        let remaining = max_iters.saturating_sub(self.meta_iter);
+        let mut batch = self.training.batch_size.min(remaining);
+        if let Some(max_meta_iterations) = max_meta_iterations {
+            batch = batch.min(max_meta_iterations);
+        }
+        if batch == 0 {
+            return 0;
+        }
+
+        let prune = should_prune(self.meta_iter, &self.training, &mut self.rng);
+        let negative_action = negative_action_traversal_config(&self.training, self.meta_iter);
+        run_lazy_batch(
+            &self.game,
+            &self.storage,
+            &self.buckets,
+            self.num_players,
+            self.bucket_counts,
+            self.rake_rate,
+            self.rake_cap,
+            batch,
+            self.meta_iter,
+            prune,
+            self.scaled_threshold,
+            negative_action,
+            self.training.chance_continuation_mode,
+        );
+        self.meta_iter += batch;
+        self.iterations.store(self.meta_iter, Ordering::Relaxed);
+
+        if should_discount(self.meta_iter, &self.training) {
+            let discount_started = Instant::now();
+            apply_dcfr_discount_lazy(&self.storage, self.meta_iter, &self.training);
+            purge_negative_action_subtrees_after_discount(&self.storage, &self.training);
+            LAZY_DISCOUNT_NANOS.fetch_add(nanos_since(discount_started), Ordering::Relaxed);
+        }
+
+        batch
+    }
+
+    /// Run until the configured iteration cap or quit flag stops training.
+    #[must_use]
+    pub fn run_until_stopped(&mut self) -> TrainResult {
+        while self.run_next_batch(None) > 0 {}
+        TrainResult {
+            meta_iterations: self.meta_iter,
+            final_strategy_delta: 0.0,
+        }
+    }
+}
+
+fn pruning_rng_at_meta_iter(start_meta_iter: u64, config: &MpTrainingConfig) -> SmallRng {
+    let mut rng = SmallRng::seed_from_u64(0xC0DE_5EED_1234_5678);
+    let mut meta_iter = 0;
+    while meta_iter < start_meta_iter {
+        let remaining = start_meta_iter.saturating_sub(meta_iter);
+        let batch = config.batch_size.min(remaining);
+        if batch == 0 {
+            break;
+        }
+        let _ = should_prune(meta_iter, config, &mut rng);
+        meta_iter += batch;
+    }
+    rng
 }
 
 /// Determine whether the current batch should use ordinary traversal pruning.
