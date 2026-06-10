@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-v1it
 title: 'Phase 3: MP eager universal exporter'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-10T17:49:11Z
+updated_at: 2026-06-10T17:50:38Z
 parent: poker_solver_rust-a29s
 ---
 
