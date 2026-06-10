@@ -44,6 +44,10 @@ use std::path::Path;
 use super::bundle::{write_bundle, BundleData};
 use super::descriptors::{ActionDescriptor, ActionKind, RowDescriptor};
 use super::error::FormatError;
+use super::export_common::{
+    self, RowEntry, bucket_semantic_fingerprint, flatten_entries,
+    row_key_fingerprint as common_row_key_fingerprint,
+};
 use super::hash::Fnv1aHasher;
 use super::manifest::{
     ActionsMetadata, BucketsMetadata, CompatibilityMetadata, GameMetadata,
@@ -59,7 +63,7 @@ use crate::blueprint_v2::storage::action_schema_fingerprint;
 const HU_ARENA_NS: u16 = 0;
 
 // ---------------------------------------------------------------------------
-// FNV-1a row key fingerprint
+// FNV-1a row key fingerprint (delegates to export_common)
 // ---------------------------------------------------------------------------
 
 /// Compute a stable FNV-1a row key fingerprint over the identity tuple.
@@ -73,13 +77,7 @@ fn row_key_fingerprint(
     source_node_idx: u32,
     global_bucket: u32,
 ) -> u64 {
-    let mut h = Fnv1aHasher::new();
-    h.mix_u16(namespace);
-    h.mix_u8(seat);
-    h.mix_u8(street);
-    h.mix_u32(source_node_idx);
-    h.mix_u32(global_bucket);
-    h.finish()
+    common_row_key_fingerprint(namespace, seat, street, source_node_idx, global_bucket)
 }
 
 // ---------------------------------------------------------------------------
@@ -254,35 +252,7 @@ pub fn export_hu_strategy_to_universal(
     Ok(ExportOutput { rows, actions, probs, manifest })
 }
 
-// ---------------------------------------------------------------------------
-// Internal row entry
-// ---------------------------------------------------------------------------
-
-/// Intermediate row before sorting and offset assignment.
-struct RowEntry {
-    namespace: u16,
-    seat: u8,
-    street: u8,
-    source_node_idx: u32,
-    global_bucket: u32,
-    row_key_fp: u64,
-    action_schema_fp: u64,
-    actions: Vec<ActionDescriptor>,
-    probs: Vec<f32>,
-}
-
-impl RowEntry {
-    fn sort_key(&self) -> (u16, u8, u8, u32, u32, u64) {
-        (
-            self.namespace,
-            self.seat,
-            self.street,
-            self.source_node_idx,
-            self.global_bucket,
-            self.row_key_fp,
-        )
-    }
-}
+// RowEntry and sort_key are provided by export_common.
 
 /// Extract probabilities for a single bucket from the legacy strategy.
 #[allow(clippy::cast_precision_loss)]
@@ -373,41 +343,7 @@ fn build_action_descriptors(
         .collect()
 }
 
-/// Assign contiguous offsets to sorted entries and flatten into arrays.
-fn flatten_entries(
-    entries: &[RowEntry],
-) -> (Vec<RowDescriptor>, Vec<ActionDescriptor>, Vec<f32>) {
-    let mut rows = Vec::with_capacity(entries.len());
-    let mut all_actions = Vec::new();
-    let mut all_probs = Vec::new();
-
-    for (row_id, entry) in entries.iter().enumerate() {
-        let action_offset = all_actions.len() as u64;
-        let prob_offset = all_probs.len() as u64;
-
-        rows.push(RowDescriptor {
-            row_id: row_id as u64,
-            namespace: entry.namespace,
-            seat: entry.seat,
-            street: entry.street,
-            local_bucket: entry.global_bucket as u16,
-            global_bucket: entry.global_bucket,
-            source_node_idx: entry.source_node_idx,
-            action_offset,
-            action_count: entry.actions.len() as u16,
-            prob_offset,
-            row_key_fingerprint: entry.row_key_fp,
-            action_schema_fingerprint: entry.action_schema_fp,
-            semantic_key_kind: 0,
-            semantic_key_offset: 0,
-        });
-
-        all_actions.extend_from_slice(&entry.actions);
-        all_probs.extend_from_slice(&entry.probs);
-    }
-
-    (rows, all_actions, all_probs)
-}
+// flatten_entries is provided by export_common.
 
 // ---------------------------------------------------------------------------
 // Manifest construction
@@ -437,14 +373,7 @@ fn action_abstraction_fingerprint(config: &BlueprintV2Config) -> u64 {
     h.finish()
 }
 
-/// Compute a bucket semantic fingerprint from bucket counts.
-fn bucket_semantic_fingerprint(bucket_counts: [u16; 4]) -> u64 {
-    let mut h = Fnv1aHasher::new();
-    for bc in bucket_counts {
-        h.mix_u16(bc);
-    }
-    h.finish()
-}
+// bucket_semantic_fingerprint is provided by export_common.
 
 /// Build game metadata from config.
 fn build_game_metadata(config: &BlueprintV2Config) -> GameMetadata {
@@ -594,62 +523,9 @@ fn bucket_mode_for_config(config: &BlueprintV2Config) -> String {
     }
 }
 
-/// Convert Unix epoch seconds to an RFC 3339 UTC timestamp string.
-///
-/// Pure arithmetic -- no external dependencies.  Handles leap years
-/// correctly for all dates from 1970 onwards.
-fn epoch_secs_to_rfc3339(epoch: u64) -> String {
-    let (days, day_secs) = (epoch / 86_400, epoch % 86_400);
-    let (hour, min, sec) = (
-        day_secs / 3600,
-        (day_secs % 3600) / 60,
-        day_secs % 60,
-    );
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
-}
-
-/// Convert days since 1970-01-01 to (year, month, day).
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    let mut year = 1970u64;
-    loop {
-        let year_days = if is_leap(year) { 366 } else { 365 };
-        if days < year_days {
-            break;
-        }
-        days -= year_days;
-        year += 1;
-    }
-    let leap = is_leap(year);
-    let month_days: [u64; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ];
-    let mut month = 1u64;
-    for &md in &month_days {
-        if days < md {
-            break;
-        }
-        days -= md;
-        month += 1;
-    }
-    (year, month, days + 1)
-}
-
-/// True if `year` is a Gregorian leap year.
-fn is_leap(year: u64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100))
-        || year.is_multiple_of(400)
-}
-
-/// Current UTC timestamp in RFC 3339 format.
+// Timestamp helpers delegate to export_common.
 fn now_rfc3339_approx() -> String {
-    use std::time::SystemTime;
-    let dur = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    epoch_secs_to_rfc3339(dur.as_secs())
+    export_common::now_rfc3339_approx()
 }
 
 // ---------------------------------------------------------------------------
@@ -885,23 +761,5 @@ mod tests {
         assert!(year >= 2020, "year too small: {year}");
     }
 
-    #[test]
-    fn epoch_to_rfc3339_known_value() {
-        // 2025-01-01T00:00:00Z = 1_735_689_600 seconds since epoch
-        let ts = epoch_secs_to_rfc3339(1_735_689_600);
-        assert_eq!(ts, "2025-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn epoch_to_rfc3339_leap_year() {
-        // 2024-02-29T12:00:00Z = 1_709_208_000 seconds since epoch
-        let ts = epoch_secs_to_rfc3339(1_709_208_000);
-        assert_eq!(ts, "2024-02-29T12:00:00Z");
-    }
-
-    #[test]
-    fn epoch_to_rfc3339_unix_epoch() {
-        let ts = epoch_secs_to_rfc3339(0);
-        assert_eq!(ts, "1970-01-01T00:00:00Z");
-    }
+    // epoch_secs_to_rfc3339 tests moved to export_common.
 }

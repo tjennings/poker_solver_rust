@@ -12,7 +12,9 @@ mod header;
 mod manifest;
 mod descriptors;
 mod bundle;
+pub(crate) mod export_common;
 pub mod hu_export;
+pub mod mp_eager_export;
 
 pub use error::FormatError;
 pub use header::{BinaryHeader, HEADER_SIZE};
