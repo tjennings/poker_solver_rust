@@ -44,7 +44,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
 
 use super::bundle::{write_bundle, BundleData};
@@ -60,80 +59,12 @@ use super::manifest::{
     GameMetadata, LayoutMetadata, Manifest, RakeConfig, SeatDescriptor,
     StrategyMetadata, TrainingMetadata,
 };
-use crate::blueprint_mp::config::BlueprintMpConfig;
+use crate::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
 use crate::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
 
-/// Size of a single semantic key record in bytes.
-pub const SEMANTIC_RECORD_SIZE: usize = 32;
-
-// ---------------------------------------------------------------------------
-// Semantic key side table record
-// ---------------------------------------------------------------------------
-
-/// A single record in `strategy.semantic.bin`.
-///
-/// ## Wire format (little-endian, 32 bytes)
-///
-/// | Offset | Size | Field          |
-/// |--------|------|----------------|
-/// | 0      | 8    | `history_hi`   |
-/// | 8      | 8    | `history_lo`   |
-/// | 16     | 8    | `history_hash` |
-/// | 24     | 2    | `history_len`  |
-/// | 26     | 6    | reserved       |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SemanticKeyRecord {
-    pub history_hi: u64,
-    pub history_lo: u64,
-    pub history_hash: u64,
-    pub history_len: u16,
-}
-
-impl SemanticKeyRecord {
-    /// Encode this record into a 32-byte buffer.
-    pub fn write_to(&self, buf: &mut [u8; SEMANTIC_RECORD_SIZE]) {
-        buf[0..8].copy_from_slice(&self.history_hi.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.history_lo.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.history_hash.to_le_bytes());
-        buf[24..26].copy_from_slice(&self.history_len.to_le_bytes());
-        buf[26..32].copy_from_slice(&[0u8; 6]);
-    }
-
-    /// Decode a record from a 32-byte buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer contains fewer than 32 bytes (statically
-    /// prevented by the array type).
-    #[must_use]
-    pub fn from_bytes(buf: &[u8; SEMANTIC_RECORD_SIZE]) -> Self {
-        Self {
-            history_hi: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            history_lo: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            history_hash: u64::from_le_bytes(
-                buf[16..24].try_into().unwrap(),
-            ),
-            history_len: u16::from_le_bytes(
-                buf[24..26].try_into().unwrap(),
-            ),
-        }
-    }
-
-    /// Serialize to a writer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `FormatError::Io` on write failure.
-    pub fn write_to_writer<W: Write>(
-        &self,
-        w: &mut W,
-    ) -> Result<(), FormatError> {
-        let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
-        self.write_to(&mut buf);
-        w.write_all(&buf)?;
-        Ok(())
-    }
-}
+// Re-export from descriptors so external consumers using this module's
+// path (`mp_lazy_export::SemanticKeyRecord`) still compile.
+pub use super::descriptors::{SemanticKeyRecord, SEMANTIC_RECORD_SIZE};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -146,6 +77,12 @@ pub struct LazyExportConfig {
     pub num_players: u8,
     pub stack_depth: f64,
     pub bucket_counts: [u16; 4],
+    /// Small blind amount in chips (0.0 if no SB, e.g. ante-only games).
+    #[serde(default)]
+    pub small_blind: f64,
+    /// Big blind amount in chips (0.0 if no BB, e.g. ante-only games).
+    #[serde(default)]
+    pub big_blind: f64,
 }
 
 /// Training provenance metadata for lazy MP export.
@@ -446,8 +383,8 @@ fn build_lazy_game_metadata(config: &LazyExportConfig) -> GameMetadata {
         num_players: config.num_players,
         seats,
         button_seat: 0,
-        small_blind: 0.0,
-        big_blind: 0.0,
+        small_blind: config.small_blind,
+        big_blind: config.big_blind,
         antes: vec![],
         straddles: vec![],
         stack_units: "chips".to_string(),
@@ -623,10 +560,18 @@ fn load_lazy_config(
     let text = std::fs::read_to_string(&path)?;
     let full: BlueprintMpConfig = serde_yaml::from_str(&text)
         .map_err(|e| ExportError::Deserialize(e.to_string()))?;
+    let sb = full.game.blinds.iter()
+        .find(|b| b.kind == ForcedBetKind::SmallBlind)
+        .map_or(0.0, |b| b.amount);
+    let bb = full.game.blinds.iter()
+        .find(|b| b.kind == ForcedBetKind::BigBlind)
+        .map_or(0.0, |b| b.amount);
     Ok(LazyExportConfig {
         num_players: full.game.num_players,
         stack_depth: full.game.stack_depth,
         bucket_counts: full.clustering.bucket_counts(),
+        small_blind: sb,
+        big_blind: bb,
     })
 }
 
@@ -667,33 +612,7 @@ fn load_sparse_entries(
 mod tests {
     use super::*;
 
-    #[test]
-    fn semantic_record_round_trip() {
-        let record = SemanticKeyRecord {
-            history_hi: 0xDEAD_BEEF_CAFE_BABE,
-            history_lo: 0x0123_4567_89AB_CDEF,
-            history_hash: 0xFFFF_FFFF_FFFF_FFFF,
-            history_len: 40,
-        };
-        let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
-        record.write_to(&mut buf);
-        let decoded = SemanticKeyRecord::from_bytes(&buf);
-        assert_eq!(decoded, record);
-    }
-
-    #[test]
-    fn semantic_record_zero_values() {
-        let record = SemanticKeyRecord {
-            history_hi: 0,
-            history_lo: 0,
-            history_hash: 0,
-            history_len: 0,
-        };
-        let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
-        record.write_to(&mut buf);
-        let decoded = SemanticKeyRecord::from_bytes(&buf);
-        assert_eq!(decoded, record);
-    }
+    // SemanticKeyRecord round-trip tests now live in descriptors.rs.
 
     #[test]
     fn normalize_strategy_sums_positive() {
@@ -784,6 +703,48 @@ mod tests {
         let fp1 = opaque_action_schema_fingerprint(3);
         let fp2 = opaque_action_schema_fingerprint(4);
         assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn build_lazy_game_metadata_populates_blinds() {
+        let config = LazyExportConfig {
+            num_players: 6,
+            stack_depth: 100.0,
+            bucket_counts: [169, 100, 50, 50],
+            small_blind: 0.5,
+            big_blind: 1.0,
+        };
+        let meta = build_lazy_game_metadata(&config);
+        assert!(
+            (meta.small_blind - 0.5).abs() < f64::EPSILON,
+            "small_blind should be 0.5, got {}",
+            meta.small_blind
+        );
+        assert!(
+            (meta.big_blind - 1.0).abs() < f64::EPSILON,
+            "big_blind should be 1.0, got {}",
+            meta.big_blind
+        );
+    }
+
+    #[test]
+    fn build_lazy_game_metadata_zero_blinds_for_ante_only() {
+        let config = LazyExportConfig {
+            num_players: 6,
+            stack_depth: 100.0,
+            bucket_counts: [169, 100, 50, 50],
+            small_blind: 0.0,
+            big_blind: 0.0,
+        };
+        let meta = build_lazy_game_metadata(&config);
+        assert!(
+            meta.small_blind.abs() < f64::EPSILON,
+            "ante-only game should have small_blind=0"
+        );
+        assert!(
+            meta.big_blind.abs() < f64::EPSILON,
+            "ante-only game should have big_blind=0"
+        );
     }
 
     #[test]

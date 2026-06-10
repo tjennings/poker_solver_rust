@@ -86,18 +86,32 @@ fn build_test_entries() -> Vec<SparseSnapshotEntry> {
     ]
 }
 
+fn default_lazy_config() -> mp_lazy_export::LazyExportConfig {
+    mp_lazy_export::LazyExportConfig {
+        num_players: 6,
+        stack_depth: 100.0,
+        bucket_counts: [169, 100, 50, 50],
+        small_blind: 1.0,
+        big_blind: 2.0,
+    }
+}
+
+fn default_training_info() -> LazyTrainingInfo {
+    LazyTrainingInfo {
+        iterations: 100,
+        elapsed_minutes: 1.0,
+    }
+}
+
 // ── Acceptance test: full round-trip ─────────────────────────────────
 
 #[test]
 fn acceptance_lazy_export_round_trip() {
     let entries = build_test_entries();
 
-    // Build config stub for the exporter
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
+    let mut config = default_lazy_config();
+    config.small_blind = 0.5;
+    config.big_blind = 1.0;
 
     let training = LazyTrainingInfo {
         iterations: 1000,
@@ -230,15 +244,8 @@ fn semantic_record_round_trip() {
 fn bundle_with_unknown_required_feature_rejected() {
     // Build a minimal valid bundle, then modify manifest to add unknown feature
     let entries = build_test_entries();
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    let training = LazyTrainingInfo {
-        iterations: 100,
-        elapsed_minutes: 1.0,
-    };
+    let config = default_lazy_config();
+    let training = default_training_info();
     let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     let dir = tempfile::tempdir().unwrap();
     mp_lazy_export::write_lazy_bundle(dir.path(), &output).unwrap();
@@ -266,15 +273,8 @@ fn bundle_with_unknown_required_feature_rejected() {
 fn mp_semantic_feature_accepted_by_reader() {
     // The updated reader must accept mp_semantic_rows_v1
     let entries = build_test_entries();
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    let training = LazyTrainingInfo {
-        iterations: 100,
-        elapsed_minutes: 1.0,
-    };
+    let config = default_lazy_config();
+    let training = default_training_info();
     let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     let dir = tempfile::tempdir().unwrap();
     mp_lazy_export::write_lazy_bundle(dir.path(), &output).unwrap();
@@ -373,6 +373,15 @@ fn disk_wrapper_exports_with_real_directory_structure() {
 
     let reader = BundleReader::open(out_dir.path()).unwrap();
     assert_eq!(reader.row_count(), entries.len());
+
+    // Verify blinds from config.yaml (SB=1, BB=2) are in the manifest
+    let manifest_text = std::fs::read_to_string(
+        out_dir.path().join("blueprint.json"),
+    ).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest["game"]["small_blind"], 1.0);
+    assert_eq!(manifest["game"]["big_blind"], 2.0);
 }
 
 #[test]
@@ -417,15 +426,8 @@ fn disk_wrapper_rejects_wrong_kind() {
 #[test]
 fn truncated_semantic_file_rejected() {
     let entries = build_test_entries();
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    let training = LazyTrainingInfo {
-        iterations: 100,
-        elapsed_minutes: 1.0,
-    };
+    let config = default_lazy_config();
+    let training = default_training_info();
     let output = mp_lazy_export::export_lazy_sparse_to_universal(
         &config, &entries, &training,
     );
@@ -468,15 +470,8 @@ fn truncated_semantic_file_rejected() {
 #[test]
 fn bad_crc_semantic_file_rejected() {
     let entries = build_test_entries();
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    let training = LazyTrainingInfo {
-        iterations: 100,
-        elapsed_minutes: 1.0,
-    };
+    let config = default_lazy_config();
+    let training = default_training_info();
     let output = mp_lazy_export::export_lazy_sparse_to_universal(
         &config, &entries, &training,
     );
@@ -529,15 +524,8 @@ fn semantic_key_offset_out_of_range_rejected() {
         regrets: vec![1, 2],
         strategy_sums: vec![10, 20],
     }];
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    let training = LazyTrainingInfo {
-        iterations: 100,
-        elapsed_minutes: 1.0,
-    };
+    let config = default_lazy_config();
+    let training = default_training_info();
     let mut output = mp_lazy_export::export_lazy_sparse_to_universal(
         &config, &entries, &training,
     );
@@ -567,15 +555,8 @@ fn unknown_semantic_key_kind_rejected() {
         regrets: vec![1, 2],
         strategy_sums: vec![10, 20],
     }];
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    let training = LazyTrainingInfo {
-        iterations: 100,
-        elapsed_minutes: 1.0,
-    };
+    let config = default_lazy_config();
+    let training = default_training_info();
     let mut output = mp_lazy_export::export_lazy_sparse_to_universal(
         &config, &entries, &training,
     );
@@ -591,5 +572,43 @@ fn unknown_semantic_key_kind_rejected() {
     assert!(
         err_msg.contains("unknown semantic_key_kind"),
         "expected unknown kind error, got: {err_msg}"
+    );
+}
+
+// ── Opaque actions without mp_semantic_rows_v1 feature gating ───────
+
+/// Bundles whose actions contain kind=Opaque but whose manifest does NOT
+/// declare `mp_semantic_rows_v1` must be rejected by the reader.
+#[test]
+fn opaque_actions_without_semantic_feature_rejected() {
+    let entries = build_test_entries();
+    let config = default_lazy_config();
+    let training = default_training_info();
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(
+        &config, &entries, &training,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    mp_lazy_export::write_lazy_bundle(dir.path(), &output).unwrap();
+
+    // Tamper: remove mp_semantic_rows_v1 from required_features,
+    // leaving the Opaque actions in the binary payload.
+    let manifest_path = dir.path().join("blueprint.json");
+    let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&manifest_text).unwrap();
+    manifest["required_features"] =
+        serde_json::Value::Array(Vec::new());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let err = BundleReader::open(dir.path()).unwrap_err();
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("Opaque") && err_msg.contains("mp_semantic_rows_v1"),
+        "expected error about Opaque actions without \
+         mp_semantic_rows_v1 feature, got: {err_msg}"
     );
 }

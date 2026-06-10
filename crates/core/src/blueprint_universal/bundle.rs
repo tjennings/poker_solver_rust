@@ -11,7 +11,8 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use super::descriptors::{
-    ActionDescriptor, RowDescriptor, ACTION_DESCRIPTOR_SIZE, ROW_DESCRIPTOR_SIZE,
+    ActionDescriptor, RowDescriptor, SemanticKeyRecord,
+    ACTION_DESCRIPTOR_SIZE, ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
 };
 use super::error::FormatError;
 use super::export_common::{SEMANTIC_KEY_MP_HISTORY_V1, SEMANTIC_KEY_NONE};
@@ -20,7 +21,6 @@ use super::header::{
     MAGIC_ROWS, MAGIC_SEMANTIC,
 };
 use super::manifest::{FileEntry, Manifest};
-use super::mp_lazy_export::{SemanticKeyRecord, SEMANTIC_RECORD_SIZE};
 
 /// CRC-64/XZ algorithm constant from the `crc` crate.
 ///
