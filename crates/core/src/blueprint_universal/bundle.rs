@@ -30,11 +30,55 @@ const CRC_ALG: crc::Algorithm<u64> = crc::CRC_64_XZ;
 /// Supported features that this reader understands.
 const SUPPORTED_FEATURES: &[&str] = &[];
 
+/// Expected value of the `format_name` field.
+const EXPECTED_FORMAT_NAME: &str = "dense_blueprint";
+
+// ---------------------------------------------------------------------------
+// Bundle data
+// ---------------------------------------------------------------------------
+
+/// The three payload arrays that make up a universal dense blueprint bundle.
+pub struct BundleData<'a> {
+    pub rows: &'a [RowDescriptor],
+    pub actions: &'a [ActionDescriptor],
+    pub probs: &'a [f32],
+}
+
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
-/// Writes a complete universal dense blueprint bundle to a directory.
+/// Write a complete universal dense blueprint bundle to a directory.
+///
+/// # Errors
+///
+/// Returns `FormatError` on I/O failure.
+pub fn write_bundle(
+    dir: &Path,
+    manifest: &Manifest,
+    data: &BundleData<'_>,
+) -> Result<(), FormatError> {
+    std::fs::create_dir_all(dir)?;
+
+    let rows_entry = write_rows_file(dir, data.rows)?;
+    let actions_entry = write_actions_file(dir, data.actions)?;
+    let probs_entry = write_probs_file(dir, data.probs)?;
+
+    let mut files = BTreeMap::new();
+    files.insert("strategy.rows.bin".to_string(), rows_entry);
+    files.insert("strategy.actions.bin".to_string(), actions_entry);
+    files.insert("strategy.probs.f32.bin".to_string(), probs_entry);
+
+    let mut full_manifest = manifest.clone();
+    full_manifest.files.clone_from(&files);
+    let manifest_json = serde_json::to_string_pretty(&full_manifest)?;
+    std::fs::write(dir.join("blueprint.json"), &manifest_json)?;
+
+    write_checksums(dir, &files)?;
+    Ok(())
+}
+
+/// Legacy wrapper kept for backward compatibility during migration.
 pub struct BundleWriter;
 
 impl BundleWriter {
@@ -43,7 +87,6 @@ impl BundleWriter {
     /// # Errors
     ///
     /// Returns `FormatError` on I/O failure.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn write(
         dir: &Path,
         manifest: &Manifest,
@@ -51,85 +94,36 @@ impl BundleWriter {
         actions: &[ActionDescriptor],
         probs: &[f32],
     ) -> Result<(), FormatError> {
-        std::fs::create_dir_all(dir)?;
-        let mut files = BTreeMap::new();
-
-        write_rows_file(dir, rows, &mut files)?;
-        write_actions_file(dir, actions, &mut files)?;
-        write_probs_file(dir, probs, &mut files)?;
-
-        let mut full_manifest = manifest.clone();
-        full_manifest.files.clone_from(&files);
-        let manifest_json = serde_json::to_string_pretty(&full_manifest)?;
-        std::fs::write(dir.join("blueprint.json"), &manifest_json)?;
-
-        write_checksums(dir, &files)?;
-        Ok(())
+        write_bundle(dir, manifest, &BundleData { rows, actions, probs })
     }
 }
 
-/// Write the rows payload file.
-fn write_rows_file(
-    dir: &Path,
-    rows: &[RowDescriptor],
-    files: &mut BTreeMap<String, FileEntry>,
-) -> Result<(), FormatError> {
-    write_payload_file(dir, "strategy.rows.bin", MAGIC_ROWS, rows.len(), &|w| {
-        for row in rows {
-            row.write_to(w)?;
-        }
-        Ok(())
-    }, files)
-}
-
-/// Write the actions payload file.
-fn write_actions_file(
-    dir: &Path,
-    actions: &[ActionDescriptor],
-    files: &mut BTreeMap<String, FileEntry>,
-) -> Result<(), FormatError> {
-    write_payload_file(dir, "strategy.actions.bin", MAGIC_ACTIONS, actions.len(), &|w| {
-        for action in actions {
-            action.write_to(w)?;
-        }
-        Ok(())
-    }, files)
-}
-
-/// Write the probs payload file.
-fn write_probs_file(
-    dir: &Path,
-    probs: &[f32],
-    files: &mut BTreeMap<String, FileEntry>,
-) -> Result<(), FormatError> {
-    write_payload_file(dir, "strategy.probs.f32.bin", MAGIC_PROBS, probs.len(), &|w| {
-        for &p in probs {
-            w.write_all(&p.to_le_bytes())?;
-        }
-        Ok(())
-    }, files)
-}
-
-/// Write a single binary payload file: header + payload, computing CRC and SHA.
-#[allow(clippy::cast_possible_truncation)]
-fn write_payload_file(
-    dir: &Path,
-    name: &str,
+/// Payload spec for a single binary file to write.
+struct PayloadSpec<'a> {
+    name: &'a str,
     magic: [u8; 8],
     record_count: usize,
-    write_payload: &dyn Fn(&mut Vec<u8>) -> Result<(), FormatError>,
-    files: &mut BTreeMap<String, FileEntry>,
-) -> Result<(), FormatError> {
+    write_fn: Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>,
+}
+
+/// Write a single binary payload file and return its `FileEntry`.
+#[allow(clippy::cast_possible_truncation)]
+fn write_payload(dir: &Path, spec: &PayloadSpec<'_>) -> Result<FileEntry, FormatError> {
     let mut payload_buf = Vec::new();
-    write_payload(&mut payload_buf)?;
+    (spec.write_fn)(&mut payload_buf)?;
 
     let crc = crc::Crc::<u64>::new(&CRC_ALG);
     let payload_crc64 = crc.checksum(&payload_buf);
     let payload_len = payload_buf.len() as u64;
 
-    let header = BinaryHeader::new(magic, record_count as u64, payload_len, payload_crc64);
+    let header = BinaryHeader::new(
+        spec.magic,
+        spec.record_count as u64,
+        payload_len,
+        payload_crc64,
+    );
 
-    let path = dir.join(name);
+    let path = dir.join(spec.name);
     let file = std::fs::File::create(&path)?;
     let mut writer = BufWriter::new(file);
     header.write_to(&mut writer)?;
@@ -139,12 +133,58 @@ fn write_payload_file(
     let file_bytes = std::fs::read(&path)?;
     let sha256 = hex::encode(Sha256::digest(&file_bytes));
 
-    files.insert(name.to_string(), FileEntry {
+    Ok(FileEntry {
         size: file_bytes.len() as u64,
         sha256,
-    });
+    })
+}
 
-    Ok(())
+/// Write the rows payload file.
+fn write_rows_file(dir: &Path, rows: &[RowDescriptor]) -> Result<FileEntry, FormatError> {
+    write_payload(dir, &PayloadSpec {
+        name: "strategy.rows.bin",
+        magic: MAGIC_ROWS,
+        record_count: rows.len(),
+        write_fn: Box::new(|w| {
+            for row in rows {
+                row.write_to(w)?;
+            }
+            Ok(())
+        }),
+    })
+}
+
+/// Write the actions payload file.
+fn write_actions_file(
+    dir: &Path,
+    actions: &[ActionDescriptor],
+) -> Result<FileEntry, FormatError> {
+    write_payload(dir, &PayloadSpec {
+        name: "strategy.actions.bin",
+        magic: MAGIC_ACTIONS,
+        record_count: actions.len(),
+        write_fn: Box::new(|w| {
+            for action in actions {
+                action.write_to(w)?;
+            }
+            Ok(())
+        }),
+    })
+}
+
+/// Write the probs payload file.
+fn write_probs_file(dir: &Path, probs: &[f32]) -> Result<FileEntry, FormatError> {
+    write_payload(dir, &PayloadSpec {
+        name: "strategy.probs.f32.bin",
+        magic: MAGIC_PROBS,
+        record_count: probs.len(),
+        write_fn: Box::new(|w| {
+            for &p in probs {
+                w.write_all(&p.to_le_bytes())?;
+            }
+            Ok(())
+        }),
+    })
 }
 
 fn write_checksums(
@@ -192,8 +232,10 @@ impl BundleReader {
         validate_required_features(&manifest)?;
 
         let rows_bytes = read_file_checked(dir, "strategy.rows.bin", &manifest)?;
-        let actions_bytes = read_file_checked(dir, "strategy.actions.bin", &manifest)?;
-        let probs_bytes = read_file_checked(dir, "strategy.probs.f32.bin", &manifest)?;
+        let actions_bytes =
+            read_file_checked(dir, "strategy.actions.bin", &manifest)?;
+        let probs_bytes =
+            read_file_checked(dir, "strategy.probs.f32.bin", &manifest)?;
 
         // Validate headers (magic + version) before SHA so corruption of magic
         // bytes surfaces as BadMagic, not ChecksumMismatch.
@@ -211,7 +253,11 @@ impl BundleReader {
 
         validate_row_order(&rows)?;
         validate_offsets(&rows, actions.len(), probs.len())?;
-        validate_normalization(&rows, &probs, manifest.strategy.normalization_tolerance)?;
+        validate_normalization(
+            &rows,
+            &probs,
+            manifest.strategy.normalization_tolerance,
+        )?;
 
         Ok(Self { rows, actions, probs })
     }
@@ -256,9 +302,6 @@ fn read_manifest(dir: &Path) -> Result<Manifest, FormatError> {
     let manifest: Manifest = serde_json::from_str(&text)?;
     Ok(manifest)
 }
-
-/// Expected value of the `format_name` field.
-const EXPECTED_FORMAT_NAME: &str = "dense_blueprint";
 
 fn validate_manifest_meta(manifest: &Manifest) -> Result<(), FormatError> {
     if manifest.format_name != EXPECTED_FORMAT_NAME {
@@ -344,8 +387,7 @@ fn check_header_only(
 /// Validate SHA-256 of file bytes against the manifest entry.
 ///
 /// The caller must have already validated that the file entry exists
-/// via `read_file_checked`, so the `unwrap` on `manifest.files.get`
-/// is safe. We still return an error for defensive correctness.
+/// via `read_file_checked`, so the lookup is defensive.
 fn check_sha256(
     data: &[u8],
     name: &str,
@@ -390,14 +432,21 @@ fn decode_actions(data: &[u8]) -> Result<Vec<ActionDescriptor>, FormatError> {
     let name = "strategy.actions.bin";
     let (header, payload) = split_header_payload(data, MAGIC_ACTIONS, name)?;
     validate_crc(&header, payload, name)?;
-    check_payload_len(payload, header.record_count, ACTION_DESCRIPTOR_SIZE, name)?;
+    check_payload_len(
+        payload,
+        header.record_count,
+        ACTION_DESCRIPTOR_SIZE,
+        name,
+    )?;
 
     let count = record_count_usize(header.record_count);
     let mut actions = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * ACTION_DESCRIPTOR_SIZE;
-        let chunk: &[u8; ACTION_DESCRIPTOR_SIZE] =
-            payload[start..start + ACTION_DESCRIPTOR_SIZE].try_into().unwrap();
+        let chunk: &[u8; ACTION_DESCRIPTOR_SIZE] = payload
+            [start..start + ACTION_DESCRIPTOR_SIZE]
+            .try_into()
+            .unwrap();
         actions.push(ActionDescriptor::from_bytes(chunk)?);
     }
     Ok(actions)
@@ -433,12 +482,13 @@ fn split_header_payload<'a>(
     }
 
     let mut cursor = Cursor::new(&data[..HEADER_SIZE]);
-    let header = BinaryHeader::read_from(&mut cursor, expected_magic, file_name)?;
+    let header =
+        BinaryHeader::read_from(&mut cursor, expected_magic, file_name)?;
 
-    let payload_len_usize = usize::try_from(header.payload_len)
+    let payload_end = usize::try_from(header.payload_len)
         .ok()
         .and_then(|pl| HEADER_SIZE.checked_add(pl));
-    let payload_end = match payload_len_usize {
+    let payload_end = match payload_end {
         Some(end) if data.len() >= end => end,
         Some(end) => {
             return Err(FormatError::Truncated {
@@ -527,82 +577,36 @@ fn validate_row_order(rows: &[RowDescriptor]) -> Result<(), FormatError> {
 }
 
 /// Validate that all row offsets point within bounds.
+///
+/// Inlines range checking (finding 13: `check_offset_range` had one caller).
 fn validate_offsets(
     rows: &[RowDescriptor],
     total_actions: usize,
     total_probs: usize,
 ) -> Result<(), FormatError> {
     for (i, row) in rows.iter().enumerate() {
-        check_offset_range(
-            i, "action", row.action_offset, row.action_count, total_actions,
-        )?;
-        check_offset_range(
-            i, "prob", row.prob_offset, row.action_count, total_probs,
-        )?;
+        let count = u64::from(row.action_count);
+        for &(label, offset, total) in &[
+            ("action", row.action_offset, total_actions),
+            ("prob", row.prob_offset, total_probs),
+        ] {
+            let end = offset.checked_add(count).ok_or_else(|| {
+                FormatError::InvalidOffset {
+                    row_index: i,
+                    detail: format!("{label} offset overflow"),
+                }
+            })?;
+            if end > total as u64 {
+                return Err(FormatError::InvalidOffset {
+                    row_index: i,
+                    detail: format!(
+                        "{label} range {offset}..{end} exceeds total {total}"
+                    ),
+                });
+            }
+        }
     }
     Ok(())
-}
-
-/// Check a single offset+count range against a total bound.
-fn check_offset_range(
-    row_index: usize,
-    label: &str,
-    offset: u64,
-    count: u16,
-    total: usize,
-) -> Result<(), FormatError> {
-    let end = offset
-        .checked_add(u64::from(count))
-        .ok_or_else(|| FormatError::InvalidOffset {
-            row_index,
-            detail: format!("{label} offset overflow"),
-        })?;
-    if end > total as u64 {
-        return Err(FormatError::InvalidOffset {
-            row_index,
-            detail: format!(
-                "{label} range {offset}..{end} exceeds total {total}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use super::super::header::MAGIC_ROWS;
-
-    /// Finding 1: payload_len near u64::MAX causes overflow in
-    /// HEADER_SIZE + payload_len as usize, wrapping on 64-bit targets.
-    #[test]
-    fn split_header_payload_rejects_overflow_payload_len() {
-        // Build a minimal 48-byte buffer with a valid header but
-        // payload_len set near u64::MAX so HEADER_SIZE + payload_len wraps.
-        let mut buf = [0u8; HEADER_SIZE];
-        let header = BinaryHeader::new(MAGIC_ROWS, 0, u64::MAX - 10, 0);
-        header.write_to(&mut buf.as_mut_slice()).unwrap();
-
-        let err = split_header_payload(&buf, MAGIC_ROWS, "test.bin")
-            .unwrap_err();
-        assert!(
-            matches!(err, FormatError::Truncated { .. }),
-            "expected Truncated on overflow, got {err:?}"
-        );
-    }
-
-    /// Finding 2: record_count near u64::MAX causes overflow in
-    /// record_count as usize * record_size.
-    #[test]
-    fn check_payload_len_rejects_overflow_record_count() {
-        let payload = &[0u8; 100];
-        let err = check_payload_len(payload, u64::MAX, 96, "test.bin")
-            .unwrap_err();
-        assert!(
-            matches!(err, FormatError::Truncated { .. }),
-            "expected Truncated on overflow, got {err:?}"
-        );
-    }
 }
 
 /// Validate that each row's probabilities are finite, non-negative, and
@@ -651,9 +655,46 @@ fn validate_row_probs(
     if (sum - 1.0).abs() > tolerance {
         return Err(FormatError::NonNormalizedRow {
             row_index,
-            detail: format!("sum = {sum}, expected 1.0 (tolerance {tolerance})"),
+            detail: format!(
+                "sum = {sum}, expected 1.0 (tolerance {tolerance})"
+            ),
         });
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::header::MAGIC_ROWS;
+
+    /// Finding 1: payload_len near u64::MAX causes overflow in
+    /// HEADER_SIZE + payload_len as usize, wrapping on 64-bit targets.
+    #[test]
+    fn split_header_payload_rejects_overflow_payload_len() {
+        let mut buf = [0u8; HEADER_SIZE];
+        let header = BinaryHeader::new(MAGIC_ROWS, 0, u64::MAX - 10, 0);
+        header.write_to(&mut buf.as_mut_slice()).unwrap();
+
+        let err =
+            split_header_payload(&buf, MAGIC_ROWS, "test.bin").unwrap_err();
+        assert!(
+            matches!(err, FormatError::Truncated { .. }),
+            "expected Truncated on overflow, got {err:?}"
+        );
+    }
+
+    /// Finding 2: record_count near u64::MAX causes overflow in
+    /// record_count as usize * record_size.
+    #[test]
+    fn check_payload_len_rejects_overflow_record_count() {
+        let payload = &[0u8; 100];
+        let err =
+            check_payload_len(payload, u64::MAX, 96, "test.bin").unwrap_err();
+        assert!(
+            matches!(err, FormatError::Truncated { .. }),
+            "expected Truncated on overflow, got {err:?}"
+        );
+    }
 }

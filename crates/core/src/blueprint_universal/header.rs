@@ -38,10 +38,6 @@ pub const MAGIC_ACTIONS: [u8; 8] = *b"BPACT001";
 /// Magic bytes for `strategy.probs.f32.bin`.
 pub const MAGIC_PROBS: [u8; 8] = *b"BPPRO001";
 
-/// Magic bytes for `cfr.snapshot.bin` (reserved for future phases).
-#[allow(dead_code)]
-pub const MAGIC_CFR: [u8; 8] = *b"BPCFR001";
-
 /// Parsed binary header for a universal blueprint payload file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryHeader {

@@ -20,4 +20,4 @@ pub use manifest::{
     SeatDescriptor, RakeConfig, BucketFileRef, PerFlopBucketConfig,
 };
 pub use descriptors::{ActionDescriptor, ActionKind, RowDescriptor, ROW_DESCRIPTOR_SIZE};
-pub use bundle::{BundleReader, BundleWriter};
+pub use bundle::{BundleData, BundleReader, BundleWriter, write_bundle};
