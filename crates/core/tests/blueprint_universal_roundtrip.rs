@@ -525,3 +525,46 @@ fn rejects_missing_manifest() {
         "expected MissingFile or InvalidManifest, got {err:?}"
     );
 }
+
+/// Finding 3: missing file entry in manifest.files must be a hard error,
+/// not silently skipped.
+#[test]
+fn rejects_missing_file_entry_in_manifest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (rows, actions, probs) = synthetic_data(1, 2);
+    let manifest = test_manifest(1, 2, 2);
+    BundleWriter::write(dir.path(), &manifest, &rows, &actions, &probs).expect("write");
+
+    // Remove the strategy.probs.f32.bin entry from manifest.files
+    let manifest_path = dir.path().join("blueprint.json");
+    let text = std::fs::read_to_string(&manifest_path).expect("read");
+    let mut json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let files = json["files"].as_object_mut().unwrap();
+    files.remove("strategy.probs.f32.bin");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&json).unwrap(),
+    )
+    .expect("write");
+
+    let err = BundleReader::open(dir.path()).unwrap_err();
+    assert!(
+        matches!(err, FormatError::MissingFileEntry { .. }),
+        "expected MissingFileEntry, got {err:?}"
+    );
+}
+
+/// Finding 9: reader must reject format_name != "dense_blueprint".
+#[test]
+fn rejects_wrong_format_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut manifest = test_manifest(0, 0, 0);
+    manifest.format_name = "something_else".to_string();
+    BundleWriter::write(dir.path(), &manifest, &[], &[], &[]).expect("write");
+
+    let err = BundleReader::open(dir.path()).unwrap_err();
+    assert!(
+        matches!(err, FormatError::InvalidFormatName { .. }),
+        "expected InvalidFormatName, got {err:?}"
+    );
+}

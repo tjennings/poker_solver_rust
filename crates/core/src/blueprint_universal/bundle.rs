@@ -257,7 +257,16 @@ fn read_manifest(dir: &Path) -> Result<Manifest, FormatError> {
     Ok(manifest)
 }
 
+/// Expected value of the `format_name` field.
+const EXPECTED_FORMAT_NAME: &str = "dense_blueprint";
+
 fn validate_manifest_meta(manifest: &Manifest) -> Result<(), FormatError> {
+    if manifest.format_name != EXPECTED_FORMAT_NAME {
+        return Err(FormatError::InvalidFormatName {
+            expected: EXPECTED_FORMAT_NAME.to_string(),
+            actual: manifest.format_name.clone(),
+        });
+    }
     if manifest.compat_min_reader > CURRENT_FORMAT_VERSION {
         return Err(FormatError::UnsupportedFormatVersion {
             file: "blueprint.json".to_string(),
@@ -280,6 +289,8 @@ fn validate_required_features(manifest: &Manifest) -> Result<(), FormatError> {
 }
 
 /// Read a file and validate its length against the manifest.
+///
+/// A missing `manifest.files` entry for a required file is a hard error.
 #[allow(clippy::cast_possible_truncation)]
 fn read_file_checked(
     dir: &Path,
@@ -293,17 +304,20 @@ fn read_file_checked(
         });
     }
 
-    let data = std::fs::read(&path)?;
-
-    if let Some(entry) = manifest.files.get(name) {
-        let actual_len = data.len() as u64;
-        if actual_len != entry.size {
-            return Err(FormatError::LengthMismatch {
-                file: name.to_string(),
-                expected: entry.size,
-                actual: actual_len,
-            });
+    let entry = manifest.files.get(name).ok_or_else(|| {
+        FormatError::MissingFileEntry {
+            file: name.to_string(),
         }
+    })?;
+
+    let data = std::fs::read(&path)?;
+    let actual_len = data.len() as u64;
+    if actual_len != entry.size {
+        return Err(FormatError::LengthMismatch {
+            file: name.to_string(),
+            expected: entry.size,
+            actual: actual_len,
+        });
     }
 
     Ok(data)
@@ -328,20 +342,27 @@ fn check_header_only(
 }
 
 /// Validate SHA-256 of file bytes against the manifest entry.
+///
+/// The caller must have already validated that the file entry exists
+/// via `read_file_checked`, so the `unwrap` on `manifest.files.get`
+/// is safe. We still return an error for defensive correctness.
 fn check_sha256(
     data: &[u8],
     name: &str,
     manifest: &Manifest,
 ) -> Result<(), FormatError> {
-    if let Some(entry) = manifest.files.get(name) {
-        let actual_sha = hex::encode(Sha256::digest(data));
-        if actual_sha != entry.sha256 {
-            return Err(FormatError::ChecksumMismatch {
-                file: name.to_string(),
-                expected: entry.sha256.clone(),
-                actual: actual_sha,
-            });
+    let entry = manifest.files.get(name).ok_or_else(|| {
+        FormatError::MissingFileEntry {
+            file: name.to_string(),
         }
+    })?;
+    let actual_sha = hex::encode(Sha256::digest(data));
+    if actual_sha != entry.sha256 {
+        return Err(FormatError::ChecksumMismatch {
+            file: name.to_string(),
+            expected: entry.sha256.clone(),
+            actual: actual_sha,
+        });
     }
     Ok(())
 }
@@ -398,7 +419,6 @@ fn decode_probs(data: &[u8]) -> Result<Vec<f32>, FormatError> {
 }
 
 /// Split raw file bytes into header + payload, validating the header.
-#[allow(clippy::cast_possible_truncation)]
 fn split_header_payload<'a>(
     data: &'a [u8],
     expected_magic: [u8; 8],
@@ -415,14 +435,26 @@ fn split_header_payload<'a>(
     let mut cursor = Cursor::new(&data[..HEADER_SIZE]);
     let header = BinaryHeader::read_from(&mut cursor, expected_magic, file_name)?;
 
-    let payload_end = HEADER_SIZE + header.payload_len as usize;
-    if data.len() < payload_end {
-        return Err(FormatError::Truncated {
-            file: file_name.to_string(),
-            expected: payload_end,
-            actual: data.len(),
-        });
-    }
+    let payload_len_usize = usize::try_from(header.payload_len)
+        .ok()
+        .and_then(|pl| HEADER_SIZE.checked_add(pl));
+    let payload_end = match payload_len_usize {
+        Some(end) if data.len() >= end => end,
+        Some(end) => {
+            return Err(FormatError::Truncated {
+                file: file_name.to_string(),
+                expected: end,
+                actual: data.len(),
+            });
+        }
+        None => {
+            return Err(FormatError::Truncated {
+                file: file_name.to_string(),
+                expected: usize::MAX,
+                actual: data.len(),
+            });
+        }
+    };
 
     Ok((header, &data[HEADER_SIZE..payload_end]))
 }
@@ -446,22 +478,28 @@ fn validate_crc(
 }
 
 /// Validate payload byte length matches `record_count` * `record_size`.
-#[allow(clippy::cast_possible_truncation)]
 fn check_payload_len(
     payload: &[u8],
     record_count: u64,
     record_size: usize,
     file_name: &str,
 ) -> Result<(), FormatError> {
-    let expected = record_count as usize * record_size;
-    if payload.len() < expected {
-        return Err(FormatError::Truncated {
+    let expected = usize::try_from(record_count)
+        .ok()
+        .and_then(|rc| rc.checked_mul(record_size));
+    match expected {
+        Some(exp) if payload.len() >= exp => Ok(()),
+        Some(exp) => Err(FormatError::Truncated {
             file: file_name.to_string(),
-            expected: HEADER_SIZE + expected,
+            expected: HEADER_SIZE + exp,
             actual: HEADER_SIZE + payload.len(),
-        });
+        }),
+        None => Err(FormatError::Truncated {
+            file: file_name.to_string(),
+            expected: usize::MAX,
+            actual: HEADER_SIZE + payload.len(),
+        }),
     }
-    Ok(())
 }
 
 /// Convert `u64` record count to `usize`, truncating on 32-bit targets.
@@ -528,6 +566,43 @@ fn check_offset_range(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::header::MAGIC_ROWS;
+
+    /// Finding 1: payload_len near u64::MAX causes overflow in
+    /// HEADER_SIZE + payload_len as usize, wrapping on 64-bit targets.
+    #[test]
+    fn split_header_payload_rejects_overflow_payload_len() {
+        // Build a minimal 48-byte buffer with a valid header but
+        // payload_len set near u64::MAX so HEADER_SIZE + payload_len wraps.
+        let mut buf = [0u8; HEADER_SIZE];
+        let header = BinaryHeader::new(MAGIC_ROWS, 0, u64::MAX - 10, 0);
+        header.write_to(&mut buf.as_mut_slice()).unwrap();
+
+        let err = split_header_payload(&buf, MAGIC_ROWS, "test.bin")
+            .unwrap_err();
+        assert!(
+            matches!(err, FormatError::Truncated { .. }),
+            "expected Truncated on overflow, got {err:?}"
+        );
+    }
+
+    /// Finding 2: record_count near u64::MAX causes overflow in
+    /// record_count as usize * record_size.
+    #[test]
+    fn check_payload_len_rejects_overflow_record_count() {
+        let payload = &[0u8; 100];
+        let err = check_payload_len(payload, u64::MAX, 96, "test.bin")
+            .unwrap_err();
+        assert!(
+            matches!(err, FormatError::Truncated { .. }),
+            "expected Truncated on overflow, got {err:?}"
+        );
+    }
 }
 
 /// Validate that each row's probabilities are finite, non-negative, and

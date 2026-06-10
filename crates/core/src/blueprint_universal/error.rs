@@ -71,6 +71,12 @@ pub enum FormatError {
     #[error("missing file: {file}")]
     MissingFile { file: String },
 
+    #[error("missing file entry in manifest for required file: {file}")]
+    MissingFileEntry { file: String },
+
+    #[error("invalid format_name: expected \"{expected}\", got \"{actual}\"")]
+    InvalidFormatName { expected: String, actual: String },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
