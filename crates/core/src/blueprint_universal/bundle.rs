@@ -103,19 +103,23 @@ impl BundleWriter {
 }
 
 /// Boxed write closure for payload serialization.
-type PayloadWriteFn<'a> = Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>;
+pub(super) type PayloadWriteFn<'a> =
+    Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>;
 
 /// Payload spec for a single binary file to write.
-struct PayloadSpec<'a> {
-    name: &'a str,
-    magic: [u8; 8],
-    record_count: usize,
-    write_fn: PayloadWriteFn<'a>,
+pub(super) struct PayloadSpec<'a> {
+    pub name: &'a str,
+    pub magic: [u8; 8],
+    pub record_count: usize,
+    pub write_fn: PayloadWriteFn<'a>,
 }
 
 /// Write a single binary payload file and return its `FileEntry`.
 #[allow(clippy::cast_possible_truncation)]
-fn write_payload(dir: &Path, spec: &PayloadSpec<'_>) -> Result<FileEntry, FormatError> {
+pub(super) fn write_payload_file(
+    dir: &Path,
+    spec: &PayloadSpec<'_>,
+) -> Result<FileEntry, FormatError> {
     let mut payload_buf = Vec::new();
     (spec.write_fn)(&mut payload_buf)?;
 
@@ -148,7 +152,7 @@ fn write_payload(dir: &Path, spec: &PayloadSpec<'_>) -> Result<FileEntry, Format
 
 /// Write the rows payload file.
 fn write_rows_file(dir: &Path, rows: &[RowDescriptor]) -> Result<FileEntry, FormatError> {
-    write_payload(dir, &PayloadSpec {
+    write_payload_file(dir, &PayloadSpec {
         name: "strategy.rows.bin",
         magic: MAGIC_ROWS,
         record_count: rows.len(),
@@ -166,7 +170,7 @@ fn write_actions_file(
     dir: &Path,
     actions: &[ActionDescriptor],
 ) -> Result<FileEntry, FormatError> {
-    write_payload(dir, &PayloadSpec {
+    write_payload_file(dir, &PayloadSpec {
         name: "strategy.actions.bin",
         magic: MAGIC_ACTIONS,
         record_count: actions.len(),
@@ -181,7 +185,7 @@ fn write_actions_file(
 
 /// Write the probs payload file.
 fn write_probs_file(dir: &Path, probs: &[f32]) -> Result<FileEntry, FormatError> {
-    write_payload(dir, &PayloadSpec {
+    write_payload_file(dir, &PayloadSpec {
         name: "strategy.probs.f32.bin",
         magic: MAGIC_PROBS,
         record_count: probs.len(),
@@ -245,68 +249,25 @@ impl BundleReader {
         let probs_bytes =
             read_file_checked(dir, "strategy.probs.f32.bin", &manifest)?;
 
-        // Validate headers (magic + version) before SHA so corruption of magic
-        // bytes surfaces as BadMagic, not ChecksumMismatch.
-        check_header_only(&rows_bytes, MAGIC_ROWS, "strategy.rows.bin")?;
-        check_header_only(&actions_bytes, MAGIC_ACTIONS, "strategy.actions.bin")?;
-        check_header_only(&probs_bytes, MAGIC_PROBS, "strategy.probs.f32.bin")?;
+        validate_binary_headers(&rows_bytes, &actions_bytes, &probs_bytes)?;
+        validate_sha_checksums(
+            &rows_bytes, &actions_bytes, &probs_bytes, &manifest,
+        )?;
 
-        check_sha256(&rows_bytes, "strategy.rows.bin", &manifest)?;
-        check_sha256(&actions_bytes, "strategy.actions.bin", &manifest)?;
-        check_sha256(&probs_bytes, "strategy.probs.f32.bin", &manifest)?;
-
+        let has_semantic = has_semantic_feature(&manifest);
         let rows = decode_rows(&rows_bytes)?;
-        let actions = decode_actions(&actions_bytes, &manifest)?;
+        let actions = decode_actions_checked(&actions_bytes, has_semantic)?;
         let probs = decode_probs(&probs_bytes)?;
-
-        // Load semantic side table if present in manifest
-        let has_semantic_feature = manifest
-            .required_features
-            .iter()
-            .any(|f| f == "mp_semantic_rows_v1");
-        let semantic_records = if manifest
-            .files
-            .contains_key("strategy.semantic.bin")
-        {
-            let sem_bytes = read_file_checked(
-                dir,
-                "strategy.semantic.bin",
-                &manifest,
-            )?;
-            check_header_only(
-                &sem_bytes,
-                MAGIC_SEMANTIC,
-                "strategy.semantic.bin",
-            )?;
-            check_sha256(
-                &sem_bytes,
-                "strategy.semantic.bin",
-                &manifest,
-            )?;
-            decode_semantic(&sem_bytes)?
-        } else {
-            Vec::new()
-        };
+        let semantic_records = load_semantic_table(dir, &manifest)?;
 
         validate_row_order(&rows)?;
-        validate_semantic_keys(
-            &rows,
-            &semantic_records,
-            has_semantic_feature,
-        )?;
+        validate_semantic_keys(&rows, &semantic_records, has_semantic)?;
         validate_offsets(&rows, actions.len(), probs.len())?;
         validate_normalization(
-            &rows,
-            &probs,
-            manifest.strategy.normalization_tolerance,
+            &rows, &probs, manifest.strategy.normalization_tolerance,
         )?;
 
-        Ok(Self {
-            rows,
-            actions,
-            probs,
-            semantic_records,
-        })
+        Ok(Self { rows, actions, probs, semantic_records })
     }
 
     /// Number of strategy rows in the bundle.
@@ -349,6 +310,53 @@ impl BundleReader {
         self.semantic_records
             .get(row.semantic_key_offset as usize)
     }
+}
+
+/// Check whether the manifest declares `mp_semantic_rows_v1`.
+fn has_semantic_feature(manifest: &Manifest) -> bool {
+    manifest
+        .required_features
+        .iter()
+        .any(|f| f == "mp_semantic_rows_v1")
+}
+
+/// Validate binary headers (magic + version) before SHA so corruption
+/// of magic bytes surfaces as `BadMagic`, not `ChecksumMismatch`.
+fn validate_binary_headers(
+    rows_bytes: &[u8],
+    actions_bytes: &[u8],
+    probs_bytes: &[u8],
+) -> Result<(), FormatError> {
+    check_header_only(rows_bytes, MAGIC_ROWS, "strategy.rows.bin")?;
+    check_header_only(actions_bytes, MAGIC_ACTIONS, "strategy.actions.bin")?;
+    check_header_only(probs_bytes, MAGIC_PROBS, "strategy.probs.f32.bin")
+}
+
+/// Validate SHA-256 checksums of all three standard payload files.
+fn validate_sha_checksums(
+    rows_bytes: &[u8],
+    actions_bytes: &[u8],
+    probs_bytes: &[u8],
+    manifest: &Manifest,
+) -> Result<(), FormatError> {
+    check_sha256(rows_bytes, "strategy.rows.bin", manifest)?;
+    check_sha256(actions_bytes, "strategy.actions.bin", manifest)?;
+    check_sha256(probs_bytes, "strategy.probs.f32.bin", manifest)
+}
+
+/// Load the semantic side table if present in the manifest.
+fn load_semantic_table(
+    dir: &Path,
+    manifest: &Manifest,
+) -> Result<Vec<SemanticKeyRecord>, FormatError> {
+    if !manifest.files.contains_key("strategy.semantic.bin") {
+        return Ok(Vec::new());
+    }
+    let sem_bytes =
+        read_file_checked(dir, "strategy.semantic.bin", manifest)?;
+    check_header_only(&sem_bytes, MAGIC_SEMANTIC, "strategy.semantic.bin")?;
+    check_sha256(&sem_bytes, "strategy.semantic.bin", manifest)?;
+    decode_semantic(&sem_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,10 +499,11 @@ fn decode_rows(data: &[u8]) -> Result<Vec<RowDescriptor>, FormatError> {
     Ok(rows)
 }
 
-/// Decode the actions payload.
-fn decode_actions(
+/// Decode the actions payload, rejecting Opaque actions unless
+/// `has_semantic` is set.
+fn decode_actions_checked(
     data: &[u8],
-    manifest: &Manifest,
+    has_semantic: bool,
 ) -> Result<Vec<ActionDescriptor>, FormatError> {
     let name = "strategy.actions.bin";
     let (header, payload) = split_header_payload(data, MAGIC_ACTIONS, name)?;
@@ -506,11 +515,6 @@ fn decode_actions(
         name,
     )?;
 
-    let has_semantic_feature = manifest
-        .required_features
-        .iter()
-        .any(|f| f == "mp_semantic_rows_v1");
-
     let count = record_count_usize(header.record_count);
     let mut actions = Vec::with_capacity(count);
     for i in 0..count {
@@ -521,7 +525,7 @@ fn decode_actions(
             .unwrap();
         let action = ActionDescriptor::from_bytes(chunk)?;
         if action.kind == super::descriptors::ActionKind::Opaque
-            && !has_semantic_feature
+            && !has_semantic
         {
             return Err(FormatError::InvalidManifest {
                 detail: format!(

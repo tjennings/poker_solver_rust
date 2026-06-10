@@ -286,57 +286,105 @@ fn mp_semantic_feature_accepted_by_reader() {
 
 // ── Disk wrapper test ────────────────────────────────────────────────
 
+/// Helper: write a minimal BlueprintMpConfig-format config.yaml to dir.
+fn write_real_mp_config_yaml(dir: &std::path::Path) {
+    let yaml = r#"
+game:
+  name: "test"
+  num_players: 6
+  stack_depth: 100.0
+  blinds:
+    - seat: 4
+      type: small_blind
+      amount: 1
+    - seat: 5
+      type: big_blind
+      amount: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 100
+  turn:
+    buckets: 50
+  river:
+    buckets: 50
+action_abstraction:
+  preflop:
+    lead: ["2bb"]
+    raise: [["1.0x"]]
+  flop:
+    lead: [0.75]
+    raise: [[1.0]]
+  turn:
+    lead: [1.0]
+    raise: [[1.0]]
+  river:
+    lead: [1.0]
+    raise: [[1.0]]
+training:
+  backend: lazy_sparse
+  iterations: 1
+snapshots:
+  warmup_minutes: 0
+  snapshot_every_minutes: 1
+  output_dir: "."
+"#;
+    std::fs::write(dir.join("config.yaml"), yaml).unwrap();
+}
+
 #[test]
-fn disk_wrapper_exports_and_round_trips() {
+fn disk_wrapper_exports_with_real_directory_structure() {
     let entries = build_test_entries();
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
 
-    // Create a fake snapshot directory
-    let snapshot_dir = tempfile::tempdir().unwrap();
+    // Create bundle_dir/snapshot_0000/ mirroring real training layout
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let snapshot_dir = bundle_dir.path().join("snapshot_0000");
+    std::fs::create_dir_all(&snapshot_dir).unwrap();
 
-    // Write sparse_entries.bin
-    let entries_path = snapshot_dir.path().join("sparse_entries.bin");
-    let file = std::fs::File::create(&entries_path).unwrap();
+    // config.yaml lives in bundle_dir (parent), NOT snapshot subdirectory
+    write_real_mp_config_yaml(bundle_dir.path());
+
+    // sparse_entries.bin and metadata.json live in snapshot subdirectory
+    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))
+        .unwrap();
     let writer = std::io::BufWriter::new(file);
     bincode::serialize_into(writer, &entries).unwrap();
 
-    // Write metadata.json
     let metadata = serde_json::json!({
         "kind": "blueprint_mp_lazy_sparse",
         "iterations": 500,
         "elapsed_minutes": 3,
     });
     std::fs::write(
-        snapshot_dir.path().join("metadata.json"),
+        snapshot_dir.join("metadata.json"),
         serde_json::to_string_pretty(&metadata).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
-    // Write config.yaml
-    let config_yaml = serde_yaml::to_string(&config).unwrap();
-    std::fs::write(snapshot_dir.path().join("config.yaml"), &config_yaml).unwrap();
-
-    // Export
+    // Export using bundle_dir + snapshot_name (matching real CLI usage)
     let out_dir = tempfile::tempdir().unwrap();
     mp_lazy_export::export_lazy_bundle_from_disk(
-        snapshot_dir.path(),
+        bundle_dir.path(),
+        "snapshot_0000",
         out_dir.path(),
-    ).unwrap();
+    )
+    .unwrap();
 
-    // Read back
     let reader = BundleReader::open(out_dir.path()).unwrap();
     assert_eq!(reader.row_count(), entries.len());
 }
 
 #[test]
 fn disk_wrapper_rejects_wrong_kind() {
-    let snapshot_dir = tempfile::tempdir().unwrap();
+    let bundle_dir = tempfile::tempdir().unwrap();
+    let snapshot_dir = bundle_dir.path().join("snapshot_0000");
+    std::fs::create_dir_all(&snapshot_dir).unwrap();
+
+    write_real_mp_config_yaml(bundle_dir.path());
 
     // Write empty sparse_entries.bin
-    std::fs::write(snapshot_dir.path().join("sparse_entries.bin"), &[]).unwrap();
+    std::fs::write(snapshot_dir.join("sparse_entries.bin"), &[]).unwrap();
 
     // Write metadata.json with wrong kind
     let metadata = serde_json::json!({
@@ -344,28 +392,22 @@ fn disk_wrapper_rejects_wrong_kind() {
         "iterations": 100,
     });
     std::fs::write(
-        snapshot_dir.path().join("metadata.json"),
+        snapshot_dir.join("metadata.json"),
         serde_json::to_string_pretty(&metadata).unwrap(),
-    ).unwrap();
-
-    let config = mp_lazy_export::LazyExportConfig {
-        num_players: 6,
-        stack_depth: 100.0,
-        bucket_counts: [169, 100, 50, 50],
-    };
-    std::fs::write(
-        snapshot_dir.path().join("config.yaml"),
-        serde_yaml::to_string(&config).unwrap(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let out_dir = tempfile::tempdir().unwrap();
     let err = mp_lazy_export::export_lazy_bundle_from_disk(
-        snapshot_dir.path(),
+        bundle_dir.path(),
+        "snapshot_0000",
         out_dir.path(),
-    ).unwrap_err();
+    )
+    .unwrap_err();
     let err_msg = format!("{err}");
     assert!(
-        err_msg.contains("blueprint_mp_lazy_sparse") || err_msg.contains("kind"),
+        err_msg.contains("blueprint_mp_lazy_sparse")
+            || err_msg.contains("kind"),
         "expected kind mismatch error, got: {err_msg}"
     );
 }

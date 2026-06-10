@@ -4597,7 +4597,7 @@ fn run_export_universal_mp(
         }
         "blueprint_mp_lazy_sparse" => {
             use poker_solver_core::blueprint_universal::mp_lazy_export;
-            mp_lazy_export::export_lazy_bundle_from_disk(&snapshot_dir, out)
+            mp_lazy_export::export_lazy_bundle_from_disk(bundle, snapshot, out)
                 .map_err(|e| format!("export failed: {e}"))?;
         }
         other => {
@@ -4631,7 +4631,14 @@ fn detect_mp_snapshot_kind(
     let kind = value
         .get("kind")
         .and_then(|v| v.as_str())
-        .unwrap_or("blueprint_mp")
+        .ok_or_else(|| {
+            format!(
+                "metadata.json at {} is missing required \"kind\" field; \
+                 expected one of: \"blueprint_mp\", \
+                 \"blueprint_mp_lazy_sparse\"",
+                meta_path.display()
+            )
+        })?
         .to_string();
     Ok(kind)
 }
@@ -6360,5 +6367,26 @@ model:
             "clamp"
         );
         assert_eq!(super::compare_solve::gadget_mode_label(false, false), "off");
+    }
+
+    #[test]
+    fn detect_mp_snapshot_kind_errors_on_missing_kind_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "iterations": 100,
+            "elapsed_minutes": 5,
+        });
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let result = super::detect_mp_snapshot_kind(dir.path());
+        assert!(
+            result.is_err(),
+            "expected error when kind field is missing, got {:?}",
+            result.unwrap()
+        );
     }
 }

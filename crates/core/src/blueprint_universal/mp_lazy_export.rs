@@ -60,13 +60,11 @@ use super::manifest::{
     GameMetadata, LayoutMetadata, Manifest, RakeConfig, SeatDescriptor,
     StrategyMetadata, TrainingMetadata,
 };
+use crate::blueprint_mp::config::BlueprintMpConfig;
 use crate::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
 
 /// Size of a single semantic key record in bytes.
 pub const SEMANTIC_RECORD_SIZE: usize = 32;
-
-/// CRC-64/XZ algorithm constant (same as bundle.rs).
-const CRC_ALG: crc::Algorithm<u64> = crc::CRC_64_XZ;
 
 // ---------------------------------------------------------------------------
 // Semantic key side table record
@@ -367,13 +365,16 @@ pub fn export_lazy_sparse_to_universal(
     }
 
     let (rows, actions, probs) = flatten_entries(&row_entries);
-    let manifest = build_lazy_manifest(
-        config,
-        training,
-        &rows,
-        &actions,
-        &probs,
-    );
+    let layout = LayoutMetadata {
+        row_count: rows.len() as u64,
+        action_descriptor_count: actions.len() as u64,
+        probability_count: probs.len() as u64,
+        row_sort_order:
+            "namespace_seat_street_node_bucket_fingerprint".to_string(),
+        row_namespace: vec!["mp_semantic".to_string()],
+        missing_row_policy: "uniform_legal".to_string(),
+    };
+    let manifest = build_lazy_manifest(config, training, layout);
 
     ExportOutput {
         rows,
@@ -391,9 +392,7 @@ pub fn export_lazy_sparse_to_universal(
 fn build_lazy_manifest(
     config: &LazyExportConfig,
     training: &LazyTrainingInfo,
-    rows: &[super::descriptors::RowDescriptor],
-    actions: &[ActionDescriptor],
-    probs: &[f32],
+    layout: LayoutMetadata,
 ) -> Manifest {
     Manifest {
         format_name: "dense_blueprint".to_string(),
@@ -419,15 +418,7 @@ fn build_lazy_manifest(
         strategy: StrategyMetadata {
             normalization_tolerance: 1e-4,
         },
-        layout: LayoutMetadata {
-            row_count: rows.len() as u64,
-            action_descriptor_count: actions.len() as u64,
-            probability_count: probs.len() as u64,
-            row_sort_order:
-                "namespace_seat_street_node_bucket_fingerprint".to_string(),
-            row_namespace: vec!["mp_semantic".to_string()],
-            missing_row_policy: "uniform_legal".to_string(),
-        },
+        layout,
         actions: ActionsMetadata {
             action_abstraction_fingerprint: 0,
         },
@@ -540,46 +531,29 @@ pub fn write_lazy_bundle(
     )
 }
 
-/// Write the semantic side table file.
+/// Write the semantic side table file, reusing the shared `write_payload`
+/// pattern from bundle.rs.
 fn write_semantic_file(
     dir: &Path,
     records: &[SemanticKeyRecord],
 ) -> Result<FileEntry, FormatError> {
-    use sha2::{Digest, Sha256};
-    use std::io::BufWriter;
+    use super::bundle::{write_payload_file, PayloadSpec};
+    use super::header::MAGIC_SEMANTIC;
 
-    use super::header::{BinaryHeader, MAGIC_SEMANTIC};
-
-    let mut payload_buf = Vec::new();
-    for record in records {
-        record.write_to_writer(&mut payload_buf)?;
-    }
-
-    let crc = crc::Crc::<u64>::new(&CRC_ALG);
-    let payload_crc64 = crc.checksum(&payload_buf);
-    let payload_len = payload_buf.len() as u64;
-
-    let header = BinaryHeader::new(
-        MAGIC_SEMANTIC,
-        records.len() as u64,
-        payload_len,
-        payload_crc64,
-    );
-
-    let path = dir.join("strategy.semantic.bin");
-    let file = std::fs::File::create(&path)?;
-    let mut writer = BufWriter::new(file);
-    header.write_to(&mut writer)?;
-    writer.write_all(&payload_buf)?;
-    writer.flush()?;
-
-    let file_bytes = std::fs::read(&path)?;
-    let sha256 = hex::encode(Sha256::digest(&file_bytes));
-
-    Ok(FileEntry {
-        size: file_bytes.len() as u64,
-        sha256,
-    })
+    write_payload_file(
+        dir,
+        &PayloadSpec {
+            name: "strategy.semantic.bin",
+            magic: MAGIC_SEMANTIC,
+            record_count: records.len(),
+            write_fn: Box::new(|w| {
+                for record in records {
+                    record.write_to_writer(w)?;
+                }
+                Ok(())
+            }),
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -596,19 +570,28 @@ struct LazySnapshotMetadata {
 
 /// Export a saved lazy sparse snapshot to universal dense format.
 ///
-/// Reads `config.yaml`, `sparse_entries.bin`, and `metadata.json`
-/// from `snapshot_dir`. Validates `kind == "blueprint_mp_lazy_sparse"`.
+/// Reads `config.yaml` from `bundle_dir` (the parent training output
+/// directory) and `sparse_entries.bin` + `metadata.json` from
+/// `bundle_dir/<snapshot_name>/`. Validates `kind ==
+/// "blueprint_mp_lazy_sparse"`.
+///
+/// This mirrors the eager export's `(bundle_dir, snapshot, out)`
+/// pattern: config lives in the bundle root, data in the snapshot
+/// subdirectory.
 ///
 /// # Errors
 ///
-/// Returns `ExportError` for missing files, kind mismatches, or write errors.
+/// Returns `ExportError` for missing files, kind mismatches, or write
+/// errors.
 pub fn export_lazy_bundle_from_disk(
-    snapshot_dir: &Path,
+    bundle_dir: &Path,
+    snapshot_name: &str,
     out_dir: &Path,
 ) -> Result<(), ExportError> {
-    let config = load_lazy_config(snapshot_dir)?;
-    let metadata = load_lazy_metadata(snapshot_dir)?;
-    let entries = load_sparse_entries(snapshot_dir)?;
+    let snapshot_dir = bundle_dir.join(snapshot_name);
+    let config = load_lazy_config(bundle_dir)?;
+    let metadata = load_lazy_metadata(&snapshot_dir)?;
+    let entries = load_sparse_entries(&snapshot_dir)?;
 
     let training = LazyTrainingInfo {
         iterations: metadata.iterations.unwrap_or(0),
@@ -632,12 +615,19 @@ fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
     }
 }
 
-fn load_lazy_config(dir: &Path) -> Result<LazyExportConfig, ExportError> {
-    let path = dir.join("config.yaml");
+fn load_lazy_config(
+    bundle_dir: &Path,
+) -> Result<LazyExportConfig, ExportError> {
+    let path = bundle_dir.join("config.yaml");
     require_file(&path, "config.yaml")?;
     let text = std::fs::read_to_string(&path)?;
-    serde_yaml::from_str(&text)
-        .map_err(|e| ExportError::Deserialize(e.to_string()))
+    let full: BlueprintMpConfig = serde_yaml::from_str(&text)
+        .map_err(|e| ExportError::Deserialize(e.to_string()))?;
+    Ok(LazyExportConfig {
+        num_players: full.game.num_players,
+        stack_depth: full.game.stack_depth,
+        bucket_counts: full.clustering.bucket_counts(),
+    })
 }
 
 fn load_lazy_metadata(
