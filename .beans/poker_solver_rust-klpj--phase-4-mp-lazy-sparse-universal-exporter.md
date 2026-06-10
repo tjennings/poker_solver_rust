@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-klpj
 title: 'Phase 4: MP lazy sparse universal exporter'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-09T18:41:22Z
+updated_at: 2026-06-10T18:55:09Z
 parent: poker_solver_rust-a29s
 ---
 
