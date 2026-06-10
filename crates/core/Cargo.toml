@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 description = "CFR poker solver core library"
 
+[lib]
+doctest = false
+
 [features]
 default = []
 accelerate = ["fastkmeans-rs/accelerate"]

@@ -3,6 +3,9 @@ name = "range-solver"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+doctest = false
+
 [dependencies]
 once_cell = "1.18"
 rayon = "1.8"

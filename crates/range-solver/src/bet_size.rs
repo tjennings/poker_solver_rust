@@ -16,7 +16,7 @@
 /// - a: All-in. (e.g., "a")
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// use range_solver::bet_size::BetSize::*;
 /// use range_solver::bet_size::BetSizeOptions;
 ///
@@ -356,6 +356,23 @@ mod tests {
         for donk in error_tests {
             assert!(DonkSizeOptions::try_from(donk).is_err());
         }
+    }
+
+    #[test]
+    fn doc_example_bet_size_options() {
+        let bet_size = BetSizeOptions::try_from(("50%, 100c, 2e, a", "2.5x")).unwrap();
+
+        assert_eq!(
+            bet_size.bet,
+            vec![
+                PotRelative(0.5),
+                Additive(100, 0),
+                Geometric(2, f64::INFINITY),
+                AllIn
+            ]
+        );
+
+        assert_eq!(bet_size.raise, vec![PrevBetRelative(2.5)]);
     }
 
     #[test]

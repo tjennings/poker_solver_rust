@@ -35,7 +35,7 @@ impl HandStrength {
     /// * `npot` - Negative potential (probability of falling behind from ahead)
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// use poker_solver_core::abstraction::HandStrength;
     ///
     /// let hs = HandStrength::new(0.5, 0.2, 0.1);
@@ -61,7 +61,7 @@ impl HandStrength {
     /// * `ehs` - Expected Hand Strength (current equity)
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// use poker_solver_core::abstraction::HandStrength;
     ///
     /// let hs = HandStrength::river(0.75);

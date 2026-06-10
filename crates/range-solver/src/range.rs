@@ -17,7 +17,7 @@ use std::str::FromStr;
 ///   - Dash range (e.g., "QQ-88", "A9s-A6s", "98o-65o")
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// use range_solver::range::Range;
 ///
 /// // construct a range from a string
@@ -928,6 +928,18 @@ mod tests {
             assert!(range.is_ok());
             assert_eq!(range.unwrap().to_string(), expected);
         }
+    }
+
+    #[test]
+    fn doc_example_range() {
+        let range = "QQ+,AKs".parse::<Range>().unwrap();
+
+        let ace_rank = 12;
+        let king_rank = 11;
+        let queen_rank = 10;
+
+        assert_eq!(range.get_weight_pair(queen_rank), 1.0);
+        assert_eq!(range.get_weight_offsuit(ace_rank, king_rank), 0.0);
     }
 
     #[test]
