@@ -606,6 +606,19 @@ enum Commands {
         #[arg(short, long)]
         out: PathBuf,
     },
+    /// Export an MP eager blueprint snapshot to universal dense format
+    #[command(name = "export-universal-mp")]
+    ExportUniversalMp {
+        /// Path to MP output directory (contains config.yaml)
+        #[arg(short, long)]
+        bundle: PathBuf,
+        /// Snapshot to export (default: final snapshot found)
+        #[arg(short, long, default_value = "final")]
+        snapshot: String,
+        /// Output directory for the universal bundle
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1783,6 +1796,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             out,
         } => {
             run_export_universal(&bundle, &snapshot, &out)?;
+        }
+        Commands::ExportUniversalMp {
+            bundle,
+            snapshot,
+            out,
+        } => {
+            run_export_universal_mp(&bundle, &snapshot, &out)?;
         }
     }
 
@@ -4545,6 +4565,29 @@ fn run_export_universal(
     eprintln!("  Output: {}", out.display());
 
     hu_export::export_hu_bundle(bundle, snapshot, out)
+        .map_err(|e| format!("export failed: {e}"))?;
+
+    eprintln!("Export complete: {}", out.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// export-universal-mp subcommand
+// ---------------------------------------------------------------------------
+
+fn run_export_universal_mp(
+    bundle: &Path,
+    snapshot: &str,
+    out: &Path,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_universal::mp_eager_export;
+
+    eprintln!("Exporting MP blueprint to universal dense format");
+    eprintln!("  Bundle: {}", bundle.display());
+    eprintln!("  Snapshot: {snapshot}");
+    eprintln!("  Output: {}", out.display());
+
+    mp_eager_export::export_mp_bundle(bundle, snapshot, out)
         .map_err(|e| format!("export failed: {e}"))?;
 
     eprintln!("Export complete: {}", out.display());
