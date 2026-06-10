@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-ev6p
 title: 'Phase 2 preflight: full suite runtime exceeds one minute'
-status: completed
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-06-04T03:00:03Z
-updated_at: 2026-06-04T03:01:07Z
+updated_at: 2026-06-10T20:39:45Z
 ---
 
 Phase 2 implementation is blocked by the required pre-development gate.
