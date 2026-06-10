@@ -15,6 +15,7 @@ mod bundle;
 pub(crate) mod export_common;
 pub mod hu_export;
 pub mod mp_eager_export;
+pub mod mp_lazy_export;
 
 pub use error::FormatError;
 pub use header::{BinaryHeader, HEADER_SIZE};
@@ -23,5 +24,8 @@ pub use manifest::{
     ActionsMetadata, BucketsMetadata, CompatibilityMetadata, FileEntry,
     SeatDescriptor, RakeConfig, BucketFileRef, PerFlopBucketConfig,
 };
-pub use descriptors::{ActionDescriptor, ActionKind, RowDescriptor, ROW_DESCRIPTOR_SIZE};
+pub use descriptors::{
+    ActionDescriptor, ActionKind, RowDescriptor, SemanticKeyRecord,
+    ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
+};
 pub use bundle::{BundleData, BundleReader, BundleWriter, write_bundle};

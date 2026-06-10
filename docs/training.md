@@ -59,13 +59,21 @@ export is analysis-only (no `cfr.snapshot.bin`); dense HU exports use the
 
 ### export-universal-mp
 
-Export an eager (dense) N-player `blueprint_mp` snapshot into the universal
-dense format. Rows use the `mp_arena` namespace with explicit acting seat;
-probabilities pass through bitwise from the snapshot's projected
-`strategy.bin`. Bucket counts are cross-checked between `config.yaml`,
-`strategy.bin`, and `metadata.json` (mismatch is a hard error). Unified
-HU/MP bundle detection is a later phase — use this command for MP bundles
-and `export-universal` for HU bundles.
+Export an N-player `blueprint_mp` snapshot (eager or lazy sparse) into the
+universal dense format. The command auto-detects the snapshot kind from
+`metadata.json`:
+
+- **`blueprint_mp`** (eager): Rows use the `mp_arena` namespace with
+  explicit acting seat; probabilities pass through bitwise from the
+  snapshot's projected `strategy.bin`.
+- **`blueprint_mp_lazy_sparse`** (lazy): Rows use the `mp_semantic`
+  namespace with opaque actions and a semantic key side table. The bundle
+  declares `mp_semantic_rows_v1` as a required feature and is marked
+  non-resumable (analysis-only). Missing row policy is `uniform_legal`.
+
+Bucket counts are cross-checked for eager exports. Unified HU/MP bundle
+detection is a later phase -- use this command for MP bundles and
+`export-universal` for HU bundles.
 
 ```bash
 cargo run -p poker-solver-trainer --release -- export-universal-mp \

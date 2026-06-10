@@ -46,7 +46,7 @@ use super::descriptors::{ActionDescriptor, ActionKind, RowDescriptor};
 use super::error::FormatError;
 use super::export_common::{
     self, RowEntry, bucket_semantic_fingerprint, flatten_entries,
-    row_key_fingerprint as common_row_key_fingerprint,
+    row_key_fingerprint,
 };
 use super::hash::Fnv1aHasher;
 use super::manifest::{
@@ -59,26 +59,7 @@ use crate::blueprint_v2::config::BlueprintV2Config;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use crate::blueprint_v2::storage::action_schema_fingerprint;
 
-/// Namespace constant for HU arena rows.
-const HU_ARENA_NS: u16 = 0;
-
-// ---------------------------------------------------------------------------
-// FNV-1a row key fingerprint (delegates to export_common)
-// ---------------------------------------------------------------------------
-
-/// Compute a stable FNV-1a row key fingerprint over the identity tuple.
-///
-/// Inputs (version 1): `(namespace: u16, seat: u8, street: u8,
-/// source_node_idx: u32, global_bucket: u32)`.
-fn row_key_fingerprint(
-    namespace: u16,
-    seat: u8,
-    street: u8,
-    source_node_idx: u32,
-    global_bucket: u32,
-) -> u64 {
-    common_row_key_fingerprint(namespace, seat, street, source_node_idx, global_bucket)
-}
+use super::export_common::NS_HU_ARENA as HU_ARENA_NS;
 
 // ---------------------------------------------------------------------------
 // Action mapping
@@ -306,12 +287,15 @@ fn collect_row_entries(
                 namespace: HU_ARENA_NS,
                 seat: player,
                 street,
+                local_bucket: bucket,
                 source_node_idx: node_idx as u32,
                 global_bucket: u32::from(bucket),
                 row_key_fp: fp,
                 action_schema_fp: schema_fp,
                 actions: action_descs.clone(),
                 probs,
+                semantic_key_kind: 0,
+                semantic_key_index: 0,
             });
         }
 
@@ -509,6 +493,7 @@ fn build_manifest(
         compatibility: CompatibilityMetadata {
             legacy_fallback: false,
             missing_row_policy: "reject".to_string(),
+            resumable: false,
         },
         files: BTreeMap::new(),
     }

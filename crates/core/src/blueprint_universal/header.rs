@@ -38,6 +38,9 @@ pub const MAGIC_ACTIONS: [u8; 8] = *b"BPACT001";
 /// Magic bytes for `strategy.probs.f32.bin`.
 pub const MAGIC_PROBS: [u8; 8] = *b"BPPRO001";
 
+/// Magic bytes for `strategy.semantic.bin`.
+pub const MAGIC_SEMANTIC: [u8; 8] = *b"BPSEM001";
+
 /// Parsed binary header for a universal blueprint payload file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryHeader {

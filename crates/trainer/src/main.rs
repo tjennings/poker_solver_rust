@@ -606,10 +606,10 @@ enum Commands {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Export an MP eager blueprint snapshot to universal dense format
+    /// Export an MP blueprint snapshot (eager or lazy sparse) to universal dense format
     #[command(name = "export-universal-mp")]
     ExportUniversalMp {
-        /// Path to MP output directory (contains config.yaml)
+        /// Path to MP output directory (contains config.yaml and snapshot dirs)
         #[arg(short, long)]
         bundle: PathBuf,
         /// Snapshot to export (default: final snapshot found)
@@ -4580,18 +4580,67 @@ fn run_export_universal_mp(
     snapshot: &str,
     out: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_universal::mp_eager_export;
+    let snapshot_dir = bundle.join(snapshot);
+    let kind = detect_mp_snapshot_kind(&snapshot_dir)?;
 
     eprintln!("Exporting MP blueprint to universal dense format");
     eprintln!("  Bundle: {}", bundle.display());
     eprintln!("  Snapshot: {snapshot}");
+    eprintln!("  Kind: {kind}");
     eprintln!("  Output: {}", out.display());
 
-    mp_eager_export::export_mp_bundle(bundle, snapshot, out)
-        .map_err(|e| format!("export failed: {e}"))?;
+    match kind.as_str() {
+        "blueprint_mp" => {
+            use poker_solver_core::blueprint_universal::mp_eager_export;
+            mp_eager_export::export_mp_bundle(bundle, snapshot, out)
+                .map_err(|e| format!("export failed: {e}"))?;
+        }
+        "blueprint_mp_lazy_sparse" => {
+            use poker_solver_core::blueprint_universal::mp_lazy_export;
+            mp_lazy_export::export_lazy_bundle_from_disk(bundle, snapshot, out)
+                .map_err(|e| format!("export failed: {e}"))?;
+        }
+        other => {
+            return Err(format!(
+                "unsupported metadata kind \"{other}\"; \
+                 supported kinds: \"blueprint_mp\", \
+                 \"blueprint_mp_lazy_sparse\""
+            )
+            .into());
+        }
+    }
 
     eprintln!("Export complete: {}", out.display());
     Ok(())
+}
+
+/// Read metadata.json from a snapshot directory and return the `kind` field.
+fn detect_mp_snapshot_kind(
+    snapshot_dir: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let meta_path = snapshot_dir.join("metadata.json");
+    if !meta_path.exists() {
+        return Err(format!(
+            "metadata.json not found at {}",
+            meta_path.display()
+        )
+        .into());
+    }
+    let text = std::fs::read_to_string(&meta_path)?;
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "metadata.json at {} is missing required \"kind\" field; \
+                 expected one of: \"blueprint_mp\", \
+                 \"blueprint_mp_lazy_sparse\"",
+                meta_path.display()
+            )
+        })?
+        .to_string();
+    Ok(kind)
 }
 
 #[cfg(test)]
@@ -6318,5 +6367,26 @@ model:
             "clamp"
         );
         assert_eq!(super::compare_solve::gadget_mode_label(false, false), "off");
+    }
+
+    #[test]
+    fn detect_mp_snapshot_kind_errors_on_missing_kind_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "iterations": 100,
+            "elapsed_minutes": 5,
+        });
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let result = super::detect_mp_snapshot_kind(dir.path());
+        assert!(
+            result.is_err(),
+            "expected error when kind field is missing, got {:?}",
+            result.unwrap()
+        );
     }
 }

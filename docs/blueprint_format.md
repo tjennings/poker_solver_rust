@@ -39,6 +39,7 @@ bundle_or_snapshot/
   strategy.actions.bin
   strategy.probs.f32.bin
   checksums.json
+  strategy.semantic.bin     # optional; semantic key side table for lazy MP rows
   cfr.snapshot.bin          # optional; present only for complete resumable state
   config.yaml               # optional retained source config / legacy context
   bucket_refs.json          # optional references to external bucket files
@@ -141,6 +142,7 @@ Initial magic values:
 | `strategy.rows.bin` | `BPROW001` |
 | `strategy.actions.bin` | `BPACT001` |
 | `strategy.probs.f32.bin` | `BPPRO001` |
+| `strategy.semantic.bin` | `BPSEM001` |
 | `cfr.snapshot.bin` | `BPCFR001` |
 
 ## Row Descriptors
@@ -180,10 +182,47 @@ Namespaces:
 | `mp_arena` | Eager MP public-tree node plus seat plus bucket |
 | `mp_semantic` | Lazy MP seat, street bucket, action-history semantic key |
 
-Semantic key payloads are stored in a future side table when fixed fields are
-not enough. Version 1 lazy MP semantic identity must at minimum preserve seat,
-street, local/global bucket, action history hash, action history length, and
-the high/low history words currently used by sparse storage.
+Semantic key payloads are stored in the side table `strategy.semantic.bin`
+when fixed row fields are not enough. Version 1 lazy MP semantic identity
+preserves seat, street, local/global bucket, action history hash, action
+history length, and the high/low history words from sparse storage.
+
+### Semantic Key Side Table
+
+`strategy.semantic.bin` stores fixed-width 32-byte records referenced by
+`semantic_key_offset` (a record index, not a byte offset) in row descriptors
+with `semantic_key_kind = 1` (`SEMANTIC_KEY_MP_HISTORY_V1`).
+
+Record wire format (little-endian, 32 bytes):
+
+| Offset | Size | Field          |
+|--------|------|----------------|
+| 0      | 8    | `history_hi`   |
+| 8      | 8    | `history_lo`   |
+| 16     | 8    | `history_hash` |
+| 24     | 2    | `history_len`  |
+| 26     | 6    | reserved       |
+
+The file uses the standard 48-byte binary header with magic `BPSEM001`.
+The manifest declares this file in `files` with SHA-256 and byte length.
+Bundles with semantic rows must declare `mp_semantic_rows_v1` in
+`required_features`. Rows with `semantic_key_kind = 0` (none) do not
+reference the side table and work exactly as before.
+
+### Semantic Key Kinds
+
+| Kind | Meaning |
+|------|---------|
+| 0    | None (HU and MP eager rows) |
+| 1    | MP history v1 (side table record) |
+
+### Opaque Action Kind
+
+Lazy MP rows carry only `num_actions`; individual action semantics are not
+recoverable from the snapshot. These rows use action kind `Opaque` (7),
+gated by `mp_semantic_rows_v1`. Each action has `amount_chips = 0`, empty
+`size_key`/`label`, `is_aggressive = false`, and `source_action_index`
+set to the per-row action index used by the trainer.
 
 ## Action Descriptors
 

@@ -92,6 +92,7 @@ fn test_manifest(row_count: u64, action_count: u64, prob_count: u64) -> Manifest
         compatibility: CompatibilityMetadata {
             legacy_fallback: false,
             missing_row_policy: "reject".to_string(),
+            resumable: false,
         },
         files: BTreeMap::new(),
     }

@@ -154,6 +154,11 @@ pub struct PerFlopBucketConfig {
 pub struct CompatibilityMetadata {
     pub legacy_fallback: bool,
     pub missing_row_policy: String,
+    /// Whether the bundle contains enough state to resume training.
+    /// Defaults to `false` for backward compatibility (HU/MP eager
+    /// bundles written before this field was added).
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 /// Metadata for a single file in the bundle.

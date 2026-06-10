@@ -50,6 +50,9 @@ use std::io::Write;
 /// Size of a single row descriptor in bytes.
 pub const ROW_DESCRIPTOR_SIZE: usize = 96;
 
+/// Size of a single semantic key record in bytes.
+pub const SEMANTIC_RECORD_SIZE: usize = 32;
+
 /// Size of a single action descriptor in bytes.
 pub const ACTION_DESCRIPTOR_SIZE: usize = 128;
 
@@ -174,6 +177,9 @@ pub enum ActionKind {
     Raise = 4,
     AllInCall = 5,
     AllInBetRaise = 6,
+    /// Opaque action: semantics unknown, only action count and order index
+    /// are meaningful. Gated by the `mp_semantic_rows_v1` required feature.
+    Opaque = 7,
 }
 
 impl ActionKind {
@@ -192,6 +198,7 @@ impl ActionKind {
             4 => Some(Self::Raise),
             5 => Some(Self::AllInCall),
             6 => Some(Self::AllInBetRaise),
+            7 => Some(Self::Opaque),
             _ => None,
         }
     }
@@ -288,6 +295,75 @@ fn decode_action(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Semantic key side table record
+// ---------------------------------------------------------------------------
+
+/// A single record in `strategy.semantic.bin`.
+///
+/// ## Wire format (little-endian, 32 bytes)
+///
+/// | Offset | Size | Field          |
+/// |--------|------|----------------|
+/// | 0      | 8    | `history_hi`   |
+/// | 8      | 8    | `history_lo`   |
+/// | 16     | 8    | `history_hash` |
+/// | 24     | 2    | `history_len`  |
+/// | 26     | 6    | reserved       |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticKeyRecord {
+    pub history_hi: u64,
+    pub history_lo: u64,
+    pub history_hash: u64,
+    pub history_len: u16,
+}
+
+impl SemanticKeyRecord {
+    /// Encode this record into a 32-byte buffer.
+    pub fn write_to(&self, buf: &mut [u8; SEMANTIC_RECORD_SIZE]) {
+        buf[0..8].copy_from_slice(&self.history_hi.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.history_lo.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.history_hash.to_le_bytes());
+        buf[24..26].copy_from_slice(&self.history_len.to_le_bytes());
+        buf[26..32].copy_from_slice(&[0u8; 6]);
+    }
+
+    /// Decode a record from a 32-byte buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer contains fewer than 32 bytes (statically
+    /// prevented by the array type).
+    #[must_use]
+    pub fn from_bytes(buf: &[u8; SEMANTIC_RECORD_SIZE]) -> Self {
+        Self {
+            history_hi: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            history_lo: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            history_hash: u64::from_le_bytes(
+                buf[16..24].try_into().unwrap(),
+            ),
+            history_len: u16::from_le_bytes(
+                buf[24..26].try_into().unwrap(),
+            ),
+        }
+    }
+
+    /// Serialize to a writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FormatError::Io` on write failure.
+    pub fn write_to_writer<W: Write>(
+        &self,
+        w: &mut W,
+    ) -> Result<(), FormatError> {
+        let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
+        self.write_to(&mut buf);
+        w.write_all(&buf)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,7 +448,8 @@ mod tests {
     fn action_kind_from_u8_known_values() {
         assert_eq!(ActionKind::from_u8(0), Some(ActionKind::Fold));
         assert_eq!(ActionKind::from_u8(6), Some(ActionKind::AllInBetRaise));
-        assert_eq!(ActionKind::from_u8(7), None);
+        assert_eq!(ActionKind::from_u8(7), Some(ActionKind::Opaque));
+        assert_eq!(ActionKind::from_u8(8), None);
         assert_eq!(ActionKind::from_u8(255), None);
     }
 
@@ -401,6 +478,34 @@ mod tests {
         let mut c = a.clone();
         c.seat = 1;
         assert!(a.identity_key() < c.identity_key());
+    }
+
+    #[test]
+    fn semantic_record_round_trip() {
+        let record = SemanticKeyRecord {
+            history_hi: 0xDEAD_BEEF_CAFE_BABE,
+            history_lo: 0x0123_4567_89AB_CDEF,
+            history_hash: 0xFFFF_FFFF_FFFF_FFFF,
+            history_len: 40,
+        };
+        let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
+        record.write_to(&mut buf);
+        let decoded = SemanticKeyRecord::from_bytes(&buf);
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn semantic_record_zero_values() {
+        let record = SemanticKeyRecord {
+            history_hi: 0,
+            history_lo: 0,
+            history_hash: 0,
+            history_len: 0,
+        };
+        let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
+        record.write_to(&mut buf);
+        let decoded = SemanticKeyRecord::from_bytes(&buf);
+        assert_eq!(decoded, record);
     }
 
     // -- Property tests -------------------------------------------------------
@@ -447,7 +552,7 @@ mod tests {
     }
 
     fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
-        (0u8..=6).prop_map(|v| ActionKind::from_u8(v).unwrap())
+        (0u8..=7).prop_map(|v| ActionKind::from_u8(v).unwrap())
     }
 
     fn arb_action() -> impl Strategy<Value = ActionDescriptor> {
