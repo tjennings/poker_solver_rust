@@ -295,6 +295,23 @@ impl RowEntry {
     }
 }
 
+/// Extract probabilities for a single bucket from the legacy strategy.
+#[allow(clippy::cast_precision_loss)]
+fn extract_bucket_probs(
+    strategy: &BlueprintV2Strategy,
+    decision_idx: usize,
+    bucket: u16,
+    num_actions: usize,
+) -> Vec<f32> {
+    let legacy_probs = strategy.get_action_probs(decision_idx, bucket);
+    if legacy_probs.len() == num_actions {
+        legacy_probs.to_vec()
+    } else {
+        let uniform = 1.0f32 / num_actions as f32;
+        vec![uniform; num_actions]
+    }
+}
+
 /// Collect all `(decision_node, bucket)` rows from the strategy.
 fn collect_row_entries(
     tree: &GameTree,
@@ -308,38 +325,24 @@ fn collect_row_entries(
     for (node_idx, node) in tree.nodes.iter().enumerate() {
         let (player, street, tree_actions) = match node {
             GameNode::Decision {
-                player,
-                street,
-                actions,
-                ..
+                player, street, actions, ..
             } => (*player, *street as u8, actions),
             _ => continue,
         };
 
         let buckets = bucket_counts[street as usize];
-        let num_actions = tree_actions.len();
         let schema_fp = action_schema_fingerprint(tree_actions);
         let action_descs =
             build_action_descriptors(tree_actions, config.game.big_blind);
 
         for bucket in 0..buckets {
-            let legacy_probs = strategy.get_action_probs(decision_idx, bucket);
-            #[allow(clippy::cast_precision_loss)]
-            let probs: Vec<f32> = if legacy_probs.len() == num_actions {
-                legacy_probs.to_vec()
-            } else {
-                let uniform = 1.0f32 / num_actions as f32;
-                vec![uniform; num_actions]
-            };
-
-            let fp = row_key_fingerprint(
-                HU_ARENA_NS,
-                player,
-                street,
-                node_idx as u32,
-                u32::from(bucket),
+            let probs = extract_bucket_probs(
+                strategy, decision_idx, bucket, tree_actions.len(),
             );
-
+            let fp = row_key_fingerprint(
+                HU_ARENA_NS, player, street,
+                node_idx as u32, u32::from(bucket),
+            );
             entries.push(RowEntry {
                 namespace: HU_ARENA_NS,
                 seat: player,
@@ -546,6 +549,41 @@ fn build_buckets_metadata(
     }
 }
 
+/// Build training metadata for the manifest.
+fn build_training_metadata(
+    source_backend: &str,
+    iterations: u64,
+    elapsed_minutes: f64,
+) -> TrainingMetadata {
+    TrainingMetadata {
+        source_backend: source_backend.to_string(),
+        unit_kind: "Iteration".to_string(),
+        units_completed: iterations,
+        elapsed_minutes,
+        strategy_unit: "average_strategy".to_string(),
+        command: None,
+        config_path: None,
+        config_fingerprint: None,
+    }
+}
+
+/// Build layout metadata from the flattened arrays.
+fn build_layout_metadata(
+    rows: &[RowDescriptor],
+    actions: &[ActionDescriptor],
+    probs: &[f32],
+) -> LayoutMetadata {
+    LayoutMetadata {
+        row_count: rows.len() as u64,
+        action_descriptor_count: actions.len() as u64,
+        probability_count: probs.len() as u64,
+        row_sort_order:
+            "namespace_seat_street_node_bucket_fingerprint".to_string(),
+        row_namespace: vec!["hu_arena".to_string()],
+        missing_row_policy: "reject".to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_manifest(
     config: &BlueprintV2Config,
@@ -562,44 +600,18 @@ fn build_manifest(
         format_version: 1,
         compat_min_reader: 1,
         created_at: now_rfc3339_approx(),
-        producer: format!(
-            "poker-solver-core {}",
-            env!("CARGO_PKG_VERSION")
-        ),
-        producer_git: option_env!("GIT_HASH")
-            .unwrap_or("unknown")
-            .to_string(),
+        producer: format!("poker-solver-core {}", env!("CARGO_PKG_VERSION")),
+        producer_git: option_env!("GIT_HASH").unwrap_or("unknown").to_string(),
         required_features: Vec::new(),
         optional_features: vec!["row_key_fingerprint_v1".to_string()],
         game_fingerprint: game_fingerprint(config),
         source_config_fingerprint: None,
         game: build_game_metadata(config),
-        training: TrainingMetadata {
-            source_backend: source_backend.to_string(),
-            unit_kind: "Iteration".to_string(),
-            units_completed: iterations,
-            elapsed_minutes,
-            strategy_unit: "average_strategy".to_string(),
-            command: None,
-            config_path: None,
-            config_fingerprint: None,
-        },
-        strategy: StrategyMetadata {
-            normalization_tolerance: 1e-4,
-        },
-        layout: LayoutMetadata {
-            row_count: rows.len() as u64,
-            action_descriptor_count: actions.len() as u64,
-            probability_count: probs.len() as u64,
-            row_sort_order:
-                "namespace_seat_street_node_bucket_fingerprint".to_string(),
-            row_namespace: vec!["hu_arena".to_string()],
-            missing_row_policy: "reject".to_string(),
-        },
+        training: build_training_metadata(source_backend, iterations, elapsed_minutes),
+        strategy: StrategyMetadata { normalization_tolerance: 1e-4 },
+        layout: build_layout_metadata(rows, actions, probs),
         actions: ActionsMetadata {
-            action_abstraction_fingerprint: action_abstraction_fingerprint(
-                config,
-            ),
+            action_abstraction_fingerprint: action_abstraction_fingerprint(config),
         },
         buckets: build_buckets_metadata(config, bucket_counts),
         compatibility: CompatibilityMetadata {
@@ -669,52 +681,31 @@ fn validate_snapshot_name(name: &str) -> Result<(), ExportError> {
 ///
 /// Returns [`ExportError`] for missing files, bad snapshot names,
 /// deserialization failures, or write errors.
-pub fn export_hu_bundle(
-    bundle_dir: &Path,
-    snapshot: &str,
-    out_dir: &Path,
-) -> Result<(), ExportError> {
-    validate_snapshot_name(snapshot)?;
-
-    let config_path = bundle_dir.join("config.yaml");
-    if !config_path.exists() {
-        return Err(ExportError::MissingFile {
-            detail: format!(
-                "config.yaml not found in {}",
-                bundle_dir.display()
-            ),
-        });
+/// Require a file to exist, returning `MissingFile` otherwise.
+fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
+    if path.exists() {
+        Ok(())
+    } else {
+        Err(ExportError::MissingFile {
+            detail: format!("{label} not found at {}", path.display()),
+        })
     }
-    let config = load_config(bundle_dir).map_err(ExportError::Io)?;
+}
 
-    let snapshot_dir = bundle_dir.join(snapshot);
-    let strategy_path = snapshot_dir.join("strategy.bin");
-    if !strategy_path.exists() {
-        return Err(ExportError::MissingFile {
-            detail: format!(
-                "strategy.bin not found in {}",
-                snapshot_dir.display()
-            ),
-        });
-    }
-    let strategy =
-        BlueprintV2Strategy::load(&strategy_path).map_err(ExportError::Io)?;
+/// Load snapshot metadata from a legacy `metadata.json`.
+fn load_snapshot_metadata(
+    snapshot_dir: &Path,
+) -> Result<SnapshotMetadata, ExportError> {
+    let path = snapshot_dir.join("metadata.json");
+    require_file(&path, "metadata.json")?;
+    let text = std::fs::read_to_string(&path).map_err(ExportError::Io)?;
+    serde_json::from_str(&text)
+        .map_err(|e| ExportError::Json(e.to_string()))
+}
 
-    let metadata_path = snapshot_dir.join("metadata.json");
-    if !metadata_path.exists() {
-        return Err(ExportError::MissingFile {
-            detail: format!(
-                "metadata.json not found in {}",
-                snapshot_dir.display()
-            ),
-        });
-    }
-    let metadata_text =
-        std::fs::read_to_string(&metadata_path).map_err(ExportError::Io)?;
-    let metadata: SnapshotMetadata = serde_json::from_str(&metadata_text)
-        .map_err(|e| ExportError::Json(e.to_string()))?;
-
-    let tree = GameTree::build_with_options(
+/// Build a [`GameTree`] from a [`BlueprintV2Config`].
+fn tree_from_config(config: &BlueprintV2Config) -> GameTree {
+    GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
         config.game.big_blind,
@@ -723,34 +714,50 @@ pub fn export_hu_bundle(
         &config.action_abstraction.turn,
         &config.action_abstraction.river,
         config.game.allow_preflop_limp,
-    );
+    )
+}
+
+/// Export a legacy HU bundle directory to universal dense format.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] for missing files, bad snapshot names,
+/// deserialization failures, or write errors.
+pub fn export_hu_bundle(
+    bundle_dir: &Path,
+    snapshot: &str,
+    out_dir: &Path,
+) -> Result<(), ExportError> {
+    validate_snapshot_name(snapshot)?;
+
+    require_file(&bundle_dir.join("config.yaml"), "config.yaml")?;
+    let config = load_config(bundle_dir).map_err(ExportError::Io)?;
+
+    let snapshot_dir = bundle_dir.join(snapshot);
+    let strategy_path = snapshot_dir.join("strategy.bin");
+    require_file(&strategy_path, "strategy.bin")?;
+    let strategy =
+        BlueprintV2Strategy::load(&strategy_path).map_err(ExportError::Io)?;
+
+    let metadata = load_snapshot_metadata(&snapshot_dir)?;
+    let tree = tree_from_config(&config);
 
     let source_backend = match config.training.storage_backend.as_str() {
         "sparse" | "lazy" => "hu_sparse_projected",
         _ => "hu_dense",
     };
 
-    let iterations = metadata.iteration.unwrap_or(0);
-    let elapsed = metadata.elapsed_minutes.unwrap_or(0.0);
-
     let (rows, actions, probs, manifest) =
         export_hu_strategy_to_universal(
-            &config,
-            &tree,
-            &strategy,
-            source_backend,
-            iterations,
-            elapsed,
+            &config, &tree, &strategy, source_backend,
+            metadata.iteration.unwrap_or(0),
+            metadata.elapsed_minutes.unwrap_or(0.0),
         )?;
 
     write_bundle(
         out_dir,
         &manifest,
-        &BundleData {
-            rows: &rows,
-            actions: &actions,
-            probs: &probs,
-        },
+        &BundleData { rows: &rows, actions: &actions, probs: &probs },
     )?;
 
     Ok(())
