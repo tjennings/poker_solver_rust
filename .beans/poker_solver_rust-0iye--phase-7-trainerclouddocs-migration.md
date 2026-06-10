@@ -5,7 +5,7 @@ status: todo
 type: task
 priority: normal
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-10T16:59:37Z
+updated_at: 2026-06-10T19:06:22Z
 parent: poker_solver_rust-a29s
 ---
 
@@ -14,3 +14,7 @@ Roll the universal format into trainer/cloud outputs behind a migration-safe pat
 ## Scope Note (2026-06-10)
 
 Per user guidance on the parent bean: no legacy data migration required. This phase reduces to wiring trainers to write universal bundles natively (plus docs/cloud references); no bulk-conversion or historical-config compatibility work.
+
+## Scope Note (2026-06-10 goal recap)
+
+Reframed: ONE training workflow (lazy sparse, 2-10 players) and ONE TUI. This phase is not just 'trainer writes universal natively' — it is the consolidation point where HU blueprint_v2 training, the MP eager dense backend, and separate TUIs get retired rather than migrated. Needs its own planning pass before implementation.

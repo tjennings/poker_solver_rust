@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: high
 created_at: 2026-06-09T13:03:45Z
-updated_at: 2026-06-09T14:55:16Z
+updated_at: 2026-06-10T19:05:58Z
 ---
 
 There are currently separate HU blueprint_v2 and multiplayer/6-max trainer paths. Plan and eventually migrate toward one trainer architecture across all player counts. This is intentionally large and requires a detailed architecture plan before implementation. The plan must cover shared game/tree abstractions, storage/key identity, traversal/sampling, action abstraction, snapshot/bundle format, TUI/metrics, validation baselines, migration compatibility, and incremental rollout slices.
@@ -119,3 +119,7 @@ User requested starting the trainer merge now, with two explicit constraints:
 - End with one TUI. The HU TUI can be kept as the base and iterated into the unified TUI rather than introducing a third dashboard.
 
 Workflow note: the project instructions call for `hex:brainstorming`, but no callable `hex`/brainstorming tool is available in this environment. Use delegated research/architecture agents plus bean planning as the fallback brainstorming record.
+
+## Goal Recap (2026-06-10, from user)
+
+End state: ONE sparse tree representation in memory supporting 2-10 players, ONE training workflow, ONE TUI. The strategy export must remain compatible with the Tauri front-end; otherwise there is NO obligation to maintain backwards compatibility with anything (HU blueprint_v2 training, MP eager dense backend, legacy bundle formats, sparse snapshot schema are all changeable/retirable). The lazy sparse path is the chosen representation, not one backend among several.

@@ -79,7 +79,7 @@ Required top-level fields:
 `game` must identify the game independently of trainer internals:
 
 - `game_kind`: currently `"holdem_no_limit"`.
-- `num_players`: 2 through 8.
+- `num_players`: 2 through 10.
 - `seats`: ordered seat descriptors with seat id, label, blind/ante role, and
   starting stack.
 - `button_seat` and dealer/blind conventions used by the trainer.
@@ -252,9 +252,15 @@ Required fingerprints:
 
 ## Compatibility Policy
 
-- Legacy HU `config.yaml` plus `strategy.bin` bundles remain readable.
+The only hard compatibility obligation is the Tauri Explorer's ability to load
+and browse exported strategies (user direction, 2026-06-10). Everything below
+the first bullet is transitional convenience, droppable once the Explorer
+reads universal bundles.
+
 - Universal readers first look for `blueprint.json`; if absent, they may fall
   back to legacy HU loading.
+- Legacy HU `config.yaml` plus `strategy.bin` bundles remain readable during
+  the transition window.
 - Writers may continue writing legacy `strategy.bin` during a compatibility
   window.
 - MP eager and MP lazy exports must not masquerade as legacy HU bundles.
