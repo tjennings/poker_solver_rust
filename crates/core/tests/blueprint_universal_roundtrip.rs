@@ -7,25 +7,94 @@ use poker_solver_core::blueprint_universal::{
     ActionDescriptor, ActionKind, BundleReader, BundleWriter, FormatError, Manifest,
     RowDescriptor,
 };
+use poker_solver_core::blueprint_universal::{
+    SeatDescriptor, RakeConfig, BucketFileRef, PerFlopBucketConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a minimal valid manifest for testing.
+/// Build a minimal valid manifest for testing with all spec-required fields.
 fn test_manifest(row_count: u64, action_count: u64, prob_count: u64) -> Manifest {
-    Manifest::builder()
-        .format_name("dense_blueprint".to_string())
-        .format_version(1)
-        .compat_min_reader(1)
-        .producer("test-harness".to_string())
-        .producer_git("unknown".to_string())
-        .num_players(2)
-        .row_count(row_count)
-        .action_descriptor_count(action_count)
-        .probability_count(prob_count)
-        .normalization_tolerance(1e-4)
-        .build()
+    use poker_solver_core::blueprint_universal::*;
+    use std::collections::BTreeMap;
+
+    Manifest {
+        format_name: "dense_blueprint".to_string(),
+        format_version: 1,
+        compat_min_reader: 1,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        producer: "test-harness".to_string(),
+        producer_git: "unknown".to_string(),
+        required_features: Vec::new(),
+        optional_features: Vec::new(),
+        game_fingerprint: 0x1234_5678_ABCD_EF00,
+        source_config_fingerprint: None,
+        game: GameMetadata {
+            game_kind: "holdem_no_limit".to_string(),
+            num_players: 2,
+            seats: vec![
+                SeatDescriptor {
+                    seat_id: 0,
+                    label: "SB".to_string(),
+                    blind_ante_role: "small_blind".to_string(),
+                    starting_stack: 100.0,
+                },
+                SeatDescriptor {
+                    seat_id: 1,
+                    label: "BB".to_string(),
+                    blind_ante_role: "big_blind".to_string(),
+                    starting_stack: 100.0,
+                },
+            ],
+            button_seat: 0,
+            small_blind: 1.0,
+            big_blind: 2.0,
+            antes: vec![],
+            straddles: vec![],
+            stack_units: "chips".to_string(),
+            rake: RakeConfig { rate: 0.0, cap: 0.0 },
+            max_flop_players: None,
+        },
+        training: TrainingMetadata {
+            source_backend: "hu_dense".to_string(),
+            unit_kind: "Iteration".to_string(),
+            units_completed: 0,
+            elapsed_minutes: 0.0,
+            strategy_unit: "average_strategy".to_string(),
+            command: None,
+            config_path: None,
+            config_fingerprint: None,
+        },
+        strategy: StrategyMetadata {
+            normalization_tolerance: 1e-4,
+        },
+        layout: LayoutMetadata {
+            row_count,
+            action_descriptor_count: action_count,
+            probability_count: prob_count,
+            row_sort_order: "namespace_seat_street_node_bucket_fingerprint".to_string(),
+            row_namespace: vec!["hu_arena".to_string()],
+            missing_row_policy: "reject".to_string(),
+        },
+        actions: ActionsMetadata {
+            action_abstraction_fingerprint: 0,
+        },
+        buckets: BucketsMetadata {
+            bucket_mode: "none".to_string(),
+            bucket_semantic_fingerprint: 0,
+            street_bucket_counts: BTreeMap::new(),
+            bucket_files: vec![],
+            bucket_generator_version: "1.0.0".to_string(),
+            per_flop_bucket_config: None,
+        },
+        compatibility: CompatibilityMetadata {
+            legacy_fallback: false,
+            missing_row_policy: "reject".to_string(),
+        },
+        files: BTreeMap::new(),
+    }
 }
 
 /// Build synthetic rows, actions, and probabilities for `n` rows,
@@ -524,6 +593,88 @@ fn rejects_missing_manifest() {
         matches!(err, FormatError::MissingFile { .. } | FormatError::InvalidManifest { .. }),
         "expected MissingFile or InvalidManifest, got {err:?}"
     );
+}
+
+/// Manifest new fields survive write -> read round-trip.
+#[test]
+fn manifest_new_fields_round_trip() {
+    use poker_solver_core::blueprint_universal::*;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut manifest = test_manifest(0, 0, 0);
+    manifest.game_fingerprint = 0xCAFE_BABE_DEAD_BEEF;
+    manifest.source_config_fingerprint = Some(0x1111_2222_3333_4444);
+    manifest.game.seats = vec![
+        SeatDescriptor {
+            seat_id: 0,
+            label: "UTG".to_string(),
+            blind_ante_role: "none".to_string(),
+            starting_stack: 200.0,
+        },
+    ];
+    manifest.game.button_seat = 0;
+    manifest.game.antes = vec![0.0, 0.0, 1.0];
+    manifest.game.straddles = vec![4.0];
+    manifest.game.stack_units = "big_blinds".to_string();
+    manifest.game.rake = RakeConfig { rate: 0.05, cap: 3.0 };
+    manifest.game.max_flop_players = Some(3);
+    manifest.training.elapsed_minutes = 42.5;
+    manifest.training.strategy_unit = "current_regret_matched_strategy".to_string();
+    manifest.training.command = Some("train --fast".to_string());
+    manifest.training.config_path = Some("/path/to/config.yaml".to_string());
+    manifest.training.config_fingerprint = Some(0xAAAA_BBBB);
+    manifest.buckets.street_bucket_counts = {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("preflop".to_string(), 169);
+        m.insert("flop".to_string(), 500);
+        m
+    };
+    manifest.buckets.bucket_files = vec![BucketFileRef {
+        name: "flop.buckets".to_string(),
+        path: "buckets/flop.buckets".to_string(),
+        byte_size: 1024,
+        sha256: "abc123".to_string(),
+    }];
+    manifest.buckets.bucket_generator_version = "2.1.0".to_string();
+    manifest.buckets.per_flop_bucket_config = Some(PerFlopBucketConfig {
+        mode: "per_flop".to_string(),
+        canonicalization_params: std::collections::BTreeMap::new(),
+    });
+    manifest.layout.row_namespace = vec!["hu_arena".to_string(), "mp_arena".to_string()];
+
+    BundleWriter::write(dir.path(), &manifest, &[], &[], &[]).expect("write");
+
+    // Re-read manifest JSON and verify new fields
+    let text = std::fs::read_to_string(dir.path().join("blueprint.json")).expect("read");
+    let loaded: Manifest = serde_json::from_str(&text).expect("parse");
+
+    assert_eq!(loaded.game_fingerprint, 0xCAFE_BABE_DEAD_BEEF);
+    assert_eq!(loaded.source_config_fingerprint, Some(0x1111_2222_3333_4444));
+    assert_eq!(loaded.game.seats.len(), 1);
+    assert_eq!(loaded.game.seats[0].label, "UTG");
+    assert_eq!(loaded.game.button_seat, 0);
+    assert_eq!(loaded.game.antes, vec![0.0, 0.0, 1.0]);
+    assert_eq!(loaded.game.straddles, vec![4.0]);
+    assert_eq!(loaded.game.stack_units, "big_blinds");
+    assert!((loaded.game.rake.rate - 0.05).abs() < 1e-9);
+    assert!((loaded.game.rake.cap - 3.0).abs() < 1e-9);
+    assert_eq!(loaded.game.max_flop_players, Some(3));
+    assert!((loaded.training.elapsed_minutes - 42.5).abs() < 1e-9);
+    assert_eq!(loaded.training.strategy_unit, "current_regret_matched_strategy");
+    assert_eq!(loaded.training.command, Some("train --fast".to_string()));
+    assert_eq!(loaded.training.config_path, Some("/path/to/config.yaml".to_string()));
+    assert_eq!(loaded.training.config_fingerprint, Some(0xAAAA_BBBB));
+    assert_eq!(*loaded.buckets.street_bucket_counts.get("preflop").unwrap(), 169);
+    assert_eq!(*loaded.buckets.street_bucket_counts.get("flop").unwrap(), 500);
+    assert_eq!(loaded.buckets.bucket_files.len(), 1);
+    assert_eq!(loaded.buckets.bucket_files[0].name, "flop.buckets");
+    assert_eq!(loaded.buckets.bucket_files[0].byte_size, 1024);
+    assert_eq!(loaded.buckets.bucket_generator_version, "2.1.0");
+    assert!(loaded.buckets.per_flop_bucket_config.is_some());
+    assert_eq!(loaded.layout.row_namespace, vec!["hu_arena", "mp_arena"]);
+
+    // Also verify full reader pipeline accepts it
+    let _reader = BundleReader::open(dir.path()).expect("open");
 }
 
 /// Finding 3: missing file entry in manifest.files must be a hard error,

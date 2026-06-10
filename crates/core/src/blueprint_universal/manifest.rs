@@ -18,6 +18,11 @@ pub struct Manifest {
     pub producer_git: String,
     pub required_features: Vec<String>,
     pub optional_features: Vec<String>,
+    /// Stable 64-bit hash identifying the game configuration.
+    pub game_fingerprint: u64,
+    /// Source config fingerprint, present when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_config_fingerprint: Option<u64>,
     pub game: GameMetadata,
     pub training: TrainingMetadata,
     pub strategy: StrategyMetadata,
@@ -33,8 +38,39 @@ pub struct Manifest {
 pub struct GameMetadata {
     pub game_kind: String,
     pub num_players: u8,
+    /// Ordered seat descriptors.
+    pub seats: Vec<SeatDescriptor>,
+    /// Seat index of the button/dealer.
+    pub button_seat: u8,
     pub small_blind: f64,
     pub big_blind: f64,
+    /// Per-seat antes (empty if no antes).
+    pub antes: Vec<f64>,
+    /// Per-seat straddles (empty if no straddles).
+    pub straddles: Vec<f64>,
+    /// Unit for stack values, e.g. "chips" or "big_blinds".
+    pub stack_units: String,
+    /// Rake configuration, present even when zero.
+    pub rake: RakeConfig,
+    /// Maximum number of players on the flop when a preflop cap is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_flop_players: Option<u8>,
+}
+
+/// Descriptor for a single seat at the table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SeatDescriptor {
+    pub seat_id: u8,
+    pub label: String,
+    pub blind_ante_role: String,
+    pub starting_stack: f64,
+}
+
+/// Rake rate and cap configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RakeConfig {
+    pub rate: f64,
+    pub cap: f64,
 }
 
 /// Training provenance metadata.
@@ -43,12 +79,23 @@ pub struct TrainingMetadata {
     pub source_backend: String,
     pub unit_kind: String,
     pub units_completed: u64,
+    pub elapsed_minutes: f64,
+    /// The strategy representation stored in the bundle.
+    pub strategy_unit: String,
+    /// CLI command used to produce the bundle, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Path to the source config file, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// Fingerprint of the source config, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_fingerprint: Option<u64>,
 }
 
 /// Strategy payload metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyMetadata {
-    pub strategy_unit: String,
     pub normalization_tolerance: f64,
 }
 
@@ -59,6 +106,8 @@ pub struct LayoutMetadata {
     pub action_descriptor_count: u64,
     pub probability_count: u64,
     pub row_sort_order: String,
+    /// Allowed namespaces in the row file.
+    pub row_namespace: Vec<String>,
     pub missing_row_policy: String,
 }
 
@@ -73,6 +122,31 @@ pub struct ActionsMetadata {
 pub struct BucketsMetadata {
     pub bucket_mode: String,
     pub bucket_semantic_fingerprint: u64,
+    /// Per-street bucket counts (e.g. "preflop" -> 169).
+    pub street_bucket_counts: BTreeMap<String, u64>,
+    /// References to bucket files (embedded or external).
+    pub bucket_files: Vec<BucketFileRef>,
+    /// Version of the bucket generator that produced the buckets.
+    pub bucket_generator_version: String,
+    /// Per-flop bucket configuration, when used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_flop_bucket_config: Option<PerFlopBucketConfig>,
+}
+
+/// Reference to a bucket file with integrity metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BucketFileRef {
+    pub name: String,
+    pub path: String,
+    pub byte_size: u64,
+    pub sha256: String,
+}
+
+/// Per-flop bucket mode and canonicalization parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PerFlopBucketConfig {
+    pub mode: String,
+    pub canonicalization_params: BTreeMap<String, String>,
 }
 
 /// Compatibility and legacy behavior metadata.
@@ -87,148 +161,4 @@ pub struct CompatibilityMetadata {
 pub struct FileEntry {
     pub size: u64,
     pub sha256: String,
-}
-
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
-
-/// Builder for constructing a [`Manifest`] with sensible defaults for testing.
-pub struct ManifestBuilder {
-    format_name: String,
-    format_version: u16,
-    compat_min_reader: u16,
-    producer: String,
-    producer_git: String,
-    num_players: u8,
-    row_count: u64,
-    action_descriptor_count: u64,
-    probability_count: u64,
-    normalization_tolerance: f64,
-    required_features: Vec<String>,
-    optional_features: Vec<String>,
-}
-
-impl ManifestBuilder {
-    #[must_use]
-    pub fn format_name(mut self, v: String) -> Self {
-        self.format_name = v;
-        self
-    }
-    #[must_use]
-    pub fn format_version(mut self, v: u16) -> Self {
-        self.format_version = v;
-        self
-    }
-    #[must_use]
-    pub fn compat_min_reader(mut self, v: u16) -> Self {
-        self.compat_min_reader = v;
-        self
-    }
-    #[must_use]
-    pub fn producer(mut self, v: String) -> Self {
-        self.producer = v;
-        self
-    }
-    #[must_use]
-    pub fn producer_git(mut self, v: String) -> Self {
-        self.producer_git = v;
-        self
-    }
-    #[must_use]
-    pub fn num_players(mut self, v: u8) -> Self {
-        self.num_players = v;
-        self
-    }
-    #[must_use]
-    pub fn row_count(mut self, v: u64) -> Self {
-        self.row_count = v;
-        self
-    }
-    #[must_use]
-    pub fn action_descriptor_count(mut self, v: u64) -> Self {
-        self.action_descriptor_count = v;
-        self
-    }
-    #[must_use]
-    pub fn probability_count(mut self, v: u64) -> Self {
-        self.probability_count = v;
-        self
-    }
-    #[must_use]
-    pub fn normalization_tolerance(mut self, v: f64) -> Self {
-        self.normalization_tolerance = v;
-        self
-    }
-
-    /// Build the manifest with file entries to be filled in by the writer.
-    #[must_use]
-    pub fn build(self) -> Manifest {
-        Manifest {
-            format_name: self.format_name,
-            format_version: self.format_version,
-            compat_min_reader: self.compat_min_reader,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            producer: self.producer,
-            producer_git: self.producer_git,
-            required_features: self.required_features,
-            optional_features: self.optional_features,
-            game: GameMetadata {
-                game_kind: "holdem_no_limit".to_string(),
-                num_players: self.num_players,
-                small_blind: 1.0,
-                big_blind: 2.0,
-            },
-            training: TrainingMetadata {
-                source_backend: "hu_dense".to_string(),
-                unit_kind: "Iteration".to_string(),
-                units_completed: 0,
-            },
-            strategy: StrategyMetadata {
-                strategy_unit: "average_strategy".to_string(),
-                normalization_tolerance: self.normalization_tolerance,
-            },
-            layout: LayoutMetadata {
-                row_count: self.row_count,
-                action_descriptor_count: self.action_descriptor_count,
-                probability_count: self.probability_count,
-                row_sort_order: "namespace_seat_street_node_bucket_fingerprint"
-                    .to_string(),
-                missing_row_policy: "reject".to_string(),
-            },
-            actions: ActionsMetadata {
-                action_abstraction_fingerprint: 0,
-            },
-            buckets: BucketsMetadata {
-                bucket_mode: "none".to_string(),
-                bucket_semantic_fingerprint: 0,
-            },
-            compatibility: CompatibilityMetadata {
-                legacy_fallback: false,
-                missing_row_policy: "reject".to_string(),
-            },
-            files: BTreeMap::new(),
-        }
-    }
-}
-
-impl Manifest {
-    /// Start building a manifest.
-    #[must_use]
-    pub fn builder() -> ManifestBuilder {
-        ManifestBuilder {
-            format_name: "dense_blueprint".to_string(),
-            format_version: 1,
-            compat_min_reader: 1,
-            producer: String::new(),
-            producer_git: "unknown".to_string(),
-            num_players: 2,
-            row_count: 0,
-            action_descriptor_count: 0,
-            probability_count: 0,
-            normalization_tolerance: 1e-4,
-            required_features: Vec::new(),
-            optional_features: Vec::new(),
-        }
-    }
 }

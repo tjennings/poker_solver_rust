@@ -14,6 +14,10 @@ mod bundle;
 
 pub use error::FormatError;
 pub use header::{BinaryHeader, HEADER_SIZE};
-pub use manifest::Manifest;
+pub use manifest::{
+    Manifest, GameMetadata, TrainingMetadata, StrategyMetadata, LayoutMetadata,
+    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, FileEntry,
+    SeatDescriptor, RakeConfig, BucketFileRef, PerFlopBucketConfig,
+};
 pub use descriptors::{ActionDescriptor, ActionKind, RowDescriptor, ROW_DESCRIPTOR_SIZE};
 pub use bundle::{BundleReader, BundleWriter};
