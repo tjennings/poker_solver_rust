@@ -57,6 +57,23 @@ The output directory contains `blueprint.json`, `strategy.rows.bin`,
 export is analysis-only (no `cfr.snapshot.bin`); dense HU exports use the
 `reject` missing-row policy.
 
+### export-universal-mp
+
+Export an eager (dense) N-player `blueprint_mp` snapshot into the universal
+dense format. Rows use the `mp_arena` namespace with explicit acting seat;
+probabilities pass through bitwise from the snapshot's projected
+`strategy.bin`. Bucket counts are cross-checked between `config.yaml`,
+`strategy.bin`, and `metadata.json` (mismatch is a hard error). Unified
+HU/MP bundle detection is a later phase — use this command for MP bundles
+and `export-universal` for HU bundles.
+
+```bash
+cargo run -p poker-solver-trainer --release -- export-universal-mp \
+  --bundle <mp_output_dir> \
+  --snapshot final \            # or snapshot_NNNN (default: final)
+  --out <universal_bundle_dir>
+```
+
 ### inspect-mp-config
 
 Inspect a multiplayer blueprint config before training. This reports effective stack depth, bucket counts, action-row counts, and known eager-backend risk patterns before the trainer builds dense tree/storage structures.
