@@ -86,35 +86,27 @@ struct NodeLayout {
 /// than silently aliased onto incompatible row data.
 #[must_use]
 pub fn action_schema_fingerprint(actions: &[TreeAction]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    use crate::blueprint_universal::hash::Fnv1aHasher;
 
-    fn mix(hash: &mut u64, value: u64) {
-        for byte in value.to_le_bytes() {
-            *hash ^= u64::from(byte);
-            *hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    }
-
-    let mut h = FNV_OFFSET;
-    mix(&mut h, actions.len() as u64);
+    let mut h = Fnv1aHasher::new();
+    h.mix_u64(actions.len() as u64);
     for action in actions {
         match *action {
-            TreeAction::Fold => mix(&mut h, 0),
-            TreeAction::Check => mix(&mut h, 1),
-            TreeAction::Call => mix(&mut h, 2),
+            TreeAction::Fold => h.mix_u64(0),
+            TreeAction::Check => h.mix_u64(1),
+            TreeAction::Call => h.mix_u64(2),
             TreeAction::Bet(v) => {
-                mix(&mut h, 3);
-                mix(&mut h, v.to_bits());
+                h.mix_u64(3);
+                h.mix_u64(v.to_bits());
             }
             TreeAction::Raise(v) => {
-                mix(&mut h, 4);
-                mix(&mut h, v.to_bits());
+                h.mix_u64(4);
+                h.mix_u64(v.to_bits());
             }
-            TreeAction::AllIn => mix(&mut h, 5),
+            TreeAction::AllIn => h.mix_u64(5),
         }
     }
-    h
+    h.finish()
 }
 
 /// Instrumentation snapshot for blueprint_v2 CFR storage backends.
@@ -1790,5 +1782,18 @@ mod tests {
         let loaded = BlueprintStorage::load_regrets(&path, &tree, [50, 50, 50, 50]).expect("load");
         assert_eq!(loaded.get_strategy_sum(node_idx, 5, 0), large_val);
         assert_eq!(loaded.get_regret(node_idx, 5, 0), 42);
+    }
+
+    /// Regression: refactoring to shared `Fnv1aHasher` must not change
+    /// the action schema fingerprint values.
+    #[test]
+    fn action_schema_fingerprint_regression() {
+        let actions = [
+            TreeAction::Fold,
+            TreeAction::Call,
+            TreeAction::Raise(5.0),
+        ];
+        let fp = action_schema_fingerprint(&actions);
+        assert_eq!(fp, 0x566e_b53f_9cda_1394);
     }
 }

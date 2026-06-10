@@ -7,10 +7,12 @@
 //! See `docs/blueprint_format.md` for the full specification.
 
 mod error;
+pub(crate) mod hash;
 mod header;
 mod manifest;
 mod descriptors;
 mod bundle;
+pub mod hu_export;
 
 pub use error::FormatError;
 pub use header::{BinaryHeader, HEADER_SIZE};

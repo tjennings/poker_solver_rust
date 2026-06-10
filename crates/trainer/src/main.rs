@@ -593,6 +593,19 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// Export a legacy HU blueprint bundle to universal dense format
+    #[command(name = "export-universal")]
+    ExportUniversal {
+        /// Path to legacy HU bundle directory (contains config.yaml)
+        #[arg(short, long)]
+        bundle: PathBuf,
+        /// Snapshot to export (default: final)
+        #[arg(short, long, default_value = "final")]
+        snapshot: String,
+        /// Output directory for the universal bundle
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1763,6 +1776,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             output,
         } => {
             run_rebel_validate(&config, num_examples, &output)?;
+        }
+        Commands::ExportUniversal {
+            bundle,
+            snapshot,
+            out,
+        } => {
+            run_export_universal(&bundle, &snapshot, &out)?;
         }
     }
 
@@ -4506,6 +4526,29 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
         iteration_at_snapshot: 0,
         error_message: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// export-universal subcommand
+// ---------------------------------------------------------------------------
+
+fn run_export_universal(
+    bundle: &Path,
+    snapshot: &str,
+    out: &Path,
+) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_universal::hu_export;
+
+    eprintln!("Exporting HU blueprint to universal dense format");
+    eprintln!("  Bundle: {}", bundle.display());
+    eprintln!("  Snapshot: {snapshot}");
+    eprintln!("  Output: {}", out.display());
+
+    hu_export::export_hu_bundle(bundle, snapshot, out)
+        .map_err(|e| format!("export failed: {e}"))?;
+
+    eprintln!("Export complete: {}", out.display());
+    Ok(())
 }
 
 #[cfg(test)]
