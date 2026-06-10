@@ -213,9 +213,9 @@ fn mp_action_label(action: &TreeAction) -> String {
 /// Compute an action schema fingerprint for MP tree actions.
 ///
 /// Uses the same structural approach as
-/// `blueprint_v2::storage::action_schema_fingerprint` (kind discriminant
-/// + amount bits via `Fnv1aHasher`), but adapted for the MP
-/// `TreeAction` variants.
+/// `blueprint_v2::storage::action_schema_fingerprint` (kind discriminant and
+/// amount bits via [`Fnv1aHasher`]), but adapted for the MP
+/// [`TreeAction`] variants.
 pub(crate) fn mp_action_schema_fingerprint(actions: &[TreeAction]) -> u64 {
     let mut h = Fnv1aHasher::new();
     h.mix_u64(actions.len() as u64);
@@ -336,17 +336,23 @@ fn validate_bucket_counts(
 }
 
 // ---------------------------------------------------------------------------
-// Row collection
+// Row collection (unified)
 // ---------------------------------------------------------------------------
 
-/// Collect all `(decision_node, bucket)` rows from the MP tree + storage.
-fn collect_mp_row_entries(
+/// Collect all `(decision_node, bucket)` rows from the MP tree using a
+/// caller-supplied probability function.
+///
+/// `prob_fn(node_idx, decision_idx, bucket, num_actions)` returns the
+/// probability vector for one (node, bucket) pair.  The `node_idx` is
+/// the index into `tree.nodes`; `decision_idx` is the sequential count
+/// of decision nodes seen so far (used by the projected strategy path).
+fn collect_row_entries_with(
     tree: &MpGameTree,
-    storage: &MpStorage,
     bucket_counts: [u16; 4],
+    mut prob_fn: impl FnMut(u32, usize, u16, usize) -> Vec<f32>,
 ) -> Vec<RowEntry> {
     let mut entries = Vec::new();
-    let mut avg_buf = vec![0.0_f64; 64];
+    let mut decision_idx = 0usize;
 
     for (node_idx, node) in tree.nodes.iter().enumerate() {
         let (seat, street, tree_actions) = match node {
@@ -362,20 +368,10 @@ fn collect_mp_row_entries(
         let schema_fp = mp_action_schema_fingerprint(tree_actions);
         let action_descs = build_mp_action_descriptors(tree_actions);
 
-        if avg_buf.len() < num_actions {
-            avg_buf.resize(num_actions, 0.0);
-        }
-
         for bucket in 0..buckets {
-            storage.average_strategy(
-                node_idx as u32,
-                bucket,
-                num_actions,
-                &mut avg_buf,
+            let probs = prob_fn(
+                node_idx as u32, decision_idx, bucket, num_actions,
             );
-            let probs: Vec<f32> =
-                avg_buf[..num_actions].iter().map(|&p| p as f32).collect();
-
             let fp = row_key_fingerprint(
                 MP_ARENA_NS,
                 seat.index(),
@@ -395,9 +391,27 @@ fn collect_mp_row_entries(
                 probs,
             });
         }
+
+        decision_idx += 1;
     }
 
     entries
+}
+
+/// Collect rows using live [`MpStorage`] average-strategy sums.
+fn collect_mp_row_entries(
+    tree: &MpGameTree,
+    storage: &MpStorage,
+    bucket_counts: [u16; 4],
+) -> Vec<RowEntry> {
+    let mut avg_buf = vec![0.0_f64; 64];
+    collect_row_entries_with(tree, bucket_counts, |node_idx, _, bucket, n| {
+        if avg_buf.len() < n {
+            avg_buf.resize(n, 0.0);
+        }
+        storage.average_strategy(node_idx, bucket, n, &mut avg_buf);
+        avg_buf[..n].iter().map(|&p| p as f32).collect()
+    })
 }
 
 /// Build action descriptors for an MP node's actions.
@@ -525,7 +539,7 @@ fn bb_amount(game: &crate::blueprint_mp::config::MpGameConfig) -> f64 {
         .map_or(0.0, |b| b.amount)
 }
 
-/// Find the button seat per MP game_tree.rs conventions.
+/// Find the button seat per MP `game_tree` conventions.
 ///
 /// In 2-player: SB = BTN. In N-player: BTN is the seat before SB.
 fn find_mp_button(
@@ -676,6 +690,75 @@ fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
     }
 }
 
+/// Load an MP config from the output directory.
+fn load_mp_config(mp_output_dir: &Path) -> Result<BlueprintMpConfig, ExportError> {
+    let config_path = mp_output_dir.join("config.yaml");
+    require_file(&config_path, "config.yaml")?;
+    let config_text =
+        std::fs::read_to_string(&config_path).map_err(ExportError::Io)?;
+    serde_yaml::from_str(&config_text)
+        .map_err(|e| ExportError::Json(e.to_string()))
+}
+
+/// Loaded MP snapshot: projected strategy plus parsed metadata.
+struct MpSnapshotBundle {
+    strategy: crate::blueprint_v2::bundle::BlueprintV2Strategy,
+    metadata: MpSnapshotMetadata,
+}
+
+/// Load and validate a snapshot's strategy and metadata from disk.
+fn load_mp_snapshot(
+    snapshot_dir: &Path,
+) -> Result<MpSnapshotBundle, ExportError> {
+    let strategy_path = snapshot_dir.join("strategy.bin");
+    require_file(&strategy_path, "strategy.bin")?;
+
+    let metadata_path = snapshot_dir.join("metadata.json");
+    require_file(&metadata_path, "metadata.json")?;
+    let meta_text =
+        std::fs::read_to_string(&metadata_path).map_err(ExportError::Io)?;
+    let metadata: MpSnapshotMetadata = serde_json::from_str(&meta_text)
+        .map_err(|e| ExportError::Json(e.to_string()))?;
+
+    if let Some(kind) = &metadata.kind
+        && kind != "blueprint_mp"
+    {
+        return Err(ExportError::BadMetadataKind {
+            actual: kind.clone(),
+        });
+    }
+
+    let strategy = crate::blueprint_v2::bundle::BlueprintV2Strategy::load(
+        &strategy_path,
+    )
+    .map_err(ExportError::Io)?;
+
+    Ok(MpSnapshotBundle { strategy, metadata })
+}
+
+/// Validate bucket counts between config and snapshot, returning error
+/// on mismatch.
+fn validate_snapshot_bucket_counts(
+    config_counts: [u16; 4],
+    snapshot: &MpSnapshotBundle,
+) -> Result<(), ExportError> {
+    if snapshot.strategy.bucket_counts != config_counts {
+        return Err(ExportError::BucketCountMismatch {
+            config_counts,
+            storage_counts: snapshot.strategy.bucket_counts,
+        });
+    }
+    if let Some(meta_counts) = snapshot.metadata.bucket_counts
+        && meta_counts != config_counts
+    {
+        return Err(ExportError::BucketCountMismatch {
+            config_counts,
+            storage_counts: meta_counts,
+        });
+    }
+    Ok(())
+}
+
 /// Export a saved MP eager snapshot to universal dense format.
 ///
 /// Loads `config.yaml`, builds the tree, loads `strategy.bin` and
@@ -690,68 +773,21 @@ pub fn export_mp_bundle(
     snapshot: &str,
     out_dir: &Path,
 ) -> Result<(), ExportError> {
-    let config_path = mp_output_dir.join("config.yaml");
-    require_file(&config_path, "config.yaml")?;
-    let config_text =
-        std::fs::read_to_string(&config_path).map_err(ExportError::Io)?;
-    let config: BlueprintMpConfig = serde_yaml::from_str(&config_text)
-        .map_err(|e| ExportError::Json(e.to_string()))?;
+    let config = load_mp_config(mp_output_dir)?;
+    let snap = load_mp_snapshot(&mp_output_dir.join(snapshot))?;
+    validate_snapshot_bucket_counts(
+        config.clustering.bucket_counts(), &snap,
+    )?;
 
-    let snapshot_dir = mp_output_dir.join(snapshot);
-    let strategy_path = snapshot_dir.join("strategy.bin");
-    require_file(&strategy_path, "strategy.bin")?;
-
-    let metadata_path = snapshot_dir.join("metadata.json");
-    require_file(&metadata_path, "metadata.json")?;
-    let meta_text =
-        std::fs::read_to_string(&metadata_path).map_err(ExportError::Io)?;
-    let metadata: MpSnapshotMetadata = serde_json::from_str(&meta_text)
-        .map_err(|e| ExportError::Json(e.to_string()))?;
-
-    // Validate metadata kind
-    if let Some(kind) = &metadata.kind {
-        if kind != "blueprint_mp" {
-            return Err(ExportError::BadMetadataKind {
-                actual: kind.clone(),
-            });
-        }
-    }
-
-    // Load projected strategy
-    let strategy = crate::blueprint_v2::bundle::BlueprintV2Strategy::load(
-        &strategy_path,
-    )
-    .map_err(ExportError::Io)?;
-
-    // Validate bucket counts: config vs strategy
-    let config_counts = config.clustering.bucket_counts();
-    if strategy.bucket_counts != config_counts {
-        return Err(ExportError::BucketCountMismatch {
-            config_counts,
-            storage_counts: strategy.bucket_counts,
-        });
-    }
-
-    // Validate bucket counts from metadata if present
-    if let Some(meta_counts) = metadata.bucket_counts {
-        if meta_counts != config_counts {
-            return Err(ExportError::BucketCountMismatch {
-                config_counts,
-                storage_counts: meta_counts,
-            });
-        }
-    }
-
-    // Build tree and export using the projected strategy
     let tree = MpGameTree::build(&config.game, &config.action_abstraction);
     let training = MpTrainingInfo {
-        iterations: metadata.iterations.unwrap_or(0),
-        elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0) as f64,
+        iterations: snap.metadata.iterations.unwrap_or(0),
+        elapsed_minutes: snap.metadata.elapsed_minutes.unwrap_or(0) as f64,
     };
 
     let output = export_mp_strategy_from_projected(
-        &config, &tree, &strategy, &training,
-    )?;
+        &config, &tree, &snap.strategy, &training,
+    );
 
     write_bundle(
         out_dir,
@@ -775,7 +811,7 @@ fn export_mp_strategy_from_projected(
     tree: &MpGameTree,
     strategy: &crate::blueprint_v2::bundle::BlueprintV2Strategy,
     training: &MpTrainingInfo,
-) -> Result<ExportOutput, ExportError> {
+) -> ExportOutput {
     let bucket_counts = config.clustering.bucket_counts();
     let mut entries = collect_projected_row_entries(
         tree, strategy, bucket_counts,
@@ -787,60 +823,18 @@ fn export_mp_strategy_from_projected(
         config, training, &rows, &actions, &probs, bucket_counts,
     );
 
-    Ok(ExportOutput { rows, actions, probs, manifest })
+    ExportOutput { rows, actions, probs, manifest }
 }
 
-/// Collect rows from a projected `BlueprintV2Strategy`.
+/// Collect rows from a projected [`BlueprintV2Strategy`].
 fn collect_projected_row_entries(
     tree: &MpGameTree,
     strategy: &crate::blueprint_v2::bundle::BlueprintV2Strategy,
     bucket_counts: [u16; 4],
 ) -> Vec<RowEntry> {
-    let mut entries = Vec::new();
-    let mut decision_idx = 0usize;
-
-    for (node_idx, node) in tree.nodes.iter().enumerate() {
-        let (seat, street, tree_actions) = match node {
-            MpGameNode::Decision {
-                seat, street, actions, ..
-            } => (*seat, *street, actions),
-            _ => continue,
-        };
-
-        let street_u8 = street as u8;
-        let buckets = bucket_counts[street_u8 as usize];
-        let num_actions = tree_actions.len();
-        let schema_fp = mp_action_schema_fingerprint(tree_actions);
-        let action_descs = build_mp_action_descriptors(tree_actions);
-
-        for bucket in 0..buckets {
-            let probs = extract_projected_probs(
-                strategy, decision_idx, bucket, num_actions,
-            );
-            let fp = row_key_fingerprint(
-                MP_ARENA_NS,
-                seat.index(),
-                street_u8,
-                node_idx as u32,
-                u32::from(bucket),
-            );
-            entries.push(RowEntry {
-                namespace: MP_ARENA_NS,
-                seat: seat.index(),
-                street: street_u8,
-                source_node_idx: node_idx as u32,
-                global_bucket: u32::from(bucket),
-                row_key_fp: fp,
-                action_schema_fp: schema_fp,
-                actions: action_descs.clone(),
-                probs,
-            });
-        }
-
-        decision_idx += 1;
-    }
-
-    entries
+    collect_row_entries_with(tree, bucket_counts, |_, dec_idx, bucket, n| {
+        extract_projected_probs(strategy, dec_idx, bucket, n)
+    })
 }
 
 /// Extract probabilities for a single bucket from the projected strategy.
