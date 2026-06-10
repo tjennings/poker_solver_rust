@@ -98,12 +98,15 @@ impl BundleWriter {
     }
 }
 
+/// Boxed write closure for payload serialization.
+type PayloadWriteFn<'a> = Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>;
+
 /// Payload spec for a single binary file to write.
 struct PayloadSpec<'a> {
     name: &'a str,
     magic: [u8; 8],
     record_count: usize,
-    write_fn: Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>,
+    write_fn: PayloadWriteFn<'a>,
 }
 
 /// Write a single binary payload file and return its `FileEntry`.

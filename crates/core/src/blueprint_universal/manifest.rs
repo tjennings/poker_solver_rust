@@ -48,7 +48,7 @@ pub struct GameMetadata {
     pub antes: Vec<f64>,
     /// Per-seat straddles (empty if no straddles).
     pub straddles: Vec<f64>,
-    /// Unit for stack values, e.g. "chips" or "big_blinds".
+    /// Unit for stack values, e.g. `"chips"` or `"big_blinds"`.
     pub stack_units: String,
     /// Rake configuration, present even when zero.
     pub rake: RakeConfig,
