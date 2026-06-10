@@ -6,12 +6,42 @@
 
 use poker_solver_core::blueprint_mp::game_tree::{MpGameNode, MpGameTree, TreeAction};
 use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
-use poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage;
+use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
+use poker_solver_core::blueprint_mp::types::{Seat, Street};
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{self, Card};
 
 use crate::blueprint_tui_widgets::{CellStrategy, HandGridState};
+
+/// Why a lazy strategy row produced its displayed average strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LazyStrategyRowState {
+    /// The infoset exists and has non-zero strategy-sum mass.
+    Present,
+    /// The infoset has not been visited; sparse storage returned uniform.
+    MissingUniform,
+    /// The infoset exists, but its average-strategy sums are still zero.
+    ZeroSumUniform,
+}
+
+/// The single source of strategy data for lazy MP TUI cells and diagnostics.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct LazyStrategyRow {
+    pub hand: CanonicalHand,
+    pub seat: Seat,
+    pub street: Street,
+    pub bucket: u16,
+    pub key: MpInfosetKey,
+    pub actions: Vec<TreeAction>,
+    pub action_labels: Vec<String>,
+    pub regrets: Vec<i32>,
+    pub strategy_sums: Vec<u64>,
+    pub current_strategy: Vec<f64>,
+    pub average_strategy: Vec<f64>,
+    pub row_state: LazyStrategyRowState,
+}
 
 /// Walk the MP game tree following a position-aware spot string.
 /// Returns (node_idx, board_cards) or None if any action fails to match.
@@ -232,18 +262,9 @@ pub fn extract_lazy_mp_grid(
     let actions = spot.actions(game);
     let num_actions = actions.len();
     let street = spot.street();
-    let bucket_count = usize::from(bucket_counts[street.index()]);
-    let labels: Vec<String> = actions.iter().map(format_mp_action).collect();
 
-    if num_actions > 0 && bucket_count > 0 {
-        fill_lazy_grid_cells(
-            &mut cells,
-            storage,
-            spot,
-            num_actions,
-            bucket_count,
-            &labels,
-        );
+    if num_actions > 0 && bucket_counts[street.index()] > 0 {
+        fill_lazy_grid_cells(&mut cells, game, storage, spot, bucket_counts);
     }
 
     HandGridState {
@@ -284,21 +305,86 @@ fn fill_grid_cells(
 
 fn fill_lazy_grid_cells(
     cells: &mut [[CellStrategy; 13]; 13],
+    game: &LazyMpGame,
     storage: &SparseMpStorage,
     spot: LazyResolvedSpot,
-    num_actions: usize,
-    bucket_count: usize,
-    labels: &[String],
+    bucket_counts: [u16; 4],
 ) {
-    let mut out = vec![0.0_f64; num_actions];
     for row in 0..13 {
         for col in 0..13 {
             let hand = CanonicalHand::from_matrix_position(row, col).unwrap();
-            let bucket = (hand.index() % bucket_count) as u16;
-            storage.average_strategy(spot.key_for_bucket(bucket), num_actions, &mut out);
-            cells[row][col] = build_cell_strategy(&out, labels);
+            if let Some(strategy_row) =
+                resolve_lazy_strategy_row(game, storage, spot, hand, bucket_counts)
+            {
+                cells[row][col] = build_cell_strategy(
+                    &strategy_row.average_strategy,
+                    &strategy_row.action_labels,
+                );
+            }
         }
     }
+}
+
+/// Resolve exactly the lazy sparse strategy row that the TUI should display.
+///
+/// Diagnostics and tests should call this function instead of reconstructing
+/// buckets, sparse keys, action labels, regrets, or strategy vectors themselves.
+pub fn resolve_lazy_strategy_row(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    spot: LazyResolvedSpot,
+    hand: CanonicalHand,
+    bucket_counts: [u16; 4],
+) -> Option<LazyStrategyRow> {
+    let actions = spot.actions(game);
+    let num_actions = actions.len();
+    if num_actions == 0 {
+        return None;
+    }
+
+    let street = spot.street();
+    let bucket_count = bucket_counts[street.index()];
+    if bucket_count == 0 {
+        return None;
+    }
+
+    let bucket = (hand.index() as u16) % bucket_count;
+    let key = spot.key_for_bucket(bucket);
+    let action_labels: Vec<String> = actions.iter().map(format_mp_action).collect();
+    let regrets: Vec<i32> = (0..num_actions)
+        .map(|action_idx| storage.get_regret(key, action_idx))
+        .collect();
+    let strategy_sums: Vec<u64> = (0..num_actions)
+        .map(|action_idx| storage.get_strategy_sum(key, action_idx))
+        .collect();
+
+    let mut current_strategy = vec![0.0_f64; num_actions];
+    storage.regret_matched_strategy(key, num_actions, &mut current_strategy);
+    let mut average_strategy = vec![0.0_f64; num_actions];
+    storage.average_strategy(key, num_actions, &mut average_strategy);
+
+    let row_state = match storage.infoset_action_count(key) {
+        None => LazyStrategyRowState::MissingUniform,
+        Some(_) if strategy_sums.iter().all(|sum| *sum == 0) => {
+            LazyStrategyRowState::ZeroSumUniform
+        }
+        Some(_) => LazyStrategyRowState::Present,
+    };
+
+    Some(LazyStrategyRow {
+        hand,
+        seat: spot.to_act(),
+        street,
+        bucket,
+        key,
+        actions,
+        action_labels,
+        regrets,
+        strategy_sums,
+        current_strategy,
+        average_strategy,
+        row_state,
+    })
 }
 
 fn build_cell_strategy(probs: &[f64], labels: &[String]) -> CellStrategy {
@@ -412,6 +498,7 @@ mod tests {
             name: "test".into(),
             num_players: 6,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -450,6 +537,7 @@ mod tests {
             name: "shallow".into(),
             num_players: 6,
             stack_depth: 10.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 4,
@@ -484,6 +572,45 @@ mod tests {
             river: empty,
         };
         MpGameTree::build(&game, &action)
+    }
+
+    fn test_6p_lazy_game() -> LazyMpGame {
+        let game = MpGameConfig {
+            name: "test lazy".into(),
+            num_players: 6,
+            stack_depth: 20.0,
+            allow_preflop_limp: true,
+            blinds: vec![
+                ForcedBet {
+                    seat: 4,
+                    kind: ForcedBetKind::SmallBlind,
+                    amount: 1.0,
+                },
+                ForcedBet {
+                    seat: 5,
+                    kind: ForcedBetKind::BigBlind,
+                    amount: 2.0,
+                },
+            ],
+            rake_rate: 0.0,
+            rake_cap: 0.0,
+        };
+        let preflop = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("5bb".into())],
+            raise: vec![],
+        };
+        let empty = MpStreetSizes {
+            lead: vec![],
+            raise: vec![],
+        };
+        let action = MpActionAbstractionConfig {
+            max_flop_players: None,
+            preflop,
+            flop: empty.clone(),
+            turn: empty.clone(),
+            river: empty,
+        };
+        LazyMpGame::new(&game, &action)
     }
 
     // -- resolve_mp_spot tests --
@@ -603,6 +730,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[timed_test(10)]
+    fn lazy_strategy_row_is_single_source_for_grid_cell() {
+        let game = test_6p_lazy_game();
+        let storage = SparseMpStorage::new();
+        let spot = LazyResolvedSpot::root(&game);
+        let hand = CanonicalHand::parse("A5s").unwrap();
+        let bucket_counts = [169, 50, 50, 50];
+        let actions = spot.actions(&game);
+        let num_actions = actions.len();
+        let key = spot.key_for_bucket(hand.index() as u16);
+
+        storage.add_regret(key, num_actions, 0, -1_000);
+        storage.add_regret(key, num_actions, 2, 3_000);
+        storage.add_strategy_sum(key, num_actions, 0, 100);
+        storage.add_strategy_sum(key, num_actions, 1, 200);
+        storage.add_strategy_sum(key, num_actions, 2, 700);
+
+        let row = resolve_lazy_strategy_row(&game, &storage, spot, hand, bucket_counts).unwrap();
+        assert_eq!(row.row_state, LazyStrategyRowState::Present);
+        assert_eq!(row.bucket, hand.index() as u16);
+        assert_eq!(row.key, key);
+        assert_eq!(row.action_labels, vec!["fold", "call", "bet 5bb"]);
+        assert_eq!(row.regrets, vec![-1_000, 0, 3_000]);
+        assert_eq!(row.strategy_sums, vec![100, 200, 700]);
+        assert_eq!(row.current_strategy, vec![0.0, 0.0, 1.0]);
+        assert_eq!(row.average_strategy, vec![0.1, 0.2, 0.7]);
+
+        let grid = extract_lazy_mp_grid(&game, &storage, spot, bucket_counts, 7, "root", "", &[]);
+        let (row_idx, col_idx) = hand.matrix_position();
+        let cell = &grid.cells[row_idx][col_idx];
+        assert_eq!(
+            cell.actions,
+            vec![
+                ("fold".to_string(), 0.1),
+                ("call".to_string(), 0.2),
+                ("bet 5bb".to_string(), 0.7),
+            ]
+        );
+    }
+
+    #[timed_test(10)]
+    fn lazy_strategy_row_distinguishes_missing_from_zero_sum_uniform() {
+        let game = test_6p_lazy_game();
+        let storage = SparseMpStorage::new();
+        let spot = LazyResolvedSpot::root(&game);
+        let hand = CanonicalHand::parse("A5s").unwrap();
+        let bucket_counts = [169, 50, 50, 50];
+        let actions = spot.actions(&game);
+        let key = spot.key_for_bucket(hand.index() as u16);
+
+        let missing =
+            resolve_lazy_strategy_row(&game, &storage, spot, hand, bucket_counts).unwrap();
+        assert_eq!(missing.row_state, LazyStrategyRowState::MissingUniform);
+        assert_eq!(missing.average_strategy, vec![1.0 / 3.0; 3]);
+
+        storage.add_regret(key, actions.len(), 0, 0);
+
+        let zero_sum =
+            resolve_lazy_strategy_row(&game, &storage, spot, hand, bucket_counts).unwrap();
+        assert_eq!(zero_sum.row_state, LazyStrategyRowState::ZeroSumUniform);
+        assert_eq!(zero_sum.average_strategy, vec![1.0 / 3.0; 3]);
     }
 
     #[timed_test(10)]
@@ -782,6 +972,7 @@ mod tests {
             name: "2p-grid-test".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,

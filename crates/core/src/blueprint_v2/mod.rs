@@ -1,3 +1,4 @@
+pub mod baseline_validation;
 pub mod bucket_file;
 pub mod bundle;
 pub mod cbv;
@@ -17,10 +18,12 @@ pub mod nut_features;
 pub mod per_flop_bucket_file;
 
 pub mod leaf_evaluator;
+pub mod sparse_storage;
 pub mod storage;
 pub mod subgame;
 pub mod subgame_cfr;
 pub mod trainer;
+pub mod training_runtime_adapter;
 
 // Re-export subgame types at module level for convenience.
 pub use leaf_evaluator::LeafEvaluator;

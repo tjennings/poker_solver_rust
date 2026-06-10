@@ -1,8 +1,10 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use poker_solver_core::blueprint_v2::baseline_validation::BaselineValidationReport;
 use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
 
 use crate::blueprint_tui::ResolvedScenario;
@@ -12,6 +14,17 @@ use crate::blueprint_tui_widgets::CellStrategy;
 
 /// Maximum number of monitored scenarios.
 pub const MAX_SCENARIOS: usize = 16;
+const SNAPSHOT_STATUS_DETAIL_CHARS: usize = 48;
+
+/// One-line status for manual TUI snapshot requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    Idle,
+    Queued,
+    Writing,
+    Saved(String),
+    Failed(String),
+}
 
 /// State for the random-scenario carousel display.
 #[derive(Debug, Clone)]
@@ -48,6 +61,7 @@ pub struct BlueprintTuiMetrics {
     pub snapshot_trigger: Arc<AtomicBool>,
     pub strategy_refresh_trigger: Arc<AtomicBool>,
     pub config_reload_trigger: Arc<AtomicBool>,
+    pub snapshot_status: Mutex<SnapshotStatus>,
 
     /// Reloaded TUI state pushed by the trainer after a config reload.
     pub reloaded_tui_state: Mutex<Option<ReloadedTuiState>>,
@@ -63,6 +77,8 @@ pub struct BlueprintTuiMetrics {
 
     /// Latest regret audit snapshots, ready for the TUI to consume.
     pub regret_audit_snapshots: Mutex<Option<Vec<AuditSnapshot>>>,
+    /// Compact raw-strategy probe lines rendered in the MP TUI metrics panel.
+    pub strategy_probe_lines: Mutex<Vec<String>>,
 
     // --- sparkline history ---
     pub strategy_delta_history: Mutex<Vec<f64>>,
@@ -80,6 +96,8 @@ pub struct BlueprintTuiMetrics {
 
     // --- top exploitable spots from BR pass ---
     pub exploitable_spots: Mutex<Vec<ExploitableSpot>>,
+    /// Latest external baseline strategy-frequency validation report.
+    pub baseline_validation_report: Mutex<Option<BaselineValidationReport>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -106,6 +124,7 @@ impl BlueprintTuiMetrics {
             snapshot_trigger: Arc::new(AtomicBool::new(false)),
             strategy_refresh_trigger: Arc::new(AtomicBool::new(false)),
             config_reload_trigger: Arc::new(AtomicBool::new(false)),
+            snapshot_status: Mutex::new(SnapshotStatus::Idle),
             reloaded_tui_state: Mutex::new(None),
 
             strategy_snapshots: Mutex::new(snapshots),
@@ -115,6 +134,7 @@ impl BlueprintTuiMetrics {
 
             strategy_grids: Mutex::new(grids),
             regret_audit_snapshots: Mutex::new(None),
+            strategy_probe_lines: Mutex::new(Vec::new()),
             strategy_delta_history: Mutex::new(Vec::new()),
             leaf_movement_history: Mutex::new(Vec::new()),
             min_regret_history: Mutex::new(Vec::new()),
@@ -128,6 +148,7 @@ impl BlueprintTuiMetrics {
             exploitability_start_time: Mutex::new(None),
 
             exploitable_spots: Mutex::new(Vec::new()),
+            baseline_validation_report: Mutex::new(None),
         }
     }
 
@@ -140,7 +161,48 @@ impl BlueprintTuiMetrics {
     }
 
     pub fn request_snapshot(&self) {
-        self.snapshot_trigger.store(true, Ordering::Relaxed);
+        self.set_snapshot_status(SnapshotStatus::Queued);
+        self.snapshot_trigger.store(true, Ordering::Release);
+    }
+
+    pub fn mark_snapshot_writing(&self) {
+        self.set_snapshot_status(SnapshotStatus::Writing);
+    }
+
+    pub fn mark_snapshot_saved(&self, path: &Path) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| path.display().to_string(), ToOwned::to_owned);
+        self.set_snapshot_status(SnapshotStatus::Saved(truncate_status_detail(&name)));
+    }
+
+    pub fn mark_snapshot_failed(&self, error: impl std::fmt::Display) {
+        self.set_snapshot_status(SnapshotStatus::Failed(truncate_status_detail(
+            &error.to_string(),
+        )));
+    }
+
+    pub fn snapshot_status_text(&self) -> Option<String> {
+        let status = self
+            .snapshot_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &*status {
+            SnapshotStatus::Idle => None,
+            SnapshotStatus::Queued => Some("snapshot: queued".to_string()),
+            SnapshotStatus::Writing => Some("snapshot: writing".to_string()),
+            SnapshotStatus::Saved(path) => Some(format!("snapshot: saved {path}")),
+            SnapshotStatus::Failed(error) => Some(format!("snapshot: failed {error}")),
+        }
+    }
+
+    fn set_snapshot_status(&self, status: SnapshotStatus) {
+        let mut current = self
+            .snapshot_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *current = status;
     }
 
     pub fn request_strategy_refresh(&self) {
@@ -154,7 +216,7 @@ impl BlueprintTuiMetrics {
     /// Consume the snapshot trigger, returning `true` if it was set.
     #[allow(dead_code)]
     pub fn take_snapshot_trigger(&self) -> bool {
-        self.snapshot_trigger.swap(false, Ordering::Relaxed)
+        self.snapshot_trigger.swap(false, Ordering::Acquire)
     }
 
     /// Update the strategy snapshot for a scenario, computing the L1 delta
@@ -205,6 +267,15 @@ impl BlueprintTuiMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *data = Some(snapshots);
+    }
+
+    /// Replace the compact raw-strategy probe lines shown by the MP TUI.
+    pub fn update_strategy_probe_lines(&self, lines: Vec<String>) {
+        let mut data = self
+            .strategy_probe_lines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *data = lines;
     }
 
     /// Take the latest audit snapshots (returns None if none pending).
@@ -311,6 +382,14 @@ impl BlueprintTuiMetrics {
             .unwrap_or_else(|e| e.into_inner()) = spots;
     }
 
+    /// Replace the latest external baseline validation report.
+    pub fn set_baseline_validation_report(&self, report: BaselineValidationReport) {
+        *self
+            .baseline_validation_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(report);
+    }
+
     /// Signal the start of an exploitability/BR pass with the given total sample count.
     pub fn start_exploitability_pass(&self, total: u64) {
         self.exploitability_progress.store(0, Ordering::Relaxed);
@@ -339,10 +418,22 @@ impl BlueprintTuiMetrics {
     }
 }
 
+fn truncate_status_detail(detail: &str) -> String {
+    let mut chars = detail.chars();
+    let mut truncated: String = chars.by_ref().take(SNAPSHOT_STATUS_DETAIL_CHARS).collect();
+    if chars.next().is_some() {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use test_macros::timed_test;
 
     #[timed_test(10)]
@@ -352,6 +443,7 @@ mod tests {
         assert!(!m.paused.load(Ordering::Relaxed));
         assert!(!m.quit_requested.load(Ordering::Relaxed));
         assert!(!m.take_snapshot_trigger());
+        assert_eq!(m.snapshot_status_text(), None);
         assert_eq!(m.target_iterations, Some(1000));
     }
 
@@ -403,9 +495,72 @@ mod tests {
         // Set and consume.
         m.request_snapshot();
         assert!(m.take_snapshot_trigger());
+        assert_eq!(
+            m.snapshot_status_text(),
+            Some("snapshot: queued".to_string())
+        );
 
         // Consumed -- second take returns false.
         assert!(!m.take_snapshot_trigger());
+    }
+
+    #[timed_test(10)]
+    fn snapshot_status_lifecycle() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.request_snapshot();
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: queued")
+        );
+
+        m.mark_snapshot_writing();
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: writing")
+        );
+
+        m.mark_snapshot_saved(Path::new("/tmp/snapshot_0007"));
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: saved snapshot_0007")
+        );
+
+        m.mark_snapshot_failed("permission denied");
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: failed permission denied")
+        );
+    }
+
+    #[timed_test(10)]
+    fn request_snapshot_sets_status_before_publishing_trigger() {
+        let m = Arc::new(BlueprintTuiMetrics::new(None, None));
+        let status_guard = m.snapshot_status.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker_metrics = Arc::clone(&m);
+
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_metrics.request_snapshot();
+        });
+        started_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {
+            assert!(
+                !m.snapshot_trigger.load(Ordering::Acquire),
+                "snapshot trigger was published before queued status was stored"
+            );
+            thread::yield_now();
+        }
+
+        drop(status_guard);
+        worker.join().unwrap();
+        assert!(m.take_snapshot_trigger());
+        assert_eq!(
+            m.snapshot_status_text().as_deref(),
+            Some("snapshot: queued")
+        );
     }
 
     #[timed_test(10)]
@@ -437,6 +592,14 @@ mod tests {
         m.update_scenario_grid(0, grid);
         let grids = m.strategy_grids.lock().unwrap();
         assert!(grids[0].is_some());
+    }
+
+    #[timed_test(10)]
+    fn strategy_probe_lines_update() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        m.update_strategy_probe_lines(vec!["UTG A5s:P:B97".into()]);
+        let lines = m.strategy_probe_lines.lock().unwrap();
+        assert_eq!(lines.as_slice(), ["UTG A5s:P:B97"]);
     }
 
     #[timed_test(10)]
@@ -588,6 +751,24 @@ mod tests {
         let m = BlueprintTuiMetrics::new(None, None);
         let spots = m.exploitable_spots.lock().unwrap();
         assert!(spots.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn baseline_validation_report_initially_empty_and_settable() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        assert!(m.baseline_validation_report.lock().unwrap().is_none());
+
+        let mut report = BaselineValidationReport::default();
+        report.aggregate.spots_total = 6;
+        report.aggregate.spots_scored = 6;
+        report.aggregate.mean_total_variation = 0.125;
+        m.set_baseline_validation_report(report);
+
+        let stored = m.baseline_validation_report.lock().unwrap();
+        let stored = stored.as_ref().expect("report should be stored");
+        assert_eq!(stored.aggregate.spots_total, 6);
+        assert_eq!(stored.aggregate.spots_scored, 6);
+        assert!((stored.aggregate.mean_total_variation - 0.125).abs() < f64::EPSILON);
     }
 
     #[timed_test(10)]

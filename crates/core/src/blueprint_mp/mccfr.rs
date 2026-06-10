@@ -22,6 +22,7 @@ use crate::poker::{Card, FlatDeck, Hand, Rank, Rankable};
 
 /// Maximum actions at any decision node (stack-allocated buffers).
 const MAX_ACTIONS: usize = 16;
+const PRUNE_STRATEGY_EPSILON: f64 = 1e-12;
 
 /// Prune statistics accumulated during a single traversal.
 ///
@@ -197,6 +198,7 @@ fn traverse_traverser(
             node_idx,
             bucket,
             a,
+            strategy[a],
             &mut stats,
         ) {
             pruned[a] = true;
@@ -228,7 +230,7 @@ fn traverse_traverser(
         &pruned,
         node_value,
     );
-    update_traverser_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
+    update_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
     (node_value, stats)
 }
 
@@ -244,9 +246,13 @@ fn should_prune_action(
     node_idx: u32,
     bucket: u16,
     action: usize,
+    action_probability: f64,
     stats: &mut PruneStats,
 ) -> bool {
     if !prune {
+        return false;
+    }
+    if action_probability > PRUNE_STRATEGY_EPSILON {
         return false;
     }
     let child_is_terminal = matches!(tree.nodes[child_idx as usize], MpGameNode::Terminal { .. });
@@ -280,7 +286,7 @@ fn update_regrets_with_pruning(
     }
 }
 
-fn update_traverser_strategy_sums(
+fn update_strategy_sums(
     storage: &MpStorage,
     node_idx: u32,
     bucket: u16,
@@ -316,10 +322,7 @@ fn traverse_opponent(
 
     let sampled = sample_action(&strategy[..num_actions], rng);
 
-    // Update strategy sums for the sampled action
-    let raw = strategy[sampled] * STRATEGY_SCALE;
-    let delta = raw.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-    storage.add_strategy_sum(node_idx, bucket, sampled, delta);
+    update_strategy_sums(storage, node_idx, bucket, num_actions, &strategy);
 
     traverse_external(
         tree,
@@ -433,12 +436,16 @@ fn rank_to_u32(rank: Rank) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
     use super::*;
     use crate::blueprint_mp::config::{
         ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpGameConfig, MpStreetSizes,
     };
-    use crate::blueprint_mp::game_tree::MpGameTree;
+    use crate::blueprint_mp::game_tree::{MpGameTree, TreeAction};
     use crate::blueprint_mp::storage::MpStorage;
+    use crate::blueprint_mp::types::Street;
     use crate::blueprint_mp::types::{Bucket, Seat};
     use test_macros::timed_test;
 
@@ -459,6 +466,7 @@ mod tests {
             name: format!("{num_players}-player mccfr test"),
             num_players,
             stack_depth: 20.0,
+            allow_preflop_limp: true,
             blinds,
             rake_rate: 0.0,
             rake_cap: 0.0,
@@ -554,6 +562,56 @@ mod tests {
     }
 
     #[timed_test]
+    fn pruning_keeps_actions_with_current_strategy_mass() {
+        let tree = minimal_tree(2);
+        let bucket_counts = [10u16, 10, 10, 10];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        let MpGameNode::Decision {
+            actions, children, ..
+        } = &tree.nodes[tree.root as usize]
+        else {
+            panic!("root should be a decision node");
+        };
+        let call_idx = actions
+            .iter()
+            .position(|action| matches!(action, TreeAction::Call))
+            .expect("minimal tree root should have a call action");
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(tree.root, 0, call_idx, -10_000);
+
+        assert!(!should_prune_action(
+            &tree,
+            &storage,
+            true,
+            -1,
+            children[call_idx],
+            tree.root,
+            0,
+            call_idx,
+            0.5,
+            &mut stats,
+        ));
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.hits, 0);
+
+        assert!(should_prune_action(
+            &tree,
+            &storage,
+            true,
+            -1,
+            children[call_idx],
+            tree.root,
+            0,
+            call_idx,
+            0.0,
+            &mut stats,
+        ));
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[timed_test]
     fn traverse_updates_regrets() {
         let tree = minimal_tree(2);
         let bucket_counts = [10u16, 10, 10, 10];
@@ -621,6 +679,71 @@ mod tests {
             any_nonzero,
             "at least one strategy sum should be non-zero after traversal"
         );
+    }
+
+    #[timed_test]
+    fn opponent_traversal_updates_full_average_strategy_vector() {
+        let tree = minimal_tree(2);
+        let bucket_counts = [10u16, 10, 10, 10];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        let mut rng = rand::thread_rng();
+        let deal = sample_deal(2, &mut rng);
+        let dwb = trivial_buckets(&deal, bucket_counts);
+        let bucket = dwb.buckets[0][Street::Preflop.index()].0;
+
+        let MpGameNode::Decision { actions, .. } = &tree.nodes[tree.root as usize] else {
+            panic!("root should be a decision node");
+        };
+
+        traverse_external(
+            &tree,
+            &storage,
+            &dwb,
+            Seat::from_raw(1),
+            tree.root,
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            0,
+        );
+
+        for action_idx in 0..actions.len() {
+            assert!(
+                storage.get_strategy_sum(tree.root, bucket, action_idx) > 0,
+                "opponent average update should record every root action"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn opponent_sample_action_matches_strategy_distribution() {
+        let strategy = [0.10, 0.25, 0.65];
+        let mut counts = [0_u32; 3];
+        let mut rng = SmallRng::seed_from_u64(0x5A11_CEED);
+        let samples = 50_000_u32;
+
+        for _ in 0..samples {
+            counts[sample_action(&strategy, &mut rng)] += 1;
+        }
+
+        for (idx, (&actual, &expected)) in counts.iter().zip(strategy.iter()).enumerate() {
+            let frequency = f64::from(actual) / f64::from(samples);
+            assert!(
+                (frequency - expected).abs() < 0.01,
+                "action {idx} sampled at {frequency:.4}, expected {expected:.4}"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn opponent_sample_action_never_selects_zero_probability_action() {
+        let strategy = [0.0, 1.0, 0.0];
+        let mut rng = SmallRng::seed_from_u64(0x51A7_E5E1);
+
+        for _ in 0..1_000 {
+            assert_eq!(sample_action(&strategy, &mut rng), 1);
+        }
     }
 
     #[timed_test]
@@ -777,17 +900,55 @@ mod tests {
         let storage = MpStorage::new(&tree, bucket_counts);
         let mut rng = rand::thread_rng();
 
-        // Force very negative regrets at all decision nodes, all buckets
-        set_all_regrets_negative(&tree, &storage, bucket_counts);
-
         let deal = sample_deal(2, &mut rng);
         let dwb = trivial_buckets(&deal, bucket_counts);
+        let node_idx = first_decision_node(&tree);
+        assert_eq!(
+            node_idx, tree.root,
+            "minimal tree should begin at the traverser's decision"
+        );
+        let MpGameNode::Decision {
+            seat,
+            street,
+            actions,
+            children,
+        } = &tree.nodes[node_idx as usize]
+        else {
+            panic!("root should be a decision node");
+        };
+        assert_eq!(
+            *seat,
+            Seat::from_raw(0),
+            "root should belong to the traverser for this regression"
+        );
+        let call_idx = actions
+            .iter()
+            .position(|action| matches!(action, TreeAction::Call))
+            .expect("minimal tree root should have a call action");
+        assert!(
+            !matches!(
+                tree.nodes[children[call_idx] as usize],
+                MpGameNode::Terminal { .. }
+            ),
+            "call should be a non-terminal action so pruning can apply"
+        );
+
+        // Pruning only applies to actions that already have zero current
+        // strategy mass. Make call negative while another action is positive,
+        // so regret matching assigns call probability 0 instead of falling
+        // back to the all-nonpositive uniform strategy.
+        let bucket = dwb.buckets[seat.index() as usize][street.index()].0;
+        for action_idx in 0..actions.len() {
+            storage.add_regret(node_idx, bucket, action_idx, 30_000);
+        }
+        storage.add_regret(node_idx, bucket, call_idx, -60_000);
+
         let (_val, stats) = traverse_external(
             &tree,
             &storage,
             &dwb,
             Seat::from_raw(0),
-            tree.root,
+            node_idx,
             &mut rng,
             0.0,
             Chips::ZERO,

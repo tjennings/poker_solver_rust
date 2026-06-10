@@ -263,6 +263,12 @@ pub struct TrainingConfig {
     /// Optimizer variant: "dcfr" (default), "sapcfr+", "lcfr", "cfr+".
     #[serde(default = "default_optimizer")]
     pub optimizer: String,
+    /// CFR storage backend: "dense" (default) or "sparse".
+    ///
+    /// Sparse storage lazily realizes `(decision node, bucket)` CFR rows in
+    /// memory while snapshots and exported strategies remain dense-compatible.
+    #[serde(default = "default_storage_backend")]
+    pub storage_backend: String,
     /// SAPCFR+ prediction step size (0 = no prediction, 1 = full PCFR+).
     #[serde(default = "default_sapcfr_eta")]
     pub sapcfr_eta: f64,
@@ -286,6 +292,12 @@ pub struct TrainingConfig {
     /// Only used when `use_baselines` is true.
     #[serde(default = "default_baseline_alpha")]
     pub baseline_alpha: f64,
+    /// External preflop strategy-frequency validation against a pinned baseline.
+    ///
+    /// This is distinct from `use_baselines`: it does not affect MCCFR
+    /// traversal and is disabled by default.
+    #[serde(default)]
+    pub baseline_validation: BaselineValidationTrainingConfig,
     /// Streets on which regret-based pruning is active.
     /// When omitted, all streets are pruned (backwards compatible).
     /// Example: `[flop, turn, river]` disables pruning on preflop.
@@ -324,6 +336,42 @@ impl TrainingConfig {
                 }
                 mask
             }
+        }
+    }
+}
+
+/// Training-time external baseline validation settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaselineValidationTrainingConfig {
+    /// Enable periodic strategy-frequency validation.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the baseline JSON artifact.
+    #[serde(default)]
+    pub baseline_path: Option<PathBuf>,
+    /// Iterations between validation reports. 0 disables iteration cadence.
+    #[serde(default)]
+    pub interval_iterations: u64,
+    /// Minutes between validation reports. 0 disables time cadence.
+    #[serde(default)]
+    pub interval_minutes: u64,
+    /// Number of worst spots retained in summaries.
+    #[serde(default = "default_baseline_validation_top_n")]
+    pub top_n_spots: usize,
+    /// Number of worst combo rows retained in summaries.
+    #[serde(default = "default_baseline_validation_top_n")]
+    pub top_n_combos_per_spot: usize,
+}
+
+impl Default for BaselineValidationTrainingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            baseline_path: None,
+            interval_iterations: 0,
+            interval_minutes: 0,
+            top_n_spots: default_baseline_validation_top_n(),
+            top_n_combos_per_spot: default_baseline_validation_top_n(),
         }
     }
 }
@@ -413,8 +461,16 @@ fn default_baseline_alpha() -> f64 {
     0.01
 }
 
+const fn default_baseline_validation_top_n() -> usize {
+    5
+}
+
 fn default_optimizer() -> String {
     "dcfr".to_string()
+}
+
+fn default_storage_backend() -> String {
+    "dense".to_string()
 }
 
 fn default_sapcfr_eta() -> f64 {
@@ -620,12 +676,14 @@ snapshots:
                 dcfr_gamma: 2.0,
                 dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,
                 brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                baseline_validation: BaselineValidationTrainingConfig::default(),
                 prune_streets: None,
                 regret_floor: None,
                 exploitability_interval_minutes: 0,
@@ -1007,6 +1065,10 @@ snapshots:
         // Baselines default to disabled with alpha = 0.01.
         assert!(!cfg.training.use_baselines);
         assert!((cfg.training.baseline_alpha - 0.01).abs() < f64::EPSILON);
+        assert_eq!(
+            cfg.training.baseline_validation,
+            BaselineValidationTrainingConfig::default()
+        );
     }
 
     #[test]
@@ -1043,6 +1105,13 @@ training:
   iterations: 100
   use_baselines: true
   baseline_alpha: 0.05
+  baseline_validation:
+    enabled: true
+    baseline_path: "local_data/baselines/cash_hu_20bb_cev.json"
+    interval_iterations: 5000
+    interval_minutes: 10
+    top_n_spots: 4
+    top_n_combos_per_spot: 3
 
 snapshots:
   warmup_minutes: 60
@@ -1053,6 +1122,19 @@ snapshots:
         let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         assert!(cfg.training.use_baselines);
         assert!((cfg.training.baseline_alpha - 0.05).abs() < f64::EPSILON);
+        assert!(cfg.training.baseline_validation.enabled);
+        assert_eq!(
+            cfg.training
+                .baseline_validation
+                .baseline_path
+                .as_deref()
+                .and_then(std::path::Path::to_str),
+            Some("local_data/baselines/cash_hu_20bb_cev.json")
+        );
+        assert_eq!(cfg.training.baseline_validation.interval_iterations, 5000);
+        assert_eq!(cfg.training.baseline_validation.interval_minutes, 10);
+        assert_eq!(cfg.training.baseline_validation.top_n_spots, 4);
+        assert_eq!(cfg.training.baseline_validation.top_n_combos_per_spot, 3);
     }
 
     #[test]

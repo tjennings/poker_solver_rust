@@ -90,6 +90,8 @@ pub struct BlueprintTuiConfig {
     pub random_scenario: RandomScenarioConfig,
     #[serde(default)]
     pub regret_audits: Vec<RegretAuditConfig>,
+    #[serde(default = "default_strategy_probe_hands")]
+    pub strategy_probe_hands: Vec<String>,
 }
 
 impl Default for BlueprintTuiConfig {
@@ -101,6 +103,7 @@ impl Default for BlueprintTuiConfig {
             scenarios: Vec::new(),
             random_scenario: RandomScenarioConfig::default(),
             regret_audits: Vec::new(),
+            strategy_probe_hands: default_strategy_probe_hands(),
         }
     }
 }
@@ -121,6 +124,14 @@ fn default_hold_minutes() -> u64 {
 }
 fn default_pool() -> Vec<StreetLabel> {
     vec![StreetLabel::Preflop, StreetLabel::Flop, StreetLabel::Turn]
+}
+fn default_strategy_probe_hands() -> Vec<String> {
+    [
+        "A2s", "A3s", "A4s", "A5s", "ATs", "AJs", "AQs", "K9s", "22", "72o",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 // --- Extraction from full YAML ---
@@ -170,6 +181,7 @@ tui:
         assert_eq!(cfg.telemetry.strategy_delta_interval_seconds, 15);
         assert_eq!(cfg.telemetry.sparkline_window, 120);
         assert_eq!(cfg.scenarios.len(), 2);
+        assert_eq!(cfg.strategy_probe_hands[0], "A2s");
 
         let s0 = &cfg.scenarios[0];
         assert_eq!(s0.name, "SB open");
@@ -229,6 +241,17 @@ tui:
     fn regret_audits_default_empty() {
         let cfg = parse_tui_config("");
         assert!(cfg.regret_audits.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn parse_strategy_probe_hands() {
+        let yaml = r#"
+tui:
+  enabled: true
+  strategy_probe_hands: ["A5s", "22", "72o"]
+"#;
+        let cfg = parse_tui_config(yaml);
+        assert_eq!(cfg.strategy_probe_hands, vec!["A5s", "22", "72o"]);
     }
 
     #[timed_test(10)]

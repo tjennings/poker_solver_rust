@@ -14,15 +14,19 @@ use rand::Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::MAX_PLAYERS;
-use super::config::{ForcedBetKind, MpActionAbstractionConfig, MpGameConfig};
+use super::config::{
+    ForcedBetKind, MpActionAbstractionConfig, MpChanceContinuationMode, MpGameConfig,
+};
 use super::game_tree::{TerminalKind, TreeAction};
 use super::mccfr::{PruneStats, terminal_value};
 use super::sparse_storage::{MpInfosetKey, SparseMpStorage};
 use super::storage::{REGRET_SCALE, STRATEGY_SCALE};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat, Street};
+use crate::poker::Card;
 
 const SIZE_EPSILON: f64 = 0.01;
 const MAX_ACTIONS: usize = 16;
+const PRUNE_STRATEGY_EPSILON: f64 = 1e-12;
 const ACTION_BITS: u16 = 4;
 const PACKED_ACTION_SLOTS: u16 = 32;
 pub const LAZY_ACTION_STREET_COUNT: usize = 4;
@@ -42,6 +46,39 @@ pub struct NegativeActionTraversalConfig {
     pub enabled: bool,
     pub prune_below: i32,
     pub reactivate_at: i32,
+}
+
+/// Precomputed exact public-card continuations for one sampled private/flop prefix.
+#[derive(Debug, Clone, Default)]
+pub struct ExactChanceRunouts {
+    pub turns: Vec<ExactTurnRunout>,
+}
+
+impl ExactChanceRunouts {
+    fn is_empty(&self) -> bool {
+        self.turns.is_empty()
+    }
+
+    fn river_deals_for_turn(&self, turn: Card) -> Option<&[DealWithBuckets]> {
+        self.turns
+            .iter()
+            .find(|runout| runout.turn == turn)
+            .map(|runout| runout.river_deals.as_slice())
+    }
+
+    fn all_river_deals(&self) -> impl Iterator<Item = &DealWithBuckets> {
+        self.turns
+            .iter()
+            .flat_map(|runout| runout.river_deals.iter())
+    }
+}
+
+/// Exact river continuations for a single turn card.
+#[derive(Debug, Clone)]
+pub struct ExactTurnRunout {
+    pub turn: Card,
+    pub turn_deal: DealWithBuckets,
+    pub river_deals: Vec<DealWithBuckets>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +102,7 @@ impl PreflopSize {
 
 struct LazyActionConfig {
     max_flop_players: Option<u8>,
+    allow_preflop_limp: bool,
     preflop_lead: Vec<PreflopSize>,
     preflop_raise: Vec<Vec<PreflopSize>>,
     flop_lead: Vec<f64>,
@@ -79,6 +117,7 @@ impl LazyActionConfig {
     fn from_action_config(config: &MpActionAbstractionConfig) -> Self {
         Self {
             max_flop_players: config.max_flop_players,
+            allow_preflop_limp: true,
             preflop_lead: parse_preflop_values(&config.preflop.lead),
             preflop_raise: parse_preflop_raise_depths(&config.preflop.raise),
             flop_lead: parse_f64_values(&config.flop.lead),
@@ -88,6 +127,12 @@ impl LazyActionConfig {
             river_lead: parse_f64_values(&config.river.lead),
             river_raise: parse_f64_raise_depths(&config.river.raise),
         }
+    }
+
+    fn from_configs(game: &MpGameConfig, config: &MpActionAbstractionConfig) -> Self {
+        let mut actions = Self::from_action_config(config);
+        actions.allow_preflop_limp = game.allow_preflop_limp;
+        actions
     }
 
     fn lead_sizes(&self, street: Street) -> LeadSizes<'_> {
@@ -164,7 +209,7 @@ impl LazyMpGame {
     pub fn new(game: &MpGameConfig, action_config: &MpActionAbstractionConfig) -> Self {
         let stack = Chips(game.stack_depth);
         Self {
-            actions: LazyActionConfig::from_action_config(action_config),
+            actions: LazyActionConfig::from_configs(game, action_config),
             root: init_public_state(game, stack),
             num_players: game.num_players,
             starting_stack: stack,
@@ -323,6 +368,10 @@ impl LazyResolvedSpot {
                 state,
                 history: self.history.append(action_idx),
             }),
+            LazyNode::Chance { state, next_street } => Some(Self {
+                state: new_street_state(state, next_street),
+                history: self.history.append(action_idx),
+            }),
             LazyNode::Terminal { .. } => None,
         }
     }
@@ -330,6 +379,10 @@ impl LazyResolvedSpot {
 
 enum LazyNode {
     Decision(LazyPublicState),
+    Chance {
+        state: LazyPublicState,
+        next_street: Street,
+    },
     Terminal {
         kind: TerminalKind,
         contributions: [Chips; MAX_PLAYERS],
@@ -341,6 +394,8 @@ pub fn traverse_external_lazy(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
     traverser: Seat,
     rng: &mut impl Rng,
     rake_rate: f64,
@@ -353,6 +408,9 @@ pub fn traverse_external_lazy(
         game,
         storage,
         deal,
+        exact_runouts,
+        chance_mode,
+        sampled_prefix_street(chance_mode),
         traverser,
         LazyNode::Decision(game.root_state()),
         LazyHistory::default(),
@@ -369,6 +427,9 @@ fn traverse_node(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
     traverser: Seat,
     node: LazyNode,
     history: LazyHistory,
@@ -383,17 +444,38 @@ fn traverse_node(
         LazyNode::Terminal {
             kind,
             contributions,
-        } => (
-            terminal_value(
+        } => {
+            let value = terminal_or_exact_river_value(
                 &kind,
                 &contributions,
                 deal,
+                exact_runouts,
+                chance_mode,
+                resolved_street,
                 traverser,
                 game.num_players,
                 rake_rate,
                 rake_cap,
-            ),
-            PruneStats::default(),
+            );
+            (value, PruneStats::default())
+        }
+        LazyNode::Chance { state, next_street } => traverse_chance(
+            game,
+            storage,
+            deal,
+            exact_runouts,
+            chance_mode,
+            resolved_street,
+            traverser,
+            state,
+            next_street,
+            history,
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
+            negative_action,
         ),
         LazyNode::Decision(state) => {
             let actions = game.actions(&state);
@@ -404,6 +486,9 @@ fn traverse_node(
                     game,
                     storage,
                     deal,
+                    exact_runouts,
+                    chance_mode,
+                    resolved_street,
                     traverser,
                     state,
                     history,
@@ -421,6 +506,9 @@ fn traverse_node(
                     game,
                     storage,
                     deal,
+                    exact_runouts,
+                    chance_mode,
+                    resolved_street,
                     traverser,
                     state,
                     history,
@@ -438,10 +526,363 @@ fn traverse_node(
     }
 }
 
+fn traverse_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
+    traverser: Seat,
+    state: LazyPublicState,
+    next_street: Street,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
+    if next_street.index() > resolved_street.index() && !exact_runouts.is_empty() {
+        return match next_street {
+            Street::Turn => traverse_exact_turn_chance(
+                game,
+                storage,
+                exact_runouts,
+                chance_mode,
+                traverser,
+                state,
+                history,
+                rng,
+                rake_rate,
+                rake_cap,
+                prune,
+                prune_threshold,
+                negative_action,
+            ),
+            Street::River => {
+                let Some(river_deals) = exact_runouts.river_deals_for_turn(deal.deal.board[3])
+                else {
+                    return traverse_sampled_chance(
+                        game,
+                        storage,
+                        deal,
+                        exact_runouts,
+                        chance_mode,
+                        resolved_street,
+                        traverser,
+                        state,
+                        next_street,
+                        history,
+                        rng,
+                        rake_rate,
+                        rake_cap,
+                        prune,
+                        prune_threshold,
+                        negative_action,
+                    );
+                };
+                traverse_exact_river_chance(
+                    game,
+                    storage,
+                    river_deals,
+                    exact_runouts,
+                    chance_mode,
+                    traverser,
+                    state,
+                    history,
+                    rng,
+                    rake_rate,
+                    rake_cap,
+                    prune,
+                    prune_threshold,
+                    negative_action,
+                )
+            }
+            Street::Preflop | Street::Flop => traverse_sampled_chance(
+                game,
+                storage,
+                deal,
+                exact_runouts,
+                chance_mode,
+                resolved_street,
+                traverser,
+                state,
+                next_street,
+                history,
+                rng,
+                rake_rate,
+                rake_cap,
+                prune,
+                prune_threshold,
+                negative_action,
+            ),
+        };
+    }
+
+    traverse_sampled_chance(
+        game,
+        storage,
+        deal,
+        exact_runouts,
+        chance_mode,
+        resolved_street,
+        traverser,
+        state,
+        next_street,
+        history,
+        rng,
+        rake_rate,
+        rake_cap,
+        prune,
+        prune_threshold,
+        negative_action,
+    )
+}
+
+fn traverse_sampled_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
+    traverser: Seat,
+    state: LazyPublicState,
+    next_street: Street,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
+    traverse_node(
+        game,
+        storage,
+        deal,
+        exact_runouts,
+        chance_mode,
+        if next_street.index() > resolved_street.index() {
+            next_street
+        } else {
+            resolved_street
+        },
+        traverser,
+        LazyNode::Decision(new_street_state(state, next_street)),
+        history,
+        rng,
+        rake_rate,
+        rake_cap,
+        prune,
+        prune_threshold,
+        negative_action,
+    )
+}
+
+fn traverse_exact_turn_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    traverser: Seat,
+    state: LazyPublicState,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
+    let mut value_sum = 0.0;
+    let mut stats = PruneStats::default();
+    for turn in &exact_runouts.turns {
+        let (value, child_stats) = traverse_node(
+            game,
+            storage,
+            &turn.turn_deal,
+            exact_runouts,
+            chance_mode,
+            Street::Turn,
+            traverser,
+            LazyNode::Decision(new_street_state(state, Street::Turn)),
+            history,
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
+            negative_action,
+        );
+        value_sum += value;
+        stats.merge(child_stats);
+    }
+    (value_sum / exact_runouts.turns.len() as f64, stats)
+}
+
+fn traverse_exact_river_chance(
+    game: &LazyMpGame,
+    storage: &SparseMpStorage,
+    river_deals: &[DealWithBuckets],
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    traverser: Seat,
+    state: LazyPublicState,
+    history: LazyHistory,
+    rng: &mut impl Rng,
+    rake_rate: f64,
+    rake_cap: Chips,
+    prune: bool,
+    prune_threshold: i32,
+    negative_action: NegativeActionTraversalConfig,
+) -> (f64, PruneStats) {
+    let mut value_sum = 0.0;
+    let mut stats = PruneStats::default();
+    for river_deal in river_deals {
+        let (value, child_stats) = traverse_node(
+            game,
+            storage,
+            river_deal,
+            exact_runouts,
+            chance_mode,
+            Street::River,
+            traverser,
+            LazyNode::Decision(new_street_state(state, Street::River)),
+            history,
+            rng,
+            rake_rate,
+            rake_cap,
+            prune,
+            prune_threshold,
+            negative_action,
+        );
+        value_sum += value;
+        stats.merge(child_stats);
+    }
+    (value_sum / river_deals.len() as f64, stats)
+}
+
+fn terminal_or_exact_river_value(
+    kind: &TerminalKind,
+    contributions: &[Chips; MAX_PLAYERS],
+    deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
+    traverser: Seat,
+    num_players: u8,
+    rake_rate: f64,
+    rake_cap: Chips,
+) -> f64 {
+    if chance_mode != MpChanceContinuationMode::SampledFullDeal
+        && resolved_street != Street::River
+        && !exact_runouts.is_empty()
+        && matches!(kind, TerminalKind::Showdown { .. })
+    {
+        if resolved_street == Street::Turn {
+            if let Some(river_deals) = exact_runouts.river_deals_for_turn(deal.deal.board[3]) {
+                let value_sum = river_deals
+                    .iter()
+                    .map(|river_deal| {
+                        terminal_value(
+                            kind,
+                            contributions,
+                            river_deal,
+                            traverser,
+                            num_players,
+                            rake_rate,
+                            rake_cap,
+                        )
+                    })
+                    .sum::<f64>();
+                return value_sum / river_deals.len() as f64;
+            }
+        } else if resolved_street == Street::Flop {
+            let mut value_sum = 0.0;
+            let mut count = 0usize;
+            for river_deal in exact_runouts.all_river_deals() {
+                value_sum += terminal_value(
+                    kind,
+                    contributions,
+                    river_deal,
+                    traverser,
+                    num_players,
+                    rake_rate,
+                    rake_cap,
+                );
+                count += 1;
+            }
+            if count > 0 {
+                return value_sum / count as f64;
+            }
+        }
+
+        if let Some(river_deals) = exact_runouts.river_deals_for_turn(deal.deal.board[3]) {
+            let value_sum = river_deals
+                .iter()
+                .map(|river_deal| {
+                    terminal_value(
+                        kind,
+                        contributions,
+                        river_deal,
+                        traverser,
+                        num_players,
+                        rake_rate,
+                        rake_cap,
+                    )
+                })
+                .sum::<f64>();
+            return value_sum / river_deals.len() as f64;
+        }
+
+        let mut value_sum = 0.0;
+        let mut count = 0usize;
+        for river_deal in exact_runouts.all_river_deals() {
+            value_sum += terminal_value(
+                kind,
+                contributions,
+                river_deal,
+                traverser,
+                num_players,
+                rake_rate,
+                rake_cap,
+            );
+            count += 1;
+        }
+        if count > 0 {
+            return value_sum / count as f64;
+        }
+    }
+
+    terminal_value(
+        kind,
+        contributions,
+        deal,
+        traverser,
+        num_players,
+        rake_rate,
+        rake_cap,
+    )
+}
+
+fn sampled_prefix_street(chance_mode: MpChanceContinuationMode) -> Street {
+    match chance_mode {
+        MpChanceContinuationMode::SampledFullDeal => Street::River,
+        MpChanceContinuationMode::SampledTurnExactRiver => Street::Turn,
+        MpChanceContinuationMode::SampledFlopExactTurnRiver => Street::Flop,
+    }
+}
+
 fn traverse_traverser(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
     traverser: Seat,
     state: LazyPublicState,
     history: LazyHistory,
@@ -459,14 +900,21 @@ fn traverse_traverser(
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
-    for (action_idx, _) in actions.iter().enumerate() {
+    for (action_idx, action) in actions.iter().copied().enumerate() {
         let child_history = history.append(action_idx);
-        blocked[action_idx] =
-            negative_action_blocks(storage, negative_action, key, action_idx, child_history);
+        let action_is_aggressive = action_increments_raise_count(&state, action);
+        blocked[action_idx] = negative_action_blocks(
+            storage,
+            negative_action,
+            action_is_aggressive,
+            key,
+            action_idx,
+            child_history,
+        );
     }
     // A concurrent worker may block an edge after this snapshot. Keep any
     // already-started traversal value rather than replacing it with an
-    // artificial zero; later gate transitions can still purge descendants.
+    // artificial zero; physical purge is deferred to the discount boundary.
     let mut eligible_strategy = [0.0; MAX_ACTIONS];
     if !mask_strategy_to_unblocked(
         &strategy[..num_actions],
@@ -488,22 +936,28 @@ fn traverse_traverser(
             pruned[action_idx] = true;
             continue;
         }
+        let child = apply_action(state, action);
+        let child_is_terminal = matches!(&child, LazyNode::Terminal { .. });
         if should_prune_lazy(
             storage,
             prune,
             prune_threshold,
+            child_is_terminal,
             key,
             action_idx,
+            eligible_strategy[action_idx],
             &mut prune_stats,
         ) {
             pruned[action_idx] = true;
             continue;
         }
-        let child = apply_action(state, action);
         let (value, child_stats) = traverse_node(
             game,
             storage,
             deal,
+            exact_runouts,
+            chance_mode,
+            resolved_street,
             traverser,
             child,
             child_history,
@@ -528,20 +982,18 @@ fn traverse_traverser(
         storage.add_regret(key, num_actions, action_idx, delta);
         let regret = storage.get_regret(key, action_idx);
         let child_history = history.append(action_idx);
+        let action_is_aggressive = action_increments_raise_count(&state, actions[action_idx]);
         let _ = transition_negative_action_gate(
             storage,
             negative_action,
+            action_is_aggressive,
             key,
             action_idx,
             regret,
             child_history,
         );
     }
-    for (action_idx, prob) in eligible_strategy[..num_actions].iter().enumerate() {
-        let raw = prob * STRATEGY_SCALE;
-        let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
-        storage.add_strategy_sum(key, num_actions, action_idx, delta);
-    }
+    update_strategy_sums(storage, key, num_actions, &eligible_strategy);
 
     (node_value, prune_stats)
 }
@@ -550,6 +1002,9 @@ fn traverse_opponent(
     game: &LazyMpGame,
     storage: &SparseMpStorage,
     deal: &DealWithBuckets,
+    exact_runouts: &ExactChanceRunouts,
+    chance_mode: MpChanceContinuationMode,
+    resolved_street: Street,
     traverser: Seat,
     state: LazyPublicState,
     history: LazyHistory,
@@ -567,10 +1022,17 @@ fn traverse_opponent(
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
-    for (action_idx, _) in actions.iter().enumerate() {
+    for (action_idx, action) in actions.iter().copied().enumerate() {
         let child_history = history.append(action_idx);
-        blocked[action_idx] =
-            negative_action_blocks(storage, negative_action, key, action_idx, child_history);
+        let action_is_aggressive = action_increments_raise_count(&state, action);
+        blocked[action_idx] = negative_action_blocks(
+            storage,
+            negative_action,
+            action_is_aggressive,
+            key,
+            action_idx,
+            child_history,
+        );
     }
     // See traverser-side note: the eligibility snapshot gates descent, but a
     // racing block after descent must not bias the sampled value to zero.
@@ -584,21 +1046,25 @@ fn traverse_opponent(
     }
     let sampled = sample_action(&eligible_strategy[..num_actions], rng);
 
-    let raw = eligible_strategy[sampled] * STRATEGY_SCALE;
-    let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
-    storage.add_strategy_sum(key, num_actions, sampled, delta);
+    update_strategy_sums(storage, key, num_actions, &eligible_strategy);
 
     let child_history = history.append(sampled);
     // Opponent nodes only attempt the sampled child. Use a read-only current
     // edge check here so telemetry cannot count blocked non-sampled actions or
-    // perturb traversal/purge behavior with a second gate transition.
-    if negative_action.enabled && storage.is_negative_action_edge_blocked(key, sampled) {
+    // perturb traversal blocking with a second gate transition.
+    if negative_action.enabled
+        && action_increments_raise_count(&state, actions[sampled])
+        && storage.is_negative_action_edge_blocked(key, sampled)
+    {
         storage.record_negative_action_blocked_traversal_skip();
     }
     let (value, stats) = traverse_node(
         game,
         storage,
         deal,
+        exact_runouts,
+        chance_mode,
+        resolved_street,
         traverser,
         apply_action(state, actions[sampled]),
         child_history,
@@ -612,29 +1078,56 @@ fn traverse_opponent(
     (value, stats)
 }
 
+fn update_strategy_sums(
+    storage: &SparseMpStorage,
+    key: MpInfosetKey,
+    num_actions: usize,
+    strategy: &[f64; MAX_ACTIONS],
+) {
+    for (action_idx, prob) in strategy[..num_actions].iter().enumerate() {
+        let raw = prob * STRATEGY_SCALE;
+        let delta = raw.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+        if delta == 0 {
+            continue;
+        }
+        storage.add_strategy_sum(key, num_actions, action_idx, delta);
+    }
+}
+
 fn negative_action_blocks(
     storage: &SparseMpStorage,
     config: NegativeActionTraversalConfig,
+    action_is_aggressive: bool,
     key: MpInfosetKey,
     action: usize,
     child_history: LazyHistory,
 ) -> bool {
-    if !config.enabled {
+    if !config.enabled || !action_is_aggressive {
         return false;
     }
     let regret = storage.get_regret(key, action);
-    transition_negative_action_gate(storage, config, key, action, regret, child_history).blocked
+    transition_negative_action_gate(
+        storage,
+        config,
+        action_is_aggressive,
+        key,
+        action,
+        regret,
+        child_history,
+    )
+    .blocked
 }
 
 fn transition_negative_action_gate(
     storage: &SparseMpStorage,
     config: NegativeActionTraversalConfig,
+    action_is_aggressive: bool,
     key: MpInfosetKey,
     action: usize,
     regret: i32,
     child_history: LazyHistory,
 ) -> super::sparse_storage::NegativeActionGateResult {
-    if !config.enabled {
+    if !config.enabled || !action_is_aggressive {
         return super::sparse_storage::NegativeActionGateResult::default();
     }
     storage.transition_negative_action_edge(
@@ -651,11 +1144,16 @@ fn should_prune_lazy(
     storage: &SparseMpStorage,
     prune: bool,
     prune_threshold: i32,
+    child_is_terminal: bool,
     key: MpInfosetKey,
     action: usize,
+    action_probability: f64,
     stats: &mut PruneStats,
 ) -> bool {
-    if !prune {
+    if !prune || child_is_terminal {
+        return false;
+    }
+    if action_probability > PRUNE_STRATEGY_EPSILON {
         return false;
     }
     stats.total += 1;
@@ -857,9 +1355,7 @@ fn advance_to_next_player(mut state: LazyPublicState) -> LazyNode {
 fn showdown_or_next_street(state: LazyPublicState) -> LazyNode {
     let should_runout = count_active_non_allin(&state) <= 1;
     match state.street.next() {
-        Some(next_street) if !should_runout => {
-            LazyNode::Decision(new_street_state(state, next_street))
-        }
+        Some(next_street) if !should_runout => LazyNode::Chance { state, next_street },
         Some(_) | None => LazyNode::Terminal {
             kind: TerminalKind::Showdown {
                 active: state.active,
@@ -928,11 +1424,10 @@ fn generate_actions(config: &LazyActionConfig, state: &LazyPublicState) -> Vec<T
     if state.facing_bet {
         actions.push(TreeAction::Fold);
     }
-    if is_unopened_preflop
-        && state.facing_bet
-        && preflop_call_allowed(config.max_flop_players, state)
-    {
-        actions.push(TreeAction::Call);
+    if is_unopened_preflop && state.facing_bet {
+        if unopened_preflop_call_allowed(config, state) {
+            actions.push(TreeAction::Call);
+        }
     } else {
         add_check_or_call(config, state, &mut actions);
     }
@@ -972,6 +1467,13 @@ fn add_check_or_call(
     } else {
         actions.push(TreeAction::Check);
     }
+}
+
+fn unopened_preflop_call_allowed(config: &LazyActionConfig, state: &LazyPublicState) -> bool {
+    let actor = state.to_act.index() as usize;
+    let actor_has_blind_posted = state.street_bets[actor] > Chips(SIZE_EPSILON);
+    (config.allow_preflop_limp || actor_has_blind_posted)
+        && preflop_call_allowed(config.max_flop_players, state)
 }
 
 fn add_sized_actions(
@@ -1462,6 +1964,7 @@ mod tests {
             name: "lazy test".to_string(),
             num_players,
             stack_depth,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -1651,6 +2154,56 @@ mod tests {
     }
 
     #[timed_test]
+    fn lazy_root_honors_no_limp_config() {
+        let mut game_config = game_config(6, 200.0);
+        game_config.allow_preflop_limp = false;
+        let game = LazyMpGame::new(&game_config, &action_config());
+
+        let mut state = game.root_state();
+        for position in ["UTG", "HJ", "CO", "BTN"] {
+            let actions = game.actions(&state);
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, TreeAction::Call)),
+                "{position} should not include a cold limp when limps are disabled, got {actions:?}"
+            );
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON)),
+                "{position} should keep configured opens when limps are disabled, got {actions:?}"
+            );
+
+            let LazyNode::Decision(next_state) =
+                normalize_node(apply_action(state, TreeAction::Fold))
+            else {
+                panic!("{position} fold should route to next unopened preflop decision");
+            };
+            state = next_state;
+        }
+
+        let sb_actions = game.actions(&state);
+        assert!(
+            sb_actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call)),
+            "SB should keep completion/call when limps are disabled, got {sb_actions:?}"
+        );
+        let LazyNode::Decision(bb_state) = normalize_node(apply_action(state, TreeAction::Call))
+        else {
+            panic!("SB completion should route to BB decision");
+        };
+        let bb_actions = game.actions(&bb_state);
+        assert!(
+            bb_actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Check)),
+            "BB should be able to check after SB completion, got {bb_actions:?}"
+        );
+    }
+
+    #[timed_test]
     fn lazy_preflop_flop_player_cap_removes_non_closing_overcall_but_keeps_closing_call() {
         let config = lazy_cap_action_config(Some(3));
         let sb_non_closing = lazy_open_one_caller_state(&[0, 1, 4, 5], 4);
@@ -1799,6 +2352,8 @@ mod tests {
             &game,
             &storage,
             &buckets,
+            &ExactChanceRunouts::default(),
+            MpChanceContinuationMode::SampledFullDeal,
             Seat::from_raw(0),
             &mut rng,
             0.0,
@@ -1810,6 +2365,92 @@ mod tests {
 
         assert!(value.is_finite());
         assert!(storage.entry_count() > 0);
+    }
+
+    #[timed_test]
+    fn zero_strategy_sum_update_does_not_allocate_sparse_row() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let root = game.root_state();
+        let key = LazyHistory::default().key(root, 0);
+        let mut strategy = [0.0; MAX_ACTIONS];
+
+        update_strategy_sums(&storage, key, 2, &strategy);
+
+        assert_eq!(storage.entry_count(), 0);
+
+        strategy[0] = 1.0;
+        update_strategy_sums(&storage, key, 2, &strategy);
+
+        assert_eq!(storage.entry_count(), 1);
+        assert_eq!(storage.get_strategy_sum(key, 0), STRATEGY_SCALE as u64);
+        assert_eq!(storage.get_strategy_sum(key, 1), 0);
+    }
+
+    #[timed_test]
+    fn lazy_opponent_traversal_updates_full_average_strategy_vector() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let mut rng = SmallRng::seed_from_u64(42);
+        let deal = sample_deal(2, &mut rng);
+        let buckets = test_buckets(&deal, [10, 10, 10, 10]);
+        let root = game.root_state();
+        let actions = game.actions(&root);
+        let bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
+        let key = LazyHistory::default().key(root, bucket);
+
+        let (value, _stats) = traverse_external_lazy(
+            &game,
+            &storage,
+            &buckets,
+            &ExactChanceRunouts::default(),
+            MpChanceContinuationMode::SampledFullDeal,
+            Seat::from_raw(1),
+            &mut rng,
+            0.0,
+            Chips::ZERO,
+            false,
+            -250,
+            NegativeActionTraversalConfig::default(),
+        );
+
+        assert!(value.is_finite());
+        for action_idx in 0..actions.len() {
+            assert!(
+                storage.get_strategy_sum(key, action_idx) > 0,
+                "opponent average update should record every root action"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn lazy_opponent_sample_action_matches_strategy_distribution() {
+        let strategy = [0.10, 0.25, 0.65];
+        let mut counts = [0_u32; 3];
+        let mut rng = SmallRng::seed_from_u64(0x1A2E_5A11);
+        let samples = 50_000_u32;
+
+        for _ in 0..samples {
+            counts[sample_action(&strategy, &mut rng)] += 1;
+        }
+
+        for (idx, (&actual, &expected)) in counts.iter().zip(strategy.iter()).enumerate() {
+            let frequency = f64::from(actual) / f64::from(samples);
+            assert!(
+                (frequency - expected).abs() < 0.01,
+                "action {idx} sampled at {frequency:.4}, expected {expected:.4}"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn lazy_opponent_sample_action_never_selects_zero_probability_action() {
+        let strategy = [0.0, 1.0, 0.0];
+        let mut rng = SmallRng::seed_from_u64(0x51A7_E5E1);
+
+        for _ in 0..1_000 {
+            assert_eq!(sample_action(&strategy, &mut rng), 1);
+        }
     }
 
     #[timed_test]
@@ -1837,6 +2478,54 @@ mod tests {
     }
 
     #[timed_test]
+    fn lazy_pruning_ignores_terminal_children() {
+        let storage = SparseMpStorage::with_shards(8);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(key, 2, 0, -10_000);
+
+        assert!(!should_prune_lazy(
+            &storage, true, -1, true, key, 0, 0.0, &mut stats
+        ));
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[timed_test]
+    fn lazy_pruning_skips_negative_nonterminal_actions() {
+        let storage = SparseMpStorage::with_shards(8);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(key, 2, 1, -10_000);
+
+        assert!(should_prune_lazy(
+            &storage, true, -1, false, key, 1, 0.0, &mut stats
+        ));
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[timed_test]
+    fn lazy_pruning_keeps_actions_with_current_strategy_mass() {
+        let storage = SparseMpStorage::with_shards(8);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 0, 0, 0, 0, 0);
+        let mut stats = PruneStats::default();
+
+        storage.add_regret(key, 2, 1, -10_000);
+
+        assert!(!should_prune_lazy(
+            &storage, true, -1, false, key, 1, 0.5, &mut stats
+        ));
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[timed_test]
     fn negative_action_gate_disabled_preserves_default_traversal_storage_behavior() {
         let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
         let storage = SparseMpStorage::with_shards(8);
@@ -1858,6 +2547,7 @@ mod tests {
                 prune_below: -1,
                 reactivate_at: 0,
             },
+            true,
             root_key,
             action_idx,
             child_history
@@ -1873,22 +2563,63 @@ mod tests {
     }
 
     #[timed_test]
-    fn lazy_negative_action_gate_purges_descendants_and_skips_reallocation() {
+    fn negative_action_gate_ignores_passive_edges() {
+        let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
+        let storage = SparseMpStorage::with_shards(8);
+        let root = game.root_state();
+        let actions = game.actions(&root);
+        let root_history = LazyHistory::default();
+        let root_key = root_history.key(root, 10);
+        let action_idx = actions
+            .iter()
+            .position(|action| !action_increments_raise_count(&root, *action))
+            .expect("root should have a passive action");
+        let child_history = root_history.append(action_idx);
+        let descendant_history = child_history.append(0);
+        let descendant_key = descendant_history.key(root, 10);
+
+        storage.add_regret(root_key, actions.len(), action_idx, -200);
+        storage.add_regret(descendant_key, 2, 0, 17);
+
+        assert!(!negative_action_blocks(
+            &storage,
+            NegativeActionTraversalConfig {
+                enabled: true,
+                prune_below: -1,
+                reactivate_at: 0,
+            },
+            false,
+            root_key,
+            action_idx,
+            child_history
+        ));
+
+        assert!(!storage.is_negative_action_edge_blocked(root_key, action_idx));
+        assert_eq!(storage.negative_action_blocked_edge_count(), 0);
+        assert_eq!(storage.get_regret(descendant_key, 0), 17);
+    }
+
+    #[timed_test]
+    fn lazy_negative_action_gate_blocks_aggressive_edge_without_traversal_time_purge() {
         let game = LazyMpGame::new(&game_config(2, 20.0), &action_config());
         let storage = SparseMpStorage::with_shards(8);
         let mut rng = SmallRng::seed_from_u64(43);
         let deal = sample_deal(2, &mut rng);
         let buckets = test_buckets(&deal, [10, 10, 10, 10]);
         let root = game.root_state();
+        let actions = game.actions(&root);
         let root_bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
         let root_history = LazyHistory::default();
         let root_key = root_history.key(root, root_bucket);
-        let action_idx = 0;
+        let action_idx = actions
+            .iter()
+            .position(|action| action_increments_raise_count(&root, *action))
+            .expect("root should have an aggressive action");
         let child_history = root_history.append(action_idx);
         let descendant_history = child_history.append(0);
         let descendant_key = descendant_history.key(root, root_bucket);
 
-        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+        storage.add_regret(root_key, actions.len(), action_idx, -2);
         storage.add_regret(descendant_key, 2, 0, 17);
         assert_eq!(storage.get_regret(descendant_key, 0), 17);
 
@@ -1896,6 +2627,8 @@ mod tests {
             &game,
             &storage,
             &buckets,
+            &ExactChanceRunouts::default(),
+            MpChanceContinuationMode::SampledFullDeal,
             root.to_act,
             &mut rng,
             0.0,
@@ -1911,7 +2644,7 @@ mod tests {
 
         assert!(value.is_finite());
         assert!(storage.is_negative_action_edge_blocked(root_key, action_idx));
-        assert_eq!(storage.get_regret(descendant_key, 0), 0);
+        assert_eq!(storage.get_regret(descendant_key, 0), 17);
         assert_eq!(
             storage.negative_action_telemetry().blocked_traversal_skips,
             1
@@ -1929,14 +2662,20 @@ mod tests {
         let root_bucket = buckets.buckets[root.to_act.index() as usize][root.street.index()].0;
         let root_history = LazyHistory::default();
         let root_key = root_history.key(root, root_bucket);
-        let action_idx = 0;
+        let actions = game.actions(&root);
+        let action_idx = actions
+            .iter()
+            .position(|action| action_increments_raise_count(&root, *action))
+            .expect("root should have an aggressive action");
 
-        storage.add_regret(root_key, game.actions(&root).len(), action_idx, -2);
+        storage.add_regret(root_key, actions.len(), action_idx, -2);
 
         let (value, _stats) = traverse_external_lazy(
             &game,
             &storage,
             &buckets,
+            &ExactChanceRunouts::default(),
+            MpChanceContinuationMode::SampledFullDeal,
             Seat::from_raw((root.to_act.index() + 1) % root.num_players),
             &mut rng,
             0.0,

@@ -195,6 +195,30 @@ mod tests {
         assert_eq!(payoffs[1], Chips(75.0));
     }
 
+    #[timed_test]
+    fn fold_payoffs_include_blind_contributions() {
+        // With BB=2 chips, the small blind is 1 chip (0.5bb) and the
+        // big blind is 2 chips (1bb). Folding loses posted blind money.
+        let contribs = [
+            Chips(1.0),
+            Chips(2.0),
+            Chips::ZERO,
+            Chips::ZERO,
+            Chips::ZERO,
+            Chips::ZERO,
+            Chips::ZERO,
+            Chips::ZERO,
+        ];
+
+        let sb_folds = resolve_fold(contribs, Seat::from_raw(1), 2);
+        assert_eq!(sb_folds[0], Chips(-1.0));
+        assert_eq!(sb_folds[1], Chips(1.0));
+
+        let bb_folds = resolve_fold(contribs, Seat::from_raw(0), 2);
+        assert_eq!(bb_folds[0], Chips(2.0));
+        assert_eq!(bb_folds[1], Chips(-2.0));
+    }
+
     // ---------- resolve_showdown tests ----------
 
     #[timed_test]

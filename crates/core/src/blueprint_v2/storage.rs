@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
-use super::game_tree::{GameNode, GameTree};
+use super::game_tree::{GameNode, GameTree, TreeAction};
 use crate::cfr::optimizer::CfrOptimizer;
 
 /// Fixed-point scaling factor for regret, prediction, and baseline buffers.
@@ -79,13 +79,131 @@ struct NodeLayout {
     street_idx: u8,
 }
 
+/// Stable fingerprint for the ordered legal-action schema at a decision node.
+///
+/// Sparse CFR rows are keyed by arena node identity, bucket, and this schema
+/// fingerprint so an accidental action-order/shape mismatch is rejected rather
+/// than silently aliased onto incompatible row data.
+#[must_use]
+pub fn action_schema_fingerprint(actions: &[TreeAction]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(hash: &mut u64, value: u64) {
+        for byte in value.to_le_bytes() {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut h = FNV_OFFSET;
+    mix(&mut h, actions.len() as u64);
+    for action in actions {
+        match *action {
+            TreeAction::Fold => mix(&mut h, 0),
+            TreeAction::Check => mix(&mut h, 1),
+            TreeAction::Call => mix(&mut h, 2),
+            TreeAction::Bet(v) => {
+                mix(&mut h, 3);
+                mix(&mut h, v.to_bits());
+            }
+            TreeAction::Raise(v) => {
+                mix(&mut h, 4);
+                mix(&mut h, v.to_bits());
+            }
+            TreeAction::AllIn => mix(&mut h, 5),
+        }
+    }
+    h
+}
+
+/// Instrumentation snapshot for blueprint_v2 CFR storage backends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CfrStorageStats {
+    pub realized_rows: usize,
+    pub realized_slots: usize,
+    pub inserts: u64,
+    pub read_probes: u64,
+    pub read_hits: u64,
+    pub write_probes: u64,
+    pub write_hits: u64,
+    pub dense_equivalent_slots: usize,
+    pub dense_equivalent_bytes: usize,
+    pub sparse_resident_bytes: usize,
+}
+
+/// Storage operations used by the blueprint_v2 MCCFR traversal.
+pub trait BlueprintCfrStorage: Send + Sync {
+    fn bucket_counts(&self) -> [u16; 4];
+    fn num_actions(&self, node_idx: u32) -> u16;
+    fn street_idx(&self, node_idx: u32) -> u8;
+
+    fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32;
+    fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32);
+    fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64;
+    fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64);
+
+    fn get_baseline(&self, node_idx: u32, bucket: u16, action: usize) -> f64;
+    fn update_baseline(&self, node_idx: u32, bucket: u16, action: usize, value: f64, alpha: f64);
+    fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32;
+    fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32);
+    fn add_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32);
+
+    fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]);
+    fn average_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64>;
+
+    fn current_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64> {
+        let mut out = vec![0.0; self.num_actions(node_idx) as usize];
+        self.current_strategy_into(node_idx, bucket, &mut out);
+        out
+    }
+
+    fn purified_average_strategy(&self, node_idx: u32, bucket: u16, threshold: f64) -> Vec<f64> {
+        let mut strat = self.average_strategy(node_idx, bucket);
+        for p in &mut strat {
+            if *p < threshold {
+                *p = 0.0;
+            }
+        }
+        let sum: f64 = strat.iter().sum();
+        if sum > 0.0 {
+            for p in &mut strat {
+                *p /= sum;
+            }
+        } else if !strat.is_empty() {
+            let uniform = 1.0 / strat.len() as f64;
+            strat.fill(uniform);
+        }
+        strat
+    }
+
+    fn storage_stats(&self) -> CfrStorageStats;
+
+    fn project_dense_regrets_and_sums(&self, tree: &GameTree) -> (Vec<i32>, Vec<i64>) {
+        let dense_slots = self.storage_stats().dense_equivalent_slots;
+        let mut regrets = Vec::with_capacity(dense_slots);
+        let mut sums = Vec::with_capacity(dense_slots);
+        let bucket_counts = self.bucket_counts();
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            let GameNode::Decision {
+                street, actions, ..
+            } = node
+            else {
+                continue;
+            };
+            for bucket in 0..bucket_counts[*street as usize] {
+                for action_idx in 0..actions.len() {
+                    regrets.push(self.get_regret(node_idx as u32, bucket, action_idx));
+                    sums.push(self.get_strategy_sum(node_idx as u32, bucket, action_idx));
+                }
+            }
+        }
+        (regrets, sums)
+    }
+}
+
 impl BlueprintStorage {
-    /// Build storage for a given tree and per-street bucket counts.
-    ///
-    /// Pre-allocates zeroed flat buffers sized to cover every
-    /// (decision node, bucket, action) triple.
-    #[must_use]
-    pub fn new(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+    fn build_layout(tree: &GameTree, bucket_counts: [u16; 4]) -> (Vec<NodeLayout>, usize) {
         let mut layout = vec![NodeLayout::default(); tree.nodes.len()];
         let mut total: usize = 0;
 
@@ -108,6 +226,31 @@ impl BlueprintStorage {
             }
         }
 
+        (layout, total)
+    }
+
+    pub(crate) fn new_unlogged(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+        let (layout, total) = Self::build_layout(tree, bucket_counts);
+        Self {
+            regrets: (0..total).map(|_| AtomicI32::new(0)).collect(),
+            strategy_sums: (0..total).map(|_| AtomicI64::new(0)).collect(),
+            baselines: None,
+            predictions: None,
+            predictions_locked: AtomicBool::new(false),
+            optimizer: None,
+            bucket_counts,
+            layout,
+            regret_floor: i32::MIN,
+        }
+    }
+
+    /// Build storage for a given tree and per-street bucket counts.
+    ///
+    /// Pre-allocates zeroed flat buffers sized to cover every
+    /// (decision node, bucket, action) triple.
+    #[must_use]
+    pub fn new(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+        let (layout, total) = Self::build_layout(tree, bucket_counts);
         let regret_bytes = total * std::mem::size_of::<AtomicI32>();
         let strategy_bytes = total * std::mem::size_of::<AtomicI64>();
         eprintln!(
@@ -147,6 +290,28 @@ impl BlueprintStorage {
             storage.baselines = Some((0..total).map(|_| AtomicI32::new(0)).collect());
         }
         storage
+    }
+
+    /// Build dense-storage metadata without allocating dense slot buffers.
+    ///
+    /// Used as the public compatibility placeholder when the trainer's active
+    /// backend is sparse. Read-only strategy methods fall back to the same
+    /// all-zero/uniform semantics as a missing sparse row; mutation methods
+    /// must not be used on this placeholder.
+    #[must_use]
+    pub fn new_projection_stub(tree: &GameTree, bucket_counts: [u16; 4]) -> Self {
+        let (layout, _) = Self::build_layout(tree, bucket_counts);
+        Self {
+            regrets: Vec::new(),
+            strategy_sums: Vec::new(),
+            baselines: None,
+            predictions: None,
+            predictions_locked: AtomicBool::new(false),
+            optimizer: None,
+            bucket_counts,
+            layout,
+            regret_floor: i32::MIN,
+        }
     }
 
     /// Flat-buffer index for a given (node, bucket, action) triple.
@@ -202,6 +367,9 @@ impl BlueprintStorage {
     pub fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        if self.regrets.is_empty() {
+            return 0;
+        }
         self.regrets[idx].load(Ordering::Relaxed)
     }
 
@@ -211,6 +379,10 @@ impl BlueprintStorage {
     pub fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        assert!(
+            !self.regrets.is_empty(),
+            "cannot mutate dense projection stub storage"
+        );
         let atom = &self.regrets[idx];
         if self.regret_floor == i32::MIN {
             // Fast path: no floor configured — still use saturating_add
@@ -233,6 +405,9 @@ impl BlueprintStorage {
     pub fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        if self.strategy_sums.is_empty() {
+            return 0;
+        }
         self.strategy_sums[idx].load(Ordering::Relaxed)
     }
 
@@ -241,12 +416,21 @@ impl BlueprintStorage {
     pub fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
         let nl = &self.layout[node_idx as usize];
         let idx = Self::slot_offset(nl, bucket) + action;
+        assert!(
+            !self.strategy_sums.is_empty(),
+            "cannot mutate dense projection stub storage"
+        );
         self.strategy_sums[idx].fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Set the pluggable optimizer for this storage.
     pub fn set_optimizer(&mut self, optimizer: Arc<dyn CfrOptimizer>) {
         self.optimizer = Some(optimizer);
+    }
+
+    /// Set the lower bound applied to cumulative regret updates.
+    pub fn set_regret_floor(&mut self, floor: i32) {
+        self.regret_floor = floor;
     }
 
     /// Allocate the prediction buffer (same size as regrets, zeroed).
@@ -330,21 +514,13 @@ impl BlueprintStorage {
     pub fn current_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64> {
         let nl = &self.layout[node_idx as usize];
         let num_actions = nl.num_actions as usize;
-        let start = Self::slot_offset(nl, bucket);
-
-        let mut positive_sum = 0.0_f64;
-        let mut positives = Vec::with_capacity(num_actions);
-        for i in 0..num_actions {
-            let r = self.regrets[start + i].load(Ordering::Relaxed).max(0) as f64;
-            positives.push(r);
-            positive_sum += r;
+        let mut strategy = vec![0.0; num_actions];
+        if self.regrets.is_empty() {
+            strategy.fill(1.0 / num_actions as f64);
+            return strategy;
         }
-
-        if positive_sum > 0.0 {
-            positives.iter().map(|&r| r / positive_sum).collect()
-        } else {
-            vec![1.0 / num_actions as f64; num_actions]
-        }
+        self.current_strategy_into(node_idx, bucket, &mut strategy);
+        strategy
     }
 
     /// Write the current regret-matched strategy into a caller-supplied buffer.
@@ -369,6 +545,11 @@ impl BlueprintStorage {
         );
         let out = &mut out[..num_actions];
         let start = Self::slot_offset(nl, bucket);
+
+        if self.regrets.is_empty() {
+            out.fill(1.0 / num_actions as f64);
+            return;
+        }
 
         if let Some(ref opt) = self.optimizer {
             opt.current_strategy(
@@ -405,6 +586,10 @@ impl BlueprintStorage {
         let nl = &self.layout[node_idx as usize];
         let num_actions = nl.num_actions as usize;
         let start = Self::slot_offset(nl, bucket);
+
+        if self.strategy_sums.is_empty() {
+            return vec![1.0 / num_actions as f64; num_actions];
+        }
 
         let mut total = 0.0_f64;
         let mut sums = Vec::with_capacity(num_actions);
@@ -685,6 +870,106 @@ impl BlueprintStorage {
     #[inline]
     fn slot_offset(nl: &NodeLayout, bucket: u16) -> usize {
         nl.offset + (bucket as usize) * (nl.num_actions as usize)
+    }
+}
+
+impl BlueprintCfrStorage for BlueprintStorage {
+    fn bucket_counts(&self) -> [u16; 4] {
+        self.bucket_counts
+    }
+
+    fn num_actions(&self, node_idx: u32) -> u16 {
+        Self::num_actions(self, node_idx)
+    }
+
+    fn street_idx(&self, node_idx: u32) -> u8 {
+        Self::street_idx(self, node_idx)
+    }
+
+    fn get_regret(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+        Self::get_regret(self, node_idx, bucket, action)
+    }
+
+    fn add_regret(&self, node_idx: u32, bucket: u16, action: usize, delta: i32) {
+        Self::add_regret(self, node_idx, bucket, action, delta);
+    }
+
+    fn get_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize) -> i64 {
+        Self::get_strategy_sum(self, node_idx, bucket, action)
+    }
+
+    fn add_strategy_sum(&self, node_idx: u32, bucket: u16, action: usize, delta: i64) {
+        Self::add_strategy_sum(self, node_idx, bucket, action, delta);
+    }
+
+    fn get_baseline(&self, node_idx: u32, bucket: u16, action: usize) -> f64 {
+        Self::get_baseline(self, node_idx, bucket, action)
+    }
+
+    fn update_baseline(&self, node_idx: u32, bucket: u16, action: usize, value: f64, alpha: f64) {
+        Self::update_baseline(self, node_idx, bucket, action, value, alpha);
+    }
+
+    fn get_prediction(&self, node_idx: u32, bucket: u16, action: usize) -> i32 {
+        Self::get_prediction(self, node_idx, bucket, action)
+    }
+
+    fn set_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32) {
+        Self::set_prediction(self, node_idx, bucket, action, value);
+    }
+
+    fn add_prediction(&self, node_idx: u32, bucket: u16, action: usize, value: i32) {
+        Self::add_prediction(self, node_idx, bucket, action, value);
+    }
+
+    fn current_strategy_into(&self, node_idx: u32, bucket: u16, out: &mut [f64]) {
+        Self::current_strategy_into(self, node_idx, bucket, out);
+    }
+
+    fn average_strategy(&self, node_idx: u32, bucket: u16) -> Vec<f64> {
+        Self::average_strategy(self, node_idx, bucket)
+    }
+
+    fn storage_stats(&self) -> CfrStorageStats {
+        let realized_rows = self
+            .layout
+            .iter()
+            .filter(|nl| nl.num_actions > 0)
+            .map(|nl| self.bucket_counts[nl.street_idx as usize] as usize)
+            .sum();
+        let base_bytes = self.regrets.len() * std::mem::size_of::<AtomicI32>()
+            + self.strategy_sums.len() * std::mem::size_of::<AtomicI64>();
+        let baseline_bytes = self
+            .baselines
+            .as_ref()
+            .map_or(0, |b| b.len() * std::mem::size_of::<AtomicI32>());
+        let prediction_bytes = self
+            .predictions
+            .as_ref()
+            .map_or(0, |p| p.len() * std::mem::size_of::<AtomicI32>());
+        let resident_bytes = base_bytes + baseline_bytes + prediction_bytes;
+
+        CfrStorageStats {
+            realized_rows,
+            realized_slots: self.regrets.len(),
+            dense_equivalent_slots: self.regrets.len(),
+            dense_equivalent_bytes: resident_bytes,
+            sparse_resident_bytes: resident_bytes,
+            ..CfrStorageStats::default()
+        }
+    }
+
+    fn project_dense_regrets_and_sums(&self, _tree: &GameTree) -> (Vec<i32>, Vec<i64>) {
+        (
+            self.regrets
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect(),
+            self.strategy_sums
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect(),
+        )
     }
 }
 

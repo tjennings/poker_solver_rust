@@ -20,11 +20,17 @@ pub struct MpGameConfig {
     pub name: String,
     pub num_players: u8,
     pub stack_depth: f64,
+    #[serde(default = "default_allow_preflop_limp")]
+    pub allow_preflop_limp: bool,
     pub blinds: Vec<ForcedBet>,
     #[serde(default)]
     pub rake_rate: f64,
     #[serde(default)]
     pub rake_cap: f64,
+}
+
+fn default_allow_preflop_limp() -> bool {
+    true
 }
 
 impl MpGameConfig {
@@ -157,6 +163,8 @@ pub struct MpStreetCluster {
 pub struct MpTrainingConfig {
     #[serde(default = "default_training_backend")]
     pub backend: MpTrainingBackend,
+    #[serde(default = "default_chance_continuation_mode")]
+    pub chance_continuation_mode: MpChanceContinuationMode,
     #[serde(default)]
     pub cluster_path: Option<String>,
     #[serde(default)]
@@ -167,10 +175,22 @@ pub struct MpTrainingConfig {
     pub lcfr_warmup_iterations: u64,
     #[serde(default = "default_discount_interval")]
     pub lcfr_discount_interval: u64,
+    /// Warmup boundary for opt-in negative-action subtree purge.
+    ///
+    /// Ordinary regret-threshold traversal pruning also waits for this boundary
+    /// when `traversal_pruning_enabled` is true.
     #[serde(default = "default_prune_after")]
     pub prune_after_iterations: u64,
+    /// Opt in to ordinary regret-threshold traversal pruning.
+    ///
+    /// This skips eligible traverser-side action branches during a batch, but it
+    /// does not physically purge sparse rows or strategy sums.
+    #[serde(default)]
+    pub traversal_pruning_enabled: bool,
+    /// Ordinary traversal-pruning cumulative regret threshold.
     #[serde(default = "default_prune_threshold")]
     pub prune_threshold: i32,
+    /// Fraction of post-warmup batches that disable ordinary traversal pruning.
     #[serde(default = "default_prune_explore")]
     pub prune_explore_pct: f64,
     #[serde(default)]
@@ -209,6 +229,18 @@ pub enum MpTrainingBackend {
     LazySparse,
 }
 
+/// Chance sampling/averaging mode for lazy MP training.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MpChanceContinuationMode {
+    /// Current behavior: sample a full board up front.
+    SampledFullDeal,
+    /// Sample through the turn, then average values over all legal rivers.
+    SampledTurnExactRiver,
+    /// Sample through the flop, then average values over all legal turn/river runouts.
+    SampledFlopExactTurnRiver,
+}
+
 /// Strategy for identifying negative-action subtrees eligible for purge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,6 +267,10 @@ pub struct MpSnapshotConfig {
 
 const fn default_training_backend() -> MpTrainingBackend {
     MpTrainingBackend::Eager
+}
+
+const fn default_chance_continuation_mode() -> MpChanceContinuationMode {
+    MpChanceContinuationMode::SampledFullDeal
 }
 
 const fn default_lcfr_warmup() -> u64 {
@@ -486,6 +522,7 @@ snapshots:
         assert!(matches!(cfg.game.blinds[0].kind, ForcedBetKind::SmallBlind));
         assert!(matches!(cfg.game.blinds[1].kind, ForcedBetKind::BigBlind));
         assert!((cfg.game.stack_depth - 100.0).abs() < f64::EPSILON);
+        assert!(cfg.game.allow_preflop_limp);
     }
 
     #[timed_test]
@@ -495,6 +532,7 @@ game:
   name: "Split Test"
   num_players: 2
   stack_depth: 100.0
+  allow_preflop_limp: false
   blinds:
     - seat: 0
       type: small_blind
@@ -551,6 +589,7 @@ snapshots:
         // Flop: 3 lead sizes, 1 raise depth
         assert_eq!(cfg.action_abstraction.flop.lead.len(), 3);
         assert_eq!(cfg.action_abstraction.flop.raise.len(), 1);
+        assert!(!cfg.game.allow_preflop_limp);
     }
 
     #[timed_test]
@@ -559,6 +598,7 @@ snapshots:
             name: "Too many".into(),
             num_players: 9,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -583,6 +623,7 @@ snapshots:
             name: "Solo".into(),
             num_players: 1,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![ForcedBet {
                 seat: 0,
                 kind: ForcedBetKind::SmallBlind,
@@ -600,6 +641,7 @@ snapshots:
             name: "Forced bets".into(),
             num_players: 6,
             stack_depth: 200.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -640,6 +682,7 @@ snapshots:
             name: "Min".into(),
             num_players: 2,
             stack_depth: 50.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -664,6 +707,7 @@ snapshots:
             name: "Max".into(),
             num_players: 8,
             stack_depth: 200.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -688,6 +732,7 @@ snapshots:
             name: "Zero stack".into(),
             num_players: 2,
             stack_depth: 0.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -712,6 +757,7 @@ snapshots:
             name: "Bad seat".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -736,6 +782,7 @@ snapshots:
             name: "Zero blind".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![
                 ForcedBet {
                     seat: 0,
@@ -760,9 +807,14 @@ snapshots:
         let cfg: MpTrainingConfig =
             serde_yaml::from_str(yaml).expect("failed to parse empty training");
 
+        assert_eq!(
+            cfg.chance_continuation_mode,
+            MpChanceContinuationMode::SampledFullDeal
+        );
         assert_eq!(cfg.lcfr_warmup_iterations, 5_000_000);
         assert_eq!(cfg.lcfr_discount_interval, 500_000);
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
+        assert!(!cfg.traversal_pruning_enabled);
         assert_eq!(cfg.prune_threshold, -250);
         assert!((cfg.prune_explore_pct - 0.05).abs() < f64::EPSILON);
         assert!(!cfg.negative_action_subtree_purge_enabled);
@@ -783,6 +835,31 @@ snapshots:
     }
 
     #[timed_test]
+    fn training_chance_continuation_mode_parses() {
+        let yaml = r#"
+chance_continuation_mode: sampled_turn_exact_river
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse chance continuation mode");
+
+        assert_eq!(
+            cfg.chance_continuation_mode,
+            MpChanceContinuationMode::SampledTurnExactRiver
+        );
+
+        let yaml = r#"
+chance_continuation_mode: sampled_flop_exact_turn_river
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse flop exact continuation mode");
+
+        assert_eq!(
+            cfg.chance_continuation_mode,
+            MpChanceContinuationMode::SampledFlopExactTurnRiver
+        );
+    }
+
+    #[timed_test]
     fn training_negative_action_purge_keys_parse() {
         let yaml = r#"
 negative_action_subtree_purge_enabled: true
@@ -800,6 +877,23 @@ negative_action_purge_mode: scan_history_prefix
             cfg.negative_action_purge_mode,
             MpNegativeActionPurgeMode::ScanHistoryPrefix
         );
+    }
+
+    #[timed_test]
+    fn training_traversal_pruning_key_parses() {
+        let yaml = r#"
+traversal_pruning_enabled: true
+prune_after_iterations: 4000000
+prune_threshold: -100
+prune_explore_pct: 0.0
+"#;
+        let cfg: MpTrainingConfig =
+            serde_yaml::from_str(yaml).expect("failed to parse traversal pruning config");
+
+        assert!(cfg.traversal_pruning_enabled);
+        assert_eq!(cfg.prune_after_iterations, 4_000_000);
+        assert_eq!(cfg.prune_threshold, -100);
+        assert!((cfg.prune_explore_pct).abs() < f64::EPSILON);
     }
 
     #[timed_test]
@@ -837,6 +931,7 @@ output_dir: "/tmp/out"
             name: "No blinds".into(),
             num_players: 2,
             stack_depth: 100.0,
+            allow_preflop_limp: true,
             blinds: vec![],
             rake_rate: 0.0,
             rake_cap: 0.0,

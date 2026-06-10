@@ -3251,7 +3251,8 @@ mod tests {
         let node_action_counts = vec![2u16, 2u16];
         let node_street_indices = vec![0u8, 1u8]; // preflop=0, flop=1
 
-        // Build via serde_json -> save -> load roundtrip to populate private node_offsets
+        // Build via serde_json to exercise the same serialized shape, then
+        // populate transient offsets without a filesystem roundtrip.
         let json = serde_json::json!({
             "action_probs": action_probs,
             "node_action_counts": node_action_counts,
@@ -3260,14 +3261,8 @@ mod tests {
             "iterations": 100u64,
             "elapsed_minutes": 1u64,
         });
-        let strat_raw: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
-        let tmp = std::env::temp_dir().join(format!(
-            "test_strategy_postflop_{:?}.bin",
-            std::thread::current().id()
-        ));
-        strat_raw.save(&tmp).expect("save");
-        let strat = BlueprintV2Strategy::load(&tmp).expect("load");
-        let _ = std::fs::remove_file(&tmp);
+        let mut strat: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
+        strat.post_deserialize();
 
         // decision_map: 6 nodes, node 0 -> decision 0, node 2 -> decision 1, rest -> MAX
         let decision_map = vec![0, u32::MAX, 1, u32::MAX, u32::MAX, u32::MAX];
@@ -3348,12 +3343,14 @@ mod tests {
                 purify_threshold: 0.0,
                 equity_cache_path: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,
                 brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                baseline_validation: Default::default(),
                 prune_streets: None,
                 regret_floor: None,
                 exploitability_interval_minutes: 0,
@@ -3378,7 +3375,8 @@ mod tests {
         let bucket_counts = strategy.bucket_counts;
         let all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
 
-        // Build via serde_json -> save -> load roundtrip
+        // Build via serde_json to exercise the same serialized shape, then
+        // populate transient offsets without a filesystem roundtrip.
         let json = serde_json::json!({
             "action_probs": strategy.action_probs,
             "node_action_counts": strategy.node_action_counts,
@@ -3387,14 +3385,9 @@ mod tests {
             "iterations": strategy.iterations,
             "elapsed_minutes": strategy.elapsed_minutes,
         });
-        let strat_raw: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
-        let tmp = std::env::temp_dir().join(format!(
-            "test_cbv_strategy_{:?}.bin",
-            std::thread::current().id()
-        ));
-        strat_raw.save(&tmp).expect("save");
-        let cbv_strategy = BlueprintV2Strategy::load(&tmp).expect("load");
-        let _ = std::fs::remove_file(&tmp);
+        let mut cbv_strategy: BlueprintV2Strategy =
+            serde_json::from_value(json).expect("from_value");
+        cbv_strategy.post_deserialize();
 
         crate::postflop::CbvContext {
             cbv_table: CbvTable {

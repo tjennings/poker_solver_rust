@@ -81,19 +81,40 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 
 ## Blueprint V2 MCCFR Solver
 
-**Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set. DCFR logic (iteration weighting, regret discounting, strategy discounting) is delegated to the shared `DcfrParams` module in `cfr/dcfr.rs`.
+**Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set, and stores the average strategy as action-frequency sums. The trainer can use either eager dense CFR storage or an opt-in sparse row backend; both feed the same traversal abstraction and export the same dense-compatible snapshot and strategy bundle formats.
 
 **Key types:**
 - `GameConfig` -- game structure: blinds, stacks, bet sizes, abstraction mode, DCFR params
 - `HunlPostflop` -- implements the `Game` trait; manages game tree traversal with pre-dealt boards
-- `MccfrSolver` -- external-sampling MCCFR; flat buffer layout for regrets and strategy sums
+- `MccfrSolver` -- external-sampling MCCFR traversal over the `BlueprintCfrStorage` abstraction
+- `BlueprintStorage` -- eager dense flat buffers for regrets, strategy sums, optional baselines, and optional prediction values
+- `SparseBlueprintStorage` -- opt-in HU lazy row storage keyed by stable decision-node identity, bucket, and action-schema fingerprint; missing rows read as zero/uniform and writes realize rows
 - `BlueprintV2Strategy` -- serialized strategy extracted from solver; maps info set keys to action distributions
 
 **Flow:**
 1. Build `GameConfig` from YAML
 2. Initialize `HunlPostflop` game with deal pool
-3. Run MCCFR iterations with parallel batch processing
-4. Extract `BlueprintV2Strategy` for exploration
+3. Select `training.storage_backend` (`dense` by default, `sparse`/`lazy` opt-in)
+4. Run MCCFR iterations with parallel batch processing
+5. Extract `BlueprintV2Strategy` for exploration
+
+**HU storage backends:**
+- `dense` is the default and preserves historical behavior: every `(decision node, bucket, action)` regret and strategy-sum slot is allocated up front.
+- `sparse`/`lazy` keeps the existing eager arena `GameTree` but realizes CFR rows only after traversal writes to a `(decision node, bucket)` pair. Reads of unrealized rows return zero regrets/sums/predictions/baselines and uniform current/average strategy.
+- Sparse training uses the same optimizer, SAPCFR+ prediction, baseline, and regret-floor plumbing as dense storage. BRCFR+ remains dense-only in the current HU slice because its best-response prediction pass is still implemented against dense buffers.
+- Snapshots and Explorer/Tauri bundles remain dense-compatible: sparse training projects to dense `regrets.bin` and `strategy.bin` at export/resume boundaries. There is no sparse on-disk snapshot format for HU `blueprint_v2`.
+- Sparse progress logging includes realized rows/slots, dense-equivalent slots/bytes, approximate sparse resident bytes, inserts, and read/write probe counters.
+
+**Shared training runtime:** `crates/core/src/training_runtime.rs` defines the backend-neutral runtime contract used to converge the HU and MP trainers. Runtime units are explicit (`Iteration` for HU blueprint_v2, `MetaIteration` for MP), and the runtime owns stop checks, pause/quit controls, snapshot/refresh/reload requests, elapsed-time limits, and counter updates. Backend adapters seed counters from restored/current trainer state but must not mutate runtime counters while running a batch.
+
+**Universal dense blueprint format:** `docs/blueprint_format.md` specifies the planned versioned export format for HU, eager MP, and lazy sparse MP strategies. The format is row-oriented, records game/player/action/bucket provenance, distinguishes read-only strategy exports from resumable CFR snapshots, and keeps legacy HU bundles readable during migration.
+
+**External baseline validation:**
+- `training.baseline_validation` is an opt-in trainer diagnostic that compares learned average strategy frequencies against a pinned external preflop baseline JSON. It is separate from VR-MCCFR `use_baselines`; it does not change traversal, regrets, or strategy sums.
+- The current validator is deliberately pinned to the 20bb HU cEV cash baseline at `local_data/baselines/cash_hu_20bb_cev.json`: stack 40 chips, blinds 1/2, no SB open limp, 169 preflop buckets, and preflop raise rows `2.5bb` then `5bb`.
+- Integration passes `BaselineGamePreconditions` from the original `GameConfig` used to build the tree. The validator refuses scoring if trusted config metadata, tree shape, preflop bucket count, or baseline document schema do not match the pinned target.
+- Reports read through the `BlueprintCfrStorage` provider boundary and call `average_strategy` on `active_storage()`. Sparse validation does not project the whole strategy to dense storage.
+- Metrics are strategy-frequency distances, not EV pass/fail results: aggregate total variation, root and first-response total variation, worst-spot total variation, coverage, skipped zero-mass rows, invalid rows, unsupported spots/actions, and worst combo rows.
 
 **Abstractions:**
 - `HandClassV2` -- 19-class hand classification with intra-class strength and equity binning (28-bit hand field)
@@ -105,6 +126,7 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 - Config: `crates/core/src/blueprint_v2/config.rs`
 - MCCFR: `crates/core/src/blueprint_v2/mccfr.rs`
 - Storage: `crates/core/src/blueprint_v2/storage.rs`
+- Sparse storage: `crates/core/src/blueprint_v2/sparse_storage.rs`
 - Trainer: `crates/core/src/blueprint_v2/trainer.rs`
 
 ### Potential-Aware Clustering Pipeline
@@ -184,6 +206,7 @@ crates/core/src/blueprint_mp/
 ├── lazy_mccfr.rs       # Dynamic public-state traversal over sparse infoset storage
 ├── mccfr.rs            # External-sampling MCCFR traversal (Pluribus-style)
 ├── trainer.rs          # Training loop with per-seat traverser cycling, DCFR
+├── training_runtime_adapter.rs # Shared-runtime adapter for lazy sparse MP
 └── exploitability.rs   # Per-seat best-response diagnostic
 ```
 
@@ -198,8 +221,10 @@ crates/core/src/blueprint_mp/
 - **Pre-allocated eager storage** for the current backend: cumulative regrets use signed 32-bit atomics, and average-strategy sums use saturating unsigned 64-bit atomics
 - **Sparse visited-infoset storage** for the planned lazy backend: unvisited infosets read as zero/uniform, visited infosets allocate sharded atomic regret and strategy counters, and snapshots export only touched entries
 - **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
-- **Experimental negative-action subtree purge** for lazy sparse traversal: action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; the storage layer scans packed action-history prefixes to remove the child row and already visited descendants while preserving sibling subtrees
-- **Pluribus-style strategy averaging** (simple, biased for N>2 but empirically sufficient)
+- **Experimental negative-action subtree purge** for lazy sparse traversal: aggressive action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; normal traversal masks blocked aggressive edges, while physical sparse-row deletion is deferred until the DCFR discount boundary, where post-discount regrets decide whether blocked child subtrees are purged or reactivated
+- **External-sampling average strategy updates**: every visited decision infoset records the full current strategy vector; opponent actions are sampled only for recursion, not for average-strategy accounting
+- **Shared-runtime lazy adapter**: `LazySparseMpTrainingRuntimeAdapter` wraps `LazyTrainContext` without changing lazy traversal or sparse key identity. Its unit is one MP meta-iteration: one sampled deal followed by one traversal per seat. `LazyMpTrainingStepper` preserves the old lazy loop's base-iteration, pruning RNG, chance-continuation, DCFR discount, and negative-action purge cadence while allowing the shared runtime to cap batches by `BatchBudget`. Snapshot, resume, and config reload hooks for lazy MP remain trainer-side work; the core adapter fails explicitly instead of faking support.
+- **Universal dense export target**: the planned `dense_blueprint` bundle in `docs/blueprint_format.md` is the common strategy export contract for HU, eager MP, and lazy sparse MP. Lazy sparse exports are read-only until their blocked-edge purge state and runtime cadence are persisted.
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ### 100bb MP Scaling Plan
@@ -208,9 +233,23 @@ The current `blueprint_mp` backend eagerly materializes the full public betting 
 
 ### Lazy Sparse Negative-Action Purge
 
-The negative-action subtree purge is an opt-in experiment layered on the lazy sparse backend. It is not part of eager `blueprint_mp` storage. During traversal, each legal action edge can be gated by cumulative regret. If the parent action regret drops below `negative_action_prune_below`, the edge is inserted into a sharded blocked-edge set and the sparse storage scans its packed child action-history prefix. Matching rows at or below that child prefix are removed, which purges the child subtree while leaving the parent infoset and non-matching sibling histories intact.
+Lazy sparse MP training supports an opt-in sampled-prefix chance continuation
+mode via `training.chance_continuation_mode`. The default `sampled_full_deal`
+keeps the original full-board sampling behavior. `sampled_turn_exact_river`
+samples private cards, flop, and turn as usual, precomputes every legal river
+runout for that sampled turn prefix, and averages values over those river
+runout for that sampled turn prefix. `sampled_flop_exact_turn_river` samples
+private cards and flop, precomputes every legal turn/river runout for that flop
+prefix, and averages values at flop-to-turn chance boundaries, turn-to-river
+chance boundaries, and pre-river showdown terminals. Regret updates use the
+averaged value, not the sum, so DCFR and pruning thresholds remain on the same
+scale as sampled training.
 
-Blocked edges are skipped by traversal before child allocation, so sparse storage stops growing below persistently negative actions. The gate has hysteresis: an edge stays blocked until the same parent action regret reaches `negative_action_reactivate_at`. Reactivation removes the edge from the blocked set and purges any stale rows below the child prefix again. Later visits below the reactivated edge allocate fresh sparse rows; descendants therefore restart from the same first-visit defaults as any unseen infoset: zero regrets, zero strategy sums, and regret-matched uniform action probabilities until updated.
+The negative-action subtree purge is an opt-in experiment layered on the lazy sparse backend. It is not part of eager `blueprint_mp` storage, and it remains inactive until the configured warmup boundary (`meta_iter >= prune_after_iterations`). Ordinary regret-threshold traversal pruning is also opt-in via `traversal_pruning_enabled`; it only skips eligible traverser-side action branches for a batch and does not physically remove sparse rows or strategy sums. During post-warmup traversal, aggressive action edges can be gated by cumulative regret when the negative-action experiment is enabled. Passive actions (`Fold`, `Check`, `Call`, and all-in calls that do not increase the current max bet) are never persistent subtree-purge candidates, because their child histories can contain other players' future decisions. If an aggressive parent action regret drops below `negative_action_prune_below`, the edge is inserted into a sharded blocked-edge set with its packed child action-history prefix. Traversal skips blocked aggressive edges before child allocation, but it does not physically delete already visited descendant rows during ordinary traversal.
+
+Physical purge runs immediately after lazy DCFR discounting. The boundary sweep scans the currently blocked edge set, rereads each parent action regret after discounting, and gives DCFR the first chance to soften or reactivate the edge. Edges whose regret reaches `negative_action_reactivate_at` are removed from the blocked set without deleting their child subtree. Remaining blocked child prefixes are batched into one sparse-storage scan for the discount boundary; matching rows at or below any stored child prefix are removed, preserving sibling histories while dropping already visited descendants below blocked actions.
+
+Persistent negative-action subtree purge only blocks and purges aggressive edges, because passive routing edges can contain later players' decision nodes. `prune_threshold` and `prune_explore_pct` control only ordinary traversal pruning when `traversal_pruning_enabled` is true; they do not enable physical subtree deletion.
 
 ## Range Solver (Exact Postflop Solver)
 
