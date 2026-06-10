@@ -59,8 +59,7 @@ use crate::blueprint_mp::game_tree::{
 };
 use crate::blueprint_mp::storage::MpStorage;
 
-/// Namespace constant for MP arena rows.
-const MP_ARENA_NS: u16 = 1;
+use super::export_common::NS_MP_ARENA as MP_ARENA_NS;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -383,12 +382,15 @@ fn collect_row_entries_with(
                 namespace: MP_ARENA_NS,
                 seat: seat.index(),
                 street: street_u8,
+                local_bucket: bucket,
                 source_node_idx: node_idx as u32,
                 global_bucket: u32::from(bucket),
                 row_key_fp: fp,
                 action_schema_fp: schema_fp,
                 actions: action_descs.clone(),
                 probs,
+                semantic_key_kind: 0,
+                semantic_key_index: 0,
             });
         }
 
@@ -631,6 +633,7 @@ fn build_mp_manifest(
         compatibility: CompatibilityMetadata {
             legacy_fallback: false,
             missing_row_policy: "reject".to_string(),
+            resumable: false,
         },
         files: BTreeMap::new(),
     }

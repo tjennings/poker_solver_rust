@@ -174,6 +174,9 @@ pub enum ActionKind {
     Raise = 4,
     AllInCall = 5,
     AllInBetRaise = 6,
+    /// Opaque action: semantics unknown, only action count and order index
+    /// are meaningful. Gated by the `mp_semantic_rows_v1` required feature.
+    Opaque = 7,
 }
 
 impl ActionKind {
@@ -192,6 +195,7 @@ impl ActionKind {
             4 => Some(Self::Raise),
             5 => Some(Self::AllInCall),
             6 => Some(Self::AllInBetRaise),
+            7 => Some(Self::Opaque),
             _ => None,
         }
     }
@@ -372,7 +376,8 @@ mod tests {
     fn action_kind_from_u8_known_values() {
         assert_eq!(ActionKind::from_u8(0), Some(ActionKind::Fold));
         assert_eq!(ActionKind::from_u8(6), Some(ActionKind::AllInBetRaise));
-        assert_eq!(ActionKind::from_u8(7), None);
+        assert_eq!(ActionKind::from_u8(7), Some(ActionKind::Opaque));
+        assert_eq!(ActionKind::from_u8(8), None);
         assert_eq!(ActionKind::from_u8(255), None);
     }
 
@@ -447,7 +452,7 @@ mod tests {
     }
 
     fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
-        (0u8..=6).prop_map(|v| ActionKind::from_u8(v).unwrap())
+        (0u8..=7).prop_map(|v| ActionKind::from_u8(v).unwrap())
     }
 
     fn arb_action() -> impl Strategy<Value = ActionDescriptor> {

@@ -12,6 +12,26 @@ use super::descriptors::{ActionDescriptor, RowDescriptor};
 use super::hash::Fnv1aHasher;
 
 // ---------------------------------------------------------------------------
+// Namespace constants
+// ---------------------------------------------------------------------------
+
+/// Namespace for HU arena rows.
+pub(crate) const NS_HU_ARENA: u16 = 0;
+/// Namespace for MP eager arena rows.
+pub(crate) const NS_MP_ARENA: u16 = 1;
+/// Namespace for MP lazy semantic rows.
+pub(crate) const NS_MP_SEMANTIC: u16 = 2;
+
+// ---------------------------------------------------------------------------
+// Semantic key kind constants
+// ---------------------------------------------------------------------------
+
+/// No semantic key side table (HU and MP eager rows).
+pub(crate) const SEMANTIC_KEY_NONE: u16 = 0;
+/// MP history semantic key v1 (side table record index).
+pub(crate) const SEMANTIC_KEY_MP_HISTORY_V1: u16 = 1;
+
+// ---------------------------------------------------------------------------
 // RowEntry: intermediate row before sorting and offset assignment
 // ---------------------------------------------------------------------------
 
@@ -20,12 +40,17 @@ pub(crate) struct RowEntry {
     pub namespace: u16,
     pub seat: u8,
     pub street: u8,
+    pub local_bucket: u16,
     pub source_node_idx: u32,
     pub global_bucket: u32,
     pub row_key_fp: u64,
     pub action_schema_fp: u64,
     pub actions: Vec<ActionDescriptor>,
     pub probs: Vec<f32>,
+    /// Semantic key kind (0 = none, 1 = mp_history_v1).
+    pub semantic_key_kind: u16,
+    /// Index into the semantic key side table (record index, not byte offset).
+    pub semantic_key_index: u64,
 }
 
 impl RowEntry {
@@ -88,7 +113,7 @@ pub(crate) fn flatten_entries(
             namespace: entry.namespace,
             seat: entry.seat,
             street: entry.street,
-            local_bucket: entry.global_bucket as u16,
+            local_bucket: entry.local_bucket,
             global_bucket: entry.global_bucket,
             source_node_idx: entry.source_node_idx,
             action_offset,
@@ -96,8 +121,8 @@ pub(crate) fn flatten_entries(
             prob_offset,
             row_key_fingerprint: entry.row_key_fp,
             action_schema_fingerprint: entry.action_schema_fp,
-            semantic_key_kind: 0,
-            semantic_key_offset: 0,
+            semantic_key_kind: entry.semantic_key_kind,
+            semantic_key_offset: entry.semantic_key_index,
         });
 
         all_actions.extend_from_slice(&entry.actions);
@@ -221,23 +246,29 @@ mod tests {
                 namespace: 1,
                 seat: 0,
                 street: 0,
+                local_bucket: 0,
                 source_node_idx: 0,
                 global_bucket: 0,
                 row_key_fp: 100,
                 action_schema_fp: 200,
                 actions: vec![ad.clone(), ad.clone()],
                 probs: vec![0.5, 0.5],
+                semantic_key_kind: 0,
+                semantic_key_index: 0,
             },
             RowEntry {
                 namespace: 1,
                 seat: 0,
                 street: 0,
+                local_bucket: 1,
                 source_node_idx: 0,
                 global_bucket: 1,
                 row_key_fp: 101,
                 action_schema_fp: 200,
                 actions: vec![ad.clone(), ad.clone(), ad.clone()],
                 probs: vec![0.33, 0.33, 0.34],
+                semantic_key_kind: 0,
+                semantic_key_index: 0,
             },
         ];
         let (rows, actions, probs) = flatten_entries(&entries);

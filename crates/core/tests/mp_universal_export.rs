@@ -8,8 +8,7 @@
 
 #![allow(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    dead_code
+    clippy::cast_precision_loss
 )]
 
 use poker_solver_core::blueprint_mp::config::*;
@@ -30,21 +29,6 @@ const BUCKET_COUNTS: [u16; 4] = [10, 10, 10, 10];
 
 fn yaml_f64(v: f64) -> serde_yaml::Value {
     serde_yaml::Value::Number(serde_yaml::Number::from(v))
-}
-
-fn sb_bb_blinds() -> Vec<ForcedBet> {
-    vec![
-        ForcedBet {
-            seat: 0,
-            kind: ForcedBetKind::SmallBlind,
-            amount: 1.0,
-        },
-        ForcedBet {
-            seat: 1,
-            kind: ForcedBetKind::BigBlind,
-            amount: 2.0,
-        },
-    ]
 }
 
 fn three_player_blinds() -> Vec<ForcedBet> {
@@ -481,7 +465,7 @@ fn mp_export_action_descriptors_correct() {
                     assert!(ad.is_aggressive);
                     found_allin = true;
                 }
-                ActionKind::AllInCall => {}
+                ActionKind::AllInCall | ActionKind::Opaque => {}
             }
         }
     }

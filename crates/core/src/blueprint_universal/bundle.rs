@@ -14,11 +14,13 @@ use super::descriptors::{
     ActionDescriptor, RowDescriptor, ACTION_DESCRIPTOR_SIZE, ROW_DESCRIPTOR_SIZE,
 };
 use super::error::FormatError;
+use super::export_common::{SEMANTIC_KEY_MP_HISTORY_V1, SEMANTIC_KEY_NONE};
 use super::header::{
     BinaryHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC_ACTIONS, MAGIC_PROBS,
-    MAGIC_ROWS,
+    MAGIC_ROWS, MAGIC_SEMANTIC,
 };
 use super::manifest::{FileEntry, Manifest};
+use super::mp_lazy_export::{SemanticKeyRecord, SEMANTIC_RECORD_SIZE};
 
 /// CRC-64/XZ algorithm constant from the `crc` crate.
 ///
@@ -28,7 +30,7 @@ use super::manifest::{FileEntry, Manifest};
 const CRC_ALG: crc::Algorithm<u64> = crc::CRC_64_XZ;
 
 /// Supported features that this reader understands.
-const SUPPORTED_FEATURES: &[&str] = &[];
+const SUPPORTED_FEATURES: &[&str] = &["mp_semantic_rows_v1"];
 
 /// Expected value of the `format_name` field.
 const EXPECTED_FORMAT_NAME: &str = "dense_blueprint";
@@ -64,13 +66,15 @@ pub fn write_bundle(
     let actions_entry = write_actions_file(dir, data.actions)?;
     let probs_entry = write_probs_file(dir, data.probs)?;
 
-    let mut files = BTreeMap::new();
+    // Start with any pre-existing file entries (e.g. semantic side table)
+    // then add/overwrite with the standard payload entries.
+    let mut files = manifest.files.clone();
     files.insert("strategy.rows.bin".to_string(), rows_entry);
     files.insert("strategy.actions.bin".to_string(), actions_entry);
     files.insert("strategy.probs.f32.bin".to_string(), probs_entry);
 
     let mut full_manifest = manifest.clone();
-    full_manifest.files.clone_from(&files);
+    full_manifest.files = files.clone();
     let manifest_json = serde_json::to_string_pretty(&full_manifest)?;
     std::fs::write(dir.join("blueprint.json"), &manifest_json)?;
 
@@ -213,6 +217,7 @@ pub struct BundleReader {
     rows: Vec<RowDescriptor>,
     actions: Vec<ActionDescriptor>,
     probs: Vec<f32>,
+    semantic_records: Vec<SemanticKeyRecord>,
 }
 
 impl BundleReader {
@@ -251,10 +256,44 @@ impl BundleReader {
         check_sha256(&probs_bytes, "strategy.probs.f32.bin", &manifest)?;
 
         let rows = decode_rows(&rows_bytes)?;
-        let actions = decode_actions(&actions_bytes)?;
+        let actions = decode_actions(&actions_bytes, &manifest)?;
         let probs = decode_probs(&probs_bytes)?;
 
+        // Load semantic side table if present in manifest
+        let has_semantic_feature = manifest
+            .required_features
+            .iter()
+            .any(|f| f == "mp_semantic_rows_v1");
+        let semantic_records = if manifest
+            .files
+            .contains_key("strategy.semantic.bin")
+        {
+            let sem_bytes = read_file_checked(
+                dir,
+                "strategy.semantic.bin",
+                &manifest,
+            )?;
+            check_header_only(
+                &sem_bytes,
+                MAGIC_SEMANTIC,
+                "strategy.semantic.bin",
+            )?;
+            check_sha256(
+                &sem_bytes,
+                "strategy.semantic.bin",
+                &manifest,
+            )?;
+            decode_semantic(&sem_bytes)?
+        } else {
+            Vec::new()
+        };
+
         validate_row_order(&rows)?;
+        validate_semantic_keys(
+            &rows,
+            &semantic_records,
+            has_semantic_feature,
+        )?;
         validate_offsets(&rows, actions.len(), probs.len())?;
         validate_normalization(
             &rows,
@@ -262,7 +301,12 @@ impl BundleReader {
             manifest.strategy.normalization_tolerance,
         )?;
 
-        Ok(Self { rows, actions, probs })
+        Ok(Self {
+            rows,
+            actions,
+            probs,
+            semantic_records,
+        })
     }
 
     /// Number of strategy rows in the bundle.
@@ -287,6 +331,23 @@ impl BundleReader {
     #[must_use]
     pub fn prob(&self, index: usize) -> Option<f32> {
         self.probs.get(index).copied()
+    }
+
+    /// Get the semantic key record for a row by row index.
+    ///
+    /// Returns `None` if the row has no semantic key (kind == 0) or
+    /// the row index is out of bounds.
+    #[must_use]
+    pub fn semantic_record(
+        &self,
+        row_index: usize,
+    ) -> Option<&SemanticKeyRecord> {
+        let row = self.rows.get(row_index)?;
+        if row.semantic_key_kind == SEMANTIC_KEY_NONE {
+            return None;
+        }
+        self.semantic_records
+            .get(row.semantic_key_offset as usize)
     }
 }
 
@@ -431,7 +492,10 @@ fn decode_rows(data: &[u8]) -> Result<Vec<RowDescriptor>, FormatError> {
 }
 
 /// Decode the actions payload.
-fn decode_actions(data: &[u8]) -> Result<Vec<ActionDescriptor>, FormatError> {
+fn decode_actions(
+    data: &[u8],
+    manifest: &Manifest,
+) -> Result<Vec<ActionDescriptor>, FormatError> {
     let name = "strategy.actions.bin";
     let (header, payload) = split_header_payload(data, MAGIC_ACTIONS, name)?;
     validate_crc(&header, payload, name)?;
@@ -442,6 +506,11 @@ fn decode_actions(data: &[u8]) -> Result<Vec<ActionDescriptor>, FormatError> {
         name,
     )?;
 
+    let has_semantic_feature = manifest
+        .required_features
+        .iter()
+        .any(|f| f == "mp_semantic_rows_v1");
+
     let count = record_count_usize(header.record_count);
     let mut actions = Vec::with_capacity(count);
     for i in 0..count {
@@ -450,7 +519,18 @@ fn decode_actions(data: &[u8]) -> Result<Vec<ActionDescriptor>, FormatError> {
             [start..start + ACTION_DESCRIPTOR_SIZE]
             .try_into()
             .unwrap();
-        actions.push(ActionDescriptor::from_bytes(chunk)?);
+        let action = ActionDescriptor::from_bytes(chunk)?;
+        if action.kind == super::descriptors::ActionKind::Opaque
+            && !has_semantic_feature
+        {
+            return Err(FormatError::InvalidManifest {
+                detail: format!(
+                    "action {i} has Opaque kind but \
+                     mp_semantic_rows_v1 feature not declared"
+                ),
+            });
+        }
+        actions.push(action);
     }
     Ok(actions)
 }
@@ -604,6 +684,84 @@ fn validate_offsets(
                     row_index: i,
                     detail: format!(
                         "{label} range {offset}..{end} exceeds total {total}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode the semantic side table payload.
+fn decode_semantic(
+    data: &[u8],
+) -> Result<Vec<SemanticKeyRecord>, FormatError> {
+    let name = "strategy.semantic.bin";
+    let (header, payload) =
+        split_header_payload(data, MAGIC_SEMANTIC, name)?;
+    validate_crc(&header, payload, name)?;
+    check_payload_len(
+        payload,
+        header.record_count,
+        SEMANTIC_RECORD_SIZE,
+        name,
+    )?;
+
+    let count = record_count_usize(header.record_count);
+    let mut records = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = i * SEMANTIC_RECORD_SIZE;
+        let chunk: &[u8; SEMANTIC_RECORD_SIZE] = payload
+            [start..start + SEMANTIC_RECORD_SIZE]
+            .try_into()
+            .unwrap();
+        records.push(SemanticKeyRecord::from_bytes(chunk));
+    }
+    Ok(records)
+}
+
+/// Validate semantic key kinds and offsets for all rows.
+///
+/// Rules:
+/// - `semantic_key_kind == 0` (none) is always valid.
+/// - `semantic_key_kind == 1` (mp_history_v1) requires the
+///   `mp_semantic_rows_v1` feature to be declared.
+/// - Any other kind is rejected.
+/// - `semantic_key_offset` must be in range when kind != 0.
+fn validate_semantic_keys(
+    rows: &[RowDescriptor],
+    semantic_records: &[SemanticKeyRecord],
+    has_semantic_feature: bool,
+) -> Result<(), FormatError> {
+    for (i, row) in rows.iter().enumerate() {
+        match row.semantic_key_kind {
+            SEMANTIC_KEY_NONE => {}
+            SEMANTIC_KEY_MP_HISTORY_V1 => {
+                if !has_semantic_feature {
+                    return Err(FormatError::InvalidManifest {
+                        detail: format!(
+                            "row {i} has semantic_key_kind {} but \
+                             mp_semantic_rows_v1 feature not declared",
+                            SEMANTIC_KEY_MP_HISTORY_V1
+                        ),
+                    });
+                }
+                let offset = row.semantic_key_offset as usize;
+                if offset >= semantic_records.len() {
+                    return Err(FormatError::InvalidOffset {
+                        row_index: i,
+                        detail: format!(
+                            "semantic_key_offset {offset} out of range \
+                             (table has {} records)",
+                            semantic_records.len()
+                        ),
+                    });
+                }
+            }
+            unknown => {
+                return Err(FormatError::InvalidManifest {
+                    detail: format!(
+                        "row {i} has unknown semantic_key_kind {unknown}"
                     ),
                 });
             }
