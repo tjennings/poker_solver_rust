@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-a29s
 title: Universal dense blueprint format for HU and N-player
-status: todo
+status: in-progress
 type: feature
 priority: high
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-09T18:40:56Z
+updated_at: 2026-06-10T14:25:35Z
 parent: poker_solver_rust-osss
 ---
 
