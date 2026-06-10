@@ -11,6 +11,7 @@ mod header;
 mod manifest;
 mod descriptors;
 mod bundle;
+pub mod hu_export;
 
 pub use error::FormatError;
 pub use header::{BinaryHeader, HEADER_SIZE};
