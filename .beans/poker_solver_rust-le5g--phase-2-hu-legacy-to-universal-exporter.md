@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-le5g
 title: 'Phase 2: HU legacy-to-universal exporter'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-09T18:41:22Z
+updated_at: 2026-06-10T16:47:20Z
 parent: poker_solver_rust-a29s
 ---
 
