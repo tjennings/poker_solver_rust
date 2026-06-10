@@ -39,6 +39,24 @@ cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
   -c <config.yaml>
 ```
 
+### export-universal
+
+Export a legacy HU `blueprint_v2` bundle into the universal dense blueprint
+format (`docs/blueprint_format.md`). Probabilities are passed through bitwise
+from the snapshot's `strategy.bin`; the legacy bundle is not modified.
+
+```bash
+cargo run -p poker-solver-trainer --release -- export-universal \
+  --bundle <legacy_bundle_dir> \
+  --snapshot final \            # or snapshot_NNNN (default: final)
+  --out <universal_bundle_dir>
+```
+
+The output directory contains `blueprint.json`, `strategy.rows.bin`,
+`strategy.actions.bin`, `strategy.probs.f32.bin`, and `checksums.json`. The
+export is analysis-only (no `cfr.snapshot.bin`); dense HU exports use the
+`reject` missing-row policy.
+
 ### inspect-mp-config
 
 Inspect a multiplayer blueprint config before training. This reports effective stack depth, bucket counts, action-row counts, and known eager-backend risk patterns before the trainer builds dense tree/storage structures.
