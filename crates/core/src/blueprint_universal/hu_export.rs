@@ -44,6 +44,7 @@ use std::path::Path;
 use super::bundle::{write_bundle, BundleData};
 use super::descriptors::{ActionDescriptor, ActionKind, RowDescriptor};
 use super::error::FormatError;
+use super::hash::Fnv1aHasher;
 use super::manifest::{
     ActionsMetadata, BucketsMetadata, CompatibilityMetadata, GameMetadata,
     LayoutMetadata, Manifest, RakeConfig, SeatDescriptor, StrategyMetadata,
@@ -72,27 +73,13 @@ fn row_key_fingerprint(
     source_node_idx: u32,
     global_bucket: u32,
 ) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut h = FNV_OFFSET;
-    for byte in namespace.to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h ^= u64::from(seat);
-    h = h.wrapping_mul(FNV_PRIME);
-    h ^= u64::from(street);
-    h = h.wrapping_mul(FNV_PRIME);
-    for byte in source_node_idx.to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    for byte in global_bucket.to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+    let mut h = Fnv1aHasher::new();
+    h.mix_u16(namespace);
+    h.mix_u8(seat);
+    h.mix_u8(street);
+    h.mix_u32(source_node_idx);
+    h.mix_u32(global_bucket);
+    h.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -168,11 +155,6 @@ pub enum ExportError {
         /// The invalid name that was provided.
         name: String,
     },
-    /// A referenced bucket/cluster file is missing.
-    MissingBucketFile {
-        /// Path to the missing file.
-        path: String,
-    },
     /// Format error from the universal bundle writer.
     Format(FormatError),
     /// I/O error.
@@ -189,9 +171,6 @@ impl std::fmt::Display for ExportError {
             }
             Self::BadSnapshotName { name } => {
                 write!(f, "bad snapshot name: {name}")
-            }
-            Self::MissingBucketFile { path } => {
-                write!(f, "missing bucket file: {path}")
             }
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
@@ -214,13 +193,27 @@ impl From<std::io::Error> for ExportError {
     }
 }
 
+/// Training provenance metadata for the export.
+pub struct TrainingInfo<'a> {
+    /// Backend identifier (e.g. `"hu_dense"`, `"hu_sparse_projected"`).
+    pub source_backend: &'a str,
+    /// Number of training iterations completed.
+    pub iterations: u64,
+    /// Wall-clock training time in minutes.
+    pub elapsed_minutes: f64,
+}
+
 /// Result of in-memory export: rows, actions, probabilities, and manifest.
-pub type ExportResult = (
-    Vec<RowDescriptor>,
-    Vec<ActionDescriptor>,
-    Vec<f32>,
-    Manifest,
-);
+pub struct ExportOutput {
+    /// Row descriptors in spec sort order.
+    pub rows: Vec<RowDescriptor>,
+    /// Action descriptors (referenced by row offsets).
+    pub actions: Vec<ActionDescriptor>,
+    /// Probability values (referenced by row offsets).
+    pub probs: Vec<f32>,
+    /// Bundle manifest.
+    pub manifest: Manifest,
+}
 
 /// In-memory export of a [`BlueprintV2Strategy`] into universal dense
 /// bundle arrays and manifest.
@@ -232,10 +225,8 @@ pub fn export_hu_strategy_to_universal(
     config: &BlueprintV2Config,
     tree: &GameTree,
     strategy: &BlueprintV2Strategy,
-    source_backend: &str,
-    iterations: u64,
-    elapsed_minutes: f64,
-) -> Result<ExportResult, ExportError> {
+    training: &TrainingInfo<'_>,
+) -> Result<ExportOutput, ExportError> {
     let bucket_counts = [
         config.clustering.preflop.buckets,
         config.clustering.flop.buckets,
@@ -253,16 +244,14 @@ pub fn export_hu_strategy_to_universal(
 
     let manifest = build_manifest(
         config,
-        source_backend,
-        iterations,
-        elapsed_minutes,
+        training,
         &rows,
         &actions,
         &probs,
         bucket_counts,
     );
 
-    Ok((rows, actions, probs, manifest))
+    Ok(ExportOutput { rows, actions, probs, manifest })
 }
 
 // ---------------------------------------------------------------------------
@@ -426,35 +415,17 @@ fn flatten_entries(
 
 /// Compute a stable game fingerprint from the config.
 fn game_fingerprint(config: &BlueprintV2Config) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut h = FNV_OFFSET;
-    for byte in u64::from(config.game.players).to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    for byte in config.game.stack_depth.to_bits().to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    for byte in config.game.small_blind.to_bits().to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    for byte in config.game.big_blind.to_bits().to_le_bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+    let mut h = Fnv1aHasher::new();
+    h.mix_u64(u64::from(config.game.players));
+    h.mix_u64(config.game.stack_depth.to_bits());
+    h.mix_u64(config.game.small_blind.to_bits());
+    h.mix_u64(config.game.big_blind.to_bits());
+    h.finish()
 }
 
 /// Compute an action abstraction fingerprint from the config.
 fn action_abstraction_fingerprint(config: &BlueprintV2Config) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut h = FNV_OFFSET;
+    let mut h = Fnv1aHasher::new();
     let repr = format!(
         "{:?}|{:?}|{:?}|{:?}",
         config.action_abstraction.preflop,
@@ -462,26 +433,17 @@ fn action_abstraction_fingerprint(config: &BlueprintV2Config) -> u64 {
         config.action_abstraction.turn,
         config.action_abstraction.river,
     );
-    for byte in repr.as_bytes() {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+    h.mix_bytes(repr.as_bytes());
+    h.finish()
 }
 
 /// Compute a bucket semantic fingerprint from bucket counts.
 fn bucket_semantic_fingerprint(bucket_counts: [u16; 4]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut h = FNV_OFFSET;
+    let mut h = Fnv1aHasher::new();
     for bc in bucket_counts {
-        for byte in bc.to_le_bytes() {
-            h ^= u64::from(byte);
-            h = h.wrapping_mul(FNV_PRIME);
-        }
+        h.mix_u16(bc);
     }
-    h
+    h.finish()
 }
 
 /// Build game metadata from config.
@@ -550,16 +512,12 @@ fn build_buckets_metadata(
 }
 
 /// Build training metadata for the manifest.
-fn build_training_metadata(
-    source_backend: &str,
-    iterations: u64,
-    elapsed_minutes: f64,
-) -> TrainingMetadata {
+fn build_training_metadata(info: &TrainingInfo<'_>) -> TrainingMetadata {
     TrainingMetadata {
-        source_backend: source_backend.to_string(),
+        source_backend: info.source_backend.to_string(),
         unit_kind: "Iteration".to_string(),
-        units_completed: iterations,
-        elapsed_minutes,
+        units_completed: info.iterations,
+        elapsed_minutes: info.elapsed_minutes,
         strategy_unit: "average_strategy".to_string(),
         command: None,
         config_path: None,
@@ -584,12 +542,9 @@ fn build_layout_metadata(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_manifest(
     config: &BlueprintV2Config,
-    source_backend: &str,
-    iterations: u64,
-    elapsed_minutes: f64,
+    training: &TrainingInfo<'_>,
     rows: &[RowDescriptor],
     actions: &[ActionDescriptor],
     probs: &[f32],
@@ -600,18 +555,26 @@ fn build_manifest(
         format_version: 1,
         compat_min_reader: 1,
         created_at: now_rfc3339_approx(),
-        producer: format!("poker-solver-core {}", env!("CARGO_PKG_VERSION")),
-        producer_git: option_env!("GIT_HASH").unwrap_or("unknown").to_string(),
+        producer: format!(
+            "poker-solver-core {}",
+            env!("CARGO_PKG_VERSION"),
+        ),
+        producer_git: option_env!("GIT_HASH")
+            .unwrap_or("unknown")
+            .to_string(),
         required_features: Vec::new(),
         optional_features: vec!["row_key_fingerprint_v1".to_string()],
         game_fingerprint: game_fingerprint(config),
         source_config_fingerprint: None,
         game: build_game_metadata(config),
-        training: build_training_metadata(source_backend, iterations, elapsed_minutes),
-        strategy: StrategyMetadata { normalization_tolerance: 1e-4 },
+        training: build_training_metadata(training),
+        strategy: StrategyMetadata {
+            normalization_tolerance: 1e-4,
+        },
         layout: build_layout_metadata(rows, actions, probs),
         actions: ActionsMetadata {
-            action_abstraction_fingerprint: action_abstraction_fingerprint(config),
+            action_abstraction_fingerprint:
+                action_abstraction_fingerprint(config),
         },
         buckets: build_buckets_metadata(config, bucket_counts),
         compatibility: CompatibilityMetadata {
@@ -631,15 +594,62 @@ fn bucket_mode_for_config(config: &BlueprintV2Config) -> String {
     }
 }
 
-/// Current UTC timestamp in RFC 3339 approximate format.
+/// Convert Unix epoch seconds to an RFC 3339 UTC timestamp string.
+///
+/// Pure arithmetic -- no external dependencies.  Handles leap years
+/// correctly for all dates from 1970 onwards.
+fn epoch_secs_to_rfc3339(epoch: u64) -> String {
+    let (days, day_secs) = (epoch / 86_400, epoch % 86_400);
+    let (hour, min, sec) = (
+        day_secs / 3600,
+        (day_secs % 3600) / 60,
+        day_secs % 60,
+    );
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Convert days since 1970-01-01 to (year, month, day).
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    let mut year = 1970u64;
+    loop {
+        let year_days = if is_leap(year) { 366 } else { 365 };
+        if days < year_days {
+            break;
+        }
+        days -= year_days;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+    (year, month, days + 1)
+}
+
+/// True if `year` is a Gregorian leap year.
+fn is_leap(year: u64) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100))
+        || year.is_multiple_of(400)
+}
+
+/// Current UTC timestamp in RFC 3339 format.
 fn now_rfc3339_approx() -> String {
     use std::time::SystemTime;
     let dur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = dur.as_secs();
-    // Approximate RFC 3339 without a chrono dependency.
-    format!("1970-01-01T00:00:00Z+{secs}s")
+    epoch_secs_to_rfc3339(dur.as_secs())
 }
 
 // ---------------------------------------------------------------------------
@@ -747,17 +757,24 @@ pub fn export_hu_bundle(
         _ => "hu_dense",
     };
 
-    let (rows, actions, probs, manifest) =
-        export_hu_strategy_to_universal(
-            &config, &tree, &strategy, source_backend,
-            metadata.iteration.unwrap_or(0),
-            metadata.elapsed_minutes.unwrap_or(0.0),
-        )?;
+    let training = TrainingInfo {
+        source_backend,
+        iterations: metadata.iteration.unwrap_or(0),
+        elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0.0),
+    };
+
+    let output = export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training,
+    )?;
 
     write_bundle(
         out_dir,
-        &manifest,
-        &BundleData { rows: &rows, actions: &actions, probs: &probs },
+        &output.manifest,
+        &BundleData {
+            rows: &output.rows,
+            actions: &output.actions,
+            probs: &output.probs,
+        },
     )?;
 
     Ok(())
@@ -842,5 +859,49 @@ mod tests {
         let (kind, agg) = map_action_kind(&TreeAction::AllIn);
         assert_eq!(kind, ActionKind::AllInBetRaise);
         assert!(agg);
+    }
+
+    /// Regression: refactoring to `Fnv1aHasher` must not change values.
+    #[test]
+    fn row_key_fingerprint_regression() {
+        // Capture a known value computed by the original inline FNV-1a.
+        let fp = row_key_fingerprint(0, 0, 1, 42, 7);
+        assert_eq!(fp, 0xba11_9b0e_8372_975f);
+    }
+
+    #[test]
+    fn now_rfc3339_approx_is_valid_rfc3339() {
+        let ts = now_rfc3339_approx();
+        // RFC 3339 format: YYYY-MM-DDTHH:MM:SSZ (20 chars exactly)
+        assert_eq!(ts.len(), 20, "bad length: {ts:?}");
+        assert!(ts.ends_with('Z'), "must end with Z: {ts:?}");
+        assert_eq!(&ts[4..5], "-", "missing dash after year: {ts:?}");
+        assert_eq!(&ts[7..8], "-", "missing dash after month: {ts:?}");
+        assert_eq!(&ts[10..11], "T", "missing T separator: {ts:?}");
+        assert_eq!(&ts[13..14], ":", "missing colon after hour: {ts:?}");
+        assert_eq!(&ts[16..17], ":", "missing colon after min: {ts:?}");
+        // Year must be >= 2020 (sanity check for current time)
+        let year: u32 = ts[0..4].parse().expect("year is numeric");
+        assert!(year >= 2020, "year too small: {year}");
+    }
+
+    #[test]
+    fn epoch_to_rfc3339_known_value() {
+        // 2025-01-01T00:00:00Z = 1_735_689_600 seconds since epoch
+        let ts = epoch_secs_to_rfc3339(1_735_689_600);
+        assert_eq!(ts, "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn epoch_to_rfc3339_leap_year() {
+        // 2024-02-29T12:00:00Z = 1_709_208_000 seconds since epoch
+        let ts = epoch_secs_to_rfc3339(1_709_208_000);
+        assert_eq!(ts, "2024-02-29T12:00:00Z");
+    }
+
+    #[test]
+    fn epoch_to_rfc3339_unix_epoch() {
+        let ts = epoch_secs_to_rfc3339(0);
+        assert_eq!(ts, "1970-01-01T00:00:00Z");
     }
 }

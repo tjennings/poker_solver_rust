@@ -161,26 +161,25 @@ fn export_probabilities_match_legacy_strategy_bitwise() {
     ];
 
     // Export to universal format in memory.
-    let (bundle_data_rows, bundle_data_actions, bundle_data_probs, manifest) =
-        hu_export::export_hu_strategy_to_universal(
-            &config,
-            &tree,
-            &strategy,
-            "hu_dense",
-            100,
-            5.0,
-        )
-        .expect("export should succeed");
+    let training = hu_export::TrainingInfo {
+        source_backend: "hu_dense",
+        iterations: 100,
+        elapsed_minutes: 5.0,
+    };
+    let output = hu_export::export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training,
+    )
+    .expect("export should succeed");
 
     // Write to disk, then load with BundleReader.
     let dir = tempfile::tempdir().expect("tempdir");
     poker_solver_core::blueprint_universal::write_bundle(
         dir.path(),
-        &manifest,
+        &output.manifest,
         &poker_solver_core::blueprint_universal::BundleData {
-            rows: &bundle_data_rows,
-            actions: &bundle_data_actions,
-            probs: &bundle_data_probs,
+            rows: &output.rows,
+            actions: &output.actions,
+            probs: &output.probs,
         },
     )
     .expect("write bundle");
@@ -256,33 +255,41 @@ fn dense_and_sparse_exports_produce_identical_payloads() {
     let config = tiny_export_config();
     let (tree, strategy) = build_test_tree_and_strategy(&config);
 
-    let (rows_d, actions_d, probs_d, manifest_d) =
-        hu_export::export_hu_strategy_to_universal(
-            &config, &tree, &strategy, "hu_dense", 100, 5.0,
-        )
-        .expect("dense export");
+    let training_d = hu_export::TrainingInfo {
+        source_backend: "hu_dense",
+        iterations: 100,
+        elapsed_minutes: 5.0,
+    };
+    let out_d = hu_export::export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training_d,
+    )
+    .expect("dense export");
 
-    let (rows_s, actions_s, probs_s, manifest_s) =
-        hu_export::export_hu_strategy_to_universal(
-            &config, &tree, &strategy, "hu_sparse_projected", 100, 5.0,
-        )
-        .expect("sparse export");
+    let training_s = hu_export::TrainingInfo {
+        source_backend: "hu_sparse_projected",
+        iterations: 100,
+        elapsed_minutes: 5.0,
+    };
+    let out_s = hu_export::export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training_s,
+    )
+    .expect("sparse export");
 
     // Row descriptors must be identical.
-    assert_eq!(rows_d.len(), rows_s.len());
-    for (d, s) in rows_d.iter().zip(rows_s.iter()) {
+    assert_eq!(out_d.rows.len(), out_s.rows.len());
+    for (d, s) in out_d.rows.iter().zip(out_s.rows.iter()) {
         assert_eq!(d, s, "row descriptor mismatch");
     }
 
     // Action descriptors must be identical.
-    assert_eq!(actions_d.len(), actions_s.len());
-    for (d, s) in actions_d.iter().zip(actions_s.iter()) {
+    assert_eq!(out_d.actions.len(), out_s.actions.len());
+    for (d, s) in out_d.actions.iter().zip(out_s.actions.iter()) {
         assert_eq!(d, s, "action descriptor mismatch");
     }
 
     // Probabilities must be bitwise identical.
-    assert_eq!(probs_d.len(), probs_s.len());
-    for (i, (&d, &s)) in probs_d.iter().zip(probs_s.iter()).enumerate() {
+    assert_eq!(out_d.probs.len(), out_s.probs.len());
+    for (i, (&d, &s)) in out_d.probs.iter().zip(out_s.probs.iter()).enumerate() {
         assert_eq!(
             d.to_bits(),
             s.to_bits(),
@@ -291,8 +298,8 @@ fn dense_and_sparse_exports_produce_identical_payloads() {
     }
 
     // Only training.source_backend should differ.
-    assert_eq!(manifest_d.training.source_backend, "hu_dense");
-    assert_eq!(manifest_s.training.source_backend, "hu_sparse_projected");
+    assert_eq!(out_d.manifest.training.source_backend, "hu_dense");
+    assert_eq!(out_s.manifest.training.source_backend, "hu_sparse_projected");
 }
 
 // ---------------------------------------------------------------------------
@@ -306,14 +313,18 @@ fn action_descriptors_match_tree_actions() {
     let config = tiny_export_config();
     let (tree, strategy) = build_test_tree_and_strategy(&config);
 
-    let (rows, actions, _probs, _manifest) =
-        hu_export::export_hu_strategy_to_universal(
-            &config, &tree, &strategy, "hu_dense", 100, 5.0,
-        )
-        .expect("export");
+    let training = hu_export::TrainingInfo {
+        source_backend: "hu_dense",
+        iterations: 100,
+        elapsed_minutes: 5.0,
+    };
+    let output = hu_export::export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training,
+    )
+    .expect("export");
 
     // For each row, verify the action descriptors match the tree node's actions.
-    for row in &rows {
+    for row in &output.rows {
         let node = &tree.nodes[row.source_node_idx as usize];
         if let GameNode::Decision {
             actions: tree_actions,
@@ -332,7 +343,7 @@ fn action_descriptors_match_tree_actions() {
 
             // Check individual action descriptors.
             for (a_idx, tree_action) in tree_actions.iter().enumerate() {
-                let desc = &actions[row.action_offset as usize + a_idx];
+                let desc = &output.actions[row.action_offset as usize + a_idx];
                 assert_eq!(desc.source_action_index, a_idx as u16);
 
                 match tree_action {
@@ -381,14 +392,18 @@ fn exported_rows_satisfy_spec_sort_order() {
     let config = tiny_export_config();
     let (tree, strategy) = build_test_tree_and_strategy(&config);
 
-    let (rows, _actions, _probs, _manifest) =
-        hu_export::export_hu_strategy_to_universal(
-            &config, &tree, &strategy, "hu_dense", 100, 5.0,
-        )
-        .expect("export");
+    let training = hu_export::TrainingInfo {
+        source_backend: "hu_dense",
+        iterations: 100,
+        elapsed_minutes: 5.0,
+    };
+    let output = hu_export::export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training,
+    )
+    .expect("export");
 
     // Rows must be sorted by identity_key and unique.
-    for window in rows.windows(2) {
+    for window in output.rows.windows(2) {
         assert!(
             window[0].identity_key() < window[1].identity_key(),
             "rows not sorted: {:?} >= {:?}",
@@ -410,18 +425,22 @@ fn zero_mass_row_exports_uniform() {
     let config = tiny_export_config();
     let (tree, strategy) = build_test_tree_and_strategy(&config);
 
-    let (rows, _actions, probs, _manifest) =
-        hu_export::export_hu_strategy_to_universal(
-            &config, &tree, &strategy, "hu_dense", 100, 5.0,
-        )
-        .expect("export");
+    let training = hu_export::TrainingInfo {
+        source_backend: "hu_dense",
+        iterations: 100,
+        elapsed_minutes: 5.0,
+    };
+    let output = hu_export::export_hu_strategy_to_universal(
+        &config, &tree, &strategy, &training,
+    )
+    .expect("export");
 
     // All rows from fresh storage should be uniform.
-    for row in &rows {
+    for row in &output.rows {
         let n = row.action_count as usize;
         let expected = 1.0f32 / n as f32;
         for a in 0..n {
-            let p = probs[row.prob_offset as usize + a];
+            let p = output.probs[row.prob_offset as usize + a];
             assert_eq!(
                 p.to_bits(),
                 expected.to_bits(),
