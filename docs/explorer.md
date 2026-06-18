@@ -32,12 +32,24 @@ curl -X POST http://localhost:3001/api/is_bundle_loaded -H 'Content-Type: applic
 
 Open the hamburger menu to choose a strategy source:
 
-The current Explorer loader is centered on legacy HU `blueprint_v2` bundles.
-The planned universal dense blueprint bundle is specified in
-`docs/blueprint_format.md`; Explorer support for that format is a later
-integration phase. Universal bundles will carry `num_players`, row identity,
-action-schema, and bucket fingerprints so the loader can reject incompatible
-strategies before rendering a matrix.
+The Explorer loads both legacy HU `blueprint_v2` bundles and universal dense
+blueprint bundles (`docs/blueprint_format.md`). When opening a directory the
+loader detects `blueprint.json` (universal) before `config.yaml` (legacy) and
+routes through the unified loader (`blueprint_universal::loader`):
+
+- **Universal HU** bundles render through the existing HU views — a
+  `BlueprintV2Strategy` is reconstructed from the universal rows (bitwise-identical
+  to the legacy strategy) using the `config.yaml` retained inside the bundle to
+  rebuild the game tree.
+- **Universal MP** bundles (eager and lazy sparse) load read-only: the bundle
+  info panel reports format kind, player count, seats, stacks, and bucket counts
+  from the manifest. Full N-player browsing (seat selection, hand grids) is a
+  later phase, so HU-only views report "MP browsing not yet supported" for MP
+  bundles. Lazy sparse rows currently carry opaque action descriptors until
+  action identity is stored at realization time.
+
+Bundle and snapshot listings report the format kind and player count for each
+entry.
 
 ### Blueprint V2 Bundle
 Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
@@ -125,7 +137,7 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 
 | Command | Description |
 |-|-|
-| `load_bundle` | Load a trained strategy bundle (auto-detects blueprint_v2 format) |
+| `load_bundle` | Load a trained strategy bundle (auto-detects universal `blueprint.json` vs legacy `blueprint_v2` `config.yaml`) |
 | `load_blueprint_v2` | Load a blueprint_v2 strategy bundle (optional `snapshot` param to pick a specific snapshot) |
 | `list_snapshots` | List available snapshots in a blueprint directory (returns name, iterations, elapsed time) |
 | `get_strategy_matrix` | Get strategy for a position (returns 13x13 matrix) |
