@@ -15,7 +15,7 @@
 )]
 
 use poker_solver_core::blueprint_universal::{
-    ActionKind, BundleData, BundleKind, LoaderError,
+    ActionKind, BundleData, BundleKind, LoaderError, MpLazyKey,
     detect_bundle_kind, load_bundle, write_bundle,
 };
 use poker_solver_core::blueprint_universal::hu_export::{
@@ -321,6 +321,23 @@ fn detect_namespace_mismatch() {
     assert!(
         matches!(err, LoaderError::NamespaceMismatch { .. }),
         "expected NamespaceMismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn detect_missing_required_feature_for_mp_lazy() {
+    let tmp = TempDir::new().unwrap();
+    write_mp_lazy_bundle(tmp.path());
+    let manifest_path = tmp.path().join("blueprint.json");
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    // Parse, remove mp_semantic_rows_v1, rewrite
+    let mut val: serde_json::Value = serde_json::from_str(&text).unwrap();
+    val["required_features"] = serde_json::json!([]);
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&val).unwrap()).unwrap();
+    let err = detect_bundle_kind(tmp.path()).unwrap_err();
+    assert!(
+        matches!(err, LoaderError::MissingRequiredFeature { .. }),
+        "expected MissingRequiredFeature, got {err:?}"
     );
 }
 
@@ -715,8 +732,15 @@ fn load_mp_lazy_and_query() {
     assert_eq!(bundle.num_players(), 6);
     assert_eq!(bundle.source_backend(), "mp_lazy_sparse_projected");
 
-    // Query by semantic key: seat 0, preflop, bucket 5
-    let view = bundle.query_mp_lazy(0, 0, 5, 0xAAAA, 4)
+    // Query by semantic key using MpLazyKey struct
+    let key = MpLazyKey {
+        seat: 0,
+        street: 0,
+        local_bucket: 5,
+        history_hash: 0xAAAA,
+        history_len: 4,
+    };
+    let view = bundle.query_mp_lazy(&key)
         .expect("should find the lazy infoset");
     assert_eq!(view.probs.len(), 3);
 
@@ -743,7 +767,14 @@ fn load_mp_lazy_zero_mass_uniform() {
     let bundle = load_bundle(tmp.path()).unwrap();
 
     // Zero-mass entry: seat 0, turn, bucket 3
-    let view = bundle.query_mp_lazy(0, 2, 3, 0xCCCC, 8)
+    let key = MpLazyKey {
+        seat: 0,
+        street: 2,
+        local_bucket: 3,
+        history_hash: 0xCCCC,
+        history_len: 8,
+    };
+    let view = bundle.query_mp_lazy(&key)
         .expect("should find the zero-mass infoset");
     assert_eq!(view.probs.len(), 2);
 
@@ -754,4 +785,20 @@ fn load_mp_lazy_zero_mass_uniform() {
             "zero-mass row should be uniform, got {p}"
         );
     }
+}
+
+#[test]
+fn mp_lazy_key_not_found_returns_none() {
+    let tmp = TempDir::new().unwrap();
+    write_mp_lazy_bundle(tmp.path());
+    let bundle = load_bundle(tmp.path()).unwrap();
+
+    let key = MpLazyKey {
+        seat: 5,
+        street: 3,
+        local_bucket: 999,
+        history_hash: 0xDEAD,
+        history_len: 99,
+    };
+    assert!(bundle.query_mp_lazy(&key).is_none());
 }

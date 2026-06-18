@@ -30,4 +30,4 @@ pub use descriptors::{
     ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
 };
 pub use bundle::{BundleData, BundleReader, BundleWriter, write_bundle};
-pub use loader::{BundleKind, LoadedBundle, LoaderError, InfosetView, detect_bundle_kind, load_bundle};
+pub use loader::{BundleKind, LoadedBundle, LoaderError, InfosetView, MpLazyKey, detect_bundle_kind, load_bundle};

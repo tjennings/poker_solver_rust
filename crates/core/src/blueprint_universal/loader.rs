@@ -69,6 +69,14 @@ pub enum LoaderError {
         actual: Vec<String>,
     },
 
+    /// A required feature is missing from the manifest's `required_features`.
+    #[error("missing required feature \"{feature}\" in {path} for source_backend \"{backend}\"")]
+    MissingRequiredFeature {
+        feature: String,
+        backend: String,
+        path: String,
+    },
+
     /// The universal format reader returned an error.
     #[error("format error: {0}")]
     Format(#[from] super::error::FormatError),
@@ -125,6 +133,24 @@ pub enum LoadedBundle {
         /// -> row index.
         index: HashMap<(u8, u8, u16, u64, u16), usize>,
     },
+}
+
+/// Semantic identity key for an MP lazy infoset query.
+///
+/// Groups the five identity fields into a single struct to keep the
+/// `query_mp_lazy` parameter count within the 4-parameter guideline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MpLazyKey {
+    /// The seat (player position) index.
+    pub seat: u8,
+    /// Street index (0 = preflop, 1 = flop, 2 = turn, 3 = river).
+    pub street: u8,
+    /// The local bucket for this street.
+    pub local_bucket: u16,
+    /// Hash of the action history prefix.
+    pub history_hash: u64,
+    /// Length of the action history prefix.
+    pub history_len: u16,
 }
 
 /// A borrowed view of an infoset's action probabilities and descriptors.
@@ -225,18 +251,18 @@ impl LoadedBundle {
     #[must_use]
     pub fn query_mp_lazy(
         &self,
-        seat: u8,
-        street: u8,
-        local_bucket: u16,
-        history_hash: u64,
-        history_len: u16,
+        key: &MpLazyKey,
     ) -> Option<InfosetView<'_>> {
         match self {
             Self::UniversalMpLazy { data, index } => {
-                let key = (
-                    seat, street, local_bucket, history_hash, history_len,
+                let tuple = (
+                    key.seat,
+                    key.street,
+                    key.local_bucket,
+                    key.history_hash,
+                    key.history_len,
                 );
-                let row_idx = *index.get(&key)?;
+                let row_idx = *index.get(&tuple)?;
                 build_view_from_reader(&data.reader, row_idx)
             }
             _ => None,
@@ -348,7 +374,9 @@ pub fn detect_bundle_kind(dir: &Path) -> Result<BundleKind, LoaderError> {
     let (effective_dir, sentinel) = resolve_bundle_dir(dir)?;
     match sentinel {
         SentinelKind::BlueprintJson => {
-            classify_universal_manifest(&effective_dir)
+            let (kind, _manifest) =
+                classify_universal_manifest(&effective_dir)?;
+            Ok(kind)
         }
         SentinelKind::ConfigYaml => Ok(BundleKind::LegacyHu),
     }
@@ -365,8 +393,9 @@ pub fn load_bundle(dir: &Path) -> Result<LoadedBundle, LoaderError> {
     match sentinel {
         SentinelKind::ConfigYaml => load_legacy_hu(dir, &effective_dir),
         SentinelKind::BlueprintJson => {
-            let kind = classify_universal_manifest(&effective_dir)?;
-            load_universal(&effective_dir, kind)
+            let (kind, manifest) =
+                classify_universal_manifest(&effective_dir)?;
+            load_universal(&effective_dir, kind, manifest)
         }
     }
 }
@@ -459,10 +488,13 @@ fn expected_namespace(backend: &str) -> Option<&'static str> {
     }
 }
 
-/// Map `source_backend` + cross-checks -> [`BundleKind`].
+/// Map `source_backend` + cross-checks -> `(BundleKind, Manifest)`.
+///
+/// Returns the parsed manifest alongside the kind so callers can
+/// reuse it without re-reading `blueprint.json`.
 fn classify_universal_manifest(
     dir: &Path,
-) -> Result<BundleKind, LoaderError> {
+) -> Result<(BundleKind, Manifest), LoaderError> {
     let manifest = read_manifest_for_detection(dir)?;
     let backend = &manifest.training.source_backend;
     let path_str = dir.display().to_string();
@@ -489,23 +521,23 @@ fn classify_universal_manifest(
             .iter()
             .any(|f| f == "mp_semantic_rows_v1");
         if !has_semantic {
-            return Err(LoaderError::NamespaceMismatch {
-                path: path_str,
+            return Err(LoaderError::MissingRequiredFeature {
+                feature: "mp_semantic_rows_v1".to_string(),
                 backend: backend.clone(),
-                expected: "mp_semantic_rows_v1 in required_features".into(),
-                actual: manifest.required_features.clone(),
+                path: path_str,
             });
         }
     }
 
     check_payload_files_exist(dir, &manifest, &path_str)?;
 
-    match backend.as_str() {
-        "hu_dense" | "hu_sparse_projected" => Ok(BundleKind::UniversalHu),
-        "mp_eager_dense" => Ok(BundleKind::UniversalMpEager),
-        "mp_lazy_sparse_projected" => Ok(BundleKind::UniversalMpLazy),
+    let kind = match backend.as_str() {
+        "hu_dense" | "hu_sparse_projected" => BundleKind::UniversalHu,
+        "mp_eager_dense" => BundleKind::UniversalMpEager,
+        "mp_lazy_sparse_projected" => BundleKind::UniversalMpLazy,
         _ => unreachable!(),
-    }
+    };
+    Ok((kind, manifest))
 }
 
 /// Read `blueprint.json` for detection (not full binary validation).
@@ -585,11 +617,14 @@ fn load_legacy_hu(
 }
 
 /// Load a universal bundle of any kind.
+///
+/// Accepts the pre-parsed `manifest` from `classify_universal_manifest`
+/// so that `blueprint.json` is not re-read a second time.
 fn load_universal(
     dir: &Path,
     kind: BundleKind,
+    manifest: Manifest,
 ) -> Result<LoadedBundle, LoaderError> {
-    let manifest = read_manifest_for_detection(dir)?;
     let reader = BundleReader::open(dir)?;
     let data = Box::new(UniversalData { manifest, reader });
     match kind {
