@@ -786,6 +786,28 @@ fn fill_bucket_probs(
     }
 }
 
+/// Build a [`BundleInfo`] for a universal MP bundle from its manifest.
+fn mp_bundle_info(
+    manifest: &poker_solver_core::blueprint_universal::Manifest,
+    kind: BundleKind,
+    iterations: u64,
+) -> BundleInfo {
+    let game = &manifest.game;
+    BundleInfo {
+        name: Some(format!("MP {kind} ({}-player)", game.num_players)),
+        stack_depth: game.seats.first()
+            .map(|s| s.starting_stack as u32)
+            .unwrap_or(0),
+        bet_sizes: vec![],
+        info_sets: manifest.layout.row_count as usize,
+        iterations,
+        preflop_only: false,
+        rake_rate: game.rake.rate,
+        rake_cap: game.rake.cap,
+        snapshot_name: None,
+    }
+}
+
 /// Load a universal MP bundle into the read-only `UniversalMp` source.
 fn load_universal_mp(
     state: &ExplorationState,
@@ -795,25 +817,7 @@ fn load_universal_mp(
     let manifest = loaded.manifest().ok_or(
         "MP bundle missing manifest"
     )?;
-    let game = &manifest.game;
-
-    let info = BundleInfo {
-        name: Some(format!(
-            "MP {} ({}-player)",
-            loaded.kind(),
-            game.num_players,
-        )),
-        stack_depth: game.seats.first()
-            .map(|s| s.starting_stack as u32)
-            .unwrap_or(0),
-        bet_sizes: vec![],
-        info_sets: manifest.layout.row_count as usize,
-        iterations: loaded.iterations(),
-        preflop_only: false,
-        rake_rate: game.rake.rate,
-        rake_cap: game.rake.cap,
-        snapshot_name: None,
-    };
+    let info = mp_bundle_info(manifest, loaded.kind(), loaded.iterations());
 
     *state.source.write() = Some(StrategySource::UniversalMp {
         bundle: Box::new(loaded),
@@ -2141,24 +2145,7 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
         }
         StrategySource::UniversalMp { bundle, .. } => {
             let manifest = bundle.manifest().ok_or("missing manifest")?;
-            let game = &manifest.game;
-            BundleInfo {
-                name: Some(format!(
-                    "MP {} ({}-player)",
-                    bundle.kind(),
-                    game.num_players,
-                )),
-                stack_depth: game.seats.first()
-                    .map(|s| s.starting_stack as u32)
-                    .unwrap_or(0),
-                bet_sizes: vec![],
-                info_sets: manifest.layout.row_count as usize,
-                iterations: bundle.iterations(),
-                preflop_only: false,
-                rake_rate: game.rake.rate,
-                rake_cap: game.rake.cap,
-                snapshot_name: None,
-            }
+            mp_bundle_info(manifest, bundle.kind(), bundle.iterations())
         }
     })
 }
@@ -4491,6 +4478,135 @@ mod tests {
             (loaded_ev - 5.0).abs() < 0.01,
             "should load hand_ev.bin from snapshot dir (5.0), but got {} (root has 99.0)",
             loaded_ev,
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // mp_bundle_info helper tests
+    // ---------------------------------------------------------------
+
+    /// Build a minimal [`Manifest`] for MP BundleInfo helper tests.
+    fn stub_mp_manifest(
+        num_players: u8,
+        starting_stack: f64,
+        row_count: u64,
+        rake_rate: f64,
+        rake_cap: f64,
+    ) -> poker_solver_core::blueprint_universal::Manifest {
+        use poker_solver_core::blueprint_universal::*;
+        use std::collections::BTreeMap;
+        Manifest {
+            format_name: "universal_dense".into(),
+            format_version: 1,
+            compat_min_reader: 1,
+            created_at: String::new(),
+            producer: String::new(),
+            producer_git: String::new(),
+            required_features: vec![],
+            optional_features: vec![],
+            game_fingerprint: 0,
+            source_config_fingerprint: None,
+            game: GameMetadata {
+                game_kind: "nlhe".into(),
+                num_players,
+                seats: vec![SeatDescriptor {
+                    seat_id: 0,
+                    label: "SB".into(),
+                    blind_ante_role: "sb".into(),
+                    starting_stack,
+                }],
+                button_seat: 0,
+                small_blind: 0.5,
+                big_blind: 1.0,
+                antes: vec![],
+                straddles: vec![],
+                stack_units: "chips".into(),
+                rake: RakeConfig { rate: rake_rate, cap: rake_cap },
+                max_flop_players: None,
+            },
+            training: TrainingMetadata {
+                source_backend: "mp_eager_dense".into(),
+                unit_kind: "iterations".into(),
+                units_completed: 0,
+                elapsed_minutes: 0.0,
+                strategy_unit: "average".into(),
+                command: None,
+                config_path: None,
+                config_fingerprint: None,
+            },
+            strategy: StrategyMetadata {
+                normalization_tolerance: 1e-4,
+            },
+            layout: LayoutMetadata {
+                row_count,
+                action_descriptor_count: 0,
+                probability_count: 0,
+                row_sort_order: "spec_v1".into(),
+                row_namespace: vec![],
+                missing_row_policy: "uniform".into(),
+            },
+            actions: ActionsMetadata {
+                action_abstraction_fingerprint: 0,
+            },
+            buckets: BucketsMetadata {
+                bucket_mode: "fixed".into(),
+                bucket_semantic_fingerprint: 0,
+                street_bucket_counts: BTreeMap::new(),
+                bucket_files: vec![],
+                bucket_generator_version: String::new(),
+                per_flop_bucket_config: None,
+            },
+            compatibility: CompatibilityMetadata {
+                legacy_fallback: false,
+                missing_row_policy: "uniform".into(),
+                resumable: false,
+            },
+            files: BTreeMap::new(),
+        }
+    }
+
+    #[timed_test]
+    fn mp_bundle_info_builds_correct_name_and_fields() {
+        use poker_solver_core::blueprint_universal::BundleKind;
+
+        let manifest = stub_mp_manifest(6, 200.0, 5000, 0.05, 3.0);
+        let info = mp_bundle_info(
+            &manifest,
+            BundleKind::UniversalMpEager,
+            42_000,
+        );
+
+        assert_eq!(
+            info.name.as_deref(),
+            Some("MP universal_mp_eager (6-player)")
+        );
+        assert_eq!(info.stack_depth, 200);
+        assert!(info.bet_sizes.is_empty());
+        assert_eq!(info.info_sets, 5000);
+        assert_eq!(info.iterations, 42_000);
+        assert!(!info.preflop_only);
+        assert!((info.rake_rate - 0.05).abs() < f64::EPSILON);
+        assert!((info.rake_cap - 3.0).abs() < f64::EPSILON);
+        assert!(info.snapshot_name.is_none());
+    }
+
+    #[timed_test]
+    fn mp_bundle_info_empty_seats_yields_zero_stack() {
+        use poker_solver_core::blueprint_universal::BundleKind;
+
+        let mut manifest = stub_mp_manifest(3, 100.0, 100, 0.0, 0.0);
+        manifest.game.seats.clear();
+
+        let info = mp_bundle_info(
+            &manifest,
+            BundleKind::UniversalMpLazy,
+            0,
+        );
+
+        assert_eq!(info.stack_depth, 0);
+        assert_eq!(
+            info.name.as_deref(),
+            Some("MP universal_mp_lazy (3-player)")
         );
     }
 }

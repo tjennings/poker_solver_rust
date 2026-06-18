@@ -539,26 +539,13 @@ pub fn export_lazy_bundle_from_disk(
         export_lazy_sparse_to_universal(&config, &entries, &training);
 
     // Retain config.yaml so the bundle is self-contained for the Explorer.
-    retain_lazy_config_yaml(
+    super::export_common::retain_config_yaml(
         &bundle_dir.join("config.yaml"),
         out_dir,
         &mut output.manifest,
     )?;
 
     write_lazy_bundle(out_dir, &output)?;
-    Ok(())
-}
-
-/// Copy source config.yaml into the output bundle and set manifest's
-/// `config_path` so the Explorer can rebuild the game tree.
-fn retain_lazy_config_yaml(
-    source: &Path,
-    out_dir: &Path,
-    manifest: &mut super::manifest::Manifest,
-) -> Result<(), ExportError> {
-    std::fs::create_dir_all(out_dir)?;
-    std::fs::copy(source, out_dir.join("config.yaml"))?;
-    manifest.training.config_path = Some("config.yaml".to_string());
     Ok(())
 }
 

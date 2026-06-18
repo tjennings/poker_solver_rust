@@ -793,7 +793,7 @@ pub fn export_mp_bundle(
     );
 
     // Retain config.yaml so the bundle is self-contained for the Explorer.
-    retain_mp_config_yaml(
+    super::export_common::retain_config_yaml(
         &mp_output_dir.join("config.yaml"),
         out_dir,
         &mut output.manifest,
@@ -809,19 +809,6 @@ pub fn export_mp_bundle(
         },
     )?;
 
-    Ok(())
-}
-
-/// Copy source config.yaml into the output bundle and set manifest's
-/// `config_path` so the Explorer can rebuild the game tree.
-fn retain_mp_config_yaml(
-    source: &Path,
-    out_dir: &Path,
-    manifest: &mut super::manifest::Manifest,
-) -> Result<(), ExportError> {
-    std::fs::create_dir_all(out_dir)?;
-    std::fs::copy(source, out_dir.join("config.yaml"))?;
-    manifest.training.config_path = Some("config.yaml".to_string());
     Ok(())
 }
 

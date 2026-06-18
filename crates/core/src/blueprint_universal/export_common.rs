@@ -8,8 +8,11 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
+use std::path::Path;
+
 use super::descriptors::{ActionDescriptor, RowDescriptor};
 use super::hash::Fnv1aHasher;
+use super::manifest::Manifest;
 
 // ---------------------------------------------------------------------------
 // Namespace constants
@@ -204,6 +207,25 @@ fn is_leap(year: u64) -> bool {
         || year.is_multiple_of(400)
 }
 
+// ---------------------------------------------------------------------------
+// Config file retention
+// ---------------------------------------------------------------------------
+
+/// Copy a source `config.yaml` into the output bundle directory and
+/// record the relative path in `manifest.training.config_path`.
+///
+/// Creates `out_dir` (including parents) if it does not already exist.
+pub(crate) fn retain_config_yaml(
+    source: &Path,
+    out_dir: &Path,
+    manifest: &mut Manifest,
+) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::copy(source, out_dir.join("config.yaml"))?;
+    manifest.training.config_path = Some("config.yaml".to_string());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +337,125 @@ mod tests {
     fn epoch_to_rfc3339_unix_epoch() {
         let ts = epoch_secs_to_rfc3339(0);
         assert_eq!(ts, "1970-01-01T00:00:00Z");
+    }
+
+    /// Build a minimal [`Manifest`] for tests that only inspect the
+    /// training.config_path field.
+    fn stub_manifest() -> super::super::manifest::Manifest {
+        use super::super::manifest::*;
+        use std::collections::BTreeMap;
+        Manifest {
+            format_name: "universal_dense".into(),
+            format_version: 1,
+            compat_min_reader: 1,
+            created_at: String::new(),
+            producer: String::new(),
+            producer_git: String::new(),
+            required_features: vec![],
+            optional_features: vec![],
+            game_fingerprint: 0,
+            source_config_fingerprint: None,
+            game: GameMetadata {
+                game_kind: "nlhe".into(),
+                num_players: 2,
+                seats: vec![],
+                button_seat: 0,
+                small_blind: 0.5,
+                big_blind: 1.0,
+                antes: vec![],
+                straddles: vec![],
+                stack_units: "chips".into(),
+                rake: RakeConfig { rate: 0.0, cap: 0.0 },
+                max_flop_players: None,
+            },
+            training: TrainingMetadata {
+                source_backend: String::new(),
+                unit_kind: "iterations".into(),
+                units_completed: 0,
+                elapsed_minutes: 0.0,
+                strategy_unit: "average".into(),
+                command: None,
+                config_path: None,
+                config_fingerprint: None,
+            },
+            strategy: StrategyMetadata {
+                normalization_tolerance: 1e-4,
+            },
+            layout: LayoutMetadata {
+                row_count: 0,
+                action_descriptor_count: 0,
+                probability_count: 0,
+                row_sort_order: "spec_v1".into(),
+                row_namespace: vec![],
+                missing_row_policy: "uniform".into(),
+            },
+            actions: ActionsMetadata {
+                action_abstraction_fingerprint: 0,
+            },
+            buckets: BucketsMetadata {
+                bucket_mode: "fixed".into(),
+                bucket_semantic_fingerprint: 0,
+                street_bucket_counts: BTreeMap::new(),
+                bucket_files: vec![],
+                bucket_generator_version: String::new(),
+                per_flop_bucket_config: None,
+            },
+            compatibility: CompatibilityMetadata {
+                legacy_fallback: false,
+                missing_row_policy: "uniform".into(),
+                resumable: false,
+            },
+            files: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn retain_config_yaml_copies_file_and_sets_manifest_path() {
+        let tmp = std::env::temp_dir()
+            .join("retain_config_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let source = tmp.join("source_config.yaml");
+        std::fs::write(&source, "game: test\n").unwrap();
+
+        let out_dir = tmp.join("output_bundle");
+        let mut manifest = stub_manifest();
+
+        retain_config_yaml(&source, &out_dir, &mut manifest)
+            .unwrap();
+
+        assert!(out_dir.join("config.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(out_dir.join("config.yaml"))
+                .unwrap(),
+            "game: test\n"
+        );
+        assert_eq!(
+            manifest.training.config_path.as_deref(),
+            Some("config.yaml")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn retain_config_yaml_creates_output_dir() {
+        let tmp = std::env::temp_dir()
+            .join("retain_config_mkdir_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let source = tmp.join("src.yaml");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&source, "x: 1\n").unwrap();
+
+        let nested = tmp.join("a").join("b").join("c");
+        let mut manifest = stub_manifest();
+
+        retain_config_yaml(&source, &nested, &mut manifest)
+            .unwrap();
+
+        assert!(nested.join("config.yaml").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
