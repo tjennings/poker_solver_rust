@@ -14,6 +14,7 @@ mod descriptors;
 mod bundle;
 pub(crate) mod export_common;
 pub mod hu_export;
+pub mod loader;
 pub mod mp_eager_export;
 pub mod mp_lazy_export;
 
@@ -29,3 +30,4 @@ pub use descriptors::{
     ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
 };
 pub use bundle::{BundleData, BundleReader, BundleWriter, write_bundle};
+pub use loader::{BundleKind, LoadedBundle, LoaderError, InfosetView, MpLazyKey, detect_bundle_kind, load_bundle};

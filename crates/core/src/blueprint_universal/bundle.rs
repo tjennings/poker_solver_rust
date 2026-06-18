@@ -294,6 +294,18 @@ impl BundleReader {
         self.probs.get(index).copied()
     }
 
+    /// Get a contiguous slice of probability values.
+    ///
+    /// Returns `None` if the range `start..start+count` is out of bounds.
+    #[must_use]
+    pub fn prob_slice(&self, start: usize, count: usize) -> Option<&[f32]> {
+        let end = start.checked_add(count)?;
+        if end > self.probs.len() {
+            return None;
+        }
+        Some(&self.probs[start..end])
+    }
+
     /// Get the semantic key record for a row by row index.
     ///
     /// Returns `None` if the row has no semantic key (kind == 0) or
