@@ -554,12 +554,10 @@ fn validate_snapshot_name(name: &str) -> Result<(), ExportError> {
 /// deserialization failures, or write errors.
 /// Require a file to exist, returning `MissingFile` otherwise.
 fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
-    if path.exists() {
-        Ok(())
+    if let Some(detail) = super::export_common::check_file_exists(path, label) {
+        Err(ExportError::MissingFile { detail })
     } else {
-        Err(ExportError::MissingFile {
-            detail: format!("{label} not found at {}", path.display()),
-        })
+        Ok(())
     }
 }
 

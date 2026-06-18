@@ -251,21 +251,11 @@ pub enum MpNegativeActionPurgeMode {
 
 // ── Snapshot config ──────────────────────────────────────────────────
 
-/// Snapshot output format selector for multiplayer training.
+/// Type alias for the shared snapshot format enum.
 ///
-/// Controls whether the trainer writes legacy files,
-/// universal dense bundles, or both at each snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MpSnapshotFormat {
-    /// Write only legacy files (default).
-    #[default]
-    Legacy,
-    /// Write only a universal dense bundle.
-    Universal,
-    /// Write both legacy files and a universal bundle.
-    Both,
-}
+/// `MpSnapshotFormat` is identical to `SnapshotFormat`; the alias
+/// preserves backward-compatible naming in MP config code.
+pub type MpSnapshotFormat = crate::training_runtime::SnapshotFormat;
 
 /// Checkpoint output settings for multiplayer training.
 #[derive(Debug, Clone, Serialize, Deserialize)]

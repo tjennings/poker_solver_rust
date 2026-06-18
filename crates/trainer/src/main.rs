@@ -3767,18 +3767,13 @@ fn save_mp_snapshot(
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
-    let write_legacy = matches!(
-        snapshot_config.format,
-        poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Legacy
-            | poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Both
-    );
-
-    if write_legacy {
-        let strategy =
-            mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
-        strategy.save(&snapshot_dir.join("strategy.bin"))?;
-        save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
-    }
+    // Always write legacy files for MP snapshots.  The format flag is
+    // accepted but universal MP writes are not yet wired, so suppressing
+    // legacy output would silently lose all strategy data.
+    let strategy =
+        mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
+    strategy.save(&snapshot_dir.join("strategy.bin"))?;
+    save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
 
     let metadata = serde_json::json!({
         "kind": "blueprint_mp",
@@ -3806,19 +3801,14 @@ fn save_lazy_mp_snapshot(
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
-    let write_legacy = matches!(
-        snapshot_config.format,
-        poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Legacy
-            | poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Both
-    );
-
-    if write_legacy {
-        let entries = storage.snapshot_entries();
-        let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
-        let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, &entries)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-    }
+    // Always write legacy files for lazy MP snapshots.  The format flag
+    // is accepted but universal lazy MP writes are not yet wired, so
+    // suppressing legacy output would silently lose all strategy data.
+    let entries = storage.snapshot_entries();
+    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
+    let writer = std::io::BufWriter::new(file);
+    bincode::serialize_into(writer, &entries)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let stats = storage.stats();
     let metadata = serde_json::json!({
@@ -4671,28 +4661,16 @@ fn dispatch_train(
             let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
             let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
 
+            if tui_config.enabled && !no_tui {
+                eprintln!(
+                    "  Note: TUI is not supported via `train` dispatcher; \
+                     use `train-blueprint` for interactive TUI. Running without TUI."
+                );
+            }
+
             let mut trainer = BlueprintTrainer::new(bp_config);
             trainer.try_resume()?;
-            let use_tui = tui_config.enabled && !no_tui;
-
-            if use_tui {
-                let metrics = Arc::new(
-                    blueprint_tui_metrics::BlueprintTuiMetrics::new(
-                        trainer.config.training.iterations,
-                        trainer.config.training.time_limit_minutes,
-                    ),
-                );
-                trainer.paused = Arc::clone(&metrics.paused);
-                trainer.quit_requested = Arc::clone(&metrics.quit_requested);
-                trainer.shared_iterations = Arc::clone(&metrics.iterations);
-                trainer.tui_active = true;
-                metrics
-                    .iterations
-                    .store(trainer.iterations, Ordering::Relaxed);
-                trainer.train();
-            } else {
-                trainer.train();
-            }
+            trainer.train()?;
         }
         DetectedConfigKind::Mp => {
             eprintln!("Detected MP config, dispatching to train-blueprint-mp");
@@ -5471,6 +5449,151 @@ snapshots:
         assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
         assert_eq!(metadata["iterations"], 456);
         assert_eq!(metadata["entries"], 1);
+    }
+
+    /// MP eager snapshot must write legacy files even when format is
+    /// `universal`, because universal MP writes are not yet wired.
+    #[test]
+    fn mp_snapshot_universal_format_still_writes_legacy_files() {
+        use poker_solver_core::blueprint_mp::config::{
+            ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
+            MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
+        };
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+
+        let tiny = MpStreetSizes {
+            lead: vec![serde_yaml::Value::String("1bb".into())],
+            raise: vec![],
+        };
+        let tiny_pf = MpStreetSizes {
+            lead: vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))],
+            raise: vec![],
+        };
+        let config = BlueprintMpConfig {
+            game: MpGameConfig {
+                name: "fmt test".into(),
+                num_players: 2,
+                stack_depth: 6.0,
+                allow_preflop_limp: true,
+                blinds: vec![
+                    ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
+                    ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+                ],
+                rake_rate: 0.0,
+                rake_cap: 0.0,
+            },
+            action_abstraction: MpActionAbstractionConfig {
+                max_flop_players: None,
+                preflop: tiny,
+                flop: tiny_pf.clone(),
+                turn: tiny_pf.clone(),
+                river: tiny_pf,
+            },
+            clustering: MpClusteringConfig {
+                preflop: MpStreetCluster { buckets: 2 },
+                flop: MpStreetCluster { buckets: 2 },
+                turn: MpStreetCluster { buckets: 2 },
+                river: MpStreetCluster { buckets: 2 },
+            },
+            training: MpTrainingConfig {
+                backend: MpTrainingBackend::Eager,
+                chance_continuation_mode:
+                    poker_solver_core::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
+                cluster_path: None,
+                iterations: Some(1),
+                time_limit_minutes: None,
+                lcfr_warmup_iterations: 0,
+                lcfr_discount_interval: 50,
+                prune_after_iterations: 1_000_000,
+                traversal_pruning_enabled: false,
+                prune_threshold: -250,
+                prune_explore_pct: 0.05,
+                negative_action_subtree_purge_enabled: false,
+                negative_action_prune_below: -1,
+                negative_action_reactivate_at: 0,
+                negative_action_purge_mode: MpNegativeActionPurgeMode::ScanHistoryPrefix,
+                batch_size: 1,
+                dcfr_alpha: 1.5,
+                dcfr_beta: 0.0,
+                dcfr_gamma: 2.0,
+                print_every_minutes: 999,
+                purify_threshold: 0.0,
+                exploitability_interval_minutes: 0,
+                exploitability_samples: 0,
+            },
+            snapshots: MpSnapshotConfig {
+                warmup_minutes: 0,
+                snapshot_every_minutes: 1,
+                output_dir: String::new(),
+                resume: false,
+                max_snapshots: None,
+                format: MpSnapshotFormat::Universal,
+            },
+        };
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            format: MpSnapshotFormat::Universal,
+            ..config.snapshots
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            42,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("snapshot save should succeed");
+
+        assert!(
+            snapshot_dir.join("strategy.bin").exists(),
+            "legacy strategy.bin must be written even with format=universal \
+             until universal MP writes are wired"
+        );
+        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+    }
+
+    /// MP lazy snapshot must write legacy files even when format is
+    /// `universal`, because universal lazy MP writes are not yet wired.
+    #[test]
+    fn lazy_mp_snapshot_universal_format_still_writes_legacy_files() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            warmup_minutes: 0,
+            snapshot_every_minutes: 1,
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            resume: false,
+            max_snapshots: None,
+            format: MpSnapshotFormat::Universal,
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &snapshot_config,
+            &storage,
+            100,
+            std::time::Duration::from_secs(3),
+        )
+        .expect("lazy snapshot save should succeed");
+
+        assert!(
+            snapshot_dir.join("sparse_entries.bin").exists(),
+            "legacy sparse_entries.bin must be written even with format=universal \
+             until universal lazy MP writes are wired"
+        );
+        assert!(snapshot_dir.join("metadata.json").exists());
     }
 
     #[test]

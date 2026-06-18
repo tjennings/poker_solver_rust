@@ -376,21 +376,8 @@ impl Default for BaselineValidationTrainingConfig {
     }
 }
 
-/// Snapshot output format selector.
-///
-/// Controls whether the trainer writes legacy `strategy.bin` files,
-/// universal dense bundles, or both at each snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotFormat {
-    /// Write only legacy `strategy.bin` / `regrets.bin` files (default).
-    #[default]
-    Legacy,
-    /// Write only a universal dense bundle.
-    Universal,
-    /// Write both legacy files and a universal bundle.
-    Both,
-}
+/// Re-export from the shared training runtime module.
+pub use crate::training_runtime::SnapshotFormat;
 
 /// Snapshot (checkpoint) output settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
