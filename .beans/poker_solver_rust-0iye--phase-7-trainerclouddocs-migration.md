@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-0iye
 title: 'Phase 7: trainer/cloud/docs migration'
-status: todo
+status: in-progress
 type: task
 priority: normal
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-18T18:43:36Z
+updated_at: 2026-06-18T19:15:54Z
 parent: poker_solver_rust-a29s
 ---
 
