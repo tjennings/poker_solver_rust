@@ -6,8 +6,12 @@ distribution plus enough identity metadata to make the row meaningful across
 heads-up `blueprint_v2`, eager N-player `blueprint_mp`, and lazy sparse
 N-player training.
 
-Phase 0 is a specification only. Existing HU bundles remain readable, and no
-trainer is required to write this format until the later implementation phases.
+Trainers can write this format natively at snapshot time by setting
+`snapshots.format` to `universal` or `both` in the training config. When
+enabled, the universal bundle is written into `snapshot_NNNN/universal/`
+alongside legacy files (when `both`) or instead of them (when `universal`).
+Existing HU bundles remain readable. Post-hoc export via `export-universal`
+and `export-universal-mp` commands is also still supported.
 
 ## Goals
 

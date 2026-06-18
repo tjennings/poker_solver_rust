@@ -109,6 +109,13 @@ launch
         └── Self-terminate
 ```
 
+The Docker container runs `train -c /config/training.yaml --output-dir /output/bundle`.
+The `train` subcommand auto-detects whether the config is HU V2 or N-player MP
+and dispatches to the appropriate trainer. When the config sets
+`snapshots.format: universal` or `snapshots.format: both`, the output bundle
+directory contains universal dense bundles that the Tauri Explorer can load
+directly.
+
 Training status is tracked via EC2 tags (`solver:status`): `starting` → `initializing` → `pulling-image` → `training` → `uploading` → `complete` (or `failed`).
 
 ## Configuration
