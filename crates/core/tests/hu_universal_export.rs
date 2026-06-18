@@ -606,3 +606,74 @@ fn full_disk_export_round_trip() {
     let reader = BundleReader::open(out_dir.path()).expect("open exported bundle");
     assert!(reader.row_count() > 0, "should have exported rows");
 }
+
+/// Part A: disk exporter retains config.yaml and it round-trips.
+#[test]
+fn disk_export_retains_config_yaml_that_rebuilds_tree() {
+    use poker_solver_core::blueprint_universal::hu_export;
+    let config = tiny_export_config();
+    let (_tree, strategy) = build_test_tree_and_strategy(&config);
+
+    let dir = tempfile::tempdir().expect("source dir");
+    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config).unwrap();
+    let snapshot_dir = dir.path().join("final");
+    std::fs::create_dir_all(&snapshot_dir).unwrap();
+    strategy.save(&snapshot_dir.join("strategy.bin")).unwrap();
+    std::fs::write(
+        snapshot_dir.join("metadata.json"),
+        r#"{"iteration": 100, "elapsed_minutes": 5}"#,
+    )
+    .unwrap();
+
+    let out_dir = tempfile::tempdir().expect("outdir");
+    hu_export::export_hu_bundle(dir.path(), "final", out_dir.path())
+        .expect("export should succeed");
+
+    // config.yaml must be present in the output.
+    assert!(
+        out_dir.path().join("config.yaml").exists(),
+        "exported bundle should contain config.yaml"
+    );
+
+    // It must deserialize back and rebuild the same tree.
+    let retained_config = poker_solver_core::blueprint_v2::bundle::load_config(out_dir.path())
+        .expect("retained config.yaml should load");
+    let aa = &retained_config.action_abstraction;
+    let tree2 = GameTree::build_with_options(
+        retained_config.game.stack_depth,
+        retained_config.game.small_blind,
+        retained_config.game.big_blind,
+        &aa.preflop,
+        &aa.flop,
+        &aa.turn,
+        &aa.river,
+        retained_config.game.allow_preflop_limp,
+    );
+    assert_eq!(
+        tree2.nodes.len(),
+        GameTree::build_with_options(
+            config.game.stack_depth,
+            config.game.small_blind,
+            config.game.big_blind,
+            &config.action_abstraction.preflop,
+            &config.action_abstraction.flop,
+            &config.action_abstraction.turn,
+            &config.action_abstraction.river,
+            config.game.allow_preflop_limp,
+        )
+        .nodes
+        .len(),
+        "rebuilt tree should have the same node count"
+    );
+
+    // Manifest should reference config.yaml.
+    let manifest_text =
+        std::fs::read_to_string(out_dir.path().join("blueprint.json")).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(
+        manifest["training"]["config_path"].as_str(),
+        Some("config.yaml"),
+        "manifest should reference retained config.yaml"
+    );
+}

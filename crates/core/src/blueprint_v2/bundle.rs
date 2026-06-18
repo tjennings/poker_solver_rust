@@ -209,6 +209,45 @@ impl BlueprintV2Strategy {
         self.node_action_counts.len()
     }
 
+    /// Construct a strategy from pre-computed action probability arrays
+    /// and a game tree.
+    ///
+    /// The tree is walked to extract per-node action counts and street
+    /// indices, matching the layout used by `from_storage`.
+    #[must_use]
+    pub fn from_raw_with_tree(
+        action_probs: Vec<f32>,
+        bucket_counts: [u16; 4],
+        iterations: u64,
+        tree: &GameTree,
+    ) -> Self {
+        let mut node_action_counts = Vec::new();
+        let mut node_street_indices = Vec::new();
+        for node in &tree.nodes {
+            if let GameNode::Decision {
+                street, actions, ..
+            } = node
+            {
+                node_action_counts.push(actions.len() as u16);
+                node_street_indices.push(*street as u8);
+            }
+        }
+        let node_offsets = compute_node_offsets(
+            &node_action_counts,
+            &node_street_indices,
+            bucket_counts,
+        );
+        Self {
+            action_probs,
+            node_action_counts,
+            node_street_indices,
+            bucket_counts,
+            iterations,
+            elapsed_minutes: 0,
+            node_offsets,
+        }
+    }
+
     /// Create an empty strategy with no decision nodes.
     ///
     /// Useful for tests and fallback construction where no trained

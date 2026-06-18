@@ -788,9 +788,16 @@ pub fn export_mp_bundle(
         elapsed_minutes: snap.metadata.elapsed_minutes.unwrap_or(0) as f64,
     };
 
-    let output = export_mp_strategy_from_projected(
+    let mut output = export_mp_strategy_from_projected(
         &config, &tree, &snap.strategy, &training,
     );
+
+    // Retain config.yaml so the bundle is self-contained for the Explorer.
+    super::export_common::retain_config_yaml(
+        &mp_output_dir.join("config.yaml"),
+        out_dir,
+        &mut output.manifest,
+    )?;
 
     write_bundle(
         out_dir,

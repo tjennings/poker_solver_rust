@@ -624,8 +624,15 @@ pub fn export_hu_bundle(
         elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0.0),
     };
 
-    let output = export_hu_strategy_to_universal(
+    let mut output = export_hu_strategy_to_universal(
         &config, &tree, &strategy, &training,
+    )?;
+
+    // Retain config.yaml so the bundle is self-contained for the Explorer.
+    export_common::retain_config_yaml(
+        &bundle_dir.join("config.yaml"),
+        out_dir,
+        &mut output.manifest,
     )?;
 
     write_bundle(

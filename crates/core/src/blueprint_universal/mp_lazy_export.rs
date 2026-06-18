@@ -535,8 +535,16 @@ pub fn export_lazy_bundle_from_disk(
         elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0) as f64,
     };
 
-    let output =
+    let mut output =
         export_lazy_sparse_to_universal(&config, &entries, &training);
+
+    // Retain config.yaml so the bundle is self-contained for the Explorer.
+    super::export_common::retain_config_yaml(
+        &bundle_dir.join("config.yaml"),
+        out_dir,
+        &mut output.manifest,
+    )?;
+
     write_lazy_bundle(out_dir, &output)?;
     Ok(())
 }
