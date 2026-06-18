@@ -3494,6 +3494,7 @@ fn run_mp_with_tui(
         &metrics,
         &quit_flag,
         &train_handle,
+        config,
         &config.snapshots,
         &telemetry_in_flight,
     );
@@ -3561,6 +3562,7 @@ fn run_mp_with_tui_lazy(
         &metrics,
         &controls,
         &train_handle,
+        config,
         &config.snapshots,
         started,
     );
@@ -3609,6 +3611,7 @@ fn bridge_mp_iterations<T>(
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     telemetry_in_flight: &Arc<AtomicBool>,
 ) {
@@ -3621,7 +3624,7 @@ fn bridge_mp_iterations<T>(
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
             metrics.mark_snapshot_writing();
-            match save_mp_snapshot(snapshot_config, storage, tree, iters, started.elapsed()) {
+            match save_mp_snapshot(config, snapshot_config, storage, tree, iters, started.elapsed()) {
                 Ok(path) => {
                     metrics.mark_snapshot_saved(&path);
                     eprintln!("  MP snapshot saved to {}", path.display());
@@ -3673,6 +3676,7 @@ fn bridge_mp_lazy_iterations<T>(
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     controls: &poker_solver_core::training_runtime::RuntimeControls,
     handle: &std::thread::JoinHandle<T>,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     started: Instant,
 ) {
@@ -3685,6 +3689,7 @@ fn bridge_mp_lazy_iterations<T>(
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
             let _ = save_lazy_mp_snapshot_for_tui(
+                config,
                 snapshot_config,
                 metrics,
                 storage,
@@ -3734,6 +3739,7 @@ fn bridge_mp_lazy_iterations<T>(
 }
 
 fn save_lazy_mp_snapshot_for_tui(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
     storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
@@ -3741,7 +3747,7 @@ fn save_lazy_mp_snapshot_for_tui(
     elapsed: Duration,
 ) -> poker_solver_core::training_runtime::RuntimeResult<()> {
     metrics.mark_snapshot_writing();
-    match save_lazy_mp_snapshot(snapshot_config, storage, iterations, elapsed) {
+    match save_lazy_mp_snapshot(config, snapshot_config, storage, iterations, elapsed) {
         Ok(path) => {
             metrics.mark_snapshot_saved(&path);
             eprintln!("  Lazy MP snapshot saved to {}", path.display());
@@ -3755,6 +3761,7 @@ fn save_lazy_mp_snapshot_for_tui(
 }
 
 fn save_mp_snapshot(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
     tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
@@ -3767,14 +3774,31 @@ fn save_mp_snapshot(
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
-    // Always write legacy files for MP snapshots.  The format flag is
-    // accepted but universal MP writes are not yet wired, so suppressing
-    // legacy output would silently lose all strategy data.
+    let format = snapshot_config.format;
     let strategy =
         mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
-    strategy.save(&snapshot_dir.join("strategy.bin"))?;
-    save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
 
+    if format.write_legacy() {
+        strategy.save(&snapshot_dir.join("strategy.bin"))?;
+        save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
+    }
+
+    write_mp_metadata(&snapshot_dir, snapshot_idx, iterations, elapsed, storage)?;
+
+    if format.write_universal() {
+        write_mp_universal(&snapshot_dir, config, tree, storage, iterations, elapsed)?;
+    }
+
+    Ok(snapshot_dir)
+}
+
+fn write_mp_metadata(
+    snapshot_dir: &Path,
+    snapshot_idx: u32,
+    iterations: u64,
+    elapsed: Duration,
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+) -> std::io::Result<()> {
     let metadata = serde_json::json!({
         "kind": "blueprint_mp",
         "snapshot_index": snapshot_idx,
@@ -3785,11 +3809,34 @@ fn save_mp_snapshot(
     });
     let metadata_json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
-    Ok(snapshot_dir)
+    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)
+}
+
+fn write_mp_universal(
+    snapshot_dir: &Path,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    iterations: u64,
+    elapsed: Duration,
+) -> std::io::Result<()> {
+    let output_dir = snapshot_dir.parent().expect("snapshot dir has parent");
+    let config_yaml_path = output_dir.join("config.yaml");
+    let universal_dir = snapshot_dir.join("universal");
+    poker_solver_core::blueprint_universal::mp_eager_export::write_mp_universal_snapshot(
+        config,
+        tree,
+        storage,
+        iterations,
+        elapsed.as_secs() as f64 / 60.0,
+        &config_yaml_path,
+        &universal_dir,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 fn save_lazy_mp_snapshot(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
     iterations: u64,
@@ -3801,15 +3848,32 @@ fn save_lazy_mp_snapshot(
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
-    // Always write legacy files for lazy MP snapshots.  The format flag
-    // is accepted but universal lazy MP writes are not yet wired, so
-    // suppressing legacy output would silently lose all strategy data.
+    let format = snapshot_config.format;
     let entries = storage.snapshot_entries();
-    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
-    let writer = std::io::BufWriter::new(file);
-    bincode::serialize_into(writer, &entries)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    if format.write_legacy() {
+        let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, &entries)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+
+    write_lazy_mp_metadata(&snapshot_dir, snapshot_idx, iterations, elapsed, storage)?;
+
+    if format.write_universal() {
+        write_lazy_mp_universal(&snapshot_dir, config, &entries, iterations, elapsed)?;
+    }
+
+    Ok(snapshot_dir)
+}
+
+fn write_lazy_mp_metadata(
+    snapshot_dir: &Path,
+    snapshot_idx: u32,
+    iterations: u64,
+    elapsed: Duration,
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+) -> std::io::Result<()> {
     let stats = storage.stats();
     let metadata = serde_json::json!({
         "kind": "blueprint_mp_lazy_sparse",
@@ -3824,8 +3888,49 @@ fn save_lazy_mp_snapshot(
     });
     let metadata_json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
-    Ok(snapshot_dir)
+    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)
+}
+
+fn write_lazy_mp_universal(
+    snapshot_dir: &Path,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    entries: &[poker_solver_core::blueprint_mp::sparse_storage::SparseSnapshotEntry],
+    iterations: u64,
+    elapsed: Duration,
+) -> std::io::Result<()> {
+    let output_dir = snapshot_dir.parent().expect("snapshot dir has parent");
+    let config_yaml_path = output_dir.join("config.yaml");
+    let universal_dir = snapshot_dir.join("universal");
+    let lazy_config = lazy_export_config_from_mp(config);
+    poker_solver_core::blueprint_universal::mp_lazy_export::write_lazy_universal_snapshot(
+        &lazy_config,
+        entries,
+        iterations,
+        elapsed.as_secs() as f64 / 60.0,
+        &config_yaml_path,
+        &universal_dir,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Build a [`LazyExportConfig`] from an in-memory [`BlueprintMpConfig`].
+fn lazy_export_config_from_mp(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+) -> poker_solver_core::blueprint_universal::mp_lazy_export::LazyExportConfig {
+    use poker_solver_core::blueprint_mp::config::ForcedBetKind;
+    let sb = config.game.blinds.iter()
+        .find(|b| b.kind == ForcedBetKind::SmallBlind)
+        .map_or(0.0, |b| b.amount);
+    let bb = config.game.blinds.iter()
+        .find(|b| b.kind == ForcedBetKind::BigBlind)
+        .map_or(0.0, |b| b.amount);
+    poker_solver_core::blueprint_universal::mp_lazy_export::LazyExportConfig {
+        num_players: config.game.num_players,
+        stack_depth: config.game.stack_depth,
+        bucket_counts: config.clustering.bucket_counts(),
+        small_blind: sb,
+        big_blind: bb,
+    }
 }
 
 
@@ -5290,98 +5395,20 @@ snapshots:
 
     #[test]
     fn mp_snapshot_save_creates_strategy_and_metadata() {
-        use poker_solver_core::blueprint_mp::config::{
-            ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
-            MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
-        };
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
         use poker_solver_core::blueprint_mp::trainer::setup_training;
         use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 
-        let tiny_preflop_size = MpStreetSizes {
-            lead: vec![serde_yaml::Value::String("1bb".into())],
-            raise: vec![],
-        };
-        let tiny_postflop_size = MpStreetSizes {
-            lead: vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))],
-            raise: vec![],
-        };
-        let config = BlueprintMpConfig {
-            game: MpGameConfig {
-                name: "snapshot test".into(),
-                num_players: 2,
-                stack_depth: 6.0,
-                allow_preflop_limp: true,
-                blinds: vec![
-                    ForcedBet {
-                        seat: 0,
-                        kind: ForcedBetKind::SmallBlind,
-                        amount: 1.0,
-                    },
-                    ForcedBet {
-                        seat: 1,
-                        kind: ForcedBetKind::BigBlind,
-                        amount: 2.0,
-                    },
-                ],
-                rake_rate: 0.0,
-                rake_cap: 0.0,
-            },
-            action_abstraction: MpActionAbstractionConfig {
-                max_flop_players: None,
-                preflop: tiny_preflop_size,
-                flop: tiny_postflop_size.clone(),
-                turn: tiny_postflop_size.clone(),
-                river: tiny_postflop_size,
-            },
-            clustering: MpClusteringConfig {
-                preflop: MpStreetCluster { buckets: 2 },
-                flop: MpStreetCluster { buckets: 2 },
-                turn: MpStreetCluster { buckets: 2 },
-                river: MpStreetCluster { buckets: 2 },
-            },
-            training: MpTrainingConfig {
-                backend: MpTrainingBackend::Eager,
-                chance_continuation_mode:
-                    poker_solver_core::blueprint_mp::config::MpChanceContinuationMode::SampledFullDeal,
-                cluster_path: None,
-                iterations: Some(1),
-                time_limit_minutes: None,
-                lcfr_warmup_iterations: 0,
-                lcfr_discount_interval: 50,
-                prune_after_iterations: 1_000_000,
-                traversal_pruning_enabled: false,
-                prune_threshold: -250,
-                prune_explore_pct: 0.05,
-                negative_action_subtree_purge_enabled: false,
-                negative_action_prune_below: -1,
-                negative_action_reactivate_at: 0,
-                negative_action_purge_mode: MpNegativeActionPurgeMode::ScanHistoryPrefix,
-                batch_size: 1,
-                dcfr_alpha: 1.5,
-                dcfr_beta: 0.0,
-                dcfr_gamma: 2.0,
-                print_every_minutes: 999,
-                purify_threshold: 0.0,
-                exploitability_interval_minutes: 0,
-                exploitability_samples: 0,
-            },
-            snapshots: MpSnapshotConfig {
-                warmup_minutes: 0,
-                snapshot_every_minutes: 1,
-                output_dir: String::new(),
-                resume: false,
-                max_snapshots: None,
-                format: MpSnapshotFormat::Legacy,
-            },
-        };
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
         let ctx = setup_training(&config);
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
-            ..config.snapshots
+            ..config.snapshots.clone()
         };
 
         let snapshot_dir = super::save_mp_snapshot(
+            &config,
             &snapshot_config,
             &ctx.storage,
             &ctx.tree,
@@ -5416,6 +5443,7 @@ snapshots:
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
 
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
         let storage =
             poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
         let key =
@@ -5424,15 +5452,12 @@ snapshots:
         storage.add_strategy_sum(key, 2, 1, 50);
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
-            warmup_minutes: 0,
-            snapshot_every_minutes: 1,
             output_dir: dir.path().to_string_lossy().into_owned(),
-            resume: false,
-            max_snapshots: None,
-            format: MpSnapshotFormat::Legacy,
+            ..config.snapshots.clone()
         };
 
         let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
             &snapshot_config,
             &storage,
             456,
@@ -5451,27 +5476,25 @@ snapshots:
         assert_eq!(metadata["entries"], 1);
     }
 
-    /// MP eager snapshot must write legacy files even when format is
-    /// `universal`, because universal MP writes are not yet wired.
-    #[test]
-    fn mp_snapshot_universal_format_still_writes_legacy_files() {
+    /// Build a minimal `BlueprintMpConfig` suitable for snapshot tests.
+    /// Uses the given `format` for `snapshots.format`.
+    fn build_test_mp_config(format: poker_solver_core::blueprint_mp::config::MpSnapshotFormat) -> BlueprintMpConfig {
         use poker_solver_core::blueprint_mp::config::{
             ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
-            MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
+            MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
         };
-        use poker_solver_core::blueprint_mp::trainer::setup_training;
 
-        let tiny = MpStreetSizes {
+        let tiny_preflop = MpStreetSizes {
             lead: vec![serde_yaml::Value::String("1bb".into())],
             raise: vec![],
         };
-        let tiny_pf = MpStreetSizes {
+        let tiny_postflop = MpStreetSizes {
             lead: vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))],
             raise: vec![],
         };
-        let config = BlueprintMpConfig {
+        BlueprintMpConfig {
             game: MpGameConfig {
-                name: "fmt test".into(),
+                name: "snapshot fmt test".into(),
                 num_players: 2,
                 stack_depth: 6.0,
                 allow_preflop_limp: true,
@@ -5484,10 +5507,10 @@ snapshots:
             },
             action_abstraction: MpActionAbstractionConfig {
                 max_flop_players: None,
-                preflop: tiny,
-                flop: tiny_pf.clone(),
-                turn: tiny_pf.clone(),
-                river: tiny_pf,
+                preflop: tiny_preflop,
+                flop: tiny_postflop.clone(),
+                turn: tiny_postflop.clone(),
+                river: tiny_postflop,
             },
             clustering: MpClusteringConfig {
                 preflop: MpStreetCluster { buckets: 2 },
@@ -5527,18 +5550,37 @@ snapshots:
                 output_dir: String::new(),
                 resume: false,
                 max_snapshots: None,
-                format: MpSnapshotFormat::Universal,
+                format,
             },
-        };
+        }
+    }
+
+    /// Write a config.yaml into `dir` from a `BlueprintMpConfig` so that
+    /// the universal writer can find and retain it.
+    fn write_test_config_yaml(dir: &std::path::Path, config: &BlueprintMpConfig) {
+        let yaml = serde_yaml::to_string(config).expect("config should serialize");
+        std::fs::write(dir.join("config.yaml"), yaml).expect("write config.yaml");
+    }
+
+    /// MP eager: format=Universal writes a loadable universal bundle and
+    /// no legacy strategy.bin/regrets.bin.
+    #[test]
+    fn mp_snapshot_format_universal_writes_universal_bundle() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Universal);
         let ctx = setup_training(&config);
         let dir = tempfile::tempdir().unwrap();
+        write_test_config_yaml(dir.path(), &config);
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
-            format: MpSnapshotFormat::Universal,
-            ..config.snapshots
+            ..config.snapshots.clone()
         };
 
         let snapshot_dir = super::save_mp_snapshot(
+            &config,
             &snapshot_config,
             &ctx.storage,
             &ctx.tree,
@@ -5547,23 +5589,192 @@ snapshots:
         )
         .expect("snapshot save should succeed");
 
+        // Universal bundle must be present and loadable
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(universal_dir.exists(), "universal/ dir must exist");
+        let bundle = loader::load_bundle(&universal_dir)
+            .expect("universal bundle should load");
+        assert!(bundle.manifest().is_some(), "manifest must be present");
+
+        // Legacy files must NOT be present under universal-only
         assert!(
-            snapshot_dir.join("strategy.bin").exists(),
-            "legacy strategy.bin must be written even with format=universal \
-             until universal MP writes are wired"
+            !snapshot_dir.join("strategy.bin").exists(),
+            "strategy.bin must NOT be written under format=universal"
         );
-        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(
+            !snapshot_dir.join("regrets.bin").exists(),
+            "regrets.bin must NOT be written under format=universal"
+        );
+
+        // metadata.json always written
         assert!(snapshot_dir.join("metadata.json").exists());
     }
 
-    /// MP lazy snapshot must write legacy files even when format is
-    /// `universal`, because universal lazy MP writes are not yet wired.
+    /// MP eager: format=Both writes both legacy files and a universal bundle.
     #[test]
-    fn lazy_mp_snapshot_universal_format_still_writes_legacy_files() {
+    fn mp_snapshot_format_both_writes_legacy_and_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Both);
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        write_test_config_yaml(dir.path(), &config);
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            42,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("snapshot save should succeed");
+
+        assert!(snapshot_dir.join("strategy.bin").exists());
+        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(universal_dir.exists(), "universal/ dir must exist under Both");
+        let bundle = loader::load_bundle(&universal_dir)
+            .expect("universal bundle should load");
+        assert!(bundle.manifest().is_some());
+    }
+
+    /// MP eager: format=Legacy writes only legacy files and no universal/ dir.
+    #[test]
+    fn mp_snapshot_format_legacy_writes_no_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            42,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("snapshot save should succeed");
+
+        assert!(snapshot_dir.join("strategy.bin").exists());
+        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert!(
+            !snapshot_dir.join("universal").exists(),
+            "universal/ dir must NOT exist under format=legacy"
+        );
+    }
+
+    /// MP lazy: format=Universal writes a loadable universal bundle and
+    /// no legacy sparse_entries.bin.
+    #[test]
+    fn lazy_mp_snapshot_format_universal_writes_universal_bundle() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Universal);
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        write_test_config_yaml(dir.path(), &config);
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &storage,
+            100,
+            std::time::Duration::from_secs(3),
+        )
+        .expect("lazy snapshot save should succeed");
+
+        // Universal bundle must be present and loadable
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(universal_dir.exists(), "universal/ dir must exist");
+        let bundle = loader::load_bundle(&universal_dir)
+            .expect("universal bundle should load");
+        assert!(bundle.manifest().is_some());
+
+        // Legacy file must NOT be present under universal-only
+        assert!(
+            !snapshot_dir.join("sparse_entries.bin").exists(),
+            "sparse_entries.bin must NOT be written under format=universal"
+        );
+
+        assert!(snapshot_dir.join("metadata.json").exists());
+    }
+
+    /// MP lazy: format=Both writes both legacy and universal.
+    #[test]
+    fn lazy_mp_snapshot_format_both_writes_legacy_and_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Both);
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        write_test_config_yaml(dir.path(), &config);
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &storage,
+            100,
+            std::time::Duration::from_secs(3),
+        )
+        .expect("lazy snapshot save should succeed");
+
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(universal_dir.exists(), "universal/ dir must exist under Both");
+        let bundle = loader::load_bundle(&universal_dir)
+            .expect("universal bundle should load");
+        assert!(bundle.manifest().is_some());
+    }
+
+    /// MP lazy: format=Legacy writes only legacy and no universal/ dir.
+    #[test]
+    fn lazy_mp_snapshot_format_legacy_writes_no_universal() {
         use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
 
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
         let storage =
             poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
         let key =
@@ -5572,15 +5783,12 @@ snapshots:
         storage.add_strategy_sum(key, 2, 1, 50);
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
-            warmup_minutes: 0,
-            snapshot_every_minutes: 1,
             output_dir: dir.path().to_string_lossy().into_owned(),
-            resume: false,
-            max_snapshots: None,
-            format: MpSnapshotFormat::Universal,
+            ..config.snapshots.clone()
         };
 
         let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
             &snapshot_config,
             &storage,
             100,
@@ -5588,12 +5796,12 @@ snapshots:
         )
         .expect("lazy snapshot save should succeed");
 
-        assert!(
-            snapshot_dir.join("sparse_entries.bin").exists(),
-            "legacy sparse_entries.bin must be written even with format=universal \
-             until universal lazy MP writes are wired"
-        );
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        assert!(
+            !snapshot_dir.join("universal").exists(),
+            "universal/ dir must NOT exist under format=legacy"
+        );
     }
 
     #[test]
@@ -5602,6 +5810,7 @@ snapshots:
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
 
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
         let storage =
             poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
         let key =
@@ -5616,15 +5825,12 @@ snapshots:
         );
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
-            warmup_minutes: 0,
-            snapshot_every_minutes: 1,
             output_dir: dir.path().to_string_lossy().into_owned(),
-            resume: false,
-            max_snapshots: None,
-            format: MpSnapshotFormat::Legacy,
+            ..config.snapshots.clone()
         };
 
         super::save_lazy_mp_snapshot_for_tui(
+            &config,
             &snapshot_config,
             &metrics,
             &storage,
@@ -5652,8 +5858,7 @@ snapshots:
     #[test]
     fn lazy_mp_tui_bridge_saves_queued_snapshot_before_finished_exit() {
         use poker_solver_core::blueprint_mp::config::{
-            ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpGameConfig, MpSnapshotConfig,
-            MpSnapshotFormat, MpStreetSizes,
+            MpSnapshotConfig, MpSnapshotFormat,
         };
         use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
         use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
@@ -5661,6 +5866,7 @@ snapshots:
         use poker_solver_core::training_runtime::RuntimeControls;
         use std::sync::atomic::AtomicU64;
 
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
         let source = std::sync::Arc::new(AtomicU64::new(321));
         let storage = std::sync::Arc::new(SparseMpStorage::with_shards(4));
         let key =
@@ -5668,38 +5874,9 @@ snapshots:
         storage.add_regret(key, 2, 0, 25);
         storage.add_strategy_sum(key, 2, 1, 50);
 
-        let game_config = MpGameConfig {
-            name: "bridge snapshot".into(),
-            num_players: 2,
-            stack_depth: 20.0,
-            allow_preflop_limp: true,
-            blinds: vec![
-                ForcedBet {
-                    seat: 0,
-                    kind: ForcedBetKind::SmallBlind,
-                    amount: 1.0,
-                },
-                ForcedBet {
-                    seat: 1,
-                    kind: ForcedBetKind::BigBlind,
-                    amount: 2.0,
-                },
-            ],
-            rake_rate: 0.0,
-            rake_cap: 0.0,
-        };
-        let empty_sizes = MpStreetSizes {
-            lead: vec![],
-            raise: vec![],
-        };
-        let action_config = MpActionAbstractionConfig {
-            max_flop_players: None,
-            preflop: empty_sizes.clone(),
-            flop: empty_sizes.clone(),
-            turn: empty_sizes.clone(),
-            river: empty_sizes,
-        };
-        let game = std::sync::Arc::new(LazyMpGame::new(&game_config, &action_config));
+        let game = std::sync::Arc::new(
+            LazyMpGame::new(&config.game, &config.action_abstraction),
+        );
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             Some(10),
             None,
@@ -5712,12 +5889,8 @@ snapshots:
         }
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
-            warmup_minutes: 0,
-            snapshot_every_minutes: 1,
             output_dir: dir.path().to_string_lossy().into_owned(),
-            resume: false,
-            max_snapshots: None,
-            format: MpSnapshotFormat::Legacy,
+            ..config.snapshots.clone()
         };
 
         super::bridge_mp_lazy_iterations(
@@ -5731,6 +5904,7 @@ snapshots:
             &metrics,
             &controls,
             &handle,
+            &config,
             &snapshot_config,
             std::time::Instant::now(),
         );
