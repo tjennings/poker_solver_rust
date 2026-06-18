@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-g54j
 title: 'Phase 5: unified bundle detection and loader'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-09T18:40:56Z
-updated_at: 2026-06-10T19:06:22Z
+updated_at: 2026-06-18T13:22:02Z
 parent: poker_solver_rust-a29s
 ---
 
