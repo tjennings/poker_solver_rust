@@ -122,6 +122,18 @@ fn cfvnet_model_kind_name(mode: BoundaryInferenceMode) -> &'static str {
 
 #[derive(Parser)]
 enum Commands {
+    /// Auto-detect config format and train (dispatches to train-blueprint or train-blueprint-mp)
+    Train {
+        /// YAML config file (BlueprintV2Config or BlueprintMpConfig)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Disable the TUI dashboard
+        #[arg(long)]
+        no_tui: bool,
+        /// Override the output directory in the config
+        #[arg(long)]
+        output_dir: Option<String>,
+    },
     /// Train a full-game blueprint strategy using MCCFR (Blueprint V2)
     TrainBlueprint {
         /// YAML config file (BlueprintV2Config)
@@ -625,6 +637,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Train {
+            config,
+            no_tui,
+            output_dir,
+        } => {
+            dispatch_train(&config, no_tui, output_dir.as_deref())?;
+        }
         Commands::TrainBlueprint { config, no_tui } => {
             let yaml = std::fs::read_to_string(&config)?;
             let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
@@ -3748,9 +3767,18 @@ fn save_mp_snapshot(
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
-    let strategy = mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
-    strategy.save(&snapshot_dir.join("strategy.bin"))?;
-    save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
+    let write_legacy = matches!(
+        snapshot_config.format,
+        poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Legacy
+            | poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Both
+    );
+
+    if write_legacy {
+        let strategy =
+            mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
+        strategy.save(&snapshot_dir.join("strategy.bin"))?;
+        save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
+    }
 
     let metadata = serde_json::json!({
         "kind": "blueprint_mp",
@@ -3778,10 +3806,19 @@ fn save_lazy_mp_snapshot(
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
-    let entries = storage.snapshot_entries();
-    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
-    let writer = std::io::BufWriter::new(file);
-    bincode::serialize_into(writer, &entries).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let write_legacy = matches!(
+        snapshot_config.format,
+        poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Legacy
+            | poker_solver_core::blueprint_mp::config::MpSnapshotFormat::Both
+    );
+
+    if write_legacy {
+        let entries = storage.snapshot_entries();
+        let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, &entries)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
 
     let stats = storage.stats();
     let metadata = serde_json::json!({
@@ -3800,6 +3837,7 @@ fn save_lazy_mp_snapshot(
     std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
     Ok(snapshot_dir)
 }
+
 
 fn next_snapshot_index(output_dir: &Path) -> std::io::Result<u32> {
     let mut next = 0_u32;
@@ -4551,6 +4589,119 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
 // ---------------------------------------------------------------------------
 // export-universal subcommand
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// train dispatcher
+// ---------------------------------------------------------------------------
+
+/// Detected training config format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedConfigKind {
+    /// HU `BlueprintV2Config` (has `game.players`).
+    HuV2,
+    /// N-player `BlueprintMpConfig` (has `game.num_players`).
+    Mp,
+}
+
+/// Detect whether a YAML string is a `BlueprintV2Config` or `BlueprintMpConfig`.
+///
+/// Detection strategy: parse the YAML as a generic value and check for
+/// distinguishing top-level fields.
+/// - `game.num_players` present -> MP config.
+/// - `game.players` present -> HU V2 config.
+/// - Neither -> error.
+fn detect_config_kind(yaml: &str) -> Result<DetectedConfigKind, Box<dyn Error>> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+
+    let game = value
+        .get("game")
+        .ok_or("config missing top-level 'game' section")?;
+
+    if game.get("num_players").is_some() {
+        return Ok(DetectedConfigKind::Mp);
+    }
+    if game.get("players").is_some() {
+        return Ok(DetectedConfigKind::HuV2);
+    }
+
+    Err("cannot detect config type: 'game' section has neither \
+         'players' (HU V2) nor 'num_players' (MP)"
+        .into())
+}
+
+/// Auto-detect config format and dispatch to the appropriate trainer.
+///
+/// When `output_dir_override` is set, the YAML is patched in memory,
+/// written to `<output_dir>/config.yaml`, and the trainer reads the
+/// patched copy.
+fn dispatch_train(
+    config_path: &Path,
+    no_tui: bool,
+    output_dir_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(config_path)?;
+    let kind = detect_config_kind(&yaml)?;
+
+    // If output_dir is overridden, patch the YAML and write a temp copy
+    // into the output directory so the trainer reads the right path.
+    let effective_path: PathBuf = if let Some(dir) = output_dir_override {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+        if let Some(snap) = value.get_mut("snapshots") {
+            snap["output_dir"] = serde_yaml::Value::String(dir.to_string());
+        }
+        let out_dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&out_dir)?;
+        let patched_path = out_dir.join("config.yaml");
+        let rewritten = serde_yaml::to_string(&value)?;
+        std::fs::write(&patched_path, &rewritten)?;
+        patched_path
+    } else {
+        config_path.to_path_buf()
+    };
+
+    let path_str = effective_path
+        .to_str()
+        .ok_or("config path is not valid UTF-8")?;
+
+    match kind {
+        DetectedConfigKind::HuV2 => {
+            eprintln!("Detected HU V2 config, dispatching to train-blueprint");
+            let yaml = std::fs::read_to_string(&effective_path)?;
+            let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
+            let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
+
+            let mut trainer = BlueprintTrainer::new(bp_config);
+            trainer.try_resume()?;
+            let use_tui = tui_config.enabled && !no_tui;
+
+            if use_tui {
+                let metrics = Arc::new(
+                    blueprint_tui_metrics::BlueprintTuiMetrics::new(
+                        trainer.config.training.iterations,
+                        trainer.config.training.time_limit_minutes,
+                    ),
+                );
+                trainer.paused = Arc::clone(&metrics.paused);
+                trainer.quit_requested = Arc::clone(&metrics.quit_requested);
+                trainer.shared_iterations = Arc::clone(&metrics.iterations);
+                trainer.tui_active = true;
+                metrics
+                    .iterations
+                    .store(trainer.iterations, Ordering::Relaxed);
+                trainer.train();
+            } else {
+                trainer.train();
+            }
+        }
+        DetectedConfigKind::Mp => {
+            eprintln!("Detected MP config, dispatching to train-blueprint-mp");
+            run_train_blueprint_mp(path_str, no_tui)?;
+        }
+    }
+
+    Ok(())
+}
 
 fn run_export_universal(
     bundle: &Path,
