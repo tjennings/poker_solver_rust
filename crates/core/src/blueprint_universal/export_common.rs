@@ -215,7 +215,7 @@ fn is_leap(year: u64) -> bool {
 /// record the relative path in `manifest.training.config_path`.
 ///
 /// Creates `out_dir` (including parents) if it does not already exist.
-pub(crate) fn retain_config_yaml(
+pub fn retain_config_yaml(
     source: &Path,
     out_dir: &Path,
     manifest: &mut Manifest,

@@ -6544,4 +6544,115 @@ model:
             result.unwrap()
         );
     }
+
+    // -----------------------------------------------------------------
+    // Train dispatcher detection tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_config_kind_hu_v2() {
+        let yaml = r#"
+game:
+  name: test
+  players: 2
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/test"
+"#;
+        let kind = super::detect_config_kind(yaml).expect("should detect");
+        assert_eq!(kind, super::DetectedConfigKind::HuV2);
+    }
+
+    #[test]
+    fn detect_config_kind_mp() {
+        let yaml = r#"
+game:
+  name: test
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/test"
+"#;
+        let kind = super::detect_config_kind(yaml).expect("should detect");
+        assert_eq!(kind, super::DetectedConfigKind::Mp);
+    }
+
+    #[test]
+    fn detect_config_kind_neither_errors() {
+        let yaml = r#"
+game:
+  name: test
+  stack_depth: 200
+snapshots:
+  output_dir: "/tmp/test"
+"#;
+        let result = super::detect_config_kind(yaml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("neither"),
+            "error should mention missing fields: {msg}"
+        );
+    }
 }
