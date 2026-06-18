@@ -41,6 +41,17 @@ pub enum BundleKind {
     UniversalMpLazy,
 }
 
+impl std::fmt::Display for BundleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyHu => write!(f, "legacy_hu"),
+            Self::UniversalHu => write!(f, "universal_hu"),
+            Self::UniversalMpEager => write!(f, "universal_mp_eager"),
+            Self::UniversalMpLazy => write!(f, "universal_mp_lazy"),
+        }
+    }
+}
+
 /// Errors from bundle detection and loading.
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
@@ -198,6 +209,30 @@ impl LoadedBundle {
             | Self::UniversalMpEager { data, .. }
             | Self::UniversalMpLazy { data, .. } => {
                 data.manifest.game.num_players
+            }
+        }
+    }
+
+    /// The manifest for universal bundles, `None` for legacy.
+    #[must_use]
+    pub fn manifest(&self) -> Option<&Manifest> {
+        match self {
+            Self::LegacyHu(..) => None,
+            Self::UniversalHu { data, .. }
+            | Self::UniversalMpEager { data, .. }
+            | Self::UniversalMpLazy { data, .. } => Some(&data.manifest),
+        }
+    }
+
+    /// Training iterations completed.
+    #[must_use]
+    pub fn iterations(&self) -> u64 {
+        match self {
+            Self::LegacyHu(d) => d.strategy.iterations,
+            Self::UniversalHu { data, .. }
+            | Self::UniversalMpEager { data, .. }
+            | Self::UniversalMpLazy { data, .. } => {
+                data.manifest.training.units_completed
             }
         }
     }

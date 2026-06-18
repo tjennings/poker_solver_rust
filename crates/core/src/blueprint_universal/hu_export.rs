@@ -624,8 +624,15 @@ pub fn export_hu_bundle(
         elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0.0),
     };
 
-    let output = export_hu_strategy_to_universal(
+    let mut output = export_hu_strategy_to_universal(
         &config, &tree, &strategy, &training,
+    )?;
+
+    // Retain config.yaml so the bundle is self-contained for the Explorer.
+    retain_config_yaml(
+        &bundle_dir.join("config.yaml"),
+        out_dir,
+        &mut output.manifest,
     )?;
 
     write_bundle(
@@ -638,6 +645,19 @@ pub fn export_hu_bundle(
         },
     )?;
 
+    Ok(())
+}
+
+/// Copy source config.yaml into the output bundle and set manifest's
+/// `config_path` so the Explorer can rebuild the game tree.
+fn retain_config_yaml(
+    source: &Path,
+    out_dir: &Path,
+    manifest: &mut Manifest,
+) -> Result<(), ExportError> {
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::copy(source, out_dir.join("config.yaml"))?;
+    manifest.training.config_path = Some("config.yaml".to_string());
     Ok(())
 }
 
