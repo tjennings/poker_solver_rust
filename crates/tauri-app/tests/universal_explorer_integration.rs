@@ -427,6 +427,7 @@ fn build_3p_config() -> BlueprintMpConfig {
         output_dir: "/tmp/mp_explorer_test".into(),
         resume: false,
         max_snapshots: None,
+        format: MpSnapshotFormat::Legacy,
     };
     BlueprintMpConfig {
         game,

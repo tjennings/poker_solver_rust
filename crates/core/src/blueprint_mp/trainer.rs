@@ -903,7 +903,8 @@ mod tests {
     use crate::blueprint_mp::config::{
         BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig,
         MpChanceContinuationMode, MpClusteringConfig, MpGameConfig, MpNegativeActionPurgeMode,
-        MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingBackend, MpTrainingConfig,
+        MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingBackend,
+        MpTrainingConfig,
     };
     use crate::blueprint_mp::game_tree::MpGameTree;
     use crate::blueprint_mp::mccfr::sample_deal;
@@ -986,6 +987,7 @@ mod tests {
             output_dir: "/tmp/mp_test".into(),
             resume: false,
             max_snapshots: None,
+            format: MpSnapshotFormat::Legacy,
         };
         BlueprintMpConfig {
             game,

@@ -251,6 +251,22 @@ pub enum MpNegativeActionPurgeMode {
 
 // ── Snapshot config ──────────────────────────────────────────────────
 
+/// Snapshot output format selector for multiplayer training.
+///
+/// Controls whether the trainer writes legacy files,
+/// universal dense bundles, or both at each snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MpSnapshotFormat {
+    /// Write only legacy files (default).
+    #[default]
+    Legacy,
+    /// Write only a universal dense bundle.
+    Universal,
+    /// Write both legacy files and a universal bundle.
+    Both,
+}
+
 /// Checkpoint output settings for multiplayer training.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MpSnapshotConfig {
@@ -261,6 +277,9 @@ pub struct MpSnapshotConfig {
     pub resume: bool,
     #[serde(default)]
     pub max_snapshots: Option<u32>,
+    /// Output format for snapshots: `legacy` (default), `universal`, or `both`.
+    #[serde(default)]
+    pub format: MpSnapshotFormat,
 }
 
 // ── Default value functions ──────────────────────────────────────────
@@ -994,5 +1013,108 @@ snapshots:
             serde_yaml::from_str(yaml).expect("failed to parse no-rake config");
         assert!((cfg.game.rake_rate).abs() < f64::EPSILON);
         assert!((cfg.game.rake_cap).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn mp_snapshot_format_defaults_to_legacy() {
+        let yaml = r#"
+game:
+  name: "Format Default"
+  num_players: 6
+  stack_depth: 200.0
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 10
+  snapshot_every_minutes: 5
+  output_dir: "/tmp/default_format"
+"#;
+        let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, MpSnapshotFormat::Legacy);
+    }
+
+    #[timed_test]
+    fn mp_snapshot_format_parses_both() {
+        let yaml = r#"
+game:
+  name: "Format Both"
+  num_players: 6
+  stack_depth: 200.0
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 10
+  snapshot_every_minutes: 5
+  output_dir: "/tmp/both_format"
+  format: both
+"#;
+        let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, MpSnapshotFormat::Both);
     }
 }

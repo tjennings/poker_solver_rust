@@ -5163,7 +5163,7 @@ snapshots:
     fn mp_snapshot_save_creates_strategy_and_metadata() {
         use poker_solver_core::blueprint_mp::config::{
             ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
-            MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
+            MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
         };
         use poker_solver_core::blueprint_mp::trainer::setup_training;
         use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
@@ -5242,6 +5242,7 @@ snapshots:
                 output_dir: String::new(),
                 resume: false,
                 max_snapshots: None,
+                format: MpSnapshotFormat::Legacy,
             },
         };
         let ctx = setup_training(&config);
@@ -5282,7 +5283,7 @@ snapshots:
 
     #[test]
     fn lazy_mp_snapshot_save_creates_sparse_entries_and_metadata() {
-        use poker_solver_core::blueprint_mp::config::MpSnapshotConfig;
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
 
@@ -5299,6 +5300,7 @@ snapshots:
             output_dir: dir.path().to_string_lossy().into_owned(),
             resume: false,
             max_snapshots: None,
+            format: MpSnapshotFormat::Legacy,
         };
 
         let snapshot_dir = super::save_lazy_mp_snapshot(
@@ -5322,7 +5324,7 @@ snapshots:
 
     #[test]
     fn lazy_mp_tui_snapshot_helper_preserves_sparse_format_and_status() {
-        use poker_solver_core::blueprint_mp::config::MpSnapshotConfig;
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
 
@@ -5345,6 +5347,7 @@ snapshots:
             output_dir: dir.path().to_string_lossy().into_owned(),
             resume: false,
             max_snapshots: None,
+            format: MpSnapshotFormat::Legacy,
         };
 
         super::save_lazy_mp_snapshot_for_tui(
@@ -5376,7 +5379,7 @@ snapshots:
     fn lazy_mp_tui_bridge_saves_queued_snapshot_before_finished_exit() {
         use poker_solver_core::blueprint_mp::config::{
             ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpGameConfig, MpSnapshotConfig,
-            MpStreetSizes,
+            MpSnapshotFormat, MpStreetSizes,
         };
         use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
         use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
@@ -5440,6 +5443,7 @@ snapshots:
             output_dir: dir.path().to_string_lossy().into_owned(),
             resume: false,
             max_snapshots: None,
+            format: MpSnapshotFormat::Legacy,
         };
 
         super::bridge_mp_lazy_iterations(

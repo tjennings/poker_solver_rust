@@ -123,6 +123,7 @@ fn tiny_export_config() -> BlueprintV2Config {
             output_dir: "runs/".into(),
             resume: false,
             max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     }
 }
@@ -561,6 +562,7 @@ fn build_3p_config() -> BlueprintMpConfig {
         output_dir: "/tmp/mp_loader_test".into(),
         resume: false,
         max_snapshots: None,
+        format: MpSnapshotFormat::Legacy,
     };
     BlueprintMpConfig { game, action_abstraction: action, clustering, training, snapshots }
 }

@@ -216,7 +216,8 @@ mod tests {
     use crate::blueprint_mp::config::{
         BlueprintMpConfig, ForcedBet, ForcedBetKind, MpActionAbstractionConfig,
         MpChanceContinuationMode, MpClusteringConfig, MpGameConfig, MpNegativeActionPurgeMode,
-        MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingBackend, MpTrainingConfig,
+        MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingBackend,
+        MpTrainingConfig,
     };
     use crate::training_runtime::{
         BatchBudget, RuntimeLimits, RuntimeStopReason, TrainingRuntimeBackend, TrainingUnit,
@@ -295,6 +296,7 @@ mod tests {
             output_dir: "/tmp/mp_runtime_adapter_test".to_string(),
             resume: false,
             max_snapshots: None,
+            format: MpSnapshotFormat::Legacy,
         };
         BlueprintMpConfig {
             game,

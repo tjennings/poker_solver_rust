@@ -512,6 +512,7 @@ mod tests {
                 output_dir: "runs/".into(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         };
 

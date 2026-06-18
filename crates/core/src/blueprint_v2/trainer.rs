@@ -2104,6 +2104,7 @@ mod tests {
                 output_dir: "/tmp/test_blueprint_v2_snapshots".into(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         }
     }
