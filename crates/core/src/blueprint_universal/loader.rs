@@ -423,7 +423,8 @@ fn resolve_bundle_dir(
         return Ok((d, SentinelKind::BlueprintJson));
     }
     if dir.join("config.yaml").exists() {
-        let strat_dir = find_strategy_bin(dir);
+        let strat_dir = find_sentinel(dir, "strategy.bin")
+            .unwrap_or_else(|| dir.to_path_buf());
         return Ok((strat_dir, SentinelKind::ConfigYaml));
     }
     Err(LoaderError::NotABundle {
@@ -442,19 +443,6 @@ fn find_sentinel(dir: &Path, sentinel: &str) -> Option<PathBuf> {
         return Some(dir.to_path_buf());
     }
     find_latest_snapshot_with(dir, sentinel)
-}
-
-/// Find the directory containing `strategy.bin` for legacy bundles.
-/// Order: `final/` -> root -> latest `snapshot_NNNN/`.
-fn find_strategy_bin(dir: &Path) -> PathBuf {
-    if dir.join("final/strategy.bin").exists() {
-        return dir.join("final");
-    }
-    if dir.join("strategy.bin").exists() {
-        return dir.to_path_buf();
-    }
-    find_latest_snapshot_with(dir, "strategy.bin")
-        .unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// Find the latest `snapshot_NNNN/` subdirectory containing a file.
@@ -478,12 +466,24 @@ fn find_latest_snapshot_with(
 
 // ── Classification ──────────────────────────────────────────────────
 
-/// Expected namespace for each `source_backend`.
-fn expected_namespace(backend: &str) -> Option<&'static str> {
+/// Map `source_backend` to its expected `(namespace, BundleKind)`.
+///
+/// Returns `None` for unrecognized backends. This is the single source
+/// of truth for the backend -> namespace/kind mapping, used by
+/// `classify_universal_manifest`.
+fn backend_metadata(
+    backend: &str,
+) -> Option<(&'static str, BundleKind)> {
     match backend {
-        "hu_dense" | "hu_sparse_projected" => Some("hu_arena"),
-        "mp_eager_dense" => Some("mp_arena"),
-        "mp_lazy_sparse_projected" => Some("mp_semantic"),
+        "hu_dense" | "hu_sparse_projected" => {
+            Some(("hu_arena", BundleKind::UniversalHu))
+        }
+        "mp_eager_dense" => {
+            Some(("mp_arena", BundleKind::UniversalMpEager))
+        }
+        "mp_lazy_sparse_projected" => {
+            Some(("mp_semantic", BundleKind::UniversalMpLazy))
+        }
         _ => None,
     }
 }
@@ -499,14 +499,16 @@ fn classify_universal_manifest(
     let backend = &manifest.training.source_backend;
     let path_str = dir.display().to_string();
 
-    let expected_ns = expected_namespace(backend).ok_or_else(|| {
-        LoaderError::UnknownSourceBackend {
-            backend: backend.clone(),
-            path: path_str.clone(),
-        }
-    })?;
+    let (expected_ns, kind) =
+        backend_metadata(backend).ok_or_else(|| {
+            LoaderError::UnknownSourceBackend {
+                backend: backend.clone(),
+                path: path_str.clone(),
+            }
+        })?;
 
-    if !manifest.layout.row_namespace.contains(&expected_ns.to_string()) {
+    if !manifest.layout.row_namespace.contains(&expected_ns.to_string())
+    {
         return Err(LoaderError::NamespaceMismatch {
             path: path_str,
             backend: backend.clone(),
@@ -515,7 +517,7 @@ fn classify_universal_manifest(
         });
     }
 
-    if backend == "mp_lazy_sparse_projected" {
+    if kind == BundleKind::UniversalMpLazy {
         let has_semantic = manifest
             .required_features
             .iter()
@@ -531,12 +533,6 @@ fn classify_universal_manifest(
 
     check_payload_files_exist(dir, &manifest, &path_str)?;
 
-    let kind = match backend.as_str() {
-        "hu_dense" | "hu_sparse_projected" => BundleKind::UniversalHu,
-        "mp_eager_dense" => BundleKind::UniversalMpEager,
-        "mp_lazy_sparse_projected" => BundleKind::UniversalMpLazy,
-        _ => unreachable!(),
-    };
     Ok((kind, manifest))
 }
 

@@ -787,6 +787,60 @@ fn load_mp_lazy_zero_mass_uniform() {
     }
 }
 
+// ── Detection precedence regression test ────────────────────────────
+
+#[test]
+fn universal_bundle_with_config_yaml_detected_as_universal() {
+    // A universal HU bundle that also contains a retained config.yaml
+    // (the spec permits an optional retained config in universal bundles)
+    // must be detected as UniversalHu, NOT LegacyHu.
+    // This guards the "blueprint.json wins over config.yaml" precedence.
+    let tmp = TempDir::new().unwrap();
+    write_universal_hu_bundle(tmp.path());
+
+    // Now also write a config.yaml into the same bundle directory.
+    let config = tiny_export_config();
+    poker_solver_core::blueprint_v2::bundle::save_config(tmp.path(), &config).unwrap();
+
+    // Detection must still return UniversalHu.
+    let kind = detect_bundle_kind(tmp.path()).unwrap();
+    assert_eq!(
+        kind,
+        BundleKind::UniversalHu,
+        "blueprint.json must take precedence over config.yaml"
+    );
+
+    // Loading must also produce a universal bundle, not legacy.
+    let bundle = load_bundle(tmp.path()).unwrap();
+    assert_eq!(
+        bundle.kind(),
+        BundleKind::UniversalHu,
+        "load_bundle must load as universal when blueprint.json is present"
+    );
+    assert_eq!(bundle.source_backend(), "hu_dense");
+}
+
+#[test]
+fn universal_in_final_with_config_yaml_at_root_detected_as_universal() {
+    // Universal bundle lives in final/, config.yaml at root.
+    // blueprint.json in final/ must still win over config.yaml at root.
+    let tmp = TempDir::new().unwrap();
+    let final_dir = tmp.path().join("final");
+    std::fs::create_dir_all(&final_dir).unwrap();
+    write_universal_hu_bundle(&final_dir);
+
+    // Write config.yaml at the root (not in final/).
+    let config = tiny_export_config();
+    poker_solver_core::blueprint_v2::bundle::save_config(tmp.path(), &config).unwrap();
+
+    let kind = detect_bundle_kind(tmp.path()).unwrap();
+    assert_eq!(
+        kind,
+        BundleKind::UniversalHu,
+        "blueprint.json in final/ must take precedence over config.yaml at root"
+    );
+}
+
 #[test]
 fn mp_lazy_key_not_found_returns_none() {
     let tmp = TempDir::new().unwrap();
