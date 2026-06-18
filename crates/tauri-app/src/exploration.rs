@@ -115,9 +115,6 @@ enum StrategySource {
     /// row-level queries only; full MP tree navigation is deferred.
     UniversalMp {
         bundle: Box<LoadedBundle>,
-        /// Retained for future MP tree navigation.
-        #[allow(dead_code)]
-        bundle_dir: PathBuf,
     },
 }
 
@@ -605,7 +602,7 @@ async fn load_universal_bundle_core(
             load_universal_hu(state, loaded, bundle_path)
         }
         BundleKind::UniversalMpEager | BundleKind::UniversalMpLazy => {
-            load_universal_mp(state, loaded, bundle_path)
+            load_universal_mp(state, loaded)
         }
         BundleKind::LegacyHu => {
             Err("Unexpected LegacyHu from universal loader".into())
@@ -702,11 +699,9 @@ fn build_hu_tree(config: &BlueprintV2Config) -> V2GameTree {
     )
 }
 
-/// Reconstruct a [`BlueprintV2Strategy`] by mapping universal rows
-/// back into the flat action_probs layout.
-#[allow(clippy::cast_possible_truncation)]
 /// Collect (arena_idx, decision_idx, n_buckets, n_actions) tuples for
 /// each decision node reachable via the decision_map.
+#[allow(clippy::cast_possible_truncation)]
 fn collect_decision_slots(
     tree: &V2GameTree,
     decision_map: &[u32],
@@ -733,6 +728,8 @@ fn collect_decision_slots(
         .collect()
 }
 
+/// Reconstruct a [`BlueprintV2Strategy`] by mapping universal rows
+/// back into the flat action_probs layout.
 fn reconstruct_hu_strategy(
     config: &BlueprintV2Config,
     tree: &V2GameTree,
@@ -812,7 +809,6 @@ fn mp_bundle_info(
 fn load_universal_mp(
     state: &ExplorationState,
     loaded: LoadedBundle,
-    bundle_path: &Path,
 ) -> Result<BundleInfo, String> {
     let manifest = loaded.manifest().ok_or(
         "MP bundle missing manifest"
@@ -821,7 +817,6 @@ fn load_universal_mp(
 
     *state.source.write() = Some(StrategySource::UniversalMp {
         bundle: Box::new(loaded),
-        bundle_dir: bundle_path.to_path_buf(),
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
