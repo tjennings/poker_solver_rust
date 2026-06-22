@@ -104,6 +104,7 @@ fn build_3p_config() -> BlueprintMpConfig {
         output_dir: "/tmp/mp_export_test".into(),
         resume: false,
         max_snapshots: None,
+        format: MpSnapshotFormat::Legacy,
     };
     BlueprintMpConfig {
         game,
@@ -408,6 +409,7 @@ fn mp_export_action_descriptors_correct() {
             output_dir: "/tmp/action_test".into(),
             resume: false,
             max_snapshots: None,
+            format: MpSnapshotFormat::Legacy,
         },
     };
 

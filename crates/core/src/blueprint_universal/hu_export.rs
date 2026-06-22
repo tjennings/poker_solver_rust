@@ -554,12 +554,10 @@ fn validate_snapshot_name(name: &str) -> Result<(), ExportError> {
 /// deserialization failures, or write errors.
 /// Require a file to exist, returning `MissingFile` otherwise.
 fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
-    if path.exists() {
-        Ok(())
+    if let Some(detail) = super::export_common::check_file_exists(path, label) {
+        Err(ExportError::MissingFile { detail })
     } else {
-        Err(ExportError::MissingFile {
-            detail: format!("{label} not found at {}", path.display()),
-        })
+        Ok(())
     }
 }
 
@@ -586,6 +584,58 @@ fn tree_from_config(config: &BlueprintV2Config) -> GameTree {
         &config.action_abstraction.river,
         config.game.allow_preflop_limp,
     )
+}
+
+/// Write a universal dense bundle from in-memory HU training state.
+///
+/// Called at snapshot time when `format` is `universal` or `both`.
+/// The bundle is written to `out_dir`, which should be a `universal/`
+/// subdirectory inside the snapshot directory.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] on export or I/O failure.
+pub fn write_hu_universal_snapshot(
+    config: &BlueprintV2Config,
+    tree: &GameTree,
+    strategy: &BlueprintV2Strategy,
+    iterations: u64,
+    elapsed_minutes: f64,
+    config_yaml_path: &Path,
+    out_dir: &Path,
+) -> Result<(), ExportError> {
+    let source_backend = match config.training.storage_backend.as_str() {
+        "sparse" | "lazy" => "hu_sparse_projected",
+        _ => "hu_dense",
+    };
+
+    let training = TrainingInfo {
+        source_backend,
+        iterations,
+        elapsed_minutes,
+    };
+
+    let mut output = export_hu_strategy_to_universal(
+        config, tree, strategy, &training,
+    )?;
+
+    export_common::retain_config_yaml(
+        config_yaml_path,
+        out_dir,
+        &mut output.manifest,
+    )?;
+
+    write_bundle(
+        out_dir,
+        &output.manifest,
+        &BundleData {
+            rows: &output.rows,
+            actions: &output.actions,
+            probs: &output.probs,
+        },
+    )?;
+
+    Ok(())
 }
 
 /// Export a legacy HU bundle directory to universal dense format.
@@ -754,4 +804,108 @@ mod tests {
     }
 
     // epoch_secs_to_rfc3339 tests moved to export_common.
+
+    #[test]
+    fn write_hu_universal_snapshot_produces_loadable_bundle() {
+        use crate::blueprint_v2::config::*;
+        use crate::blueprint_v2::game_tree::GameTree;
+        use crate::blueprint_v2::storage::BlueprintStorage;
+
+        let config = BlueprintV2Config {
+            game: GameConfig {
+                name: "NativeWriteTest".to_string(),
+                players: 2,
+                stack_depth: 10.0,
+                small_blind: 1.0,
+                big_blind: 2.0,
+                rake_rate: 0.0,
+                rake_cap: 0.0,
+                allow_preflop_limp: true,
+            },
+            clustering: ClusteringConfig {
+                algorithm: ClusteringAlgorithm::PotentialAwareEmd,
+                preflop: StreetClusterConfig {
+                    buckets: 3, delta_bins: None, expected_delta: false,
+                    sample_boards: None, metric: Default::default(),
+                },
+                flop: StreetClusterConfig {
+                    buckets: 2, delta_bins: None, expected_delta: false,
+                    sample_boards: None, metric: Default::default(),
+                },
+                turn: StreetClusterConfig {
+                    buckets: 2, delta_bins: None, expected_delta: false,
+                    sample_boards: None, metric: Default::default(),
+                },
+                river: StreetClusterConfig {
+                    buckets: 2, delta_bins: None, expected_delta: false,
+                    sample_boards: None, metric: Default::default(),
+                },
+                seed: 42, kmeans_iterations: 10, cfvnet_river_data: None,
+                per_flop: None,
+            },
+            action_abstraction: ActionAbstractionConfig {
+                preflop: vec![vec!["5bb".into()]],
+                flop: vec![vec![1.0]],
+                turn: vec![vec![1.0]],
+                river: vec![vec![1.0]],
+            },
+            training: TrainingConfig {
+                cluster_path: None, iterations: Some(100),
+                time_limit_minutes: None, lcfr_warmup_iterations: 0,
+                lcfr_discount_interval: 1, prune_after_iterations: 200,
+                prune_threshold: 0, prune_explore_pct: 0.05,
+                print_every_minutes: 10, batch_size: 200,
+                target_strategy_delta: None, purify_threshold: 0.0,
+                equity_cache_path: None, dcfr_alpha: 1.0, dcfr_beta: 1.0,
+                dcfr_gamma: 1.0, dcfr_epoch_cap: None,
+                optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
+                sapcfr_eta: 0.5, brcfr_eta: 0.6,
+                brcfr_warmup_iterations: 0, brcfr_interval: 100_000_000,
+                use_baselines: false, baseline_alpha: 0.01,
+                baseline_validation: Default::default(),
+                prune_streets: None, regret_floor: None,
+                exploitability_interval_minutes: 0,
+                exploitability_samples: 100_000,
+            },
+            snapshots: SnapshotConfig {
+                warmup_minutes: 60, snapshot_every_minutes: 30,
+                output_dir: "runs/".into(), resume: false,
+                max_snapshots: None, format: SnapshotFormat::Legacy,
+            },
+        };
+
+        let tree = GameTree::build_with_options(
+            config.game.stack_depth, config.game.small_blind,
+            config.game.big_blind, &config.action_abstraction.preflop,
+            &config.action_abstraction.flop, &config.action_abstraction.turn,
+            &config.action_abstraction.river, config.game.allow_preflop_limp,
+        );
+        let storage = BlueprintStorage::new(&tree, [3, 2, 2, 2]);
+        let strategy = crate::blueprint_v2::bundle::BlueprintV2Strategy::from_storage(
+            &storage, &tree,
+        );
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let universal_dir = dir.path().join("universal");
+        // Save config.yaml for retain_config_yaml
+        let config_yaml = serde_yaml::to_string(&config).unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, &config_yaml).unwrap();
+
+        write_hu_universal_snapshot(
+            &config, &tree, &strategy, 42, 1.5, &config_path, &universal_dir,
+        )
+        .expect("native write should succeed");
+
+        // Verify loadable
+        assert!(universal_dir.join("blueprint.json").exists());
+        assert!(universal_dir.join("strategy.rows.bin").exists());
+        assert!(universal_dir.join("strategy.probs.f32.bin").exists());
+        assert!(universal_dir.join("config.yaml").exists());
+
+        let reader = crate::blueprint_universal::BundleReader::open(&universal_dir)
+            .expect("bundle should load");
+        assert!(reader.row_count() > 0);
+    }
 }

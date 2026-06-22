@@ -376,6 +376,9 @@ impl Default for BaselineValidationTrainingConfig {
     }
 }
 
+/// Re-export from the shared training runtime module.
+pub use crate::training_runtime::SnapshotFormat;
+
 /// Snapshot (checkpoint) output settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
@@ -393,6 +396,9 @@ pub struct SnapshotConfig {
     /// oldest snapshots are deleted after each new save. `None` = unlimited.
     #[serde(default)]
     pub max_snapshots: Option<u32>,
+    /// Output format for snapshots: `legacy` (default), `universal`, or `both`.
+    #[serde(default)]
+    pub format: SnapshotFormat,
 }
 
 // ── Default value functions ──────────────────────────────────────────
@@ -695,6 +701,7 @@ snapshots:
                 output_dir: "/data/snapshots".to_owned(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         };
 
@@ -1408,5 +1415,121 @@ snapshots:
         assert_eq!(cfg.clustering.flop.metric.nut_distance_cap, Some(1.5));
         assert_eq!(cfg.clustering.flop.metric.nut_sample_boards, 50);
         assert!(!cfg.clustering.turn.metric.enabled);
+    }
+
+    #[test]
+    fn snapshot_format_defaults_to_legacy() {
+        let yaml = r#"
+game:
+  name: "Format Default"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+"#;
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, SnapshotFormat::Legacy);
+    }
+
+    #[test]
+    fn snapshot_format_parses_universal() {
+        let yaml = r#"
+game:
+  name: "Format Universal"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+  format: universal
+"#;
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, SnapshotFormat::Universal);
+    }
+
+    #[test]
+    fn snapshot_format_parses_both() {
+        let yaml = r#"
+game:
+  name: "Format Both"
+  players: 2
+  stack_depth: 200.0
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/snapshots"
+  format: both
+"#;
+        let cfg: BlueprintV2Config = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, SnapshotFormat::Both);
     }
 }

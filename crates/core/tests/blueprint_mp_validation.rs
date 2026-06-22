@@ -129,6 +129,7 @@ fn build_full_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         output_dir: "/tmp/mp_validation".into(),
         resume: false,
         max_snapshots: None,
+        format: MpSnapshotFormat::Legacy,
     };
     BlueprintMpConfig {
         game,

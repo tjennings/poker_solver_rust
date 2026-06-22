@@ -103,6 +103,7 @@ fn tiny_config(cluster_dir: &std::path::Path, run_dir: &std::path::Path) -> Blue
             output_dir: run_dir.to_string_lossy().into_owned(),
             resume: false,
             max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     }
 }
@@ -396,6 +397,7 @@ fn brcfr_plus_converges_small_game() {
             output_dir: run_dir.to_string_lossy().into_owned(),
             resume: false,
             max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     };
 

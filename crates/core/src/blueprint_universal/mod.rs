@@ -12,7 +12,7 @@ mod header;
 mod manifest;
 mod descriptors;
 mod bundle;
-pub(crate) mod export_common;
+pub mod export_common;
 pub mod hu_export;
 pub mod loader;
 pub mod mp_eager_export;

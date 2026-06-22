@@ -131,7 +131,7 @@ mod tests {
 
     use crate::blueprint_v2::config::{
         ActionAbstractionConfig, BlueprintV2Config, ClusteringAlgorithm, ClusteringConfig,
-        GameConfig, SnapshotConfig, StreetClusterConfig, TrainingConfig,
+        GameConfig, SnapshotConfig, SnapshotFormat, StreetClusterConfig, TrainingConfig,
     };
     use crate::training_runtime::{
         BatchBudget, RuntimeLimits, RuntimeStopReason, TrainingRuntimeBackend, run_until_stopped,
@@ -230,6 +230,7 @@ mod tests {
                 output_dir: output_dir.to_string_lossy().to_string(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         }
     }

@@ -10,16 +10,67 @@ Always use `--release` for training and diagnostics.
 
 ## Blueprint Bundle Formats
 
-The current production HU bundle is the legacy `blueprint_v2` layout containing
-`config.yaml`, `strategy.bin`, metadata, and snapshot directories. The planned
-universal dense strategy format is specified in `docs/blueprint_format.md`.
-That format is a versioned directory bundle with `blueprint.json`,
+Trainers support two output formats, controlled by the `snapshots.format` config
+field:
+
+| Value | Behavior |
+|-|-|
+| `legacy` (default) | Write `strategy.bin`, `regrets.bin`, metadata -- the original format. |
+| `universal` | Write a universal dense bundle (`blueprint.json` + binary payloads) into `snapshot_NNNN/universal/`. |
+| `both` | Write both legacy files and a universal bundle. |
+
+The universal dense strategy format is specified in `docs/blueprint_format.md`.
+It is a versioned directory bundle with `blueprint.json`,
 row/action/probability binary payloads, explicit player/action/bucket
-provenance, checksums, and separate optional resumable CFR state. Until the
-implementation phases land, `train-blueprint` and `train-blueprint-mp` continue
-to use their existing snapshot/export behavior.
+provenance, checksums, and separate optional resumable CFR state.
+
+When `format` is `universal` or `both`, the trainer writes the universal bundle
+at each snapshot using the same in-memory state that produces legacy files.
+Binary payloads are byte-identical to running the post-hoc `export-universal` /
+`export-universal-mp` commands on the same snapshot. The manifest `created_at`
+timestamp will differ between native and post-hoc writes (it is per-run).
+
+Existing configs without a `format` field default to `legacy` with no behavior
+change.
+
+### Example: enabling native universal output
+
+```yaml
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "runs/my_blueprint"
+  format: both    # write legacy + universal at each snapshot
+```
+
+The universal bundle is written to `snapshot_NNNN/universal/` within the
+snapshot directory and contains `blueprint.json`, `strategy.rows.bin`,
+`strategy.actions.bin`, `strategy.probs.f32.bin`, `checksums.json`, and
+`config.yaml`.
 
 ## Commands
+
+### train
+
+Auto-detect the config format (HU V2 or N-player MP) and dispatch to the
+appropriate trainer. This is the recommended entry point and the command used
+by the cloud training pipeline (`cloud/user-data.sh.tpl`).
+
+```bash
+cargo run -p poker-solver-trainer --release -- train \
+  -c <config.yaml>
+```
+
+Detection: if `game.num_players` is present, the config is treated as MP;
+if `game.players` is present, it is treated as HU V2. An error is raised
+if neither field is found.
+
+Optional flags:
+
+| Flag | Description |
+|-|-|
+| `--no-tui` | Disable the TUI dashboard |
+| `--output-dir <dir>` | Override `snapshots.output_dir` from the config |
 
 ### train-blueprint
 

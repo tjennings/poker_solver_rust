@@ -684,12 +684,10 @@ struct MpSnapshotMetadata {
 
 /// Require a file to exist, returning `MissingFile` otherwise.
 fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
-    if path.exists() {
-        Ok(())
+    if let Some(detail) = super::export_common::check_file_exists(path, label) {
+        Err(ExportError::MissingFile { detail })
     } else {
-        Err(ExportError::MissingFile {
-            detail: format!("{label} not found at {}", path.display()),
-        })
+        Ok(())
     }
 }
 
@@ -767,6 +765,50 @@ fn validate_snapshot_bucket_counts(
 /// Loads `config.yaml`, builds the tree, loads `strategy.bin` and
 /// `metadata.json`, validates bucket counts, and emits the bundle.
 ///
+/// Write a universal dense bundle from in-memory MP eager training state.
+///
+/// Called at snapshot time when `format` is `universal` or `both`.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] on export or I/O failure.
+pub fn write_mp_universal_snapshot(
+    config: &BlueprintMpConfig,
+    tree: &MpGameTree,
+    storage: &MpStorage,
+    iterations: u64,
+    elapsed_minutes: f64,
+    config_yaml_path: &Path,
+    out_dir: &Path,
+) -> Result<(), ExportError> {
+    let training = MpTrainingInfo {
+        iterations,
+        elapsed_minutes,
+    };
+
+    let mut output = export_mp_strategy_to_universal(
+        config, tree, storage, &training,
+    )?;
+
+    super::export_common::retain_config_yaml(
+        config_yaml_path,
+        out_dir,
+        &mut output.manifest,
+    )?;
+
+    write_bundle(
+        out_dir,
+        &output.manifest,
+        &BundleData {
+            rows: &output.rows,
+            actions: &output.actions,
+            probs: &output.probs,
+        },
+    )?;
+
+    Ok(())
+}
+
 /// # Errors
 ///
 /// Returns [`ExportError`] for missing files, bucket count mismatches,

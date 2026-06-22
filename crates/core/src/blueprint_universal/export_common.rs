@@ -211,11 +211,26 @@ fn is_leap(year: u64) -> bool {
 // Config file retention
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// File-existence check (shared across export modules)
+// ---------------------------------------------------------------------------
+
+/// Check that `path` exists, returning `None` on success or a
+/// descriptive detail string on failure.  Each export module wraps
+/// this into its own `ExportError::MissingFile` variant.
+pub(crate) fn check_file_exists(path: &Path, label: &str) -> Option<String> {
+    if path.exists() {
+        None
+    } else {
+        Some(format!("{label} not found at {}", path.display()))
+    }
+}
+
 /// Copy a source `config.yaml` into the output bundle directory and
 /// record the relative path in `manifest.training.config_path`.
 ///
 /// Creates `out_dir` (including parents) if it does not already exist.
-pub(crate) fn retain_config_yaml(
+pub fn retain_config_yaml(
     source: &Path,
     out_dir: &Path,
     manifest: &mut Manifest,
@@ -337,6 +352,27 @@ mod tests {
     fn epoch_to_rfc3339_unix_epoch() {
         let ts = epoch_secs_to_rfc3339(0);
         assert_eq!(ts, "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn check_file_exists_returns_none_for_existing_file() {
+        let tmp = std::env::temp_dir().join("check_exists_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("present.txt");
+        std::fs::write(&file, "data").unwrap();
+        assert!(check_file_exists(&file, "present.txt").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_file_exists_returns_detail_for_missing_file() {
+        let missing = std::env::temp_dir().join("nonexistent_file_for_test.xyz");
+        let detail = check_file_exists(&missing, "test label");
+        assert!(detail.is_some());
+        let msg = detail.unwrap();
+        assert!(msg.contains("test label"), "detail should include label");
+        assert!(msg.contains("not found"), "detail should say not found");
     }
 
     /// Build a minimal [`Manifest`] for tests that only inspect the

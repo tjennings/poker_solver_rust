@@ -29,7 +29,7 @@ use super::baseline_validation::{
 };
 use super::bucket_file::BucketFile;
 use super::bundle::{self, BlueprintV2Strategy};
-use super::config::BlueprintV2Config;
+use super::config::{BlueprintV2Config, SnapshotFormat};
 use super::game_tree::GameTree;
 use super::mccfr::{
     AllBuckets, Deal, DealWithBuckets, FullTreeEvTracker, PRUNE_HITS, PRUNE_TOTAL, PruneStats,
@@ -1797,6 +1797,7 @@ impl BlueprintTrainer {
         }
 
         let snapshot_dir = output_dir.join(format!("snapshot_{:04}", self.snapshot_count));
+        let format = self.config.snapshots.format;
 
         let projected_storage;
         let storage = if self.sparse_storage.is_some() {
@@ -1821,7 +1822,20 @@ impl BlueprintTrainer {
             self.mean_positive_regret(),
         );
 
-        bundle::save_snapshot(&snapshot_dir, &strategy, storage, &metadata)?;
+        let write_legacy = matches!(format, SnapshotFormat::Legacy | SnapshotFormat::Both);
+        let write_universal = matches!(format, SnapshotFormat::Universal | SnapshotFormat::Both);
+
+        if write_legacy {
+            bundle::save_snapshot(&snapshot_dir, &strategy, storage, &metadata)?;
+        } else {
+            // Universal-only still needs snapshot_dir and metadata
+            std::fs::create_dir_all(&snapshot_dir)?;
+            std::fs::write(snapshot_dir.join("metadata.json"), &metadata)?;
+        }
+
+        if write_universal {
+            self.write_universal_bundle(&snapshot_dir, &strategy)?;
+        }
 
         // Save full-tree EV tracker.
         self.full_ev_tracker
@@ -1906,6 +1920,35 @@ impl BlueprintTrainer {
             self.prune_old_snapshots(output_dir, max)?;
         }
 
+        Ok(())
+    }
+
+    /// Write a universal dense bundle into `snapshot_dir/universal/`.
+    fn write_universal_bundle(
+        &self,
+        snapshot_dir: &Path,
+        strategy: &BlueprintV2Strategy,
+    ) -> Result<(), Box<dyn Error>> {
+        let output_dir = Path::new(&self.config.snapshots.output_dir);
+        let config_path = output_dir.join("config.yaml");
+        let universal_dir = snapshot_dir.join("universal");
+
+        crate::blueprint_universal::hu_export::write_hu_universal_snapshot(
+            &self.config,
+            &self.tree,
+            strategy,
+            self.iterations,
+            self.elapsed_minutes() as f64,
+            &config_path,
+            &universal_dir,
+        )?;
+
+        if !self.tui_active {
+            eprintln!(
+                "  Universal bundle written to {}",
+                universal_dir.display(),
+            );
+        }
         Ok(())
     }
 
@@ -2104,6 +2147,7 @@ mod tests {
                 output_dir: "/tmp/test_blueprint_v2_snapshots".into(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         }
     }

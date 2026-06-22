@@ -437,6 +437,39 @@ fn lazy_game_fingerprint(config: &LazyExportConfig) -> u64 {
 
 /// Write a lazy bundle to disk, including the semantic side table.
 ///
+/// Write a universal dense bundle from in-memory MP lazy sparse state.
+///
+/// Called at snapshot time when `format` is `universal` or `both`.
+///
+/// # Errors
+///
+/// Returns `FormatError` on export or I/O failure.
+pub fn write_lazy_universal_snapshot(
+    config: &LazyExportConfig,
+    entries: &[SparseSnapshotEntry],
+    iterations: u64,
+    elapsed_minutes: f64,
+    config_yaml_path: &Path,
+    out_dir: &Path,
+) -> Result<(), FormatError> {
+    let training = LazyTrainingInfo {
+        iterations,
+        elapsed_minutes,
+    };
+
+    let mut output = export_lazy_sparse_to_universal(
+        config, entries, &training,
+    );
+
+    super::export_common::retain_config_yaml(
+        config_yaml_path,
+        out_dir,
+        &mut output.manifest,
+    )?;
+
+    write_lazy_bundle(out_dir, &output)
+}
+
 /// # Errors
 ///
 /// Returns `FormatError` on I/O failure.
@@ -551,12 +584,10 @@ pub fn export_lazy_bundle_from_disk(
 
 /// Require a file to exist, returning `MissingFile` otherwise.
 fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
-    if path.exists() {
-        Ok(())
+    if let Some(detail) = super::export_common::check_file_exists(path, label) {
+        Err(ExportError::MissingFile { detail })
     } else {
-        Err(ExportError::MissingFile {
-            detail: format!("{label} not found at {}", path.display()),
-        })
+        Ok(())
     }
 }
 

@@ -1,10 +1,44 @@
 #![allow(clippy::module_name_repetitions)]
 
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+// ── Snapshot format ────────────────────────────────────────────────────
+
+/// Snapshot output format selector.
+///
+/// Controls whether the trainer writes legacy files,
+/// universal dense bundles, or both at each snapshot.  Shared by both
+/// the HU and MP config modules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotFormat {
+    /// Write only legacy files (default).
+    #[default]
+    Legacy,
+    /// Write only a universal dense bundle.
+    Universal,
+    /// Write both legacy files and a universal bundle.
+    Both,
+}
+
+impl SnapshotFormat {
+    /// True when legacy files should be written.
+    #[must_use]
+    pub const fn write_legacy(self) -> bool {
+        matches!(self, Self::Legacy | Self::Both)
+    }
+
+    /// True when universal bundles should be written.
+    #[must_use]
+    pub const fn write_universal(self) -> bool {
+        matches!(self, Self::Universal | Self::Both)
+    }
+}
 
 /// Error type shared by backend-neutral training runtime hooks.
 pub type RuntimeError = Box<dyn Error + Send + Sync>;
@@ -1215,5 +1249,54 @@ mod tests {
                 target_units: 1,
             },
         }));
+    }
+
+    #[test]
+    fn snapshot_format_defaults_to_legacy() {
+        let fmt = SnapshotFormat::default();
+        assert_eq!(fmt, SnapshotFormat::Legacy);
+    }
+
+    #[test]
+    fn snapshot_format_write_legacy_true_for_legacy_and_both() {
+        assert!(SnapshotFormat::Legacy.write_legacy());
+        assert!(SnapshotFormat::Both.write_legacy());
+        assert!(!SnapshotFormat::Universal.write_legacy());
+    }
+
+    #[test]
+    fn snapshot_format_write_universal_true_for_universal_and_both() {
+        assert!(SnapshotFormat::Universal.write_universal());
+        assert!(SnapshotFormat::Both.write_universal());
+        assert!(!SnapshotFormat::Legacy.write_universal());
+    }
+
+    #[test]
+    fn snapshot_format_serde_round_trips() {
+        for variant in [
+            SnapshotFormat::Legacy,
+            SnapshotFormat::Universal,
+            SnapshotFormat::Both,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: SnapshotFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, back);
+        }
+    }
+
+    #[test]
+    fn snapshot_format_serde_snake_case_names() {
+        assert_eq!(
+            serde_json::to_string(&SnapshotFormat::Legacy).unwrap(),
+            "\"legacy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotFormat::Universal).unwrap(),
+            "\"universal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SnapshotFormat::Both).unwrap(),
+            "\"both\""
+        );
     }
 }
