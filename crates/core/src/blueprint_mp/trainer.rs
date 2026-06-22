@@ -1411,10 +1411,12 @@ mod tests {
     #[timed_test(10)]
     fn exact_chance_runouts_enumerate_legal_turn_rivers_for_flop_prefix() {
         let mut rng = SmallRng::seed_from_u64(0xC0FF_EE17);
-        let deal = sample_deal(6, &mut rng);
+        let deal = sample_deal(3, &mut rng);
         let counts = [10u16, 10, 10, 10];
         let mut all_buckets = AllBuckets::new(counts, [None, None, None, None]);
         all_buckets.equity_fallback = true;
+        let expected_turns = 52usize - deal.num_players as usize * 2 - 3;
+        let expected_rivers_per_turn = expected_turns - 1;
 
         let runouts = exact_chance_runouts_for_deal(
             &deal,
@@ -1423,7 +1425,7 @@ mod tests {
             MpChanceContinuationMode::SampledFlopExactTurnRiver,
         );
 
-        assert_eq!(runouts.turns.len(), 37);
+        assert_eq!(runouts.turns.len(), expected_turns);
         let mut turns = Vec::with_capacity(runouts.turns.len());
         let mut total_rivers = 0usize;
         for turn_runout in &runouts.turns {
@@ -1431,7 +1433,7 @@ mod tests {
             assert!(!deal_uses_hole_or_board_prefix(&deal, turn, 3));
             assert!(!turns.contains(&turn));
             turns.push(turn);
-            assert_eq!(turn_runout.river_deals.len(), 36);
+            assert_eq!(turn_runout.river_deals.len(), expected_rivers_per_turn);
             assert_eq!(turn_runout.turn_deal.deal.board[3], turn);
             total_rivers += turn_runout.river_deals.len();
 
@@ -1450,7 +1452,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total_rivers, 1_332);
+        assert_eq!(total_rivers, expected_turns * expected_rivers_per_turn);
     }
 
     #[timed_test]
