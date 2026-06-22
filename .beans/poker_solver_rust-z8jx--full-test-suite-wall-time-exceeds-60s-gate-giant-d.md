@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-z8jx
 title: Full test-suite wall time exceeds 60s gate (giant debug test binaries)
-status: todo
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-06-18T17:13:53Z
-updated_at: 2026-06-22T18:38:15Z
+updated_at: 2026-06-22T19:19:15Z
 ---
 
 Warm cargo test --workspace measures ~66-73s wall, over the 60s gate (CLAUDE.md). Diagnosis (2026-06-18): test EXECUTION is healthy and flat at ~29s across 30 binaries; the overage (~35-45s, highly variable with disk/cache contention) is binary load/startup. The deps are enormous debug test binaries: poker-solver-trainer 5x~148MB, cfvnet 5x~125MB, rebel ~116MB, tauri 3x~31MB — several GB loaded sequentially per run. Not caused by any one feature phase; cumulative. Fix directions (cited, with tradeoffs to weigh): (1) workspace [profile.test]/[profile.dev] debug tuning — debug="line-tables-only" or split-debuginfo="unpacked" or strip — to shrink debuginfo-dominated binaries (cargo profile docs; tradeoff: backtrace line info); (2) consolidate the 7 core + 3 tauri tests/*.rs integration files into fewer binaries (each tests/*.rs is a separate binary linking the whole crate — cargo book); (3) gate/feature-flag the heaviest crates' test binaries (cfvnet/trainer) out of the default fast suite. Measure each lever's wall-time delta. Goal: warm cargo test --workspace reliably under 60s.
@@ -6843,3 +6843,12 @@ failures:
     blueprint_mp::trainer::tests::exact_chance_runouts_enumerate_legal_turn_rivers_for_flop_prefix
 
 test result: FAILED. 1256 passed; 1 failed; 17 ignored; 0 measured; 0 filtered out; finished in 11.46s invocation, on top of the giant-debug-binary load cost. Investigate: compare `cargo build --workspace --tests` vs `cargo test --workspace --no-run` artifact fingerprints; check for differing features/profiles across the two commands (e.g. a dev-dep enabling a feature only under test). Fixing this rebuild churn may matter more than binary size for the wall-time gate. (All tests PASS green unsandboxed; this is purely wall-time.)
+
+## 2026-06-22 Resume Notes
+
+After fixing BoundaryTracer and committing rustfmt cleanup, this remains the mandatory pre-development gate before `8jan` / `mt3l`. Current evidence has two components:
+
+- Full workspace test wall time is above the project's 60s gate.
+- The latest diagnostic also captured `blueprint_mp::trainer::tests::exact_chance_runouts_enumerate_legal_turn_rivers_for_flop_prefix` exceeding the 10s timed-test cap at 11.457s.
+
+Next work should investigate the timed core test and the full-suite rebuild/binary-load behavior before starting trainer consolidation feature work.
