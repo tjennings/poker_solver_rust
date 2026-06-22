@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-nbzo
 title: '8jan-prereq: re-layout MpInfosetKey for seats 0-9 (3-bit seat mask blocker)'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-06-18T18:43:16Z
-updated_at: 2026-06-18T18:43:36Z
+updated_at: 2026-06-22T15:14:51Z
 parent: poker_solver_rust-osss
 blocking:
     - poker_solver_rust-8jan
