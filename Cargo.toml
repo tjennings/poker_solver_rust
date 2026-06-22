@@ -30,3 +30,6 @@ rayon = "1.10"
 lto = "thin"
 codegen-units = 8
 opt-level = 3
+
+[profile.test]
+debug = "line-tables-only"
