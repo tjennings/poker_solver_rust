@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -810,7 +811,7 @@ pub struct BoundaryTracer {
     enabled_ordinals: TraceFilter,
     enabled_iters: TraceFilter,
     trace_dir: PathBuf,
-    handles: Mutex<HashMap<usize, std::io::BufWriter<std::fs::File>>>,
+    write_lock: Mutex<()>,
     /// Ordinals below this threshold are unconditionally skipped.
     /// Set to 2 in gadget-tree mode to avoid tracing the static gadget
     /// terminals at ordinals 0 and 1.
@@ -828,7 +829,7 @@ impl BoundaryTracer {
             enabled_ordinals: ords,
             enabled_iters: iters,
             trace_dir: dir,
-            handles: Mutex::new(HashMap::new()),
+            write_lock: Mutex::new(()),
             skip_leading_ordinals,
         }
     }
@@ -876,19 +877,17 @@ impl BoundaryTracer {
             format_trace_txt(iter, ord, event)
         };
 
-        let mut handles = self.handles.lock().expect("tracer lock poisoned");
-        let writer = handles.entry(ord).or_insert_with(|| {
-            std::fs::create_dir_all(&self.trace_dir).expect("failed to create trace directory");
-            let path = self.trace_dir.join(format!("boundary_{ord}.txt"));
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
-            std::io::BufWriter::new(file)
-        });
-        write!(writer, "{txt}").expect("failed to write trace record");
-        writer.flush().expect("failed to flush trace record");
+        let _guard = self.write_lock.lock().expect("tracer lock poisoned");
+        std::fs::create_dir_all(&self.trace_dir).expect("failed to create trace directory");
+        let path = self.trace_dir.join(format!("boundary_{ord}.txt"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
+        file.write_all(txt.as_bytes())
+            .expect("failed to write trace record");
+        file.flush().expect("failed to flush trace record");
     }
 }
 
@@ -896,6 +895,30 @@ impl BoundaryTracer {
 mod tests {
     use super::*;
     use range_solver::Action;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn trace_temp_dir(prefix: &str) -> PathBuf {
+        static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn minimal_trace_event() -> BoundaryTraceEvent {
+        BoundaryTraceEvent {
+            board: "AhKd2c".to_string(),
+            pot: 100,
+            stack: 50.0,
+            spot: None,
+            oop_range_1326: vec![0.0; 1326],
+            ip_range_1326: vec![0.0; 1326],
+            oop_cfvs_1326: vec![0.0; 1326],
+            ip_cfvs_1326: vec![0.0; 1326],
+            strategy_at_prev: None,
+        }
+    }
 
     // ---------------------------------------------------------------
     // build_boundary_spot_paths integration tests
@@ -905,7 +928,7 @@ mod tests {
     /// creates depth boundary nodes (one per non-isomorphic turn card).
     fn make_depth_limited_turn_game() -> range_solver::PostFlopGame {
         use range_solver::bet_size::BetSizeOptions;
-        use range_solver::card::{card_from_str, flop_from_str, NOT_DEALT};
+        use range_solver::card::{flop_from_str, NOT_DEALT};
         use range_solver::{ActionTree, BoardState, CardConfig, PostFlopGame, TreeConfig};
 
         let oop_range: range_solver::range::Range = "AA,KK".parse().unwrap();
@@ -1585,7 +1608,7 @@ mod tests {
 
     #[test]
     fn tracer_writes_txt_file() {
-        let dir = std::env::temp_dir().join("boundary_trace_test_txt");
+        let dir = trace_temp_dir("boundary_trace_test_txt");
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(TraceFilter::All, TraceFilter::All, dir.clone(), 0);
         let event = BoundaryTraceEvent {
@@ -1628,8 +1651,54 @@ mod tests {
     }
 
     #[test]
+    fn tracer_appends_repeated_writes_to_same_ordinal() {
+        let dir = trace_temp_dir("boundary_trace_append_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let tracer = BoundaryTracer::new(TraceFilter::All, TraceFilter::All, dir.clone(), 0);
+        let event = minimal_trace_event();
+
+        for iter in 0..3 {
+            tracer.trace(7, iter, &event);
+        }
+
+        let content = std::fs::read_to_string(dir.join("boundary_7.txt")).unwrap();
+        assert_eq!(
+            content.matches("[iter=").count(),
+            3,
+            "expected one record per trace call"
+        );
+        assert!(
+            content.contains("[iter=0 boundary=7")
+                && content.contains("[iter=1 boundary=7")
+                && content.contains("[iter=2 boundary=7"),
+            "expected all appended iterations, got:\n{content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracer_writes_many_ordinals_without_fd_pressure() {
+        let dir = trace_temp_dir("boundary_trace_many_ordinals_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let tracer = BoundaryTracer::new(TraceFilter::All, TraceFilter::All, dir.clone(), 0);
+        let event = minimal_trace_event();
+
+        for ord in 0..300 {
+            tracer.trace(ord, 0, &event);
+        }
+
+        for ord in [0, 128, 255, 299] {
+            let path = dir.join(format!("boundary_{ord}.txt"));
+            assert!(path.exists(), "{} should exist", path.display());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tracer_skips_disabled_ordinals() {
-        let dir = std::env::temp_dir().join("boundary_trace_test_skip_txt");
+        let dir = trace_temp_dir("boundary_trace_test_skip_txt");
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::Set(HashSet::from([10])),
@@ -1665,8 +1734,7 @@ mod tests {
 
     #[test]
     fn tracer_skips_leading_ordinals() {
-        let dir =
-            std::env::temp_dir().join(format!("gadget_tracer_skip_test_{}", std::process::id()));
+        let dir = trace_temp_dir("gadget_tracer_skip_test");
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::All,
@@ -1709,8 +1777,7 @@ mod tests {
 
     #[test]
     fn tracer_skip_zero_traces_all() {
-        let dir =
-            std::env::temp_dir().join(format!("gadget_tracer_skip0_test_{}", std::process::id()));
+        let dir = trace_temp_dir("gadget_tracer_skip0_test");
         let _ = std::fs::remove_dir_all(&dir);
         let tracer = BoundaryTracer::new(
             TraceFilter::All,

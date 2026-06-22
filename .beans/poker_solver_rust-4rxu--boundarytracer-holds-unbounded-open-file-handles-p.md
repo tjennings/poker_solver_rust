@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-4rxu
 title: BoundaryTracer holds unbounded open file handles per ordinal
-status: in-progress
+status: completed
 type: bug
 priority: normal
 created_at: 2026-04-24T13:12:55Z
-updated_at: 2026-06-22T18:27:45Z
+updated_at: 2026-06-22T18:33:57Z
 ---
 
 Surfaced during Task 14 iter-15 E2E run on branch feat/option-a-gadget-tree (2026-04-24).
@@ -39,3 +39,11 @@ cargo test -p poker-solver-tauri --lib boundary_trace::tests::tracer_ -- --nocap
 ```
 
 This is now blocking the pre-development suite gate. The likely fix direction remains eliminating long-lived per-ordinal `BufWriter<File>` handles or making trace test temp directories unique and race-proof, with preference for fixing the production fd issue rather than only hardening the test.
+
+## Summary of Changes
+
+- Replaced BoundaryTracer's unbounded per-ordinal cached `BufWriter<File>` map with a single write lock and open/write/flush/close per trace event.
+- Preserved append semantics and `boundary_{ord}.txt` filenames.
+- Added unique temp directory helpers for tracer tests so parallel/full-suite runs do not share fixed temp paths.
+- Added regression coverage for repeated appends to one ordinal and writing 300 distinct ordinals without fd pressure.
+- Verified focused and broader boundary trace test filters pass.
