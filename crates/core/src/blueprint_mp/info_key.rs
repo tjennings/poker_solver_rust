@@ -34,12 +34,20 @@ use super::types::Seat;
 const SEAT_SHIFT: u32 = 60;
 const BUCKET_SHIFT: u32 = 32;
 
-// Masks for extraction.
-const SEAT_MASK: u64 = 0xF; // 4 bits (full nibble, capacity 0-15)
-const BUCKET_MASK: u64 = 0xFFF_FFFF; // 28 bits
-
 /// Number of bits in the seat field.
 const SEAT_BITS: u32 = 4;
+
+/// Maximum seat index that fits in the packed field (2^SEAT_BITS - 1).
+/// Shared with `MpInfosetKey::from_parts` via `SEAT_CAPACITY`.
+const MAX_PACKED_SEAT: u8 = ((1u64 << SEAT_BITS) - 1) as u8;
+
+/// Number of distinct seat values the packed field can hold (2^SEAT_BITS).
+pub(crate) const SEAT_CAPACITY: u8 = (1u64 << SEAT_BITS) as u8;
+
+// Masks for extraction — derived from field widths so they cannot silently
+// disagree with the width constants.
+const SEAT_MASK: u64 = (1u64 << SEAT_BITS) - 1;
+const BUCKET_MASK: u64 = 0xFFF_FFFF; // 28 bits
 
 /// Total number of 4-bit action slots in the 90-bit action history.
 const MAX_ACTIONS: usize = 22;
@@ -114,10 +122,9 @@ impl InfoKey128 {
     /// truncated seat would collide with a different seat's key.
     fn pack_header(seat: Seat, bucket: u32) -> u64 {
         assert!(
-            u64::from(seat.index()) < (1 << SEAT_BITS),
-            "seat {} does not fit {SEAT_BITS}-bit packed field (max {})",
+            seat.index() <= MAX_PACKED_SEAT,
+            "seat {} does not fit {SEAT_BITS}-bit packed field (max {MAX_PACKED_SEAT})",
             seat.index(),
-            (1u64 << SEAT_BITS) - 1,
         );
         let mut hi: u64 = 0;
         hi |= u64::from(seat.index()) << SEAT_SHIFT;
@@ -415,7 +422,6 @@ mod tests {
     mod prop_tests {
         use super::*;
         use proptest::prelude::*;
-        use std::collections::HashSet;
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(500))]

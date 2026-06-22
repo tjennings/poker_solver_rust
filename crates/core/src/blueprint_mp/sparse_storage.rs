@@ -17,6 +17,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::info_key::SEAT_CAPACITY;
 use super::{MAX_PLAYERS, Seat, Street};
 
 const DEFAULT_SHARDS: usize = 4096;
@@ -74,8 +75,8 @@ impl MpInfosetKey {
     ///
     /// # Panics
     ///
-    /// Panics if `seat.index() >= 16` (exceeds the 4-bit seat capacity
-    /// of the packed `InfoKey128` representation).
+    /// Panics if `seat.index() >= SEAT_CAPACITY` (exceeds the packed
+    /// seat field shared with `InfoKey128`).
     #[must_use]
     pub const fn from_parts(
         seat: Seat,
@@ -86,8 +87,8 @@ impl MpInfosetKey {
         history_len: u16,
     ) -> Self {
         assert!(
-            seat.index() < 16,
-            "seat exceeds 4-bit seat capacity (max 15)"
+            seat.index() < SEAT_CAPACITY,
+            "seat exceeds packed seat capacity"
         );
         Self {
             seat: seat.index(),
