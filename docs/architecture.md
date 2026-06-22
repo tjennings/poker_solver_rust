@@ -25,7 +25,7 @@ poker_solver_rust/
 │   │       ├── game/          # Action/Player types, HunlPostflop game
 │   │       ├── cfr/           # CFR utilities (regret matching, shared DCFR/LCFR logic)
 │   │       ├── blueprint_v2/  # MCCFR blueprint trainer, strategy storage, config
-│   │       ├── blueprint_mp/  # N-player (2-8) MCCFR blueprint trainer
+│   │       ├── blueprint_mp/  # N-player (2-10) MCCFR blueprint trainer
 │   │       ├── abstraction/   # Card abstraction (isomorphism, EHS2, HandClassV2)
 │   │       ├── hand_class.rs  # 19-variant hand classification system
 │   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
@@ -190,7 +190,7 @@ clustering:
 
 ## N-Player Blueprint (`blueprint_mp`)
 
-A clean-room N-player (2-8) MCCFR solver module alongside the existing `blueprint_v2`. Uses strong domain types and supports configurable blind/ante structures.
+A clean-room N-player (2-10) MCCFR solver module alongside the existing `blueprint_v2`. Uses strong domain types and supports configurable blind/ante structures.
 
 ### Module Structure
 
@@ -212,7 +212,7 @@ crates/core/src/blueprint_mp/
 
 ### Key Design Decisions
 
-- **2-8 players** with `MAX_PLAYERS = 8`
+- **2-10 players** with `MAX_PLAYERS = 10`
 - **Configurable blinds**: SB, BB, ante, BB-ante, straddle via per-seat config
 - **Lead/raise split**: Separate bet sizes for opening bets vs raises
 - **Optional preflop flop-player cap**: `action_abstraction.max_flop_players` prunes non-closing preflop calls that would fill the last allowed flop seat, while preserving closing calls up to the cap

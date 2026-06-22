@@ -2154,6 +2154,28 @@ mod tests {
     }
 
     #[timed_test]
+    fn lazy_10_player_root_generates_actions_without_building_tree() {
+        let game = LazyMpGame::new(&game_config(10, 200.0), &action_config());
+
+        let root = game.root_state();
+        let actions = game.actions(&root);
+
+        assert_eq!(game.num_players, 10);
+        assert_eq!(root.to_act(), Seat::from_raw(2));
+        assert_eq!(root.street(), Street::Preflop);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Fold))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call))
+        );
+    }
+
+    #[timed_test]
     fn lazy_root_honors_no_limp_config() {
         let mut game_config = game_config(6, 200.0);
         game_config.allow_preflop_limp = false;

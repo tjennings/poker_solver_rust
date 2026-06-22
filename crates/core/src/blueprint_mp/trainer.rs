@@ -1867,19 +1867,21 @@ mod tests {
 
     fn flop_bucket_for(hole: [Card; 2], flop: [Card; 3], all_buckets: &AllBuckets) -> u16 {
         let deal = Deal {
-            hole_cards: [
-                hole,
-                [
+            hole_cards: {
+                let mut hole_cards = [[card(Value::Two, Suit::Club); 2]; MAX_PLAYERS];
+                hole_cards[0] = hole;
+                hole_cards[1] = [
                     card(Value::Queen, Suit::Heart),
                     card(Value::Jack, Suit::Diamond),
-                ],
-                [card(Value::Ten, Suit::Club); 2],
-                [card(Value::Ten, Suit::Diamond); 2],
-                [card(Value::Nine, Suit::Club); 2],
-                [card(Value::Nine, Suit::Diamond); 2],
-                [card(Value::Eight, Suit::Club); 2],
-                [card(Value::Eight, Suit::Diamond); 2],
-            ],
+                ];
+                hole_cards[2] = [card(Value::Ten, Suit::Club); 2];
+                hole_cards[3] = [card(Value::Ten, Suit::Diamond); 2];
+                hole_cards[4] = [card(Value::Nine, Suit::Club); 2];
+                hole_cards[5] = [card(Value::Nine, Suit::Diamond); 2];
+                hole_cards[6] = [card(Value::Eight, Suit::Club); 2];
+                hole_cards[7] = [card(Value::Eight, Suit::Diamond); 2];
+                hole_cards
+            },
             board: [
                 flop[0],
                 flop[1],

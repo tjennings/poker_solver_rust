@@ -460,6 +460,13 @@ fn position_to_seat(name: &str, num_players: u8) -> Option<u8> {
                 None
             }
         }
+        "mp" => {
+            if n >= 7 {
+                Some(n - 6)
+            } else {
+                None
+            }
+        }
         "utg" => Some(0),
         "utg1" | "utg+1" => {
             if n >= 7 {
@@ -471,6 +478,13 @@ fn position_to_seat(name: &str, num_players: u8) -> Option<u8> {
         "utg2" | "utg+2" => {
             if n >= 8 {
                 Some(2)
+            } else {
+                None
+            }
+        }
+        "utg3" | "utg+3" => {
+            if n >= 10 {
+                Some(3)
             } else {
                 None
             }
@@ -897,6 +911,18 @@ mod tests {
     fn position_to_seat_co_requires_4_players() {
         assert_eq!(position_to_seat("co", 3), None);
         assert_eq!(position_to_seat("co", 4), Some(0));
+    }
+
+    #[timed_test]
+    fn position_to_seat_10max_extended_utg_labels() {
+        assert_eq!(position_to_seat("utg", 10), Some(0));
+        assert_eq!(position_to_seat("utg1", 10), Some(1));
+        assert_eq!(position_to_seat("utg+1", 10), Some(1));
+        assert_eq!(position_to_seat("utg2", 10), Some(2));
+        assert_eq!(position_to_seat("utg+2", 10), Some(2));
+        assert_eq!(position_to_seat("utg3", 10), Some(3));
+        assert_eq!(position_to_seat("utg+3", 10), Some(3));
+        assert_eq!(position_to_seat("mp", 10), Some(4));
     }
 
     // -- parse_board_segment tests --

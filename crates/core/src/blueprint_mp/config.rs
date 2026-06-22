@@ -37,7 +37,7 @@ impl MpGameConfig {
     /// Validate game config constraints.
     ///
     /// # Errors
-    /// Returns `Err` if `num_players` not in 2..=8, `stack_depth` <= 0,
+    /// Returns `Err` if `num_players` not in 2..=10, `stack_depth` <= 0,
     /// a blind seat >= `num_players`, or a blind amount <= 0.
     pub fn validate(&self) -> Result<(), String> {
         self.validate_players()?;
@@ -46,8 +46,11 @@ impl MpGameConfig {
     }
 
     fn validate_players(&self) -> Result<(), String> {
-        if self.num_players < 2 || self.num_players > 8 {
-            return Err(format!("num_players must be 2-8, got {}", self.num_players));
+        if self.num_players < 2 || self.num_players > 10 {
+            return Err(format!(
+                "num_players must be 2-10, got {}",
+                self.num_players
+            ));
         }
         Ok(())
     }
@@ -602,10 +605,10 @@ snapshots:
     }
 
     #[timed_test]
-    fn game_config_validation_rejects_9_players() {
+    fn game_config_validation_rejects_11_players() {
         let game = MpGameConfig {
             name: "Too many".into(),
-            num_players: 9,
+            num_players: 11,
             stack_depth: 100.0,
             allow_preflop_limp: true,
             blinds: vec![
@@ -711,10 +714,10 @@ snapshots:
     }
 
     #[timed_test]
-    fn validation_accepts_8_players() {
+    fn validation_accepts_10_players() {
         let game = MpGameConfig {
             name: "Max".into(),
-            num_players: 8,
+            num_players: 10,
             stack_depth: 200.0,
             allow_preflop_limp: true,
             blinds: vec![

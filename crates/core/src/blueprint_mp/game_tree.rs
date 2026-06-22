@@ -1,6 +1,6 @@
 //! N-player game tree builder for multiplayer MCCFR.
 //!
-//! Builds an arena-allocated game tree for 2-8 player NLHE with
+//! Builds an arena-allocated game tree for 2-10 player NLHE with
 //! configurable action abstraction per street and per raise depth.
 
 #![allow(clippy::cast_possible_truncation)]
@@ -1838,16 +1838,12 @@ mod tests {
     #[timed_test]
     fn try_add_sized_action_skips_allin_equivalent() {
         let state = BuildState {
-            stacks: [
-                Chips(10.0),
-                Chips(100.0),
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-            ],
+            stacks: {
+                let mut stacks = [Chips::ZERO; MAX_PLAYERS];
+                stacks[0] = Chips(10.0);
+                stacks[1] = Chips(100.0);
+                stacks
+            },
             street_bets: [Chips::ZERO; MAX_PLAYERS],
             contributions: [Chips::ZERO; MAX_PLAYERS],
             active: PlayerSet::all(2),
@@ -1873,16 +1869,12 @@ mod tests {
     #[timed_test]
     fn try_add_sized_action_adds_valid_size() {
         let state = BuildState {
-            stacks: [
-                Chips(100.0),
-                Chips(100.0),
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-            ],
+            stacks: {
+                let mut stacks = [Chips::ZERO; MAX_PLAYERS];
+                stacks[0] = Chips(100.0);
+                stacks[1] = Chips(100.0);
+                stacks
+            },
             street_bets: [Chips::ZERO; MAX_PLAYERS],
             contributions: [Chips::ZERO; MAX_PLAYERS],
             active: PlayerSet::all(2),
@@ -1908,16 +1900,12 @@ mod tests {
     #[timed_test]
     fn try_add_sized_action_skips_duplicate() {
         let state = BuildState {
-            stacks: [
-                Chips(100.0),
-                Chips(100.0),
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-                Chips::ZERO,
-            ],
+            stacks: {
+                let mut stacks = [Chips::ZERO; MAX_PLAYERS];
+                stacks[0] = Chips(100.0);
+                stacks[1] = Chips(100.0);
+                stacks
+            },
             street_bets: [Chips::ZERO; MAX_PLAYERS],
             contributions: [Chips::ZERO; MAX_PLAYERS],
             active: PlayerSet::all(2),

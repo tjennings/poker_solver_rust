@@ -83,7 +83,7 @@ cargo run -p poker-solver-trainer --release -- train-blueprint \
 
 ### train-blueprint-mp
 
-Train a multiplayer (2-8 player) blueprint strategy using external-sampling MCCFR.
+Train a multiplayer (2-10 player) blueprint strategy using external-sampling MCCFR.
 
 ```bash
 cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
@@ -212,7 +212,7 @@ snapshots:
 
 | Feature | `train-blueprint` (v2) | `train-blueprint-mp` |
 |---------|----------------------|---------------------|
-| Players | 2 only | 2-8 |
+| Players | 2 only | 2-10 |
 | Blind structure | `small_blind` + `big_blind` fields | Per-seat `blinds` list with types |
 | Bet sizing | Per-street, indexed by raise depth | Lead/raise split per street |
 | Info key | 64-bit, 6 action slots | 128-bit, 22 action slots |

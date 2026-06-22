@@ -150,21 +150,28 @@ mod tests {
     use super::*;
     use test_macros::timed_test;
 
+    fn contributions(values: &[f64]) -> [Chips; MAX_PLAYERS] {
+        let mut out = [Chips::ZERO; MAX_PLAYERS];
+        for (idx, value) in values.iter().copied().enumerate() {
+            out[idx] = Chips(value);
+        }
+        out
+    }
+
+    fn ranks(values: &[u32]) -> [u32; MAX_PLAYERS] {
+        let mut out = [0; MAX_PLAYERS];
+        for (idx, value) in values.iter().copied().enumerate() {
+            out[idx] = value;
+        }
+        out
+    }
+
     // ---------- resolve_fold tests ----------
 
     #[timed_test]
     fn fold_last_standing_3_player() {
         // 3 players each put in 10, P2 wins
-        let contribs = [
-            Chips(10.0),
-            Chips(10.0),
-            Chips(10.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
+        let contribs = contributions(&[10.0, 10.0, 10.0]);
         let payoffs = resolve_fold(contribs, Seat::from_raw(2), 3);
         assert_eq!(payoffs[0], Chips(-10.0));
         assert_eq!(payoffs[1], Chips(-10.0));
@@ -178,16 +185,7 @@ mod tests {
     #[timed_test]
     fn fold_payoffs_sum_to_zero() {
         // 4 players, arbitrary contributions
-        let contribs = [
-            Chips(15.0),
-            Chips(25.0),
-            Chips(5.0),
-            Chips(55.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
+        let contribs = contributions(&[15.0, 25.0, 5.0, 55.0]);
         let payoffs = resolve_fold(contribs, Seat::from_raw(1), 4);
         let sum: f64 = payoffs.iter().map(|c| c.0).sum();
         assert!(sum.abs() < 1e-9, "fold payoffs must sum to zero, got {sum}");
@@ -199,16 +197,7 @@ mod tests {
     fn fold_payoffs_include_blind_contributions() {
         // With BB=2 chips, the small blind is 1 chip (0.5bb) and the
         // big blind is 2 chips (1bb). Folding loses posted blind money.
-        let contribs = [
-            Chips(1.0),
-            Chips(2.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
+        let contribs = contributions(&[1.0, 2.0]);
 
         let sb_folds = resolve_fold(contribs, Seat::from_raw(1), 2);
         assert_eq!(sb_folds[0], Chips(-1.0));
@@ -224,17 +213,8 @@ mod tests {
     #[timed_test]
     fn showdown_no_side_pots() {
         // 3 players, equal contributions, P0 has best hand
-        let contribs = [
-            Chips(50.0),
-            Chips(50.0),
-            Chips(50.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [100, 50, 30, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[50.0, 50.0, 50.0]);
+        let ranks = ranks(&[100, 50, 30]);
         let active = PlayerSet::from_bits(0b0000_0111);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
         assert_eq!(payoffs[0], Chips(100.0));
@@ -245,17 +225,8 @@ mod tests {
     #[timed_test]
     fn showdown_with_side_pot() {
         // P0 all-in 30, P1/P2 put in 100. P0 best hand, P1 second best.
-        let contribs = [
-            Chips(30.0),
-            Chips(100.0),
-            Chips(100.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [300, 200, 100, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[30.0, 100.0, 100.0]);
+        let ranks = ranks(&[300, 200, 100]);
         let active = PlayerSet::from_bits(0b0000_0111);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
         assert_eq!(payoffs[0], Chips(60.0));
@@ -266,17 +237,8 @@ mod tests {
     #[timed_test]
     fn showdown_three_way_side_pots() {
         // P0=20, P1=50, P2=100. P2 has best hand, wins everything.
-        let contribs = [
-            Chips(20.0),
-            Chips(50.0),
-            Chips(100.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [10, 20, 30, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[20.0, 50.0, 100.0]);
+        let ranks = ranks(&[10, 20, 30]);
         let active = PlayerSet::from_bits(0b0000_0111);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
         assert_eq!(payoffs[0], Chips(-20.0));
@@ -287,17 +249,8 @@ mod tests {
     #[timed_test]
     fn showdown_with_rake() {
         // 2 players, 50 each, 5% rake cap 10. P0 wins.
-        let contribs = [
-            Chips(50.0),
-            Chips(50.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [200, 100, 0, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[50.0, 50.0]);
+        let ranks = ranks(&[200, 100]);
         let active = PlayerSet::from_bits(0b0000_0011);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 2, 0.05, Chips(10.0));
         assert!(
@@ -315,17 +268,8 @@ mod tests {
     #[timed_test]
     fn showdown_payoffs_sum_to_negative_rake() {
         // With rake, sum of payoffs = -(total rake taken)
-        let contribs = [
-            Chips(50.0),
-            Chips(50.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [200, 100, 0, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[50.0, 50.0]);
+        let ranks = ranks(&[200, 100]);
         let active = PlayerSet::from_bits(0b0000_0011);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 2, 0.05, Chips(10.0));
         let sum: f64 = payoffs.iter().map(|c| c.0).sum();
@@ -338,17 +282,8 @@ mod tests {
     #[timed_test]
     fn showdown_tie_splits_pot() {
         // 2 players equal hands, each put 50. Both break even.
-        let contribs = [
-            Chips(50.0),
-            Chips(50.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [100, 100, 0, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[50.0, 50.0]);
+        let ranks = ranks(&[100, 100]);
         let active = PlayerSet::from_bits(0b0000_0011);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 2, 0.0, Chips::ZERO);
         assert!(
@@ -366,17 +301,8 @@ mod tests {
     #[timed_test]
     fn showdown_tie_three_way() {
         // 3 players equal hands, equal contributions. All break even.
-        let contribs = [
-            Chips(30.0),
-            Chips(30.0),
-            Chips(30.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [50, 50, 50, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[30.0, 30.0, 30.0]);
+        let ranks = ranks(&[50, 50, 50]);
         let active = PlayerSet::from_bits(0b0000_0111);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
         for i in 0..3 {
@@ -391,17 +317,8 @@ mod tests {
     #[timed_test]
     fn showdown_short_stack_best_hand_wins_main_pot_only() {
         // Short-stack with best hand can only win the main pot.
-        let contribs = [
-            Chips(20.0),
-            Chips(100.0),
-            Chips(100.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [999, 500, 100, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[20.0, 100.0, 100.0]);
+        let ranks = ranks(&[999, 500, 100]);
         let active = PlayerSet::from_bits(0b0000_0111);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
         assert_eq!(payoffs[0], Chips(40.0));
@@ -420,17 +337,8 @@ mod tests {
         // P1 wins main pot (best hand): 90 - 30 = +60
         // P2 wins side pot (only eligible): 80 - 100 = net -20
         // P0 folded: -40
-        let contribs = [
-            Chips(40.0),
-            Chips(30.0),
-            Chips(100.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [0, 999, 500, 0, 0, 0, 0, 0]; // P0 rank irrelevant (folded)
+        let contribs = contributions(&[40.0, 30.0, 100.0]);
+        let ranks = ranks(&[0, 999, 500]); // P0 rank irrelevant (folded)
         let active = PlayerSet::from_bits(0b0000_0110); // P1, P2 active
         let payoffs = resolve_showdown(&contribs, &ranks, active, 3, 0.0, Chips::ZERO);
         // Total pot = 40 + 30 + 100 = 170. Must all be distributed.
@@ -454,17 +362,8 @@ mod tests {
         // Rake 10%, cap 5 chips.
         // Main pot: 30*2 = 60, rake = min(6, 5) = 5, net = 55
         // Side pot: 70*1 = 70, rake = min(7, 0 remaining cap) = 0, net = 70
-        let contribs = [
-            Chips(30.0),
-            Chips(100.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
-        let ranks = [200, 100, 0, 0, 0, 0, 0, 0];
+        let contribs = contributions(&[30.0, 100.0]);
+        let ranks = ranks(&[200, 100]);
         let active = PlayerSet::from_bits(0b0000_0011);
         let payoffs = resolve_showdown(&contribs, &ranks, active, 2, 0.10, Chips(5.0));
         // P0 wins main pot net: 55 - 30 = +25
