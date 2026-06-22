@@ -3441,6 +3441,7 @@ fn make_test_config() -> BlueprintV2Config {
             output_dir: "/tmp/test".to_string(),
             resume: false,
             max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     }
 }

@@ -3725,6 +3725,7 @@ mod tests {
                 output_dir: "/tmp".to_string(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         }
     }
