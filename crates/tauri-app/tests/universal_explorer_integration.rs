@@ -6,25 +6,18 @@
 //! - Part D: MP bundles load without error; HU-only views return clean error for MP
 //! - Part E: universal HU bundles load through the shared _core path
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
-)]
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::path::Path;
 
+use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
+use poker_solver_core::blueprint_universal::{write_bundle, BundleData};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
-use poker_solver_core::blueprint_universal::hu_export::{
-    self, TrainingInfo as HuTrainingInfo,
-};
-use poker_solver_core::blueprint_universal::{
-    BundleData, write_bundle,
-};
 
-use poker_solver_tauri::{ExplorationState, ExplorationPosition};
+use poker_solver_tauri::{ExplorationPosition, ExplorationState};
 use tempfile::TempDir;
 
 // ── Shared helpers ──────────────────────────────────────────────────
@@ -125,9 +118,7 @@ fn tiny_export_config() -> BlueprintV2Config {
     }
 }
 
-fn build_tree_and_strategy(
-    config: &BlueprintV2Config,
-) -> (GameTree, BlueprintV2Strategy) {
+fn build_tree_and_strategy(config: &BlueprintV2Config) -> (GameTree, BlueprintV2Strategy) {
     let tree = GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
@@ -161,7 +152,8 @@ fn write_legacy_bundle(dir: &Path) {
     std::fs::write(
         final_dir.join("metadata.json"),
         r#"{"iteration": 100, "elapsed_minutes": 5}"#,
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 /// Export a universal HU bundle (with retained config.yaml).
@@ -173,10 +165,8 @@ fn write_universal_hu_bundle(dir: &Path) {
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .expect("export should succeed");
+    let output = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training)
+        .expect("export should succeed");
     write_bundle(
         dir,
         &output.manifest,
@@ -208,11 +198,9 @@ async fn universal_hu_renders_identically_to_legacy() {
     .expect("legacy bundle should load");
 
     let legacy_pos = ExplorationPosition::default();
-    let legacy_actions = poker_solver_tauri::get_available_actions_core(
-        &legacy_state,
-        legacy_pos.clone(),
-    )
-    .expect("legacy get_available_actions should succeed");
+    let legacy_actions =
+        poker_solver_tauri::get_available_actions_core(&legacy_state, legacy_pos.clone())
+            .expect("legacy get_available_actions should succeed");
 
     let legacy_matrix = poker_solver_tauri::get_strategy_matrix_core(
         &legacy_state,
@@ -239,11 +227,9 @@ async fn universal_hu_renders_identically_to_legacy() {
     .expect("universal bundle should load");
 
     let univ_pos = ExplorationPosition::default();
-    let univ_actions = poker_solver_tauri::get_available_actions_core(
-        &univ_state,
-        univ_pos.clone(),
-    )
-    .expect("universal get_available_actions should succeed");
+    let univ_actions =
+        poker_solver_tauri::get_available_actions_core(&univ_state, univ_pos.clone())
+            .expect("universal get_available_actions should succeed");
 
     let univ_matrix = poker_solver_tauri::get_strategy_matrix_core(
         &univ_state,
@@ -270,7 +256,10 @@ async fn universal_hu_renders_identically_to_legacy() {
     // Same action IDs.
     for (i, (la, ua)) in legacy_actions.iter().zip(univ_actions.iter()).enumerate() {
         assert_eq!(la.id, ua.id, "action id mismatch at index {i}");
-        assert_eq!(la.action_type, ua.action_type, "action type mismatch at {i}");
+        assert_eq!(
+            la.action_type, ua.action_type,
+            "action type mismatch at {i}"
+        );
     }
 
     // Same stack depth and info sets.
@@ -327,12 +316,10 @@ async fn universal_hu_loads_through_load_bundle_core() {
     write_universal_hu_bundle(dir.path());
 
     let state = ExplorationState::default();
-    let info = poker_solver_tauri::load_bundle_core(
-        &state,
-        dir.path().to_string_lossy().to_string(),
-    )
-    .await
-    .expect("universal HU bundle should load via load_bundle_core");
+    let info =
+        poker_solver_tauri::load_bundle_core(&state, dir.path().to_string_lossy().to_string())
+            .await
+            .expect("universal HU bundle should load via load_bundle_core");
 
     assert!(info.stack_depth > 0, "stack_depth should be positive");
     assert!(info.info_sets > 0, "info_sets should be positive");
@@ -344,17 +331,15 @@ async fn universal_hu_loads_through_load_bundle_core() {
 use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
+use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
-use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
-use poker_solver_core::blueprint_mp::sparse_storage::{
-    MpInfosetKey, SparseSnapshotEntry,
-};
 use poker_solver_core::blueprint_mp::Street as MpStreet;
+use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, Seat, MAX_PLAYERS};
 use poker_solver_core::blueprint_universal::mp_eager_export::{
     self, MpTrainingInfo as MpEagerTrainingInfo,
 };
 use poker_solver_core::blueprint_universal::mp_lazy_export::{
-    self, LazyTrainingInfo, LazyExportConfig,
+    self, LazyExportConfig, LazyTrainingInfo,
 };
 
 const MP_BUCKET_COUNTS: [u16; 4] = [10, 10, 10, 10];
@@ -392,10 +377,18 @@ fn build_3p_config() -> BlueprintMpConfig {
         river: empty,
     };
     let clustering = MpClusteringConfig {
-        preflop: MpStreetCluster { buckets: MP_BUCKET_COUNTS[0] },
-        flop: MpStreetCluster { buckets: MP_BUCKET_COUNTS[1] },
-        turn: MpStreetCluster { buckets: MP_BUCKET_COUNTS[2] },
-        river: MpStreetCluster { buckets: MP_BUCKET_COUNTS[3] },
+        preflop: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[0],
+        },
+        flop: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[1],
+        },
+        turn: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[2],
+        },
+        river: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[3],
+        },
     };
     let training = MpTrainingConfig {
         backend: MpTrainingBackend::Eager,
@@ -439,9 +432,7 @@ fn build_3p_config() -> BlueprintMpConfig {
     }
 }
 
-fn trivial_buckets(
-    deal: &poker_solver_core::blueprint_mp::Deal,
-) -> DealWithBuckets {
+fn trivial_buckets(deal: &poker_solver_core::blueprint_mp::Deal) -> DealWithBuckets {
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
     for seat in 0..deal.num_players as usize {
         let card_idx = deal.hole_cards[seat][0].value as u16;
@@ -464,8 +455,16 @@ fn run_mp_iterations(tree: &MpGameTree, storage: &MpStorage, count: u64) {
         let buckets = trivial_buckets(&deal);
         for seat in 0..n {
             traverse_external(
-                tree, storage, &buckets, Seat::from_raw(seat),
-                tree.root, &mut rng, 0.0, Chips::ZERO, false, 0,
+                tree,
+                storage,
+                &buckets,
+                Seat::from_raw(seat),
+                tree.root,
+                &mut rng,
+                0.0,
+                Chips::ZERO,
+                false,
+                0,
             );
         }
     }
@@ -482,10 +481,9 @@ fn write_mp_eager_bundle(dir: &Path) {
         iterations: 200,
         elapsed_minutes: 0.1,
     };
-    let output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .expect("mp export should succeed");
+    let output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .expect("mp export should succeed");
 
     write_bundle(
         dir,
@@ -501,17 +499,20 @@ fn write_mp_eager_bundle(dir: &Path) {
 
 /// Write a universal MP lazy bundle.
 fn write_mp_lazy_bundle(dir: &Path) {
-    let entries = vec![
-        SparseSnapshotEntry {
-            key: MpInfosetKey::from_street_bucket(
-                Seat::from_raw(0), MpStreet::Preflop, 5,
-                0x1234, 0x5678, 0xAAAA, 4,
-            ),
-            num_actions: 3,
-            regrets: vec![10, -5, 3],
-            strategy_sums: vec![100, 200, 300],
-        },
-    ];
+    let entries = vec![SparseSnapshotEntry {
+        key: MpInfosetKey::from_street_bucket(
+            Seat::from_raw(0),
+            MpStreet::Preflop,
+            5,
+            0x1234,
+            0x5678,
+            0xAAAA,
+            4,
+        ),
+        num_actions: 3,
+        regrets: vec![10, -5, 3],
+        strategy_sums: vec![100, 200, 300],
+    }];
     let config = LazyExportConfig {
         num_players: 6,
         stack_depth: 100.0,
@@ -523,9 +524,7 @@ fn write_mp_lazy_bundle(dir: &Path) {
         iterations: 100,
         elapsed_minutes: 1.0,
     };
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     mp_lazy_export::write_lazy_bundle(dir, &output).unwrap();
 }
 
@@ -550,10 +549,9 @@ fn list_blueprints_detects_universal_and_legacy() {
     std::fs::create_dir_all(&univ_mp).unwrap();
     write_mp_eager_bundle(&univ_mp);
 
-    let entries = poker_solver_tauri::list_blueprints_core(
-        base.path().to_string_lossy().to_string(),
-    )
-    .expect("listing should succeed");
+    let entries =
+        poker_solver_tauri::list_blueprints_core(base.path().to_string_lossy().to_string())
+            .expect("listing should succeed");
 
     // Should find at least legacy_hu and universal_hu.
     // Note: list_blueprints_core detects config.yaml and blueprint.json.
@@ -582,12 +580,10 @@ async fn mp_eager_bundle_loads_and_provides_bundle_info() {
     write_mp_eager_bundle(dir.path());
 
     let state = ExplorationState::default();
-    let info = poker_solver_tauri::load_bundle_core(
-        &state,
-        dir.path().to_string_lossy().to_string(),
-    )
-    .await
-    .expect("MP eager bundle should load without error");
+    let info =
+        poker_solver_tauri::load_bundle_core(&state, dir.path().to_string_lossy().to_string())
+            .await
+            .expect("MP eager bundle should load without error");
 
     // Bundle info should report the MP kind.
     assert!(info.info_sets > 0, "info_sets should be positive");
@@ -605,12 +601,10 @@ async fn mp_lazy_bundle_loads_and_provides_bundle_info() {
     write_mp_lazy_bundle(dir.path());
 
     let state = ExplorationState::default();
-    let _info = poker_solver_tauri::load_bundle_core(
-        &state,
-        dir.path().to_string_lossy().to_string(),
-    )
-    .await
-    .expect("MP lazy bundle should load without error");
+    let _info =
+        poker_solver_tauri::load_bundle_core(&state, dir.path().to_string_lossy().to_string())
+            .await
+            .expect("MP lazy bundle should load without error");
 
     assert!(poker_solver_tauri::is_bundle_loaded_core(&state));
 
@@ -625,22 +619,14 @@ async fn mp_bundle_hu_views_return_clean_error() {
     write_mp_eager_bundle(dir.path());
 
     let state = ExplorationState::default();
-    poker_solver_tauri::load_bundle_core(
-        &state,
-        dir.path().to_string_lossy().to_string(),
-    )
-    .await
-    .expect("MP eager bundle should load");
+    poker_solver_tauri::load_bundle_core(&state, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("MP eager bundle should load");
 
     // Strategy matrix should return a clean error, not panic.
     let pos = ExplorationPosition::default();
-    let result = poker_solver_tauri::get_strategy_matrix_core(
-        &state,
-        pos.clone(),
-        None,
-        None,
-        None,
-    );
+    let result =
+        poker_solver_tauri::get_strategy_matrix_core(&state, pos.clone(), None, None, None);
     assert!(result.is_err());
     assert!(
         result
@@ -652,21 +638,14 @@ async fn mp_bundle_hu_views_return_clean_error() {
     // Available actions should also return a clean error.
     let result = poker_solver_tauri::get_available_actions_core(&state, pos);
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("MP browsing not yet supported"),
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("MP browsing not yet supported"),);
 
     // Preflop ranges should also return a clean error.
-    let result = poker_solver_tauri::get_preflop_ranges_core(
-        &state,
-        vec!["c".to_string()],
-    );
+    let result = poker_solver_tauri::get_preflop_ranges_core(&state, vec!["c".to_string()]);
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("MP browsing not yet supported"),
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("MP browsing not yet supported"),);
 }

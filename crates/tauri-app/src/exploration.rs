@@ -338,10 +338,7 @@ fn has_universal_sentinel(dir: &Path) -> bool {
 }
 
 /// Find the latest `snapshot_NNNN/` subdir containing a given file.
-fn find_latest_snapshot_with_file(
-    dir: &Path,
-    file_name: &str,
-) -> Option<PathBuf> {
+fn find_latest_snapshot_with_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut snapshots: Vec<_> = entries
         .filter_map(Result::ok)
@@ -598,15 +595,11 @@ async fn load_universal_bundle_core(
     .map_err(|e| format!("Load task panicked: {e}"))??;
 
     match loaded.kind() {
-        BundleKind::UniversalHu => {
-            load_universal_hu(state, loaded, bundle_path)
-        }
+        BundleKind::UniversalHu => load_universal_hu(state, loaded, bundle_path),
         BundleKind::UniversalMpEager | BundleKind::UniversalMpLazy => {
             load_universal_mp(state, loaded)
         }
-        BundleKind::LegacyHu => {
-            Err("Unexpected LegacyHu from universal loader".into())
-        }
+        BundleKind::LegacyHu => Err("Unexpected LegacyHu from universal loader".into()),
     }
 }
 
@@ -626,9 +619,7 @@ fn load_universal_hu(
     let decision_map = tree.decision_index_map();
     let (decision_nodes, _, _) = tree.node_counts();
 
-    let strategy = reconstruct_hu_strategy(
-        &config, &tree, &decision_map, &loaded,
-    )?;
+    let strategy = reconstruct_hu_strategy(&config, &tree, &decision_map, &loaded)?;
 
     let info = BundleInfo {
         name: Some(config.game.name.clone()),
@@ -660,9 +651,7 @@ fn load_universal_hu(
 /// Load the retained `config.yaml` from a universal bundle directory.
 ///
 /// Checks: bundle root, `final/`, then latest `snapshot_NNNN/`.
-fn load_retained_hu_config(
-    bundle_path: &Path,
-) -> Result<BlueprintV2Config, String> {
+fn load_retained_hu_config(bundle_path: &Path) -> Result<BlueprintV2Config, String> {
     let candidates = [
         bundle_path.join("config.yaml"),
         bundle_path.join("final/config.yaml"),
@@ -674,8 +663,7 @@ fn load_retained_hu_config(
         }
     }
     // Check snapshot dirs.
-    if let Some(snap) = find_latest_snapshot_with_file(bundle_path, "config.yaml")
-    {
+    if let Some(snap) = find_latest_snapshot_with_file(bundle_path, "config.yaml") {
         return v2_bundle::load_config(&snap)
             .map_err(|e| format!("Failed to load retained config.yaml: {e}"));
     }
@@ -765,7 +753,10 @@ fn reconstruct_hu_strategy(
     }
 
     Ok(BlueprintV2Strategy::from_raw_with_tree(
-        action_probs, bucket_counts, loaded.iterations(), tree,
+        action_probs,
+        bucket_counts,
+        loaded.iterations(),
+        tree,
     ))
 }
 
@@ -792,7 +783,9 @@ fn mp_bundle_info(
     let game = &manifest.game;
     BundleInfo {
         name: Some(format!("MP {kind} ({}-player)", game.num_players)),
-        stack_depth: game.seats.first()
+        stack_depth: game
+            .seats
+            .first()
             .map(|s| s.starting_stack as u32)
             .unwrap_or(0),
         bet_sizes: vec![],
@@ -806,13 +799,8 @@ fn mp_bundle_info(
 }
 
 /// Load a universal MP bundle into the read-only `UniversalMp` source.
-fn load_universal_mp(
-    state: &ExplorationState,
-    loaded: LoadedBundle,
-) -> Result<BundleInfo, String> {
-    let manifest = loaded.manifest().ok_or(
-        "MP bundle missing manifest"
-    )?;
+fn load_universal_mp(state: &ExplorationState, loaded: LoadedBundle) -> Result<BundleInfo, String> {
+    let manifest = loaded.manifest().ok_or("MP bundle missing manifest")?;
     let info = mp_bundle_info(manifest, loaded.kind(), loaded.iterations());
 
     *state.source.write() = Some(StrategySource::UniversalMp {
@@ -1051,9 +1039,7 @@ fn try_make_universal_entry(dir: &Path) -> Option<BlueprintListEntry> {
         kind,
     );
 
-    let stack_depth = game.seats.first()
-        .map(|s| s.starting_stack)
-        .unwrap_or(0.0);
+    let stack_depth = game.seats.first().map(|s| s.starting_stack).unwrap_or(0.0);
 
     Some(BlueprintListEntry {
         name,
@@ -1066,13 +1052,8 @@ fn try_make_universal_entry(dir: &Path) -> Option<BlueprintListEntry> {
 
 /// Read a manifest cheaply from the first `blueprint.json` found
 /// (checking final/, root, then snapshot_NNNN/).
-fn read_manifest_cheaply(
-    dir: &Path,
-) -> Option<poker_solver_core::blueprint_universal::Manifest> {
-    let candidates = [
-        dir.join("final/blueprint.json"),
-        dir.join("blueprint.json"),
-    ];
+fn read_manifest_cheaply(dir: &Path) -> Option<poker_solver_core::blueprint_universal::Manifest> {
+    let candidates = [dir.join("final/blueprint.json"), dir.join("blueprint.json")];
     for c in &candidates {
         if let Ok(text) = std::fs::read_to_string(c) {
             if let Ok(m) = serde_json::from_str(&text) {
@@ -1111,8 +1092,8 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
                 return None;
             }
             let snap_dir = e.path();
-            let has_strategy = snap_dir.join("strategy.bin").exists()
-                || snap_dir.join("blueprint.json").exists();
+            let has_strategy =
+                snap_dir.join("strategy.bin").exists() || snap_dir.join("blueprint.json").exists();
 
             // Try to read metadata.json for iteration count and elapsed time.
             let (iterations, elapsed_minutes) =
@@ -1222,9 +1203,7 @@ pub fn get_strategy_matrix_core(
                 hand_evs.as_deref(),
             )
         }
-        StrategySource::UniversalMp { .. } => {
-            Err("MP browsing not yet supported".to_string())
-        }
+        StrategySource::UniversalMp { .. } => Err("MP browsing not yet supported".to_string()),
     }
 }
 
@@ -2074,9 +2053,7 @@ pub fn get_available_actions_core(
             &agent.game.bet_sizes,
             &position,
         )),
-        StrategySource::UniversalMp { .. } => {
-            Err("MP browsing not yet supported".to_string())
-        }
+        StrategySource::UniversalMp { .. } => Err("MP browsing not yet supported".to_string()),
     }
 }
 
@@ -3198,9 +3175,11 @@ pub fn get_preflop_ranges_core(
             decision_map,
             ..
         } => (config, strategy, tree, decision_map),
-        _ => return Err("get_preflop_ranges requires a BlueprintV2 source \
+        _ => {
+            return Err("get_preflop_ranges requires a BlueprintV2 source \
                          (MP browsing not yet supported)"
-            .to_string()),
+                .to_string())
+        }
     };
 
     // 169-element weight arrays for both players, initialized to 1.0.
@@ -4517,7 +4496,10 @@ mod tests {
                 antes: vec![],
                 straddles: vec![],
                 stack_units: "chips".into(),
-                rake: RakeConfig { rate: rake_rate, cap: rake_cap },
+                rake: RakeConfig {
+                    rate: rake_rate,
+                    cap: rake_cap,
+                },
                 max_flop_players: None,
             },
             training: TrainingMetadata {
@@ -4566,11 +4548,7 @@ mod tests {
         use poker_solver_core::blueprint_universal::BundleKind;
 
         let manifest = stub_mp_manifest(6, 200.0, 5000, 0.05, 3.0);
-        let info = mp_bundle_info(
-            &manifest,
-            BundleKind::UniversalMpEager,
-            42_000,
-        );
+        let info = mp_bundle_info(&manifest, BundleKind::UniversalMpEager, 42_000);
 
         assert_eq!(
             info.name.as_deref(),
@@ -4593,11 +4571,7 @@ mod tests {
         let mut manifest = stub_mp_manifest(3, 100.0, 100, 0.0, 0.0);
         manifest.game.seats.clear();
 
-        let info = mp_bundle_info(
-            &manifest,
-            BundleKind::UniversalMpLazy,
-            0,
-        );
+        let info = mp_bundle_info(&manifest, BundleKind::UniversalMpLazy, 0);
 
         assert_eq!(info.stack_depth, 0);
         assert_eq!(
