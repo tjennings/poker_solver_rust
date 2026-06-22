@@ -17,6 +17,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::info_key::SEAT_CAPACITY;
 use super::{MAX_PLAYERS, Seat, Street};
 
 const DEFAULT_SHARDS: usize = 4096;
@@ -71,6 +72,11 @@ impl MpInfosetKey {
     }
 
     /// Create a key from a global abstract-bucket id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seat.index() >= SEAT_CAPACITY` (exceeds the packed
+    /// seat field shared with `InfoKey128`).
     #[must_use]
     pub const fn from_parts(
         seat: Seat,
@@ -80,6 +86,10 @@ impl MpInfosetKey {
         history_hash: u64,
         history_len: u16,
     ) -> Self {
+        assert!(
+            seat.index() < SEAT_CAPACITY,
+            "seat exceeds packed seat capacity"
+        );
         Self {
             seat: seat.index(),
             bucket,
@@ -2161,5 +2171,64 @@ mod tests {
         assert_eq!(restored.get_regret(key(4), 1), 0);
         assert_eq!(restored.get_strategy_sum(key(4), 0), 0);
         assert_eq!(restored.get_strategy_sum(key(4), 1), 55);
+    }
+
+    // ── MpInfosetKey seat guard tests ──
+
+    #[timed_test]
+    fn mp_infoset_key_seats_0_through_15() {
+        for s in 0..=15u8 {
+            let k = MpInfosetKey::from_parts(
+                Seat::from_raw(s),
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(k.seat, s, "seat {s} not stored correctly");
+        }
+    }
+
+    #[timed_test]
+    #[should_panic(expected = "seat capacity")]
+    fn mp_infoset_key_seat_16_panics() {
+        let _ = MpInfosetKey::from_parts(
+            Seat::from_raw(16),
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+
+    #[timed_test]
+    #[should_panic(expected = "seat capacity")]
+    fn mp_infoset_key_from_street_bucket_seat_overflow_panics() {
+        let _ = MpInfosetKey::from_street_bucket(
+            Seat::from_raw(16),
+            Street::Flop,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+
+    #[timed_test]
+    fn mp_infoset_key_seat_9_works() {
+        let k = MpInfosetKey::from_street_bucket(
+            Seat::from_raw(9),
+            Street::Turn,
+            100,
+            0xAA,
+            0xBB,
+            0xCC,
+            4,
+        );
+        assert_eq!(k.seat, 9);
+        assert_eq!(k.seat(), Seat::from_raw(9));
     }
 }
