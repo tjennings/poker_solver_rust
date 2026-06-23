@@ -4,6 +4,7 @@ pub mod config;
 pub mod evaluator;
 pub mod game;
 pub mod harness;
+pub mod hu_mp_lazy;
 pub mod metrics;
 pub mod reporter;
 pub mod solver_trait;
