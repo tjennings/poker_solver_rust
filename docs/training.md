@@ -118,7 +118,9 @@ universal dense format. The command auto-detects the snapshot kind from
   explicit acting seat; probabilities pass through bitwise from the
   snapshot's projected `strategy.bin`.
 - **`blueprint_mp_lazy_sparse`** (lazy): Rows use the `mp_semantic`
-  namespace with opaque actions and a semantic key side table. The bundle
+  namespace with a semantic key side table. Rows realized by lazy traversal
+  export concrete action descriptors from stored sparse action identity;
+  synthetic rows without identity fall back to opaque actions. The bundle
   declares `mp_semantic_rows_v1` as a required feature and is marked
   non-resumable (analysis-only). Missing row policy is `uniform_legal`.
 

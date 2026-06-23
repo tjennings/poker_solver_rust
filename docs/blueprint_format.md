@@ -220,13 +220,20 @@ reference the side table and work exactly as before.
 | 0    | None (HU and MP eager rows) |
 | 1    | MP history v1 (side table record) |
 
-### Opaque Action Kind
+### Lazy MP Action Identity
 
-Lazy MP rows carry only `num_actions`; individual action semantics are not
-recoverable from the snapshot. These rows use action kind `Opaque` (7),
-gated by `mp_semantic_rows_v1`. Each action has `amount_chips = 0`, empty
-`size_key`/`label`, `is_aggressive = false`, and `source_action_index`
-set to the per-row action index used by the trainer.
+Realized lazy MP sparse rows persist compact action identity when the row is
+materialized during traversal. Exports convert that stored identity into the
+normal action descriptor kinds (`Fold`, `Check`, `Call`, `Bet`, `Raise`,
+`AllInCall`, and `AllInBetRaise`) with chip amounts, labels, aggression flags,
+and the original per-row source action index. Hash-only long histories
+therefore do not need to be replayed to recover action semantics.
+
+Rows without stored action identity, such as synthetic fixtures or older manual
+entries, use the safe fallback action kind `Opaque` (7), gated by
+`mp_semantic_rows_v1`. Each fallback action has `amount_chips = 0`, empty
+`size_key`/`label`, `is_aggressive = false`, and `source_action_index` set to
+the per-row action index used by the trainer.
 
 ## Action Descriptors
 

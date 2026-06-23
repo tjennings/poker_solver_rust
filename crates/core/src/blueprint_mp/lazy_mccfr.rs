@@ -19,7 +19,9 @@ use super::config::{
 };
 use super::game_tree::{TerminalKind, TreeAction};
 use super::mccfr::{PruneStats, terminal_value};
-use super::sparse_storage::{MpInfosetKey, SparseMpStorage};
+use super::sparse_storage::{
+    MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseMpStorage,
+};
 use super::storage::{REGRET_SCALE, STRATEGY_SCALE};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat, Street};
 use crate::poker::Card;
@@ -897,6 +899,7 @@ fn traverse_traverser(
 ) -> (f64, PruneStats) {
     let num_actions = actions.len();
     debug_assert!(num_actions <= MAX_ACTIONS);
+    storage.record_actions(key, &sparse_action_descriptors(&state, actions));
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
@@ -1019,6 +1022,7 @@ fn traverse_opponent(
 ) -> (f64, PruneStats) {
     let num_actions = actions.len();
     debug_assert!(num_actions <= MAX_ACTIONS);
+    storage.record_actions(key, &sparse_action_descriptors(&state, actions));
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
@@ -1091,6 +1095,45 @@ fn update_strategy_sums(
             continue;
         }
         storage.add_strategy_sum(key, num_actions, action_idx, delta);
+    }
+}
+
+fn sparse_action_descriptors(
+    state: &LazyPublicState,
+    actions: &[TreeAction],
+) -> Vec<SparseActionDescriptor> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(idx, action)| {
+            let (kind, amount_chips) = match *action {
+                TreeAction::Fold => (SparseActionKind::Fold, 0),
+                TreeAction::Check => (SparseActionKind::Check, 0),
+                TreeAction::Call => (SparseActionKind::Call, 0),
+                TreeAction::Lead(amount) => (SparseActionKind::Lead, action_amount_chips(amount)),
+                TreeAction::Raise(amount) => (SparseActionKind::Raise, action_amount_chips(amount)),
+                TreeAction::AllIn if action_increments_raise_count(state, *action) => {
+                    (SparseActionKind::AllInBetRaise, 0)
+                }
+                TreeAction::AllIn => (SparseActionKind::AllInCall, 0),
+            };
+            SparseActionDescriptor {
+                kind,
+                amount_chips,
+                source_action_index: idx as u16,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn action_amount_chips(amount: f64) -> u32 {
+    if amount <= 0.0 {
+        0
+    } else if amount >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        amount.round() as u32
     }
 }
 
@@ -2291,6 +2334,24 @@ mod tests {
         let actions = game.actions(&state);
 
         assert_eq!(actions, vec![TreeAction::Fold, TreeAction::AllIn]);
+    }
+
+    #[timed_test]
+    fn lazy_sparse_action_identity_marks_all_in_call() {
+        let state = river_spr_zero_state(true, 50.0, 50.0);
+
+        let descriptors = sparse_action_descriptors(&state, &[TreeAction::Fold, TreeAction::AllIn]);
+
+        assert_eq!(descriptors[1].kind, SparseActionKind::AllInCall);
+    }
+
+    #[timed_test]
+    fn lazy_sparse_action_identity_marks_all_in_bet_raise() {
+        let state = postflop_audit_state(Street::Flop, true, 1);
+
+        let descriptors = sparse_action_descriptors(&state, &[TreeAction::Fold, TreeAction::AllIn]);
+
+        assert_eq!(descriptors[1].kind, SparseActionKind::AllInBetRaise);
     }
 
     #[timed_test]

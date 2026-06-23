@@ -9,17 +9,12 @@
 //! - MP eager: load and query matches exporter output
 //! - MP lazy: load and query matches lazy normalization
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
-)]
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
 use poker_solver_core::blueprint_universal::{
-    ActionKind, BundleData, BundleKind, LoaderError, MpLazyKey,
-    detect_bundle_kind, load_bundle, write_bundle,
-};
-use poker_solver_core::blueprint_universal::hu_export::{
-    self, TrainingInfo as HuTrainingInfo,
+    ActionKind, BundleData, BundleKind, LoaderError, MpLazyKey, detect_bundle_kind, load_bundle,
+    write_bundle,
 };
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
@@ -27,8 +22,8 @@ use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 
 use rand::SeedableRng;
-use tempfile::TempDir;
 use std::path::Path;
+use tempfile::TempDir;
 
 // ── Shared helpers (reused from hu_universal_export.rs pattern) ────────
 
@@ -128,9 +123,7 @@ fn tiny_export_config() -> BlueprintV2Config {
     }
 }
 
-fn build_test_tree_and_strategy(
-    config: &BlueprintV2Config,
-) -> (GameTree, BlueprintV2Strategy) {
+fn build_test_tree_and_strategy(config: &BlueprintV2Config) -> (GameTree, BlueprintV2Strategy) {
     let tree = GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
@@ -175,10 +168,8 @@ fn write_universal_hu_bundle(dir: &Path) -> (BlueprintV2Config, GameTree, Bluepr
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .expect("export should succeed");
+    let output = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training)
+        .expect("export should succeed");
 
     write_bundle(
         dir,
@@ -351,7 +342,10 @@ fn load_missing_payload_file_error() {
     let err = load_bundle(tmp.path()).unwrap_err();
     // Should be either MissingPayloadFile (from detection) or Format (from reader)
     assert!(
-        matches!(err, LoaderError::MissingPayloadFile { .. } | LoaderError::Format(..)),
+        matches!(
+            err,
+            LoaderError::MissingPayloadFile { .. } | LoaderError::Format(..)
+        ),
         "expected MissingPayloadFile or Format error, got {err:?}"
     );
 }
@@ -374,7 +368,8 @@ fn load_legacy_hu_and_query() {
         .position(|&d| d == 0)
         .expect("should have decision node 0");
 
-    let view = bundle.query_hu(first_decision_arena_idx as u32, 0)
+    let view = bundle
+        .query_hu(first_decision_arena_idx as u32, 0)
         .expect("should find the infoset");
     let legacy_probs = strategy.get_action_probs(0, 0);
     assert_eq!(view.probs.len(), legacy_probs.len());
@@ -400,7 +395,8 @@ fn load_universal_hu_and_query() {
         .position(|&d| d == 0)
         .expect("should have decision node 0");
 
-    let view = bundle.query_hu(first_decision_arena_idx as u32, 0)
+    let view = bundle
+        .query_hu(first_decision_arena_idx as u32, 0)
         .expect("should find the infoset");
     let legacy_probs = strategy.get_action_probs(0, 0);
     assert_eq!(view.probs.len(), legacy_probs.len());
@@ -494,16 +490,22 @@ use poker_solver_core::blueprint_mp::game_tree::*;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
 use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
-use poker_solver_core::blueprint_universal::mp_eager_export::{
-    self, MpTrainingInfo,
-};
+use poker_solver_core::blueprint_universal::mp_eager_export::{self, MpTrainingInfo};
 
 const MP_BUCKET_COUNTS: [u16; 4] = [10, 10, 10, 10];
 
 fn three_player_blinds() -> Vec<ForcedBet> {
     vec![
-        ForcedBet { seat: 1, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-        ForcedBet { seat: 2, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+        ForcedBet {
+            seat: 1,
+            kind: ForcedBetKind::SmallBlind,
+            amount: 1.0,
+        },
+        ForcedBet {
+            seat: 2,
+            kind: ForcedBetKind::BigBlind,
+            amount: 2.0,
+        },
     ]
 }
 
@@ -517,7 +519,10 @@ fn build_3p_config() -> BlueprintMpConfig {
         rake_rate: 0.0,
         rake_cap: 0.0,
     };
-    let empty = MpStreetSizes { lead: vec![], raise: vec![] };
+    let empty = MpStreetSizes {
+        lead: vec![],
+        raise: vec![],
+    };
     let action = MpActionAbstractionConfig {
         max_flop_players: None,
         preflop: empty.clone(),
@@ -526,10 +531,18 @@ fn build_3p_config() -> BlueprintMpConfig {
         river: empty,
     };
     let clustering = MpClusteringConfig {
-        preflop: MpStreetCluster { buckets: MP_BUCKET_COUNTS[0] },
-        flop: MpStreetCluster { buckets: MP_BUCKET_COUNTS[1] },
-        turn: MpStreetCluster { buckets: MP_BUCKET_COUNTS[2] },
-        river: MpStreetCluster { buckets: MP_BUCKET_COUNTS[3] },
+        preflop: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[0],
+        },
+        flop: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[1],
+        },
+        turn: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[2],
+        },
+        river: MpStreetCluster {
+            buckets: MP_BUCKET_COUNTS[3],
+        },
     };
     let training = MpTrainingConfig {
         backend: MpTrainingBackend::Eager,
@@ -564,12 +577,16 @@ fn build_3p_config() -> BlueprintMpConfig {
         max_snapshots: None,
         format: MpSnapshotFormat::Legacy,
     };
-    BlueprintMpConfig { game, action_abstraction: action, clustering, training, snapshots }
+    BlueprintMpConfig {
+        game,
+        action_abstraction: action,
+        clustering,
+        training,
+        snapshots,
+    }
 }
 
-fn trivial_buckets(
-    deal: &poker_solver_core::blueprint_mp::Deal,
-) -> DealWithBuckets {
+fn trivial_buckets(deal: &poker_solver_core::blueprint_mp::Deal) -> DealWithBuckets {
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
     for seat in 0..deal.num_players as usize {
         let card_idx = deal.hole_cards[seat][0].value as u16;
@@ -577,7 +594,10 @@ fn trivial_buckets(
             buckets[seat][street] = Bucket(card_idx % count);
         }
     }
-    DealWithBuckets { deal: deal.clone(), buckets }
+    DealWithBuckets {
+        deal: deal.clone(),
+        buckets,
+    }
 }
 
 fn run_mp_iterations(tree: &MpGameTree, storage: &MpStorage, count: u64, seed: u64) {
@@ -588,8 +608,16 @@ fn run_mp_iterations(tree: &MpGameTree, storage: &MpStorage, count: u64, seed: u
         let buckets = trivial_buckets(&deal);
         for seat in 0..n {
             traverse_external(
-                tree, storage, &buckets, Seat::from_raw(seat),
-                tree.root, &mut rng, 0.0, Chips::ZERO, false, 0,
+                tree,
+                storage,
+                &buckets,
+                Seat::from_raw(seat),
+                tree.root,
+                &mut rng,
+                0.0,
+                Chips::ZERO,
+                false,
+                0,
             );
         }
     }
@@ -601,11 +629,13 @@ fn write_mp_eager_bundle(dir: &Path) -> (BlueprintMpConfig, MpGameTree, MpStorag
     let storage = MpStorage::new(&tree, config.clustering.bucket_counts());
     run_mp_iterations(&tree, &storage, 200, 42);
 
-    let training = MpTrainingInfo { iterations: 200, elapsed_minutes: 0.1 };
-    let output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .expect("mp export should succeed");
+    let training = MpTrainingInfo {
+        iterations: 200,
+        elapsed_minutes: 0.1,
+    };
+    let output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .expect("mp export should succeed");
 
     write_bundle(
         dir,
@@ -632,17 +662,24 @@ fn load_mp_eager_and_query() {
     assert_eq!(bundle.source_backend(), "mp_eager_dense");
 
     // Query a known infoset: find a decision node in the tree
-    let first_decision = tree.nodes.iter().enumerate()
+    let first_decision = tree
+        .nodes
+        .iter()
+        .enumerate()
         .find_map(|(i, n)| match n {
-            MpGameNode::Decision { seat, street, actions, .. } => {
-                Some((i as u32, seat.index() as u8, *street as u8, actions.len()))
-            }
+            MpGameNode::Decision {
+                seat,
+                street,
+                actions,
+                ..
+            } => Some((i as u32, seat.index() as u8, *street as u8, actions.len())),
             _ => None,
         })
         .expect("should have at least one decision node");
 
     let (node_idx, seat, _street, num_actions) = first_decision;
-    let view = bundle.query_mp_eager(node_idx, seat, 0)
+    let view = bundle
+        .query_mp_eager(node_idx, seat, 0)
         .expect("should find the infoset");
     assert_eq!(view.probs.len(), num_actions);
 
@@ -652,7 +689,8 @@ fn load_mp_eager_and_query() {
     for (i, &p) in view.probs.iter().enumerate() {
         let expected = avg_buf[i] as f32;
         assert_eq!(
-            p.to_bits(), expected.to_bits(),
+            p.to_bits(),
+            expected.to_bits(),
             "prob mismatch at action {i}: got {p}, expected {expected}"
         );
     }
@@ -660,12 +698,12 @@ fn load_mp_eager_and_query() {
 
 // ── MP lazy test ─────────────────────────────────────────────────────
 
-use poker_solver_core::blueprint_mp::sparse_storage::{
-    MpInfosetKey, SparseSnapshotEntry,
-};
 use poker_solver_core::blueprint_mp::Street as MpStreet;
+use poker_solver_core::blueprint_mp::sparse_storage::{
+    MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseSnapshotEntry,
+};
 use poker_solver_core::blueprint_universal::mp_lazy_export::{
-    self, LazyTrainingInfo, LazyExportConfig,
+    self, LazyExportConfig, LazyTrainingInfo,
 };
 
 fn make_lazy_key(
@@ -678,9 +716,26 @@ fn make_lazy_key(
     history_len: u16,
 ) -> MpInfosetKey {
     MpInfosetKey::from_street_bucket(
-        Seat::from_raw(seat), street, local_bucket,
-        history_hi, history_lo, history_hash, history_len,
+        Seat::from_raw(seat),
+        street,
+        local_bucket,
+        history_hi,
+        history_lo,
+        history_hash,
+        history_len,
     )
+}
+
+fn lazy_action(
+    kind: SparseActionKind,
+    amount_chips: u32,
+    source_action_index: u16,
+) -> SparseActionDescriptor {
+    SparseActionDescriptor {
+        kind,
+        amount_chips,
+        source_action_index,
+    }
 }
 
 fn build_lazy_test_entries() -> Vec<SparseSnapshotEntry> {
@@ -688,12 +743,21 @@ fn build_lazy_test_entries() -> Vec<SparseSnapshotEntry> {
         SparseSnapshotEntry {
             key: make_lazy_key(0, MpStreet::Preflop, 5, 0x1234, 0x5678, 0xAAAA, 4),
             num_actions: 3,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Fold, 0, 0),
+                lazy_action(SparseActionKind::Call, 0, 1),
+                lazy_action(SparseActionKind::Raise, 6, 2),
+            ]),
             regrets: vec![10, -5, 3],
             strategy_sums: vec![100, 200, 300],
         },
         SparseSnapshotEntry {
             key: make_lazy_key(1, MpStreet::Flop, 10, 0xABCD, 0xEF01, 0xBBBB, 16),
             num_actions: 2,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Check, 0, 0),
+                lazy_action(SparseActionKind::Lead, 20, 1),
+            ]),
             regrets: vec![20, -10],
             strategy_sums: vec![500, 500],
         },
@@ -701,6 +765,10 @@ fn build_lazy_test_entries() -> Vec<SparseSnapshotEntry> {
         SparseSnapshotEntry {
             key: make_lazy_key(0, MpStreet::Turn, 3, 0x1111, 0x2222, 0xCCCC, 8),
             num_actions: 2,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Check, 0, 0),
+                lazy_action(SparseActionKind::AllInCall, 0, 1),
+            ]),
             regrets: vec![0, 0],
             strategy_sums: vec![0, 0],
         },
@@ -716,10 +784,11 @@ fn write_mp_lazy_bundle(dir: &Path) -> Vec<SparseSnapshotEntry> {
         small_blind: 1.0,
         big_blind: 2.0,
     };
-    let training = LazyTrainingInfo { iterations: 100, elapsed_minutes: 1.0 };
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let training = LazyTrainingInfo {
+        iterations: 100,
+        elapsed_minutes: 1.0,
+    };
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     mp_lazy_export::write_lazy_bundle(dir, &output).unwrap();
     entries
 }
@@ -742,7 +811,8 @@ fn load_mp_lazy_and_query() {
         history_hash: 0xAAAA,
         history_len: 4,
     };
-    let view = bundle.query_mp_lazy(&key)
+    let view = bundle
+        .query_mp_lazy(&key)
         .expect("should find the lazy infoset");
     assert_eq!(view.probs.len(), 3);
 
@@ -756,10 +826,11 @@ fn load_mp_lazy_and_query() {
         );
     }
 
-    // Verify actions are Opaque
-    for action in &view.actions {
-        assert_eq!(action.kind, ActionKind::Opaque);
-    }
+    assert_eq!(view.actions[0].kind, ActionKind::Fold);
+    assert_eq!(view.actions[1].kind, ActionKind::Call);
+    assert_eq!(view.actions[2].kind, ActionKind::Raise);
+    assert_eq!(view.actions[2].amount_chips, 6);
+    assert!(view.actions[2].is_aggressive);
 }
 
 #[test]
@@ -776,7 +847,8 @@ fn load_mp_lazy_zero_mass_uniform() {
         history_hash: 0xCCCC,
         history_len: 8,
     };
-    let view = bundle.query_mp_lazy(&key)
+    let view = bundle
+        .query_mp_lazy(&key)
         .expect("should find the zero-mass infoset");
     assert_eq!(view.probs.len(), 2);
 
@@ -787,6 +859,8 @@ fn load_mp_lazy_zero_mass_uniform() {
             "zero-mass row should be uniform, got {p}"
         );
     }
+    assert_eq!(view.actions[1].kind, ActionKind::AllInCall);
+    assert!(!view.actions[1].is_aggressive);
 }
 
 // ── Detection precedence regression test ────────────────────────────

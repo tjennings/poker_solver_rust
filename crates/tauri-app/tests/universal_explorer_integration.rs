@@ -510,6 +510,7 @@ fn write_mp_lazy_bundle(dir: &Path) {
             4,
         ),
         num_actions: 3,
+        action_identity: None,
         regrets: vec![10, -5, 3],
         strategy_sums: vec![100, 200, 300],
     }];

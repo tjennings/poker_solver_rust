@@ -15,16 +15,12 @@
 //! `source_node_idx` is `u32::MAX` because lazy rows do not reference
 //! arena tree nodes.
 //!
-//! ## Opaque actions
+//! ## Action identity
 //!
-//! `SparseSnapshotEntry` carries only `num_actions`; action kinds and
-//! amounts are NOT recoverable (histories >32 actions exist only as a
-//! hash, so replay is impossible in general). Each lazy row emits
-//! `num_actions` descriptors with kind `Opaque`, `amount_chips = 0`,
-//! empty `size_key`/`label`, `is_aggressive = false`, and
-//! `source_action_index = i` (the per-row action index the trainer
-//! used). Consumers needing real action semantics must replay public
-//! state from the history key (future work).
+//! Realized traversal rows carry compact storage-side action identity. When
+//! present and length-matched, export converts it to universal
+//! `ActionDescriptor` values. Synthetic/manual rows without identity keep the
+//! safe `Opaque` fallback.
 //!
 //! ## Probability conversion
 //!
@@ -46,25 +42,26 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::bundle::{write_bundle, BundleData};
+use super::bundle::{BundleData, write_bundle};
 use super::descriptors::{ActionDescriptor, ActionKind};
 use super::error::FormatError;
 use super::export_common::{
-    RowEntry, bucket_semantic_fingerprint, flatten_entries, now_rfc3339_approx,
-    NS_MP_SEMANTIC, SEMANTIC_KEY_MP_HISTORY_V1,
+    NS_MP_SEMANTIC, RowEntry, SEMANTIC_KEY_MP_HISTORY_V1, bucket_semantic_fingerprint,
+    flatten_entries, now_rfc3339_approx,
 };
 use super::hash::Fnv1aHasher;
 use super::manifest::{
-    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, FileEntry,
-    GameMetadata, LayoutMetadata, Manifest, RakeConfig, SeatDescriptor,
-    StrategyMetadata, TrainingMetadata,
+    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, FileEntry, GameMetadata,
+    LayoutMetadata, Manifest, RakeConfig, SeatDescriptor, StrategyMetadata, TrainingMetadata,
 };
 use crate::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
-use crate::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
+use crate::blueprint_mp::sparse_storage::{
+    MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseSnapshotEntry,
+};
 
 // Re-export from descriptors so external consumers using this module's
 // path (`mp_lazy_export::SemanticKeyRecord`) still compile.
-pub use super::descriptors::{SemanticKeyRecord, SEMANTIC_RECORD_SIZE};
+pub use super::descriptors::{SEMANTIC_RECORD_SIZE, SemanticKeyRecord};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -107,10 +104,7 @@ pub struct ExportOutput {
 #[derive(Debug)]
 pub enum ExportError {
     /// The metadata `kind` field does not match expected value.
-    BadMetadataKind {
-        expected: String,
-        actual: String,
-    },
+    BadMetadataKind { expected: String, actual: String },
     /// A required file is missing.
     MissingFile { detail: String },
     /// Format error from the universal bundle writer.
@@ -187,6 +181,30 @@ fn opaque_action_schema_fingerprint(num_actions: u8) -> u64 {
     h.finish()
 }
 
+/// Compute action schema fingerprint for concrete lazy MP row actions.
+fn sparse_action_schema_fingerprint(actions: &[SparseActionDescriptor]) -> u64 {
+    let mut h = Fnv1aHasher::new();
+    h.mix_u64(actions.len() as u64);
+    for action in actions {
+        match action.kind {
+            SparseActionKind::Fold => h.mix_u64(0),
+            SparseActionKind::Check => h.mix_u64(1),
+            SparseActionKind::Call => h.mix_u64(2),
+            SparseActionKind::Lead => {
+                h.mix_u64(3);
+                h.mix_u64(u64::from(action.amount_chips));
+            }
+            SparseActionKind::Raise => {
+                h.mix_u64(4);
+                h.mix_u64(u64::from(action.amount_chips));
+            }
+            SparseActionKind::AllInCall => h.mix_u64(5),
+            SparseActionKind::AllInBetRaise => h.mix_u64(6),
+        }
+    }
+    h.finish()
+}
+
 // ---------------------------------------------------------------------------
 // Probability normalization (matches SparseMpStorage::average_strategy)
 // ---------------------------------------------------------------------------
@@ -226,6 +244,52 @@ fn build_opaque_actions(num_actions: u8) -> Vec<ActionDescriptor> {
         .collect()
 }
 
+fn build_sparse_actions(actions: &[SparseActionDescriptor]) -> Vec<ActionDescriptor> {
+    actions.iter().map(sparse_action_descriptor).collect()
+}
+
+fn sparse_action_descriptor(action: &SparseActionDescriptor) -> ActionDescriptor {
+    let (kind, is_aggressive) = match action.kind {
+        SparseActionKind::Fold => (ActionKind::Fold, false),
+        SparseActionKind::Check => (ActionKind::Check, false),
+        SparseActionKind::Call => (ActionKind::Call, false),
+        SparseActionKind::Lead => (ActionKind::Bet, true),
+        SparseActionKind::Raise => (ActionKind::Raise, true),
+        SparseActionKind::AllInCall => (ActionKind::AllInCall, false),
+        SparseActionKind::AllInBetRaise => (ActionKind::AllInBetRaise, true),
+    };
+    ActionDescriptor {
+        kind,
+        amount_chips: action.amount_chips,
+        size_key: sparse_action_size_key(action),
+        label: sparse_action_label(action),
+        is_aggressive,
+        source_action_index: action.source_action_index,
+    }
+}
+
+fn sparse_action_size_key(action: &SparseActionDescriptor) -> String {
+    match action.kind {
+        SparseActionKind::Lead | SparseActionKind::Raise => {
+            format!("{}chips", action.amount_chips)
+        }
+        SparseActionKind::AllInCall | SparseActionKind::AllInBetRaise => "allin".to_string(),
+        SparseActionKind::Fold | SparseActionKind::Check | SparseActionKind::Call => String::new(),
+    }
+}
+
+fn sparse_action_label(action: &SparseActionDescriptor) -> String {
+    match action.kind {
+        SparseActionKind::Fold => "Fold".to_string(),
+        SparseActionKind::Check => "Check".to_string(),
+        SparseActionKind::Call => "Call".to_string(),
+        SparseActionKind::Lead => format!("Bet {}", action.amount_chips),
+        SparseActionKind::Raise => format!("Raise {}", action.amount_chips),
+        SparseActionKind::AllInCall => "All-In Call".to_string(),
+        SparseActionKind::AllInBetRaise => "All-In".to_string(),
+    }
+}
+
 /// Collect row entries from sparse snapshot entries.
 fn collect_lazy_entries(
     entries: &[SparseSnapshotEntry],
@@ -239,10 +303,19 @@ fn collect_lazy_entries(
         let local_bucket = key.bucket & 0x3FFF;
         let global_bucket = u32::from(key.bucket);
         let fp = mp_semantic_row_key_fingerprint(key);
-        let schema_fp =
-            opaque_action_schema_fingerprint(entry.num_actions);
+        let concrete_actions = entry
+            .action_identity
+            .as_deref()
+            .filter(|actions| actions.len() == usize::from(entry.num_actions));
+        let schema_fp = concrete_actions.map_or_else(
+            || opaque_action_schema_fingerprint(entry.num_actions),
+            sparse_action_schema_fingerprint,
+        );
         let probs = normalize_strategy_sums(&entry.strategy_sums);
-        let actions = build_opaque_actions(entry.num_actions);
+        let actions = concrete_actions.map_or_else(
+            || build_opaque_actions(entry.num_actions),
+            build_sparse_actions,
+        );
 
         let sem_idx = semantic_records.len() as u64;
         semantic_records.push(SemanticKeyRecord {
@@ -306,8 +379,7 @@ pub fn export_lazy_sparse_to_universal(
         row_count: rows.len() as u64,
         action_descriptor_count: actions.len() as u64,
         probability_count: probs.len() as u64,
-        row_sort_order:
-            "namespace_seat_street_node_bucket_fingerprint".to_string(),
+        row_sort_order: "namespace_seat_street_node_bucket_fingerprint".to_string(),
         row_namespace: vec!["mp_semantic".to_string()],
         missing_row_policy: "uniform_legal".to_string(),
     };
@@ -336,16 +408,12 @@ fn build_lazy_manifest(
         format_version: 1,
         compat_min_reader: 1,
         created_at: now_rfc3339_approx(),
-        producer: format!(
-            "poker-solver-core {}",
-            env!("CARGO_PKG_VERSION"),
-        ),
-        producer_git: option_env!("GIT_HASH")
-            .unwrap_or("unknown")
-            .to_string(),
+        producer: format!("poker-solver-core {}", env!("CARGO_PKG_VERSION"),),
+        producer_git: option_env!("GIT_HASH").unwrap_or("unknown").to_string(),
         required_features: vec!["mp_semantic_rows_v1".to_string()],
         optional_features: vec![
             "mp_semantic_row_key_fingerprint_v1".to_string(),
+            "mp_lazy_sparse_action_identity_v1".to_string(),
             "opaque_action_schema_fingerprint_v1".to_string(),
         ],
         game_fingerprint: lazy_game_fingerprint(config),
@@ -388,14 +456,15 @@ fn build_lazy_game_metadata(config: &LazyExportConfig) -> GameMetadata {
         antes: vec![],
         straddles: vec![],
         stack_units: "chips".to_string(),
-        rake: RakeConfig { rate: 0.0, cap: 0.0 },
+        rake: RakeConfig {
+            rate: 0.0,
+            cap: 0.0,
+        },
         max_flop_players: None,
     }
 }
 
-fn build_lazy_training_metadata(
-    training: &LazyTrainingInfo,
-) -> TrainingMetadata {
+fn build_lazy_training_metadata(training: &LazyTrainingInfo) -> TrainingMetadata {
     TrainingMetadata {
         source_backend: "mp_lazy_sparse_projected".to_string(),
         unit_kind: "MetaIteration".to_string(),
@@ -457,15 +526,9 @@ pub fn write_lazy_universal_snapshot(
         elapsed_minutes,
     };
 
-    let mut output = export_lazy_sparse_to_universal(
-        config, entries, &training,
-    );
+    let mut output = export_lazy_sparse_to_universal(config, entries, &training);
 
-    super::export_common::retain_config_yaml(
-        config_yaml_path,
-        out_dir,
-        &mut output.manifest,
-    )?;
+    super::export_common::retain_config_yaml(config_yaml_path, out_dir, &mut output.manifest)?;
 
     write_lazy_bundle(out_dir, &output)
 }
@@ -473,10 +536,7 @@ pub fn write_lazy_universal_snapshot(
 /// # Errors
 ///
 /// Returns `FormatError` on I/O failure.
-pub fn write_lazy_bundle(
-    dir: &Path,
-    output: &ExportOutput,
-) -> Result<(), FormatError> {
+pub fn write_lazy_bundle(dir: &Path, output: &ExportOutput) -> Result<(), FormatError> {
     // First write the three standard payloads + semantic side table
     std::fs::create_dir_all(dir)?;
 
@@ -485,10 +545,9 @@ pub fn write_lazy_bundle(
     // Write the standard bundle, then patch the manifest to include
     // the semantic file entry.
     let mut manifest = output.manifest.clone();
-    manifest.files.insert(
-        "strategy.semantic.bin".to_string(),
-        sem_entry,
-    );
+    manifest
+        .files
+        .insert("strategy.semantic.bin".to_string(), sem_entry);
 
     write_bundle(
         dir,
@@ -507,7 +566,7 @@ fn write_semantic_file(
     dir: &Path,
     records: &[SemanticKeyRecord],
 ) -> Result<FileEntry, FormatError> {
-    use super::bundle::{write_payload_file, PayloadSpec};
+    use super::bundle::{PayloadSpec, write_payload_file};
     use super::header::MAGIC_SEMANTIC;
 
     write_payload_file(
@@ -568,8 +627,7 @@ pub fn export_lazy_bundle_from_disk(
         elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0) as f64,
     };
 
-    let mut output =
-        export_lazy_sparse_to_universal(&config, &entries, &training);
+    let mut output = export_lazy_sparse_to_universal(&config, &entries, &training);
 
     // Retain config.yaml so the bundle is self-contained for the Explorer.
     super::export_common::retain_config_yaml(
@@ -591,18 +649,22 @@ fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
     }
 }
 
-fn load_lazy_config(
-    bundle_dir: &Path,
-) -> Result<LazyExportConfig, ExportError> {
+fn load_lazy_config(bundle_dir: &Path) -> Result<LazyExportConfig, ExportError> {
     let path = bundle_dir.join("config.yaml");
     require_file(&path, "config.yaml")?;
     let text = std::fs::read_to_string(&path)?;
-    let full: BlueprintMpConfig = serde_yaml::from_str(&text)
-        .map_err(|e| ExportError::Deserialize(e.to_string()))?;
-    let sb = full.game.blinds.iter()
+    let full: BlueprintMpConfig =
+        serde_yaml::from_str(&text).map_err(|e| ExportError::Deserialize(e.to_string()))?;
+    let sb = full
+        .game
+        .blinds
+        .iter()
         .find(|b| b.kind == ForcedBetKind::SmallBlind)
         .map_or(0.0, |b| b.amount);
-    let bb = full.game.blinds.iter()
+    let bb = full
+        .game
+        .blinds
+        .iter()
         .find(|b| b.kind == ForcedBetKind::BigBlind)
         .map_or(0.0, |b| b.amount);
     Ok(LazyExportConfig {
@@ -614,14 +676,12 @@ fn load_lazy_config(
     })
 }
 
-fn load_lazy_metadata(
-    dir: &Path,
-) -> Result<LazySnapshotMetadata, ExportError> {
+fn load_lazy_metadata(dir: &Path) -> Result<LazySnapshotMetadata, ExportError> {
     let path = dir.join("metadata.json");
     require_file(&path, "metadata.json")?;
     let text = std::fs::read_to_string(&path)?;
-    let metadata: LazySnapshotMetadata = serde_json::from_str(&text)
-        .map_err(|e| ExportError::Deserialize(e.to_string()))?;
+    let metadata: LazySnapshotMetadata =
+        serde_json::from_str(&text).map_err(|e| ExportError::Deserialize(e.to_string()))?;
     let kind = metadata.kind.as_deref().unwrap_or("");
     if kind != "blueprint_mp_lazy_sparse" {
         return Err(ExportError::BadMetadataKind {
@@ -632,15 +692,12 @@ fn load_lazy_metadata(
     Ok(metadata)
 }
 
-fn load_sparse_entries(
-    dir: &Path,
-) -> Result<Vec<SparseSnapshotEntry>, ExportError> {
+fn load_sparse_entries(dir: &Path) -> Result<Vec<SparseSnapshotEntry>, ExportError> {
     let path = dir.join("sparse_entries.bin");
     require_file(&path, "sparse_entries.bin")?;
     let file = std::fs::File::open(&path)?;
     let reader = std::io::BufReader::new(file);
-    bincode::deserialize_from(reader)
-        .map_err(|e| ExportError::Deserialize(e.to_string()))
+    bincode::deserialize_from(reader).map_err(|e| ExportError::Deserialize(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -700,10 +757,7 @@ mod tests {
             history_hash: 0,
             history_len: 1,
         };
-        let key2 = MpInfosetKey {
-            seat: 1,
-            ..key1
-        };
+        let key2 = MpInfosetKey { seat: 1, ..key1 };
         assert_ne!(
             mp_semantic_row_key_fingerprint(&key1),
             mp_semantic_row_key_fingerprint(&key2)

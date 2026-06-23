@@ -14,12 +14,10 @@
 )]
 
 use poker_solver_core::blueprint_mp::sparse_storage::{
-    MpInfosetKey, SparseMpStorage, SparseSnapshotEntry,
+    MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseMpStorage, SparseSnapshotEntry,
 };
 use poker_solver_core::blueprint_mp::{Seat, Street};
-use poker_solver_core::blueprint_universal::mp_lazy_export::{
-    self, LazyTrainingInfo,
-};
+use poker_solver_core::blueprint_universal::mp_lazy_export::{self, LazyTrainingInfo};
 use poker_solver_core::blueprint_universal::{ActionKind, BundleReader};
 use sha2::Digest;
 
@@ -45,6 +43,37 @@ fn make_key(
     )
 }
 
+fn action(
+    kind: SparseActionKind,
+    amount_chips: u32,
+    source_action_index: u16,
+) -> SparseActionDescriptor {
+    SparseActionDescriptor {
+        kind,
+        amount_chips,
+        source_action_index,
+    }
+}
+
+fn universal_kind(kind: SparseActionKind) -> ActionKind {
+    match kind {
+        SparseActionKind::Fold => ActionKind::Fold,
+        SparseActionKind::Check => ActionKind::Check,
+        SparseActionKind::Call => ActionKind::Call,
+        SparseActionKind::Lead => ActionKind::Bet,
+        SparseActionKind::Raise => ActionKind::Raise,
+        SparseActionKind::AllInCall => ActionKind::AllInCall,
+        SparseActionKind::AllInBetRaise => ActionKind::AllInBetRaise,
+    }
+}
+
+fn is_aggressive(kind: SparseActionKind) -> bool {
+    matches!(
+        kind,
+        SparseActionKind::Lead | SparseActionKind::Raise | SparseActionKind::AllInBetRaise
+    )
+}
+
 /// Build test entries spanning multiple seats, streets, buckets, history
 /// lengths (including >32 for hash-only identity), and a zero-mass entry.
 fn build_test_entries() -> Vec<SparseSnapshotEntry> {
@@ -53,6 +82,11 @@ fn build_test_entries() -> Vec<SparseSnapshotEntry> {
         SparseSnapshotEntry {
             key: make_key(0, Street::Preflop, 5, 0x1234, 0x5678, 0xAAAA, 4),
             num_actions: 3,
+            action_identity: Some(vec![
+                action(SparseActionKind::Fold, 0, 0),
+                action(SparseActionKind::Call, 0, 1),
+                action(SparseActionKind::Raise, 6, 2),
+            ]),
             regrets: vec![10, -5, 3],
             strategy_sums: vec![100, 200, 300],
         },
@@ -60,6 +94,10 @@ fn build_test_entries() -> Vec<SparseSnapshotEntry> {
         SparseSnapshotEntry {
             key: make_key(1, Street::Flop, 10, 0xABCD, 0xEF01, 0xBBBB, 16),
             num_actions: 2,
+            action_identity: Some(vec![
+                action(SparseActionKind::Check, 0, 0),
+                action(SparseActionKind::Lead, 20, 1),
+            ]),
             regrets: vec![20, -10],
             strategy_sums: vec![500, 500],
         },
@@ -67,19 +105,31 @@ fn build_test_entries() -> Vec<SparseSnapshotEntry> {
         SparseSnapshotEntry {
             key: make_key(0, Street::Turn, 3, 0x1111, 0x2222, 0xCCCC, 8),
             num_actions: 2,
+            action_identity: Some(vec![
+                action(SparseActionKind::Check, 0, 0),
+                action(SparseActionKind::AllInCall, 0, 1),
+            ]),
             regrets: vec![0, 0],
             strategy_sums: vec![0, 0],
         },
         // Long history (>32 actions, hash-only identity)
         SparseSnapshotEntry {
             key: make_key(
-                2, Street::River, 7,
+                2,
+                Street::River,
+                7,
                 0xDEAD_BEEF_CAFE_BABE,
                 0x0123_4567_89AB_CDEF,
                 0xFFFF_FFFF_FFFF_FFFF,
                 40,
             ),
             num_actions: 4,
+            action_identity: Some(vec![
+                action(SparseActionKind::Fold, 0, 0),
+                action(SparseActionKind::Call, 0, 1),
+                action(SparseActionKind::Raise, 80, 2),
+                action(SparseActionKind::AllInBetRaise, 0, 3),
+            ]),
             regrets: vec![1, 2, 3, 4],
             strategy_sums: vec![10, 20, 30, 40],
         },
@@ -119,11 +169,7 @@ fn acceptance_lazy_export_round_trip() {
     };
 
     // Export in memory
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config,
-        &entries,
-        &training,
-    );
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
 
     // Write to tempdir
     let dir = tempfile::tempdir().unwrap();
@@ -143,16 +189,19 @@ fn acceptance_lazy_export_round_trip() {
         let sem = reader.semantic_record(i).unwrap();
 
         // Find the matching entry by semantic identity
-        let matching_entry = entries.iter().find(|e| {
-            e.key.seat == row.seat
-                && e.key.bucket_street().unwrap() as u8 == row.street
-                && e.key.local_bucket() == row.local_bucket
-                && u32::from(e.key.bucket) == row.global_bucket
-                && e.key.history_hi == sem.history_hi
-                && e.key.history_lo == sem.history_lo
-                && e.key.history_hash == sem.history_hash
-                && e.key.history_len == sem.history_len
-        }).expect("every exported row must match an input entry verbatim");
+        let matching_entry = entries
+            .iter()
+            .find(|e| {
+                e.key.seat == row.seat
+                    && e.key.bucket_street().unwrap() as u8 == row.street
+                    && e.key.local_bucket() == row.local_bucket
+                    && u32::from(e.key.bucket) == row.global_bucket
+                    && e.key.history_hi == sem.history_hi
+                    && e.key.history_lo == sem.history_lo
+                    && e.key.history_hash == sem.history_hash
+                    && e.key.history_len == sem.history_len
+            })
+            .expect("every exported row must match an input entry verbatim");
 
         // Verify probabilities match average_strategy
         let num_actions = matching_entry.num_actions as usize;
@@ -182,12 +231,18 @@ fn acceptance_lazy_export_round_trip() {
             }
         }
 
-        // Verify action descriptors are Opaque
-        for j in 0..num_actions {
+        // Verify action descriptors carry real action identity when present.
+        let identity = matching_entry
+            .action_identity
+            .as_ref()
+            .expect("test fixture should carry action identity");
+        for (j, expected) in identity.iter().enumerate() {
             let action_idx = row.action_offset as usize + j;
             let action = reader.action(action_idx).unwrap();
-            assert_eq!(action.kind, ActionKind::Opaque);
-            assert_eq!(action.source_action_index, j as u16);
+            assert_eq!(action.kind, universal_kind(expected.kind));
+            assert_eq!(action.amount_chips, expected.amount_chips);
+            assert_eq!(action.source_action_index, expected.source_action_index);
+            assert_eq!(action.is_aggressive, is_aggressive(expected.kind));
         }
 
         // Verify source_node_idx is u32::MAX (semantic-only)
@@ -208,7 +263,10 @@ fn acceptance_lazy_export_round_trip() {
     assert!(feature_strings.contains(&"mp_semantic_rows_v1"));
 
     // Verify training metadata
-    assert_eq!(manifest["training"]["source_backend"], "mp_lazy_sparse_projected");
+    assert_eq!(
+        manifest["training"]["source_backend"],
+        "mp_lazy_sparse_projected"
+    );
     assert_eq!(manifest["training"]["unit_kind"], "MetaIteration");
 
     // Verify layout
@@ -346,8 +404,7 @@ fn disk_wrapper_exports_with_real_directory_structure() {
     write_real_mp_config_yaml(bundle_dir.path());
 
     // sparse_entries.bin and metadata.json live in snapshot subdirectory
-    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))
-        .unwrap();
+    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin")).unwrap();
     let writer = std::io::BufWriter::new(file);
     bincode::serialize_into(writer, &entries).unwrap();
 
@@ -375,11 +432,8 @@ fn disk_wrapper_exports_with_real_directory_structure() {
     assert_eq!(reader.row_count(), entries.len());
 
     // Verify blinds from config.yaml (SB=1, BB=2) are in the manifest
-    let manifest_text = std::fs::read_to_string(
-        out_dir.path().join("blueprint.json"),
-    ).unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).unwrap();
+    let manifest_text = std::fs::read_to_string(out_dir.path().join("blueprint.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
     assert_eq!(manifest["game"]["small_blind"], 1.0);
     assert_eq!(manifest["game"]["big_blind"], 2.0);
 }
@@ -415,8 +469,7 @@ fn disk_wrapper_rejects_wrong_kind() {
     .unwrap_err();
     let err_msg = format!("{err}");
     assert!(
-        err_msg.contains("blueprint_mp_lazy_sparse")
-            || err_msg.contains("kind"),
+        err_msg.contains("blueprint_mp_lazy_sparse") || err_msg.contains("kind"),
         "expected kind mismatch error, got: {err_msg}"
     );
 }
@@ -428,9 +481,7 @@ fn truncated_semantic_file_rejected() {
     let entries = build_test_entries();
     let config = default_lazy_config();
     let training = default_training_info();
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     let dir = tempfile::tempdir().unwrap();
     mp_lazy_export::write_lazy_bundle(dir.path(), &output).unwrap();
 
@@ -444,13 +495,11 @@ fn truncated_semantic_file_rejected() {
     // validation fails
     let manifest_path = dir.path().join("blueprint.json");
     let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
     manifest["files"]["strategy.semantic.bin"]["size"] = 20.into();
     // Recompute SHA-256
     let sha = hex::encode(sha2::Sha256::digest(&data[..20]));
-    manifest["files"]["strategy.semantic.bin"]["sha256"] =
-        serde_json::Value::String(sha);
+    manifest["files"]["strategy.semantic.bin"]["sha256"] = serde_json::Value::String(sha);
     std::fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest).unwrap(),
@@ -472,9 +521,7 @@ fn bad_crc_semantic_file_rejected() {
     let entries = build_test_entries();
     let config = default_lazy_config();
     let training = default_training_info();
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     let dir = tempfile::tempdir().unwrap();
     mp_lazy_export::write_lazy_bundle(dir.path(), &output).unwrap();
 
@@ -489,11 +536,9 @@ fn bad_crc_semantic_file_rejected() {
     // Update manifest with new SHA-256 and size
     let manifest_path = dir.path().join("blueprint.json");
     let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
     let sha = hex::encode(sha2::Sha256::digest(&data));
-    manifest["files"]["strategy.semantic.bin"]["sha256"] =
-        serde_json::Value::String(sha);
+    manifest["files"]["strategy.semantic.bin"]["sha256"] = serde_json::Value::String(sha);
     manifest["files"]["strategy.semantic.bin"]["size"] =
         serde_json::Value::Number(data.len().into());
     std::fs::write(
@@ -521,14 +566,13 @@ fn semantic_key_offset_out_of_range_rejected() {
     let entries = vec![SparseSnapshotEntry {
         key: make_key(0, Street::Preflop, 5, 1, 2, 3, 4),
         num_actions: 2,
+        action_identity: None,
         regrets: vec![1, 2],
         strategy_sums: vec![10, 20],
     }];
     let config = default_lazy_config();
     let training = default_training_info();
-    let mut output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let mut output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
 
     // Tamper: clear semantic records so offset 0 is out of range
     output.semantic_records.clear();
@@ -539,8 +583,7 @@ fn semantic_key_offset_out_of_range_rejected() {
     let err = BundleReader::open(dir.path()).unwrap_err();
     let err_msg = format!("{err}");
     assert!(
-        err_msg.contains("semantic_key_offset")
-            || err_msg.contains("out of range"),
+        err_msg.contains("semantic_key_offset") || err_msg.contains("out of range"),
         "expected semantic key offset error, got: {err_msg}"
     );
 }
@@ -552,14 +595,13 @@ fn unknown_semantic_key_kind_rejected() {
     let entries = vec![SparseSnapshotEntry {
         key: make_key(0, Street::Preflop, 5, 1, 2, 3, 4),
         num_actions: 2,
+        action_identity: None,
         regrets: vec![1, 2],
         strategy_sums: vec![10, 20],
     }];
     let config = default_lazy_config();
     let training = default_training_info();
-    let mut output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let mut output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
 
     // Tamper: set an unknown semantic key kind on the row
     output.rows[0].semantic_key_kind = 99;
@@ -581,12 +623,13 @@ fn unknown_semantic_key_kind_rejected() {
 /// declare `mp_semantic_rows_v1` must be rejected by the reader.
 #[test]
 fn opaque_actions_without_semantic_feature_rejected() {
-    let entries = build_test_entries();
+    let mut entries = build_test_entries();
+    for entry in &mut entries {
+        entry.action_identity = None;
+    }
     let config = default_lazy_config();
     let training = default_training_info();
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(
-        &config, &entries, &training,
-    );
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
     let dir = tempfile::tempdir().unwrap();
     mp_lazy_export::write_lazy_bundle(dir.path(), &output).unwrap();
 
@@ -594,10 +637,8 @@ fn opaque_actions_without_semantic_feature_rejected() {
     // leaving the Opaque actions in the binary payload.
     let manifest_path = dir.path().join("blueprint.json");
     let manifest_text = std::fs::read_to_string(&manifest_path).unwrap();
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).unwrap();
-    manifest["required_features"] =
-        serde_json::Value::Array(Vec::new());
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    manifest["required_features"] = serde_json::Value::Array(Vec::new());
     std::fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest).unwrap(),
@@ -611,4 +652,25 @@ fn opaque_actions_without_semantic_feature_rejected() {
         "expected error about Opaque actions without \
          mp_semantic_rows_v1 feature, got: {err_msg}"
     );
+}
+
+#[test]
+fn entries_without_action_identity_export_opaque_actions() {
+    let entries = vec![SparseSnapshotEntry {
+        key: make_key(0, Street::Preflop, 5, 1, 2, 3, 4),
+        num_actions: 2,
+        action_identity: None,
+        regrets: vec![1, 2],
+        strategy_sums: vec![10, 20],
+    }];
+    let config = default_lazy_config();
+    let training = default_training_info();
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
+
+    assert_eq!(output.actions.len(), 2);
+    for (idx, action) in output.actions.iter().enumerate() {
+        assert_eq!(action.kind, ActionKind::Opaque);
+        assert_eq!(action.source_action_index, idx as u16);
+        assert_eq!(action.amount_chips, 0);
+    }
 }
