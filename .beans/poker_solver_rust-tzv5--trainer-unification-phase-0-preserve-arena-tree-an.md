@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-tzv5
 title: 'Trainer unification phase 0: preserve arena tree and establish shared runtime seam'
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-06-09T14:55:16Z
-updated_at: 2026-06-23T21:03:55Z
+updated_at: 2026-06-23T21:20:13Z
 parent: poker_solver_rust-osss
 ---
 
@@ -86,11 +86,11 @@ Preflight:
 
 Slice 1 checklist:
 
-- [ ] Dispatch fresh research review for the neutral runtime seam and invariants.
-- [ ] Dispatch fresh architecture/brainstorming review for the minimal API/test shape.
-- [ ] Implement runtime primitives and fake-backend tests only; do not touch traversal/TUI/snapshot formats.
-- [ ] Update docs only if the public architecture/training docs need to mention the new seam.
-- [ ] Run focused tests, diff hygiene, and hot full workspace suite under one minute.
+- [x] Dispatch fresh research review for the neutral runtime seam and invariants.
+- [x] Dispatch fresh architecture/brainstorming review for the minimal API/test shape.
+- [x] Implement runtime primitives and fake-backend tests only; do not touch traversal/TUI/snapshot formats.
+- [x] Update docs only if the public architecture/training docs need to mention the new seam.
+- [x] Run focused tests, diff hygiene, and hot full workspace suite under one minute.
 
 ## 2026-06-23 Runtime Seam Reconciliation Notes
 
@@ -106,3 +106,18 @@ Important finding: the requested runtime seam work is already present in this br
 - `d294c838 Fix review findings: error propagation, MP snapshot gating, TUI stub, dedup`
 
 Current files include `crates/core/src/training_runtime.rs`, `crates/core/src/blueprint_v2/training_runtime_adapter.rs`, `crates/core/src/blueprint_mp/training_runtime_adapter.rs`, exported modules, and `docs/architecture.md` runtime documentation. The remaining work for this turn is validation/review and tracker closeout, not duplicating the implementation.
+
+## Summary of Changes
+
+- Reconciled Phase 0 Slice 1 against the current branch and confirmed the shared training runtime seam is already implemented in ancestry: `training_runtime.rs`, HU runtime adapter, MP lazy runtime adapter, MP lazy runtime wiring, snapshot format support, and architecture documentation are present.
+- Re-ran the required research and architecture/brainstorming passes. Both confirmed the seam preserves the intended boundary: runtime owns scheduling/control/counters/telemetry/batch budgets, while traversal, chance policy, pruning, storage identity, snapshots, TUI extraction, and validation stay backend-owned.
+- Verified that HU arena/sparse identities and MP lazy sparse semantic identities remain opaque to the runtime and are not interpreted by the shared seam.
+- Closure review found no blockers. One deferred follow-up candidate remains: consolidate shared snapshot trigger/status flow later; current direct MP lazy TUI snapshot handling is consistent with the documented trainer-side boundary.
+
+Verification:
+
+- `cargo test -p poker-solver-core --lib training_runtime -- --nocapture` passed: 42 relevant runtime/adapter tests.
+- `cargo test -p poker-solver-core --lib blueprint_v2::training_runtime_adapter -- --nocapture` passed: 4 HU adapter tests.
+- `cargo test -p poker-solver-core --lib blueprint_mp::training_runtime_adapter -- --nocapture` passed: 16 MP lazy adapter tests.
+- `git diff --check` passed.
+- Full redirected workspace suite passed once with `real 283.79`, then immediate hot retry passed under the gate: `/usr/bin/time -p sh -c 'cargo test --workspace --quiet >/tmp/poker_solver_tzv5_final_hot2.log 2>&1'` -> `real 45.37`, `user 106.42`, `sys 15.21`.
