@@ -33,10 +33,13 @@ use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as HuGameNode, TreeAction as HuTreeAction,
 };
 use poker_solver_core::blueprint_v2::trainer::BlueprintTrainer;
+use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::training_runtime::SnapshotFormat as RuntimeSnapshotFormat;
 use serde::{Deserialize, Serialize};
 
 const CHIP_EPSILON: f64 = 0.01;
+const PROBABILITY_SUM_EPSILON: f64 = 1.0e-6;
+const UNMATCHED_ACTION_MASS_EPSILON: f64 = 1.0e-9;
 
 /// Final gate result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +58,15 @@ pub struct HuMpLazyHarnessConfig {
     pub max_l1_tolerance: f64,
     /// Mean root-row L1 distance tolerated before adding a NO-GO reason.
     pub mean_l1_tolerance: f64,
+    /// Maximum combo-weighted root action-frequency delta tolerated. The
+    /// production gate should use <= 0.01; this tiny smoke default stays looser
+    /// because one-iteration sparse coverage is diagnostic, not calibrated.
+    pub max_action_frequency_delta_tolerance: f64,
+    /// Total combo-weighted root action-frequency L1 tolerated. Production
+    /// should be closer to 0.02; this default avoids making tiny smoke fragile.
+    pub total_action_frequency_l1_tolerance: f64,
+    /// Number of largest bucket/action frequency deltas retained in artifacts.
+    pub worst_action_frequency_spots: usize,
     /// Effective stack in chips. The default keeps the fixture tiny while
     /// leaving room for a real sized preflop open below the stack.
     pub stack_chips: f64,
@@ -82,6 +94,9 @@ impl Default for HuMpLazyHarnessConfig {
             iterations: 2,
             max_l1_tolerance: 0.05,
             mean_l1_tolerance: 0.01,
+            max_action_frequency_delta_tolerance: 0.05,
+            total_action_frequency_l1_tolerance: 0.10,
+            worst_action_frequency_spots: 20,
             stack_chips: 10.0,
             small_blind_chips: 1.0,
             big_blind_chips: 2.0,
@@ -146,6 +161,87 @@ pub struct HuMpLazyRowCoverage {
     pub missing_mp_root_rows: usize,
 }
 
+/// Shared distribution metadata for counterfactual action-frequency aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HuMpLazyActionFrequencyDistribution {
+    pub name: String,
+    pub bucket_count: usize,
+    pub total_weight: usize,
+    pub normalized_weight_total: f64,
+}
+
+/// Coverage diagnostics for the action-frequency evaluator.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HuMpLazyActionFrequencyCoverage {
+    pub matched_rows: usize,
+    pub missing_mp_rows: usize,
+    pub skipped_rows: usize,
+    pub invalid_rows: usize,
+    pub zero_sum_rows: usize,
+    pub off_normalized_rows: usize,
+    pub uniform_fallback_rows: usize,
+    pub included_normalized_weight_total: f64,
+    pub skipped_normalized_weight_total: f64,
+    pub hu_unmatched_rows: usize,
+    pub mp_unmatched_rows: usize,
+    pub hu_unmatched_probability_mass: f64,
+    pub mp_unmatched_probability_mass: f64,
+    pub hu_unmatched_weighted_mass: f64,
+    pub mp_unmatched_weighted_mass: f64,
+}
+
+/// Combo-weighted aggregate action-frequency comparison at root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HuMpLazyActionFrequencyAggregateRow {
+    pub path: String,
+    pub action_index: usize,
+    pub action_label: String,
+    pub action_kind: String,
+    pub amount_chips: Option<f64>,
+    pub hu_frequency: f64,
+    pub mp_frequency: f64,
+    pub delta: f64,
+    pub abs_delta: f64,
+}
+
+/// Worst bucket/action local frequency differences for attribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HuMpLazyActionFrequencySpot {
+    pub path: String,
+    pub bucket: u16,
+    pub hand_label: String,
+    pub combo_count: usize,
+    pub normalized_weight: f64,
+    pub action_index: usize,
+    pub action_label: String,
+    pub hu_probability: f64,
+    pub mp_probability: f64,
+    pub abs_delta: f64,
+    pub row_l1: f64,
+    pub weighted_l1_contribution: f64,
+    pub mp_row_visited: bool,
+}
+
+/// Aggregate action-frequency totals and threshold result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HuMpLazyActionFrequencyTotals {
+    pub total_l1_delta: f64,
+    pub max_abs_delta: f64,
+    pub weighted_row_l1: f64,
+    pub max_row_l1: f64,
+    pub passed_thresholds: bool,
+}
+
+/// Root-only counterfactual action-frequency parity report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HuMpLazyActionFrequencyReport {
+    pub distribution: HuMpLazyActionFrequencyDistribution,
+    pub coverage: HuMpLazyActionFrequencyCoverage,
+    pub aggregate_actions: Vec<HuMpLazyActionFrequencyAggregateRow>,
+    pub worst_spots: Vec<HuMpLazyActionFrequencySpot>,
+    pub totals: HuMpLazyActionFrequencyTotals,
+}
+
 /// Runtime and coarse memory/storage telemetry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HuMpLazyRuntimeStats {
@@ -174,6 +270,7 @@ pub struct HuMpLazyReport {
     pub max_l1_distance: Option<f64>,
     pub mean_l1_distance: Option<f64>,
     pub max_abs_distance: Option<f64>,
+    pub action_frequency: Option<HuMpLazyActionFrequencyReport>,
     pub runtime_stats: HuMpLazyRuntimeStats,
     pub average_strategy_accounting_reconciled: bool,
 }
@@ -184,6 +281,8 @@ impl HuMpLazyReport {
     /// - `report.txt`
     /// - `root_action_schema_mismatches.csv`
     /// - `strategy_distance.csv`
+    /// - `root_action_frequencies.csv`
+    /// - `root_action_frequency_spots.csv`
     pub fn save(&self, dir: &Path) -> Result<(), Box<dyn Error>> {
         std::fs::create_dir_all(dir)?;
         std::fs::write(
@@ -204,6 +303,21 @@ impl HuMpLazyReport {
             distance_writer.serialize(distance)?;
         }
         distance_writer.flush()?;
+
+        let mut action_frequency_writer =
+            csv::Writer::from_path(dir.join("root_action_frequencies.csv"))?;
+        let mut action_frequency_spots_writer =
+            csv::Writer::from_path(dir.join("root_action_frequency_spots.csv"))?;
+        if let Some(action_frequency) = &self.action_frequency {
+            for row in &action_frequency.aggregate_actions {
+                action_frequency_writer.serialize(row)?;
+            }
+            for spot in &action_frequency.worst_spots {
+                action_frequency_spots_writer.serialize(spot)?;
+            }
+        }
+        action_frequency_writer.flush()?;
+        action_frequency_spots_writer.flush()?;
 
         Ok(())
     }
@@ -248,6 +362,61 @@ impl HuMpLazyReport {
             format_optional_f64(self.max_l1_distance),
             format_optional_f64(self.max_abs_distance)
         ));
+
+        out.push_str("\n--- Root Action Frequencies ---\n");
+        if let Some(action_frequency) = &self.action_frequency {
+            out.push_str(&format!(
+                "distribution: {} buckets={}, total_weight={}, normalized_weight_total={:.6}\n",
+                action_frequency.distribution.name,
+                action_frequency.distribution.bucket_count,
+                action_frequency.distribution.total_weight,
+                action_frequency.distribution.normalized_weight_total
+            ));
+            out.push_str(&format!(
+                "coverage: matched={}, missing_mp={}, skipped={}, invalid={}, zero_sum={}, off_normalized={}, uniform_fallback={}\n",
+                action_frequency.coverage.matched_rows,
+                action_frequency.coverage.missing_mp_rows,
+                action_frequency.coverage.skipped_rows,
+                action_frequency.coverage.invalid_rows,
+                action_frequency.coverage.zero_sum_rows,
+                action_frequency.coverage.off_normalized_rows,
+                action_frequency.coverage.uniform_fallback_rows
+            ));
+            out.push_str(&format!(
+                "weight coverage: input={:.6}, included={:.6}, skipped={:.6}\n",
+                action_frequency.distribution.normalized_weight_total,
+                action_frequency.coverage.included_normalized_weight_total,
+                action_frequency.coverage.skipped_normalized_weight_total
+            ));
+            out.push_str(&format!(
+                "unmatched action mass: HU rows={}, raw={:.6}, weighted={:.6}; MP rows={}, raw={:.6}, weighted={:.6}\n",
+                action_frequency.coverage.hu_unmatched_rows,
+                action_frequency.coverage.hu_unmatched_probability_mass,
+                action_frequency.coverage.hu_unmatched_weighted_mass,
+                action_frequency.coverage.mp_unmatched_rows,
+                action_frequency.coverage.mp_unmatched_probability_mass,
+                action_frequency.coverage.mp_unmatched_weighted_mass
+            ));
+            out.push_str(&format!(
+                "total L1: {:.6}, max abs: {:.6}, weighted row L1: {:.6}, max row L1: {:.6}, thresholds passed: {}\n",
+                action_frequency.totals.total_l1_delta,
+                action_frequency.totals.max_abs_delta,
+                action_frequency.totals.weighted_row_l1,
+                action_frequency.totals.max_row_l1,
+                action_frequency.totals.passed_thresholds
+            ));
+            for row in &action_frequency.aggregate_actions {
+                out.push_str(&format!(
+                    "{}: HU {}, MP {}, delta {}\n",
+                    row.action_label,
+                    format_percent(row.hu_frequency),
+                    format_percent(row.mp_frequency),
+                    format_signed_percent(row.delta)
+                ));
+            }
+        } else {
+            out.push_str("not produced\n");
+        }
 
         out.push_str("\n--- Runtime / Storage ---\n");
         out.push_str(&format!(
@@ -305,6 +474,7 @@ pub fn preflight_report_for_configs(
         root_action_schema_mismatches,
         HuMpLazyRowCoverage::default(),
         Vec::new(),
+        None,
         HuMpLazyRuntimeStats::default(),
     )
 }
@@ -345,6 +515,15 @@ pub fn run_hu_mp_lazy_harness(
 
     let (row_coverage, strategy_distances, max_l1, mean_l1, max_abs) =
         compare_root_average_strategies(harness, &hu_trainer, &mp_ctx);
+    let action_frequency = compare_root_action_frequencies(harness, &hu_trainer, &mp_ctx)
+        .map_or_else(
+            |reason| {
+                let mut reasons = Vec::new();
+                reasons.push(reason);
+                (None, reasons)
+            },
+            |report| (Some(report), Vec::new()),
+        );
 
     let hu_stats = hu_trainer.storage_stats();
     let mp_stats = mp_ctx.storage.stats();
@@ -362,7 +541,7 @@ pub fn run_hu_mp_lazy_harness(
         mp_sparse_approx_bytes: mp_stats.approx_bytes,
     };
 
-    let mut reasons = Vec::new();
+    let (action_frequency, mut reasons) = action_frequency;
     if let Some(max_l1) = max_l1 {
         if max_l1 > harness.max_l1_tolerance {
             reasons.push(format!(
@@ -387,6 +566,7 @@ pub fn run_hu_mp_lazy_harness(
         preflight.root_action_schema_mismatches,
         row_coverage,
         strategy_distances,
+        action_frequency,
         runtime_stats,
     )
     .with_distances(max_l1, mean_l1, max_abs))
@@ -589,7 +769,10 @@ fn structural_checks(
         &mut checks,
         "stack_blinds_rake_limp",
         approx_eq(hu.game.stack_depth, mp.game.stack_depth)
-            && approx_eq(hu.game.small_blind, mp_blind_any(mp, ForcedBetKind::SmallBlind))
+            && approx_eq(
+                hu.game.small_blind,
+                mp_blind_any(mp, ForcedBetKind::SmallBlind),
+            )
             && approx_eq(hu.game.big_blind, mp_blind_any(mp, ForcedBetKind::BigBlind))
             && approx_eq(hu.game.rake_rate, mp.game.rake_rate)
             && approx_eq(hu.game.rake_cap, mp.game.rake_cap)
@@ -1027,6 +1210,379 @@ fn compare_root_average_strategies(
     )
 }
 
+fn compare_root_action_frequencies(
+    harness: &HuMpLazyHarnessConfig,
+    hu_trainer: &BlueprintTrainer,
+    mp_ctx: &poker_solver_core::blueprint_mp::trainer::LazyTrainContext,
+) -> Result<HuMpLazyActionFrequencyReport, String> {
+    let weights = canonical_preflop_bucket_weights(harness.preflop_buckets)?;
+    let hu_actions = match &hu_trainer.tree.nodes[hu_trainer.tree.root as usize] {
+        HuGameNode::Decision { actions, .. } => {
+            comparable_hu_root_actions(actions, &hu_trainer.config)
+        }
+        _ => Vec::new(),
+    };
+    if hu_actions.is_empty() {
+        return Err("root action-frequency evidence was not produced: HU root action extraction returned no comparable actions".to_string());
+    }
+
+    let mp_root = LazyResolvedSpot::root(&mp_ctx.game);
+    let mp_root_actions = mp_root.actions(&mp_ctx.game);
+    let mp_actions = mp_root_actions
+        .iter()
+        .enumerate()
+        .map(|(idx, action)| (idx, normalize_mp_root_action(action)))
+        .collect::<Vec<_>>();
+    let hu_descriptors = hu_actions
+        .iter()
+        .map(|(_, action)| action.clone())
+        .collect::<Vec<_>>();
+    let hu_action_indices = hu_actions.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+    let mp_descriptors = mp_actions
+        .iter()
+        .map(|(_, action)| action.clone())
+        .collect::<Vec<_>>();
+    let mp_action_indices = mp_actions.iter().map(|(idx, _)| *idx).collect::<Vec<_>>();
+    let descriptor_mismatches =
+        compare_action_descriptors("root", &hu_descriptors, &mp_descriptors);
+    if !descriptor_mismatches.is_empty() {
+        return Err(format!(
+            "root action-frequency evidence was not produced: {} root action descriptor mismatch(es)",
+            descriptor_mismatches.len()
+        ));
+    }
+
+    let snapshot = mp_ctx.storage.snapshot_entries();
+    let visited: HashSet<MpInfosetKey> = snapshot.iter().map(|entry| entry.key).collect();
+    let mut rows = Vec::with_capacity(weights.len());
+    for weight in weights {
+        let hu_full_strategy = hu_trainer
+            .storage
+            .average_strategy(hu_trainer.tree.root, weight.bucket);
+
+        let key = mp_root.key_for_bucket(weight.bucket);
+        let mp_row_visited = visited.contains(&key);
+        let mut mp_full_strategy = vec![0.0; mp_root_actions.len()];
+        mp_ctx
+            .storage
+            .average_strategy(key, mp_root_actions.len(), &mut mp_full_strategy);
+
+        rows.push(ActionFrequencyInputRow {
+            bucket: weight.bucket,
+            hand_label: weight.hand_label,
+            combo_count: weight.combo_count,
+            normalized_weight: weight.normalized_weight,
+            hu_probabilities: hu_full_strategy,
+            mp_probabilities: mp_full_strategy,
+            mp_row_visited,
+        });
+    }
+
+    Ok(aggregate_action_frequency_rows(
+        "root",
+        &hu_descriptors,
+        &hu_action_indices,
+        &mp_action_indices,
+        rows,
+        harness.worst_action_frequency_spots,
+        harness.max_action_frequency_delta_tolerance,
+        harness.total_action_frequency_l1_tolerance,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalPreflopBucketWeight {
+    bucket: u16,
+    hand_label: String,
+    combo_count: usize,
+    normalized_weight: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ActionFrequencyInputRow {
+    bucket: u16,
+    hand_label: String,
+    combo_count: usize,
+    normalized_weight: f64,
+    hu_probabilities: Vec<f64>,
+    mp_probabilities: Vec<f64>,
+    mp_row_visited: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbabilityRowError {
+    Invalid,
+    ZeroSum,
+    OffNormalized,
+}
+
+fn canonical_preflop_bucket_weights(
+    bucket_count: u16,
+) -> Result<Vec<CanonicalPreflopBucketWeight>, String> {
+    if bucket_count != 169 {
+        return Err(format!(
+            "root action-frequency evidence was not produced: canonical_combo_count_preflop requires 169 buckets, got {bucket_count}"
+        ));
+    }
+
+    let mut weights = Vec::with_capacity(169);
+    let mut total_weight = 0_usize;
+    for bucket in 0..bucket_count {
+        let hand = CanonicalHand::from_index(usize::from(bucket)).ok_or_else(|| {
+            format!("canonical_combo_count_preflop missing canonical hand for bucket {bucket}")
+        })?;
+        let combo_count = usize::from(hand.num_combos());
+        total_weight += combo_count;
+        weights.push(CanonicalPreflopBucketWeight {
+            bucket,
+            hand_label: hand.to_string(),
+            combo_count,
+            normalized_weight: 0.0,
+        });
+    }
+
+    if total_weight != 1326 {
+        return Err(format!(
+            "canonical_combo_count_preflop total weight {total_weight} != 1326"
+        ));
+    }
+    for weight in &mut weights {
+        weight.normalized_weight = weight.combo_count as f64 / total_weight as f64;
+    }
+    Ok(weights)
+}
+
+fn aggregate_action_frequency_rows(
+    path: &str,
+    actions: &[NormalizedActionDescriptor],
+    hu_action_indices: &[usize],
+    mp_action_indices: &[usize],
+    rows: Vec<ActionFrequencyInputRow>,
+    worst_spot_limit: usize,
+    max_action_frequency_delta_tolerance: f64,
+    total_action_frequency_l1_tolerance: f64,
+) -> HuMpLazyActionFrequencyReport {
+    let mut coverage = HuMpLazyActionFrequencyCoverage::default();
+    let mut hu_action_frequencies = vec![0.0; actions.len()];
+    let mut mp_action_frequencies = vec![0.0; actions.len()];
+    let mut worst_spots = Vec::new();
+    let mut weighted_row_l1 = 0.0;
+    let mut max_row_l1 = 0.0_f64;
+    let total_weight = rows.iter().map(|row| row.combo_count).sum::<usize>();
+    let normalized_weight_total = rows.iter().map(|row| row.normalized_weight).sum::<f64>();
+    let bucket_count = rows.len();
+
+    for row in rows {
+        let mut skip_row = false;
+        if !row.mp_row_visited {
+            coverage.missing_mp_rows += 1;
+            skip_row = true;
+        }
+
+        if let Err(error) = validate_probability_row(&row.hu_probabilities, hu_action_indices) {
+            mark_probability_row_error(&mut coverage, error);
+            skip_row = true;
+        }
+        if let Err(error) = validate_probability_row(&row.mp_probabilities, mp_action_indices) {
+            mark_probability_row_error(&mut coverage, error);
+            skip_row = true;
+        }
+
+        if skip_row {
+            coverage.skipped_rows += 1;
+            coverage.skipped_normalized_weight_total += row.normalized_weight;
+            continue;
+        }
+
+        coverage.matched_rows += 1;
+        coverage.included_normalized_weight_total += row.normalized_weight;
+
+        let hu_unmatched_mass =
+            unmatched_probability_mass(&row.hu_probabilities, hu_action_indices);
+        let mp_unmatched_mass =
+            unmatched_probability_mass(&row.mp_probabilities, mp_action_indices);
+        if hu_unmatched_mass > UNMATCHED_ACTION_MASS_EPSILON {
+            coverage.hu_unmatched_rows += 1;
+            coverage.hu_unmatched_probability_mass += hu_unmatched_mass;
+            coverage.hu_unmatched_weighted_mass += row.normalized_weight * hu_unmatched_mass;
+        }
+        if mp_unmatched_mass > UNMATCHED_ACTION_MASS_EPSILON {
+            coverage.mp_unmatched_rows += 1;
+            coverage.mp_unmatched_probability_mass += mp_unmatched_mass;
+            coverage.mp_unmatched_weighted_mass += row.normalized_weight * mp_unmatched_mass;
+        }
+
+        let hu = hu_action_indices
+            .iter()
+            .map(|idx| row.hu_probabilities[*idx])
+            .collect::<Vec<_>>();
+        let mp = mp_action_indices
+            .iter()
+            .map(|idx| row.mp_probabilities[*idx])
+            .collect::<Vec<_>>();
+
+        let (row_l1, _) = strategy_distance(&hu, &mp);
+        max_row_l1 = max_row_l1.max(row_l1);
+        let weighted_l1_contribution = row.normalized_weight * row_l1;
+        weighted_row_l1 += weighted_l1_contribution;
+
+        for (action_index, ((hu_probability, mp_probability), action)) in
+            hu.iter().zip(&mp).zip(actions).enumerate()
+        {
+            hu_action_frequencies[action_index] += row.normalized_weight * *hu_probability;
+            mp_action_frequencies[action_index] += row.normalized_weight * *mp_probability;
+            worst_spots.push(HuMpLazyActionFrequencySpot {
+                path: path.to_string(),
+                bucket: row.bucket,
+                hand_label: row.hand_label.clone(),
+                combo_count: row.combo_count,
+                normalized_weight: row.normalized_weight,
+                action_index,
+                action_label: descriptor_label(action),
+                hu_probability: *hu_probability,
+                mp_probability: *mp_probability,
+                abs_delta: (*hu_probability - *mp_probability).abs(),
+                row_l1,
+                weighted_l1_contribution,
+                mp_row_visited: row.mp_row_visited,
+            });
+        }
+    }
+
+    let aggregate_actions = actions
+        .iter()
+        .enumerate()
+        .map(|(action_index, action)| {
+            let hu_frequency = hu_action_frequencies[action_index];
+            let mp_frequency = mp_action_frequencies[action_index];
+            let delta = hu_frequency - mp_frequency;
+            HuMpLazyActionFrequencyAggregateRow {
+                path: path.to_string(),
+                action_index,
+                action_label: descriptor_label(action),
+                action_kind: action.kind.clone(),
+                amount_chips: action.amount_chips,
+                hu_frequency,
+                mp_frequency,
+                delta,
+                abs_delta: delta.abs(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let total_l1_delta = aggregate_actions
+        .iter()
+        .map(|row| row.abs_delta)
+        .sum::<f64>();
+    let max_abs_delta = aggregate_actions
+        .iter()
+        .map(|row| row.abs_delta)
+        .fold(0.0_f64, f64::max);
+
+    worst_spots.sort_by(|a, b| {
+        b.abs_delta
+            .total_cmp(&a.abs_delta)
+            .then_with(|| {
+                b.weighted_l1_contribution
+                    .total_cmp(&a.weighted_l1_contribution)
+            })
+            .then_with(|| a.bucket.cmp(&b.bucket))
+            .then_with(|| a.action_index.cmp(&b.action_index))
+    });
+    worst_spots.truncate(worst_spot_limit);
+
+    let coverage_blocks_thresholds = coverage.missing_mp_rows > 0
+        || coverage.skipped_rows > 0
+        || coverage.invalid_rows > 0
+        || coverage.zero_sum_rows > 0
+        || coverage.off_normalized_rows > 0
+        || coverage.hu_unmatched_weighted_mass > UNMATCHED_ACTION_MASS_EPSILON
+        || coverage.mp_unmatched_weighted_mass > UNMATCHED_ACTION_MASS_EPSILON
+        || coverage.included_normalized_weight_total + PROBABILITY_SUM_EPSILON
+            < normalized_weight_total;
+
+    HuMpLazyActionFrequencyReport {
+        distribution: HuMpLazyActionFrequencyDistribution {
+            name: "canonical_combo_count_preflop".to_string(),
+            bucket_count,
+            total_weight,
+            normalized_weight_total,
+        },
+        coverage,
+        aggregate_actions,
+        worst_spots,
+        totals: HuMpLazyActionFrequencyTotals {
+            total_l1_delta,
+            max_abs_delta,
+            weighted_row_l1,
+            max_row_l1,
+            passed_thresholds: !coverage_blocks_thresholds
+                && max_abs_delta <= max_action_frequency_delta_tolerance
+                && total_l1_delta <= total_action_frequency_l1_tolerance,
+        },
+    }
+}
+
+fn validate_probability_row(
+    probabilities: &[f64],
+    matched_action_indices: &[usize],
+) -> Result<(), ProbabilityRowError> {
+    if probabilities.is_empty()
+        || matched_action_indices
+            .iter()
+            .any(|idx| *idx >= probabilities.len())
+        || probabilities
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(ProbabilityRowError::Invalid);
+    }
+    let total = probabilities.iter().sum::<f64>();
+    if total <= 0.0 {
+        return Err(ProbabilityRowError::ZeroSum);
+    }
+    if (total - 1.0).abs() > PROBABILITY_SUM_EPSILON {
+        return Err(ProbabilityRowError::OffNormalized);
+    }
+    Ok(())
+}
+
+fn mark_probability_row_error(
+    coverage: &mut HuMpLazyActionFrequencyCoverage,
+    error: ProbabilityRowError,
+) {
+    match error {
+        ProbabilityRowError::Invalid => coverage.invalid_rows += 1,
+        ProbabilityRowError::ZeroSum => coverage.zero_sum_rows += 1,
+        ProbabilityRowError::OffNormalized => {
+            coverage.invalid_rows += 1;
+            coverage.off_normalized_rows += 1;
+        }
+    }
+}
+
+fn unmatched_probability_mass(probabilities: &[f64], matched_action_indices: &[usize]) -> f64 {
+    probabilities
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !matched_action_indices.contains(idx))
+        .map(|(_, probability)| *probability)
+        .sum()
+}
+
+fn has_unmatched_action_mass(coverage: &HuMpLazyActionFrequencyCoverage) -> bool {
+    coverage.hu_unmatched_weighted_mass > UNMATCHED_ACTION_MASS_EPSILON
+        || coverage.mp_unmatched_weighted_mass > UNMATCHED_ACTION_MASS_EPSILON
+}
+
+fn has_incomplete_action_frequency_coverage(coverage: &HuMpLazyActionFrequencyCoverage) -> bool {
+    coverage.missing_mp_rows > 0
+        || coverage.skipped_rows > 0
+        || coverage.invalid_rows > 0
+        || coverage.zero_sum_rows > 0
+        || coverage.off_normalized_rows > 0
+        || has_unmatched_action_mass(coverage)
+}
+
 fn finalize_report(
     harness: &HuMpLazyHarnessConfig,
     mut reasons: Vec<String>,
@@ -1034,6 +1590,7 @@ fn finalize_report(
     root_action_schema_mismatches: Vec<HuMpLazySchemaMismatch>,
     row_coverage: HuMpLazyRowCoverage,
     strategy_distances: Vec<HuMpLazyStrategyDistance>,
+    action_frequency: Option<HuMpLazyActionFrequencyReport>,
     runtime_stats: HuMpLazyRuntimeStats,
 ) -> HuMpLazyReport {
     if strategy_distances.is_empty()
@@ -1043,6 +1600,130 @@ fn finalize_report(
     {
         reasons
             .push("strategy distance rows are empty; no comparable evidence was produced".into());
+    }
+    if strategy_distances.is_empty()
+        && runtime_stats.total_runtime_ms > 0
+        && action_frequency.is_none()
+        && structural_checks.iter().all(|check| check.passed)
+        && root_action_schema_mismatches.is_empty()
+    {
+        reasons.push("root action-frequency evidence was not produced".into());
+    }
+    if !strategy_distances.is_empty() && action_frequency.is_none() {
+        reasons.push("root action-frequency evidence was not produced".into());
+    }
+    if let Some(action_frequency) = &action_frequency {
+        if action_frequency.coverage.missing_mp_rows > 0 {
+            reasons.push(format!(
+                "root action-frequency coverage missing {} MP sparse row(s); those rows were excluded from the primary metric",
+                action_frequency.coverage.missing_mp_rows
+            ));
+        }
+        if action_frequency.coverage.skipped_rows > 0 {
+            reasons.push(format!(
+                "root action-frequency skipped {} row(s); included weight {:.6} of input weight {:.6}",
+                action_frequency.coverage.skipped_rows,
+                action_frequency.coverage.included_normalized_weight_total,
+                action_frequency.distribution.normalized_weight_total
+            ));
+        }
+        if action_frequency.coverage.invalid_rows > 0 {
+            reasons.push(format!(
+                "root action-frequency saw {} invalid source strategy row(s)",
+                action_frequency.coverage.invalid_rows
+            ));
+        }
+        if action_frequency.coverage.zero_sum_rows > 0 {
+            reasons.push(format!(
+                "root action-frequency saw {} zero-sum source strategy row(s)",
+                action_frequency.coverage.zero_sum_rows
+            ));
+        }
+        if action_frequency.coverage.off_normalized_rows > 0 {
+            reasons.push(format!(
+                "root action-frequency saw {} materially off-normalized source strategy row(s)",
+                action_frequency.coverage.off_normalized_rows
+            ));
+        }
+        if action_frequency.coverage.hu_unmatched_weighted_mass > UNMATCHED_ACTION_MASS_EPSILON {
+            reasons.push(format!(
+                "root action-frequency HU comparable actions omitted weighted probability mass {:.6} across {} row(s)",
+                action_frequency.coverage.hu_unmatched_weighted_mass,
+                action_frequency.coverage.hu_unmatched_rows
+            ));
+        }
+        if action_frequency.coverage.mp_unmatched_weighted_mass > UNMATCHED_ACTION_MASS_EPSILON {
+            reasons.push(format!(
+                "root action-frequency MP comparable actions omitted weighted probability mass {:.6} across {} row(s)",
+                action_frequency.coverage.mp_unmatched_weighted_mass,
+                action_frequency.coverage.mp_unmatched_rows
+            ));
+        }
+        if has_incomplete_action_frequency_coverage(&action_frequency.coverage)
+            && action_frequency.totals.passed_thresholds
+        {
+            reasons.push(
+                "root action-frequency thresholds passed despite incomplete coverage".to_string(),
+            );
+        }
+        if !action_frequency.totals.passed_thresholds {
+            reasons.push(
+                "root action-frequency thresholds did not pass after coverage checks".to_string(),
+            );
+        }
+        if action_frequency.coverage.skipped_rows > 0
+            && action_frequency.coverage.skipped_normalized_weight_total > 0.0
+        {
+            reasons.push(format!(
+                "root action-frequency skipped normalized input weight {:.6}",
+                action_frequency.coverage.skipped_normalized_weight_total
+            ));
+        }
+        if action_frequency.coverage.uniform_fallback_rows > 0 {
+            reasons.push(format!(
+                "root action-frequency used {} uniform fallback row(s)",
+                action_frequency.coverage.uniform_fallback_rows
+            ));
+        }
+        if action_frequency.coverage.skipped_rows > 0 && action_frequency.coverage.matched_rows == 0
+        {
+            reasons.push(
+                "root action-frequency has no valid included rows after coverage filtering"
+                    .to_string(),
+            );
+        }
+        if action_frequency.coverage.skipped_rows > 0
+            && action_frequency.coverage.included_normalized_weight_total + PROBABILITY_SUM_EPSILON
+                < action_frequency.distribution.normalized_weight_total
+        {
+            reasons.push(format!(
+                "root action-frequency included only {:.6} of {:.6} normalized input weight",
+                action_frequency.coverage.included_normalized_weight_total,
+                action_frequency.distribution.normalized_weight_total
+            ));
+        }
+        if action_frequency.coverage.skipped_rows > 0
+            && action_frequency.coverage.invalid_rows == 0
+            && action_frequency.coverage.zero_sum_rows == 0
+            && action_frequency.coverage.missing_mp_rows == 0
+        {
+            reasons.push(format!(
+                "root action-frequency skipped {} row(s) for coverage reasons",
+                action_frequency.coverage.skipped_rows
+            ));
+        }
+        if action_frequency.totals.max_abs_delta > harness.max_action_frequency_delta_tolerance {
+            reasons.push(format!(
+                "max root action-frequency delta {:.6} exceeds tolerance {:.6}",
+                action_frequency.totals.max_abs_delta, harness.max_action_frequency_delta_tolerance
+            ));
+        }
+        if action_frequency.totals.total_l1_delta > harness.total_action_frequency_l1_tolerance {
+            reasons.push(format!(
+                "total root action-frequency L1 {:.6} exceeds tolerance {:.6}",
+                action_frequency.totals.total_l1_delta, harness.total_action_frequency_l1_tolerance
+            ));
+        }
     }
     reasons.push(
         "average-strategy accounting is not reconciled: HU sums traverser nodes only, MP lazy also accumulates sampled opponent nodes"
@@ -1063,6 +1744,7 @@ fn finalize_report(
         max_l1_distance: None,
         mean_l1_distance: None,
         max_abs_distance: None,
+        action_frequency,
         runtime_stats,
         average_strategy_accounting_reconciled: false,
     }
@@ -1254,6 +1936,14 @@ fn format_optional_f64(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.6}"))
 }
 
+fn format_percent(value: f64) -> String {
+    format!("{:.2}%", value * 100.0)
+}
+
+fn format_signed_percent(value: f64) -> String {
+    format!("{:+.2}%", value * 100.0)
+}
+
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
@@ -1334,6 +2024,7 @@ mod tests {
             max_l1_distance: Some(0.0),
             mean_l1_distance: Some(0.0),
             max_abs_distance: Some(0.0),
+            action_frequency: Some(sample_action_frequency_report()),
             runtime_stats: HuMpLazyRuntimeStats::default(),
             average_strategy_accounting_reconciled: true,
         };
@@ -1355,6 +2046,223 @@ mod tests {
             .join("root_action_schema_mismatches.csv")
             .exists());
         assert!(dir.path().join("strategy_distance.csv").exists());
+        assert!(dir.path().join("root_action_frequencies.csv").exists());
+        assert!(dir.path().join("root_action_frequency_spots.csv").exists());
+
+        let summary_json =
+            std::fs::read_to_string(dir.path().join("summary.json")).expect("read summary");
+        assert!(summary_json.contains("action_frequency"));
+        let text = std::fs::read_to_string(dir.path().join("report.txt")).expect("read report");
+        assert!(text.contains("Root Action Frequencies"));
+        assert!(text.contains("Fold"));
+    }
+
+    fn sample_action_frequency_report() -> HuMpLazyActionFrequencyReport {
+        aggregate_action_frequency_rows(
+            "root",
+            &[
+                normalized("Fold", None),
+                normalized("Call", None),
+                normalized("Raise", Some(6.0)),
+            ],
+            &[0, 1, 2],
+            &[0, 1, 2],
+            vec![ActionFrequencyInputRow {
+                bucket: 0,
+                hand_label: "AA".to_string(),
+                combo_count: 6,
+                normalized_weight: 1.0,
+                hu_probabilities: vec![0.2, 0.3, 0.5],
+                mp_probabilities: vec![0.1, 0.4, 0.5],
+                mp_row_visited: true,
+            }],
+            20,
+            0.05,
+            0.10,
+        )
+    }
+
+    #[test]
+    fn canonical_preflop_bucket_weights_sum_to_combo_count_distribution() {
+        let weights = canonical_preflop_bucket_weights(169).expect("canonical weights");
+
+        assert_eq!(weights.len(), 169);
+        assert_eq!(
+            weights
+                .iter()
+                .map(|weight| weight.combo_count)
+                .sum::<usize>(),
+            1326
+        );
+        assert!(
+            (weights
+                .iter()
+                .map(|weight| weight.normalized_weight)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(weights[0].hand_label, "AA");
+        assert_eq!(weights[0].combo_count, 6);
+        assert_eq!(weights[13].hand_label, "AKs");
+        assert_eq!(weights[13].combo_count, 4);
+        assert_eq!(weights[91].hand_label, "AKo");
+        assert_eq!(weights[91].combo_count, 12);
+
+        let err = canonical_preflop_bucket_weights(168).expect_err("wrong bucket count errors");
+        assert!(err.contains("requires 169 buckets"));
+    }
+
+    #[test]
+    fn action_frequency_aggregation_uses_combo_weighted_raw_source_rows() {
+        let report = aggregate_action_frequency_rows(
+            "root",
+            &[normalized("Fold", None), normalized("Raise", Some(6.0))],
+            &[0, 1],
+            &[0, 1],
+            vec![
+                ActionFrequencyInputRow {
+                    bucket: 0,
+                    hand_label: "AA".to_string(),
+                    combo_count: 6,
+                    normalized_weight: 0.25,
+                    hu_probabilities: vec![0.25, 0.75],
+                    mp_probabilities: vec![0.5, 0.5],
+                    mp_row_visited: true,
+                },
+                ActionFrequencyInputRow {
+                    bucket: 1,
+                    hand_label: "AKo".to_string(),
+                    combo_count: 18,
+                    normalized_weight: 0.75,
+                    hu_probabilities: vec![0.0, 1.0],
+                    mp_probabilities: vec![0.2, 0.8],
+                    mp_row_visited: true,
+                },
+            ],
+            4,
+            0.25,
+            0.50,
+        );
+
+        assert_eq!(report.coverage.matched_rows, 2);
+        assert_eq!(report.coverage.missing_mp_rows, 0);
+        assert_eq!(report.coverage.uniform_fallback_rows, 0);
+        assert_eq!(report.coverage.skipped_rows, 0);
+        assert_eq!(report.distribution.total_weight, 24);
+        assert!((report.distribution.normalized_weight_total - 1.0).abs() < 1e-12);
+        assert!((report.coverage.included_normalized_weight_total - 1.0).abs() < 1e-12);
+
+        let fold = &report.aggregate_actions[0];
+        let raise = &report.aggregate_actions[1];
+        assert!((fold.hu_frequency - 0.0625).abs() < 1e-12);
+        assert!((raise.hu_frequency - 0.9375).abs() < 1e-12);
+        assert!((fold.mp_frequency - 0.275).abs() < 1e-12);
+        assert!((raise.mp_frequency - 0.725).abs() < 1e-12);
+        assert!((report.totals.total_l1_delta - 0.425).abs() < 1e-12);
+        assert!((report.totals.max_abs_delta - 0.2125).abs() < 1e-12);
+        assert!((report.totals.weighted_row_l1 - 0.425).abs() < 1e-12);
+        assert!(report.totals.passed_thresholds);
+        assert!(!report.worst_spots.is_empty());
+    }
+
+    #[test]
+    fn action_frequency_aggregation_surfaces_unmatched_mass_without_renormalizing() {
+        let report = aggregate_action_frequency_rows(
+            "root",
+            &[normalized("Fold", None), normalized("Raise", Some(6.0))],
+            &[0, 1],
+            &[0, 1],
+            vec![ActionFrequencyInputRow {
+                bucket: 0,
+                hand_label: "AA".to_string(),
+                combo_count: 6,
+                normalized_weight: 1.0,
+                hu_probabilities: vec![0.2, 0.6, 0.2],
+                mp_probabilities: vec![0.2, 0.8],
+                mp_row_visited: true,
+            }],
+            4,
+            1.0,
+            1.0,
+        );
+
+        assert_eq!(report.coverage.matched_rows, 1);
+        assert_eq!(report.coverage.hu_unmatched_rows, 1);
+        assert!((report.coverage.hu_unmatched_probability_mass - 0.2).abs() < 1e-12);
+        assert!((report.coverage.hu_unmatched_weighted_mass - 0.2).abs() < 1e-12);
+        assert_eq!(report.coverage.mp_unmatched_rows, 0);
+        assert!(!report.totals.passed_thresholds);
+
+        let fold = &report.aggregate_actions[0];
+        let raise = &report.aggregate_actions[1];
+        assert!((fold.hu_frequency - 0.2).abs() < 1e-12);
+        assert!((raise.hu_frequency - 0.6).abs() < 1e-12);
+        assert!((fold.mp_frequency - 0.2).abs() < 1e-12);
+        assert!((raise.mp_frequency - 0.8).abs() < 1e-12);
+
+        let harness = HuMpLazyHarnessConfig {
+            max_action_frequency_delta_tolerance: 1.0,
+            total_action_frequency_l1_tolerance: 1.0,
+            ..Default::default()
+        };
+        let final_report = finalize_report(
+            &harness,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HuMpLazyRowCoverage::default(),
+            Vec::new(),
+            Some(report),
+            HuMpLazyRuntimeStats::default(),
+        );
+        assert!(final_report.reasons.iter().any(|reason| {
+            reason.contains("HU comparable actions omitted weighted probability mass")
+        }));
+    }
+
+    #[test]
+    fn action_frequency_aggregation_surfaces_invalid_zero_and_missing_rows() {
+        let report = aggregate_action_frequency_rows(
+            "root",
+            &[normalized("Fold", None), normalized("Call", None)],
+            &[0, 1],
+            &[0, 1],
+            vec![
+                ActionFrequencyInputRow {
+                    bucket: 0,
+                    hand_label: "AA".to_string(),
+                    combo_count: 6,
+                    normalized_weight: 0.5,
+                    hu_probabilities: vec![0.0, 0.0],
+                    mp_probabilities: vec![0.5, 0.5],
+                    mp_row_visited: true,
+                },
+                ActionFrequencyInputRow {
+                    bucket: 1,
+                    hand_label: "KK".to_string(),
+                    combo_count: 6,
+                    normalized_weight: 0.5,
+                    hu_probabilities: vec![0.5, 0.5],
+                    mp_probabilities: vec![f64::NAN, 0.5],
+                    mp_row_visited: false,
+                },
+            ],
+            10,
+            0.01,
+            0.02,
+        );
+
+        assert_eq!(report.coverage.matched_rows, 0);
+        assert_eq!(report.coverage.skipped_rows, 2);
+        assert_eq!(report.coverage.zero_sum_rows, 1);
+        assert_eq!(report.coverage.invalid_rows, 1);
+        assert_eq!(report.coverage.missing_mp_rows, 1);
+        assert_eq!(report.coverage.uniform_fallback_rows, 0);
+        assert!((report.coverage.skipped_normalized_weight_total - 1.0).abs() < 1e-12);
+        assert!(!report.totals.passed_thresholds);
+        assert!(report.worst_spots.is_empty());
     }
 
     #[test]
@@ -1480,5 +2388,10 @@ mod tests {
         assert!(report.runtime_stats.mp_meta_iterations_completed >= 1);
         assert!(report.row_coverage.compared_rows > 0);
         assert!(report.max_l1_distance.is_some());
+        let action_frequency = report
+            .action_frequency
+            .as_ref()
+            .expect("action frequency report");
+        assert!(!action_frequency.aggregate_actions.is_empty());
     }
 }

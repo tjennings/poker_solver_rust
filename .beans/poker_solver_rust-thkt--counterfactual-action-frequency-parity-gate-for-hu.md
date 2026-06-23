@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-thkt
 title: Counterfactual action-frequency parity gate for HU vs MP lazy
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-06-23T13:28:24Z
-updated_at: 2026-06-23T13:39:34Z
+updated_at: 2026-06-23T14:29:17Z
 parent: poker_solver_rust-osss
 ---
 
@@ -23,11 +23,11 @@ Scope checklist:
 
 - [x] Research counterfactual action-frequency equivalence metrics for HU vs MP lazy and identify confounders/tolerances.
 - [x] Brainstorm the smallest credible evaluator/report extension that reuses the existing hu_mp_lazy harness.
-- [ ] Implement matched-public-infoset action-frequency aggregation with a shared canonical weighting distribution.
-- [ ] Preserve local policy-distance diagnostics for attribution and keep the conservative GO/NO-GO semantics.
-- [ ] Emit durable report artifacts for frequency deltas and worst spots.
-- [ ] Add focused tests for normalization, weighted aggregation, mismatch handling, and serialization.
-- [ ] Run focused tests, git diff --check, and the hot full workspace suite under one minute.
+- [x] Implement matched-public-infoset action-frequency aggregation with a shared canonical weighting distribution.
+- [x] Preserve local policy-distance diagnostics for attribution and keep the conservative GO/NO-GO semantics.
+- [x] Emit durable report artifacts for frequency deltas and worst spots.
+- [x] Add focused tests for normalization, weighted aggregation, mismatch handling, and serialization.
+- [x] Run focused tests, git diff --check, and the hot full workspace suite under one minute.
 
 ## Research / Brainstorming Notes
 
@@ -53,3 +53,21 @@ Implementation slice:
 - Extend the existing root comparison loop to compute combo-weighted aggregate action frequencies and worst bucket/action deltas.
 - Emit `root_action_frequencies.csv` and `root_action_frequency_spots.csv`, plus a report.txt action-frequency section.
 - Keep postflop/deeper matched public-state rollout, CLI/TUI wiring, production baseline runs, and EV/exploitability parity out of this slice.
+
+## Summary of Changes
+
+Implemented a root-only counterfactual action-frequency parity section in `crates/convergence-harness/src/hu_mp_lazy.rs`. The existing HU-vs-MP-lazy harness now reports combo-count weighted root action frequencies under the shared canonical 169-hand preflop distribution, using `CanonicalHand::from_index(bucket).num_combos()` and total mass 1326.
+
+The metric uses raw source probabilities at matched action indices. It does not renormalize after filtering comparable actions, so unmatched/filtered HU or MP action mass is surfaced as coverage evidence and prevents threshold pass. Missing MP sparse root rows are skipped and reported instead of being silently treated as uniform fallback parity.
+
+Added nested action-frequency report types, config thresholds, aggregate action rows, worst bucket/action spots, coverage totals, report.txt output, and CSV artifacts: `root_action_frequencies.csv` and `root_action_frequency_spots.csv`. Existing local strategy-distance diagnostics remain for attribution, and the harness remains conservative NO-GO because average-strategy accounting is still unreconciled.
+
+Review fixed a blocking metric bug where projected rows were originally renormalized and could hide filtered action mass. Final review found no blockers.
+
+Verification:
+
+- `cargo test -p convergence-harness hu_mp_lazy -- --nocapture` passed (11 tests).
+- `cargo test -p convergence-harness --tests -- --nocapture` passed (110 lib + 13 main tests, 3 ignored integration tests).
+- `git diff --check` passed.
+- `rustfmt --check crates/convergence-harness/src/hu_mp_lazy.rs` passed.
+- Hot redirected full workspace suite passed with `real 44.96`, `user 96.62`, `sys 14.52`.
