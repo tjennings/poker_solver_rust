@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-3kn5
 title: Ratify action-frequency parity as HU vs MP lazy gate
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-06-23T15:36:34Z
-updated_at: 2026-06-23T15:43:52Z
+updated_at: 2026-06-23T16:03:10Z
 parent: poker_solver_rust-osss
 ---
 
@@ -27,7 +27,7 @@ Scope checklist:
 - [ ] Add or update calibration run evidence for the small representative 2p harness fixture.
 - [ ] Update report artifacts/tests so reasons vs warnings are explicit and hard-gate behavior is covered.
 - [ ] Update docs only if public/user-facing workflow changes.
-- [ ] Run focused tests, diff hygiene, and hot full workspace suite under one minute.
+- [x] Run focused tests, diff hygiene, and hot full workspace suite under one minute.
 
 ## Research / Brainstorming Notes
 
@@ -49,3 +49,18 @@ Implementation plan:
 - Keep absent action-frequency evidence as hard NO-GO, including structurally valid preflight reports.
 - Add tests proving clean action-frequency evidence can produce GO despite accounting/local-L1 warnings, while coverage/frequency/schema failures remain NO-GO.
 - Update module docs; no broad docs required because there is no CLI/user workflow change.
+
+## Summary of Changes
+
+- Added a serde-compatible `warnings` field to HU-vs-MP-lazy reports and updated human output so hard NO-GO causes and non-blocking diagnostics are separate.
+- Ratified complete canonical preflop combo-weighted root action-frequency parity as the behavioral GO criterion: structural/schema/evidence/coverage/unmatched-mass/frequency failures remain hard `reasons`, while average-strategy accounting and local root strategy L1 are warnings.
+- Added focused tests for preflight NO-GO without action-frequency evidence, duplicate missing-evidence suppression, GO despite accounting/local-L1 warnings, and hard NO-GO behavior for tolerance and coverage failures.
+- No broad docs changed because the public CLI workflow did not change; the report/module wording now documents the gate caveat directly.
+
+Verification:
+
+- `cargo test -p convergence-harness hu_mp_lazy -- --nocapture` passed: 17 tests.
+- `cargo test -p convergence-harness --tests -- --nocapture` passed: 116 library tests, 13 binary tests, 3 integration tests ignored.
+- `git diff --check` passed.
+- `/usr/bin/time -p sh -c 'cargo test --workspace --quiet >/tmp/poker_solver_3kn5_final_hot.log 2>&1'` passed with `real 45.10`, `user 101.95`, `sys 15.56`.
+- Read-only review agent found no blockers; residual caveat is that GO-path coverage is synthetic until a real full-coverage fixture is available.

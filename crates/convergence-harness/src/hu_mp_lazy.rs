@@ -2,10 +2,11 @@
 //!
 //! This module is intentionally a GO/NO-GO gate, not a proof that heads-up
 //! training can be retired. The first reusable slice verifies structural
-//! preconditions, compares normalized root action schemas, runs a tiny smoke path,
-//! and emits durable diagnostics. Average-strategy accounting remains a known
-//! blocker until a later slice reconciles HU traverser-only sums with MP lazy
-//! opponent-sampled sums.
+//! preconditions, compares normalized root action schemas, and gates behavior on
+//! complete canonical preflop root combo-weighted action-frequency parity. Local
+//! row strategy L1 and average-strategy accounting remain diagnostics when the
+//! action-frequency gate passes; GO does not prove per-hand, post-root, EV, or
+//! exploitability parity.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -263,6 +264,8 @@ pub struct HuMpLazyRuntimeStats {
 pub struct HuMpLazyReport {
     pub verdict: HuMpLazyVerdict,
     pub reasons: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub structural_checks: Vec<HuMpLazyStructuralCheck>,
     pub root_action_schema_mismatches: Vec<HuMpLazySchemaMismatch>,
     pub row_coverage: HuMpLazyRowCoverage,
@@ -332,13 +335,25 @@ impl HuMpLazyReport {
             "Average-strategy accounting reconciled: {}\n\n",
             self.average_strategy_accounting_reconciled
         ));
+        out.push_str(
+            "GO criterion: complete canonical preflop root combo-weighted action frequencies matched within tolerance; this is not per-hand, post-root, EV, or exploitability parity.\n\n",
+        );
 
-        out.push_str("--- Reasons ---\n");
+        out.push_str("--- Reasons (hard NO-GO causes) ---\n");
         if self.reasons.is_empty() {
             out.push_str("none\n");
         } else {
             for reason in &self.reasons {
                 out.push_str(&format!("- {reason}\n"));
+            }
+        }
+
+        out.push_str("\n--- Warnings ---\n");
+        if self.warnings.is_empty() {
+            out.push_str("none\n");
+        } else {
+            for warning in &self.warnings {
+                out.push_str(&format!("- {warning}\n"));
             }
         }
 
@@ -470,6 +485,7 @@ pub fn preflight_report_for_configs(
     finalize_report(
         harness,
         reasons,
+        Vec::new(),
         structural_checks,
         root_action_schema_mismatches,
         HuMpLazyRowCoverage::default(),
@@ -541,10 +557,11 @@ pub fn run_hu_mp_lazy_harness(
         mp_sparse_approx_bytes: mp_stats.approx_bytes,
     };
 
-    let (action_frequency, mut reasons) = action_frequency;
+    let (action_frequency, reasons) = action_frequency;
+    let mut warnings = Vec::new();
     if let Some(max_l1) = max_l1 {
         if max_l1 > harness.max_l1_tolerance {
-            reasons.push(format!(
+            warnings.push(format!(
                 "max root strategy L1 {max_l1:.6} exceeds tolerance {:.6}",
                 harness.max_l1_tolerance
             ));
@@ -552,7 +569,7 @@ pub fn run_hu_mp_lazy_harness(
     }
     if let Some(mean_l1) = mean_l1 {
         if mean_l1 > harness.mean_l1_tolerance {
-            reasons.push(format!(
+            warnings.push(format!(
                 "mean root strategy L1 {mean_l1:.6} exceeds tolerance {:.6}",
                 harness.mean_l1_tolerance
             ));
@@ -562,6 +579,7 @@ pub fn run_hu_mp_lazy_harness(
     Ok(finalize_report(
         harness,
         reasons,
+        warnings,
         preflight.structural_checks,
         preflight.root_action_schema_mismatches,
         row_coverage,
@@ -1583,9 +1601,16 @@ fn has_incomplete_action_frequency_coverage(coverage: &HuMpLazyActionFrequencyCo
         || has_unmatched_action_mass(coverage)
 }
 
+fn has_action_frequency_missing_reason(reasons: &[String]) -> bool {
+    reasons
+        .iter()
+        .any(|reason| reason.contains("root action-frequency evidence was not produced"))
+}
+
 fn finalize_report(
     harness: &HuMpLazyHarnessConfig,
     mut reasons: Vec<String>,
+    mut warnings: Vec<String>,
     structural_checks: Vec<HuMpLazyStructuralCheck>,
     root_action_schema_mismatches: Vec<HuMpLazySchemaMismatch>,
     row_coverage: HuMpLazyRowCoverage,
@@ -1598,18 +1623,14 @@ fn finalize_report(
         && root_action_schema_mismatches.is_empty()
         && harness.iterations > 0
     {
-        reasons
+        warnings
             .push("strategy distance rows are empty; no comparable evidence was produced".into());
     }
-    if strategy_distances.is_empty()
-        && runtime_stats.total_runtime_ms > 0
-        && action_frequency.is_none()
+    if action_frequency.is_none()
         && structural_checks.iter().all(|check| check.passed)
         && root_action_schema_mismatches.is_empty()
+        && !has_action_frequency_missing_reason(&reasons)
     {
-        reasons.push("root action-frequency evidence was not produced".into());
-    }
-    if !strategy_distances.is_empty() && action_frequency.is_none() {
         reasons.push("root action-frequency evidence was not produced".into());
     }
     if let Some(action_frequency) = &action_frequency {
@@ -1725,7 +1746,7 @@ fn finalize_report(
             ));
         }
     }
-    reasons.push(
+    warnings.push(
         "average-strategy accounting is not reconciled: HU sums traverser nodes only, MP lazy also accumulates sampled opponent nodes"
             .to_string(),
     );
@@ -1737,6 +1758,7 @@ fn finalize_report(
     HuMpLazyReport {
         verdict,
         reasons,
+        warnings,
         structural_checks,
         root_action_schema_mismatches,
         row_coverage,
@@ -1999,6 +2021,7 @@ mod tests {
         let report = HuMpLazyReport {
             verdict: HuMpLazyVerdict::Go,
             reasons: Vec::new(),
+            warnings: vec!["diagnostic only".to_string()],
             structural_checks: vec![HuMpLazyStructuralCheck {
                 name: "sample".to_string(),
                 passed: true,
@@ -2030,6 +2053,15 @@ mod tests {
         };
         let json = serde_json::to_string(&report).expect("serialize GO report");
         assert!(json.contains("GO"));
+        assert!(json.contains("warnings"));
+        let mut legacy_value = serde_json::to_value(&report).expect("convert report to JSON value");
+        legacy_value
+            .as_object_mut()
+            .expect("report JSON object")
+            .remove("warnings");
+        let legacy_report: HuMpLazyReport =
+            serde_json::from_value(legacy_value).expect("deserialize legacy report");
+        assert!(legacy_report.warnings.is_empty());
 
         let mut no_go = report.clone();
         no_go.verdict = HuMpLazyVerdict::NoGo;
@@ -2052,7 +2084,11 @@ mod tests {
         let summary_json =
             std::fs::read_to_string(dir.path().join("summary.json")).expect("read summary");
         assert!(summary_json.contains("action_frequency"));
+        assert!(summary_json.contains("warnings"));
         let text = std::fs::read_to_string(dir.path().join("report.txt")).expect("read report");
+        assert!(text.contains("Reasons (hard NO-GO causes)"));
+        assert!(text.contains("Warnings"));
+        assert!(text.contains("complete canonical preflop root combo-weighted"));
         assert!(text.contains("Root Action Frequencies"));
         assert!(text.contains("Fold"));
     }
@@ -2080,6 +2116,72 @@ mod tests {
             0.05,
             0.10,
         )
+    }
+
+    fn complete_action_frequency_report_with<F>(
+        mut row: F,
+        max_delta_tolerance: f64,
+        total_l1_tolerance: f64,
+    ) -> HuMpLazyActionFrequencyReport
+    where
+        F: FnMut(usize, &CanonicalPreflopBucketWeight) -> (Vec<f64>, Vec<f64>, bool),
+    {
+        let rows = canonical_preflop_bucket_weights(169)
+            .expect("canonical weights")
+            .iter()
+            .enumerate()
+            .map(|(idx, weight)| {
+                let (hu_probabilities, mp_probabilities, mp_row_visited) = row(idx, weight);
+                ActionFrequencyInputRow {
+                    bucket: weight.bucket,
+                    hand_label: weight.hand_label.clone(),
+                    combo_count: weight.combo_count,
+                    normalized_weight: weight.normalized_weight,
+                    hu_probabilities,
+                    mp_probabilities,
+                    mp_row_visited,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        aggregate_action_frequency_rows(
+            "root",
+            &[normalized("Fold", None), normalized("Raise", Some(6.0))],
+            &[0, 1],
+            &[0, 1],
+            rows,
+            20,
+            max_delta_tolerance,
+            total_l1_tolerance,
+        )
+    }
+
+    fn clean_complete_action_frequency_report() -> HuMpLazyActionFrequencyReport {
+        complete_action_frequency_report_with(
+            |_idx, _weight| (vec![0.25, 0.75], vec![0.25, 0.75], true),
+            0.01,
+            0.02,
+        )
+    }
+
+    fn passing_structural_checks() -> Vec<HuMpLazyStructuralCheck> {
+        vec![HuMpLazyStructuralCheck {
+            name: "sample".to_string(),
+            passed: true,
+            detail: "ok".to_string(),
+        }]
+    }
+
+    fn sample_strategy_distance() -> HuMpLazyStrategyDistance {
+        HuMpLazyStrategyDistance {
+            path: "root".to_string(),
+            bucket: 0,
+            hu_strategy: "0.25|0.75".to_string(),
+            mp_strategy: "0.25|0.75".to_string(),
+            l1_distance: 0.0,
+            max_abs_distance: 0.0,
+            mp_row_visited: true,
+        }
     }
 
     #[test]
@@ -2212,6 +2314,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             HuMpLazyRowCoverage::default(),
             Vec::new(),
             Some(report),
@@ -2220,6 +2323,211 @@ mod tests {
         assert!(final_report.reasons.iter().any(|reason| {
             reason.contains("HU comparable actions omitted weighted probability mass")
         }));
+    }
+
+    #[test]
+    fn matching_preflight_is_no_go_without_action_frequency_evidence() {
+        let (harness, hu, mp, _) = default_configs();
+
+        let report = preflight_report_for_configs(&harness, &hu, &mp);
+
+        assert_eq!(report.verdict, HuMpLazyVerdict::NoGo);
+        assert!(report.action_frequency.is_none());
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| { reason == "root action-frequency evidence was not produced" }));
+        assert_eq!(
+            report
+                .reasons
+                .iter()
+                .filter(|reason| reason.contains("root action-frequency evidence was not produced"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn specific_missing_action_frequency_reason_is_not_duplicated() {
+        let harness = HuMpLazyHarnessConfig::default();
+        let report = finalize_report(
+            &harness,
+            vec![
+                "root action-frequency evidence was not produced: 1 root action descriptor mismatch(es)"
+                    .to_string(),
+            ],
+            Vec::new(),
+            passing_structural_checks(),
+            Vec::new(),
+            HuMpLazyRowCoverage::default(),
+            vec![sample_strategy_distance()],
+            None,
+            HuMpLazyRuntimeStats::default(),
+        );
+
+        assert_eq!(report.verdict, HuMpLazyVerdict::NoGo);
+        assert_eq!(
+            report
+                .reasons
+                .iter()
+                .filter(|reason| reason.contains("root action-frequency evidence was not produced"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn clean_complete_action_frequency_can_go_with_accounting_warning() {
+        let harness = HuMpLazyHarnessConfig::default();
+        let report = finalize_report(
+            &harness,
+            Vec::new(),
+            Vec::new(),
+            passing_structural_checks(),
+            Vec::new(),
+            HuMpLazyRowCoverage {
+                compared_rows: 169,
+                hu_dense_rows: 169,
+                mp_sparse_rows_total: 169,
+                mp_root_rows_visited: 169,
+                missing_mp_root_rows: 0,
+            },
+            vec![sample_strategy_distance()],
+            Some(clean_complete_action_frequency_report()),
+            HuMpLazyRuntimeStats::default(),
+        );
+
+        assert_eq!(report.verdict, HuMpLazyVerdict::Go);
+        assert!(report.reasons.is_empty());
+        assert!(!report.average_strategy_accounting_reconciled);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("average-strategy accounting is not reconciled") }));
+    }
+
+    #[test]
+    fn local_row_l1_warning_does_not_block_clean_action_frequency_go() {
+        let harness = HuMpLazyHarnessConfig::default();
+        let report = finalize_report(
+            &harness,
+            Vec::new(),
+            vec![
+                "max root strategy L1 0.500000 exceeds tolerance 0.050000".to_string(),
+                "mean root strategy L1 0.100000 exceeds tolerance 0.010000".to_string(),
+            ],
+            passing_structural_checks(),
+            Vec::new(),
+            HuMpLazyRowCoverage {
+                compared_rows: 169,
+                hu_dense_rows: 169,
+                mp_sparse_rows_total: 169,
+                mp_root_rows_visited: 169,
+                missing_mp_root_rows: 0,
+            },
+            vec![sample_strategy_distance()],
+            Some(clean_complete_action_frequency_report()),
+            HuMpLazyRuntimeStats::default(),
+        );
+
+        assert_eq!(report.verdict, HuMpLazyVerdict::Go);
+        assert!(report.reasons.is_empty());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("max root strategy L1")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mean root strategy L1")));
+    }
+
+    #[test]
+    fn action_frequency_tolerance_failure_remains_hard_no_go() {
+        let harness = HuMpLazyHarnessConfig {
+            max_action_frequency_delta_tolerance: 0.01,
+            total_action_frequency_l1_tolerance: 0.02,
+            ..Default::default()
+        };
+        let action_frequency = complete_action_frequency_report_with(
+            |_idx, _weight| (vec![0.25, 0.75], vec![0.75, 0.25], true),
+            harness.max_action_frequency_delta_tolerance,
+            harness.total_action_frequency_l1_tolerance,
+        );
+
+        let report = finalize_report(
+            &harness,
+            Vec::new(),
+            Vec::new(),
+            passing_structural_checks(),
+            Vec::new(),
+            HuMpLazyRowCoverage {
+                compared_rows: 169,
+                hu_dense_rows: 169,
+                mp_sparse_rows_total: 169,
+                mp_root_rows_visited: 169,
+                missing_mp_root_rows: 0,
+            },
+            vec![sample_strategy_distance()],
+            Some(action_frequency),
+            HuMpLazyRuntimeStats::default(),
+        );
+
+        assert_eq!(report.verdict, HuMpLazyVerdict::NoGo);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("root action-frequency thresholds did not pass") }));
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("max root action-frequency delta") }));
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("total root action-frequency L1") }));
+    }
+
+    #[test]
+    fn incomplete_action_frequency_coverage_remains_hard_no_go() {
+        let harness = HuMpLazyHarnessConfig::default();
+        let action_frequency = complete_action_frequency_report_with(
+            |idx, _weight| (vec![0.25, 0.75], vec![0.25, 0.75], idx != 0),
+            harness.max_action_frequency_delta_tolerance,
+            harness.total_action_frequency_l1_tolerance,
+        );
+
+        let report = finalize_report(
+            &harness,
+            Vec::new(),
+            Vec::new(),
+            passing_structural_checks(),
+            Vec::new(),
+            HuMpLazyRowCoverage {
+                compared_rows: 168,
+                hu_dense_rows: 169,
+                mp_sparse_rows_total: 168,
+                mp_root_rows_visited: 168,
+                missing_mp_root_rows: 1,
+            },
+            vec![sample_strategy_distance()],
+            Some(action_frequency),
+            HuMpLazyRuntimeStats::default(),
+        );
+
+        assert_eq!(report.verdict, HuMpLazyVerdict::NoGo);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("root action-frequency coverage missing") }));
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("root action-frequency skipped") }));
+        assert!(!report
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("root action-frequency has no valid included rows") }));
     }
 
     #[test]
