@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-06-09T14:55:16Z
-updated_at: 2026-06-09T15:02:54Z
+updated_at: 2026-06-23T19:11:06Z
 parent: poker_solver_rust-osss
 ---
 
@@ -73,3 +73,21 @@ Child work slices:
 7. Shared snapshot/telemetry trigger/status flow with backend-owned serialization.
 
 Decision for this turn: implement slice 1 only. Do not touch traversal logic or TUI shells yet.
+
+## 2026-06-23 Slice 1 Activation
+
+Branch: `codex/training-runtime-seam`.
+
+Preflight:
+
+- Working tree clean before branch creation.
+- Cold/noisy redirected full suite passed but missed the gate: `/usr/bin/time -p sh -c 'cargo test --workspace --quiet >/tmp/poker_solver_tzv5_preflight.log 2>&1'` -> `real 147.99`, `user 97.68`, `sys 18.41`.
+- Hot redirected rerun passed under the gate: `/usr/bin/time -p sh -c 'cargo test --workspace --quiet >/tmp/poker_solver_tzv5_preflight_hot.log 2>&1'` -> `real 44.34`, `user 99.47`, `sys 14.83`.
+
+Slice 1 checklist:
+
+- [ ] Dispatch fresh research review for the neutral runtime seam and invariants.
+- [ ] Dispatch fresh architecture/brainstorming review for the minimal API/test shape.
+- [ ] Implement runtime primitives and fake-backend tests only; do not touch traversal/TUI/snapshot formats.
+- [ ] Update docs only if the public architecture/training docs need to mention the new seam.
+- [ ] Run focused tests, diff hygiene, and hot full workspace suite under one minute.
