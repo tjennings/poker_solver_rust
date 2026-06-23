@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-06-09T14:55:16Z
-updated_at: 2026-06-23T19:11:06Z
+updated_at: 2026-06-23T21:03:55Z
 parent: poker_solver_rust-osss
 ---
 
@@ -91,3 +91,18 @@ Slice 1 checklist:
 - [ ] Implement runtime primitives and fake-backend tests only; do not touch traversal/TUI/snapshot formats.
 - [ ] Update docs only if the public architecture/training docs need to mention the new seam.
 - [ ] Run focused tests, diff hygiene, and hot full workspace suite under one minute.
+
+## 2026-06-23 Runtime Seam Reconciliation Notes
+
+Fresh research and architecture passes completed for this turn. Both confirmed the seam must be scheduler/runtime only: target/time limits, pause/quit/snapshot/telemetry/config-reload requests, unit counters, batch budget capping, stop reasons, event ordering, and backend trait are runtime-owned; traversal, chance policy, bucket lookup, regret/average-strategy accounting, pruning, storage identity, snapshots, TUI extraction, and validation remain backend-owned.
+
+Important finding: the requested runtime seam work is already present in this branch ancestry rather than absent. Relevant commits found in history include:
+
+- `3b34ee76 Add shared training runtime primitives`
+- `9e4a2596 Add HU blueprint runtime adapter`
+- `2bb84dda Add MP lazy shared runtime adapter`
+- `89004a91 Wire MP lazy trainer through shared runtime`
+- `9d9a2068 Add snapshot.format config flag (legacy | universal | both)`
+- `d294c838 Fix review findings: error propagation, MP snapshot gating, TUI stub, dedup`
+
+Current files include `crates/core/src/training_runtime.rs`, `crates/core/src/blueprint_v2/training_runtime_adapter.rs`, `crates/core/src/blueprint_mp/training_runtime_adapter.rs`, exported modules, and `docs/architecture.md` runtime documentation. The remaining work for this turn is validation/review and tracker closeout, not duplicating the implementation.
