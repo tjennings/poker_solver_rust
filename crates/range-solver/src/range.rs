@@ -17,7 +17,7 @@ use std::str::FromStr;
 ///   - Dash range (e.g., "QQ-88", "A9s-A6s", "98o-65o")
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::range::Range;
 ///
 /// // construct a range from a string

@@ -44,7 +44,7 @@ impl Street {
     /// Returns `AbstractionError::InvalidBoardSize` if `len` is not 0, 3, 4, or 5.
     ///
     /// # Examples
-    /// ```ignore
+    /// ```text
     /// use poker_solver_core::abstraction::Street;
     ///
     /// assert_eq!(Street::from_board_len(0).unwrap(), Street::Preflop);

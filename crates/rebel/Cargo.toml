@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 poker-solver-core = { path = "../core" }
 range-solver = { path = "../range-solver" }

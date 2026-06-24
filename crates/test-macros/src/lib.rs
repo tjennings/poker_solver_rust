@@ -6,7 +6,7 @@ use syn::{ItemFn, LitInt, parse_macro_input};
 /// any test exceeding a timeout (default: 1 second).
 ///
 /// # Usage
-/// ```ignore
+/// ```text
 /// use test_macros::timed_test;
 ///
 /// #[timed_test]

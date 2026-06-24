@@ -293,7 +293,7 @@ pub(crate) fn check_card(card: Card) -> Result<(), String> {
 /// Attempts to convert a card into a string.
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::card::card_to_string;
 ///
 /// assert_eq!(card_to_string(0), Ok("2c".to_string()));
@@ -332,7 +332,7 @@ pub fn holes_to_strings(holes: &[(Card, Card)]) -> Result<Vec<String>, String> {
 /// Attempts to read the next card from a char iterator.
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::card::card_from_chars;
 ///
 /// let mut chars = "2c3d4hAs".chars();
@@ -356,7 +356,7 @@ pub fn card_from_chars<T: Iterator<Item = char>>(chars: &mut T) -> Result<Card, 
 /// Attempts to convert a string into a card.
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::card::card_from_str;
 ///
 /// assert_eq!(card_from_str("2c"), Ok(0));
@@ -377,7 +377,7 @@ pub fn card_from_str(s: &str) -> Result<Card, String> {
 /// Attempts to convert an optionally space-separated string into a sorted flop array.
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::card::flop_from_str;
 ///
 /// assert_eq!(flop_from_str("2c3d4h"), Ok([0, 5, 10]));

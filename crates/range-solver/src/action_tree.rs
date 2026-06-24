@@ -105,7 +105,7 @@ impl fmt::Display for BoardState {
 /// A struct containing the game tree configuration.
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::action_tree::*;
 /// use range_solver::bet_size::*;
 ///

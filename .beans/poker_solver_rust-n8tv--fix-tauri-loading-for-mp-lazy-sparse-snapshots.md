@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-06-24T18:25:48Z
-updated_at: 2026-06-24T18:28:51Z
+updated_at: 2026-06-24T19:31:25Z
 parent: poker_solver_rust-osss
 ---
 
@@ -17,7 +17,7 @@ cargo tauri dev cannot load snapshots produced by the new Blueprint MP lazy_spar
 
 ## Checklist
 
-- [ ] Preflight full suite passes within the required time budget.
+- [x] Preflight full suite passes within the required time budget.
 - [ ] Identify the snapshot/export layout mismatch for MP lazy_sparse bundles.
 - [ ] Identify the Tauri/devserver config-loading path that assumes legacy HU game.players.
 - [ ] Implement bundle export/config metadata fix.

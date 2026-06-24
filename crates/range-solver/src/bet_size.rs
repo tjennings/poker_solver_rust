@@ -16,7 +16,7 @@
 /// - a: All-in. (e.g., "a")
 ///
 /// # Examples
-/// ```ignore
+/// ```text
 /// use range_solver::bet_size::BetSize::*;
 /// use range_solver::bet_size::BetSizeOptions;
 ///

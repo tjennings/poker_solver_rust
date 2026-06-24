@@ -29,3 +29,4 @@ burn = { version = "0.16", features = ["ndarray"] }
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
+doctest = false
