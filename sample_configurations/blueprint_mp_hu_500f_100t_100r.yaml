@@ -68,7 +68,7 @@ training:
   exploitability_samples: 10000
 
 snapshots:
-  resume: true
+  resume: false
   warmup_minutes: 60
   snapshot_every_minutes: 30
   output_dir: "./local_data/blueprints/mp_hu_500f_100t_100r_nut_high_cap_0p5_v1"
