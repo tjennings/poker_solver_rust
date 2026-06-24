@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-06-24T18:25:48Z
-updated_at: 2026-06-24T19:31:25Z
+updated_at: 2026-06-24T19:35:06Z
 parent: poker_solver_rust-osss
 ---
 
@@ -18,10 +18,18 @@ cargo tauri dev cannot load snapshots produced by the new Blueprint MP lazy_spar
 ## Checklist
 
 - [x] Preflight full suite passes within the required time budget.
-- [ ] Identify the snapshot/export layout mismatch for MP lazy_sparse bundles.
-- [ ] Identify the Tauri/devserver config-loading path that assumes legacy HU game.players.
+- [x] Identify the snapshot/export layout mismatch for MP lazy_sparse bundles.
+- [x] Identify the Tauri/devserver config-loading path that assumes legacy HU game.players.
 - [ ] Implement bundle export/config metadata fix.
 - [ ] Implement Explorer loader compatibility for MP lazy_sparse bundles while preserving legacy HU bundles.
 - [ ] Add regression coverage.
 - [ ] Run focused and full-suite verification.
 - [ ] Update docs if the bundle layout or user workflow changes.
+
+
+## Diagnosis
+
+- MP snapshot writers assumed root `config.yaml` already existed; tests manually created it, but training output may not.
+- The HU MP lazy sample omitted `snapshots.format`, so it defaulted to legacy sparse output only.
+- Universal MP lazy snapshots are written under `snapshot_NNNN/universal/`, but core/Tauri detection only checked root, `final/`, or direct `snapshot_NNNN/blueprint.json`.
+- The Explorer snapshot path calls `load_blueprint_v2`, which parses `config.yaml` as HU `BlueprintV2Config` and fails on MP `game.num_players` configs with missing `game.players`.
