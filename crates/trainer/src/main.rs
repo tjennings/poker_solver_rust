@@ -3624,7 +3624,14 @@ fn bridge_mp_iterations<T>(
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
             metrics.mark_snapshot_writing();
-            match save_mp_snapshot(config, snapshot_config, storage, tree, iters, started.elapsed()) {
+            match save_mp_snapshot(
+                config,
+                snapshot_config,
+                storage,
+                tree,
+                iters,
+                started.elapsed(),
+            ) {
                 Ok(path) => {
                     metrics.mark_snapshot_saved(&path);
                     eprintln!("  MP snapshot saved to {}", path.display());
@@ -3770,13 +3777,13 @@ fn save_mp_snapshot(
 ) -> std::io::Result<PathBuf> {
     let output_dir = PathBuf::from(&snapshot_config.output_dir);
     std::fs::create_dir_all(&output_dir)?;
+    write_mp_root_config(config, snapshot_config, &output_dir)?;
     let snapshot_idx = next_snapshot_index(&output_dir)?;
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
     let format = snapshot_config.format;
-    let strategy =
-        mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
+    let strategy = mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
 
     if format.write_legacy() {
         strategy.save(&snapshot_dir.join("strategy.bin"))?;
@@ -3835,6 +3842,18 @@ fn write_mp_universal(
     .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
+fn write_mp_root_config(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    let mut persisted = config.clone();
+    persisted.snapshots = snapshot_config.clone();
+    let yaml =
+        serde_yaml::to_string(&persisted).map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(output_dir.join("config.yaml"), yaml)
+}
+
 fn save_lazy_mp_snapshot(
     config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
@@ -3844,6 +3863,7 @@ fn save_lazy_mp_snapshot(
 ) -> std::io::Result<PathBuf> {
     let output_dir = PathBuf::from(&snapshot_config.output_dir);
     std::fs::create_dir_all(&output_dir)?;
+    write_mp_root_config(config, snapshot_config, &output_dir)?;
     let snapshot_idx = next_snapshot_index(&output_dir)?;
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
@@ -3918,10 +3938,16 @@ fn lazy_export_config_from_mp(
     config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
 ) -> poker_solver_core::blueprint_universal::mp_lazy_export::LazyExportConfig {
     use poker_solver_core::blueprint_mp::config::ForcedBetKind;
-    let sb = config.game.blinds.iter()
+    let sb = config
+        .game
+        .blinds
+        .iter()
         .find(|b| b.kind == ForcedBetKind::SmallBlind)
         .map_or(0.0, |b| b.amount);
-    let bb = config.game.blinds.iter()
+    let bb = config
+        .game
+        .blinds
+        .iter()
         .find(|b| b.kind == ForcedBetKind::BigBlind)
         .map_or(0.0, |b| b.amount);
     poker_solver_core::blueprint_universal::mp_lazy_export::LazyExportConfig {
@@ -3932,7 +3958,6 @@ fn lazy_export_config_from_mp(
         big_blind: bb,
     }
 }
-
 
 fn next_snapshot_index(output_dir: &Path) -> std::io::Result<u32> {
     let mut next = 0_u32;
@@ -4786,11 +4811,7 @@ fn dispatch_train(
     Ok(())
 }
 
-fn run_export_universal(
-    bundle: &Path,
-    snapshot: &str,
-    out: &Path,
-) -> Result<(), Box<dyn Error>> {
+fn run_export_universal(bundle: &Path, snapshot: &str, out: &Path) -> Result<(), Box<dyn Error>> {
     use poker_solver_core::blueprint_universal::hu_export;
 
     eprintln!("Exporting HU blueprint to universal dense format");
@@ -4849,16 +4870,10 @@ fn run_export_universal_mp(
 }
 
 /// Read metadata.json from a snapshot directory and return the `kind` field.
-fn detect_mp_snapshot_kind(
-    snapshot_dir: &Path,
-) -> Result<String, Box<dyn Error>> {
+fn detect_mp_snapshot_kind(snapshot_dir: &Path) -> Result<String, Box<dyn Error>> {
     let meta_path = snapshot_dir.join("metadata.json");
     if !meta_path.exists() {
-        return Err(format!(
-            "metadata.json not found at {}",
-            meta_path.display()
-        )
-        .into());
+        return Err(format!("metadata.json not found at {}", meta_path.display()).into());
     }
     let text = std::fs::read_to_string(&meta_path)?;
     let value: serde_json::Value = serde_json::from_str(&text)?;
@@ -5420,6 +5435,11 @@ snapshots:
         assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
 
         let strategy = BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin")).unwrap();
         assert_eq!(strategy.iterations, 123);
@@ -5467,6 +5487,11 @@ snapshots:
 
         assert!(snapshot_dir.join("sparse_entries.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
         let metadata: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
         )
@@ -5478,7 +5503,9 @@ snapshots:
 
     /// Build a minimal `BlueprintMpConfig` suitable for snapshot tests.
     /// Uses the given `format` for `snapshots.format`.
-    fn build_test_mp_config(format: poker_solver_core::blueprint_mp::config::MpSnapshotFormat) -> BlueprintMpConfig {
+    fn build_test_mp_config(
+        format: poker_solver_core::blueprint_mp::config::MpSnapshotFormat,
+    ) -> BlueprintMpConfig {
         use poker_solver_core::blueprint_mp::config::{
             ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
             MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
@@ -5555,11 +5582,16 @@ snapshots:
         }
     }
 
-    /// Write a config.yaml into `dir` from a `BlueprintMpConfig` so that
-    /// the universal writer can find and retain it.
-    fn write_test_config_yaml(dir: &std::path::Path, config: &BlueprintMpConfig) {
-        let yaml = serde_yaml::to_string(config).expect("config should serialize");
-        std::fs::write(dir.join("config.yaml"), yaml).expect("write config.yaml");
+    fn assert_root_config_yaml(
+        dir: &std::path::Path,
+        expected_format: poker_solver_core::blueprint_mp::config::MpSnapshotFormat,
+        expected_output_dir: &str,
+    ) -> BlueprintMpConfig {
+        let yaml = std::fs::read_to_string(dir.join("config.yaml")).expect("read config.yaml");
+        let persisted: BlueprintMpConfig = serde_yaml::from_str(&yaml).expect("parse config.yaml");
+        assert_eq!(persisted.snapshots.format, expected_format);
+        assert_eq!(persisted.snapshots.output_dir, expected_output_dir);
+        persisted
     }
 
     /// MP eager: format=Universal writes a loadable universal bundle and
@@ -5573,7 +5605,6 @@ snapshots:
         let config = build_test_mp_config(MpSnapshotFormat::Universal);
         let ctx = setup_training(&config);
         let dir = tempfile::tempdir().unwrap();
-        write_test_config_yaml(dir.path(), &config);
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
             ..config.snapshots.clone()
@@ -5592,9 +5623,19 @@ snapshots:
         // Universal bundle must be present and loadable
         let universal_dir = snapshot_dir.join("universal");
         assert!(universal_dir.exists(), "universal/ dir must exist");
-        let bundle = loader::load_bundle(&universal_dir)
-            .expect("universal bundle should load");
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
         assert!(bundle.manifest().is_some(), "manifest must be present");
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Universal,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpEager
+        );
 
         // Legacy files must NOT be present under universal-only
         assert!(
@@ -5620,7 +5661,6 @@ snapshots:
         let config = build_test_mp_config(MpSnapshotFormat::Both);
         let ctx = setup_training(&config);
         let dir = tempfile::tempdir().unwrap();
-        write_test_config_yaml(dir.path(), &config);
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
             ..config.snapshots.clone()
@@ -5640,10 +5680,23 @@ snapshots:
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
         let universal_dir = snapshot_dir.join("universal");
-        assert!(universal_dir.exists(), "universal/ dir must exist under Both");
-        let bundle = loader::load_bundle(&universal_dir)
-            .expect("universal bundle should load");
+        assert!(
+            universal_dir.exists(),
+            "universal/ dir must exist under Both"
+        );
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
         assert!(bundle.manifest().is_some());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Both,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpEager
+        );
     }
 
     /// MP eager: format=Legacy writes only legacy files and no universal/ dir.
@@ -5673,6 +5726,11 @@ snapshots:
         assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
         assert!(
             !snapshot_dir.join("universal").exists(),
             "universal/ dir must NOT exist under format=legacy"
@@ -5696,7 +5754,6 @@ snapshots:
         storage.add_regret(key, 2, 0, 25);
         storage.add_strategy_sum(key, 2, 1, 50);
         let dir = tempfile::tempdir().unwrap();
-        write_test_config_yaml(dir.path(), &config);
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
             ..config.snapshots.clone()
@@ -5714,9 +5771,19 @@ snapshots:
         // Universal bundle must be present and loadable
         let universal_dir = snapshot_dir.join("universal");
         assert!(universal_dir.exists(), "universal/ dir must exist");
-        let bundle = loader::load_bundle(&universal_dir)
-            .expect("universal bundle should load");
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
         assert!(bundle.manifest().is_some());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Universal,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpLazy
+        );
 
         // Legacy file must NOT be present under universal-only
         assert!(
@@ -5743,7 +5810,6 @@ snapshots:
         storage.add_regret(key, 2, 0, 25);
         storage.add_strategy_sum(key, 2, 1, 50);
         let dir = tempfile::tempdir().unwrap();
-        write_test_config_yaml(dir.path(), &config);
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
             ..config.snapshots.clone()
@@ -5761,10 +5827,23 @@ snapshots:
         assert!(snapshot_dir.join("sparse_entries.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
         let universal_dir = snapshot_dir.join("universal");
-        assert!(universal_dir.exists(), "universal/ dir must exist under Both");
-        let bundle = loader::load_bundle(&universal_dir)
-            .expect("universal bundle should load");
+        assert!(
+            universal_dir.exists(),
+            "universal/ dir must exist under Both"
+        );
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
         assert!(bundle.manifest().is_some());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Both,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpLazy
+        );
     }
 
     /// MP lazy: format=Legacy writes only legacy and no universal/ dir.
@@ -5798,6 +5877,11 @@ snapshots:
 
         assert!(snapshot_dir.join("sparse_entries.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
         assert!(
             !snapshot_dir.join("universal").exists(),
             "universal/ dir must NOT exist under format=legacy"
@@ -5857,9 +5941,7 @@ snapshots:
 
     #[test]
     fn lazy_mp_tui_bridge_saves_queued_snapshot_before_finished_exit() {
-        use poker_solver_core::blueprint_mp::config::{
-            MpSnapshotConfig, MpSnapshotFormat,
-        };
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
         use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
         use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
@@ -5874,9 +5956,7 @@ snapshots:
         storage.add_regret(key, 2, 0, 25);
         storage.add_strategy_sum(key, 2, 1, 50);
 
-        let game = std::sync::Arc::new(
-            LazyMpGame::new(&config.game, &config.action_abstraction),
-        );
+        let game = std::sync::Arc::new(LazyMpGame::new(&config.game, &config.action_abstraction));
         let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
             Some(10),
             None,

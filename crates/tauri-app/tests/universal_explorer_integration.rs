@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
-use poker_solver_core::blueprint_universal::{write_bundle, BundleData};
+use poker_solver_core::blueprint_universal::{BundleData, write_bundle};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
@@ -328,13 +328,13 @@ async fn universal_hu_loads_through_load_bundle_core() {
 
 // ── MP bundle helpers ───────────────────────────────────────────────
 
+use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
-use poker_solver_core::blueprint_mp::Street as MpStreet;
-use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, Seat, MAX_PLAYERS};
+use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
 use poker_solver_core::blueprint_universal::mp_eager_export::{
     self, MpTrainingInfo as MpEagerTrainingInfo,
 };
@@ -529,6 +529,35 @@ fn write_mp_lazy_bundle(dir: &Path) {
     mp_lazy_export::write_lazy_bundle(dir, &output).unwrap();
 }
 
+fn write_mp_root_config(dir: &Path) {
+    std::fs::write(
+        dir.join("config.yaml"),
+        r#"
+game:
+  name: "MP lazy root config"
+  num_players: 2
+  stack_depth: 6
+  allow_preflop_limp: true
+  blinds:
+    - { seat: 0, type: small_blind, amount: 1 }
+    - { seat: 1, type: big_blind, amount: 2 }
+"#,
+    )
+    .unwrap();
+}
+
+fn write_nested_mp_lazy_snapshot(root: &Path, name: &str) {
+    write_mp_root_config(root);
+    let snap = root.join(name);
+    std::fs::create_dir_all(snap.join("universal")).unwrap();
+    std::fs::write(
+        snap.join("metadata.json"),
+        r#"{"kind":"blueprint_mp_lazy_sparse","iterations":100,"elapsed_minutes":1}"#,
+    )
+    .unwrap();
+    write_mp_lazy_bundle(&snap.join("universal"));
+}
+
 // ── Part C: listing reports kind + player count ─────────────────────
 
 #[test]
@@ -573,6 +602,34 @@ fn list_blueprints_detects_universal_and_legacy() {
     }
 }
 
+#[test]
+fn list_blueprints_uses_newest_nested_universal_snapshot_manifest() {
+    let base = TempDir::new().unwrap();
+    let bundle = base.path().join("mixed_universal_snapshots");
+    std::fs::create_dir_all(bundle.join("snapshot_0001")).unwrap();
+    write_universal_hu_bundle(&bundle.join("snapshot_0001"));
+
+    std::fs::create_dir_all(bundle.join("snapshot_0002/universal")).unwrap();
+    write_mp_lazy_bundle(&bundle.join("snapshot_0002/universal"));
+
+    let entries =
+        poker_solver_tauri::list_blueprints_core(base.path().to_string_lossy().to_string())
+            .expect("listing should succeed");
+    let bundle_path = bundle.to_string_lossy().to_string();
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path == bundle_path)
+        .expect("mixed snapshot bundle should be listed");
+
+    assert!(
+        entry.name.contains("(6-player universal_mp_lazy)"),
+        "entry name should reflect newest nested manifest, got {}",
+        entry.name
+    );
+    assert_eq!(entry.stack_depth, 100.0);
+    assert!(entry.has_strategy);
+}
+
 // ── Part D: MP bundles load without error ───────────────────────────
 
 #[tokio::test]
@@ -615,6 +672,39 @@ async fn mp_lazy_bundle_loads_and_provides_bundle_info() {
 }
 
 #[tokio::test]
+async fn nested_mp_lazy_snapshot_loads_through_root_and_snapshot_v2_entrypoint() {
+    let dir = TempDir::new().unwrap();
+    write_nested_mp_lazy_snapshot(dir.path(), "snapshot_0001");
+
+    let state = ExplorationState::default();
+    let root_info =
+        poker_solver_tauri::load_bundle_core(&state, dir.path().to_string_lossy().to_string())
+            .await
+            .expect("root should resolve nested MP lazy universal bundle");
+    assert_eq!(root_info.iterations, 100);
+    assert!(poker_solver_tauri::is_bundle_loaded_core(&state));
+
+    let state = ExplorationState::default();
+    let snapshot_info = poker_solver_tauri::load_blueprint_v2_core(
+        &state,
+        dir.path().to_string_lossy().to_string(),
+        Some("snapshot_0001".to_string()),
+    )
+    .await
+    .expect("snapshot v2 entrypoint should delegate to nested universal bundle");
+    assert_eq!(snapshot_info.iterations, 100);
+
+    let snapshots =
+        poker_solver_tauri::list_snapshots_core(dir.path().to_string_lossy().to_string())
+            .expect("snapshot listing should succeed");
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].name, "snapshot_0001");
+    assert!(snapshots[0].has_strategy);
+    assert_eq!(snapshots[0].iterations, Some(100));
+    assert_eq!(snapshots[0].elapsed_minutes, Some(1));
+}
+
+#[tokio::test]
 async fn mp_bundle_hu_views_return_clean_error() {
     let dir = TempDir::new().unwrap();
     write_mp_eager_bundle(dir.path());
@@ -639,14 +729,18 @@ async fn mp_bundle_hu_views_return_clean_error() {
     // Available actions should also return a clean error.
     let result = poker_solver_tauri::get_available_actions_core(&state, pos);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .contains("MP browsing not yet supported"),);
+    assert!(
+        result
+            .unwrap_err()
+            .contains("MP browsing not yet supported"),
+    );
 
     // Preflop ranges should also return a clean error.
     let result = poker_solver_tauri::get_preflop_ranges_core(&state, vec!["c".to_string()]);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .contains("MP browsing not yet supported"),);
+    assert!(
+        result
+            .unwrap_err()
+            .contains("MP browsing not yet supported"),
+    );
 }

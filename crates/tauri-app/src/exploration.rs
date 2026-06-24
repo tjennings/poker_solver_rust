@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint_universal::{BundleKind, LoadedBundle};
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
@@ -23,7 +24,6 @@ use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
 };
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
-use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::hand_class::classify;
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value};
@@ -334,7 +334,7 @@ pub async fn load_bundle_core(
 fn has_universal_sentinel(dir: &Path) -> bool {
     dir.join("blueprint.json").exists()
         || dir.join("final/blueprint.json").exists()
-        || find_latest_snapshot_with_file(dir, "blueprint.json").is_some()
+        || find_latest_universal_snapshot(dir).is_some()
 }
 
 /// Find the latest `snapshot_NNNN/` subdir containing a given file.
@@ -351,6 +351,54 @@ fn find_latest_snapshot_with_file(dir: &Path, file_name: &str) -> Option<PathBuf
         .collect();
     snapshots.sort_by_key(std::fs::DirEntry::file_name);
     snapshots.last().map(std::fs::DirEntry::path)
+}
+
+/// Find the newest universal snapshot, considering both direct
+/// `snapshot_NNNN/blueprint.json` and nested
+/// `snapshot_NNNN/universal/blueprint.json` layouts together.
+fn find_latest_universal_snapshot(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("snapshot_") {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.join("universal/blueprint.json").exists() {
+            candidates.push((name.clone(), 0_u8, path.join("universal")));
+        }
+        if path.join("blueprint.json").exists() {
+            candidates.push((name, 1_u8, path));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    candidates.pop().map(|(_, _, path)| path)
+}
+
+/// Resolve a universal bundle for the legacy BlueprintV2 entry point.
+///
+/// The frontend historically calls `load_blueprint_v2` after selecting a
+/// snapshot. MP lazy snapshots retain an MP `config.yaml` at the root and put
+/// the Explorer-readable bundle under `snapshot_NNNN/universal/`; this helper
+/// detects that before the HU-only config parser runs.
+fn resolve_universal_for_v2_request(dir: &Path, snapshot: Option<&str>) -> Option<PathBuf> {
+    if let Some(snap_name) = snapshot {
+        let snap_dir = dir.join(snap_name);
+        if snap_dir.join("blueprint.json").exists() {
+            return Some(snap_dir);
+        }
+        let nested = snap_dir.join("universal");
+        if nested.join("blueprint.json").exists() {
+            return Some(nested);
+        }
+        return None;
+    }
+
+    has_universal_sentinel(dir).then(|| dir.to_path_buf())
 }
 
 /// Load a strategy bundle (Tauri wrapper).
@@ -395,6 +443,10 @@ pub async fn load_blueprint_v2_core(
     snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
     let dir = PathBuf::from(&dir_path);
+    if let Some(universal_dir) = resolve_universal_for_v2_request(&dir, snapshot.as_deref()) {
+        return load_universal_bundle_core(state, &universal_dir).await;
+    }
+
     let (config, strategy, cbv_table, snapshot_name, strat_dir) =
         tokio::task::spawn_blocking(move || {
             let cfg = v2_bundle::load_config(&dir)
@@ -1050,8 +1102,8 @@ fn try_make_universal_entry(dir: &Path) -> Option<BlueprintListEntry> {
     })
 }
 
-/// Read a manifest cheaply from the first `blueprint.json` found
-/// (checking final/, root, then snapshot_NNNN/).
+/// Read a manifest cheaply from the first `blueprint.json` found:
+/// `final/`, root, then the newest direct-or-nested universal snapshot.
 fn read_manifest_cheaply(dir: &Path) -> Option<poker_solver_core::blueprint_universal::Manifest> {
     let candidates = [dir.join("final/blueprint.json"), dir.join("blueprint.json")];
     for c in &candidates {
@@ -1061,8 +1113,9 @@ fn read_manifest_cheaply(dir: &Path) -> Option<poker_solver_core::blueprint_univ
             }
         }
     }
-    // Check latest snapshot.
-    if let Some(snap) = find_latest_snapshot_with_file(dir, "blueprint.json") {
+    // Check the newest universal snapshot, comparing direct and nested
+    // universal layouts by snapshot directory name.
+    if let Some(snap) = find_latest_universal_snapshot(dir) {
         if let Ok(text) = std::fs::read_to_string(snap.join("blueprint.json")) {
             if let Ok(m) = serde_json::from_str(&text) {
                 return Some(m);
@@ -1092,8 +1145,9 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
                 return None;
             }
             let snap_dir = e.path();
-            let has_strategy =
-                snap_dir.join("strategy.bin").exists() || snap_dir.join("blueprint.json").exists();
+            let has_strategy = snap_dir.join("strategy.bin").exists()
+                || snap_dir.join("blueprint.json").exists()
+                || snap_dir.join("universal/blueprint.json").exists();
 
             // Try to read metadata.json for iteration count and elapsed time.
             let (iterations, elapsed_minutes) =
@@ -1102,7 +1156,9 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
                     .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
                     .map(|json| {
                         (
-                            json.get("iteration").and_then(|v| v.as_u64()),
+                            json.get("iterations")
+                                .or_else(|| json.get("iteration"))
+                                .and_then(|v| v.as_u64()),
                             json.get("elapsed_minutes").and_then(|v| v.as_u64()),
                         )
                     })
@@ -3178,7 +3234,7 @@ pub fn get_preflop_ranges_core(
         _ => {
             return Err("get_preflop_ranges requires a BlueprintV2 source \
                          (MP browsing not yet supported)"
-                .to_string())
+                .to_string());
         }
     };
 

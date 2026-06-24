@@ -45,16 +45,22 @@ routes through the unified loader (`blueprint_universal::loader`):
   info panel reports format kind, player count, seats, stacks, and bucket counts
   from the manifest. Full N-player browsing (seat selection, hand grids) is a
   later phase, so HU-only views report "MP browsing not yet supported" for MP
-  bundles. Lazy sparse rows currently carry opaque action descriptors until
-  action identity is stored at realization time.
+  bundles.
+
+Universal bundles may be placed directly at the selected directory, under
+`final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout
+`snapshot_NNNN/universal/`. The `load_blueprint_v2` snapshot path also detects
+that nested universal layout before parsing `config.yaml`, so MP configs using
+`game.num_players` are not treated as HU `BlueprintV2Config` files.
 
 Bundle and snapshot listings report the format kind and player count for each
-entry.
+entry. Snapshot listings mark `snapshot_NNNN/universal/blueprint.json` as
+loadable and read iteration metadata from either `iterations` or `iteration`.
 
 ### Blueprint V2 Bundle
 Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
 
-**Snapshot selection**: If a blueprint has multiple training snapshots (`snapshot_0000/`, `snapshot_0001/`, etc.), a second picker appears showing each snapshot with its iteration count and training time. The latest snapshot is pre-selected. Blueprints with only one snapshot load directly without the extra step.
+**Snapshot selection**: If a blueprint has multiple training snapshots (`snapshot_0000/`, `snapshot_0001/`, etc.), a second picker appears showing each snapshot with its iteration count and training time. The latest snapshot is pre-selected. Blueprints with only one snapshot load directly without the extra step. MP lazy sparse snapshots are Explorer-loadable when `snapshots.format` is `universal` or `both`, which writes `snapshot_NNNN/universal/blueprint.json`.
 
 ### Rule-Based Agents
 Agent TOML configs from `agents/*.toml` are listed automatically. Each agent maps `HandClass` variants to action frequencies. Select one to explore its strategy.

@@ -240,6 +240,56 @@ fn detect_nested_snapshot_universal() {
 }
 
 #[test]
+fn root_mp_config_with_nested_snapshot_universal_loads_mp_lazy() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("config.yaml"),
+        r#"
+game:
+  name: "MP lazy root config"
+  num_players: 2
+  stack_depth: 6
+  allow_preflop_limp: true
+  blinds:
+    - { seat: 0, type: small_blind, amount: 1 }
+    - { seat: 1, type: big_blind, amount: 2 }
+"#,
+    )
+    .unwrap();
+    let nested = tmp.path().join("snapshot_0001/universal");
+    std::fs::create_dir_all(&nested).unwrap();
+    write_mp_lazy_bundle(&nested);
+
+    let kind = detect_bundle_kind(tmp.path()).unwrap();
+    assert_eq!(kind, BundleKind::UniversalMpLazy);
+
+    let bundle = load_bundle(tmp.path()).unwrap();
+    assert_eq!(bundle.kind(), BundleKind::UniversalMpLazy);
+    assert_eq!(bundle.source_backend(), "mp_lazy_sparse_projected");
+}
+
+#[test]
+fn mixed_direct_old_and_nested_newer_universal_loads_newest_snapshot() {
+    let tmp = TempDir::new().unwrap();
+
+    let older_direct = tmp.path().join("snapshot_0001");
+    std::fs::create_dir_all(&older_direct).unwrap();
+    write_universal_hu_bundle(&older_direct);
+
+    let newer_nested = tmp.path().join("snapshot_0002/universal");
+    std::fs::create_dir_all(&newer_nested).unwrap();
+    write_mp_lazy_bundle(&newer_nested);
+
+    let kind = detect_bundle_kind(tmp.path()).unwrap();
+    assert_eq!(kind, BundleKind::UniversalMpLazy);
+
+    let bundle = load_bundle(tmp.path()).unwrap();
+    assert_eq!(bundle.kind(), BundleKind::UniversalMpLazy);
+    assert_eq!(bundle.num_players(), 6);
+    assert_eq!(bundle.source_backend(), "mp_lazy_sparse_projected");
+}
+
+#[test]
 fn detect_nested_final_legacy() {
     // Legacy bundle where strategy.bin is in final/ (already tested by write_legacy_bundle)
     let tmp = TempDir::new().unwrap();

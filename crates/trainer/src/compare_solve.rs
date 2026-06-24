@@ -657,6 +657,7 @@ fn find_strategy_path(
                 .to_str()
                 .is_some_and(|n| n.starts_with("snapshot_"))
         })
+        .filter(|e| e.path().join("strategy.bin").exists())
         .collect();
     snapshots.sort_by_key(|e| e.file_name());
     match snapshots.last() {
@@ -3678,6 +3679,19 @@ mod tests {
         std::fs::write(dir.join("snapshot_0005/strategy.bin"), b"b").unwrap();
         let result = find_strategy_path(&dir, None).unwrap();
         assert_eq!(result, dir.join("snapshot_0005/strategy.bin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_strategy_path_latest_snapshot_fallback_skips_incomplete_newest_snapshot() {
+        let dir = std::env::temp_dir().join("cmp_solve_test_latest_loadable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("snapshot_0002")).unwrap();
+        std::fs::create_dir_all(dir.join("snapshot_0005")).unwrap();
+        std::fs::write(dir.join("snapshot_0002/strategy.bin"), b"a").unwrap();
+
+        let result = find_strategy_path(&dir, None).unwrap();
+        assert_eq!(result, dir.join("snapshot_0002/strategy.bin"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

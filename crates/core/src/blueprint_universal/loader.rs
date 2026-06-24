@@ -3,14 +3,18 @@
 //! ## Bundle resolution order
 //!
 //! Both legacy and universal bundles may nest their content inside the bundle
-//! root, `final/`, or the latest `snapshot_NNNN/` subdirectory. The resolver
+//! root, `final/`, or the latest `snapshot_NNNN/` subdirectory. Universal
+//! bundles written natively by trainers may also live under
+//! `snapshot_NNNN/universal/`. The resolver
 //! checks these locations in order:
 //!
 //! 1. `dir/final/` — if it contains the sentinel file (`blueprint.json` for
 //!    universal, `strategy.bin` for legacy).
 //! 2. `dir/` (the root) — if the sentinel is directly present.
-//! 3. `dir/snapshot_NNNN/` — the lexicographically last snapshot subdirectory
-//!    that contains the sentinel.
+//! 3. Snapshot subdirectories — legacy bundles use the lexicographically last
+//!    direct `snapshot_NNNN/` directory containing the sentinel; universal
+//!    bundles use the newest snapshot across direct `snapshot_NNNN/blueprint.json`
+//!    and nested `snapshot_NNNN/universal/blueprint.json` layouts.
 //!
 //! This matches the Explorer's existing `strategy.bin` discovery order
 //! (final -> root -> latest snapshot) and extends it to universal bundles.
@@ -24,7 +28,7 @@ use super::bundle::BundleReader;
 use super::descriptors::ActionDescriptor;
 use super::manifest::Manifest;
 
-use crate::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use crate::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use crate::blueprint_v2::config::BlueprintV2Config;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 
@@ -72,7 +76,9 @@ pub enum LoaderError {
     MissingPayloadFile { name: String, path: String },
 
     /// The manifest's `row_namespace` does not match the `source_backend`.
-    #[error("namespace mismatch in {path}: source_backend \"{backend}\" expects namespace {expected}, got {actual:?}")]
+    #[error(
+        "namespace mismatch in {path}: source_backend \"{backend}\" expects namespace {expected}, got {actual:?}"
+    )]
     NamespaceMismatch {
         path: String,
         backend: String,
@@ -194,9 +200,7 @@ impl LoadedBundle {
             Self::LegacyHu(d) => &d.source_backend,
             Self::UniversalHu { data, .. }
             | Self::UniversalMpEager { data, .. }
-            | Self::UniversalMpLazy { data, .. } => {
-                &data.manifest.training.source_backend
-            }
+            | Self::UniversalMpLazy { data, .. } => &data.manifest.training.source_backend,
         }
     }
 
@@ -207,9 +211,7 @@ impl LoadedBundle {
             Self::LegacyHu(d) => d.config.game.players,
             Self::UniversalHu { data, .. }
             | Self::UniversalMpEager { data, .. }
-            | Self::UniversalMpLazy { data, .. } => {
-                data.manifest.game.num_players
-            }
+            | Self::UniversalMpLazy { data, .. } => data.manifest.game.num_players,
         }
     }
 
@@ -231,9 +233,7 @@ impl LoadedBundle {
             Self::LegacyHu(d) => d.strategy.iterations,
             Self::UniversalHu { data, .. }
             | Self::UniversalMpEager { data, .. }
-            | Self::UniversalMpLazy { data, .. } => {
-                data.manifest.training.units_completed
-            }
+            | Self::UniversalMpLazy { data, .. } => data.manifest.training.units_completed,
         }
     }
 
@@ -242,18 +242,11 @@ impl LoadedBundle {
     /// Works for both `LegacyHu` and `UniversalHu` bundles.
     /// Returns `None` if the infoset is not found.
     #[must_use]
-    pub fn query_hu(
-        &self,
-        arena_node_idx: u32,
-        bucket: u16,
-    ) -> Option<InfosetView<'_>> {
+    pub fn query_hu(&self, arena_node_idx: u32, bucket: u16) -> Option<InfosetView<'_>> {
         match self {
             Self::LegacyHu(d) => query_legacy_hu(d, arena_node_idx, bucket),
             Self::UniversalHu { data, index } => {
-                let row_idx = *index.get(&(
-                    arena_node_idx,
-                    u32::from(bucket),
-                ))?;
+                let row_idx = *index.get(&(arena_node_idx, u32::from(bucket)))?;
                 build_view_from_reader(&data.reader, row_idx)
             }
             _ => None,
@@ -284,10 +277,7 @@ impl LoadedBundle {
     ///
     /// Returns `None` if the infoset is not found.
     #[must_use]
-    pub fn query_mp_lazy(
-        &self,
-        key: &MpLazyKey,
-    ) -> Option<InfosetView<'_>> {
+    pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<InfosetView<'_>> {
         match self {
             Self::UniversalMpLazy { data, index } => {
                 let tuple = (
@@ -308,11 +298,7 @@ impl LoadedBundle {
 // ── Query helpers ───────────────────────────────────────────────────
 
 /// Query a legacy HU bundle by arena node index and bucket.
-fn query_legacy_hu(
-    d: &LegacyHuData,
-    arena_node_idx: u32,
-    bucket: u16,
-) -> Option<InfosetView<'_>> {
+fn query_legacy_hu(d: &LegacyHuData, arena_node_idx: u32, bucket: u16) -> Option<InfosetView<'_>> {
     let idx = arena_node_idx as usize;
     if idx >= d.decision_index_map.len() {
         return None;
@@ -331,10 +317,7 @@ fn query_legacy_hu(
 
 /// Synthesize action descriptors from the game tree node's actions
 /// so legacy HU and universal HU return comparable shapes.
-fn synthesize_hu_actions(
-    tree: &GameTree,
-    arena_node_idx: u32,
-) -> Vec<ActionDescriptor> {
+fn synthesize_hu_actions(tree: &GameTree, arena_node_idx: u32) -> Vec<ActionDescriptor> {
     let node = &tree.nodes[arena_node_idx as usize];
     match node {
         GameNode::Decision { actions, .. } => actions
@@ -347,10 +330,7 @@ fn synthesize_hu_actions(
 }
 
 /// Convert a `TreeAction` to an `ActionDescriptor`.
-fn tree_action_to_descriptor(
-    action: &TreeAction,
-    source_idx: u16,
-) -> ActionDescriptor {
+fn tree_action_to_descriptor(action: &TreeAction, source_idx: u16) -> ActionDescriptor {
     use super::descriptors::ActionKind;
     let (kind, amount, aggressive) = match action {
         TreeAction::Fold => (ActionKind::Fold, 0, false),
@@ -379,10 +359,7 @@ fn tree_action_to_descriptor(
 }
 
 /// Build an `InfosetView` from a `BundleReader` row index.
-fn build_view_from_reader(
-    reader: &BundleReader,
-    row_idx: usize,
-) -> Option<InfosetView<'_>> {
+fn build_view_from_reader(reader: &BundleReader, row_idx: usize) -> Option<InfosetView<'_>> {
     let row = reader.row(row_idx)?;
     let count = usize::from(row.action_count);
     let prob_start = row.prob_offset as usize;
@@ -409,8 +386,7 @@ pub fn detect_bundle_kind(dir: &Path) -> Result<BundleKind, LoaderError> {
     let (effective_dir, sentinel) = resolve_bundle_dir(dir)?;
     match sentinel {
         SentinelKind::BlueprintJson => {
-            let (kind, _manifest) =
-                classify_universal_manifest(&effective_dir)?;
+            let (kind, _manifest) = classify_universal_manifest(&effective_dir)?;
             Ok(kind)
         }
         SentinelKind::ConfigYaml => Ok(BundleKind::LegacyHu),
@@ -428,8 +404,7 @@ pub fn load_bundle(dir: &Path) -> Result<LoadedBundle, LoaderError> {
     match sentinel {
         SentinelKind::ConfigYaml => load_legacy_hu(dir, &effective_dir),
         SentinelKind::BlueprintJson => {
-            let (kind, manifest) =
-                classify_universal_manifest(&effective_dir)?;
+            let (kind, manifest) = classify_universal_manifest(&effective_dir)?;
             load_universal(&effective_dir, kind, manifest)
         }
     }
@@ -447,19 +422,18 @@ enum SentinelKind {
 }
 
 /// Resolve the effective bundle directory, handling nesting inside
-/// `final/` or `snapshot_NNNN/`.
+/// `final/`, `snapshot_NNNN/`, or `snapshot_NNNN/universal/`.
 ///
 /// Priority: universal (`blueprint.json`) over legacy (`config.yaml`).
-/// Nesting order: `final/` -> root -> latest `snapshot_NNNN/`.
-fn resolve_bundle_dir(
-    dir: &Path,
-) -> Result<(PathBuf, SentinelKind), LoaderError> {
+/// Nesting order: `final/` -> root -> latest direct-or-nested universal
+/// snapshot for universal bundles. Legacy HU snapshot behavior remains direct
+/// `snapshot_NNNN/strategy.bin` only.
+fn resolve_bundle_dir(dir: &Path) -> Result<(PathBuf, SentinelKind), LoaderError> {
     if let Some(d) = find_sentinel(dir, "blueprint.json") {
         return Ok((d, SentinelKind::BlueprintJson));
     }
     if dir.join("config.yaml").exists() {
-        let strat_dir = find_sentinel(dir, "strategy.bin")
-            .unwrap_or_else(|| dir.to_path_buf());
+        let strat_dir = find_sentinel(dir, "strategy.bin").unwrap_or_else(|| dir.to_path_buf());
         return Ok((strat_dir, SentinelKind::ConfigYaml));
     }
     Err(LoaderError::NotABundle {
@@ -477,14 +451,15 @@ fn find_sentinel(dir: &Path, sentinel: &str) -> Option<PathBuf> {
     if dir.join(sentinel).exists() {
         return Some(dir.to_path_buf());
     }
-    find_latest_snapshot_with(dir, sentinel)
+    if sentinel == "blueprint.json" {
+        find_latest_universal_snapshot(dir)
+    } else {
+        find_latest_snapshot_with(dir, sentinel)
+    }
 }
 
 /// Find the latest `snapshot_NNNN/` subdirectory containing a file.
-fn find_latest_snapshot_with(
-    dir: &Path,
-    file_name: &str,
-) -> Option<PathBuf> {
+fn find_latest_snapshot_with(dir: &Path, file_name: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut snapshots: Vec<_> = entries
         .filter_map(Result::ok)
@@ -499,6 +474,32 @@ fn find_latest_snapshot_with(
     snapshots.last().map(std::fs::DirEntry::path)
 }
 
+/// Find the newest universal snapshot, considering both direct
+/// `snapshot_NNNN/blueprint.json` and nested
+/// `snapshot_NNNN/universal/blueprint.json` layouts together.
+fn find_latest_universal_snapshot(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("snapshot_") {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.join("universal/blueprint.json").exists() {
+            candidates.push((name.clone(), 0_u8, path.join("universal")));
+        }
+        if path.join("blueprint.json").exists() {
+            candidates.push((name, 1_u8, path));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    candidates.pop().map(|(_, _, path)| path)
+}
+
 // ── Classification ──────────────────────────────────────────────────
 
 /// Map `source_backend` to its expected `(namespace, BundleKind)`.
@@ -506,19 +507,11 @@ fn find_latest_snapshot_with(
 /// Returns `None` for unrecognized backends. This is the single source
 /// of truth for the backend -> namespace/kind mapping, used by
 /// `classify_universal_manifest`.
-fn backend_metadata(
-    backend: &str,
-) -> Option<(&'static str, BundleKind)> {
+fn backend_metadata(backend: &str) -> Option<(&'static str, BundleKind)> {
     match backend {
-        "hu_dense" | "hu_sparse_projected" => {
-            Some(("hu_arena", BundleKind::UniversalHu))
-        }
-        "mp_eager_dense" => {
-            Some(("mp_arena", BundleKind::UniversalMpEager))
-        }
-        "mp_lazy_sparse_projected" => {
-            Some(("mp_semantic", BundleKind::UniversalMpLazy))
-        }
+        "hu_dense" | "hu_sparse_projected" => Some(("hu_arena", BundleKind::UniversalHu)),
+        "mp_eager_dense" => Some(("mp_arena", BundleKind::UniversalMpEager)),
+        "mp_lazy_sparse_projected" => Some(("mp_semantic", BundleKind::UniversalMpLazy)),
         _ => None,
     }
 }
@@ -527,22 +520,21 @@ fn backend_metadata(
 ///
 /// Returns the parsed manifest alongside the kind so callers can
 /// reuse it without re-reading `blueprint.json`.
-fn classify_universal_manifest(
-    dir: &Path,
-) -> Result<(BundleKind, Manifest), LoaderError> {
+fn classify_universal_manifest(dir: &Path) -> Result<(BundleKind, Manifest), LoaderError> {
     let manifest = read_manifest_for_detection(dir)?;
     let backend = &manifest.training.source_backend;
     let path_str = dir.display().to_string();
 
     let (expected_ns, kind) =
-        backend_metadata(backend).ok_or_else(|| {
-            LoaderError::UnknownSourceBackend {
-                backend: backend.clone(),
-                path: path_str.clone(),
-            }
+        backend_metadata(backend).ok_or_else(|| LoaderError::UnknownSourceBackend {
+            backend: backend.clone(),
+            path: path_str.clone(),
         })?;
 
-    if !manifest.layout.row_namespace.contains(&expected_ns.to_string())
+    if !manifest
+        .layout
+        .row_namespace
+        .contains(&expected_ns.to_string())
     {
         return Err(LoaderError::NamespaceMismatch {
             path: path_str,
@@ -572,21 +564,15 @@ fn classify_universal_manifest(
 }
 
 /// Read `blueprint.json` for detection (not full binary validation).
-fn read_manifest_for_detection(
-    dir: &Path,
-) -> Result<Manifest, LoaderError> {
+fn read_manifest_for_detection(dir: &Path) -> Result<Manifest, LoaderError> {
     let path = dir.join("blueprint.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        LoaderError::ManifestParse {
-            path: dir.display().to_string(),
-            detail: e.to_string(),
-        }
+    let text = std::fs::read_to_string(&path).map_err(|e| LoaderError::ManifestParse {
+        path: dir.display().to_string(),
+        detail: e.to_string(),
     })?;
-    serde_json::from_str::<Manifest>(&text).map_err(|e| {
-        LoaderError::ManifestParse {
-            path: dir.display().to_string(),
-            detail: e.to_string(),
-        }
+    serde_json::from_str::<Manifest>(&text).map_err(|e| LoaderError::ManifestParse {
+        path: dir.display().to_string(),
+        detail: e.to_string(),
     })
 }
 
@@ -612,10 +598,7 @@ fn check_payload_files_exist(
 /// Load a legacy HU bundle.
 ///
 /// `root_dir` has `config.yaml`; `strat_dir` has `strategy.bin`.
-fn load_legacy_hu(
-    root_dir: &Path,
-    strat_dir: &Path,
-) -> Result<LoadedBundle, LoaderError> {
+fn load_legacy_hu(root_dir: &Path, strat_dir: &Path) -> Result<LoadedBundle, LoaderError> {
     let config = load_config(root_dir)?;
     let strat_path = strat_dir.join("strategy.bin");
     let strategy = BlueprintV2Strategy::load(&strat_path)?;
@@ -689,30 +672,21 @@ fn build_hu_index(reader: &BundleReader) -> HashMap<(u32, u32), usize> {
 }
 
 /// Build a lookup index for universal MP eager bundles.
-fn build_mp_eager_index(
-    reader: &BundleReader,
-) -> HashMap<(u32, u8, u32), usize> {
+fn build_mp_eager_index(reader: &BundleReader) -> HashMap<(u32, u8, u32), usize> {
     let mut index = HashMap::with_capacity(reader.row_count());
     for i in 0..reader.row_count() {
         if let Some(row) = reader.row(i) {
-            index.insert(
-                (row.source_node_idx, row.seat, row.global_bucket),
-                i,
-            );
+            index.insert((row.source_node_idx, row.seat, row.global_bucket), i);
         }
     }
     index
 }
 
 /// Build a lookup index for universal MP lazy bundles.
-fn build_mp_lazy_index(
-    reader: &BundleReader,
-) -> HashMap<(u8, u8, u16, u64, u16), usize> {
+fn build_mp_lazy_index(reader: &BundleReader) -> HashMap<(u8, u8, u16, u64, u16), usize> {
     let mut index = HashMap::with_capacity(reader.row_count());
     for i in 0..reader.row_count() {
-        let (Some(row), Some(sem)) =
-            (reader.row(i), reader.semantic_record(i))
-        else {
+        let (Some(row), Some(sem)) = (reader.row(i), reader.semantic_record(i)) else {
             continue;
         };
         index.insert(
