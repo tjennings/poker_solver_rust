@@ -10,16 +10,20 @@
 
 use std::path::Path;
 
+use poker_solver_core::abstraction::isomorphism::CanonicalBoard;
+use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
-use poker_solver_core::blueprint_universal::{BundleData, write_bundle};
+use poker_solver_core::blueprint_universal::{write_bundle, BundleData};
+use poker_solver_core::blueprint_v2::bucket_file::{BucketFile, BucketFileHeader, PackedBoard};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
+use poker_solver_core::poker::{Card, Suit, Value};
 
 use poker_solver_tauri::{
-    ExplorationPosition, ExplorationState, GameSessionState, PostflopState, game_get_state_core,
-    game_new_core, game_play_action_core,
+    game_back_core, game_deal_card_core, game_get_state_core, game_new_core, game_play_action_core,
+    ExplorationPosition, ExplorationState, GameSessionState, PostflopState,
 };
 use tempfile::TempDir;
 
@@ -331,13 +335,13 @@ async fn universal_hu_loads_through_load_bundle_core() {
 
 // ── MP bundle helpers ───────────────────────────────────────────────
 
-use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
-use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
+use poker_solver_core::blueprint_mp::Street as MpStreet;
+use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, Seat, MAX_PLAYERS};
 use poker_solver_core::blueprint_universal::mp_eager_export::{
     self, MpTrainingInfo as MpEagerTrainingInfo,
 };
@@ -535,6 +539,14 @@ fn write_mp_lazy_bundle(dir: &Path) {
 /// Write a two-player lazy bundle plus the retained trainer config needed by
 /// the Tauri lazy session adapter.
 fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
+    write_mp_lazy_2p_bundle_with_options(dir, true, true);
+}
+
+fn write_mp_lazy_2p_bundle_with_options(
+    dir: &Path,
+    include_flop_buckets: bool,
+    include_flop_rows: bool,
+) {
     let mut config = build_3p_config();
     config.game.name = "2p-lazy-session-test".to_string();
     config.game.num_players = 2;
@@ -551,27 +563,73 @@ fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
         },
     ];
     config.training.backend = MpTrainingBackend::LazySparse;
+    config.action_abstraction.flop =
+        serde_yaml::from_str("lead: [1.0]\nraise: [[1.0]]").expect("valid test flop action sizes");
+    config.action_abstraction.turn = config.action_abstraction.flop.clone();
+    config.action_abstraction.river = config.action_abstraction.flop.clone();
     std::fs::write(
         dir.join("config.yaml"),
         serde_yaml::to_string(&config).expect("serialize MP config"),
     )
     .expect("write MP config");
 
-    let entries = vec![SparseSnapshotEntry {
-        key: MpInfosetKey::from_street_bucket(
-            Seat::from_raw(0),
-            MpStreet::Preflop,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-        num_actions: 2,
-        action_identity: None,
-        regrets: vec![10, -5],
-        strategy_sums: vec![100, 200],
-    }];
+    let game = LazyMpGame::new(&config.game, &config.action_abstraction);
+    let root = LazyResolvedSpot::root(&game);
+    let mut entries = Vec::new();
+    let mut add_preflop_rows = |spot: LazyResolvedSpot| {
+        let actions = spot.actions(&game);
+        for bucket in 0..config.clustering.preflop.buckets {
+            let key = spot.key_for_bucket(bucket);
+            if entries
+                .iter()
+                .any(|entry: &SparseSnapshotEntry| entry.key == key)
+            {
+                continue;
+            }
+            entries.push(SparseSnapshotEntry {
+                key,
+                num_actions: actions.len() as u8,
+                action_identity: None,
+                regrets: vec![0; actions.len()],
+                strategy_sums: (0..actions.len())
+                    .map(|index| if index == 0 { u64::from(bucket) + 1 } else { 1 })
+                    .collect(),
+            });
+        }
+    };
+    let mut preflop_spot = root;
+    for action_index in [1, 0] {
+        add_preflop_rows(preflop_spot);
+        let Some(next) = preflop_spot.advance(&game, action_index) else {
+            break;
+        };
+        preflop_spot = next;
+        if preflop_spot.street() != MpStreet::Preflop {
+            break;
+        }
+    }
+    if include_flop_rows {
+        let mut flop_spot = root
+            .advance(&game, 1)
+            .and_then(|spot| spot.advance(&game, 0))
+            .expect("preflop call should reach the flop boundary");
+        for _ in 0..3 {
+            let flop_actions = flop_spot.actions(&game);
+            entries.push(SparseSnapshotEntry {
+                key: flop_spot.key_for_bucket(0),
+                num_actions: flop_actions.len() as u8,
+                action_identity: None,
+                regrets: vec![0; flop_actions.len()],
+                strategy_sums: (0..flop_actions.len())
+                    .map(|index| 100 + index as u64 * 100)
+                    .collect(),
+            });
+            let Some(next) = flop_spot.advance(&game, 0) else {
+                break;
+            };
+            flop_spot = next;
+        }
+    }
     let export_config = LazyExportConfig {
         num_players: 2,
         stack_depth: config.game.stack_depth,
@@ -586,6 +644,30 @@ fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
     let output =
         mp_lazy_export::export_lazy_sparse_to_universal(&export_config, &entries, &training);
     mp_lazy_export::write_lazy_bundle(dir, &output).expect("write 2p lazy bundle");
+
+    if include_flop_buckets {
+        let flop = [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Queen, Suit::Heart),
+        ];
+        let canonical = CanonicalBoard::from_cards(&flop).expect("valid test flop");
+        let buckets_dir = dir.join("buckets");
+        std::fs::create_dir_all(&buckets_dir).expect("create bucket directory");
+        BucketFile {
+            header: BucketFileHeader {
+                street: poker_solver_core::blueprint_v2::Street::Flop,
+                bucket_count: config.clustering.flop.buckets,
+                board_count: 1,
+                combos_per_board: 1326,
+                version: 2,
+            },
+            boards: vec![PackedBoard::from_cards(&canonical.cards)],
+            buckets: vec![0; 1326],
+        }
+        .save(&buckets_dir.join("flop.buckets"))
+        .expect("write test flop buckets");
+    }
 }
 
 fn write_mp_root_config(dir: &Path) {
@@ -718,19 +800,15 @@ async fn mp_eager_game_new_is_rejected_by_lazy_session_gate() {
     write_mp_eager_bundle(dir.path());
 
     let exploration = ExplorationState::default();
-    poker_solver_tauri::load_bundle_core(
-        &exploration,
-        dir.path().to_string_lossy().to_string(),
-    )
-    .await
-    .expect("MP eager bundle should load for metadata");
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("MP eager bundle should load for metadata");
 
     let sessions = GameSessionState::default();
     let error = game_new_core(&exploration, &PostflopState::default(), &sessions)
         .expect_err("eager MP bundle must not enter the lazy session");
     assert!(
-        error.contains("supports only universal_mp_lazy")
-            && error.contains("universal_mp_eager"),
+        error.contains("supports only universal_mp_lazy") && error.contains("universal_mp_eager"),
         "unexpected eager backend error: {error}"
     );
 }
@@ -759,12 +837,9 @@ async fn two_player_lazy_bundle_starts_game_session_and_advances_root_action() {
     write_mp_lazy_2p_bundle_with_config(dir.path());
 
     let exploration = ExplorationState::default();
-    poker_solver_tauri::load_bundle_core(
-        &exploration,
-        dir.path().to_string_lossy().to_string(),
-    )
-    .await
-    .expect("2p MP lazy bundle should load");
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy bundle should load");
 
     let postflop = PostflopState::default();
     let sessions = GameSessionState::default();
@@ -776,10 +851,165 @@ async fn two_player_lazy_bundle_starts_game_session_and_advances_root_action() {
     assert_eq!(root.matrix.as_ref().expect("root matrix").cells.len(), 13);
     assert_eq!(root.matrix.as_ref().unwrap().cells[0].len(), 13);
     assert!(!root.actions.is_empty());
+    let high_canonical_probability = root.matrix.as_ref().unwrap().cells[12][11].probabilities[0];
+    let expected_final_bucket_probability = f32::from(MP_BUCKET_COUNTS[0])
+        / (f32::from(MP_BUCKET_COUNTS[0]) + (root.actions.len() - 1) as f32);
+    assert!(
+        (high_canonical_probability - expected_final_bucket_probability).abs() < 1e-6,
+        "32o should map to final preflop bucket {}",
+        MP_BUCKET_COUNTS[0] - 1
+    );
 
     let child = game_play_action_core(&sessions, &root.actions[0].id, None)
         .expect("first root action should advance");
     assert_eq!(child.action_history.len(), 1);
+}
+
+async fn start_two_player_lazy_session(
+    dir: &TempDir,
+    include_flop_buckets: bool,
+    include_flop_rows: bool,
+) -> (ExplorationState, GameSessionState) {
+    write_mp_lazy_2p_bundle_with_options(dir.path(), include_flop_buckets, include_flop_rows);
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy bundle should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("2p MP lazy bundle should initialize");
+    (exploration, sessions)
+}
+
+fn enter_two_player_flop_chance(sessions: &GameSessionState) -> poker_solver_tauri::GameState {
+    let mut state = game_get_state_core(sessions, None).expect("preflop state");
+    for _ in 0..4 {
+        if state.street == "Flop" && state.is_chance {
+            return state;
+        }
+        let action = state
+            .actions
+            .iter()
+            .find(|action| action.action_type == "call" || action.action_type == "check")
+            .expect("preflop call/check action");
+        state = game_play_action_core(sessions, &action.id, None).expect("advance preflop");
+    }
+    panic!("preflop line did not reach flop chance: {state:?}");
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_exposes_partial_flop_chance_and_renders_flop_matrix() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
+
+    let root = game_get_state_core(&sessions, None).unwrap();
+    let chance = enter_two_player_flop_chance(&sessions);
+    assert!(chance.is_chance);
+    assert_eq!(chance.street, "Flop");
+    assert!(chance.board.is_empty());
+
+    let one_card = game_deal_card_core(&sessions, "As").unwrap();
+    assert!(one_card.is_chance);
+    assert_eq!(one_card.board, vec!["As"]);
+    let duplicate = game_deal_card_core(&sessions, "As").unwrap_err();
+    assert!(duplicate.contains("Duplicate board card"));
+    let after_duplicate = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(after_duplicate.board, vec!["As"]);
+
+    let two_cards = game_deal_card_core(&sessions, "Kd").unwrap();
+    assert!(two_cards.is_chance);
+    assert_eq!(two_cards.board, vec!["As", "Kd"]);
+    let flop = game_deal_card_core(&sessions, "Qh").unwrap();
+    assert_eq!(flop.street, "Flop");
+    assert!(!flop.is_chance);
+    assert_eq!(flop.board, vec!["As", "Kd", "Qh"]);
+    let matrix = flop.matrix.expect("completed flop should render a matrix");
+    assert_eq!(matrix.cells.len(), 13);
+    assert!(matrix
+        .cells
+        .iter()
+        .flatten()
+        .any(|cell| cell.combo_count > 0));
+    assert_ne!(root.actions.len(), 0);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_missing_flop_bucket_source_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, false, true).await;
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+
+    let error = game_deal_card_core(&sessions, "Qh").unwrap_err();
+    assert!(error.contains("flop bucket source is missing"), "{error}");
+    let state = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(state.board, vec!["As", "Kd"]);
+    assert!(state.is_chance);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_missing_flop_row_with_full_key_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, false).await;
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+
+    let error = game_deal_card_core(&sessions, "Qh").unwrap_err();
+    assert!(error.contains("sparse row is missing"), "{error}");
+    assert!(error.contains("history_hash") && error.contains("history_len"));
+    let state = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(state.board, vec!["As", "Kd"]);
+    assert!(state.is_chance);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_back_replays_preflop_and_flop_state() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let flop = game_deal_card_core(&sessions, "Qh").unwrap();
+
+    let after_flop_action = game_play_action_core(&sessions, &flop.actions[0].id, None)
+        .expect("first flop action should be replayable");
+    assert_eq!(after_flop_action.board, vec!["As", "Kd", "Qh"]);
+    let restored_flop = game_back_core(&sessions, None).unwrap();
+    assert_eq!(restored_flop.board, vec!["As", "Kd", "Qh"]);
+    assert_eq!(restored_flop.street, "Flop");
+    assert!(!restored_flop.is_chance);
+
+    let restored_preflop = game_back_core(&sessions, None).unwrap();
+    assert_eq!(restored_preflop.board, Vec::<String>::new());
+    assert_eq!(restored_preflop.street, "Preflop");
+    assert_eq!(restored_preflop.action_history.len(), 1);
+    let restored_root = game_back_core(&sessions, None).unwrap();
+    assert_eq!(restored_root.board, Vec::<String>::new());
+    assert_eq!(restored_root.street, "Preflop");
+    assert!(restored_root.action_history.is_empty());
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_turn_deal_at_boundary() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let mut state = game_deal_card_core(&sessions, "Qh").unwrap();
+
+    while state.street == "Flop" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    assert_eq!(state.street, "Turn");
+    assert!(state.is_chance);
+    let error = game_deal_card_core(&sessions, "Jc").unwrap_err();
+    assert!(error.contains("does not support dealing the turn"));
+    let unchanged = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(unchanged.board, vec!["As", "Kd", "Qh"]);
+    assert_eq!(unchanged.action_history.len(), state.action_history.len());
 }
 
 #[tokio::test]
@@ -840,18 +1070,14 @@ async fn mp_bundle_hu_views_return_clean_error() {
     // Available actions should also return a clean error.
     let result = poker_solver_tauri::get_available_actions_core(&state, pos);
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("MP browsing not yet supported"),
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("MP browsing not yet supported"),);
 
     // Preflop ranges should also return a clean error.
     let result = poker_solver_tauri::get_preflop_ranges_core(&state, vec!["c".to_string()]);
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("MP browsing not yet supported"),
-    );
+    assert!(result
+        .unwrap_err()
+        .contains("MP browsing not yet supported"),);
 }

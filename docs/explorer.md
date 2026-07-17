@@ -44,11 +44,14 @@ routes through the unified loader (`blueprint_universal::loader`):
 - **Universal MP** bundles (eager and lazy sparse) load with manifest metadata.
   The mounted Game view can additionally open a two-player `universal_mp_lazy`
   bundle when its retained full MP `config.yaml` is present: it renders the
-  preflop hand grid and advances through preflop actions using semantic lazy
-  row keys, without materializing a dense MP tree. Eager MP bundles, postflop
-  card/bucket navigation, and N-player seat selection remain deferred; those
-  paths report a precise unsupported-capability error rather than routing MP
-  data through the HU tree.
+  preflop hand grid, exposes a chance state while a flop has 0-2 selected
+  cards, and renders the flop matrix after three unique legal cards. Flop
+  buckets come from trainer-compatible file-backed `AllBuckets` data resolved
+  from a bundle-local/ancestor `buckets/` directory or a valid
+  `training.cluster_path`; missing sources, mappings, sparse rows, or action
+  schemas are errors. Turn and river dealing, eager MP bundles, and N-player
+  seat selection remain unsupported; these paths preserve the current state
+  and report a precise capability error rather than fabricating strategy.
 
 Universal bundles may be placed directly at the selected directory, under
 `final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout
@@ -89,6 +92,11 @@ When the game reaches the flop, enter board cards (e.g. `Ac Th 4d`). The app:
 3. Displays the strategy matrix for that board
 
 Continue through turn and river by entering additional cards. The suit mapping from flop canonicalization is applied to turn/river cards automatically.
+
+The turn/river workflow above applies to HU Blueprint sessions. The supported
+two-player `universal_mp_lazy` Game session stops at the flop boundary: a flop
+action may expose a turn chance boundary, but dealing the turn is explicitly
+rejected until a later bean adds turn bucket and row support.
 
 ### Navigation
 

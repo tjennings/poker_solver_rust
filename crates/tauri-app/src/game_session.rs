@@ -12,17 +12,22 @@ use std::time::Instant;
 use parking_lot::RwLock;
 use serde::Serialize;
 
+use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
+use poker_solver_core::blueprint_mp::game_tree::TreeAction as MpTreeAction;
+use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
+use poker_solver_core::blueprint_mp::Street as MpStreet;
+use poker_solver_core::blueprint_universal::{
+    ActionDescriptor, ActionKind, BundleKind, LoadedBundle, MpLazyKey,
+};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
 };
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
-use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
-use poker_solver_core::blueprint_mp::game_tree::TreeAction as MpTreeAction;
-use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
-use poker_solver_core::blueprint_mp::Street as MpStreet;
-use poker_solver_core::blueprint_universal::{BundleKind, LoadedBundle, MpLazyKey};
+use poker_solver_core::hands::CanonicalHand;
+use poker_solver_core::poker::{Card as RsPokerCard, Value as RsPokerValue};
 
 use range_solver::card::{card_to_string, NOT_DEALT};
 use range_solver::interface::Game;
@@ -177,9 +182,7 @@ fn boundary_evaluator_log_line(
             },
         )) => {
             let evaluator = match inference_mode {
-                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => {
-                    "Direct CFVNet"
-                }
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => "Direct CFVNet",
                 cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy => {
                     "Direct CFVNet (legacy scaled bcfv)"
                 }
@@ -459,17 +462,19 @@ impl Default for GameSessionState {
 // Lazy MP GameSession
 // ---------------------------------------------------------------------------
 
-/// Read-only, preflop navigation over a universal lazy MP bundle.
+/// Read-only navigation over a two-player universal lazy MP bundle.
 ///
-/// This intentionally owns the lazy public cursor rather than reconstructing
-/// the sparse rows into a HU BlueprintV2 tree. The first Tauri gate supports
-/// the two-player preflop view; postflop bucket/card mapping remains an
-/// explicit boundary until the universal bundle carries the required mapping.
+/// The cursor remains the semantic lazy public model. The adapter only adds a
+/// typed flop board and uses file-backed `AllBuckets` lookups when the flop is
+/// complete; it never materializes a dense MP tree or fabricates postflop rows.
 pub struct LazyMpSession {
     game: LazyMpGame,
     spot: LazyResolvedSpot,
     bundle: Arc<LoadedBundle>,
     config: BlueprintMpConfig,
+    all_buckets: Option<Arc<AllBuckets>>,
+    bucket_error: Option<String>,
+    board: Vec<RsPokerCard>,
     action_history: Vec<ActionRecord>,
     terminal: bool,
 }
@@ -484,7 +489,7 @@ impl LazyMpSession {
                 "Universal MP GameExplorer supports only universal_mp_lazy bundles; received {bundle_kind}"
             ));
         }
-        let config = data.config.ok_or_else(|| {
+        let config = data.config.clone().ok_or_else(|| {
             "game_new requires a retained MP config.yaml for universal MP navigation".to_string()
         })?;
         let manifest = data
@@ -507,11 +512,18 @@ impl LazyMpSession {
 
         let game = LazyMpGame::new(&config.game, &config.action_abstraction);
         let spot = LazyResolvedSpot::root(&game);
+        let (all_buckets, bucket_error) = match crate::exploration::load_mp_all_buckets(&data) {
+            Ok(all_buckets) => (Some(all_buckets), None),
+            Err(error) => (None, Some(error)),
+        };
         Ok(Self {
             game,
             spot,
             bundle: data.bundle,
             config: *config,
+            all_buckets,
+            bucket_error,
+            board: vec![],
             action_history: vec![],
             terminal: false,
         })
@@ -545,8 +557,7 @@ impl LazyMpSession {
             .blinds
             .iter()
             .find(|blind| {
-                blind.kind
-                    == poker_solver_core::blueprint_mp::config::ForcedBetKind::SmallBlind
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::SmallBlind
             })
             .map_or(0, |blind| blind.seat);
         let bb_seat = self
@@ -555,84 +566,263 @@ impl LazyMpSession {
             .blinds
             .iter()
             .find(|blind| {
-                blind.kind
-                    == poker_solver_core::blueprint_mp::config::ForcedBetKind::BigBlind
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::BigBlind
             })
             .map_or(1, |blind| blind.seat);
-        [stacks[bb_seat as usize].0 as i32, stacks[sb_seat as usize].0 as i32]
+        [
+            stacks[bb_seat as usize].0 as i32,
+            stacks[sb_seat as usize].0 as i32,
+        ]
     }
 
-    fn uniform_legal_row(&self, action_count: usize) -> Vec<f32> {
-        if action_count == 0 {
-            return vec![];
-        }
-        vec![1.0 / action_count as f32; action_count]
+    fn current_actions_at(&self, spot: LazyResolvedSpot) -> Vec<MpTreeAction> {
+        spot.actions(&self.game)
     }
 
     fn probabilities_for_bucket(
         &self,
+        spot: LazyResolvedSpot,
         bucket: u16,
-        action_count: usize,
+        mp_actions: &[MpTreeAction],
     ) -> Result<Vec<f32>, String> {
-        let key = self.spot.key_for_bucket(bucket);
+        let key = spot.key_for_bucket(bucket);
         let lazy_key = MpLazyKey {
             seat: key.seat,
-            street: self.spot.street() as u8,
+            street: spot.street() as u8,
             local_bucket: key.local_bucket(),
             history_hash: key.history_hash,
             history_len: key.history_len,
         };
         let Some(view) = self.bundle.query_mp_lazy(&lazy_key) else {
-            let policy = self
-                .bundle
-                .manifest()
-                .map(|manifest| manifest.layout.missing_row_policy.as_str())
-                .unwrap_or("reject");
-            return match policy {
-                "uniform" | "uniform_legal" => Ok(self.uniform_legal_row(action_count)),
-                _ => Err(format!(
-                    "Universal MP sparse row is missing for seat {}, street {}, bucket {}; bundle policy is {policy}",
-                    lazy_key.seat, lazy_key.street, lazy_key.local_bucket
-                )),
-            };
+            return Err(format!(
+                "Universal MP sparse row is missing: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}",
+                lazy_key.seat,
+                lazy_key.street,
+                lazy_key.local_bucket,
+                lazy_key.history_hash,
+                lazy_key.history_len
+            ));
         };
 
-        let mut probabilities = vec![0.0; action_count];
+        if view.actions.len() != mp_actions.len() || view.probs.len() != view.actions.len() {
+            return Err(format!(
+                "Universal MP sparse row schema mismatch: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}, row_actions={}, row_probs={}, legal_actions={}",
+                lazy_key.seat,
+                lazy_key.street,
+                lazy_key.local_bucket,
+                lazy_key.history_hash,
+                lazy_key.history_len,
+                view.actions.len(),
+                view.probs.len(),
+                mp_actions.len()
+            ));
+        }
+
+        let mut probabilities = vec![0.0; mp_actions.len()];
+        let mut seen = vec![false; mp_actions.len()];
         for (row_index, descriptor) in view.actions.iter().enumerate() {
             let action_index = usize::from(descriptor.source_action_index);
-            if action_index < action_count {
-                probabilities[action_index] = view.probs.get(row_index).copied().unwrap_or(0.0);
+            if action_index >= mp_actions.len() || seen[action_index] {
+                return Err(format!(
+                    "Universal MP sparse row action schema is incompatible: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}, source_action_index={action_index}, legal_actions={}",
+                    lazy_key.seat,
+                    lazy_key.street,
+                    lazy_key.local_bucket,
+                    lazy_key.history_hash,
+                    lazy_key.history_len,
+                    mp_actions.len()
+                ));
             }
+            validate_mp_action_descriptor(descriptor, &mp_actions[action_index]).map_err(|error| {
+                format!(
+                    "Universal MP sparse row action schema mismatch at seat={}, street={}, local_bucket={}, history_hash={}, history_len={}, source_action_index={action_index}: {error}",
+                    lazy_key.seat,
+                    lazy_key.street,
+                    lazy_key.local_bucket,
+                    lazy_key.history_hash,
+                    lazy_key.history_len
+                )
+            })?;
+            seen[action_index] = true;
+            probabilities[action_index] = view.probs[row_index];
+        }
+        if seen.iter().any(|seen| !seen) {
+            return Err(format!(
+                "Universal MP sparse row action schema omits a legal action: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}",
+                lazy_key.seat,
+                lazy_key.street,
+                lazy_key.local_bucket,
+                lazy_key.history_hash,
+                lazy_key.history_len
+            ));
         }
         Ok(probabilities)
     }
 
+    fn flop_bucket(
+        &self,
+        spot: LazyResolvedSpot,
+        hand: &str,
+        hole_cards: [RsPokerCard; 2],
+        board: &[RsPokerCard],
+    ) -> Result<u16, String> {
+        let all_buckets = self.all_buckets.as_ref().ok_or_else(|| {
+            self.bucket_error
+                .clone()
+                .unwrap_or_else(|| "Universal MP flop bucket source is unavailable".to_string())
+        })?;
+        all_buckets
+            .try_get_bucket(Street::Flop, hole_cards, board)
+            .map_err(|error| {
+                format!(
+                    "Universal MP flop bucket lookup failed: seat={}, street=flop, hand={}, board={:?}, hole_cards={:?}: {error}",
+                    spot.to_act().index(),
+                    hand,
+                    board,
+                    hole_cards
+                )
+            })
+    }
+
+    fn build_flop_matrix(
+        &self,
+        spot: LazyResolvedSpot,
+        board: &[RsPokerCard],
+        mp_actions: &[MpTreeAction],
+    ) -> Result<GameMatrix, String> {
+        if board.len() != 3 {
+            return Err(format!(
+                "Universal MP flop matrix requires exactly 3 board cards, got {}",
+                board.len()
+            ));
+        }
+        let actions = build_mp_game_actions(mp_actions, mp_big_blind_amount(&self.config)?);
+        let mut cells = Vec::with_capacity(13);
+        for (row, &rank1) in RANKS.iter().enumerate() {
+            let mut row_cells = Vec::with_capacity(13);
+            for (col, &rank2) in RANKS.iter().enumerate() {
+                let (label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
+                let hand = CanonicalHand::new(mp_rank_value(rank1), mp_rank_value(rank2), suited);
+                let mut sum_probabilities = vec![0.0; actions.len()];
+                let mut combos = Vec::new();
+                for (card1, card2) in hand.combos() {
+                    if board.iter().any(|card| *card == card1 || *card == card2) {
+                        continue;
+                    }
+                    let bucket = self.flop_bucket(spot, &label, [card1, card2], board)?;
+                    let probabilities = self.probabilities_for_bucket(spot, bucket, mp_actions)?;
+                    for (sum, probability) in sum_probabilities.iter_mut().zip(probabilities.iter())
+                    {
+                        *sum += *probability;
+                    }
+                    let cards = format!(
+                        "{}{}",
+                        card_to_string(crate::exploration::rs_card_to_range_solver(card1))
+                            .unwrap_or_default(),
+                        card_to_string(crate::exploration::rs_card_to_range_solver(card2))
+                            .unwrap_or_default()
+                    );
+                    combos.push(ComboDetail {
+                        cards,
+                        probabilities,
+                        weight: 1.0,
+                        bucket: Some(bucket),
+                    });
+                }
+                let combo_count = combos.len();
+                let probabilities = if combo_count == 0 {
+                    vec![0.0; actions.len()]
+                } else {
+                    sum_probabilities
+                        .into_iter()
+                        .map(|probability| probability / combo_count as f32)
+                        .collect()
+                };
+                row_cells.push(GameMatrixCell {
+                    hand: label,
+                    suited,
+                    pair,
+                    probabilities,
+                    combo_count,
+                    weight: 1.0,
+                    ev: None,
+                    combos,
+                });
+            }
+            cells.push(row_cells);
+        }
+        Ok(GameMatrix { cells, actions })
+    }
+
     #[allow(clippy::cast_possible_truncation)]
-    fn get_state(&self) -> Result<GameState, String> {
-        let stacks = self.display_stacks();
-        if self.terminal {
+    fn state_at(
+        &self,
+        spot: LazyResolvedSpot,
+        board: &[RsPokerCard],
+        action_history: &[ActionRecord],
+        terminal: bool,
+    ) -> Result<GameState, String> {
+        let stacks = self.display_stacks_at(spot);
+        let board_strings = mp_board_strings(board);
+        let street = mp_street_to_string(spot.street());
+        if terminal {
             return Ok(GameState {
-                street: street_to_string(Street::Preflop),
+                street,
                 position: String::new(),
-                board: vec![],
-                pot: self.spot.pot().0 as i32,
+                board: board_strings,
+                pot: spot.pot().0 as i32,
                 stacks,
                 matrix: None,
                 actions: vec![],
-                action_history: self.action_history.clone(),
+                action_history: action_history.to_vec(),
                 is_terminal: true,
                 is_chance: false,
                 solve: None,
             });
         }
-        if self.spot.street() != MpStreet::Preflop {
-            return Err(
-                "Universal MP GameExplorer currently supports preflop navigation only; postflop card/bucket mapping is unavailable".to_string(),
-            );
+
+        let required_board_cards = mp_required_board_cards(spot.street());
+        if required_board_cards > board.len() {
+            return Ok(GameState {
+                street,
+                position: String::new(),
+                board: board_strings,
+                pot: spot.pot().0 as i32,
+                stacks,
+                matrix: None,
+                actions: vec![],
+                action_history: action_history.to_vec(),
+                is_terminal: false,
+                is_chance: true,
+                solve: None,
+            });
         }
 
-        let mp_actions = self.current_actions();
+        let mp_actions = self.current_actions_at(spot);
         let actions = build_mp_game_actions(&mp_actions, mp_big_blind_amount(&self.config)?);
+        if spot.street() == MpStreet::Flop {
+            let matrix = self.build_flop_matrix(spot, board, &mp_actions)?;
+            return Ok(GameState {
+                street,
+                position: self.position_label(spot.to_act().index()),
+                board: board_strings,
+                pot: spot.pot().0 as i32,
+                stacks,
+                matrix: Some(matrix),
+                actions,
+                action_history: action_history.to_vec(),
+                is_terminal: false,
+                is_chance: false,
+                solve: None,
+            });
+        }
+        if spot.street() != MpStreet::Preflop {
+            return Err(format!(
+                "Universal MP GameExplorer does not support {} decision navigation; turn/river strategy is unavailable",
+                street
+            ));
+        }
+
         let bucket_count = usize::from(self.config.clustering.preflop.buckets);
         if bucket_count == 0 {
             return Err("Universal MP config has zero preflop buckets".to_string());
@@ -646,13 +836,13 @@ impl LazyMpSession {
                 let bucket = if bucket_count == 169 {
                     hand_index as u16
                 } else {
-                    (hand_index % bucket_count) as u16
+                    hand_index.min(bucket_count - 1) as u16
                 };
                 row_cells.push(GameMatrixCell {
                     hand: label,
                     suited,
                     pair,
-                    probabilities: self.probabilities_for_bucket(bucket, actions.len())?,
+                    probabilities: self.probabilities_for_bucket(spot, bucket, &mp_actions)?,
                     combo_count: 0,
                     weight: 1.0,
                     ev: None,
@@ -663,26 +853,62 @@ impl LazyMpSession {
         }
 
         Ok(GameState {
-            street: street_to_string(Street::Preflop),
-            position: self.position_label(self.spot.to_act().index()),
-            board: vec![],
-            pot: self.spot.pot().0 as i32,
+            street,
+            position: self.position_label(spot.to_act().index()),
+            board: board_strings,
+            pot: spot.pot().0 as i32,
             stacks,
             matrix: Some(GameMatrix {
                 cells,
                 actions: actions.clone(),
             }),
             actions,
-            action_history: self.action_history.clone(),
+            action_history: action_history.to_vec(),
             is_terminal: false,
             is_chance: false,
             solve: None,
         })
     }
 
+    fn display_stacks_at(&self, spot: LazyResolvedSpot) -> [i32; 2] {
+        let stacks = spot.stacks();
+        let sb_seat = self
+            .config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| {
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::SmallBlind
+            })
+            .map_or(0, |blind| blind.seat);
+        let bb_seat = self
+            .config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| {
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::BigBlind
+            })
+            .map_or(1, |blind| blind.seat);
+        [
+            stacks[bb_seat as usize].0 as i32,
+            stacks[sb_seat as usize].0 as i32,
+        ]
+    }
+
+    fn get_state(&self) -> Result<GameState, String> {
+        self.state_at(self.spot, &self.board, &self.action_history, self.terminal)
+    }
+
     fn play_action(&mut self, action_id: &str) -> Result<GameState, String> {
         if self.terminal {
             return Err("Universal MP session is already terminal".to_string());
+        }
+        if mp_required_board_cards(self.spot.street()) > self.board.len() {
+            return Err(format!(
+                "Universal MP session is at a {} chance boundary; deal the remaining board cards before playing an action",
+                mp_street_to_string(self.spot.street())
+            ));
         }
         let action_index = action_id
             .parse::<usize>()
@@ -696,50 +922,191 @@ impl LazyMpSession {
             ));
         }
         let stacks = self.display_stacks();
-        self.action_history.push(ActionRecord {
+        let mut next_history = self.action_history.clone();
+        next_history.push(ActionRecord {
             action_id: action_id.to_string(),
             label: actions[action_index].label.clone(),
             position: self.position_label(self.spot.to_act().index()),
-            street: "Preflop".to_string(),
+            street: mp_street_to_string(self.spot.street()),
             pot: self.spot.pot().0 as i32,
-            stack: stacks[if self.spot.to_act().index() == 1 { 0 } else { 1 }],
-            actions,
+            stack: stacks[if self.spot.to_act().index() == 1 {
+                0
+            } else {
+                1
+            }],
+            actions: actions.clone(),
         });
-        self.spot = match self.spot.advance(&self.game, action_index) {
-            Some(next) => next,
-            None => {
-                self.terminal = true;
-                return self.get_state();
+        let next_spot = self.spot.advance(&self.game, action_index);
+        let next_terminal = next_spot.is_none();
+        let next_spot = next_spot.unwrap_or(self.spot);
+        let state = self.state_at(next_spot, &self.board, &next_history, next_terminal)?;
+        self.spot = next_spot;
+        self.action_history = next_history;
+        self.terminal = next_terminal;
+        Ok(state)
+    }
+
+    fn deal_card(&mut self, card: &str) -> Result<GameState, String> {
+        if self.terminal {
+            return Err("Universal MP session is already terminal".to_string());
+        }
+        if self.spot.street() != MpStreet::Flop || self.board.len() >= 3 {
+            if self.spot.street() == MpStreet::Turn && self.board.len() == 3 {
+                return Err(
+                    "Universal MP GameExplorer does not support dealing the turn; state unchanged"
+                        .to_string(),
+                );
             }
-        };
-        self.get_state()
+            return Err(format!(
+                "Universal MP session is not at a supported flop chance state; street={}, board_cards={}, state unchanged",
+                mp_street_to_string(self.spot.street()),
+                self.board.len()
+            ));
+        }
+        let parsed = parse_rs_poker_card(card)?;
+        if self.board.contains(&parsed) {
+            return Err(format!(
+                "Duplicate board card {card} is illegal; board unchanged"
+            ));
+        }
+        let mut next_board = self.board.clone();
+        next_board.push(parsed);
+        let state = self.state_at(self.spot, &next_board, &self.action_history, false)?;
+        self.board = next_board;
+        Ok(state)
     }
 
     fn back(&mut self) -> Result<GameState, String> {
         if self.action_history.is_empty() {
             return Err("No actions to undo".to_string());
         }
-        let replay_ids: Vec<String> = self.action_history[..self.action_history.len() - 1]
-            .iter()
-            .map(|record| record.action_id.clone())
-            .collect();
-        self.spot = LazyResolvedSpot::root(&self.game);
-        self.action_history.clear();
-        self.terminal = false;
-        for action_id in replay_ids {
-            let action_index = action_id
+        let last = self.action_history.last().cloned().unwrap();
+        let target_history = self.action_history[..self.action_history.len() - 1].to_vec();
+        let target_board = if last.street == "Preflop" {
+            Vec::new()
+        } else {
+            self.board.clone()
+        };
+        let mut target_spot = LazyResolvedSpot::root(&self.game);
+        let mut target_terminal = false;
+        for record in &target_history {
+            let action_index = record
+                .action_id
                 .parse::<usize>()
-                .map_err(|_| format!("Invalid MP action_id during back: {action_id}"))?;
-            self.spot = match self.spot.advance(&self.game, action_index) {
+                .map_err(|_| format!("Invalid MP action_id during back: {}", record.action_id))?;
+            target_spot = match target_spot.advance(&self.game, action_index) {
                 Some(next) => next,
                 None => {
-                    self.terminal = true;
+                    target_terminal = true;
                     break;
                 }
             };
         }
-        self.get_state()
+        let state = self.state_at(target_spot, &target_board, &target_history, target_terminal)?;
+        self.spot = target_spot;
+        self.board = target_board;
+        self.action_history = target_history;
+        self.terminal = target_terminal;
+        Ok(state)
     }
+}
+
+fn mp_street_to_string(street: MpStreet) -> String {
+    match street {
+        MpStreet::Preflop => "Preflop".to_string(),
+        MpStreet::Flop => "Flop".to_string(),
+        MpStreet::Turn => "Turn".to_string(),
+        MpStreet::River => "River".to_string(),
+    }
+}
+
+const fn mp_required_board_cards(street: MpStreet) -> usize {
+    match street {
+        MpStreet::Preflop => 0,
+        MpStreet::Flop => 3,
+        MpStreet::Turn => 4,
+        MpStreet::River => 5,
+    }
+}
+
+fn mp_board_strings(board: &[RsPokerCard]) -> Vec<String> {
+    board
+        .iter()
+        .map(|card| {
+            card_to_string(crate::exploration::rs_card_to_range_solver(*card))
+                .unwrap_or_else(|_| "??".to_string())
+        })
+        .collect()
+}
+
+fn mp_rank_value(rank: char) -> RsPokerValue {
+    match rank {
+        'A' => RsPokerValue::Ace,
+        'K' => RsPokerValue::King,
+        'Q' => RsPokerValue::Queen,
+        'J' => RsPokerValue::Jack,
+        'T' => RsPokerValue::Ten,
+        '9' => RsPokerValue::Nine,
+        '8' => RsPokerValue::Eight,
+        '7' => RsPokerValue::Seven,
+        '6' => RsPokerValue::Six,
+        '5' => RsPokerValue::Five,
+        '4' => RsPokerValue::Four,
+        '3' => RsPokerValue::Three,
+        '2' => RsPokerValue::Two,
+        _ => unreachable!("RANKS contains only legal ranks"),
+    }
+}
+
+fn expected_mp_action_kind(action: &MpTreeAction) -> ActionKind {
+    match action {
+        MpTreeAction::Fold => ActionKind::Fold,
+        MpTreeAction::Check => ActionKind::Check,
+        MpTreeAction::Call => ActionKind::Call,
+        MpTreeAction::Lead(_) => ActionKind::Bet,
+        MpTreeAction::Raise(_) => ActionKind::Raise,
+        MpTreeAction::AllIn => ActionKind::AllInBetRaise,
+    }
+}
+
+fn validate_mp_action_descriptor(
+    descriptor: &ActionDescriptor,
+    action: &MpTreeAction,
+) -> Result<(), String> {
+    if descriptor.kind == ActionKind::Opaque {
+        return Ok(());
+    }
+    let kind_matches = match action {
+        MpTreeAction::AllIn => matches!(
+            descriptor.kind,
+            ActionKind::AllInCall | ActionKind::AllInBetRaise
+        ),
+        _ => descriptor.kind == expected_mp_action_kind(action),
+    };
+    if !kind_matches {
+        return Err(format!(
+            "row kind {:?} does not match legal action {:?}",
+            descriptor.kind, action
+        ));
+    }
+    let expected_amount = match action {
+        MpTreeAction::Lead(amount) | MpTreeAction::Raise(amount) => {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                Some(amount.round() as u32)
+            }
+        }
+        _ => None,
+    };
+    if let Some(expected_amount) = expected_amount {
+        if descriptor.amount_chips != expected_amount {
+            return Err(format!(
+                "row amount {} does not match legal amount {}",
+                descriptor.amount_chips, expected_amount
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,9 +2096,7 @@ fn mp_big_blind_amount(config: &BlueprintMpConfig) -> Result<f64, String> {
         .find(|blind| blind.kind == ForcedBetKind::BigBlind)
         .map(|blind| blind.amount)
         .filter(|amount| *amount > 0.0)
-        .ok_or_else(|| {
-            "Universal MP config must define a positive BigBlind forced bet".to_string()
-        })
+        .ok_or_else(|| "Universal MP config must define a positive BigBlind forced bet".to_string())
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -1744,14 +2109,12 @@ fn build_mp_game_actions(actions: &[MpTreeAction], big_blind: f64) -> Vec<GameAc
                 MpTreeAction::Fold => ("Fold".to_string(), "fold".to_string()),
                 MpTreeAction::Check => ("Check".to_string(), "check".to_string()),
                 MpTreeAction::Call => ("Call".to_string(), "call".to_string()),
-                MpTreeAction::Lead(amount) => (
-                    format_mp_amount(*amount, big_blind),
-                    "bet".to_string(),
-                ),
-                MpTreeAction::Raise(amount) => (
-                    format_mp_amount(*amount, big_blind),
-                    "raise".to_string(),
-                ),
+                MpTreeAction::Lead(amount) => {
+                    (format_mp_amount(*amount, big_blind), "bet".to_string())
+                }
+                MpTreeAction::Raise(amount) => {
+                    (format_mp_amount(*amount, big_blind), "raise".to_string())
+                }
                 MpTreeAction::AllIn => ("All-in".to_string(), "allin".to_string()),
             };
             GameAction {
@@ -2906,9 +3269,9 @@ pub fn game_deal_card_core(
     card: &str,
 ) -> Result<GameState, String> {
     if session_state.mp_session.read().is_some() {
-        return Err(format!(
-            "Universal MP GameExplorer does not support dealing cards yet (requested {card}); postflop bucket mapping is unavailable"
-        ));
+        let mut guard = session_state.mp_session.write();
+        let session = guard.as_mut().ok_or("No MP game session active")?;
+        return session.deal_card(card);
     }
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;

@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
-use poker_solver_core::blueprint_universal::{BundleKind, LoadedBundle};
 use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
-use poker_solver_core::blueprint_v2::Street;
+use poker_solver_core::blueprint_universal::{BundleKind, LoadedBundle};
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
@@ -25,6 +24,7 @@ use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
 };
 use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
+use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::hand_class::classify;
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card, Suit, Value};
@@ -120,6 +120,8 @@ enum StrategySource {
         /// has a config.yaml. Direct universal fixtures may intentionally omit
         /// it and remain metadata-loadable.
         config: Option<Box<BlueprintMpConfig>>,
+        config_dir: Option<PathBuf>,
+        bundle_dir: PathBuf,
     },
 }
 
@@ -150,6 +152,8 @@ pub(crate) struct BlueprintV2Data {
 pub(crate) struct UniversalMpData {
     pub(crate) bundle: Arc<LoadedBundle>,
     pub(crate) config: Option<Box<BlueprintMpConfig>>,
+    pub(crate) config_dir: Option<PathBuf>,
+    pub(crate) bundle_dir: PathBuf,
 }
 
 impl ExplorationState {
@@ -190,9 +194,16 @@ impl ExplorationState {
         let source_guard = self.source.read();
         let source = source_guard.as_ref()?;
         match source {
-            StrategySource::UniversalMp { bundle, config } => Some(Ok(UniversalMpData {
+            StrategySource::UniversalMp {
+                bundle,
+                config,
+                config_dir,
+                bundle_dir,
+            } => Some(Ok(UniversalMpData {
                 bundle: Arc::clone(bundle),
                 config: config.clone(),
+                config_dir: config_dir.clone(),
+                bundle_dir: bundle_dir.clone(),
             })),
             _ => None,
         }
@@ -886,16 +897,28 @@ fn load_universal_mp(
 ) -> Result<BundleInfo, String> {
     let manifest = loaded.manifest().ok_or("MP bundle missing manifest")?;
     let info = mp_bundle_info(manifest, loaded.kind(), loaded.iterations());
-    let config = load_retained_mp_config(bundle_path)?;
+    let retained_config = load_retained_mp_config(bundle_path)?;
+    let config = retained_config
+        .as_ref()
+        .map(|retained| Box::new(retained.config.clone()));
+    let config_dir = retained_config.map(|retained| retained.dir);
 
     *state.source.write() = Some(StrategySource::UniversalMp {
         bundle: Arc::new(loaded),
-        config: config.map(Box::new),
+        config,
+        config_dir,
+        bundle_dir: bundle_path.to_path_buf(),
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
 
     Ok(info)
+}
+
+/// Retained multiplayer config and the directory it came from.
+struct RetainedMpConfig {
+    config: BlueprintMpConfig,
+    dir: PathBuf,
 }
 
 /// Load a retained multiplayer config from the bundle directory or an ancestor.
@@ -904,7 +927,7 @@ fn load_universal_mp(
 /// while the trainer-owned `config.yaml` remains at the run root. A universal
 /// bundle without any retained config is still valid for metadata and row-level
 /// APIs, so this returns `Ok(None)` in that case.
-fn load_retained_mp_config(bundle_path: &Path) -> Result<Option<BlueprintMpConfig>, String> {
+fn load_retained_mp_config(bundle_path: &Path) -> Result<Option<RetainedMpConfig>, String> {
     let mut dir = Some(bundle_path);
     while let Some(candidate_dir) = dir {
         let config_path = candidate_dir.join("config.yaml");
@@ -914,13 +937,136 @@ fn load_retained_mp_config(bundle_path: &Path) -> Result<Option<BlueprintMpConfi
                 // the game section. Keep those bundles metadata-loadable and
                 // let game_new report that a full MP config is required.
                 if let Ok(config) = serde_yaml::from_str::<BlueprintMpConfig>(&text) {
-                    return Ok(Some(config));
+                    return Ok(Some(RetainedMpConfig {
+                        config,
+                        dir: candidate_dir.to_path_buf(),
+                    }));
                 }
             }
         }
         dir = candidate_dir.parent();
     }
     Ok(None)
+}
+
+fn bucket_dir_candidates(
+    bundle_dir: &Path,
+    config_dir: Option<&Path>,
+    cluster_path: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut add_ancestors = |start: &Path| {
+        let mut dir = Some(start);
+        while let Some(candidate) = dir {
+            candidates.push(candidate.join("buckets"));
+            dir = candidate.parent();
+        }
+    };
+    add_ancestors(bundle_dir);
+    if let Some(dir) = config_dir {
+        add_ancestors(dir);
+    }
+    if let Some(cluster_path) = cluster_path {
+        let configured = PathBuf::from(cluster_path);
+        if configured.is_absolute() {
+            candidates.push(configured);
+        } else {
+            // Preserve trainer semantics for paths relative to the process
+            // working directory, while also supporting retained config paths.
+            candidates.push(configured.clone());
+            if let Some(dir) = config_dir {
+                candidates.push(dir.join(configured));
+            }
+        }
+    }
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+/// Load the same file-backed bucket inputs used by the MP trainer.
+///
+/// The Explorer only needs the flop file for the supported boundary, but it
+/// keeps all available street files and per-flop files in the `AllBuckets`
+/// object so lookup semantics remain shared with training. A source directory
+/// is valid for this boundary only when it contains a readable `flop.buckets`.
+pub(crate) fn load_mp_all_buckets(data: &UniversalMpData) -> Result<Arc<AllBuckets>, String> {
+    let config = data
+        .config
+        .as_ref()
+        .ok_or_else(|| "Universal MP session is missing retained config.yaml".to_string())?;
+    let bucket_counts = config.clustering.bucket_counts();
+    let candidates = bucket_dir_candidates(
+        &data.bundle_dir,
+        data.config_dir.as_deref(),
+        config.training.cluster_path.as_deref(),
+    );
+    let searched = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+
+    let Some(cluster_dir) = candidates
+        .iter()
+        .find(|dir| dir.join("flop.buckets").is_file())
+    else {
+        return Err(format!(
+            "Universal MP flop bucket source is missing; expected readable flop.buckets in bundle-local/ancestor directories or training.cluster_path. Searched: {}",
+            searched.join(", ")
+        ));
+    };
+
+    let names = [
+        "preflop.buckets",
+        "flop.buckets",
+        "turn.buckets",
+        "river.buckets",
+    ];
+    let expected_streets = [Street::Preflop, Street::Flop, Street::Turn, Street::River];
+    let mut files: [Option<BucketFile>; 4] = [None, None, None, None];
+    for (index, name) in names.iter().enumerate() {
+        let path = cluster_dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let file = BucketFile::load(&path).map_err(|error| {
+            format!(
+                "Failed to load Universal MP {} bucket file {}: {error}",
+                expected_streets[index] as u8,
+                path.display()
+            )
+        })?;
+        if file.header.street != expected_streets[index] {
+            return Err(format!(
+                "Universal MP bucket file {} declares street {:?}, expected {:?}",
+                path.display(),
+                file.header.street,
+                expected_streets[index]
+            ));
+        }
+        if file.header.bucket_count != bucket_counts[index] {
+            return Err(format!(
+                "Universal MP bucket file {} declares {} buckets, config requires {} for {:?}",
+                path.display(),
+                file.header.bucket_count,
+                bucket_counts[index],
+                expected_streets[index]
+            ));
+        }
+        files[index] = Some(file);
+    }
+
+    let all_buckets = AllBuckets::new(bucket_counts, files);
+    let all_buckets = if cluster_dir.join("flop_0000.buckets").is_file() {
+        all_buckets.with_per_flop_dir(cluster_dir.clone())
+    } else {
+        all_buckets
+    };
+    Ok(Arc::new(all_buckets))
 }
 
 /// Load a Blueprint V2 bundle (Tauri wrapper).

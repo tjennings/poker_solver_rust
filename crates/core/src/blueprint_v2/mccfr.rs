@@ -366,6 +366,91 @@ impl AllBuckets {
         self.lookup_bucket(street as usize, hole_cards, board)
     }
 
+    /// Fallible file-backed bucket lookup for callers that must surface
+    /// missing sources or board mappings instead of panicking.
+    ///
+    /// This intentionally mirrors the production portion of [`get_bucket`]
+    /// and never enables the equity fallback. It is primarily for read-only
+    /// adapters such as the Explorer, where a rejected lookup must leave the
+    /// user-visible state unchanged.
+    pub fn try_get_bucket(
+        &self,
+        street: Street,
+        hole_cards: [Card; 2],
+        board: &[Card],
+    ) -> Result<u16, String> {
+        if street == Street::Preflop {
+            let hand = crate::hands::CanonicalHand::from_cards(hole_cards[0], hole_cards[1]);
+            let idx = hand.index() as u16;
+            return Ok(idx.min(self.bucket_counts[0].saturating_sub(1)));
+        }
+
+        let street_idx = street as usize;
+        let street_name = match street {
+            Street::Preflop => "preflop",
+            Street::Flop => "flop",
+            Street::Turn => "turn",
+            Street::River => "river",
+        };
+        if board.len() < street_idx + 2 {
+            return Err(format!(
+                "invalid {street_name} board length {} for hole cards {hole_cards:?}",
+                board.len()
+            ));
+        }
+
+        if (street_idx == 2 || street_idx == 3) && self.per_flop_dir.is_some() {
+            return self.lookup_per_flop(street_idx, hole_cards, board).ok_or_else(|| {
+                format!(
+                    "missing per-flop {street_name} bucket mapping for board {board:?} and hole cards {hole_cards:?}"
+                )
+            });
+        }
+
+        let Some(bucket_file) = self.bucket_files[street_idx].as_ref() else {
+            return Err(format!(
+                "missing {street_name} bucket file for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        };
+        let Some(board_map) = self.board_maps[street_idx].as_ref() else {
+            return Err(format!(
+                "missing {street_name} board mapping for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        };
+        let canonical = CanonicalBoard::from_cards(board).map_err(|error| {
+            format!(
+                "cannot canonicalize {street_name} board {board:?} for hole cards {hole_cards:?}: {error}"
+            )
+        })?;
+        let packed = canonical_key(&canonical.cards);
+        let Some(&board_idx) = board_map.get(&packed) else {
+            return Err(format!(
+                "missing {street_name} board mapping for canonical board {packed:?} (original {board:?}), hole cards {hole_cards:?}"
+            ));
+        };
+        let (c0, c1) = canonical.canonicalize_holding(hole_cards[0], hole_cards[1]);
+        let combo_idx = combo_index(c0, c1) as usize;
+        let combos_per_board = usize::from(bucket_file.header.combos_per_board);
+        if combo_idx >= combos_per_board {
+            return Err(format!(
+                "{street_name} bucket file combo index {combo_idx} out of range 0..{combos_per_board} for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        }
+        let flat_idx = board_idx as usize * combos_per_board + combo_idx;
+        let Some(&bucket) = bucket_file.buckets.get(flat_idx) else {
+            return Err(format!(
+                "{street_name} bucket file row missing at board index {board_idx}, combo index {combo_idx} for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        };
+        if bucket >= bucket_file.header.bucket_count {
+            return Err(format!(
+                "{street_name} bucket id {bucket} exceeds declared bucket count {} for board {board:?} and hole cards {hole_cards:?}",
+                bucket_file.header.bucket_count
+            ));
+        }
+        Ok(bucket)
+    }
+
     /// Return the visible board slice for a given street.
     #[must_use]
     pub fn board_for_street(board: &[Card; 5], street: Street) -> &[Card] {
