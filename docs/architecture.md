@@ -117,7 +117,9 @@ renders a completed-flop matrix by enumerating canonical-hand combos, removing
 board blockers, resolving each combo through trainer-compatible file-backed
 `AllBuckets`, and averaging the matching sparse row probabilities. Bucket files
 are resolved from bundle-local/ancestor `buckets/` directories or a valid
-retained `training.cluster_path`; missing sources, mappings, rows, and
+retained `training.cluster_path`. Relative configured paths are anchored at
+the retained config directory and searched through its ancestors before
+implicit `buckets/` candidates; missing sources, mappings, rows, and
 incompatible action schemas are explicit errors. The narrow additive
 `AllBuckets::try_get_bucket` API provides the same canonical/combo lookup with
 errors instead of the trainer hot path's panic behavior. Card and action

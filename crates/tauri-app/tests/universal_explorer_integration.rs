@@ -615,15 +615,23 @@ fn write_mp_lazy_2p_bundle_with_options(
             .expect("preflop call should reach the flop boundary");
         for _ in 0..3 {
             let flop_actions = flop_spot.actions(&game);
-            entries.push(SparseSnapshotEntry {
-                key: flop_spot.key_for_bucket(0),
-                num_actions: flop_actions.len() as u8,
-                action_identity: None,
-                regrets: vec![0; flop_actions.len()],
-                strategy_sums: (0..flop_actions.len())
-                    .map(|index| 100 + index as u64 * 100)
-                    .collect(),
-            });
+            for bucket in 0..=1 {
+                entries.push(SparseSnapshotEntry {
+                    key: flop_spot.key_for_bucket(bucket),
+                    num_actions: flop_actions.len() as u8,
+                    action_identity: None,
+                    regrets: vec![0; flop_actions.len()],
+                    strategy_sums: (0..flop_actions.len())
+                        .map(|index| {
+                            if bucket == 0 {
+                                100 + index as u64 * 100
+                            } else {
+                                300 - index as u64 * 100
+                            }
+                        })
+                        .collect(),
+                });
+            }
             let Some(next) = flop_spot.advance(&game, 0) else {
                 break;
             };
@@ -646,28 +654,35 @@ fn write_mp_lazy_2p_bundle_with_options(
     mp_lazy_export::write_lazy_bundle(dir, &output).expect("write 2p lazy bundle");
 
     if include_flop_buckets {
-        let flop = [
-            Card::new(Value::Ace, Suit::Spade),
-            Card::new(Value::King, Suit::Diamond),
-            Card::new(Value::Queen, Suit::Heart),
-        ];
-        let canonical = CanonicalBoard::from_cards(&flop).expect("valid test flop");
-        let buckets_dir = dir.join("buckets");
-        std::fs::create_dir_all(&buckets_dir).expect("create bucket directory");
-        BucketFile {
-            header: BucketFileHeader {
-                street: poker_solver_core::blueprint_v2::Street::Flop,
-                bucket_count: config.clustering.flop.buckets,
-                board_count: 1,
-                combos_per_board: 1326,
-                version: 2,
-            },
-            boards: vec![PackedBoard::from_cards(&canonical.cards)],
-            buckets: vec![0; 1326],
-        }
-        .save(&buckets_dir.join("flop.buckets"))
-        .expect("write test flop buckets");
+        write_test_flop_bucket(&dir.join("buckets"), config.clustering.flop.buckets);
     }
+}
+
+fn write_test_flop_bucket(dir: &Path, bucket_count: u16) {
+    write_test_flop_bucket_with_assignment(dir, bucket_count, 0);
+}
+
+fn write_test_flop_bucket_with_assignment(dir: &Path, bucket_count: u16, bucket: u16) {
+    let flop = [
+        Card::new(Value::Ace, Suit::Spade),
+        Card::new(Value::King, Suit::Diamond),
+        Card::new(Value::Queen, Suit::Heart),
+    ];
+    let canonical = CanonicalBoard::from_cards(&flop).expect("valid test flop");
+    std::fs::create_dir_all(dir).expect("create bucket directory");
+    BucketFile {
+        header: BucketFileHeader {
+            street: poker_solver_core::blueprint_v2::Street::Flop,
+            bucket_count,
+            board_count: 1,
+            combos_per_board: 1326,
+            version: 2,
+        },
+        boards: vec![PackedBoard::from_cards(&canonical.cards)],
+        buckets: vec![bucket; 1326],
+    }
+    .save(&dir.join("flop.buckets"))
+    .expect("write test flop buckets");
 }
 
 fn write_mp_root_config(dir: &Path) {
@@ -697,6 +712,59 @@ fn write_nested_mp_lazy_snapshot(root: &Path, name: &str) {
     )
     .unwrap();
     write_mp_lazy_bundle(&snap.join("universal"));
+}
+
+fn write_nested_mp_lazy_snapshot_with_relative_cluster_path(root: &Path, name: &str) {
+    let universal = root.join(name).join("universal");
+    std::fs::create_dir_all(&universal).unwrap();
+    write_mp_lazy_2p_bundle_with_config(&universal);
+
+    let config_path = universal.join("config.yaml");
+    let mut config: BlueprintMpConfig = serde_yaml::from_str(
+        &std::fs::read_to_string(&config_path).expect("read retained MP config"),
+    )
+    .expect("retained MP config should deserialize");
+    config.training.cluster_path = Some("./local_data/buckets/test_cluster".to_string());
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&config).expect("serialize retained MP config"),
+    )
+    .expect("write retained MP config");
+
+    write_test_flop_bucket_with_assignment(
+        &root.join("local_data/buckets/test_cluster"),
+        config.clustering.flop.buckets,
+        1,
+    );
+    write_test_flop_bucket_with_assignment(
+        &universal.join("buckets"),
+        config.clustering.flop.buckets + 1,
+        0,
+    );
+}
+
+fn write_nested_mp_lazy_snapshot_with_invalid_configured_cluster_path(root: &Path, name: &str) {
+    let universal = root.join(name).join("universal");
+    std::fs::create_dir_all(&universal).unwrap();
+    write_mp_lazy_2p_bundle_with_config(&universal);
+
+    let config_path = universal.join("config.yaml");
+    let mut config: BlueprintMpConfig = serde_yaml::from_str(
+        &std::fs::read_to_string(&config_path).expect("read retained MP config"),
+    )
+    .expect("retained MP config should deserialize");
+    config.training.cluster_path = Some("./local_data/buckets/invalid_cluster".to_string());
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&config).expect("serialize retained MP config"),
+    )
+    .expect("write retained MP config");
+
+    write_test_flop_bucket(
+        &root.join("local_data/buckets/invalid_cluster"),
+        config.clustering.flop.buckets + 1,
+    );
+    write_test_flop_bucket(&universal.join("buckets"), config.clustering.flop.buckets);
 }
 
 // ── Part C: listing reports kind + player count ─────────────────────
@@ -1043,6 +1111,80 @@ async fn nested_mp_lazy_snapshot_loads_through_root_and_snapshot_v2_entrypoint()
     assert!(snapshots[0].has_strategy);
     assert_eq!(snapshots[0].iterations, Some(100));
     assert_eq!(snapshots[0].elapsed_minutes, Some(1));
+}
+
+#[tokio::test]
+async fn nested_mp_lazy_snapshot_resolves_relative_cluster_path_before_implicit_buckets() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    write_nested_mp_lazy_snapshot_with_relative_cluster_path(&project, "snapshot_0001");
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_blueprint_v2_core(
+        &exploration,
+        project.to_string_lossy().to_string(),
+        Some("snapshot_0001".to_string()),
+    )
+    .await
+    .expect("snapshot path should resolve nested MP lazy universal bundle");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("nested 2p MP lazy bundle should initialize");
+
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let flop = game_deal_card_core(&sessions, "Qh")
+        .expect("relative retained cluster_path should resolve the flop buckets");
+
+    assert_eq!(flop.street, "Flop");
+    assert!(!flop.is_chance);
+    assert_eq!(flop.board, vec!["As", "Kd", "Qh"]);
+    let buckets: Vec<u16> = flop
+        .matrix
+        .as_ref()
+        .expect("flop state should include the strategy matrix")
+        .cells
+        .iter()
+        .flatten()
+        .flat_map(|cell| cell.combos.iter())
+        .filter_map(|combo| combo.bucket)
+        .collect();
+    assert!(!buckets.is_empty());
+    assert!(
+        buckets.iter().all(|&bucket| bucket == 1),
+        "configured bucket source should assign every visible combo to bucket 1, got {buckets:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_mp_lazy_snapshot_rejects_invalid_configured_cluster_path() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    write_nested_mp_lazy_snapshot_with_invalid_configured_cluster_path(&project, "snapshot_0001");
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_blueprint_v2_core(
+        &exploration,
+        project.to_string_lossy().to_string(),
+        Some("snapshot_0001".to_string()),
+    )
+    .await
+    .expect("snapshot path should resolve nested MP lazy universal bundle");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("nested 2p MP lazy bundle should initialize");
+
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let error = game_deal_card_core(&sessions, "Qh").expect_err(
+        "an invalid configured bucket source must not be hidden by a valid implicit source",
+    );
+    assert!(
+        error.contains("Invalid Universal MP configured training.cluster_path flop bucket file"),
+        "expected configured-source validation error, got: {error}"
+    );
 }
 
 #[tokio::test]

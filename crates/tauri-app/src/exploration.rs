@@ -954,7 +954,7 @@ fn bucket_dir_candidates(
     config_dir: Option<&Path>,
     cluster_path: Option<&str>,
 ) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+    let mut candidates = configured_bucket_dir_candidates(bundle_dir, config_dir, cluster_path);
     let mut add_ancestors = |start: &Path| {
         let mut dir = Some(start);
         while let Some(candidate) = dir {
@@ -966,19 +966,6 @@ fn bucket_dir_candidates(
     if let Some(dir) = config_dir {
         add_ancestors(dir);
     }
-    if let Some(cluster_path) = cluster_path {
-        let configured = PathBuf::from(cluster_path);
-        if configured.is_absolute() {
-            candidates.push(configured);
-        } else {
-            // Preserve trainer semantics for paths relative to the process
-            // working directory, while also supporting retained config paths.
-            candidates.push(configured.clone());
-            if let Some(dir) = config_dir {
-                candidates.push(dir.join(configured));
-            }
-        }
-    }
     let mut unique = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if !unique.contains(&candidate) {
@@ -986,6 +973,98 @@ fn bucket_dir_candidates(
         }
     }
     unique
+}
+
+fn configured_bucket_dir_candidates(
+    bundle_dir: &Path,
+    config_dir: Option<&Path>,
+    cluster_path: Option<&str>,
+) -> Vec<PathBuf> {
+    let Some(cluster_path) = cluster_path else {
+        return Vec::new();
+    };
+
+    let configured = PathBuf::from(cluster_path);
+    let mut candidates = Vec::new();
+    if configured.is_absolute() {
+        candidates.push(configured);
+    } else {
+        let mut add_ancestors_with_path = |start: &Path| {
+            let mut dir = Some(start);
+            while let Some(candidate) = dir {
+                candidates.push(candidate.join(&configured));
+                dir = candidate.parent();
+            }
+        };
+
+        if let Some(dir) = config_dir {
+            add_ancestors_with_path(dir);
+        }
+        add_ancestors_with_path(bundle_dir);
+
+        // Preserve trainer semantics for paths relative to the process
+        // working directory as the final compatibility fallback.
+        candidates.push(configured);
+    }
+
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn validate_flop_bucket_file(file: &BucketFile, expected_bucket_count: u16) -> Result<(), String> {
+    if file.header.street != Street::Flop {
+        return Err(format!(
+            "declares street {:?}, expected {:?}",
+            file.header.street,
+            Street::Flop
+        ));
+    }
+    if file.header.bucket_count != expected_bucket_count {
+        return Err(format!(
+            "declares {} buckets, config requires {}",
+            file.header.bucket_count, expected_bucket_count
+        ));
+    }
+    if file.header.combos_per_board != 1326 {
+        return Err(format!(
+            "declares {} combos per board, expected 1326",
+            file.header.combos_per_board
+        ));
+    }
+    if file.header.board_count == 0 || file.boards.is_empty() {
+        return Err("contains no usable flop boards".to_string());
+    }
+    if file.boards.len() != file.header.board_count as usize {
+        return Err(format!(
+            "declares {} boards but contains {} board entries",
+            file.header.board_count,
+            file.boards.len()
+        ));
+    }
+    let expected_bucket_values = (file.header.board_count as usize)
+        .checked_mul(usize::from(file.header.combos_per_board))
+        .ok_or_else(|| "declares too many bucket assignments".to_string())?;
+    if file.buckets.len() != expected_bucket_values {
+        return Err(format!(
+            "declares {} boards x {} combos but contains {} bucket assignments",
+            file.header.board_count,
+            file.header.combos_per_board,
+            file.buckets.len()
+        ));
+    }
+    if file
+        .buckets
+        .iter()
+        .any(|&bucket| bucket >= expected_bucket_count)
+    {
+        return Err("contains a bucket assignment outside the configured bucket range".to_string());
+    }
+    Ok(())
 }
 
 /// Load the same file-backed bucket inputs used by the MP trainer.
@@ -1010,10 +1089,68 @@ pub(crate) fn load_mp_all_buckets(data: &UniversalMpData) -> Result<Arc<AllBucke
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
 
-    let Some(cluster_dir) = candidates
-        .iter()
-        .find(|dir| dir.join("flop.buckets").is_file())
-    else {
+    let explicit_candidates = configured_bucket_dir_candidates(
+        &data.bundle_dir,
+        data.config_dir.as_deref(),
+        config.training.cluster_path.as_deref(),
+    );
+    let mut selected_cluster_dir = None;
+    let mut selected_flop_file = None;
+    let mut implicit_invalid_error = None;
+    let mut ordered_candidates = explicit_candidates.clone();
+    ordered_candidates.extend(
+        candidates
+            .iter()
+            .filter(|candidate| !explicit_candidates.contains(candidate))
+            .cloned(),
+    );
+    for candidate in &ordered_candidates {
+        let path = candidate.join("flop.buckets");
+        if !path.is_file() {
+            continue;
+        }
+
+        let source_kind = if explicit_candidates.contains(candidate) {
+            "configured training.cluster_path"
+        } else {
+            "implicit bundle/config ancestor"
+        };
+        let file = match BucketFile::load(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                let message = format!(
+                    "Failed to load Universal MP {source_kind} flop bucket file {}: {error}. Searched: {}",
+                    path.display(),
+                    searched.join(", ")
+                );
+                if source_kind == "configured training.cluster_path" {
+                    return Err(message);
+                }
+                implicit_invalid_error.get_or_insert(message);
+                continue;
+            }
+        };
+        if let Err(error) = validate_flop_bucket_file(&file, bucket_counts[1]) {
+            let message = format!(
+                "Invalid Universal MP {source_kind} flop bucket file {}: {error}. Searched: {}",
+                path.display(),
+                searched.join(", ")
+            );
+            if source_kind == "configured training.cluster_path" {
+                return Err(message);
+            }
+            implicit_invalid_error.get_or_insert(message);
+            continue;
+        }
+        selected_cluster_dir = Some(candidate.clone());
+        selected_flop_file = Some(file);
+        break;
+    }
+
+    let Some(cluster_dir) = selected_cluster_dir else {
+        if let Some(error) = implicit_invalid_error {
+            return Err(error);
+        }
         return Err(format!(
             "Universal MP flop bucket source is missing; expected readable flop.buckets in bundle-local/ancestor directories or training.cluster_path. Searched: {}",
             searched.join(", ")
@@ -1028,7 +1165,11 @@ pub(crate) fn load_mp_all_buckets(data: &UniversalMpData) -> Result<Arc<AllBucke
     ];
     let expected_streets = [Street::Preflop, Street::Flop, Street::Turn, Street::River];
     let mut files: [Option<BucketFile>; 4] = [None, None, None, None];
+    files[1] = selected_flop_file;
     for (index, name) in names.iter().enumerate() {
+        if index == 1 {
+            continue;
+        }
         let path = cluster_dir.join(name);
         if !path.is_file() {
             continue;

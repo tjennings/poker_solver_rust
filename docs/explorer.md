@@ -48,7 +48,9 @@ routes through the unified loader (`blueprint_universal::loader`):
   cards, and renders the flop matrix after three unique legal cards. Flop
   buckets come from trainer-compatible file-backed `AllBuckets` data resolved
   from a bundle-local/ancestor `buckets/` directory or a valid
-  `training.cluster_path`; missing sources, mappings, sparse rows, or action
+  `training.cluster_path`; relative values are anchored at the retained config
+  directory and searched through its ancestors before implicit bundle/ancestor
+  `buckets/` directories. Missing sources, mappings, sparse rows, or action
   schemas are errors. Turn and river dealing, eager MP bundles, and N-player
   seat selection remain unsupported; these paths preserve the current state
   and report a precise capability error rather than fabricating strategy.

@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-3u3p
 title: Resolve lazy MP bucket path from retained config
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-07-17T20:58:10Z
-updated_at: 2026-07-17T20:58:10Z
+updated_at: 2026-07-17T21:45:18Z
 parent: poker_solver_rust-osss
 ---
 
@@ -15,11 +15,17 @@ Use the retained config location as the anchor for relative training.cluster_pat
 
 ## Checklist
 
-- [ ] Research config path ownership and current bucket candidate resolution.
-- [ ] Anchor relative training.cluster_path to the retained config directory or equivalent project root.
-- [ ] Preserve absolute paths and existing bundle-local/ancestor candidates.
-- [ ] Add regression coverage for relative cluster_path resolution.
-- [ ] Run focused Tauri tests and verification.
-- [ ] Update docs if path behavior is user-visible.
+- [x] Research config path ownership and current bucket candidate resolution.
+- [x] Anchor relative training.cluster_path to the retained config directory or equivalent project root.
+- [x] Preserve absolute paths and existing bundle-local/ancestor candidates.
+- [x] Add regression coverage for relative cluster_path resolution.
+- [x] Run focused Tauri tests and verification.
+- [x] Update docs if path behavior is user-visible.
+
+## Summary of Changes
+
+- Anchored relative `training.cluster_path` values to the retained config directory and its ancestors, while preserving absolute and process-CWD compatibility fallbacks.
+- Prioritized configured bucket sources, validated flop bucket metadata, and prevented invalid implicit candidates from masking valid configured sources.
+- Added nested snapshot regression coverage for configured-path resolution and invalid configured-source errors; documented the behavior in the Explorer and architecture guides.
 
 Parent: unified HU/MP trainer runtime epic.
