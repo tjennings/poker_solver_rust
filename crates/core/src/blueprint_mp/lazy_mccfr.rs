@@ -342,6 +342,18 @@ impl LazyResolvedSpot {
         self.state.to_act()
     }
 
+    /// Current per-seat stack amounts.
+    #[must_use]
+    pub const fn stacks(self) -> [Chips; MAX_PLAYERS] {
+        self.state.stacks
+    }
+
+    /// Current pot amount.
+    #[must_use]
+    pub const fn pot(self) -> Chips {
+        self.state.pot()
+    }
+
     /// Current street.
     #[must_use]
     pub const fn street(self) -> Street {

@@ -5325,6 +5325,7 @@ dependencies = [
  "rs_poker",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

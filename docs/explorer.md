@@ -41,11 +41,14 @@ routes through the unified loader (`blueprint_universal::loader`):
   `BlueprintV2Strategy` is reconstructed from the universal rows (bitwise-identical
   to the legacy strategy) using the `config.yaml` retained inside the bundle to
   rebuild the game tree.
-- **Universal MP** bundles (eager and lazy sparse) load read-only: the bundle
-  info panel reports format kind, player count, seats, stacks, and bucket counts
-  from the manifest. Full N-player browsing (seat selection, hand grids) is a
-  later phase, so HU-only views report "MP browsing not yet supported" for MP
-  bundles.
+- **Universal MP** bundles (eager and lazy sparse) load with manifest metadata.
+  The mounted Game view can additionally open a two-player `universal_mp_lazy`
+  bundle when its retained full MP `config.yaml` is present: it renders the
+  preflop hand grid and advances through preflop actions using semantic lazy
+  row keys, without materializing a dense MP tree. Eager MP bundles, postflop
+  card/bucket navigation, and N-player seat selection remain deferred; those
+  paths report a precise unsupported-capability error rather than routing MP
+  data through the HU tree.
 
 Universal bundles may be placed directly at the selected directory, under
 `final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout

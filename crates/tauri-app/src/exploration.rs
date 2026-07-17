@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
 use poker_solver_core::blueprint_universal::{BundleKind, LoadedBundle};
+use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
 use poker_solver_core::blueprint_v2::Street;
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
@@ -114,7 +115,11 @@ enum StrategySource {
     /// Universal MP bundle (eager or lazy). Read-only: bundle info and
     /// row-level queries only; full MP tree navigation is deferred.
     UniversalMp {
-        bundle: Box<LoadedBundle>,
+        bundle: Arc<LoadedBundle>,
+        /// Retained multiplayer config, when the bundle root or an ancestor
+        /// has a config.yaml. Direct universal fixtures may intentionally omit
+        /// it and remain metadata-loadable.
+        config: Option<Box<BlueprintMpConfig>>,
     },
 }
 
@@ -139,6 +144,12 @@ pub(crate) struct BlueprintV2Data {
     pub(crate) tree: Box<V2GameTree>,
     pub(crate) decision_map: Vec<u32>,
     pub(crate) hand_evs: Option<Vec<[[f64; 169]; 2]>>,
+}
+
+/// Data extracted from a loaded universal MP source for GameSession.
+pub(crate) struct UniversalMpData {
+    pub(crate) bundle: Arc<LoadedBundle>,
+    pub(crate) config: Option<Box<BlueprintMpConfig>>,
 }
 
 impl ExplorationState {
@@ -167,6 +178,23 @@ impl ExplorationState {
             _ => Err("game_new requires a BlueprintV2 source \
                       (MP browsing not yet supported)"
                 .to_string()),
+        }
+    }
+
+    /// Extract the retained universal MP bundle and optional config.
+    ///
+    /// The outer `Option` distinguishes a non-MP source from an MP source
+    /// whose config is missing. This lets metadata-only MP loads continue to
+    /// work while `game_new` can report the actionable missing-config error.
+    pub(crate) fn extract_universal_mp_data(&self) -> Option<Result<UniversalMpData, String>> {
+        let source_guard = self.source.read();
+        let source = source_guard.as_ref()?;
+        match source {
+            StrategySource::UniversalMp { bundle, config } => Some(Ok(UniversalMpData {
+                bundle: Arc::clone(bundle),
+                config: config.clone(),
+            })),
+            _ => None,
         }
     }
 }
@@ -649,7 +677,7 @@ async fn load_universal_bundle_core(
     match loaded.kind() {
         BundleKind::UniversalHu => load_universal_hu(state, loaded, bundle_path),
         BundleKind::UniversalMpEager | BundleKind::UniversalMpLazy => {
-            load_universal_mp(state, loaded)
+            load_universal_mp(state, loaded, bundle_path)
         }
         BundleKind::LegacyHu => Err("Unexpected LegacyHu from universal loader".into()),
     }
@@ -851,17 +879,48 @@ fn mp_bundle_info(
 }
 
 /// Load a universal MP bundle into the read-only `UniversalMp` source.
-fn load_universal_mp(state: &ExplorationState, loaded: LoadedBundle) -> Result<BundleInfo, String> {
+fn load_universal_mp(
+    state: &ExplorationState,
+    loaded: LoadedBundle,
+    bundle_path: &Path,
+) -> Result<BundleInfo, String> {
     let manifest = loaded.manifest().ok_or("MP bundle missing manifest")?;
     let info = mp_bundle_info(manifest, loaded.kind(), loaded.iterations());
+    let config = load_retained_mp_config(bundle_path)?;
 
     *state.source.write() = Some(StrategySource::UniversalMp {
-        bundle: Box::new(loaded),
+        bundle: Arc::new(loaded),
+        config: config.map(Box::new),
     });
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
 
     Ok(info)
+}
+
+/// Load a retained multiplayer config from the bundle directory or an ancestor.
+///
+/// Nested lazy snapshots keep `blueprint.json` below the snapshot directory
+/// while the trainer-owned `config.yaml` remains at the run root. A universal
+/// bundle without any retained config is still valid for metadata and row-level
+/// APIs, so this returns `Ok(None)` in that case.
+fn load_retained_mp_config(bundle_path: &Path) -> Result<Option<BlueprintMpConfig>, String> {
+    let mut dir = Some(bundle_path);
+    while let Some(candidate_dir) = dir {
+        let config_path = candidate_dir.join("config.yaml");
+        if config_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&config_path) {
+                // Universal snapshot fixtures and older runs may retain only
+                // the game section. Keep those bundles metadata-loadable and
+                // let game_new report that a full MP config is required.
+                if let Ok(config) = serde_yaml::from_str::<BlueprintMpConfig>(&text) {
+                    return Ok(Some(config));
+                }
+            }
+        }
+        dir = candidate_dir.parent();
+    }
+    Ok(None)
 }
 
 /// Load a Blueprint V2 bundle (Tauri wrapper).

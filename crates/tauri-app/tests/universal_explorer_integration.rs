@@ -17,7 +17,10 @@ use poker_solver_core::blueprint_v2::config::*;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 
-use poker_solver_tauri::{ExplorationPosition, ExplorationState};
+use poker_solver_tauri::{
+    ExplorationPosition, ExplorationState, GameSessionState, PostflopState, game_get_state_core,
+    game_new_core, game_play_action_core,
+};
 use tempfile::TempDir;
 
 // ── Shared helpers ──────────────────────────────────────────────────
@@ -529,6 +532,62 @@ fn write_mp_lazy_bundle(dir: &Path) {
     mp_lazy_export::write_lazy_bundle(dir, &output).unwrap();
 }
 
+/// Write a two-player lazy bundle plus the retained trainer config needed by
+/// the Tauri lazy session adapter.
+fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
+    let mut config = build_3p_config();
+    config.game.name = "2p-lazy-session-test".to_string();
+    config.game.num_players = 2;
+    config.game.blinds = vec![
+        ForcedBet {
+            seat: 0,
+            kind: ForcedBetKind::SmallBlind,
+            amount: 1.0,
+        },
+        ForcedBet {
+            seat: 1,
+            kind: ForcedBetKind::BigBlind,
+            amount: 2.0,
+        },
+    ];
+    config.training.backend = MpTrainingBackend::LazySparse;
+    std::fs::write(
+        dir.join("config.yaml"),
+        serde_yaml::to_string(&config).expect("serialize MP config"),
+    )
+    .expect("write MP config");
+
+    let entries = vec![SparseSnapshotEntry {
+        key: MpInfosetKey::from_street_bucket(
+            Seat::from_raw(0),
+            MpStreet::Preflop,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+        num_actions: 2,
+        action_identity: None,
+        regrets: vec![10, -5],
+        strategy_sums: vec![100, 200],
+    }];
+    let export_config = LazyExportConfig {
+        num_players: 2,
+        stack_depth: config.game.stack_depth,
+        bucket_counts: config.clustering.bucket_counts(),
+        small_blind: 1.0,
+        big_blind: 2.0,
+    };
+    let training = LazyTrainingInfo {
+        iterations: 100,
+        elapsed_minutes: 1.0,
+    };
+    let output =
+        mp_lazy_export::export_lazy_sparse_to_universal(&export_config, &entries, &training);
+    mp_lazy_export::write_lazy_bundle(dir, &output).expect("write 2p lazy bundle");
+}
+
 fn write_mp_root_config(dir: &Path) {
     std::fs::write(
         dir.join("config.yaml"),
@@ -654,6 +713,29 @@ async fn mp_eager_bundle_loads_and_provides_bundle_info() {
 }
 
 #[tokio::test]
+async fn mp_eager_game_new_is_rejected_by_lazy_session_gate() {
+    let dir = TempDir::new().unwrap();
+    write_mp_eager_bundle(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(
+        &exploration,
+        dir.path().to_string_lossy().to_string(),
+    )
+    .await
+    .expect("MP eager bundle should load for metadata");
+
+    let sessions = GameSessionState::default();
+    let error = game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect_err("eager MP bundle must not enter the lazy session");
+    assert!(
+        error.contains("supports only universal_mp_lazy")
+            && error.contains("universal_mp_eager"),
+        "unexpected eager backend error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn mp_lazy_bundle_loads_and_provides_bundle_info() {
     let dir = TempDir::new().unwrap();
     write_mp_lazy_bundle(dir.path());
@@ -669,6 +751,35 @@ async fn mp_lazy_bundle_loads_and_provides_bundle_info() {
     let bi = poker_solver_tauri::get_bundle_info_core(&state)
         .expect("get_bundle_info should succeed for MP lazy");
     assert_eq!(bi.iterations, 100);
+}
+
+#[tokio::test]
+async fn two_player_lazy_bundle_starts_game_session_and_advances_root_action() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_config(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(
+        &exploration,
+        dir.path().to_string_lossy().to_string(),
+    )
+    .await
+    .expect("2p MP lazy bundle should load");
+
+    let postflop = PostflopState::default();
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &postflop, &sessions)
+        .expect("configured 2p MP lazy bundle should initialize");
+
+    let root = game_get_state_core(&sessions, None).expect("root state");
+    assert_eq!(root.street, "Preflop");
+    assert_eq!(root.matrix.as_ref().expect("root matrix").cells.len(), 13);
+    assert_eq!(root.matrix.as_ref().unwrap().cells[0].len(), 13);
+    assert!(!root.actions.is_empty());
+
+    let child = game_play_action_core(&sessions, &root.actions[0].id, None)
+        .expect("first root action should advance");
+    assert_eq!(child.action_history.len(), 1);
 }
 
 #[tokio::test]
