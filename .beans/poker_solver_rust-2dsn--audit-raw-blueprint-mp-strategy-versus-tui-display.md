@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-05-20T15:42:14Z
+updated_at: 2026-07-27T23:39:08Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -43,3 +43,12 @@ Extended live lazy-sparse TUI probe cells to show dominant average action, domin
 ## Probe Observation
 
 Current-vs-average probe output shows a mixed picture with multi-million strategy-sum mass per opener row. Some suspicious hands look like plausible DCFR average lag, e.g. HJ A3s:P:aF94/cB81/s3m. Others are current-strategy folds with substantial mass, e.g. UTG A2s/A3s/A4s current F100 with s3m, HJ A5s current F100 with s2m, and CO A2s/A4s/A5s current F100 with s2m, while nearby hands like CO A3s, CO K9s, and CO 22 are current raises. This narrows the next audit to raw row internals: action labels, bucket/key, regrets, and per-action strategy sums for adjacent suited Ax hands and comparison hands.
+
+
+## New Report: SB 72o Facing Reraise
+
+SB folds 72o at the unopened/preflop opening node, but the TUI reports approximately 72% SB call frequency after SB raises to 2bb and BB reraises to 3bb. The audit must compare the raw row and action-history resolution at both nodes before changing training or storage.
+
+- [ ] Reproduce the exact SB r2 / BB r3 / SB decision with a deterministic diagnostic.
+- [ ] Compare 72o at opening and reraised SB nodes, including action labels and row keys.
+- [ ] Classify the defect as display, navigation, keying, or training data.
