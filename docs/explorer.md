@@ -71,6 +71,10 @@ that nested universal layout before parsing `config.yaml`, so MP configs using
 Bundle and snapshot listings report the format kind and player count for each
 entry. Snapshot listings mark `snapshot_NNNN/universal/blueprint.json` as
 loadable and read iteration metadata from either `iterations` or `iteration`.
+Legacy MP directories that contain only an MP `config.yaml` are listed as
+metadata-only entries and are not offered to the HU `load_blueprint_v2` path;
+this avoids probing them for the HU-only `game.players` field. Universal MP
+bundles remain the supported MP loading surface.
 
 ### Blueprint V2 Bundle
 Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
