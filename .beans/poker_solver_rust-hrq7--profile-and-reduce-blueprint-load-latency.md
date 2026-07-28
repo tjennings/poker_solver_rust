@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-hrq7
 title: Profile and reduce blueprint load latency
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-07-28T01:45:42Z
-updated_at: 2026-07-28T02:08:42Z
+updated_at: 2026-07-28T02:34:53Z
 parent: poker_solver_rust-osss
 ---
 
@@ -31,3 +31,12 @@ Acceptance:
 
 
 Scope note: this turn is limited to the MP lazy bucket initialization fix, focused regression tests, formatting, narrow verification, and a commit; timing instrumentation and docs are deferred.
+
+
+## Verification
+
+- Universal bundle load tracing now reports command, reader/index, HU reconstruction, MP source setup, and initial matrix phase timings.
+- Universal MP lazy session construction no longer eagerly loads the file-backed all-street bucket corpus; bucket data is loaded and cached on first flop access.
+- Focused verification passed: `cargo test -p poker-solver-tauri --lib` (376 passed, 6 ignored) and `cargo test -p poker-solver-tauri --test universal_explorer_integration` (20 passed).
+- Changed Tauri files pass targeted rustfmt and `git diff --check`.
+- Repository-wide formatter check still reports unrelated pre-existing formatting drift outside this change; the pre-existing sample configuration edit remains untouched.
