@@ -1113,7 +1113,9 @@ impl LazyMpSession {
     }
 
     fn get_state(&mut self) -> Result<GameState, String> {
-        self.state_at(self.spot, &self.board, &self.action_history, self.terminal)
+        let board = self.board.clone();
+        let action_history = self.action_history.clone();
+        self.state_at(self.spot, &board, &action_history, self.terminal)
     }
 
     fn play_action(&mut self, action_id: &str) -> Result<GameState, String> {
@@ -1155,7 +1157,8 @@ impl LazyMpSession {
         let next_spot = self.spot.advance(&self.game, action_index);
         let next_terminal = next_spot.is_none();
         let next_spot = next_spot.unwrap_or(self.spot);
-        let state = self.state_at(next_spot, &self.board, &next_history, next_terminal)?;
+        let board = self.board.clone();
+        let state = self.state_at(next_spot, &board, &next_history, next_terminal)?;
         self.spot = next_spot;
         self.action_history = next_history;
         self.terminal = next_terminal;
@@ -1187,7 +1190,8 @@ impl LazyMpSession {
         }
         let mut next_board = self.board.clone();
         next_board.push(parsed);
-        let state = self.state_at(self.spot, &next_board, &self.action_history, false)?;
+        let action_history = self.action_history.clone();
+        let state = self.state_at(self.spot, &next_board, &action_history, false)?;
         self.board = next_board;
         Ok(state)
     }
