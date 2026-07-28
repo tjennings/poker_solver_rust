@@ -126,7 +126,7 @@ The mounted Tauri Game view now has a separate lazy-session adapter for exactly
 two-player `universal_mp_lazy` bundles with a retained full MP config. It keeps
 the semantic lazy row model, renders preflop rows by seat/street/bucket/history
 identity, exposes a typed flop chance state while 0-2 cards are selected, and
-renders a completed-flop matrix by enumerating canonical-hand combos, removing
+renders completed-street matrices by enumerating canonical-hand combos, removing
 board blockers, resolving each combo through trainer-compatible file-backed
 `AllBuckets`, and averaging the matching sparse row probabilities. Bucket files
 are resolved from bundle-local/ancestor `buckets/` directories or a valid
@@ -137,10 +137,11 @@ incompatible action schemas are explicit errors. The narrow additive
 `AllBuckets::try_get_bucket` API provides the same canonical/combo lookup with
 errors instead of the trainer hot path's panic behavior. Card and action
 updates are transactional, and back navigation replays the semantic action
-path and retained board selection. Turn/river navigation remains explicitly
-unsupported: a flop action may reach a turn chance boundary, but dealing the
-turn is rejected without changing state. Eager MP and N-player UI remain
-deferred.
+path and retained board selection. The Universal MP lazy browser supports
+two-player turn and river navigation, including dealing and rewinding those
+streets. Exact MP solving remains limited to non-terminal two-player flop
+decisions; turn and river exact solve roots are not supported. Eager MP and
+N-player UI remain deferred.
 
 **External baseline validation:**
 - `training.baseline_validation` is an opt-in trainer diagnostic that compares learned average strategy frequencies against a pinned external preflop baseline JSON. It is separate from VR-MCCFR `use_baselines`; it does not change traversal, regrets, or strategy sums.

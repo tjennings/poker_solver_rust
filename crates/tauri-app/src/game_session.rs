@@ -483,6 +483,10 @@ pub struct GameSessionState {
     /// existing GameSession and solver tests keep their original ownership and
     /// state model.
     pub mp_session: RwLock<Option<LazyMpSession>>,
+    /// Serializes solve-input capture with session mutations. The write side
+    /// is held only while a solve request snapshots its inputs and starts a
+    /// generation; navigation uses the read side while changing state.
+    solve_request_gate: RwLock<()>,
     pub subgame_solve: Arc<SolveState>,
     pub exact_solve: Arc<SolveState>,
 }
@@ -503,6 +507,7 @@ impl Default for GameSessionState {
         Self {
             session: RwLock::new(None),
             mp_session: RwLock::new(None),
+            solve_request_gate: RwLock::new(()),
             subgame_solve: Arc::new(SolveState::default()),
             exact_solve: Arc::new(SolveState::default()),
         }
@@ -3566,6 +3571,7 @@ pub fn game_new_core(
     postflop: &crate::postflop::PostflopState,
     session_state: &GameSessionState,
 ) -> Result<(), String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
     let cbv_ctx = postflop.cbv_context.read().clone();
     if let Some(mp_data) = exploration.extract_universal_mp_data() {
         let mp_session_started = Instant::now();
@@ -3681,7 +3687,24 @@ fn resolve_solve_path_from_mp_session(
     Some(path)
 }
 
+fn reusable_mp_solve_path(
+    ss: &SolveState,
+    previous_street: MpStreet,
+    previous_board: &[RsPokerCard],
+    session: &LazyMpSession,
+) -> Option<Vec<usize>> {
+    if previous_street != session.spot.street()
+        || previous_board != session.board.as_slice()
+        || ss.solving.load(Ordering::Acquire)
+        || ss.iteration.load(Ordering::Acquire) == 0
+    {
+        return None;
+    }
+    resolve_solve_path_from_mp_session(ss, session)
+}
+
 fn apply_exact_solve_overlay(state: &mut GameState, ss: &SolveState, path: Option<Vec<usize>>) {
+    let _publish_guard = ss.publish_gate.read();
     let is_solving = ss.solving.load(Ordering::Relaxed);
     let iteration = ss.iteration.load(Ordering::Relaxed);
     if !is_solving && iteration == 0 {
@@ -3790,6 +3813,7 @@ pub fn game_get_state_core(
     session_state: &GameSessionState,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let _session_state_guard = session_state.solve_request_gate.read();
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
@@ -3868,6 +3892,7 @@ pub fn game_play_action_core(
     action_id: &str,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
@@ -4025,6 +4050,7 @@ pub fn game_deal_card_core(
     session_state: &GameSessionState,
     card: &str,
 ) -> Result<GameState, String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
@@ -4052,13 +4078,36 @@ pub fn game_back_core(
     session_state: &GameSessionState,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
+        let previous_street = session.spot.street();
+        let previous_board = session.board.clone();
         let mut state = session.back()?;
-        session_state.subgame_solve.reset();
-        session_state.exact_solve.reset();
-        state.solve = None;
+        let exact_path = reusable_mp_solve_path(
+            &session_state.exact_solve,
+            previous_street,
+            &previous_board,
+            session,
+        );
+        let subgame_path = reusable_mp_solve_path(
+            &session_state.subgame_solve,
+            previous_street,
+            &previous_board,
+            session,
+        );
+        if exact_path.is_none() {
+            session_state.exact_solve.reset();
+        }
+        if subgame_path.is_none() {
+            session_state.subgame_solve.reset();
+        }
+        if source.as_deref() == Some("exact") {
+            apply_exact_solve_overlay(&mut state, &session_state.exact_solve, exact_path);
+        } else if exact_path.is_none() {
+            state.solve = None;
+        }
         return Ok(state);
     }
     let ss = solve_state_for_source(session_state, source.as_deref());
@@ -4134,13 +4183,142 @@ pub fn game_solve_core(
 ) -> Result<(), String> {
     let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
+    let max_iters = max_iterations.unwrap_or(200);
 
-    // Guard: reject if this mode is already solving
-    if ss_ref.solving.load(Ordering::Relaxed) {
-        return Err("A solve is already in progress".to_string());
-    }
+    // Capture the solve inputs and advance the generation while navigation is
+    // excluded. Once this guard is released, any navigation either sees this
+    // request as current or invalidates its generation before the worker can
+    // publish.
+    let (inputs, boundary_cut, solve_generation) = {
+        let _solve_request_guard = session_state.solve_request_gate.write();
+        if ss_ref.solving.load(Ordering::Acquire) {
+            return Err("A solve is already in progress".to_string());
+        }
 
-    // Read session state under lock, clone what the thread needs
+        let inputs = {
+            if session_state.mp_session.read().is_some() {
+                if !is_exact {
+                    return Err(
+                        "UniversalMpLazy currently supports Exact solve for flop decisions only"
+                            .to_string(),
+                    );
+                }
+                let mut guard = session_state.mp_session.write();
+                let session = guard.as_mut().ok_or("No MP game session active")?;
+                let action_big_blind = mp_big_blind_amount(&session.config)?;
+                let snapshot = session.exact_solve_snapshot()?;
+                let oop_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.oop_seat)].clone();
+                let ip_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.ip_seat)].clone();
+                let position = if snapshot.acting_seat == snapshot.oop_seat {
+                    "BB"
+                } else {
+                    "SB"
+                };
+                let solve_anchor = SolveAnchor {
+                    node_idx: 0,
+                    board: snapshot.board.clone(),
+                    action_ids: snapshot
+                        .action_history
+                        .iter()
+                        .map(|action| action.action_id.clone())
+                        .collect(),
+                };
+                (
+                    snapshot.board,
+                    oop_w,
+                    ip_w,
+                    snapshot.pot,
+                    effective_stack_for_solve_root(&snapshot.root),
+                    snapshot.bet_sizes,
+                    None,
+                    0,
+                    position.to_string(),
+                    solve_anchor,
+                    ["BB".to_string(), "SB".to_string()],
+                    snapshot.root,
+                    Street::Flop,
+                    Some(action_big_blind),
+                )
+            } else {
+                let guard = session_state.session.read();
+                let session = guard.as_ref().ok_or("No game session active")?;
+
+                // Must be at a postflop decision node
+                if session.board.len() < 3 {
+                    return Err(
+                        "Solve requires a postflop position (deal board cards first)".to_string(),
+                    );
+                }
+                let node = &session.tree.nodes[session.node_idx as usize];
+                let player = match node {
+                    V2GameNode::Decision { player, .. } => *player,
+                    _ => return Err("Not at a decision node".to_string()),
+                };
+
+                let board = session.board.clone();
+                let oop_w = session.weights[0].clone();
+                let ip_w = session.weights[1].clone();
+                let pot = session.compute_pot();
+                let solve_root = session.solve_game_root_for_player(player)?;
+                let eff_stack = effective_stack_for_solve_root(&solve_root);
+
+                let street = session.current_street();
+                let sizes = match street {
+                    Street::Flop => &session.config.action_abstraction.flop,
+                    Street::Turn => &session.config.action_abstraction.turn,
+                    Street::River => &session.config.action_abstraction.river,
+                    Street::Preflop => return Err("Cannot solve preflop".to_string()),
+                };
+
+                let cbv_ctx = session.cbv_context.clone();
+                let position = session.position_label(player).to_string();
+                let current_node = session.node_idx;
+                let solve_anchor = SolveAnchor {
+                    node_idx: current_node,
+                    board: board.clone(),
+                    action_ids: session
+                        .action_history
+                        .iter()
+                        .map(|a| a.action_id.clone())
+                        .collect(),
+                };
+                let player_labels = [
+                    session.position_label(1 - session.tree.dealer).to_string(),
+                    session.position_label(session.tree.dealer).to_string(),
+                ];
+
+                (
+                    board,
+                    oop_w,
+                    ip_w,
+                    pot,
+                    eff_stack,
+                    sizes.clone(),
+                    cbv_ctx,
+                    current_node,
+                    position,
+                    solve_anchor,
+                    player_labels,
+                    solve_root,
+                    street,
+                    None,
+                )
+            }
+        };
+
+        let root_street = inputs.12;
+        let sbc = street_boundary_config.unwrap_or_default();
+        let boundary_cut = if is_exact {
+            None
+        } else {
+            resolve_street_boundary(&sbc, root_street)
+        };
+        validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
+        let solve_generation =
+            reset_solve_state_for_start(ss_ref, max_iters, inputs.8.clone(), inputs.9.clone());
+        (inputs, boundary_cut, solve_generation)
+    };
+
     let (
         board,
         oop_w,
@@ -4151,130 +4329,13 @@ pub fn game_solve_core(
         cbv_ctx,
         current_node_idx,
         position_label,
-        solve_anchor,
+        _solve_anchor,
         player_labels,
         solve_root,
-        root_street,
+        _root_street,
         action_big_blind,
-    ) = {
-        if session_state.mp_session.read().is_some() {
-            if !is_exact {
-                return Err(
-                    "UniversalMpLazy currently supports Exact solve for flop decisions only"
-                        .to_string(),
-                );
-            }
-            let mut guard = session_state.mp_session.write();
-            let session = guard.as_mut().ok_or("No MP game session active")?;
-            let action_big_blind = mp_big_blind_amount(&session.config)?;
-            let snapshot = session.exact_solve_snapshot()?;
-            let oop_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.oop_seat)].clone();
-            let ip_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.ip_seat)].clone();
-            let position = if snapshot.acting_seat == snapshot.oop_seat {
-                "BB"
-            } else {
-                "SB"
-            };
-            let solve_anchor = SolveAnchor {
-                node_idx: 0,
-                board: snapshot.board.clone(),
-                action_ids: snapshot
-                    .action_history
-                    .iter()
-                    .map(|action| action.action_id.clone())
-                    .collect(),
-            };
-            (
-                snapshot.board,
-                oop_w,
-                ip_w,
-                snapshot.pot,
-                effective_stack_for_solve_root(&snapshot.root),
-                snapshot.bet_sizes,
-                None,
-                0,
-                position.to_string(),
-                solve_anchor,
-                ["BB".to_string(), "SB".to_string()],
-                snapshot.root,
-                Street::Flop,
-                Some(action_big_blind),
-            )
-        } else {
-            let guard = session_state.session.read();
-            let session = guard.as_ref().ok_or("No game session active")?;
+    ) = inputs;
 
-            // Must be at a postflop decision node
-            if session.board.len() < 3 {
-                return Err(
-                    "Solve requires a postflop position (deal board cards first)".to_string(),
-                );
-            }
-            let node = &session.tree.nodes[session.node_idx as usize];
-            let player = match node {
-                V2GameNode::Decision { player, .. } => *player,
-                _ => return Err("Not at a decision node".to_string()),
-            };
-
-            let board = session.board.clone();
-            let oop_w = session.weights[0].clone();
-            let ip_w = session.weights[1].clone();
-            let pot = session.compute_pot();
-            let solve_root = session.solve_game_root_for_player(player)?;
-            let eff_stack = effective_stack_for_solve_root(&solve_root);
-
-            let street = session.current_street();
-            let sizes = match street {
-                Street::Flop => &session.config.action_abstraction.flop,
-                Street::Turn => &session.config.action_abstraction.turn,
-                Street::River => &session.config.action_abstraction.river,
-                Street::Preflop => return Err("Cannot solve preflop".to_string()),
-            };
-
-            let cbv_ctx = session.cbv_context.clone();
-            let position = session.position_label(player).to_string();
-            let current_node = session.node_idx;
-            let solve_anchor = SolveAnchor {
-                node_idx: current_node,
-                board: board.clone(),
-                action_ids: session
-                    .action_history
-                    .iter()
-                    .map(|a| a.action_id.clone())
-                    .collect(),
-            };
-            let player_labels = [
-                session.position_label(1 - session.tree.dealer).to_string(),
-                session.position_label(session.tree.dealer).to_string(),
-            ];
-
-            (
-                board,
-                oop_w,
-                ip_w,
-                pot,
-                eff_stack,
-                sizes.clone(),
-                cbv_ctx,
-                current_node,
-                position,
-                solve_anchor,
-                player_labels,
-                solve_root,
-                street,
-                None,
-            )
-        }
-    };
-
-    // Resolve StreetBoundaryConfig to (depth_limit, model_path)
-    let sbc = street_boundary_config.unwrap_or_default();
-    let boundary_cut = if is_exact {
-        None
-    } else {
-        resolve_street_boundary(&sbc, root_street)
-    };
-    validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
     eprintln!(
         "{}",
         boundary_evaluator_log_line(if is_exact { "exact" } else { "subgame" }, &boundary_cut)
@@ -4299,7 +4360,6 @@ pub fn game_solve_core(
 
     let gadget_enabled = enable_gadget.unwrap_or(false);
 
-    let max_iters = max_iterations.unwrap_or(200);
     let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
     let target_exp = target_exploitability.unwrap_or(3.0);
 
@@ -4341,10 +4401,7 @@ pub fn game_solve_core(
         }
     };
 
-    // Reset solve state for this mode before building, so progress snapshots
-    // cannot read a stale solved tree from an earlier solve.
     let ss = ss_ref;
-    let solve_generation = reset_solve_state_for_start(ss, max_iters, position_label, solve_anchor);
 
     let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
     let build_exact = is_exact || boundary_cut.is_none();
@@ -4393,12 +4450,14 @@ pub fn game_solve_core(
     let mut game = match game_result {
         Ok(game) => game,
         Err(e) => {
-            ss.solving.store(false, Ordering::Release);
+            let _ = ss.publish_if_current(solve_generation, |state| {
+                state.solving.store(false, Ordering::Release);
+            });
             return Err(e);
         }
     };
 
-    let position_label_for_guard = ss.solve_position.read().clone();
+    let position_label_for_guard = position_label.clone();
     if let Err(e) = validate_solve_root_actor_label(
         game.current_player(),
         &player_labels,
@@ -7412,9 +7471,15 @@ mod tests {
         assert_ne!(ss.generation.load(Ordering::Acquire), generation);
         assert!(!ss.publish_if_current(generation, |state| {
             state.iteration.store(99, Ordering::Relaxed);
+            state.solving.store(false, Ordering::Relaxed);
+            state
+                .solve_cache
+                .write()
+                .insert(vec![], make_cached_node("STALE", &["Check"], "BB"));
         }));
         assert_eq!(ss.iteration.load(Ordering::Relaxed), 0);
         assert!(!ss.solving.load(Ordering::Relaxed));
+        assert!(ss.solve_cache.read().is_empty());
         assert!(ss.cancel.load(Ordering::Acquire));
     }
 

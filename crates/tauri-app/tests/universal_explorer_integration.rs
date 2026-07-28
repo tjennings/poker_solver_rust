@@ -1473,6 +1473,47 @@ async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
                 "exact root should retain an aggressive action"
             );
 
+            let generation_before_rewind = sessions
+                .exact_solve
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            let cache_len_before_rewind = sessions.exact_solve.solve_cache.read().len();
+            let check = state
+                .actions
+                .iter()
+                .find(|action| action.action_type == "check")
+                .expect("exact flop root should expose a check action");
+            let same_street_child =
+                game_play_action_core(&sessions, &check.id, Some("exact".to_string()))
+                    .expect("same-street exact action should be replayable");
+            assert_eq!(same_street_child.street, "Flop");
+            assert!(same_street_child
+                .solve
+                .as_ref()
+                .is_some_and(|solve| solve.is_complete));
+
+            let same_street_back = game_back_core(&sessions, Some("exact".to_string()))
+                .expect("same-street exact back should succeed");
+            assert_eq!(same_street_back.street, "Flop");
+            assert!(same_street_back
+                .solve
+                .as_ref()
+                .is_some_and(|solve| solve.is_complete));
+            assert!(same_street_back.matrix.is_some());
+            assert_eq!(
+                sessions
+                    .exact_solve
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+                generation_before_rewind,
+                "same-street cache rewind must not invalidate the exact solve"
+            );
+            assert_eq!(
+                sessions.exact_solve.solve_cache.read().len(),
+                cache_len_before_rewind,
+                "same-street cache rewind must retain completed exact nodes"
+            );
+
             let stale_back = game_back_core(&sessions, Some("exact".to_string()))
                 .expect("back from the flop should succeed");
             assert_eq!(stale_back.street, "Preflop");
