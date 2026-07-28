@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-07-28T01:01:22Z
+updated_at: 2026-07-28T01:19:41Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -78,3 +78,14 @@ The Explorer matrix must display only root-reach-weighted action frequencies. A 
 - Reach replay follows the exact action-index history and multiplies only the player acting at each prior decision; opponent actions do not reduce that player's marginal reach.
 - Root remains unchanged, while a root-folded hand displays zero at descendant nodes. Action descriptors, missing-row errors, and session mutation behavior are covered by regression tests.
 - Postflop matrix values remain explicitly conditional until combo-level reach and blocker-aware propagation are implemented.
+
+
+## New Requirement: Root-Reach-Weighted Postflop Display
+
+The previous change weighted lazy MP preflop matrices but left postflop matrices conditional. At a flop node, BB 72o must not appear to raise if its preflop reach is zero. Extend reach weighting through postflop matrix construction, honoring board blockers and the concrete combo reach for the acting player.
+
+- [ ] Define combo-level reach semantics through preflop actions, chance cards, and postflop actions.
+- [ ] Propagate root reach into flop/turn/river matrix cells without multiplying by opponent actions.
+- [ ] Add an A-K-Q flop regression proving root-folded 72o has zero displayed action frequencies.
+- [ ] Preserve legal actions and correct combo/bucket mapping.
+- [ ] Update docs and run focused tests/review.
