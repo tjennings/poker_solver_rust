@@ -478,6 +478,7 @@ pub struct LazyMpSession {
     config: BlueprintMpConfig,
     all_buckets: Option<Arc<AllBuckets>>,
     bucket_error: Option<String>,
+    bucket_source: Option<crate::exploration::UniversalMpData>,
     board: Vec<RsPokerCard>,
     action_history: Vec<ActionRecord>,
     terminal: bool,
@@ -516,20 +517,41 @@ impl LazyMpSession {
 
         let game = LazyMpGame::new(&config.game, &config.action_abstraction);
         let spot = LazyResolvedSpot::root(&game);
-        let (all_buckets, bucket_error) = match crate::exploration::load_mp_all_buckets(&data) {
-            Ok(all_buckets) => (Some(all_buckets), None),
-            Err(error) => (None, Some(error)),
+        let bucket_source = crate::exploration::UniversalMpData {
+            bundle: Arc::clone(&data.bundle),
+            config: data.config.clone(),
+            config_dir: data.config_dir.clone(),
+            bundle_dir: data.bundle_dir.clone(),
         };
         Ok(Self {
             game,
             spot,
             bundle: data.bundle,
             config: *config,
-            all_buckets,
-            bucket_error,
+            all_buckets: None,
+            bucket_error: None,
+            bucket_source: Some(bucket_source),
             board: vec![],
             action_history: vec![],
             terminal: false,
+        })
+    }
+
+    fn ensure_all_buckets(&mut self) -> Result<&AllBuckets, String> {
+        if self.all_buckets.is_none() && self.bucket_error.is_none() {
+            let source = self.bucket_source.take().ok_or_else(|| {
+                "Universal MP flop bucket source is unavailable".to_string()
+            })?;
+            match crate::exploration::load_mp_all_buckets(&source) {
+                Ok(all_buckets) => self.all_buckets = Some(all_buckets),
+                Err(error) => self.bucket_error = Some(error),
+            }
+        }
+
+        self.all_buckets.as_deref().ok_or_else(|| {
+            self.bucket_error
+                .clone()
+                .unwrap_or_else(|| "Universal MP flop bucket source is unavailable".to_string())
         })
     }
 
@@ -739,7 +761,7 @@ impl LazyMpSession {
     /// Propagate concrete-combo reach through the public action path for a
     /// completed flop. Each action changes only the reach of its acting seat.
     fn flop_root_reaches(
-        &self,
+        &mut self,
         action_history: &[ActionRecord],
         board: &[RsPokerCard],
     ) -> Result<[Vec<f32>; 2], String> {
@@ -822,17 +844,13 @@ impl LazyMpSession {
     }
 
     fn flop_bucket(
-        &self,
+        &mut self,
         spot: LazyResolvedSpot,
         hand: &str,
         hole_cards: [RsPokerCard; 2],
         board: &[RsPokerCard],
     ) -> Result<u16, String> {
-        let all_buckets = self.all_buckets.as_ref().ok_or_else(|| {
-            self.bucket_error
-                .clone()
-                .unwrap_or_else(|| "Universal MP flop bucket source is unavailable".to_string())
-        })?;
+        let all_buckets = self.ensure_all_buckets()?;
         all_buckets
             .try_get_bucket(Street::Flop, hole_cards, board)
             .map_err(|error| {
@@ -847,7 +865,7 @@ impl LazyMpSession {
     }
 
     fn build_flop_matrix(
-        &self,
+        &mut self,
         spot: LazyResolvedSpot,
         board: &[RsPokerCard],
         mp_actions: &[MpTreeAction],
@@ -953,7 +971,7 @@ impl LazyMpSession {
 
     #[allow(clippy::cast_possible_truncation)]
     fn state_at(
-        &self,
+        &mut self,
         spot: LazyResolvedSpot,
         board: &[RsPokerCard],
         action_history: &[ActionRecord],
@@ -1094,7 +1112,7 @@ impl LazyMpSession {
         ]
     }
 
-    fn get_state(&self) -> Result<GameState, String> {
+    fn get_state(&mut self) -> Result<GameState, String> {
         self.state_at(self.spot, &self.board, &self.action_history, self.terminal)
     }
 
@@ -3302,7 +3320,9 @@ pub fn game_get_state_core(
     session_state: &GameSessionState,
     source: Option<String>,
 ) -> Result<GameState, String> {
-    if let Some(session) = session_state.mp_session.read().as_ref() {
+    if session_state.mp_session.read().is_some() {
+        let mut guard = session_state.mp_session.write();
+        let session = guard.as_mut().ok_or("No MP game session active")?;
         return session.get_state();
     }
     let guard = session_state.session.read();
