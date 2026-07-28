@@ -115,7 +115,9 @@ Continue through turn and river by entering additional cards. The suit mapping f
 The turn/river workflow above applies to HU Blueprint sessions. The supported
 two-player `universal_mp_lazy` Game session stops at the flop boundary: a flop
 action may expose a turn chance boundary, but dealing the turn is explicitly
-rejected until a later bean adds turn bucket and row support.
+rejected until a later bean adds turn bucket and row support. Exact solving is
+available for supported two-player flop decision spots; turn/river and
+multi-player exact solving remain unsupported.
 
 ### Navigation
 
