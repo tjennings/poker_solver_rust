@@ -996,9 +996,13 @@ fn load_universal_mp(
     loaded: LoadedBundle,
     bundle_path: &Path,
 ) -> Result<BundleInfo, String> {
+    let started = Instant::now();
+    let kind = loaded.kind();
     let manifest = loaded.manifest().ok_or("MP bundle missing manifest")?;
-    let info = mp_bundle_info(manifest, loaded.kind(), loaded.iterations());
+    let rows = manifest.layout.row_count;
+    let info = mp_bundle_info(manifest, kind, loaded.iterations());
     let retained_config = load_retained_mp_config(bundle_path)?;
+    let has_retained_config = retained_config.is_some();
     let config = retained_config
         .as_ref()
         .map(|retained| Box::new(retained.config.clone()));
@@ -1720,7 +1724,16 @@ pub fn get_strategy_matrix_core(
             )
         }
         StrategySource::UniversalMp { .. } => Err("MP browsing not yet supported".to_string()),
+    };
+
+    if let Some(started) = initial_matrix_started {
+        eprintln!(
+            "[explorer-load] phase=initial_matrix source={source_kind} ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
     }
+    result
 }
 
 /// Get the strategy matrix for a given position (Tauri wrapper).
