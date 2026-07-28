@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-07-28T00:07:57Z
+updated_at: 2026-07-28T00:23:55Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -60,3 +60,14 @@ The exact Tauri path resolves SB after two actions to a distinct sparse row: SB 
 ## Current Change
 
 Added deterministic sentinel-row regression coverage for the root, intermediate, and reraised SB nodes, plus Explorer documentation clarifying conditional strategy versus reach-weighted frequency.
+
+
+## New Requirement: Root-Reach-Weighted Display
+
+The Explorer matrix must display only root-reach-weighted action frequencies. A hand that folds at the root must have zero displayed frequency at every descendant node. Do not expose conditional off-path strategy as the primary matrix metric.
+
+- [ ] Define the exact reach-weighting semantics for each action-history segment.
+- [ ] Implement root reach propagation for lazy MP preflop matrices.
+- [ ] Add regression coverage proving root-folded 72o displays zero after SB r2 / BB r3.
+- [ ] Update user-facing labels/docs to identify the displayed metric.
+- [ ] Run focused tests and review the change.
