@@ -5,7 +5,7 @@ status: completed
 type: bug
 priority: critical
 created_at: 2026-07-28T13:46:24Z
-updated_at: 2026-07-28T14:10:15Z
+updated_at: 2026-07-28T15:31:27Z
 parent: poker_solver_rust-osss
 ---
 
@@ -23,3 +23,5 @@ Acceptance:
 - Run focused core/Tauri tests; leave sample_configurations/blueprint_mp_hu_500f_100t_100r.yaml untouched.
 
 \n\n## Summary of Changes\n\n- Added a private memmap2-backed UniversalMpLazy reader for fixed-width rows, actions, probabilities, and semantic payloads.\n- Preserved BundleReader for HU, eager MP, and legacy paths.\n- Kept strict header, manifest, SHA-256, CRC-64, record-length, ordering, duplicate, offset, semantic, action-kind, and normalization validation at load time.\n- Added phase timing logs for mapping, integrity, validation, reader-ready, and MP-lazy range-index construction.\n- Added an owned MP-lazy query view so little-endian probabilities are decoded safely without changing borrowed HU/eager InfosetView callers.\n- Added full action-descriptor and probability-bit-pattern equivalence assertions plus mapped checksum corruption coverage.\n- Representative large-bundle benchmark was not run in this turn; strict checksum and full structural scans remain the likely residual startup cost.\n\n## Verification\n\n- cargo check -p poker-solver-core\n- cargo check -p poker-solver-tauri\n- cargo test -p poker-solver-core --test loader_unified (28 passed)\n- cargo test -p poker-solver-core --test blueprint_universal_roundtrip (23 passed)\n- cargo test -p poker-solver-core --test mp_lazy_universal_export (12 passed)\n- targeted rustfmt --check and git diff --check passed.\n
+
+## Benchmark\n\nRepresentative bundle:\n- path: local_data/blueprints/mp_hu_500f_100t_100r_nut_high_cap_0p5_v2\n- rows: 1,898,121\n- previous Explorer load: 33,814 ms\n- current Explorer load: 3,221 ms\n- phases: loading 70 ms, integrity 3,100 ms, validation 44 ms, index 2 ms\n- end-to-end curl request: 3.23 s\n- observed improvement: approximately 10.5x\n\nThe remaining startup cost is integrity checksum/CRC scanning, not MP index construction or descriptor/probability decoding.

@@ -5,7 +5,7 @@ status: completed
 type: bug
 priority: high
 created_at: 2026-07-28T14:16:36Z
-updated_at: 2026-07-28T15:28:51Z
+updated_at: 2026-07-28T15:31:44Z
 parent: poker_solver_rust-osss
 ---
 
@@ -31,3 +31,5 @@ Review follow-up for the UniversalMpLazy mmap reader.
 - cargo test -p poker-solver-tauri --test universal_explorer_integration: 20 passed
 - Targeted rustfmt and git diff --check passed.
 - Residual limitation: raw payload bytes and one cache slot per row remain resident; decoded row probabilities are retained after first visit. This is the follow-up target for bounded memory eviction.
+
+## Benchmark\n\nThe representative 1,898,121-row bundle loaded in 3.221 seconds through the release devserver, down from 33.814 seconds. Reader phases were loading 70 ms, integrity 3,100 ms, validation 44 ms, and index 2 ms. The remaining startup bottleneck is integrity scanning.
