@@ -5,7 +5,7 @@ status: completed
 type: bug
 priority: high
 created_at: 2026-07-28T01:45:42Z
-updated_at: 2026-07-28T02:34:53Z
+updated_at: 2026-07-28T02:35:21Z
 parent: poker_solver_rust-osss
 ---
 
@@ -30,7 +30,7 @@ Acceptance:
 - [ ] Review, commit, and report results
 
 
-Scope note: this turn is limited to the MP lazy bucket initialization fix, focused regression tests, formatting, narrow verification, and a commit; timing instrumentation and docs are deferred.
+Scope note: the load timing instrumentation, lazy MP bucket initialization, focused verification, formatting, and Explorer documentation are complete.
 
 
 ## Verification
