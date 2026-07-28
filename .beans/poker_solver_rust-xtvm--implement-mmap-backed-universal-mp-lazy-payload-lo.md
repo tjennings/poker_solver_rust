@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-xtvm
 title: Implement mmap-backed universal MP lazy payload loading
-status: in-progress
+status: completed
 type: bug
 priority: critical
 created_at: 2026-07-28T13:46:24Z
-updated_at: 2026-07-28T13:46:24Z
+updated_at: 2026-07-28T14:10:15Z
 parent: poker_solver_rust-osss
 ---
 
@@ -21,3 +21,5 @@ Acceptance:
 - No on-disk format change unless required and documented; preserve arena/lazy session structure.
 - Update docs/architecture.md and docs/explorer.md for the reader mode and validation contract.
 - Run focused core/Tauri tests; leave sample_configurations/blueprint_mp_hu_500f_100t_100r.yaml untouched.
+
+\n\n## Summary of Changes\n\n- Added a private memmap2-backed UniversalMpLazy reader for fixed-width rows, actions, probabilities, and semantic payloads.\n- Preserved BundleReader for HU, eager MP, and legacy paths.\n- Kept strict header, manifest, SHA-256, CRC-64, record-length, ordering, duplicate, offset, semantic, action-kind, and normalization validation at load time.\n- Added phase timing logs for mapping, integrity, validation, reader-ready, and MP-lazy range-index construction.\n- Added an owned MP-lazy query view so little-endian probabilities are decoded safely without changing borrowed HU/eager InfosetView callers.\n- Added full action-descriptor and probability-bit-pattern equivalence assertions plus mapped checksum corruption coverage.\n- Representative large-bundle benchmark was not run in this turn; strict checksum and full structural scans remain the likely residual startup cost.\n\n## Verification\n\n- cargo check -p poker-solver-core\n- cargo check -p poker-solver-tauri\n- cargo test -p poker-solver-core --test loader_unified (28 passed)\n- cargo test -p poker-solver-core --test blueprint_universal_roundtrip (23 passed)\n- cargo test -p poker-solver-core --test mp_lazy_universal_export (12 passed)\n- targeted rustfmt --check and git diff --check passed.\n
