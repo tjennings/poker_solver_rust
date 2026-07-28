@@ -13,8 +13,8 @@
 
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
 use poker_solver_core::blueprint_universal::{
-    detect_bundle_kind, load_bundle, write_bundle, ActionKind, BundleData, BundleKind,
-    BundleReader, LoaderError, MpLazyKey,
+    ActionKind, BundleData, BundleKind, BundleReader, FormatError, LoaderError, MpLazyKey,
+    detect_bundle_kind, load_bundle, write_bundle,
 };
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
@@ -539,7 +539,7 @@ use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::*;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
-use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, Seat, MAX_PLAYERS};
+use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
 use poker_solver_core::blueprint_universal::mp_eager_export::{self, MpTrainingInfo};
 
 const MP_BUCKET_COUNTS: [u16; 4] = [10, 10, 10, 10];
@@ -748,10 +748,10 @@ fn load_mp_eager_and_query() {
 
 // ── MP lazy test ─────────────────────────────────────────────────────
 
+use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_mp::sparse_storage::{
     MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseSnapshotEntry,
 };
-use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_universal::mp_lazy_export::{
     self, LazyExportConfig, LazyTrainingInfo,
 };
@@ -907,7 +907,7 @@ fn load_mp_lazy_zero_mass_uniform() {
     assert_eq!(view.probs.len(), 2);
 
     // Should be uniform (0.5, 0.5)
-    for &p in view.probs {
+    for &p in &view.probs {
         assert!(
             (p - 0.5).abs() < 1e-6,
             "zero-mass row should be uniform, got {p}"
@@ -1041,9 +1041,36 @@ fn load_mp_lazy_duplicate_hash_and_length_returns_last_serialized_row() {
         })
         .unwrap();
     assert_eq!(view.probs, expected_probs);
+    assert_eq!(
+        view.probs
+            .iter()
+            .map(|prob| prob.to_bits())
+            .collect::<Vec<_>>(),
+        expected_probs
+            .iter()
+            .map(|prob| prob.to_bits())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(view.actions, expected_actions);
     assert_eq!(view.actions[0].kind, ActionKind::Fold);
     assert_eq!(view.actions[1].amount_chips, 40);
+}
+
+#[test]
+fn load_mp_lazy_rejects_mapped_payload_checksum_mismatch() {
+    let tmp = TempDir::new().unwrap();
+    write_mp_lazy_bundle(tmp.path());
+
+    let path = tmp.path().join("strategy.probs.f32.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[48] ^= 0x01;
+    std::fs::write(&path, bytes).unwrap();
+
+    let error = load_bundle(tmp.path()).unwrap_err();
+    assert!(matches!(
+        error,
+        LoaderError::Format(FormatError::ChecksumMismatch { .. })
+    ));
 }
 
 // ── Detection precedence regression test ────────────────────────────

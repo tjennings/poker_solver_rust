@@ -5,20 +5,23 @@
 //! existing bundle for read-only row/action/probability lookup.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufWriter, Cursor, Write};
 use std::path::Path;
+use std::time::Instant;
 
+use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
 use super::descriptors::{
-    ActionDescriptor, RowDescriptor, SemanticKeyRecord,
-    ACTION_DESCRIPTOR_SIZE, ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
+    ACTION_DESCRIPTOR_SIZE, ActionDescriptor, ActionKind, ROW_DESCRIPTOR_SIZE, RowDescriptor,
+    SEMANTIC_RECORD_SIZE, SemanticKeyRecord,
 };
 use super::error::FormatError;
 use super::export_common::{SEMANTIC_KEY_MP_HISTORY_V1, SEMANTIC_KEY_NONE};
 use super::header::{
-    BinaryHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC_ACTIONS, MAGIC_PROBS,
-    MAGIC_ROWS, MAGIC_SEMANTIC,
+    BinaryHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC_ACTIONS, MAGIC_PROBS, MAGIC_ROWS,
+    MAGIC_SEMANTIC,
 };
 use super::manifest::{FileEntry, Manifest};
 
@@ -98,13 +101,20 @@ impl BundleWriter {
         actions: &[ActionDescriptor],
         probs: &[f32],
     ) -> Result<(), FormatError> {
-        write_bundle(dir, manifest, &BundleData { rows, actions, probs })
+        write_bundle(
+            dir,
+            manifest,
+            &BundleData {
+                rows,
+                actions,
+                probs,
+            },
+        )
     }
 }
 
 /// Boxed write closure for payload serialization.
-pub(super) type PayloadWriteFn<'a> =
-    Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>;
+pub(super) type PayloadWriteFn<'a> = Box<dyn Fn(&mut Vec<u8>) -> Result<(), FormatError> + 'a>;
 
 /// Payload spec for a single binary file to write.
 pub(super) struct PayloadSpec<'a> {
@@ -152,56 +162,59 @@ pub(super) fn write_payload_file(
 
 /// Write the rows payload file.
 fn write_rows_file(dir: &Path, rows: &[RowDescriptor]) -> Result<FileEntry, FormatError> {
-    write_payload_file(dir, &PayloadSpec {
-        name: "strategy.rows.bin",
-        magic: MAGIC_ROWS,
-        record_count: rows.len(),
-        write_fn: Box::new(|w| {
-            for row in rows {
-                row.write_to(w)?;
-            }
-            Ok(())
-        }),
-    })
+    write_payload_file(
+        dir,
+        &PayloadSpec {
+            name: "strategy.rows.bin",
+            magic: MAGIC_ROWS,
+            record_count: rows.len(),
+            write_fn: Box::new(|w| {
+                for row in rows {
+                    row.write_to(w)?;
+                }
+                Ok(())
+            }),
+        },
+    )
 }
 
 /// Write the actions payload file.
-fn write_actions_file(
-    dir: &Path,
-    actions: &[ActionDescriptor],
-) -> Result<FileEntry, FormatError> {
-    write_payload_file(dir, &PayloadSpec {
-        name: "strategy.actions.bin",
-        magic: MAGIC_ACTIONS,
-        record_count: actions.len(),
-        write_fn: Box::new(|w| {
-            for action in actions {
-                action.write_to(w)?;
-            }
-            Ok(())
-        }),
-    })
+fn write_actions_file(dir: &Path, actions: &[ActionDescriptor]) -> Result<FileEntry, FormatError> {
+    write_payload_file(
+        dir,
+        &PayloadSpec {
+            name: "strategy.actions.bin",
+            magic: MAGIC_ACTIONS,
+            record_count: actions.len(),
+            write_fn: Box::new(|w| {
+                for action in actions {
+                    action.write_to(w)?;
+                }
+                Ok(())
+            }),
+        },
+    )
 }
 
 /// Write the probs payload file.
 fn write_probs_file(dir: &Path, probs: &[f32]) -> Result<FileEntry, FormatError> {
-    write_payload_file(dir, &PayloadSpec {
-        name: "strategy.probs.f32.bin",
-        magic: MAGIC_PROBS,
-        record_count: probs.len(),
-        write_fn: Box::new(|w| {
-            for &p in probs {
-                w.write_all(&p.to_le_bytes())?;
-            }
-            Ok(())
-        }),
-    })
+    write_payload_file(
+        dir,
+        &PayloadSpec {
+            name: "strategy.probs.f32.bin",
+            magic: MAGIC_PROBS,
+            record_count: probs.len(),
+            write_fn: Box::new(|w| {
+                for &p in probs {
+                    w.write_all(&p.to_le_bytes())?;
+                }
+                Ok(())
+            }),
+        },
+    )
 }
 
-fn write_checksums(
-    dir: &Path,
-    files: &BTreeMap<String, FileEntry>,
-) -> Result<(), FormatError> {
+fn write_checksums(dir: &Path, files: &BTreeMap<String, FileEntry>) -> Result<(), FormatError> {
     let checksums: BTreeMap<&str, &str> = files
         .iter()
         .map(|(k, v)| (k.as_str(), v.sha256.as_str()))
@@ -244,15 +257,11 @@ impl BundleReader {
         validate_required_features(&manifest)?;
 
         let rows_bytes = read_file_checked(dir, "strategy.rows.bin", &manifest)?;
-        let actions_bytes =
-            read_file_checked(dir, "strategy.actions.bin", &manifest)?;
-        let probs_bytes =
-            read_file_checked(dir, "strategy.probs.f32.bin", &manifest)?;
+        let actions_bytes = read_file_checked(dir, "strategy.actions.bin", &manifest)?;
+        let probs_bytes = read_file_checked(dir, "strategy.probs.f32.bin", &manifest)?;
 
         validate_binary_headers(&rows_bytes, &actions_bytes, &probs_bytes)?;
-        validate_sha_checksums(
-            &rows_bytes, &actions_bytes, &probs_bytes, &manifest,
-        )?;
+        validate_sha_checksums(&rows_bytes, &actions_bytes, &probs_bytes, &manifest)?;
 
         let has_semantic = has_semantic_feature(&manifest);
         let rows = decode_rows(&rows_bytes)?;
@@ -263,11 +272,14 @@ impl BundleReader {
         validate_row_order(&rows)?;
         validate_semantic_keys(&rows, &semantic_records, has_semantic)?;
         validate_offsets(&rows, actions.len(), probs.len())?;
-        validate_normalization(
-            &rows, &probs, manifest.strategy.normalization_tolerance,
-        )?;
+        validate_normalization(&rows, &probs, manifest.strategy.normalization_tolerance)?;
 
-        Ok(Self { rows, actions, probs, semantic_records })
+        Ok(Self {
+            rows,
+            actions,
+            probs,
+            semantic_records,
+        })
     }
 
     /// Number of strategy rows in the bundle.
@@ -311,16 +323,497 @@ impl BundleReader {
     /// Returns `None` if the row has no semantic key (kind == 0) or
     /// the row index is out of bounds.
     #[must_use]
-    pub fn semantic_record(
-        &self,
-        row_index: usize,
-    ) -> Option<&SemanticKeyRecord> {
+    pub fn semantic_record(&self, row_index: usize) -> Option<&SemanticKeyRecord> {
         let row = self.rows.get(row_index)?;
         if row.semantic_key_kind == SEMANTIC_KEY_NONE {
             return None;
         }
-        self.semantic_records
-            .get(row.semantic_key_offset as usize)
+        self.semantic_records.get(row.semantic_key_offset as usize)
+    }
+}
+
+/// A read-only fixed-width payload mapped directly from an MP-lazy bundle.
+///
+/// The file handle is retained alongside the mapping to make the immutable
+/// file lifetime explicit. The mapped bytes are only decoded through the
+/// little-endian descriptor APIs; no Rust structs are overlaid on the file.
+#[derive(Debug)]
+pub(super) struct MappedPayload {
+    _file: File,
+    mmap: Mmap,
+    header: BinaryHeader,
+}
+
+impl MappedPayload {
+    fn payload(&self) -> &[u8] {
+        &self.mmap[HEADER_SIZE..]
+    }
+
+    fn record_count(&self) -> Result<usize, FormatError> {
+        usize::try_from(self.header.record_count).map_err(|_| FormatError::Truncated {
+            file: "mapped payload".to_string(),
+            expected: usize::MAX,
+            actual: self.mmap.len(),
+        })
+    }
+}
+
+/// Private mapped reader for the `mp_semantic` universal bundle format.
+///
+/// Unlike [`BundleReader`], this reader never materializes the fixed-width
+/// rows, action descriptors, semantic records, or probabilities as complete
+/// owned arrays. It still performs all integrity and structural validation at
+/// load time. Query methods decode only the selected row's descriptors and
+/// probabilities.
+#[derive(Debug)]
+pub(super) struct MpLazyBundleReader {
+    rows: MappedPayload,
+    actions: MappedPayload,
+    probs: MappedPayload,
+    semantic: Option<MappedPayload>,
+}
+
+impl MpLazyBundleReader {
+    /// Open, map, checksum, and fully validate an MP-lazy bundle.
+    pub(super) fn open(dir: &Path, manifest: &Manifest) -> Result<Self, FormatError> {
+        let started = Instant::now();
+        validate_manifest_meta(manifest)?;
+        validate_required_features(manifest)?;
+
+        let mapping_started = Instant::now();
+        let rows = map_payload(dir, "strategy.rows.bin", manifest, MAGIC_ROWS)?;
+        let actions = map_payload(dir, "strategy.actions.bin", manifest, MAGIC_ACTIONS)?;
+        let probs = map_payload(dir, "strategy.probs.f32.bin", manifest, MAGIC_PROBS)?;
+        let semantic = if manifest.files.contains_key("strategy.semantic.bin") {
+            Some(map_payload(
+                dir,
+                "strategy.semantic.bin",
+                manifest,
+                MAGIC_SEMANTIC,
+            )?)
+        } else {
+            None
+        };
+        eprintln!(
+            "[universal-reader] phase=mapping kind=universal_mp_lazy rows={} elapsed_ms={}",
+            rows.header.record_count,
+            mapping_started.elapsed().as_millis()
+        );
+
+        let integrity_started = Instant::now();
+        validate_mapped_integrity(&rows, &actions, &probs, semantic.as_ref(), manifest)?;
+        eprintln!(
+            "[universal-reader] phase=integrity kind=universal_mp_lazy elapsed_ms={}",
+            integrity_started.elapsed().as_millis()
+        );
+
+        let validation_started = Instant::now();
+        validate_mapped_structure(
+            &rows,
+            &actions,
+            &probs,
+            semantic.as_ref(),
+            has_semantic_feature(manifest),
+            manifest.strategy.normalization_tolerance,
+        )?;
+        eprintln!(
+            "[universal-reader] phase=validation kind=universal_mp_lazy rows={} elapsed_ms={}",
+            rows.header.record_count,
+            validation_started.elapsed().as_millis()
+        );
+        eprintln!(
+            "[universal-reader] phase=reader_ready kind=universal_mp_lazy rows={} elapsed_ms={}",
+            rows.header.record_count,
+            started.elapsed().as_millis()
+        );
+
+        Ok(Self {
+            rows,
+            actions,
+            probs,
+            semantic,
+        })
+    }
+
+    pub(super) fn row_count(&self) -> usize {
+        self.rows.record_count().unwrap_or(0)
+    }
+
+    pub(super) fn row(&self, index: usize) -> Option<RowDescriptor> {
+        mapped_record::<ROW_DESCRIPTOR_SIZE, _>(&self.rows, index, RowDescriptor::from_bytes)
+    }
+
+    pub(super) fn semantic_record(&self, row_index: usize) -> Option<SemanticKeyRecord> {
+        let row = self.row(row_index)?;
+        if row.semantic_key_kind == SEMANTIC_KEY_NONE {
+            return None;
+        }
+        let semantic = self.semantic.as_ref()?;
+        mapped_record(
+            semantic,
+            usize::try_from(row.semantic_key_offset).ok()?,
+            SemanticKeyRecord::from_bytes,
+        )
+    }
+
+    pub(super) fn action(&self, index: usize) -> Option<ActionDescriptor> {
+        mapped_record_result(&self.actions, index, ActionDescriptor::from_bytes)
+            .and_then(Result::ok)
+    }
+
+    pub(super) fn prob_slice(&self, start: usize, count: usize) -> Option<Vec<f32>> {
+        let end = start.checked_add(count)?;
+        let payload = self.probs.payload();
+        let byte_start = start.checked_mul(4)?;
+        let byte_end = end.checked_mul(4)?;
+        let bytes = payload.get(byte_start..byte_end)?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect(),
+        )
+    }
+}
+
+fn map_payload(
+    dir: &Path,
+    name: &str,
+    manifest: &Manifest,
+    expected_magic: [u8; 8],
+) -> Result<MappedPayload, FormatError> {
+    let path = dir.join(name);
+    let entry = manifest
+        .files
+        .get(name)
+        .ok_or_else(|| FormatError::MissingFileEntry {
+            file: name.to_string(),
+        })?;
+    let file = File::open(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            FormatError::MissingFile {
+                file: name.to_string(),
+            }
+        } else {
+            FormatError::Io(err)
+        }
+    })?;
+    let actual_len = file.metadata()?.len();
+    if actual_len != entry.size {
+        return Err(FormatError::LengthMismatch {
+            file: name.to_string(),
+            expected: entry.size,
+            actual: actual_len,
+        });
+    }
+    let map_len = usize::try_from(actual_len).map_err(|_| FormatError::Truncated {
+        file: name.to_string(),
+        expected: usize::MAX,
+        actual: 0,
+    })?;
+    if map_len < HEADER_SIZE {
+        return Err(FormatError::Truncated {
+            file: name.to_string(),
+            expected: HEADER_SIZE,
+            actual: map_len,
+        });
+    }
+    // SAFETY: the file is opened read-only, its length is checked against the
+    // manifest before mapping, and the mapping is retained for all queries.
+    // The bundle is an immutable input while loaded, as required by mmap.
+    let mmap = unsafe { MmapOptions::new().len(map_len).map(&file)? };
+    let mut cursor = Cursor::new(&mmap[..HEADER_SIZE]);
+    let header = BinaryHeader::read_from(&mut cursor, expected_magic, name)?;
+    let payload_len = usize::try_from(header.payload_len).map_err(|_| FormatError::Truncated {
+        file: name.to_string(),
+        expected: usize::MAX,
+        actual: map_len,
+    })?;
+    let expected_file_len =
+        HEADER_SIZE
+            .checked_add(payload_len)
+            .ok_or_else(|| FormatError::Truncated {
+                file: name.to_string(),
+                expected: usize::MAX,
+                actual: map_len,
+            })?;
+    if expected_file_len > map_len {
+        return Err(FormatError::Truncated {
+            file: name.to_string(),
+            expected: expected_file_len,
+            actual: map_len,
+        });
+    }
+    if expected_file_len != map_len {
+        return Err(FormatError::LengthMismatch {
+            file: name.to_string(),
+            expected: expected_file_len as u64,
+            actual: map_len as u64,
+        });
+    }
+    Ok(MappedPayload {
+        _file: file,
+        mmap,
+        header,
+    })
+}
+
+fn mapped_record<const SIZE: usize, T>(
+    payload: &MappedPayload,
+    index: usize,
+    decode: fn(&[u8; SIZE]) -> T,
+) -> Option<T> {
+    let start = index.checked_mul(SIZE)?;
+    let bytes = payload.payload().get(start..start.checked_add(SIZE)?)?;
+    let chunk: &[u8; SIZE] = bytes.try_into().ok()?;
+    Some(decode(chunk))
+}
+
+fn mapped_record_result<const SIZE: usize, T, E>(
+    payload: &MappedPayload,
+    index: usize,
+    decode: fn(&[u8; SIZE]) -> Result<T, E>,
+) -> Option<Result<T, E>> {
+    let start = index.checked_mul(SIZE)?;
+    let bytes = payload.payload().get(start..start.checked_add(SIZE)?)?;
+    let chunk: &[u8; SIZE] = bytes.try_into().ok()?;
+    Some(decode(chunk))
+}
+
+fn validate_mapped_integrity(
+    rows: &MappedPayload,
+    actions: &MappedPayload,
+    probs: &MappedPayload,
+    semantic: Option<&MappedPayload>,
+    manifest: &Manifest,
+) -> Result<(), FormatError> {
+    check_sha256(&rows.mmap, "strategy.rows.bin", manifest)?;
+    check_sha256(&actions.mmap, "strategy.actions.bin", manifest)?;
+    check_sha256(&probs.mmap, "strategy.probs.f32.bin", manifest)?;
+    if let Some(semantic) = semantic {
+        check_sha256(&semantic.mmap, "strategy.semantic.bin", manifest)?;
+    }
+    validate_crc(&rows.header, rows.payload(), "strategy.rows.bin")?;
+    validate_crc(&actions.header, actions.payload(), "strategy.actions.bin")?;
+    validate_crc(&probs.header, probs.payload(), "strategy.probs.f32.bin")?;
+    if let Some(semantic) = semantic {
+        validate_crc(
+            &semantic.header,
+            semantic.payload(),
+            "strategy.semantic.bin",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_mapped_structure(
+    rows: &MappedPayload,
+    actions: &MappedPayload,
+    probs: &MappedPayload,
+    semantic: Option<&MappedPayload>,
+    has_semantic_feature: bool,
+    tolerance: f64,
+) -> Result<(), FormatError> {
+    check_mapped_payload_len(rows, ROW_DESCRIPTOR_SIZE, "strategy.rows.bin")?;
+    check_mapped_payload_len(actions, ACTION_DESCRIPTOR_SIZE, "strategy.actions.bin")?;
+    check_mapped_payload_len(probs, 4, "strategy.probs.f32.bin")?;
+    if let Some(semantic) = semantic {
+        check_mapped_payload_len(semantic, SEMANTIC_RECORD_SIZE, "strategy.semantic.bin")?;
+    }
+
+    let row_count = rows.record_count()?;
+    let action_count = actions.record_count()?;
+    let prob_count = probs.record_count()?;
+    let semantic_count = semantic.map(MappedPayload::record_count).transpose()?;
+
+    let mut previous: Option<(u16, u8, u8, u32, u32, u64)> = None;
+    for i in 0..row_count {
+        let row = mapped_record::<ROW_DESCRIPTOR_SIZE, _>(rows, i, RowDescriptor::from_bytes)
+            .ok_or_else(|| FormatError::Truncated {
+                file: "strategy.rows.bin".to_string(),
+                expected: HEADER_SIZE + (i + 1) * ROW_DESCRIPTOR_SIZE,
+                actual: rows.mmap.len(),
+            })?;
+        if let Some(prev) = previous {
+            match prev.cmp(&row.identity_key()) {
+                std::cmp::Ordering::Greater => {
+                    return Err(FormatError::RowsNotSorted { index: i });
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(FormatError::DuplicateRowIdentity { index: i });
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        previous = Some(row.identity_key());
+
+        let action_start =
+            usize::try_from(row.action_offset).map_err(|_| FormatError::InvalidOffset {
+                row_index: i,
+                detail: "action offset does not fit in usize".to_string(),
+            })?;
+        let prob_start =
+            usize::try_from(row.prob_offset).map_err(|_| FormatError::InvalidOffset {
+                row_index: i,
+                detail: "probability offset does not fit in usize".to_string(),
+            })?;
+        let count = usize::from(row.action_count);
+        let action_end =
+            action_start
+                .checked_add(count)
+                .ok_or_else(|| FormatError::InvalidOffset {
+                    row_index: i,
+                    detail: "action offset overflow".to_string(),
+                })?;
+        let prob_end = prob_start
+            .checked_add(count)
+            .ok_or_else(|| FormatError::InvalidOffset {
+                row_index: i,
+                detail: "probability offset overflow".to_string(),
+            })?;
+        if action_end > action_count {
+            return Err(FormatError::InvalidOffset {
+                row_index: i,
+                detail: format!(
+                    "action range {}..{} exceeds total {}",
+                    row.action_offset, action_end, action_count
+                ),
+            });
+        }
+        if prob_end > prob_count {
+            return Err(FormatError::InvalidOffset {
+                row_index: i,
+                detail: format!(
+                    "prob range {}..{} exceeds total {}",
+                    row.prob_offset, prob_end, prob_count
+                ),
+            });
+        }
+
+        if row.semantic_key_kind == SEMANTIC_KEY_NONE {
+            // No side-table record is required.
+        } else if row.semantic_key_kind == SEMANTIC_KEY_MP_HISTORY_V1 {
+            if !has_semantic_feature {
+                return Err(FormatError::InvalidManifest {
+                    detail: format!(
+                        "row {i} has semantic_key_kind {} but mp_semantic_rows_v1 feature not declared",
+                        SEMANTIC_KEY_MP_HISTORY_V1
+                    ),
+                });
+            }
+            let semantic_offset = usize::try_from(row.semantic_key_offset).map_err(|_| {
+                FormatError::InvalidOffset {
+                    row_index: i,
+                    detail: "semantic key offset does not fit in usize".to_string(),
+                }
+            })?;
+            if semantic_offset >= semantic_count.unwrap_or(0) {
+                return Err(FormatError::InvalidOffset {
+                    row_index: i,
+                    detail: format!(
+                        "semantic_key_offset {semantic_offset} out of range (table has {})",
+                        semantic_count.unwrap_or(0)
+                    ),
+                });
+            }
+        } else {
+            return Err(FormatError::InvalidManifest {
+                detail: format!(
+                    "row {i} has unknown semantic_key_kind {}",
+                    row.semantic_key_kind
+                ),
+            });
+        }
+
+        let prob_bytes = probs.payload();
+        let prob_bytes = &prob_bytes[prob_start * 4..prob_end * 4];
+        validate_mapped_row_probs(i, prob_bytes, tolerance)?;
+    }
+
+    for i in 0..action_count {
+        let bytes = mapped_record_bytes(actions, i, ACTION_DESCRIPTOR_SIZE).ok_or_else(|| {
+            FormatError::Truncated {
+                file: "strategy.actions.bin".to_string(),
+                expected: HEADER_SIZE + (i + 1) * ACTION_DESCRIPTOR_SIZE,
+                actual: actions.mmap.len(),
+            }
+        })?;
+        let kind = ActionKind::from_u8(bytes[0]).ok_or_else(|| FormatError::InvalidManifest {
+            detail: format!("unknown action kind: {}", bytes[0]),
+        })?;
+        if kind == ActionKind::Opaque && !has_semantic_feature {
+            return Err(FormatError::InvalidManifest {
+                detail: format!(
+                    "action {i} has Opaque kind but mp_semantic_rows_v1 feature not declared"
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_mapped_row_probs(
+    row_index: usize,
+    bytes: &[u8],
+    tolerance: f64,
+) -> Result<(), FormatError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let mut sum = 0.0_f64;
+    for (j, chunk) in bytes.chunks_exact(4).enumerate() {
+        let p = f32::from_le_bytes(chunk.try_into().unwrap());
+        if !p.is_finite() {
+            return Err(FormatError::NonNormalizedRow {
+                row_index,
+                detail: format!("prob[{j}] is not finite: {p}"),
+            });
+        }
+        if p < 0.0 {
+            return Err(FormatError::NonNormalizedRow {
+                row_index,
+                detail: format!("prob[{j}] is negative: {p}"),
+            });
+        }
+        sum += f64::from(p);
+    }
+    if (sum - 1.0).abs() > tolerance {
+        return Err(FormatError::NonNormalizedRow {
+            row_index,
+            detail: format!("sum = {sum}, expected 1.0 (tolerance {tolerance})"),
+        });
+    }
+    Ok(())
+}
+
+fn mapped_record_bytes(payload: &MappedPayload, index: usize, size: usize) -> Option<&[u8]> {
+    let start = index.checked_mul(size)?;
+    payload.payload().get(start..start.checked_add(size)?)
+}
+
+fn check_mapped_payload_len(
+    payload: &MappedPayload,
+    record_size: usize,
+    file_name: &str,
+) -> Result<(), FormatError> {
+    let expected = payload
+        .record_count()
+        .ok()
+        .and_then(|count| count.checked_mul(record_size));
+    match expected {
+        Some(expected) if payload.payload().len() == expected => Ok(()),
+        Some(expected) => Err(FormatError::Truncated {
+            file: file_name.to_string(),
+            expected: HEADER_SIZE + expected,
+            actual: payload.mmap.len(),
+        }),
+        None => Err(FormatError::Truncated {
+            file: file_name.to_string(),
+            expected: usize::MAX,
+            actual: payload.mmap.len(),
+        }),
     }
 }
 
@@ -364,8 +857,7 @@ fn load_semantic_table(
     if !manifest.files.contains_key("strategy.semantic.bin") {
         return Ok(Vec::new());
     }
-    let sem_bytes =
-        read_file_checked(dir, "strategy.semantic.bin", manifest)?;
+    let sem_bytes = read_file_checked(dir, "strategy.semantic.bin", manifest)?;
     check_header_only(&sem_bytes, MAGIC_SEMANTIC, "strategy.semantic.bin")?;
     check_sha256(&sem_bytes, "strategy.semantic.bin", manifest)?;
     decode_semantic(&sem_bytes)
@@ -419,11 +911,7 @@ fn validate_required_features(manifest: &Manifest) -> Result<(), FormatError> {
 ///
 /// A missing `manifest.files` entry for a required file is a hard error.
 #[allow(clippy::cast_possible_truncation)]
-fn read_file_checked(
-    dir: &Path,
-    name: &str,
-    manifest: &Manifest,
-) -> Result<Vec<u8>, FormatError> {
+fn read_file_checked(dir: &Path, name: &str, manifest: &Manifest) -> Result<Vec<u8>, FormatError> {
     let path = dir.join(name);
     if !path.exists() {
         return Err(FormatError::MissingFile {
@@ -431,11 +919,12 @@ fn read_file_checked(
         });
     }
 
-    let entry = manifest.files.get(name).ok_or_else(|| {
-        FormatError::MissingFileEntry {
+    let entry = manifest
+        .files
+        .get(name)
+        .ok_or_else(|| FormatError::MissingFileEntry {
             file: name.to_string(),
-        }
-    })?;
+        })?;
 
     let data = std::fs::read(&path)?;
     let actual_len = data.len() as u64;
@@ -472,16 +961,13 @@ fn check_header_only(
 ///
 /// The caller must have already validated that the file entry exists
 /// via `read_file_checked`, so the lookup is defensive.
-fn check_sha256(
-    data: &[u8],
-    name: &str,
-    manifest: &Manifest,
-) -> Result<(), FormatError> {
-    let entry = manifest.files.get(name).ok_or_else(|| {
-        FormatError::MissingFileEntry {
+fn check_sha256(data: &[u8], name: &str, manifest: &Manifest) -> Result<(), FormatError> {
+    let entry = manifest
+        .files
+        .get(name)
+        .ok_or_else(|| FormatError::MissingFileEntry {
             file: name.to_string(),
-        }
-    })?;
+        })?;
     let actual_sha = hex::encode(Sha256::digest(data));
     if actual_sha != entry.sha256 {
         return Err(FormatError::ChecksumMismatch {
@@ -504,8 +990,9 @@ fn decode_rows(data: &[u8]) -> Result<Vec<RowDescriptor>, FormatError> {
     let mut rows = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * ROW_DESCRIPTOR_SIZE;
-        let chunk: &[u8; ROW_DESCRIPTOR_SIZE] =
-            payload[start..start + ROW_DESCRIPTOR_SIZE].try_into().unwrap();
+        let chunk: &[u8; ROW_DESCRIPTOR_SIZE] = payload[start..start + ROW_DESCRIPTOR_SIZE]
+            .try_into()
+            .unwrap();
         rows.push(RowDescriptor::from_bytes(chunk));
     }
     Ok(rows)
@@ -520,25 +1007,17 @@ fn decode_actions_checked(
     let name = "strategy.actions.bin";
     let (header, payload) = split_header_payload(data, MAGIC_ACTIONS, name)?;
     validate_crc(&header, payload, name)?;
-    check_payload_len(
-        payload,
-        header.record_count,
-        ACTION_DESCRIPTOR_SIZE,
-        name,
-    )?;
+    check_payload_len(payload, header.record_count, ACTION_DESCRIPTOR_SIZE, name)?;
 
     let count = record_count_usize(header.record_count);
     let mut actions = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * ACTION_DESCRIPTOR_SIZE;
-        let chunk: &[u8; ACTION_DESCRIPTOR_SIZE] = payload
-            [start..start + ACTION_DESCRIPTOR_SIZE]
+        let chunk: &[u8; ACTION_DESCRIPTOR_SIZE] = payload[start..start + ACTION_DESCRIPTOR_SIZE]
             .try_into()
             .unwrap();
         let action = ActionDescriptor::from_bytes(chunk)?;
-        if action.kind == super::descriptors::ActionKind::Opaque
-            && !has_semantic
-        {
+        if action.kind == super::descriptors::ActionKind::Opaque && !has_semantic {
             return Err(FormatError::InvalidManifest {
                 detail: format!(
                     "action {i} has Opaque kind but \
@@ -581,8 +1060,7 @@ fn split_header_payload<'a>(
     }
 
     let mut cursor = Cursor::new(&data[..HEADER_SIZE]);
-    let header =
-        BinaryHeader::read_from(&mut cursor, expected_magic, file_name)?;
+    let header = BinaryHeader::read_from(&mut cursor, expected_magic, file_name)?;
 
     let payload_end = usize::try_from(header.payload_len)
         .ok()
@@ -609,11 +1087,7 @@ fn split_header_payload<'a>(
 }
 
 /// Validate the CRC-64/XZ of the payload against the header.
-fn validate_crc(
-    header: &BinaryHeader,
-    payload: &[u8],
-    file_name: &str,
-) -> Result<(), FormatError> {
+fn validate_crc(header: &BinaryHeader, payload: &[u8], file_name: &str) -> Result<(), FormatError> {
     let crc = crc::Crc::<u64>::new(&CRC_ALG);
     let actual = crc.checksum(payload);
     if actual != header.payload_crc64 {
@@ -689,18 +1163,16 @@ fn validate_offsets(
             ("action", row.action_offset, total_actions),
             ("prob", row.prob_offset, total_probs),
         ] {
-            let end = offset.checked_add(count).ok_or_else(|| {
-                FormatError::InvalidOffset {
+            let end = offset
+                .checked_add(count)
+                .ok_or_else(|| FormatError::InvalidOffset {
                     row_index: i,
                     detail: format!("{label} offset overflow"),
-                }
-            })?;
+                })?;
             if end > total as u64 {
                 return Err(FormatError::InvalidOffset {
                     row_index: i,
-                    detail: format!(
-                        "{label} range {offset}..{end} exceeds total {total}"
-                    ),
+                    detail: format!("{label} range {offset}..{end} exceeds total {total}"),
                 });
             }
         }
@@ -709,26 +1181,17 @@ fn validate_offsets(
 }
 
 /// Decode the semantic side table payload.
-fn decode_semantic(
-    data: &[u8],
-) -> Result<Vec<SemanticKeyRecord>, FormatError> {
+fn decode_semantic(data: &[u8]) -> Result<Vec<SemanticKeyRecord>, FormatError> {
     let name = "strategy.semantic.bin";
-    let (header, payload) =
-        split_header_payload(data, MAGIC_SEMANTIC, name)?;
+    let (header, payload) = split_header_payload(data, MAGIC_SEMANTIC, name)?;
     validate_crc(&header, payload, name)?;
-    check_payload_len(
-        payload,
-        header.record_count,
-        SEMANTIC_RECORD_SIZE,
-        name,
-    )?;
+    check_payload_len(payload, header.record_count, SEMANTIC_RECORD_SIZE, name)?;
 
     let count = record_count_usize(header.record_count);
     let mut records = Vec::with_capacity(count);
     for i in 0..count {
         let start = i * SEMANTIC_RECORD_SIZE;
-        let chunk: &[u8; SEMANTIC_RECORD_SIZE] = payload
-            [start..start + SEMANTIC_RECORD_SIZE]
+        let chunk: &[u8; SEMANTIC_RECORD_SIZE] = payload[start..start + SEMANTIC_RECORD_SIZE]
             .try_into()
             .unwrap();
         records.push(SemanticKeyRecord::from_bytes(chunk));
@@ -776,9 +1239,7 @@ fn validate_semantic_keys(
             }
             unknown => {
                 return Err(FormatError::InvalidManifest {
-                    detail: format!(
-                        "row {i} has unknown semantic_key_kind {unknown}"
-                    ),
+                    detail: format!("row {i} has unknown semantic_key_kind {unknown}"),
                 });
             }
         }
@@ -803,11 +1264,7 @@ fn validate_normalization(
 }
 
 /// Validate a single row's probability slice.
-fn validate_row_probs(
-    row_index: usize,
-    probs: &[f32],
-    tolerance: f64,
-) -> Result<(), FormatError> {
+fn validate_row_probs(row_index: usize, probs: &[f32], tolerance: f64) -> Result<(), FormatError> {
     if probs.is_empty() {
         return Ok(());
     }
@@ -832,9 +1289,7 @@ fn validate_row_probs(
     if (sum - 1.0).abs() > tolerance {
         return Err(FormatError::NonNormalizedRow {
             row_index,
-            detail: format!(
-                "sum = {sum}, expected 1.0 (tolerance {tolerance})"
-            ),
+            detail: format!("sum = {sum}, expected 1.0 (tolerance {tolerance})"),
         });
     }
 
@@ -843,8 +1298,8 @@ fn validate_row_probs(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::header::MAGIC_ROWS;
+    use super::*;
 
     /// Finding 1: payload_len near u64::MAX causes overflow in
     /// HEADER_SIZE + payload_len as usize, wrapping on 64-bit targets.
@@ -854,8 +1309,7 @@ mod tests {
         let header = BinaryHeader::new(MAGIC_ROWS, 0, u64::MAX - 10, 0);
         header.write_to(&mut buf.as_mut_slice()).unwrap();
 
-        let err =
-            split_header_payload(&buf, MAGIC_ROWS, "test.bin").unwrap_err();
+        let err = split_header_payload(&buf, MAGIC_ROWS, "test.bin").unwrap_err();
         assert!(
             matches!(err, FormatError::Truncated { .. }),
             "expected Truncated on overflow, got {err:?}"
@@ -867,8 +1321,7 @@ mod tests {
     #[test]
     fn check_payload_len_rejects_overflow_record_count() {
         let payload = &[0u8; 100];
-        let err =
-            check_payload_len(payload, u64::MAX, 96, "test.bin").unwrap_err();
+        let err = check_payload_len(payload, u64::MAX, 96, "test.bin").unwrap_err();
         assert!(
             matches!(err, FormatError::Truncated { .. }),
             "expected Truncated on overflow, got {err:?}"

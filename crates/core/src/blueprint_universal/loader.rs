@@ -23,12 +23,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use super::bundle::BundleReader;
+use super::bundle::{BundleReader, MpLazyBundleReader};
 use super::descriptors::ActionDescriptor;
 use super::manifest::Manifest;
 
-use crate::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use crate::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use crate::blueprint_v2::config::BlueprintV2Config;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 
@@ -117,7 +118,29 @@ pub(crate) struct LegacyHuData {
 #[derive(Debug)]
 pub(crate) struct UniversalData {
     manifest: Manifest,
-    reader: BundleReader,
+    reader: UniversalReader,
+}
+
+#[derive(Debug)]
+enum UniversalReader {
+    Eager(BundleReader),
+    MpLazy(MpLazyBundleReader),
+}
+
+impl UniversalReader {
+    fn eager(&self) -> Option<&BundleReader> {
+        match self {
+            Self::Eager(reader) => Some(reader),
+            Self::MpLazy(_) => None,
+        }
+    }
+
+    fn mp_lazy(&self) -> Option<&MpLazyBundleReader> {
+        match self {
+            Self::Eager(_) => None,
+            Self::MpLazy(reader) => Some(reader),
+        }
+    }
 }
 
 /// A loaded bundle ready for strategy queries.
@@ -175,6 +198,19 @@ pub struct MpLazyKey {
 pub struct InfosetView<'a> {
     /// The action probabilities for this infoset (one per action).
     pub probs: &'a [f32],
+    /// The action descriptors for this infoset.
+    pub actions: Vec<ActionDescriptor>,
+}
+
+/// Owned view returned by MP-lazy queries.
+///
+/// MP-lazy probabilities are decoded from little-endian mapped bytes into a
+/// small owned vector per query. Keeping this separate from [`InfosetView`]
+/// preserves the borrowed public API used by HU and eager MP callers.
+#[derive(Debug)]
+pub struct MpLazyInfosetView {
+    /// The action probabilities for this infoset (one per action).
+    pub probs: Vec<f32>,
     /// The action descriptors for this infoset.
     pub actions: Vec<ActionDescriptor>,
 }
@@ -286,7 +322,7 @@ impl LoadedBundle {
             Self::LegacyHu(d) => query_legacy_hu(d, arena_node_idx, bucket),
             Self::UniversalHu { data, index } => {
                 let row_idx = *index.get(&(arena_node_idx, u32::from(bucket)))?;
-                build_view_from_reader(&data.reader, row_idx)
+                build_view_from_reader(data.reader.eager()?, row_idx)
             }
             _ => None,
         }
@@ -306,7 +342,7 @@ impl LoadedBundle {
             Self::UniversalMpEager { data, index } => {
                 let key = (arena_node_idx, seat, u32::from(bucket));
                 let row_idx = *index.get(&key)?;
-                build_view_from_reader(&data.reader, row_idx)
+                build_view_from_reader(data.reader.eager()?, row_idx)
             }
             _ => None,
         }
@@ -316,7 +352,7 @@ impl LoadedBundle {
     ///
     /// Returns `None` if the infoset is not found.
     #[must_use]
-    pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<InfosetView<'_>> {
+    pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<MpLazyInfosetView> {
         match self {
             Self::UniversalMpLazy { data, index } => {
                 let public_key = MpLazyPublicKey {
@@ -329,7 +365,7 @@ impl LoadedBundle {
                 // builder's overwrite behavior for duplicate keys.
                 let mut row_idx = None;
                 for i in range.start..range.end {
-                    let Some(sem) = data.reader.semantic_record(i) else {
+                    let Some(sem) = data.reader.mp_lazy()?.semantic_record(i) else {
                         continue;
                     };
                     if sem.history_hash == key.history_hash && sem.history_len == key.history_len {
@@ -337,7 +373,7 @@ impl LoadedBundle {
                     }
                 }
                 let row_idx = row_idx?;
-                build_view_from_reader(&data.reader, row_idx)
+                build_view_from_mp_lazy(data.reader.mp_lazy()?, row_idx)
             }
             _ => None,
         }
@@ -362,6 +398,25 @@ fn query_legacy_hu(d: &LegacyHuData, arena_node_idx: u32, bucket: u16) -> Option
     }
     let actions = synthesize_hu_actions(&d.tree, arena_node_idx);
     Some(InfosetView { probs, actions })
+}
+
+/// Build a query view from the mapped MP-lazy reader. The small per-row
+/// allocations are deliberate: the wire format is little-endian and cannot
+/// be exposed as an aligned `&[f32]` portably without unsafe casts.
+fn build_view_from_mp_lazy(
+    reader: &MpLazyBundleReader,
+    row_idx: usize,
+) -> Option<MpLazyInfosetView> {
+    let row = reader.row(row_idx)?;
+    let count = usize::from(row.action_count);
+    let prob_start = usize::try_from(row.prob_offset).ok()?;
+    let probs = reader.prob_slice(prob_start, count)?;
+    let action_start = usize::try_from(row.action_offset).ok()?;
+    let mut actions = Vec::with_capacity(count);
+    for i in 0..count {
+        actions.push(reader.action(action_start.checked_add(i)?)?);
+    }
+    Some(MpLazyInfosetView { probs, actions })
 }
 
 /// Synthesize action descriptors from the game tree node's actions
@@ -688,19 +743,32 @@ fn load_universal(
     kind: BundleKind,
     manifest: Manifest,
 ) -> Result<LoadedBundle, LoaderError> {
-    let reader = BundleReader::open(dir)?;
-    let data = Box::new(UniversalData { manifest, reader });
     match kind {
         BundleKind::UniversalHu => {
-            let index = build_hu_index(&data.reader);
+            let reader = BundleReader::open(dir)?;
+            let index = build_hu_index(&reader);
+            let data = Box::new(UniversalData {
+                manifest,
+                reader: UniversalReader::Eager(reader),
+            });
             Ok(LoadedBundle::UniversalHu { data, index })
         }
         BundleKind::UniversalMpEager => {
-            let index = build_mp_eager_index(&data.reader);
+            let reader = BundleReader::open(dir)?;
+            let index = build_mp_eager_index(&reader);
+            let data = Box::new(UniversalData {
+                manifest,
+                reader: UniversalReader::Eager(reader),
+            });
             Ok(LoadedBundle::UniversalMpEager { data, index })
         }
         BundleKind::UniversalMpLazy => {
-            let index = build_mp_lazy_index(&data.reader);
+            let reader = MpLazyBundleReader::open(dir, &manifest)?;
+            let index = build_mp_lazy_index(&reader);
+            let data = Box::new(UniversalData {
+                manifest,
+                reader: UniversalReader::MpLazy(reader),
+            });
             Ok(LoadedBundle::UniversalMpLazy { data, index })
         }
         BundleKind::LegacyHu => unreachable!(),
@@ -732,7 +800,8 @@ fn build_mp_eager_index(reader: &BundleReader) -> HashMap<(u32, u8, u32), usize>
 }
 
 /// Build a lookup index for universal MP lazy bundles.
-fn build_mp_lazy_index(reader: &BundleReader) -> MpLazyIndex {
+fn build_mp_lazy_index(reader: &MpLazyBundleReader) -> MpLazyIndex {
+    let started = Instant::now();
     let mut ranges: Vec<MpLazyRange> = Vec::new();
     for i in 0..reader.row_count() {
         let Some(row) = reader.row(i) else {
@@ -752,5 +821,11 @@ fn build_mp_lazy_index(reader: &BundleReader) -> MpLazyIndex {
             }),
         }
     }
+    eprintln!(
+        "[universal-reader] phase=index kind=universal_mp_lazy rows={} ranges={} elapsed_ms={}",
+        reader.row_count(),
+        ranges.len(),
+        started.elapsed().as_millis()
+    );
     MpLazyIndex { ranges }
 }
