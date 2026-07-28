@@ -534,6 +534,14 @@ pub async fn load_blueprint_v2_core(
         return result;
     }
 
+    if classify_legacy_config(&dir).kind == LegacyConfigKind::Mp {
+        return Err(
+            "Legacy multiplayer config.yaml is listable but cannot be loaded through \
+             load_blueprint_v2; use a universal MP bundle"
+                .to_string(),
+        );
+    }
+
     eprintln!(
         "[explorer-load] phase=command_resolution command=load_blueprint_v2 source=legacy_hu path={} elapsed_ms={}",
         dir_path,
@@ -1480,28 +1488,36 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
         return None;
     }
 
-    let (name, stack_depth) = match v2_bundle::load_config(dir) {
-        Ok(config) => (config.game.name.clone(), config.game.stack_depth),
-        Err(e) => {
-            eprintln!("Warning: failed to parse config in {}: {e}", dir.display());
-            let fallback = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            (fallback, 0.0)
-        }
+    let metadata = classify_legacy_config(dir);
+    let fallback_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let (name, stack_depth) = match metadata.kind {
+        LegacyConfigKind::Hu => v2_bundle::load_config(dir)
+            .map(|config| (config.game.name, config.game.stack_depth))
+            .unwrap_or_else(|_| {
+                (
+                    metadata.name.unwrap_or_else(|| fallback_name.clone()),
+                    metadata.stack_depth.unwrap_or(0.0),
+                )
+            }),
+        LegacyConfigKind::Mp | LegacyConfigKind::Unknown => (
+            metadata.name.unwrap_or(fallback_name),
+            metadata.stack_depth.unwrap_or(0.0),
+        ),
     };
 
-    let has_strategy = dir.join("final/strategy.bin").exists()
-        || dir.join("strategy.bin").exists()
+    let has_strategy = dir.join("final/strategy.bin").is_file()
+        || dir.join("strategy.bin").is_file()
         || std::fs::read_dir(dir)
             .ok()
             .map(|rd| {
                 rd.filter_map(Result::ok).any(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with("snapshot_"))
+                    e.file_name().to_str().is_some_and(|n| {
+                        n.starts_with("snapshot_") && snapshot_has_strategy(&e.path())
+                    })
                 })
             })
             .unwrap_or(false);
@@ -1530,6 +1546,72 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
         has_strategy,
         latest_snapshot,
     })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LegacyConfigKind {
+    Hu,
+    Mp,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Default)]
+struct LegacyConfigMetadata {
+    kind: LegacyConfigKind,
+    name: Option<String>,
+    stack_depth: Option<f64>,
+}
+
+/// Read only the game metadata needed by the picker before attempting typed
+/// HU parsing. MP configs are intentionally classified without deserializing
+/// them as [`BlueprintV2Config`], because they have a different schema.
+fn classify_legacy_config(dir: &Path) -> LegacyConfigMetadata {
+    let Ok(text) = std::fs::read_to_string(dir.join("config.yaml")) else {
+        return LegacyConfigMetadata::default();
+    };
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return LegacyConfigMetadata::default();
+    };
+    let Some(game) = root
+        .as_mapping()
+        .and_then(|mapping| yaml_mapping_value(mapping, "game"))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return LegacyConfigMetadata::default();
+    };
+
+    let has_players = yaml_mapping_value(game, "players").is_some();
+    let has_num_players = yaml_mapping_value(game, "num_players").is_some();
+    let kind = match (has_players, has_num_players) {
+        (true, false) => LegacyConfigKind::Hu,
+        (false, true) => LegacyConfigKind::Mp,
+        _ => LegacyConfigKind::Unknown,
+    };
+
+    LegacyConfigMetadata {
+        kind,
+        name: yaml_mapping_value(game, "name")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_owned),
+        stack_depth: yaml_mapping_value(game, "stack_depth")
+            .and_then(|value| serde_yaml::from_value::<f64>(value.clone()).ok()),
+    }
+}
+
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping
+        .iter()
+        .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
+}
+
+fn snapshot_has_strategy(snapshot_dir: &Path) -> bool {
+    snapshot_dir.join("strategy.bin").is_file()
+        || snapshot_dir.join("blueprint.json").is_file()
+        || snapshot_dir.join("universal/blueprint.json").is_file()
 }
 
 /// Try to interpret `dir` as a universal bundle directory.
@@ -1602,9 +1684,7 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
                 return None;
             }
             let snap_dir = e.path();
-            let has_strategy = snap_dir.join("strategy.bin").exists()
-                || snap_dir.join("blueprint.json").exists()
-                || snap_dir.join("universal/blueprint.json").exists();
+            let has_strategy = snapshot_has_strategy(&snap_dir);
 
             // Try to read metadata.json for iteration count and elapsed time.
             let (iterations, elapsed_minutes) =
@@ -4780,6 +4860,108 @@ mod tests {
         assert!(!result[0].has_strategy);
         assert!(result[0].iterations.is_none());
         assert!(result[0].elapsed_minutes.is_none());
+    }
+
+    #[timed_test]
+    fn blueprint_listing_preserves_legacy_hu_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hu = tmp.path().join("legacy_hu");
+        v2_bundle::save_config(&hu, &build_minimal_config()).unwrap();
+
+        let entry = try_make_blueprint_entry(&hu).expect("legacy HU should be listed");
+        assert_eq!(entry.name, "test");
+        assert_eq!(entry.stack_depth, 200.0);
+        assert!(!entry.has_strategy);
+    }
+
+    #[timed_test]
+    fn blueprint_listing_classifies_legacy_mp_without_hu_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = tmp.path().join("legacy_mp");
+        std::fs::create_dir_all(mp.join("snapshot_0001")).unwrap();
+        std::fs::write(
+            mp.join("config.yaml"),
+            "game:\n  name: legacy six-max\n  num_players: 6\n  stack_depth: 150\n",
+        )
+        .unwrap();
+        std::fs::write(mp.join("snapshot_0001/strategy.bin"), b"strategy").unwrap();
+
+        let entry = try_make_blueprint_entry(&mp).expect("legacy MP should be listed");
+        assert_eq!(classify_legacy_config(&mp).kind, LegacyConfigKind::Mp);
+        assert_eq!(entry.name, "legacy six-max");
+        assert_eq!(entry.stack_depth, 150.0);
+        assert!(entry.has_strategy);
+        assert_eq!(entry.latest_snapshot.as_deref(), Some("snapshot_0001"));
+    }
+
+    #[timed_test]
+    fn blueprint_listing_handles_unknown_and_malformed_configs_quietly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unknown = tmp.path().join("unknown_config");
+        std::fs::create_dir_all(&unknown).unwrap();
+        std::fs::write(
+            unknown.join("config.yaml"),
+            "game:\n  name: unknown\n  stack_depth: 40\n",
+        )
+        .unwrap();
+
+        let malformed = tmp.path().join("malformed_config");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join("config.yaml"), "game: [").unwrap();
+
+        let unknown_entry = try_make_blueprint_entry(&unknown).expect("unknown should list");
+        assert_eq!(
+            classify_legacy_config(&unknown).kind,
+            LegacyConfigKind::Unknown
+        );
+        assert_eq!(unknown_entry.name, "unknown");
+        assert_eq!(unknown_entry.stack_depth, 40.0);
+        assert!(!unknown_entry.has_strategy);
+
+        let malformed_entry =
+            try_make_blueprint_entry(&malformed).expect("malformed config should list");
+        assert_eq!(
+            classify_legacy_config(&malformed).kind,
+            LegacyConfigKind::Unknown
+        );
+        assert_eq!(malformed_entry.name, "malformed_config");
+        assert_eq!(malformed_entry.stack_depth, 0.0);
+        assert!(!malformed_entry.has_strategy);
+    }
+
+    #[timed_test]
+    fn blueprint_listing_does_not_count_empty_snapshot_as_trained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = tmp.path().join("legacy_mp");
+        std::fs::create_dir_all(mp.join("snapshot_0001")).unwrap();
+        std::fs::write(
+            mp.join("config.yaml"),
+            "game:\n  name: legacy mp\n  num_players: 3\n  stack_depth: 80\n",
+        )
+        .unwrap();
+
+        let entry = try_make_blueprint_entry(&mp).expect("legacy MP should be listed");
+        assert!(!entry.has_strategy);
+        assert_eq!(entry.latest_snapshot.as_deref(), Some("snapshot_0001"));
+    }
+
+    #[tokio::test]
+    async fn load_blueprint_v2_rejects_legacy_mp_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "game:\n  name: legacy mp\n  num_players: 3\n  stack_depth: 80\n",
+        )
+        .unwrap();
+
+        let error = load_blueprint_v2_core(
+            &ExplorationState::default(),
+            tmp.path().to_string_lossy().to_string(),
+            None,
+        )
+        .await
+        .expect_err("legacy MP must not use the HU loader");
+        assert!(error.contains("cannot be loaded through load_blueprint_v2"));
     }
 
     #[timed_test]
