@@ -546,15 +546,19 @@ fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
 }
 
 fn write_mp_lazy_2p_bundle_with_anomaly_rows(dir: &Path) {
-    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false, false);
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false, false, 2.0);
 }
 
 fn write_mp_lazy_2p_bundle_with_flop_reach_anomaly(dir: &Path) {
-    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false, true);
+    write_mp_lazy_2p_bundle_with_flop_reach_anomaly_and_big_blind(dir, 2.0);
+}
+
+fn write_mp_lazy_2p_bundle_with_flop_reach_anomaly_and_big_blind(dir: &Path, big_blind: f64) {
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false, true, big_blind);
 }
 
 fn write_mp_lazy_2p_bundle_with_missing_preflop_row(dir: &Path) {
-    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, false, true, false);
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, false, true, false, 2.0);
 }
 
 fn write_mp_lazy_2p_bundle_with_options(
@@ -569,6 +573,7 @@ fn write_mp_lazy_2p_bundle_with_options(
         false,
         false,
         false,
+        2.0,
     );
 }
 
@@ -579,6 +584,7 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
     include_anomaly_rows: bool,
     omit_preflop_row: bool,
     zero_bb_reraise_reach: bool,
+    big_blind: f64,
 ) {
     let mut config = build_3p_config();
     config.game.name = "2p-lazy-session-test".to_string();
@@ -592,7 +598,7 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
         ForcedBet {
             seat: 1,
             kind: ForcedBetKind::BigBlind,
-            amount: 2.0,
+            amount: big_blind,
         },
     ];
     config.training.backend = MpTrainingBackend::LazySparse;
@@ -658,7 +664,7 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
         let reordered_root_actions = [
             SparseActionDescriptor {
                 kind: SparseActionKind::Lead,
-                amount_chips: 4,
+                amount_chips: (2.0 * big_blind).round() as u32,
                 source_action_index: 2,
             },
             SparseActionDescriptor {
@@ -762,7 +768,7 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
         stack_depth: config.game.stack_depth,
         bucket_counts: config.clustering.bucket_counts(),
         small_blind: 1.0,
-        big_blind: 2.0,
+        big_blind,
     };
     let training = LazyTrainingInfo {
         iterations: 100,
@@ -1336,12 +1342,10 @@ async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
         range_solver::Action::None
     );
     assert_eq!(snapshot.raw_reaches_by_seat.len(), 2);
-    assert!(
-        snapshot
-            .raw_reaches_by_seat
-            .iter()
-            .all(|reach| reach.len() == 1326)
-    );
+    assert!(snapshot
+        .raw_reaches_by_seat
+        .iter()
+        .all(|reach| reach.len() == 1326));
     assert_eq!(snapshot.action_history.len(), 3);
     assert_eq!(snapshot.action_history[0].position, "SB");
     assert_eq!(snapshot.action_history[1].position, "BB");
@@ -1369,11 +1373,136 @@ async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
                 state.matrix.is_some(),
                 "exact result should overlay the MP state"
             );
+            assert_eq!(state.position, "BB");
+            assert!(
+                !state.actions.is_empty(),
+                "exact root should expose actions"
+            );
+            assert!(
+                state
+                    .actions
+                    .iter()
+                    .any(|action| action.action_type == "bet" || action.action_type == "raise"),
+                "exact root should retain an aggressive action"
+            );
+
+            let stale_back = game_back_core(&sessions, Some("exact".to_string()))
+                .expect("back from the flop should succeed");
+            assert_eq!(stale_back.street, "Preflop");
+            assert!(
+                stale_back.solve.is_none(),
+                "stale exact status must be omitted"
+            );
+            assert!(
+                !stale_back.actions.is_empty(),
+                "live preflop actions must remain"
+            );
+
+            let stale_action = game_play_action_core(
+                &sessions,
+                &stale_back.actions[0].id,
+                Some("exact".to_string()),
+            )
+            .expect("stale exact navigation should still play a live action");
+            assert!(
+                stale_action.solve.is_none(),
+                "stale exact action must not expose the old solve"
+            );
+            let after_stale_get =
+                game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+            assert!(
+                after_stale_get.solve.is_none(),
+                "get_state must omit stale exact status"
+            );
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("Universal MP exact solve did not complete");
+}
+
+#[tokio::test]
+async fn two_player_lazy_exact_solve_uses_configured_big_blind_for_root_actions() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_flop_reach_anomaly_and_big_blind(dir.path(), 1.5);
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("nonstandard-BB MP exact fixture should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("nonstandard-BB MP exact fixture should initialize");
+
+    let root = game_get_state_core(&sessions, None).unwrap();
+    let sb_raise = root
+        .actions
+        .iter()
+        .find(|action| action.label == "2bb")
+        .expect("SB should expose the opening raise");
+    let after_sb_raise = game_play_action_core(&sessions, &sb_raise.id, None).unwrap();
+    let bb_reraise = after_sb_raise
+        .actions
+        .iter()
+        .find(|action| action.label == "3bb")
+        .expect("BB should expose the reraise");
+    let after_bb_reraise = game_play_action_core(&sessions, &bb_reraise.id, None).unwrap();
+    let sb_call = after_bb_reraise
+        .actions
+        .iter()
+        .find(|action| action.action_type == "call")
+        .expect("SB should expose the call");
+    game_play_action_core(&sessions, &sb_call.id, None).unwrap();
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let flop = game_deal_card_core(&sessions, "Qh").unwrap();
+    assert_eq!(flop.position, "BB");
+    let live_actions = flop.actions.clone();
+
+    game_solve_core(
+        &sessions,
+        Some("exact".to_string()),
+        Some(1),
+        None,
+        Some(1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(false),
+    )
+    .expect("Universal MP exact solve with a 1.5-chip BB should start");
+
+    for _ in 0..200 {
+        let solved = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+        if solved.solve.as_ref().is_some_and(|solve| solve.is_complete) {
+            assert_eq!(
+                solved
+                    .actions
+                    .iter()
+                    .map(|action| (&action.label, &action.action_type))
+                    .collect::<Vec<_>>(),
+                live_actions
+                    .iter()
+                    .map(|action| (&action.label, &action.action_type))
+                    .collect::<Vec<_>>(),
+                "exact cached root actions must use the configured BB units"
+            );
+            let aggressive = solved
+                .actions
+                .iter()
+                .find(|action| action.action_type == "bet" || action.action_type == "raise")
+                .expect("exact root should retain an aggressive action");
+            let child = game_play_action_core(&sessions, &aggressive.id, Some("exact".to_string()))
+                .expect("configured-BB exact action should match the live MP action");
+            assert_eq!(child.action_history.len(), 4);
+            assert!(child.solve.is_some());
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("Universal MP exact solve with a 1.5-chip BB did not complete");
 }
 
 #[tokio::test]

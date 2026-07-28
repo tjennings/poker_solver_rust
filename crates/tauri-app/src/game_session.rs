@@ -14,7 +14,9 @@ use serde::Serialize;
 
 use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
 use poker_solver_core::blueprint_mp::game_tree::TreeAction as MpTreeAction;
-use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyBettingSnapshot, LazyMpGame, LazyResolvedSpot};
+use poker_solver_core::blueprint_mp::lazy_mccfr::{
+    LazyBettingSnapshot, LazyMpGame, LazyResolvedSpot,
+};
 use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_universal::{
     ActionDescriptor, ActionKind, BundleKind, LoadedBundle, MpLazyKey,
@@ -2615,18 +2617,27 @@ fn semantic_action_from_tree_action(action: &TreeAction) -> SemanticAction {
     }
 }
 
-fn semantic_action_from_mp_tree_action(action: &MpTreeAction) -> SemanticAction {
+fn semantic_action_from_mp_tree_action(action: &MpTreeAction, big_blind: f64) -> SemanticAction {
     let (action_type, amount_bb) = match action {
         MpTreeAction::Fold => ("fold", None),
         MpTreeAction::Check => ("check", None),
         MpTreeAction::Call => ("call", None),
-        MpTreeAction::Lead(amount) => ("bet", Some((amount / 2.0).round() as i32)),
-        MpTreeAction::Raise(amount) => ("raise", Some((amount / 2.0).round() as i32)),
+        MpTreeAction::Lead(amount) => ("bet", Some(mp_amount_to_bb(*amount, big_blind))),
+        MpTreeAction::Raise(amount) => ("raise", Some(mp_amount_to_bb(*amount, big_blind))),
         MpTreeAction::AllIn => ("allin", None),
     };
     SemanticAction {
         action_type: action_type.to_string(),
         amount_bb,
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn mp_amount_to_bb(amount: f64, big_blind: f64) -> i32 {
+    if big_blind > 0.0 {
+        (amount / big_blind).round() as i32
+    } else {
+        amount.round() as i32
     }
 }
 
@@ -3040,20 +3051,23 @@ fn build_inner_evaluator_for_solve(
     Ok(evaluator)
 }
 
-/// Convert a range-solver `Action` to a `GameAction`.
+/// Convert a range-solver `Action` to a `GameAction` using the legacy HU units.
 fn range_solver_action_to_game_action(action: &range_solver::Action, idx: usize) -> GameAction {
+    range_solver_action_to_game_action_with_big_blind(action, idx, 2.0)
+}
+
+/// Convert a range-solver action to a game action using the configured MP chip units.
+fn range_solver_action_to_game_action_with_big_blind(
+    action: &range_solver::Action,
+    idx: usize,
+    big_blind: f64,
+) -> GameAction {
     let (label, action_type) = match action {
         range_solver::Action::Fold => ("Fold".to_string(), "fold"),
         range_solver::Action::Check => ("Check".to_string(), "check"),
         range_solver::Action::Call => ("Call".to_string(), "call"),
-        range_solver::Action::Bet(amt) => {
-            let bb = *amt as f64 / 2.0;
-            (format!("{bb:.0}bb"), "bet")
-        }
-        range_solver::Action::Raise(amt) => {
-            let bb = *amt as f64 / 2.0;
-            (format!("{bb:.0}bb"), "raise")
-        }
+        range_solver::Action::Bet(amt) => (format_mp_amount(*amt as f64, big_blind), "bet"),
+        range_solver::Action::Raise(amt) => (format_mp_amount(*amt as f64, big_blind), "raise"),
         range_solver::Action::AllIn(_) => ("All-in".to_string(), "allin"),
         _ => ("?".to_string(), "unknown"),
     };
@@ -3066,8 +3080,17 @@ fn range_solver_action_to_game_action(action: &range_solver::Action, idx: usize)
 
 /// Build a `GameMatrix` from the current `PostFlopGame` state at the root.
 fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+    build_solve_matrix_with_big_blind(game, hand_evs, None)
+}
+
+/// Build a solve matrix using the supplied chip-to-BB conversion for actions.
+fn build_solve_matrix_with_big_blind(
+    game: &mut PostFlopGame,
+    hand_evs: Option<&[f32]>,
+    big_blind: Option<f64>,
+) -> GameMatrix {
     game.back_to_root();
-    build_solve_matrix_at_current(game, hand_evs)
+    build_solve_matrix_at_current_with_big_blind(game, hand_evs, big_blind)
 }
 
 /// Build a `GameMatrix` from the current `PostFlopGame` position (without navigating to root).
@@ -3075,6 +3098,15 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
 /// Same logic as `build_solve_matrix` but does NOT call `game.back_to_root()`.
 #[allow(clippy::cast_possible_truncation)]
 fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+    build_solve_matrix_at_current_with_big_blind(game, hand_evs, None)
+}
+
+/// Build a solve matrix at the current position using the supplied action units.
+fn build_solve_matrix_at_current_with_big_blind(
+    game: &mut PostFlopGame,
+    hand_evs: Option<&[f32]>,
+    big_blind: Option<f64>,
+) -> GameMatrix {
     use crate::postflop::{card_pair_to_matrix, matrix_cell_label};
 
     let player = game.current_player();
@@ -3089,7 +3121,12 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
     let game_actions: Vec<GameAction> = available_actions
         .iter()
         .enumerate()
-        .map(|(i, a)| range_solver_action_to_game_action(a, i))
+        .map(|(i, a)| {
+            big_blind.map_or_else(
+                || range_solver_action_to_game_action(a, i),
+                |big_blind| range_solver_action_to_game_action_with_big_blind(a, i, big_blind),
+            )
+        })
         .collect();
     let num_actions = game_actions.len();
 
@@ -3195,14 +3232,23 @@ fn build_solve_cache(
     game: &mut PostFlopGame,
     player_labels: &[String; 2],
 ) -> HashMap<Vec<usize>, CachedSolveNode> {
+    build_solve_cache_with_big_blind(game, player_labels, None)
+}
+
+fn build_solve_cache_with_big_blind(
+    game: &mut PostFlopGame,
+    player_labels: &[String; 2],
+    big_blind: Option<f64>,
+) -> HashMap<Vec<usize>, CachedSolveNode> {
     let mut cache = HashMap::new();
-    build_solve_cache_recursive(game, player_labels, &mut vec![], &mut cache);
+    build_solve_cache_recursive(game, player_labels, big_blind, &mut vec![], &mut cache);
     cache
 }
 
 fn build_solve_cache_recursive(
     game: &mut PostFlopGame,
     player_labels: &[String; 2],
+    big_blind: Option<f64>,
     path: &mut Vec<usize>,
     cache: &mut HashMap<Vec<usize>, CachedSolveNode>,
 ) {
@@ -3210,12 +3256,17 @@ fn build_solve_cache_recursive(
         return;
     }
 
-    let matrix = build_solve_matrix_at_current(game, None);
+    let matrix = build_solve_matrix_at_current_with_big_blind(game, None, big_blind);
     let actions: Vec<GameAction> = game
         .available_actions()
         .iter()
         .enumerate()
-        .map(|(i, a)| range_solver_action_to_game_action(a, i))
+        .map(|(i, a)| {
+            big_blind.map_or_else(
+                || range_solver_action_to_game_action(a, i),
+                |big_blind| range_solver_action_to_game_action_with_big_blind(a, i, big_blind),
+            )
+        })
         .collect();
     let player = game.current_player();
     let position = player_labels
@@ -3236,7 +3287,7 @@ fn build_solve_cache_recursive(
     for i in 0..num_actions {
         game.play(i);
         path.push(i);
-        build_solve_cache_recursive(game, player_labels, path, cache);
+        build_solve_cache_recursive(game, player_labels, big_blind, path, cache);
         path.pop();
         // Navigate back: PostFlopGame has no undo, so replay from root.
         game.back_to_root();
@@ -3521,6 +3572,12 @@ fn apply_exact_solve_overlay(state: &mut GameState, ss: &SolveState, path: Optio
     if !is_solving && iteration == 0 {
         return;
     }
+    let Some(path) = path else {
+        // The MP session no longer matches the solve anchor. Keep the live
+        // state untouched and do not expose status from an unrelated solve.
+        state.solve = None;
+        return;
+    };
     let exp = f32::from_bits(ss.exploitability_bits.load(Ordering::Relaxed));
     let max_iters = ss.max_iterations.load(Ordering::Relaxed);
     let elapsed = ss
@@ -3537,9 +3594,6 @@ fn apply_exact_solve_overlay(state: &mut GameState, ss: &SolveState, path: Optio
         is_complete: !is_solving && iteration > 0,
     });
 
-    let Some(path) = path else {
-        return;
-    };
     set_solve_path_if_changed(ss, &path);
     if let Some(node) = cached_node_for_path(ss, &path) {
         state.matrix = Some(node.matrix);
@@ -3699,6 +3753,7 @@ pub fn game_play_action_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
+        let big_blind = mp_big_blind_amount(&session.config)?;
         let ss = solve_state_for_source(session_state, source.as_deref());
         let session_action_id = if let Some(ss) = ss.as_ref() {
             resolve_solve_path_from_mp_session(ss, session)
@@ -3715,7 +3770,7 @@ pub fn game_play_action_core(
                                 .find(|(_, current)| {
                                     semantic_actions_match(
                                         &semantic_action_from_game_action(action),
-                                        &semantic_action_from_mp_tree_action(current),
+                                        &semantic_action_from_mp_tree_action(current, big_blind),
                                     )
                                 })
                                 .map(|(index, _)| index.to_string())
@@ -3962,6 +4017,7 @@ pub fn game_solve_core(
         player_labels,
         solve_root,
         root_street,
+        action_big_blind,
     ) = {
         if session_state.mp_session.read().is_some() {
             if !is_exact {
@@ -3972,6 +4028,7 @@ pub fn game_solve_core(
             }
             let mut guard = session_state.mp_session.write();
             let session = guard.as_mut().ok_or("No MP game session active")?;
+            let action_big_blind = mp_big_blind_amount(&session.config)?;
             let snapshot = session.exact_solve_snapshot()?;
             let oop_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.oop_seat)].clone();
             let ip_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.ip_seat)].clone();
@@ -4003,6 +4060,7 @@ pub fn game_solve_core(
                 ["BB".to_string(), "SB".to_string()],
                 snapshot.root,
                 Street::Flop,
+                Some(action_big_blind),
             )
         } else {
             let guard = session_state.session.read();
@@ -4066,6 +4124,7 @@ pub fn game_solve_core(
                 player_labels,
                 solve_root,
                 street,
+                None,
             )
         }
     };
@@ -4223,7 +4282,14 @@ pub fn game_solve_core(
                 .available_actions()
                 .iter()
                 .enumerate()
-                .map(|(i, a)| range_solver_action_to_game_action(a, i))
+                .map(|(i, a)| {
+                    action_big_blind.map_or_else(
+                        || range_solver_action_to_game_action(a, i),
+                        |big_blind| {
+                            range_solver_action_to_game_action_with_big_blind(a, i, big_blind)
+                        },
+                    )
+                })
                 .collect();
             *ss_clone.solve_actions.write() = actions;
         }
@@ -4320,7 +4386,7 @@ pub fn game_solve_core(
             .map(|_| crate::boundary_trace::build_preceding_decision_map(&game));
 
         // Initial matrix snapshot
-        let matrix = build_solve_matrix(&mut game, None);
+        let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
         *ss_clone.matrix_snapshot.write() = Some(matrix);
 
         // Solve loop
@@ -4370,7 +4436,7 @@ pub fn game_solve_core(
 
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
-                let matrix = build_solve_matrix(&mut game, None);
+                let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
                 *ss_clone.matrix_snapshot.write() = Some(matrix);
 
                 if is_exact {
@@ -4417,7 +4483,8 @@ pub fn game_solve_core(
         game.cache_normalized_weights();
         let player = game.current_player();
         let evs = game.expected_values(player);
-        let final_matrix = build_solve_matrix(&mut game, Some(&evs));
+        let final_matrix =
+            build_solve_matrix_with_big_blind(&mut game, Some(&evs), action_big_blind);
         *ss_clone.matrix_snapshot.write() = Some(final_matrix);
 
         // Compute exploitability using cached boundary CFVs
@@ -4432,7 +4499,8 @@ pub fn game_solve_core(
 
         // Build solve cache for all decision nodes in the solved tree.
         game.back_to_root();
-        let solve_cache = build_solve_cache(&mut game, &player_labels);
+        let solve_cache =
+            build_solve_cache_with_big_blind(&mut game, &player_labels, action_big_blind);
         eprintln!(
             "[solve] cached {} decision nodes for subgame navigation",
             solve_cache.len()
