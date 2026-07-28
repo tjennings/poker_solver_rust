@@ -5,7 +5,7 @@ status: completed
 type: bug
 priority: high
 created_at: 2026-07-28T12:52:24Z
-updated_at: 2026-07-28T13:04:31Z
+updated_at: 2026-07-28T13:18:18Z
 parent: poker_solver_rust-osss
 ---
 
@@ -24,3 +24,15 @@ Acceptance:
 ## Summary of Changes
 
 Replaced the universal MP-lazy per-row HashMap with a compact sorted public-prefix range locator and preserved last-match duplicate semantics. Added focused loader coverage for multiple histories per prefix, missing keys, duplicate hash/length keys, and exact action/probability results.
+
+
+## Explorer listing changes
+
+Added schema-aware legacy config classification so MP `game.num_players` YAML is not parsed as HU `game.players`. Legacy MP entries are metadata-only and empty snapshots no longer count as trained strategy entries.
+
+## Verification
+
+- `cargo test -p poker-solver-core --test loader_unified`: 27 passed.
+- `cargo test -p poker-solver-tauri --test universal_explorer_integration`: 20 passed.
+- The large-bundle phase measurement came from the Tauri `[explorer-load]` timing reported by the user; no production-sized fixture was added to CI.
+- Architecture and Explorer documentation updated; the pre-existing sample configuration remains untouched.
