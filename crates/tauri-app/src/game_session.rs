@@ -542,10 +542,15 @@ impl LazyMpSession {
             let source = self.bucket_source.take().ok_or_else(|| {
                 "Universal MP flop bucket source is unavailable".to_string()
             })?;
+            let bucket_load_started = Instant::now();
             match crate::exploration::load_mp_all_buckets(&source) {
                 Ok(all_buckets) => self.all_buckets = Some(all_buckets),
                 Err(error) => self.bucket_error = Some(error),
             }
+            eprintln!(
+                "[game_new] universal MP first bucket load completed in {:.3}s",
+                bucket_load_started.elapsed().as_secs_f64()
+            );
         }
 
         self.all_buckets.as_deref().ok_or_else(|| {
@@ -3194,11 +3199,16 @@ pub fn game_new_core(
 ) -> Result<(), String> {
     let cbv_ctx = postflop.cbv_context.read().clone();
     if let Some(mp_data) = exploration.extract_universal_mp_data() {
+        let mp_session_started = Instant::now();
         let mp_session = LazyMpSession::from_exploration_data(mp_data?)?;
         *session_state.mp_session.write() = Some(mp_session);
         *session_state.session.write() = None;
         session_state.subgame_solve.reset();
         session_state.exact_solve.reset();
+        eprintln!(
+            "[game_new] universal MP LazyMpSession initialized in {:.3}s",
+            mp_session_started.elapsed().as_secs_f64()
+        );
         return Ok(());
     }
     let session = GameSession::from_exploration_state(exploration, cbv_ctx)?;
