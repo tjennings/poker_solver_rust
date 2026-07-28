@@ -29,7 +29,7 @@ use super::bundle::{BundleReader, MpLazyBundleReader};
 use super::descriptors::ActionDescriptor;
 use super::manifest::Manifest;
 
-use crate::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
+use crate::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
 use crate::blueprint_v2::config::BlueprintV2Config;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 
@@ -204,9 +204,9 @@ pub struct InfosetView<'a> {
 
 /// Owned view returned by MP-lazy queries.
 ///
-/// MP-lazy probabilities are decoded from little-endian mapped bytes into a
-/// small owned vector per query. Keeping this separate from [`InfosetView`]
-/// preserves the borrowed public API used by HU and eager MP callers.
+/// MP-lazy probabilities are decoded from little-endian bytes into a small
+/// owned vector per query. Keeping this separate from [`InfosetView`] preserves
+/// the borrowed public API used by HU and eager MP callers.
 #[derive(Debug)]
 pub struct MpLazyInfosetView {
     /// The action probabilities for this infoset (one per action).
@@ -238,7 +238,7 @@ struct MpLazyRange {
 ///
 /// This replaces the per-row hash table used by the other bundle kinds. The
 /// range vector has one entry per public prefix rather than one entry per
-/// realized history, while the row payload remains owned by `BundleReader`.
+/// realized history, while the row payload remains owned by the lazy reader.
 #[derive(Debug)]
 struct MpLazyIndex {
     ranges: Vec<MpLazyRange>,
@@ -355,6 +355,10 @@ impl LoadedBundle {
     pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<MpLazyInfosetView> {
         match self {
             Self::UniversalMpLazy { data, index } => {
+                let reader = data.reader.mp_lazy()?;
+                if !reader.is_stable() {
+                    return None;
+                }
                 let public_key = MpLazyPublicKey {
                     seat: key.seat,
                     street: key.street,
@@ -365,7 +369,7 @@ impl LoadedBundle {
                 // builder's overwrite behavior for duplicate keys.
                 let mut row_idx = None;
                 for i in range.start..range.end {
-                    let Some(sem) = data.reader.mp_lazy()?.semantic_record(i) else {
+                    let Some(sem) = reader.semantic_record(i) else {
                         continue;
                     };
                     if sem.history_hash == key.history_hash && sem.history_len == key.history_len {
@@ -373,7 +377,8 @@ impl LoadedBundle {
                     }
                 }
                 let row_idx = row_idx?;
-                build_view_from_mp_lazy(data.reader.mp_lazy()?, row_idx)
+                let view = build_view_from_mp_lazy(reader, row_idx)?;
+                reader.is_stable().then_some(view)
             }
             _ => None,
         }
@@ -400,9 +405,9 @@ fn query_legacy_hu(d: &LegacyHuData, arena_node_idx: u32, bucket: u16) -> Option
     Some(InfosetView { probs, actions })
 }
 
-/// Build a query view from the mapped MP-lazy reader. The small per-row
-/// allocations are deliberate: the wire format is little-endian and cannot
-/// be exposed as an aligned `&[f32]` portably without unsafe casts.
+/// Build a query view from the owned MP-lazy reader. The small per-row
+/// probability allocation is deliberate: the wire format is little-endian
+/// and cannot be exposed as an aligned `&[f32]` portably without unsafe casts.
 fn build_view_from_mp_lazy(
     reader: &MpLazyBundleReader,
     row_idx: usize,
@@ -765,6 +770,14 @@ fn load_universal(
         BundleKind::UniversalMpLazy => {
             let reader = MpLazyBundleReader::open(dir, &manifest)?;
             let index = build_mp_lazy_index(&reader);
+            if !reader.is_stable() {
+                return Err(LoaderError::Format(
+                    super::error::FormatError::InvalidManifest {
+                        detail: "one or more MP-lazy payload files changed while indexing"
+                            .to_string(),
+                    },
+                ));
+            }
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::MpLazy(reader),

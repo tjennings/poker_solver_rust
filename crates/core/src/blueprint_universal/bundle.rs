@@ -6,16 +6,18 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Cursor, Write};
-use std::path::Path;
-use std::time::Instant;
+use std::io::{BufWriter, Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime};
 
-use memmap2::{Mmap, MmapOptions};
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use super::descriptors::{
-    ACTION_DESCRIPTOR_SIZE, ActionDescriptor, ActionKind, ROW_DESCRIPTOR_SIZE, RowDescriptor,
-    SEMANTIC_RECORD_SIZE, SemanticKeyRecord,
+    ActionDescriptor, ActionKind, RowDescriptor, SemanticKeyRecord, ACTION_DESCRIPTOR_SIZE,
+    ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
 };
 use super::error::FormatError;
 use super::export_common::{SEMANTIC_KEY_MP_HISTORY_V1, SEMANTIC_KEY_NONE};
@@ -332,33 +334,84 @@ impl BundleReader {
     }
 }
 
-/// A read-only fixed-width payload mapped directly from an MP-lazy bundle.
+/// A validated, owned snapshot of one MP-lazy payload file.
 ///
-/// The file handle is retained alongside the mapping to make the immutable
-/// file lifetime explicit. The mapped bytes are only decoded through the
-/// little-endian descriptor APIs; no Rust structs are overlaid on the file.
+/// A read-only `mmap` is not a safety boundary: another process can truncate
+/// or rewrite the file after the mapping is created, and retaining the `File`
+/// does not prevent that. The lazy reader therefore uses an owned byte
+/// snapshot. It retains the opened file, path, and stable metadata stamp so
+/// query callers can refuse a bundle whose source file was replaced or
+/// modified after loading. The snapshot itself remains safe even if a writer
+/// ignores the guard or races it.
 #[derive(Debug)]
-pub(super) struct MappedPayload {
-    _file: File,
-    mmap: Mmap,
+pub(super) struct OwnedPayload {
+    file: File,
+    path: PathBuf,
+    bytes: Box<[u8]>,
+    stamp: FileStamp,
     header: BinaryHeader,
+    payload_len: usize,
 }
 
-impl MappedPayload {
+impl OwnedPayload {
+    fn file_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     fn payload(&self) -> &[u8] {
-        &self.mmap[HEADER_SIZE..]
+        &self.bytes[HEADER_SIZE..HEADER_SIZE + self.payload_len]
     }
 
     fn record_count(&self) -> Result<usize, FormatError> {
         usize::try_from(self.header.record_count).map_err(|_| FormatError::Truncated {
-            file: "mapped payload".to_string(),
+            file: self.path.display().to_string(),
             expected: usize::MAX,
-            actual: self.mmap.len(),
+            actual: self.bytes.len(),
         })
+    }
+
+    fn is_stable(&self) -> bool {
+        current_file_stamp(&self.file).ok() == Some(self.stamp)
+            && current_path_stamp(&self.path).ok() == Some(self.stamp)
     }
 }
 
-/// Private mapped reader for the `mp_semantic` universal bundle format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn metadata_stamp(metadata: &std::fs::Metadata) -> Result<FileStamp, FormatError> {
+    Ok(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified()?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+fn current_file_stamp(file: &File) -> Result<FileStamp, FormatError> {
+    metadata_stamp(&file.metadata()?)
+}
+
+fn current_path_stamp(path: &Path) -> Result<FileStamp, FormatError> {
+    metadata_stamp(&std::fs::metadata(path)?)
+}
+
+fn changed_while_loading(file: &str) -> FormatError {
+    FormatError::InvalidManifest {
+        detail: format!("payload {file} changed while loading"),
+    }
+}
+
+/// Private lazy reader for the `mp_semantic` universal bundle format.
 ///
 /// Unlike [`BundleReader`], this reader never materializes the fixed-width
 /// rows, action descriptors, semantic records, or probabilities as complete
@@ -367,25 +420,25 @@ impl MappedPayload {
 /// probabilities.
 #[derive(Debug)]
 pub(super) struct MpLazyBundleReader {
-    rows: MappedPayload,
-    actions: MappedPayload,
-    probs: MappedPayload,
-    semantic: Option<MappedPayload>,
+    rows: OwnedPayload,
+    actions: OwnedPayload,
+    probs: OwnedPayload,
+    semantic: Option<OwnedPayload>,
 }
 
 impl MpLazyBundleReader {
-    /// Open, map, checksum, and fully validate an MP-lazy bundle.
+    /// Open, snapshot, checksum, and fully validate an MP-lazy bundle.
     pub(super) fn open(dir: &Path, manifest: &Manifest) -> Result<Self, FormatError> {
         let started = Instant::now();
         validate_manifest_meta(manifest)?;
         validate_required_features(manifest)?;
 
-        let mapping_started = Instant::now();
-        let rows = map_payload(dir, "strategy.rows.bin", manifest, MAGIC_ROWS)?;
-        let actions = map_payload(dir, "strategy.actions.bin", manifest, MAGIC_ACTIONS)?;
-        let probs = map_payload(dir, "strategy.probs.f32.bin", manifest, MAGIC_PROBS)?;
+        let loading_started = Instant::now();
+        let rows = read_payload(dir, "strategy.rows.bin", manifest, MAGIC_ROWS)?;
+        let actions = read_payload(dir, "strategy.actions.bin", manifest, MAGIC_ACTIONS)?;
+        let probs = read_payload(dir, "strategy.probs.f32.bin", manifest, MAGIC_PROBS)?;
         let semantic = if manifest.files.contains_key("strategy.semantic.bin") {
-            Some(map_payload(
+            Some(read_payload(
                 dir,
                 "strategy.semantic.bin",
                 manifest,
@@ -395,13 +448,20 @@ impl MpLazyBundleReader {
             None
         };
         eprintln!(
-            "[universal-reader] phase=mapping kind=universal_mp_lazy rows={} elapsed_ms={}",
+            "[universal-reader] phase=loading kind=universal_mp_lazy rows={} elapsed_ms={}",
             rows.header.record_count,
-            mapping_started.elapsed().as_millis()
+            loading_started.elapsed().as_millis()
         );
+
+        if !payloads_are_stable(&rows, &actions, &probs, semantic.as_ref()) {
+            return Err(changed_while_loading("one or more payload files"));
+        }
 
         let integrity_started = Instant::now();
         validate_mapped_integrity(&rows, &actions, &probs, semantic.as_ref(), manifest)?;
+        if !payloads_are_stable(&rows, &actions, &probs, semantic.as_ref()) {
+            return Err(changed_while_loading("one or more payload files"));
+        }
         eprintln!(
             "[universal-reader] phase=integrity kind=universal_mp_lazy elapsed_ms={}",
             integrity_started.elapsed().as_millis()
@@ -416,6 +476,9 @@ impl MpLazyBundleReader {
             has_semantic_feature(manifest),
             manifest.strategy.normalization_tolerance,
         )?;
+        if !payloads_are_stable(&rows, &actions, &probs, semantic.as_ref()) {
+            return Err(changed_while_loading("one or more payload files"));
+        }
         eprintln!(
             "[universal-reader] phase=validation kind=universal_mp_lazy rows={} elapsed_ms={}",
             rows.header.record_count,
@@ -433,6 +496,15 @@ impl MpLazyBundleReader {
             probs,
             semantic,
         })
+    }
+
+    pub(super) fn is_stable(&self) -> bool {
+        payloads_are_stable(
+            &self.rows,
+            &self.actions,
+            &self.probs,
+            self.semantic.as_ref(),
+        )
     }
 
     pub(super) fn row_count(&self) -> usize {
@@ -476,12 +548,12 @@ impl MpLazyBundleReader {
     }
 }
 
-fn map_payload(
+fn read_payload(
     dir: &Path,
     name: &str,
     manifest: &Manifest,
     expected_magic: [u8; 8],
-) -> Result<MappedPayload, FormatError> {
+) -> Result<OwnedPayload, FormatError> {
     let path = dir.join(name);
     let entry = manifest
         .files
@@ -498,36 +570,40 @@ fn map_payload(
             FormatError::Io(err)
         }
     })?;
-    let actual_len = file.metadata()?.len();
-    if actual_len != entry.size {
+    let stamp = current_file_stamp(&file)?;
+    if stamp.len != entry.size {
         return Err(FormatError::LengthMismatch {
             file: name.to_string(),
             expected: entry.size,
-            actual: actual_len,
+            actual: stamp.len,
         });
     }
-    let map_len = usize::try_from(actual_len).map_err(|_| FormatError::Truncated {
+    let file_len = usize::try_from(stamp.len).map_err(|_| FormatError::Truncated {
         file: name.to_string(),
         expected: usize::MAX,
         actual: 0,
     })?;
-    if map_len < HEADER_SIZE {
+    if file_len < HEADER_SIZE {
         return Err(FormatError::Truncated {
             file: name.to_string(),
             expected: HEADER_SIZE,
-            actual: map_len,
+            actual: file_len,
         });
     }
-    // SAFETY: the file is opened read-only, its length is checked against the
-    // manifest before mapping, and the mapping is retained for all queries.
-    // The bundle is an immutable input while loaded, as required by mmap.
-    let mmap = unsafe { MmapOptions::new().len(map_len).map(&file)? };
-    let mut cursor = Cursor::new(&mmap[..HEADER_SIZE]);
+
+    let mut bytes = Vec::with_capacity(file_len);
+    (&file).take(stamp.len).read_to_end(&mut bytes)?;
+    let after_read = current_file_stamp(&file)?;
+    if stamp != after_read || bytes.len() != file_len {
+        return Err(changed_while_loading(name));
+    }
+
+    let mut cursor = Cursor::new(&bytes[..HEADER_SIZE]);
     let header = BinaryHeader::read_from(&mut cursor, expected_magic, name)?;
     let payload_len = usize::try_from(header.payload_len).map_err(|_| FormatError::Truncated {
         file: name.to_string(),
         expected: usize::MAX,
-        actual: map_len,
+        actual: file_len,
     })?;
     let expected_file_len =
         HEADER_SIZE
@@ -535,31 +611,39 @@ fn map_payload(
             .ok_or_else(|| FormatError::Truncated {
                 file: name.to_string(),
                 expected: usize::MAX,
-                actual: map_len,
+                actual: file_len,
             })?;
-    if expected_file_len > map_len {
+    if expected_file_len > file_len {
         return Err(FormatError::Truncated {
             file: name.to_string(),
             expected: expected_file_len,
-            actual: map_len,
+            actual: file_len,
         });
     }
-    if expected_file_len != map_len {
-        return Err(FormatError::LengthMismatch {
-            file: name.to_string(),
-            expected: expected_file_len as u64,
-            actual: map_len as u64,
-        });
-    }
-    Ok(MappedPayload {
-        _file: file,
-        mmap,
+    Ok(OwnedPayload {
+        file,
+        path,
+        bytes: bytes.into_boxed_slice(),
+        stamp,
         header,
+        payload_len,
     })
 }
 
+fn payloads_are_stable(
+    rows: &OwnedPayload,
+    actions: &OwnedPayload,
+    probs: &OwnedPayload,
+    semantic: Option<&OwnedPayload>,
+) -> bool {
+    rows.is_stable()
+        && actions.is_stable()
+        && probs.is_stable()
+        && semantic.is_none_or(OwnedPayload::is_stable)
+}
+
 fn mapped_record<const SIZE: usize, T>(
-    payload: &MappedPayload,
+    payload: &OwnedPayload,
     index: usize,
     decode: fn(&[u8; SIZE]) -> T,
 ) -> Option<T> {
@@ -570,7 +654,7 @@ fn mapped_record<const SIZE: usize, T>(
 }
 
 fn mapped_record_result<const SIZE: usize, T, E>(
-    payload: &MappedPayload,
+    payload: &OwnedPayload,
     index: usize,
     decode: fn(&[u8; SIZE]) -> Result<T, E>,
 ) -> Option<Result<T, E>> {
@@ -581,17 +665,17 @@ fn mapped_record_result<const SIZE: usize, T, E>(
 }
 
 fn validate_mapped_integrity(
-    rows: &MappedPayload,
-    actions: &MappedPayload,
-    probs: &MappedPayload,
-    semantic: Option<&MappedPayload>,
+    rows: &OwnedPayload,
+    actions: &OwnedPayload,
+    probs: &OwnedPayload,
+    semantic: Option<&OwnedPayload>,
     manifest: &Manifest,
 ) -> Result<(), FormatError> {
-    check_sha256(&rows.mmap, "strategy.rows.bin", manifest)?;
-    check_sha256(&actions.mmap, "strategy.actions.bin", manifest)?;
-    check_sha256(&probs.mmap, "strategy.probs.f32.bin", manifest)?;
+    check_sha256(rows.file_bytes(), "strategy.rows.bin", manifest)?;
+    check_sha256(actions.file_bytes(), "strategy.actions.bin", manifest)?;
+    check_sha256(probs.file_bytes(), "strategy.probs.f32.bin", manifest)?;
     if let Some(semantic) = semantic {
-        check_sha256(&semantic.mmap, "strategy.semantic.bin", manifest)?;
+        check_sha256(semantic.file_bytes(), "strategy.semantic.bin", manifest)?;
     }
     validate_crc(&rows.header, rows.payload(), "strategy.rows.bin")?;
     validate_crc(&actions.header, actions.payload(), "strategy.actions.bin")?;
@@ -607,10 +691,10 @@ fn validate_mapped_integrity(
 }
 
 fn validate_mapped_structure(
-    rows: &MappedPayload,
-    actions: &MappedPayload,
-    probs: &MappedPayload,
-    semantic: Option<&MappedPayload>,
+    rows: &OwnedPayload,
+    actions: &OwnedPayload,
+    probs: &OwnedPayload,
+    semantic: Option<&OwnedPayload>,
     has_semantic_feature: bool,
     tolerance: f64,
 ) -> Result<(), FormatError> {
@@ -624,7 +708,7 @@ fn validate_mapped_structure(
     let row_count = rows.record_count()?;
     let action_count = actions.record_count()?;
     let prob_count = probs.record_count()?;
-    let semantic_count = semantic.map(MappedPayload::record_count).transpose()?;
+    let semantic_count = semantic.map(OwnedPayload::record_count).transpose()?;
 
     let mut previous: Option<(u16, u8, u8, u32, u32, u64)> = None;
     for i in 0..row_count {
@@ -632,7 +716,7 @@ fn validate_mapped_structure(
             .ok_or_else(|| FormatError::Truncated {
                 file: "strategy.rows.bin".to_string(),
                 expected: HEADER_SIZE + (i + 1) * ROW_DESCRIPTOR_SIZE,
-                actual: rows.mmap.len(),
+                actual: rows.file_bytes().len(),
             })?;
         if let Some(prev) = previous {
             match prev.cmp(&row.identity_key()) {
@@ -735,7 +819,7 @@ fn validate_mapped_structure(
             FormatError::Truncated {
                 file: "strategy.actions.bin".to_string(),
                 expected: HEADER_SIZE + (i + 1) * ACTION_DESCRIPTOR_SIZE,
-                actual: actions.mmap.len(),
+                actual: actions.file_bytes().len(),
             }
         })?;
         let kind = ActionKind::from_u8(bytes[0]).ok_or_else(|| FormatError::InvalidManifest {
@@ -788,13 +872,13 @@ fn validate_mapped_row_probs(
     Ok(())
 }
 
-fn mapped_record_bytes(payload: &MappedPayload, index: usize, size: usize) -> Option<&[u8]> {
+fn mapped_record_bytes(payload: &OwnedPayload, index: usize, size: usize) -> Option<&[u8]> {
     let start = index.checked_mul(size)?;
     payload.payload().get(start..start.checked_add(size)?)
 }
 
 fn check_mapped_payload_len(
-    payload: &MappedPayload,
+    payload: &OwnedPayload,
     record_size: usize,
     file_name: &str,
 ) -> Result<(), FormatError> {
@@ -803,16 +887,16 @@ fn check_mapped_payload_len(
         .ok()
         .and_then(|count| count.checked_mul(record_size));
     match expected {
-        Some(expected) if payload.payload().len() == expected => Ok(()),
+        Some(expected) if payload.payload().len() >= expected => Ok(()),
         Some(expected) => Err(FormatError::Truncated {
             file: file_name.to_string(),
             expected: HEADER_SIZE + expected,
-            actual: payload.mmap.len(),
+            actual: payload.file_bytes().len(),
         }),
         None => Err(FormatError::Truncated {
             file: file_name.to_string(),
             expected: usize::MAX,
-            actual: payload.mmap.len(),
+            actual: payload.file_bytes().len(),
         }),
     }
 }

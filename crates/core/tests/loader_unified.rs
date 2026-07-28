@@ -13,8 +13,8 @@
 
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
 use poker_solver_core::blueprint_universal::{
-    ActionKind, BundleData, BundleKind, BundleReader, FormatError, LoaderError, MpLazyKey,
-    detect_bundle_kind, load_bundle, write_bundle,
+    detect_bundle_kind, load_bundle, write_bundle, ActionKind, BundleData, BundleKind,
+    BundleReader, FormatError, LoaderError, MpLazyKey,
 };
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
@@ -22,6 +22,7 @@ use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 
 use rand::SeedableRng;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -539,7 +540,7 @@ use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::*;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
-use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
+use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, Seat, MAX_PLAYERS};
 use poker_solver_core::blueprint_universal::mp_eager_export::{self, MpTrainingInfo};
 
 const MP_BUCKET_COUNTS: [u16; 4] = [10, 10, 10, 10];
@@ -748,10 +749,10 @@ fn load_mp_eager_and_query() {
 
 // ── MP lazy test ─────────────────────────────────────────────────────
 
-use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_mp::sparse_storage::{
     MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseSnapshotEntry,
 };
+use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_universal::mp_lazy_export::{
     self, LazyExportConfig, LazyTrainingInfo,
 };
@@ -847,6 +848,28 @@ fn write_mp_lazy_bundle_with_entries(dir: &Path, entries: &[SparseSnapshotEntry]
     mp_lazy_export::write_lazy_bundle(dir, &output).unwrap();
 }
 
+fn append_trailing_payload_byte(dir: &Path, name: &str) {
+    let path = dir.join(name);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(0xA5);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let manifest_path = dir.join("blueprint.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let entry = manifest
+        .get_mut("files")
+        .and_then(|files| files.get_mut(name))
+        .unwrap();
+    entry["size"] = serde_json::json!(bytes.len());
+    entry["sha256"] = serde_json::json!(hex::encode(Sha256::digest(&bytes)));
+    std::fs::write(
+        manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn load_mp_lazy_and_query() {
     let tmp = TempDir::new().unwrap();
@@ -885,6 +908,28 @@ fn load_mp_lazy_and_query() {
     assert_eq!(view.actions[2].kind, ActionKind::Raise);
     assert_eq!(view.actions[2].amount_chips, 6);
     assert!(view.actions[2].is_aggressive);
+}
+
+#[test]
+fn load_mp_lazy_accepts_trailing_payload_bytes() {
+    let tmp = TempDir::new().unwrap();
+    write_mp_lazy_bundle(tmp.path());
+    append_trailing_payload_byte(tmp.path(), "strategy.probs.f32.bin");
+
+    // BundleReader has always treated bytes after header.payload_len as
+    // compatible trailing data; the lazy reader must preserve that contract.
+    BundleReader::open(tmp.path()).expect("eager reader accepts trailing bytes");
+    let bundle = load_bundle(tmp.path()).expect("lazy reader accepts trailing bytes");
+    let view = bundle
+        .query_mp_lazy(&MpLazyKey {
+            seat: 0,
+            street: 0,
+            local_bucket: 5,
+            history_hash: 0xAAAA,
+            history_len: 4,
+        })
+        .expect("row remains queryable");
+    assert_eq!(view.probs.len(), 3);
 }
 
 #[test]
@@ -1057,7 +1102,7 @@ fn load_mp_lazy_duplicate_hash_and_length_returns_last_serialized_row() {
 }
 
 #[test]
-fn load_mp_lazy_rejects_mapped_payload_checksum_mismatch() {
+fn load_mp_lazy_rejects_payload_checksum_mismatch() {
     let tmp = TempDir::new().unwrap();
     write_mp_lazy_bundle(tmp.path());
 
@@ -1071,6 +1116,31 @@ fn load_mp_lazy_rejects_mapped_payload_checksum_mismatch() {
         error,
         LoaderError::Format(FormatError::ChecksumMismatch { .. })
     ));
+}
+
+#[test]
+fn load_mp_lazy_query_returns_none_after_payload_truncation() {
+    let tmp = TempDir::new().unwrap();
+    write_mp_lazy_bundle(tmp.path());
+    let bundle = load_bundle(tmp.path()).unwrap();
+    let path = tmp.path().join("strategy.probs.f32.bin");
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    assert!(bundle
+        .query_mp_lazy(&MpLazyKey {
+            seat: 0,
+            street: 0,
+            local_bucket: 5,
+            history_hash: 0xAAAA,
+            history_len: 4,
+        })
+        .is_none());
 }
 
 // ── Detection precedence regression test ────────────────────────────
