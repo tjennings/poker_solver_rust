@@ -561,6 +561,19 @@ fn write_mp_lazy_2p_bundle_with_missing_preflop_row(dir: &Path) {
     write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, false, true, false, 2.0);
 }
 
+fn write_mp_lazy_2p_bundle_with_missing_postflop_row(dir: &Path, street: MpStreet) {
+    write_mp_lazy_2p_bundle_with_options_and_missing_postflop_row(
+        dir,
+        true,
+        true,
+        false,
+        false,
+        false,
+        2.0,
+        Some(street),
+    );
+}
+
 fn write_mp_lazy_2p_bundle_with_options(
     dir: &Path,
     include_flop_buckets: bool,
@@ -585,6 +598,28 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
     omit_preflop_row: bool,
     zero_bb_reraise_reach: bool,
     big_blind: f64,
+) {
+    write_mp_lazy_2p_bundle_with_options_and_missing_postflop_row(
+        dir,
+        include_flop_buckets,
+        include_flop_rows,
+        include_anomaly_rows,
+        omit_preflop_row,
+        zero_bb_reraise_reach,
+        big_blind,
+        None,
+    );
+}
+
+fn write_mp_lazy_2p_bundle_with_options_and_missing_postflop_row(
+    dir: &Path,
+    include_flop_buckets: bool,
+    include_flop_rows: bool,
+    include_anomaly_rows: bool,
+    omit_preflop_row: bool,
+    zero_bb_reraise_reach: bool,
+    big_blind: f64,
+    missing_postflop_row: Option<MpStreet>,
 ) {
     let mut config = build_3p_config();
     config.game.name = "2p-lazy-session-test".to_string();
@@ -728,7 +763,7 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
         }
     }
     if include_flop_rows {
-        let mut flop_spot = if zero_bb_reraise_reach {
+        let mut postflop_spot = if zero_bb_reraise_reach {
             root.advance(&game, 2)
                 .and_then(|spot| spot.advance(&game, 2))
                 .and_then(|spot| spot.advance(&game, 1))
@@ -738,29 +773,35 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
                 .and_then(|spot| spot.advance(&game, 0))
                 .expect("preflop call should reach the flop boundary")
         };
-        for _ in 0..if zero_bb_reraise_reach { 1 } else { 3 } {
-            let flop_actions = flop_spot.actions(&game);
-            for bucket in 0..=1 {
-                entries.push(SparseSnapshotEntry {
-                    key: flop_spot.key_for_bucket(bucket),
-                    num_actions: flop_actions.len() as u8,
-                    action_identity: None,
-                    regrets: vec![0; flop_actions.len()],
-                    strategy_sums: (0..flop_actions.len())
-                        .map(|index| {
-                            if bucket == 0 {
-                                100 + index as u64 * 100
-                            } else {
-                                300 - index as u64 * 100
-                            }
-                        })
-                        .collect(),
-                });
+        for _ in 0..8 {
+            let street = postflop_spot.street();
+            if !matches!(street, MpStreet::Flop | MpStreet::Turn | MpStreet::River) {
+                break;
             }
-            let Some(next) = flop_spot.advance(&game, 0) else {
+            if missing_postflop_row != Some(street) {
+                let postflop_actions = postflop_spot.actions(&game);
+                for bucket in 0..=1 {
+                    entries.push(SparseSnapshotEntry {
+                        key: postflop_spot.key_for_bucket(bucket),
+                        num_actions: postflop_actions.len() as u8,
+                        action_identity: None,
+                        regrets: vec![0; postflop_actions.len()],
+                        strategy_sums: (0..postflop_actions.len())
+                            .map(|index| {
+                                if bucket == 0 {
+                                    100 + index as u64 * 100
+                                } else {
+                                    300 - index as u64 * 100
+                                }
+                            })
+                            .collect(),
+                    });
+                }
+            }
+            let Some(next) = postflop_spot.advance(&game, 0) else {
                 break;
             };
-            flop_spot = next;
+            postflop_spot = next;
         }
     }
     let export_config = LazyExportConfig {
@@ -779,7 +820,35 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
     mp_lazy_export::write_lazy_bundle(dir, &output).expect("write 2p lazy bundle");
 
     if include_flop_buckets {
-        write_test_flop_bucket(&dir.join("buckets"), config.clustering.flop.buckets);
+        let buckets_dir = dir.join("buckets");
+        write_test_flop_bucket(&buckets_dir, config.clustering.flop.buckets);
+        write_test_postflop_bucket(
+            &buckets_dir,
+            poker_solver_core::blueprint_v2::Street::Turn,
+            [
+                Card::new(Value::Ace, Suit::Spade),
+                Card::new(Value::King, Suit::Diamond),
+                Card::new(Value::Queen, Suit::Heart),
+                Card::new(Value::Jack, Suit::Club),
+            ],
+            config.clustering.turn.buckets,
+            0,
+            "turn.buckets",
+        );
+        write_test_postflop_bucket(
+            &buckets_dir,
+            poker_solver_core::blueprint_v2::Street::River,
+            [
+                Card::new(Value::Ace, Suit::Spade),
+                Card::new(Value::King, Suit::Diamond),
+                Card::new(Value::Queen, Suit::Heart),
+                Card::new(Value::Jack, Suit::Club),
+                Card::new(Value::Ten, Suit::Spade),
+            ],
+            config.clustering.river.buckets,
+            0,
+            "river.buckets",
+        );
     }
 }
 
@@ -788,16 +857,34 @@ fn write_test_flop_bucket(dir: &Path, bucket_count: u16) {
 }
 
 fn write_test_flop_bucket_with_assignment(dir: &Path, bucket_count: u16, bucket: u16) {
-    let flop = [
-        Card::new(Value::Ace, Suit::Spade),
-        Card::new(Value::King, Suit::Diamond),
-        Card::new(Value::Queen, Suit::Heart),
-    ];
-    let canonical = CanonicalBoard::from_cards(&flop).expect("valid test flop");
+    write_test_postflop_bucket(
+        dir,
+        poker_solver_core::blueprint_v2::Street::Flop,
+        [
+            Card::new(Value::Ace, Suit::Spade),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Queen, Suit::Heart),
+        ],
+        bucket_count,
+        bucket,
+        "flop.buckets",
+    );
+}
+
+fn write_test_postflop_bucket<const N: usize>(
+    dir: &Path,
+    street: poker_solver_core::blueprint_v2::Street,
+    board: [Card; N],
+    bucket_count: u16,
+    bucket: u16,
+    filename: &str,
+) {
+    assert!(matches!(N, 3 | 4 | 5));
+    let canonical = CanonicalBoard::from_cards(&board).expect("valid test board");
     std::fs::create_dir_all(dir).expect("create bucket directory");
     BucketFile {
         header: BucketFileHeader {
-            street: poker_solver_core::blueprint_v2::Street::Flop,
+            street,
             bucket_count,
             board_count: 1,
             combos_per_board: 1326,
@@ -806,8 +893,8 @@ fn write_test_flop_bucket_with_assignment(dir: &Path, bucket_count: u16, bucket:
         boards: vec![PackedBoard::from_cards(&canonical.cards)],
         buckets: vec![bucket; 1326],
     }
-    .save(&dir.join("flop.buckets"))
-    .expect("write test flop buckets");
+    .save(&dir.join(filename))
+    .expect("write test postflop buckets");
 }
 
 fn write_mp_root_config(dir: &Path) {
@@ -1667,7 +1754,7 @@ async fn two_player_lazy_session_back_replays_preflop_and_flop_state() {
 }
 
 #[tokio::test]
-async fn two_player_lazy_session_rejects_turn_deal_at_boundary() {
+async fn two_player_lazy_session_navigates_flop_turn_river_and_back() {
     let dir = TempDir::new().unwrap();
     let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
     enter_two_player_flop_chance(&sessions);
@@ -1680,11 +1767,164 @@ async fn two_player_lazy_session_rejects_turn_deal_at_boundary() {
     }
     assert_eq!(state.street, "Turn");
     assert!(state.is_chance);
+    let turn = game_deal_card_core(&sessions, "Jc").unwrap();
+    assert_eq!(turn.street, "Turn");
+    assert!(!turn.is_chance);
+    assert_eq!(turn.board, vec!["As", "Kd", "Qh", "Jc"]);
+    let turn_matrix = turn.matrix.as_ref().expect("turn matrix");
+    assert!(turn_matrix
+        .cells
+        .iter()
+        .flatten()
+        .any(|cell| cell.combos.iter().any(|combo| combo.bucket == Some(0))));
+
+    state = turn;
+    while state.street == "Turn" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    assert_eq!(state.street, "River");
+    assert!(state.is_chance);
+    let river = game_deal_card_core(&sessions, "Ts").unwrap();
+    assert_eq!(river.street, "River");
+    assert!(!river.is_chance);
+    assert_eq!(river.board, vec!["As", "Kd", "Qh", "Jc", "Ts"]);
+    let river_matrix = river.matrix.as_ref().expect("river matrix");
+    assert!(river_matrix
+        .cells
+        .iter()
+        .flatten()
+        .any(|cell| cell.combos.iter().any(|combo| combo.bucket == Some(0))));
+
+    let restored_turn = game_back_core(&sessions, None).unwrap();
+    assert_eq!(restored_turn.street, "Turn");
+    assert_eq!(restored_turn.board, vec!["As", "Kd", "Qh", "Jc"]);
+    assert!(!restored_turn.is_chance);
+    let restored_turn_root = game_back_core(&sessions, None).unwrap();
+    assert_eq!(restored_turn_root.street, "Turn");
+    assert_eq!(restored_turn_root.board, vec!["As", "Kd", "Qh", "Jc"]);
+    assert!(!restored_turn_root.is_chance);
+    let restored_flop = game_back_core(&sessions, None).unwrap();
+    assert_eq!(restored_flop.street, "Flop");
+    assert_eq!(restored_flop.board, vec!["As", "Kd", "Qh"]);
+    assert!(!restored_flop.is_chance);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_missing_turn_bucket_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_options(&dir.path(), true, true);
+    std::fs::remove_file(dir.path().join("buckets/turn.buckets")).unwrap();
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions).unwrap();
+
+    let mut state = enter_two_player_flop_chance(&sessions);
+    for card in ["As", "Kd", "Qh"] {
+        state = game_deal_card_core(&sessions, card).unwrap();
+    }
+    while state.street == "Flop" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
     let error = game_deal_card_core(&sessions, "Jc").unwrap_err();
-    assert!(error.contains("does not support dealing the turn"));
+    assert!(error.contains("turn bucket lookup failed"), "{error}");
+    assert!(error.contains("missing turn bucket file"), "{error}");
     let unchanged = game_get_state_core(&sessions, None).unwrap();
     assert_eq!(unchanged.board, vec!["As", "Kd", "Qh"]);
     assert_eq!(unchanged.action_history.len(), state.action_history.len());
+    assert!(unchanged.is_chance);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_missing_river_bucket_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_options(&dir.path(), true, true);
+    std::fs::remove_file(dir.path().join("buckets/river.buckets")).unwrap();
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions).unwrap();
+
+    let mut state = enter_two_player_flop_chance(&sessions);
+    for card in ["As", "Kd", "Qh"] {
+        state = game_deal_card_core(&sessions, card).unwrap();
+    }
+    while state.street == "Flop" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    state = game_deal_card_core(&sessions, "Jc").unwrap();
+    while state.street == "Turn" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    let error = game_deal_card_core(&sessions, "Ts").unwrap_err();
+    assert!(error.contains("river bucket lookup failed"), "{error}");
+    assert!(error.contains("missing river bucket file"), "{error}");
+    let unchanged = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(unchanged.board, vec!["As", "Kd", "Qh", "Jc"]);
+    assert_eq!(unchanged.action_history.len(), state.action_history.len());
+    assert!(unchanged.is_chance);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_missing_turn_row_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_missing_postflop_row(dir.path(), MpStreet::Turn);
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions).unwrap();
+
+    let mut state = enter_two_player_flop_chance(&sessions);
+    for card in ["As", "Kd", "Qh"] {
+        state = game_deal_card_core(&sessions, card).unwrap();
+    }
+    while state.street == "Flop" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    let error = game_deal_card_core(&sessions, "Jc").unwrap_err();
+    assert!(error.contains("sparse row is missing"), "{error}");
+    assert!(error.contains("street=2"), "{error}");
+    let unchanged = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(unchanged.board, vec!["As", "Kd", "Qh"]);
+    assert_eq!(unchanged.action_history.len(), state.action_history.len());
+    assert!(unchanged.is_chance);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_rejects_missing_river_row_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_missing_postflop_row(dir.path(), MpStreet::River);
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions).unwrap();
+
+    let mut state = enter_two_player_flop_chance(&sessions);
+    for card in ["As", "Kd", "Qh"] {
+        state = game_deal_card_core(&sessions, card).unwrap();
+    }
+    while state.street == "Flop" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    state = game_deal_card_core(&sessions, "Jc").unwrap();
+    while state.street == "Turn" && !state.is_chance {
+        state = game_play_action_core(&sessions, "0", None).unwrap();
+    }
+    let error = game_deal_card_core(&sessions, "Ts").unwrap_err();
+    assert!(error.contains("sparse row is missing"), "{error}");
+    assert!(error.contains("street=3"), "{error}");
+    let unchanged = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(unchanged.board, vec!["As", "Kd", "Qh", "Jc"]);
+    assert_eq!(unchanged.action_history.len(), state.action_history.len());
+    assert!(unchanged.is_chance);
 }
 
 #[tokio::test]

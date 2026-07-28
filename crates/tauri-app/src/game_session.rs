@@ -265,10 +265,9 @@ pub struct GameMatrixCell {
     pub hand: String,
     pub suited: bool,
     pub pair: bool,
-    /// One value per action. Universal lazy MP preflop and flop matrix values
-    /// are root-reach-weighted and sum to `weight`; turn and river matrices
-    /// remain unsupported. Other sources may expose conditional strategy
-    /// frequencies.
+    /// One value per action. Universal lazy MP preflop and postflop matrix
+    /// values are root-reach-weighted and sum to `weight`. Other sources may
+    /// expose conditional strategy frequencies.
     pub probabilities: Vec<f32>,
     pub combo_count: usize,
     pub weight: f32, // reaching probability
@@ -496,9 +495,9 @@ impl Default for GameSessionState {
 
 /// Read-only navigation over a two-player universal lazy MP bundle.
 ///
-/// The cursor remains the semantic lazy public model. The adapter only adds a
-/// typed flop board and uses file-backed `AllBuckets` lookups when the flop is
-/// complete; it never materializes a dense MP tree or fabricates postflop rows.
+/// The cursor remains the semantic lazy public model. The adapter adds a typed
+/// board and uses file-backed `AllBuckets` lookups for completed postflop
+/// streets; it never materializes a dense MP tree or fabricates rows.
 pub struct LazyMpSession {
     game: LazyMpGame,
     spot: LazyResolvedSpot,
@@ -793,8 +792,9 @@ impl LazyMpSession {
     }
 
     /// Propagate concrete-combo reach through the public action path for a
-    /// completed flop. Each action changes only the reach of its acting seat.
-    fn flop_root_reaches(
+    /// completed postflop board. Each action changes only the reach of its
+    /// acting seat, while blockers are checked against the complete board.
+    fn postflop_root_reaches(
         &mut self,
         action_history: &[ActionRecord],
         board: &[RsPokerCard],
@@ -804,9 +804,12 @@ impl LazyMpSession {
 
         for record in action_history {
             let street = replay_spot.street();
-            if !matches!(street, MpStreet::Preflop | MpStreet::Flop) {
+            if !matches!(
+                street,
+                MpStreet::Preflop | MpStreet::Flop | MpStreet::Turn | MpStreet::River
+            ) {
                 return Err(format!(
-                    "Universal MP flop reach replay reached {} before action {}",
+                    "Universal MP postflop reach replay reached {} before action {}",
                     mp_street_to_string(street),
                     record.action_id
                 ));
@@ -848,7 +851,13 @@ impl LazyMpSession {
                     let hand = CanonicalHand::from_cards(combo[0], combo[1]);
                     self.preflop_bucket_for_hand(hand.index())?
                 } else {
-                    self.flop_bucket(replay_spot, "concrete combo", combo, board)?
+                    let visible_board_cards = mp_required_board_cards(street);
+                    self.postflop_bucket(
+                        replay_spot,
+                        "concrete combo",
+                        combo,
+                        &board[..visible_board_cards],
+                    )?
                 };
                 let probabilities = match probabilities_by_bucket.get(&bucket) {
                     Some(probabilities) => probabilities,
@@ -868,7 +877,7 @@ impl LazyMpSession {
                 .advance(&self.game, action_index)
                 .ok_or_else(|| {
                     format!(
-                        "Universal MP flop reach replay action {} terminated before the requested state",
+                        "Universal MP postflop reach replay action {} terminated before the requested state",
                         record.action_id
                     )
                 })?;
@@ -896,7 +905,8 @@ impl LazyMpSession {
 
         let board = mp_board_strings(&self.board);
         let action_history = self.action_history.clone();
-        let raw_reaches_by_seat = self.flop_root_reaches(&action_history, &self.board.clone())?;
+        let raw_reaches_by_seat =
+            self.postflop_root_reaches(&action_history, &self.board.clone())?;
         let actions =
             build_mp_game_actions(&self.current_actions(), mp_big_blind_amount(&self.config)?);
         let betting = self.spot.betting_snapshot();
@@ -924,19 +934,30 @@ impl LazyMpSession {
         })
     }
 
-    fn flop_bucket(
+    fn postflop_bucket(
         &mut self,
         spot: LazyResolvedSpot,
         hand: &str,
         hole_cards: [RsPokerCard; 2],
         board: &[RsPokerCard],
     ) -> Result<u16, String> {
+        let street = spot.street();
+        if street == MpStreet::Preflop {
+            return Err("Universal MP postflop bucket lookup received a preflop spot".to_string());
+        }
+        let street_name = mp_street_to_string(street).to_ascii_lowercase();
         let all_buckets = self.ensure_all_buckets()?;
+        let bucket_street = match street {
+            MpStreet::Flop => Street::Flop,
+            MpStreet::Turn => Street::Turn,
+            MpStreet::River => Street::River,
+            MpStreet::Preflop => unreachable!("preflop was rejected above"),
+        };
         all_buckets
-            .try_get_bucket(Street::Flop, hole_cards, board)
+            .try_get_bucket(bucket_street, hole_cards, board)
             .map_err(|error| {
                 format!(
-                    "Universal MP flop bucket lookup failed: seat={}, street=flop, hand={}, board={:?}, hole_cards={:?}: {error}",
+                    "Universal MP {street_name} bucket lookup failed: seat={}, street={street_name}, hand={}, board={:?}, hole_cards={:?}: {error}",
                     spot.to_act().index(),
                     hand,
                     board,
@@ -945,25 +966,37 @@ impl LazyMpSession {
             })
     }
 
-    fn build_flop_matrix(
+    fn build_postflop_matrix(
         &mut self,
         spot: LazyResolvedSpot,
         board: &[RsPokerCard],
         mp_actions: &[MpTreeAction],
         action_history: &[ActionRecord],
     ) -> Result<GameMatrix, String> {
-        if board.len() != 3 {
+        let required_board_cards = mp_required_board_cards(spot.street());
+        if !matches!(
+            spot.street(),
+            MpStreet::Flop | MpStreet::Turn | MpStreet::River
+        ) {
             return Err(format!(
-                "Universal MP flop matrix requires exactly 3 board cards, got {}",
-                board.len()
+                "Universal MP postflop matrix requires a postflop decision, got {}",
+                mp_street_to_string(spot.street())
+            ));
+        }
+        if board.len() != required_board_cards {
+            return Err(format!(
+                "Universal MP {} matrix requires exactly {} board cards, got {}",
+                mp_street_to_string(spot.street()).to_ascii_lowercase(),
+                required_board_cards,
+                board.len(),
             ));
         }
         let actions = build_mp_game_actions(mp_actions, mp_big_blind_amount(&self.config)?);
-        let reaches = self.flop_root_reaches(action_history, board)?;
+        let reaches = self.postflop_root_reaches(action_history, board)?;
         let acting_seat = usize::from(spot.to_act().index());
         if acting_seat >= reaches.len() {
             return Err(format!(
-                "Universal MP flop matrix encountered unsupported seat {}",
+                "Universal MP postflop matrix encountered unsupported seat {}",
                 spot.to_act().index()
             ));
         }
@@ -982,7 +1015,7 @@ impl LazyMpSession {
                     if combo_is_blocked(combo, board) {
                         continue;
                     }
-                    let bucket = self.flop_bucket(spot, &label, [card1, card2], board)?;
+                    let bucket = self.postflop_bucket(spot, &label, [card1, card2], board)?;
                     let probabilities = match probabilities_by_bucket.get(&bucket) {
                         Some(probabilities) => probabilities,
                         None => {
@@ -1096,8 +1129,11 @@ impl LazyMpSession {
 
         let mp_actions = self.current_actions_at(spot);
         let actions = build_mp_game_actions(&mp_actions, mp_big_blind_amount(&self.config)?);
-        if spot.street() == MpStreet::Flop {
-            let matrix = self.build_flop_matrix(spot, board, &mp_actions, action_history)?;
+        if matches!(
+            spot.street(),
+            MpStreet::Flop | MpStreet::Turn | MpStreet::River
+        ) {
+            let matrix = self.build_postflop_matrix(spot, board, &mp_actions, action_history)?;
             return Ok(GameState {
                 street,
                 position: self.position_label(spot.to_act().index()),
@@ -1112,12 +1148,7 @@ impl LazyMpSession {
                 solve: None,
             });
         }
-        if spot.street() != MpStreet::Preflop {
-            return Err(format!(
-                "Universal MP GameExplorer does not support {} decision navigation; turn/river strategy is unavailable",
-                street
-            ));
-        }
+        debug_assert_eq!(spot.street(), MpStreet::Preflop);
 
         let reaches = self.preflop_root_reaches(action_history)?;
         let acting_seat = usize::from(spot.to_act().index());
@@ -1295,15 +1326,15 @@ impl LazyMpSession {
         if self.terminal {
             return Err("Universal MP session is already terminal".to_string());
         }
-        if self.spot.street() != MpStreet::Flop || self.board.len() >= 3 {
-            if self.spot.street() == MpStreet::Turn && self.board.len() == 3 {
-                return Err(
-                    "Universal MP GameExplorer does not support dealing the turn; state unchanged"
-                        .to_string(),
-                );
-            }
+        let required_board_cards = mp_required_board_cards(self.spot.street());
+        let valid_chance = match self.spot.street() {
+            MpStreet::Flop => self.board.len() < required_board_cards,
+            MpStreet::Turn | MpStreet::River => self.board.len() + 1 == required_board_cards,
+            MpStreet::Preflop => false,
+        };
+        if !valid_chance {
             return Err(format!(
-                "Universal MP session is not at a supported flop chance state; street={}, board_cards={}, state unchanged",
+                "Universal MP session is not at a supported board chance state; street={}, board_cards={}, state unchanged",
                 mp_street_to_string(self.spot.street()),
                 self.board.len()
             ));
@@ -1328,11 +1359,6 @@ impl LazyMpSession {
         }
         let last = self.action_history.last().cloned().unwrap();
         let target_history = self.action_history[..self.action_history.len() - 1].to_vec();
-        let target_board = if last.street == "Preflop" {
-            Vec::new()
-        } else {
-            self.board.clone()
-        };
         let mut target_spot = LazyResolvedSpot::root(&self.game);
         let mut target_terminal = false;
         for record in &target_history {
@@ -1348,6 +1374,15 @@ impl LazyMpSession {
                 }
             };
         }
+        let undone_street = match last.street.as_str() {
+            "Preflop" => MpStreet::Preflop,
+            "Flop" => MpStreet::Flop,
+            "Turn" => MpStreet::Turn,
+            "River" => MpStreet::River,
+            street => return Err(format!("Invalid MP street during back: {street}")),
+        };
+        let target_board_len = self.board.len().min(mp_required_board_cards(undone_street));
+        let target_board = self.board[..target_board_len].to_vec();
         let state = self.state_at(target_spot, &target_board, &target_history, target_terminal)?;
         self.spot = target_spot;
         self.board = target_board;
@@ -3813,6 +3848,7 @@ pub fn game_play_action_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
+        let previous_street = session.spot.street();
         let big_blind = mp_big_blind_amount(&session.config)?;
         let ss = solve_state_for_source(session_state, source.as_deref());
         let cached_navigation = ss.as_ref().and_then(|ss| {
@@ -3843,11 +3879,23 @@ pub fn game_play_action_core(
         });
         if let (Some(ss), Some((session_action_id, next_path))) = (ss.as_ref(), cached_navigation) {
             let mut state = session.play_action_without_state(&session_action_id)?;
+            if session.spot.street() != previous_street {
+                session_state.subgame_solve.reset();
+                session_state.exact_solve.reset();
+                state.solve = None;
+                return Ok(state);
+            }
             apply_exact_solve_overlay(&mut state, ss, Some(next_path));
             return Ok(state);
         }
         let session_action_id = action_id.to_string();
         let mut state = session.play_action(&session_action_id)?;
+        let street_changed = session.spot.street() != previous_street;
+        if street_changed {
+            session_state.subgame_solve.reset();
+            session_state.exact_solve.reset();
+            state.solve = None;
+        }
         if let Some(ss) = ss.as_ref() {
             let path = resolve_solve_path_from_mp_session(ss, session);
             apply_exact_solve_overlay(&mut state, ss, path);
@@ -3952,7 +4000,12 @@ pub fn game_deal_card_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
+        let previous_board_len = session.board.len();
         let mut state = session.deal_card(card)?;
+        if session.board.len() != previous_board_len {
+            session_state.subgame_solve.reset();
+            session_state.exact_solve.reset();
+        }
         if session_state.exact_solve.iteration.load(Ordering::Relaxed) > 0
             || session_state.exact_solve.solving.load(Ordering::Relaxed)
         {
@@ -3982,7 +4035,14 @@ pub fn game_back_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
+        let previous_street = session.spot.street();
+        let previous_board_len = session.board.len();
         let mut state = session.back()?;
+        if session.spot.street() != previous_street || session.board.len() != previous_board_len {
+            session_state.subgame_solve.reset();
+            session_state.exact_solve.reset();
+            state.solve = None;
+        }
         if source.as_deref() == Some("exact") {
             let ss = &session_state.exact_solve;
             let path = resolve_solve_path_from_mp_session(ss, session);
