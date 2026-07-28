@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-07-28T01:45:42Z
-updated_at: 2026-07-28T01:56:48Z
+updated_at: 2026-07-28T02:08:42Z
 parent: poker_solver_rust-osss
 ---
 
@@ -28,3 +28,6 @@ Acceptance:
 - [ ] Update explorer docs if lifecycle behavior changed
 - [ ] Run formatting and focused tests
 - [ ] Review, commit, and report results
+
+
+Scope note: this turn is limited to the MP lazy bucket initialization fix, focused regression tests, formatting, narrow verification, and a commit; timing instrumentation and docs are deferred.
