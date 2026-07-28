@@ -146,9 +146,9 @@ pub enum LoadedBundle {
     /// Universal MP lazy bundle with lookup index.
     UniversalMpLazy {
         data: Box<UniversalData>,
-        /// Maps `(seat, street, local_bucket, history_hash, history_len)`
-        /// -> row index.
-        index: HashMap<(u8, u8, u16, u64, u16), usize>,
+        /// Locates contiguous rows by public prefix, then matches semantic
+        /// history fields within the selected range.
+        index: MpLazyIndex,
     },
 }
 
@@ -177,6 +177,45 @@ pub struct InfosetView<'a> {
     pub probs: &'a [f32],
     /// The action descriptors for this infoset.
     pub actions: Vec<ActionDescriptor>,
+}
+
+/// A public MP-lazy key prefix shared by all histories at one infoset.
+///
+/// The exporter sorts rows by this prefix before the history fingerprint, so
+/// rows with the same public identity occupy one contiguous range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MpLazyPublicKey {
+    seat: u8,
+    street: u8,
+    local_bucket: u16,
+}
+
+/// One contiguous row range for an MP-lazy public key prefix.
+#[derive(Debug, Clone, Copy)]
+struct MpLazyRange {
+    key: MpLazyPublicKey,
+    start: usize,
+    end: usize,
+}
+
+/// Compact sorted locator for MP-lazy rows.
+///
+/// This replaces the per-row hash table used by the other bundle kinds. The
+/// range vector has one entry per public prefix rather than one entry per
+/// realized history, while the row payload remains owned by `BundleReader`.
+#[derive(Debug)]
+struct MpLazyIndex {
+    ranges: Vec<MpLazyRange>,
+}
+
+impl MpLazyIndex {
+    fn range_for(&self, key: MpLazyPublicKey) -> Option<MpLazyRange> {
+        let index = self
+            .ranges
+            .binary_search_by_key(&key, |range| range.key)
+            .ok()?;
+        Some(self.ranges[index])
+    }
 }
 
 // ── LoadedBundle query API ──────────────────────────────────────────
@@ -280,14 +319,24 @@ impl LoadedBundle {
     pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<InfosetView<'_>> {
         match self {
             Self::UniversalMpLazy { data, index } => {
-                let tuple = (
-                    key.seat,
-                    key.street,
-                    key.local_bucket,
-                    key.history_hash,
-                    key.history_len,
-                );
-                let row_idx = *index.get(&tuple)?;
+                let public_key = MpLazyPublicKey {
+                    seat: key.seat,
+                    street: key.street,
+                    local_bucket: key.local_bucket,
+                };
+                let range = index.range_for(public_key)?;
+                // Keep the last matching row to preserve the old HashMap
+                // builder's overwrite behavior for duplicate keys.
+                let mut row_idx = None;
+                for i in range.start..range.end {
+                    let Some(sem) = data.reader.semantic_record(i) else {
+                        continue;
+                    };
+                    if sem.history_hash == key.history_hash && sem.history_len == key.history_len {
+                        row_idx = Some(i);
+                    }
+                }
+                let row_idx = row_idx?;
                 build_view_from_reader(&data.reader, row_idx)
             }
             _ => None,
@@ -683,22 +732,25 @@ fn build_mp_eager_index(reader: &BundleReader) -> HashMap<(u32, u8, u32), usize>
 }
 
 /// Build a lookup index for universal MP lazy bundles.
-fn build_mp_lazy_index(reader: &BundleReader) -> HashMap<(u8, u8, u16, u64, u16), usize> {
-    let mut index = HashMap::with_capacity(reader.row_count());
+fn build_mp_lazy_index(reader: &BundleReader) -> MpLazyIndex {
+    let mut ranges: Vec<MpLazyRange> = Vec::new();
     for i in 0..reader.row_count() {
-        let (Some(row), Some(sem)) = (reader.row(i), reader.semantic_record(i)) else {
+        let Some(row) = reader.row(i) else {
             continue;
         };
-        index.insert(
-            (
-                row.seat,
-                row.street,
-                row.local_bucket,
-                sem.history_hash,
-                sem.history_len,
-            ),
-            i,
-        );
+        let key = MpLazyPublicKey {
+            seat: row.seat,
+            street: row.street,
+            local_bucket: row.local_bucket,
+        };
+        match ranges.last_mut() {
+            Some(last) if last.key == key => last.end = i + 1,
+            _ => ranges.push(MpLazyRange {
+                key,
+                start: i,
+                end: i + 1,
+            }),
+        }
     }
-    index
+    MpLazyIndex { ranges }
 }

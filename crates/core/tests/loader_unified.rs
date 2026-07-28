@@ -13,8 +13,8 @@
 
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
 use poker_solver_core::blueprint_universal::{
-    ActionKind, BundleData, BundleKind, LoaderError, MpLazyKey, detect_bundle_kind, load_bundle,
-    write_bundle,
+    ActionKind, BundleData, BundleKind, BundleReader, LoaderError, MpLazyKey, detect_bundle_kind,
+    load_bundle, write_bundle,
 };
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
@@ -827,6 +827,11 @@ fn build_lazy_test_entries() -> Vec<SparseSnapshotEntry> {
 
 fn write_mp_lazy_bundle(dir: &Path) -> Vec<SparseSnapshotEntry> {
     let entries = build_lazy_test_entries();
+    write_mp_lazy_bundle_with_entries(dir, &entries);
+    entries
+}
+
+fn write_mp_lazy_bundle_with_entries(dir: &Path, entries: &[SparseSnapshotEntry]) {
     let config = LazyExportConfig {
         num_players: 6,
         stack_depth: 100.0,
@@ -838,9 +843,8 @@ fn write_mp_lazy_bundle(dir: &Path) -> Vec<SparseSnapshotEntry> {
         iterations: 100,
         elapsed_minutes: 1.0,
     };
-    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, &entries, &training);
+    let output = mp_lazy_export::export_lazy_sparse_to_universal(&config, entries, &training);
     mp_lazy_export::write_lazy_bundle(dir, &output).unwrap();
-    entries
 }
 
 #[test]
@@ -911,6 +915,135 @@ fn load_mp_lazy_zero_mass_uniform() {
     }
     assert_eq!(view.actions[1].kind, ActionKind::AllInCall);
     assert!(!view.actions[1].is_aggressive);
+}
+
+#[test]
+fn load_mp_lazy_matches_multiple_histories_in_one_public_prefix() {
+    let tmp = TempDir::new().unwrap();
+    let entries = vec![
+        SparseSnapshotEntry {
+            key: make_lazy_key(0, MpStreet::Preflop, 5, 1, 2, 0xDDDD, 6),
+            num_actions: 2,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Check, 0, 0),
+                lazy_action(SparseActionKind::Lead, 10, 1),
+            ]),
+            regrets: vec![0, 0],
+            strategy_sums: vec![1, 3],
+        },
+        SparseSnapshotEntry {
+            key: make_lazy_key(0, MpStreet::Preflop, 5, 3, 4, 0xEEEE, 7),
+            num_actions: 2,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Fold, 0, 0),
+                lazy_action(SparseActionKind::Call, 0, 1),
+            ]),
+            regrets: vec![0, 0],
+            strategy_sums: vec![4, 1],
+        },
+    ];
+    write_mp_lazy_bundle_with_entries(tmp.path(), &entries);
+    let bundle = load_bundle(tmp.path()).unwrap();
+
+    let first = bundle
+        .query_mp_lazy(&MpLazyKey {
+            seat: 0,
+            street: 0,
+            local_bucket: 5,
+            history_hash: 0xDDDD,
+            history_len: 6,
+        })
+        .unwrap();
+    assert_eq!(first.probs, &[0.25, 0.75]);
+    assert_eq!(first.actions[1].kind, ActionKind::Bet);
+    assert_eq!(first.actions[1].amount_chips, 10);
+
+    let second = bundle
+        .query_mp_lazy(&MpLazyKey {
+            seat: 0,
+            street: 0,
+            local_bucket: 5,
+            history_hash: 0xEEEE,
+            history_len: 7,
+        })
+        .unwrap();
+    assert_eq!(second.probs, &[0.8, 0.2]);
+    assert_eq!(second.actions[0].kind, ActionKind::Fold);
+    assert_eq!(second.actions[1].kind, ActionKind::Call);
+}
+
+#[test]
+fn load_mp_lazy_duplicate_hash_and_length_returns_last_serialized_row() {
+    let tmp = TempDir::new().unwrap();
+    let entries = vec![
+        SparseSnapshotEntry {
+            key: make_lazy_key(0, MpStreet::Preflop, 5, 1, 2, 0xABCD, 9),
+            num_actions: 2,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Check, 0, 0),
+                lazy_action(SparseActionKind::Call, 0, 1),
+            ]),
+            regrets: vec![0, 0],
+            strategy_sums: vec![10, 0],
+        },
+        SparseSnapshotEntry {
+            key: make_lazy_key(0, MpStreet::Preflop, 5, 3, 4, 0xABCD, 9),
+            num_actions: 2,
+            action_identity: Some(vec![
+                lazy_action(SparseActionKind::Fold, 0, 0),
+                lazy_action(SparseActionKind::Raise, 40, 1),
+            ]),
+            regrets: vec![0, 0],
+            strategy_sums: vec![0, 10],
+        },
+    ];
+    write_mp_lazy_bundle_with_entries(tmp.path(), &entries);
+
+    let reader = BundleReader::open(tmp.path()).unwrap();
+    let mut last_matching_row = None;
+    for i in 0..reader.row_count() {
+        let row = reader.row(i).unwrap();
+        let semantic = reader.semantic_record(i).unwrap();
+        if row.seat == 0
+            && row.street == 0
+            && row.local_bucket == 5
+            && semantic.history_hash == 0xABCD
+            && semantic.history_len == 9
+        {
+            last_matching_row = Some(i);
+        }
+    }
+    let last_matching_row = last_matching_row.unwrap();
+    let expected_row = reader.row(last_matching_row).unwrap();
+    let expected_probs = reader
+        .prob_slice(
+            expected_row.prob_offset as usize,
+            expected_row.action_count as usize,
+        )
+        .unwrap();
+    let expected_actions: Vec<_> = (0..usize::from(expected_row.action_count))
+        .map(|i| {
+            reader
+                .action(expected_row.action_offset as usize + i)
+                .unwrap()
+                .clone()
+        })
+        .collect();
+
+    let bundle = load_bundle(tmp.path()).unwrap();
+    let view = bundle
+        .query_mp_lazy(&MpLazyKey {
+            seat: 0,
+            street: 0,
+            local_bucket: 5,
+            history_hash: 0xABCD,
+            history_len: 9,
+        })
+        .unwrap();
+    assert_eq!(view.probs, expected_probs);
+    assert_eq!(view.actions, expected_actions);
+    assert_eq!(view.actions[0].kind, ActionKind::Fold);
+    assert_eq!(view.actions[1].amount_chips, 40);
 }
 
 // ── Detection precedence regression test ────────────────────────────

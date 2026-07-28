@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-5qgb
 title: Make universal MP lazy loading truly on-demand
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-07-28T12:52:24Z
-updated_at: 2026-07-28T12:52:24Z
+updated_at: 2026-07-28T13:04:31Z
 parent: poker_solver_rust-osss
 ---
 
@@ -20,3 +20,7 @@ Acceptance:
 - MP config.yaml directories are listed without attempting HU-only game.players parsing or emitting misleading warnings.
 - Update architecture/training/explorer docs for the reader mode/validation contract.
 - Run focused core and Tauri tests; leave the pre-existing sample configuration edit untouched.
+
+## Summary of Changes
+
+Replaced the universal MP-lazy per-row HashMap with a compact sorted public-prefix range locator and preserved last-match duplicate semantics. Added focused loader coverage for multiple histories per prefix, missing keys, duplicate hash/length keys, and exact action/probability results.
