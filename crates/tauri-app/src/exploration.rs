@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -345,22 +346,52 @@ pub async fn load_bundle_core(
     state: &ExplorationState,
     path: String,
 ) -> Result<BundleInfo, String> {
+    let started = Instant::now();
     let bundle_path = PathBuf::from(&path);
+    eprintln!("[explorer-load] phase=command_entry command=load_bundle path={path}");
 
     if path.ends_with(".toml") {
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_bundle source=agent path={path} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         let (info, source) = load_agent(&bundle_path)?;
         *state.source.write() = Some(source);
         state.bucket_cache.write().clear();
         *state.suit_mapping.write() = None;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_bundle source=agent elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         return Ok(info);
     }
     // Universal bundles: detect blueprint.json BEFORE config.yaml.
     if has_universal_sentinel(&bundle_path) {
-        return load_universal_bundle_core(state, &bundle_path).await;
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_bundle source=universal path={path} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let result = load_universal_bundle_core(state, &bundle_path).await;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_bundle source=universal ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        return result;
     }
     if bundle_path.join("config.yaml").exists() {
         // Legacy Blueprint V2 bundle — delegate to the dedicated loader.
-        return load_blueprint_v2_core(state, path, None).await;
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_bundle source=legacy_hu path={path} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let result = load_blueprint_v2_core(state, path, None).await;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_bundle source=legacy_hu ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        return result;
     }
 
     Err("Directory does not contain blueprint.json (universal), \
@@ -481,11 +512,35 @@ pub async fn load_blueprint_v2_core(
     dir_path: String,
     snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
+    let started = Instant::now();
     let dir = PathBuf::from(&dir_path);
+    eprintln!(
+        "[explorer-load] phase=command_entry command=load_blueprint_v2 path={} snapshot={}",
+        dir_path,
+        snapshot.as_deref().unwrap_or("auto")
+    );
     if let Some(universal_dir) = resolve_universal_for_v2_request(&dir, snapshot.as_deref()) {
-        return load_universal_bundle_core(state, &universal_dir).await;
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_blueprint_v2 source=universal path={} elapsed_ms={}",
+            universal_dir.display(),
+            started.elapsed().as_millis()
+        );
+        let result = load_universal_bundle_core(state, &universal_dir).await;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_blueprint_v2 source=universal ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        return result;
     }
 
+    eprintln!(
+        "[explorer-load] phase=command_resolution command=load_blueprint_v2 source=legacy_hu path={} elapsed_ms={}",
+        dir_path,
+        started.elapsed().as_millis()
+    );
+
+    let source_started = Instant::now();
     let (config, strategy, cbv_table, snapshot_name, strat_dir) =
         tokio::task::spawn_blocking(move || {
             let cfg = v2_bundle::load_config(&dir)
@@ -556,8 +611,15 @@ pub async fn load_blueprint_v2_core(
         })
         .await
         .map_err(|e| format!("Load task panicked: {e}"))??;
+    eprintln!(
+        "[explorer-load] phase=legacy_hu_source_load iterations={} snapshot={} elapsed_ms={}",
+        strategy.iterations,
+        snapshot_name.as_deref().unwrap_or("root"),
+        source_started.elapsed().as_millis()
+    );
 
     let aa = &config.action_abstraction;
+    let tree_started = Instant::now();
     let tree = V2GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
@@ -571,6 +633,11 @@ pub async fn load_blueprint_v2_core(
     let decision_map = tree.decision_index_map();
 
     let (decision_nodes, _, _) = tree.node_counts();
+    eprintln!(
+        "[explorer-load] phase=legacy_hu_tree decision_nodes={} elapsed_ms={}",
+        decision_nodes,
+        tree_started.elapsed().as_millis()
+    );
     let info = BundleInfo {
         name: Some(config.game.name.clone()),
         stack_depth: config.game.stack_depth as u32,
@@ -661,6 +728,10 @@ pub async fn load_blueprint_v2_core(
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
 
+    eprintln!(
+        "[explorer-load] phase=command_complete command=load_blueprint_v2 source=legacy_hu ok=true elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(info)
 }
 
@@ -677,6 +748,7 @@ async fn load_universal_bundle_core(
     state: &ExplorationState,
     bundle_path: &Path,
 ) -> Result<BundleInfo, String> {
+    let started = Instant::now();
     let path = bundle_path.to_path_buf();
     let loaded = tokio::task::spawn_blocking(move || {
         poker_solver_core::blueprint_universal::load_bundle(&path)
@@ -685,7 +757,16 @@ async fn load_universal_bundle_core(
     .await
     .map_err(|e| format!("Load task panicked: {e}"))??;
 
-    match loaded.kind() {
+    let kind = loaded.kind();
+    let rows = loaded.manifest().map(|manifest| manifest.layout.row_count);
+    eprintln!(
+        "[explorer-load] phase=universal_reader_load kind={kind} rows={} path={} elapsed_ms={}",
+        rows.map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+        bundle_path.display(),
+        started.elapsed().as_millis()
+    );
+
+    match kind {
         BundleKind::UniversalHu => load_universal_hu(state, loaded, bundle_path),
         BundleKind::UniversalMpEager | BundleKind::UniversalMpLazy => {
             load_universal_mp(state, loaded, bundle_path)
@@ -705,12 +786,32 @@ fn load_universal_hu(
     loaded: LoadedBundle,
     bundle_path: &Path,
 ) -> Result<BundleInfo, String> {
+    let config_started = Instant::now();
     let config = load_retained_hu_config(bundle_path)?;
+    eprintln!(
+        "[explorer-load] phase=hu_config source=universal_hu path={} elapsed_ms={}",
+        bundle_path.display(),
+        config_started.elapsed().as_millis()
+    );
+
+    let tree_started = Instant::now();
     let tree = build_hu_tree(&config);
     let decision_map = tree.decision_index_map();
     let (decision_nodes, _, _) = tree.node_counts();
+    eprintln!(
+        "[explorer-load] phase=hu_tree source=universal_hu decision_nodes={} elapsed_ms={}",
+        decision_nodes,
+        tree_started.elapsed().as_millis()
+    );
 
+    let reconstruction_started = Instant::now();
     let strategy = reconstruct_hu_strategy(&config, &tree, &decision_map, &loaded)?;
+    eprintln!(
+        "[explorer-load] phase=hu_reconstruction source=universal_hu target=blueprint_v2 decision_nodes={} path={} elapsed_ms={}",
+        decision_nodes,
+        bundle_path.display(),
+        reconstruction_started.elapsed().as_millis()
+    );
 
     let info = BundleInfo {
         name: Some(config.game.name.clone()),
@@ -912,6 +1013,12 @@ fn load_universal_mp(
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
 
+    eprintln!(
+        "[explorer-load] phase=mp_source_setup kind={kind} rows={rows} retained_config={} path={} elapsed_ms={}",
+        has_retained_config,
+        bundle_path.display(),
+        started.elapsed().as_millis()
+    );
     Ok(info)
 }
 
@@ -1583,7 +1690,14 @@ pub fn get_strategy_matrix_core(
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
-    match source {
+    let initial_matrix = position.history.is_empty() && position.board.is_empty();
+    let initial_matrix_started = initial_matrix.then(Instant::now);
+    let source_kind = match source {
+        StrategySource::Agent(_) => "agent",
+        StrategySource::BlueprintV2 { .. } => "blueprint_v2",
+        StrategySource::UniversalMp { .. } => "universal_mp",
+    };
+    let result = match source {
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
         StrategySource::BlueprintV2 {
             config,
