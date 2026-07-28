@@ -337,6 +337,7 @@ async fn universal_hu_loads_through_load_bundle_core() {
 
 use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::MpGameTree;
+use poker_solver_core::blueprint_mp::game_tree::TreeAction;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseSnapshotEntry};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
@@ -542,10 +543,28 @@ fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
     write_mp_lazy_2p_bundle_with_options(dir, true, true);
 }
 
+fn write_mp_lazy_2p_bundle_with_anomaly_rows(dir: &Path) {
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true);
+}
+
 fn write_mp_lazy_2p_bundle_with_options(
     dir: &Path,
     include_flop_buckets: bool,
     include_flop_rows: bool,
+) {
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(
+        dir,
+        include_flop_buckets,
+        include_flop_rows,
+        false,
+    );
+}
+
+fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
+    dir: &Path,
+    include_flop_buckets: bool,
+    include_flop_rows: bool,
+    include_anomaly_rows: bool,
 ) {
     let mut config = build_3p_config();
     config.game.name = "2p-lazy-session-test".to_string();
@@ -563,6 +582,11 @@ fn write_mp_lazy_2p_bundle_with_options(
         },
     ];
     config.training.backend = MpTrainingBackend::LazySparse;
+    if include_anomaly_rows {
+        config.action_abstraction.preflop =
+            serde_yaml::from_str("lead: [\"2bb\"]\nraise: [[\"3bb\"]]")
+                .expect("valid anomaly preflop action sizes");
+    }
     config.action_abstraction.flop =
         serde_yaml::from_str("lead: [1.0]\nraise: [[1.0]]").expect("valid test flop action sizes");
     config.action_abstraction.turn = config.action_abstraction.flop.clone();
@@ -576,7 +600,7 @@ fn write_mp_lazy_2p_bundle_with_options(
     let game = LazyMpGame::new(&config.game, &config.action_abstraction);
     let root = LazyResolvedSpot::root(&game);
     let mut entries = Vec::new();
-    let mut add_preflop_rows = |spot: LazyResolvedSpot| {
+    let mut add_preflop_rows = |spot: LazyResolvedSpot, sentinel: Option<&[u64]>| {
         let actions = spot.actions(&game);
         for bucket in 0..config.clustering.preflop.buckets {
             let key = spot.key_for_bucket(bucket);
@@ -586,26 +610,65 @@ fn write_mp_lazy_2p_bundle_with_options(
             {
                 continue;
             }
+            let strategy_sums = if bucket == MP_BUCKET_COUNTS[0] - 1 {
+                sentinel.map_or_else(
+                    || {
+                        (0..actions.len())
+                            .map(|index| if index == 0 { u64::from(bucket) + 1 } else { 1 })
+                            .collect()
+                    },
+                    |values| {
+                        assert_eq!(values.len(), actions.len());
+                        values.to_vec()
+                    },
+                )
+            } else {
+                (0..actions.len())
+                    .map(|index| if index == 0 { u64::from(bucket) + 1 } else { 1 })
+                    .collect()
+            };
             entries.push(SparseSnapshotEntry {
                 key,
                 num_actions: actions.len() as u8,
                 action_identity: None,
                 regrets: vec![0; actions.len()],
-                strategy_sums: (0..actions.len())
-                    .map(|index| if index == 0 { u64::from(bucket) + 1 } else { 1 })
-                    .collect(),
+                strategy_sums,
             });
         }
     };
-    let mut preflop_spot = root;
-    for action_index in [1, 0] {
-        add_preflop_rows(preflop_spot);
-        let Some(next) = preflop_spot.advance(&game, action_index) else {
-            break;
-        };
-        preflop_spot = next;
-        if preflop_spot.street() != MpStreet::Preflop {
-            break;
+
+    if include_anomaly_rows {
+        let sb_raise_index = root
+            .actions(&game)
+            .iter()
+            .position(|action| matches!(action, TreeAction::Lead(_)))
+            .expect("anomaly root should offer an opening raise");
+        let sb_raise = root
+            .advance(&game, sb_raise_index)
+            .expect("SB raise should reach BB decision");
+        let bb_reraise_index = sb_raise
+            .actions(&game)
+            .iter()
+            .position(|action| matches!(action, TreeAction::Raise(_)))
+            .expect("BB should offer a 3bb reraise");
+        let bb_reraise = sb_raise
+            .advance(&game, bb_reraise_index)
+            .expect("BB reraise should reach SB decision");
+
+        add_preflop_rows(root, Some(&[1, 2, 7]));
+        add_preflop_rows(sb_raise, Some(&[2, 3, 4, 1]));
+        add_preflop_rows(bb_reraise, Some(&[7, 2, 1]));
+    } else {
+        let mut preflop_spot = root;
+        for action_index in [1, 0] {
+            add_preflop_rows(preflop_spot, None);
+            let Some(next) = preflop_spot.advance(&game, action_index) else {
+                break;
+            };
+            preflop_spot = next;
+            if preflop_spot.street() != MpStreet::Preflop {
+                break;
+            }
         }
     }
     if include_flop_rows {
@@ -931,6 +994,95 @@ async fn two_player_lazy_bundle_starts_game_session_and_advances_root_action() {
     let child = game_play_action_core(&sessions, &root.actions[0].id, None)
         .expect("first root action should advance");
     assert_eq!(child.action_history.len(), 1);
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_uses_history_specific_sparse_row_for_72o() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_anomaly_rows(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy anomaly bundle should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("2p MP lazy anomaly bundle should initialize");
+
+    let assert_72o_probabilities = |state: &poker_solver_tauri::GameState, expected: &[f32]| {
+        let cell = state
+            .matrix
+            .as_ref()
+            .expect("decision state should include a matrix")
+            .cells
+            .iter()
+            .flatten()
+            .find(|cell| cell.hand == "72o")
+            .expect("matrix should include 72o");
+        assert_eq!(cell.probabilities, expected);
+    };
+
+    let root = game_get_state_core(&sessions, None).expect("root state");
+    assert_eq!(root.position, "SB");
+    assert_eq!(
+        root.actions
+            .iter()
+            .map(|action| action.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Fold", "Call", "2bb"]
+    );
+    assert_72o_probabilities(&root, &[0.1, 0.2, 0.7]);
+
+    let sb_raise = root
+        .actions
+        .iter()
+        .find(|action| action.label == "2bb")
+        .expect("root should expose the 2bb SB raise");
+    let after_sb_raise = game_play_action_core(&sessions, &sb_raise.id, None)
+        .expect("SB 2bb raise should advance to BB");
+    assert_eq!(after_sb_raise.position, "BB");
+    assert_eq!(after_sb_raise.action_history.len(), 1);
+    assert_eq!(after_sb_raise.action_history[0].position, "SB");
+    assert_eq!(after_sb_raise.action_history[0].label, "2bb");
+    assert_eq!(
+        after_sb_raise
+            .actions
+            .iter()
+            .map(|action| action.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Fold", "Call", "3bb", "All-in"]
+    );
+    assert_72o_probabilities(&after_sb_raise, &[0.2, 0.3, 0.4, 0.1]);
+
+    let bb_reraise = after_sb_raise
+        .actions
+        .iter()
+        .find(|action| action.label == "3bb")
+        .expect("BB should expose the 3bb reraise");
+    let after_bb_reraise = game_play_action_core(&sessions, &bb_reraise.id, None)
+        .expect("BB 3bb reraise should advance to SB");
+    assert_eq!(after_bb_reraise.position, "SB");
+    assert_eq!(after_bb_reraise.action_history.len(), 2);
+    assert_eq!(
+        after_bb_reraise
+            .action_history
+            .iter()
+            .map(|record| (record.position.as_str(), record.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("SB", "2bb"), ("BB", "3bb")]
+    );
+    assert_eq!(
+        after_bb_reraise
+            .actions
+            .iter()
+            .map(|action| action.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Fold", "Call", "All-in"]
+    );
+
+    // GameState exposes one vector derived from universal lazy strategy_sums:
+    // the average strategy. It has no separate current-strategy field.
+    assert_72o_probabilities(&after_bb_reraise, &[0.7, 0.2, 0.1]);
 }
 
 async fn start_two_player_lazy_session(

@@ -108,6 +108,8 @@ rejected until a later bean adds turn bucket and row support.
 
 When using Blueprint, Subgame, or Exact strategy sources, the matrix is source-specific for the current game state. Solved Subgame and Exact sources keep their solved matrix cache anchored to the street state where the solve started, so taking actions or rewinding within that solved subtree continues to show the solved strategy instead of falling back to the blueprint matrix. Player labels in the Explorer are always seat positions (`BB`/`SB`).
 
+For Universal MP lazy preflop navigation, matrix probabilities are the conditional average strategy for the displayed acting player and hand at the exact action history; they are not reach-weighted joint frequencies from the root. Consequently, an off-path child such as SB after SB raises and BB reraises may show a nonzero call strategy even when 72o is folded at the opening node. The TUI has regression coverage for this exact history.
+
 ## Simulator Tab
 
 Hand simulation interface for testing strategies against each other.

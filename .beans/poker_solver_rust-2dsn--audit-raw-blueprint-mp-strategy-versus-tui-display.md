@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-07-27T23:39:08Z
+updated_at: 2026-07-28T00:07:57Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -49,6 +49,14 @@ Current-vs-average probe output shows a mixed picture with multi-million strateg
 
 SB folds 72o at the unopened/preflop opening node, but the TUI reports approximately 72% SB call frequency after SB raises to 2bb and BB reraises to 3bb. The audit must compare the raw row and action-history resolution at both nodes before changing training or storage.
 
-- [ ] Reproduce the exact SB r2 / BB r3 / SB decision with a deterministic diagnostic.
-- [ ] Compare 72o at opening and reraised SB nodes, including action labels and row keys.
-- [ ] Classify the defect as display, navigation, keying, or training data.
+- [x] Reproduce the exact SB r2 / BB r3 / SB decision with a deterministic diagnostic.
+- [x] Compare 72o at opening and reraised SB nodes, including action labels and row keys.
+- [x] Classify the defect as display, navigation, keying, or training data.
+
+## Diagnostic Conclusion
+
+The exact Tauri path resolves SB after two actions to a distinct sparse row: SB raises to 2bb, BB reraises to 3bb, then SB acts. The displayed 72o value is the normalized average strategy stored for that conditional infoset. It is not the unconditional probability of reaching the node from the root. Therefore 72o can be folded at the opening node while showing a nonzero call strategy at the off-path reraised node; this is not a navigation, keying, or display-row mismatch.
+
+## Current Change
+
+Added deterministic sentinel-row regression coverage for the root, intermediate, and reraised SB nodes, plus Explorer documentation clarifying conditional strategy versus reach-weighted frequency.
