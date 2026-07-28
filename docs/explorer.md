@@ -62,10 +62,11 @@ manifest, header, checksum, CRC, structural, and probability-normalization
 validation still runs during load, and descriptor materialization is deferred to
 queries as applicable. Queries return no row after a detectable payload
 replacement, truncation, or metadata change. The Tauri log includes
-`[explorer-load]` timings for payload loading, integrity, validation, and index
-setup, plus `[game_new]` session and first-bucket timings. This separates
-universal payload/index work from deferred bucket I/O when diagnosing a slow
-load. HU, eager MP, and legacy readers are unchanged.
+`[universal-reader]` timings for payload loading, integrity, validation, and
+index setup, plus `[explorer-load]` command-level timings and `[game_new]`
+session and first-bucket timings. This separates universal payload/index work
+from deferred bucket I/O when diagnosing a slow load. HU, eager MP, and legacy
+readers are unchanged.
 
 Universal bundles may be placed directly at the selected directory, under
 `final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout

@@ -119,6 +119,11 @@ pub(crate) struct LegacyHuData {
 pub(crate) struct UniversalData {
     manifest: Manifest,
     reader: UniversalReader,
+    /// Safely decoded MP-lazy probabilities retained for the borrowed query API.
+    ///
+    /// The wire format stores little-endian bytes, so this backing buffer is
+    /// decoded once rather than exposing an aligned `&[f32]` through a cast.
+    mp_lazy_probs: Option<Box<[f32]>>,
 }
 
 #[derive(Debug)]
@@ -202,11 +207,11 @@ pub struct InfosetView<'a> {
     pub actions: Vec<ActionDescriptor>,
 }
 
-/// Owned view returned by MP-lazy queries.
+/// Owned view returned by [`LoadedBundle::query_mp_lazy_owned`].
 ///
-/// MP-lazy probabilities are decoded from little-endian bytes into a small
-/// owned vector per query. Keeping this separate from [`InfosetView`] preserves
-/// the borrowed public API used by HU and eager MP callers.
+/// MP-lazy probabilities are copied into an owned vector for the caller.
+/// Keeping this separate from [`InfosetView`] preserves the borrowed public
+/// API used by HU, eager MP, and compatibility MP-lazy callers.
 #[derive(Debug)]
 pub struct MpLazyInfosetView {
     /// The action probabilities for this infoset (one per action).
@@ -352,10 +357,11 @@ impl LoadedBundle {
     ///
     /// Returns `None` if the infoset is not found.
     #[must_use]
-    pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<MpLazyInfosetView> {
+    pub fn query_mp_lazy(&self, key: &MpLazyKey) -> Option<InfosetView<'_>> {
         match self {
             Self::UniversalMpLazy { data, index } => {
                 let reader = data.reader.mp_lazy()?;
+                let probs = data.mp_lazy_probs.as_deref()?;
                 if !reader.is_stable() {
                     return None;
                 }
@@ -377,11 +383,23 @@ impl LoadedBundle {
                     }
                 }
                 let row_idx = row_idx?;
-                let view = build_view_from_mp_lazy(reader, row_idx)?;
+                let view = build_view_from_mp_lazy(reader, probs, row_idx)?;
                 reader.is_stable().then_some(view)
             }
             _ => None,
         }
+    }
+
+    /// Query an MP-lazy infoset and return owned probabilities and actions.
+    ///
+    /// This is the owned counterpart to [`Self::query_mp_lazy`].
+    #[must_use]
+    pub fn query_mp_lazy_owned(&self, key: &MpLazyKey) -> Option<MpLazyInfosetView> {
+        let view = self.query_mp_lazy(key)?;
+        Some(MpLazyInfosetView {
+            probs: view.probs.to_vec(),
+            actions: view.actions,
+        })
     }
 }
 
@@ -405,23 +423,39 @@ fn query_legacy_hu(d: &LegacyHuData, arena_node_idx: u32, bucket: u16) -> Option
     Some(InfosetView { probs, actions })
 }
 
-/// Build a query view from the owned MP-lazy reader. The small per-row
-/// probability allocation is deliberate: the wire format is little-endian
-/// and cannot be exposed as an aligned `&[f32]` portably without unsafe casts.
-fn build_view_from_mp_lazy(
-    reader: &MpLazyBundleReader,
+/// Build a borrowed compatibility view from the owned MP-lazy reader and its
+/// safely decoded probability backing buffer.
+fn build_view_from_mp_lazy<'a>(
+    reader: &'a MpLazyBundleReader,
+    probs: &'a [f32],
     row_idx: usize,
-) -> Option<MpLazyInfosetView> {
+) -> Option<InfosetView<'a>> {
     let row = reader.row(row_idx)?;
     let count = usize::from(row.action_count);
     let prob_start = usize::try_from(row.prob_offset).ok()?;
-    let probs = reader.prob_slice(prob_start, count)?;
+    let prob_end = prob_start.checked_add(count)?;
+    let probs = probs.get(prob_start..prob_end)?;
     let action_start = usize::try_from(row.action_offset).ok()?;
     let mut actions = Vec::with_capacity(count);
     for i in 0..count {
         actions.push(reader.action(action_start.checked_add(i)?)?);
     }
-    Some(MpLazyInfosetView { probs, actions })
+    Some(InfosetView { probs, actions })
+}
+
+/// Decode the MP-lazy probability payload into a stable backing buffer for
+/// the compatibility query API. Row and probability validation has already
+/// run before this helper is called, so a missing range indicates malformed
+/// in-memory state and returns `None` rather than panicking.
+fn decode_mp_lazy_probs(reader: &MpLazyBundleReader) -> Option<Box<[f32]>> {
+    let mut total = 0usize;
+    for row_idx in 0..reader.row_count() {
+        let row = reader.row(row_idx)?;
+        let start = usize::try_from(row.prob_offset).ok()?;
+        let end = start.checked_add(usize::from(row.action_count))?;
+        total = total.max(end);
+    }
+    Some(reader.prob_slice(0, total)?.into_boxed_slice())
 }
 
 /// Synthesize action descriptors from the game tree node's actions
@@ -755,6 +789,7 @@ fn load_universal(
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::Eager(reader),
+                mp_lazy_probs: None,
             });
             Ok(LoadedBundle::UniversalHu { data, index })
         }
@@ -764,6 +799,7 @@ fn load_universal(
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::Eager(reader),
+                mp_lazy_probs: None,
             });
             Ok(LoadedBundle::UniversalMpEager { data, index })
         }
@@ -778,9 +814,15 @@ fn load_universal(
                     },
                 ));
             }
+            let mp_lazy_probs = decode_mp_lazy_probs(&reader).ok_or_else(|| {
+                LoaderError::Format(super::error::FormatError::InvalidManifest {
+                    detail: "failed to decode MP-lazy probability payload".to_string(),
+                })
+            })?;
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::MpLazy(reader),
+                mp_lazy_probs: Some(mp_lazy_probs),
             });
             Ok(LoadedBundle::UniversalMpLazy { data, index })
         }

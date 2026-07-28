@@ -14,7 +14,7 @@
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
 use poker_solver_core::blueprint_universal::{
     detect_bundle_kind, load_bundle, write_bundle, ActionKind, BundleData, BundleKind,
-    BundleReader, FormatError, LoaderError, MpLazyKey,
+    BundleReader, FormatError, InfosetView, LoaderError, MpLazyKey,
 };
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
@@ -888,7 +888,7 @@ fn load_mp_lazy_and_query() {
         history_hash: 0xAAAA,
         history_len: 4,
     };
-    let view = bundle
+    let view: InfosetView<'_> = bundle
         .query_mp_lazy(&key)
         .expect("should find the lazy infoset");
     assert_eq!(view.probs.len(), 3);
@@ -952,7 +952,7 @@ fn load_mp_lazy_zero_mass_uniform() {
     assert_eq!(view.probs.len(), 2);
 
     // Should be uniform (0.5, 0.5)
-    for &p in &view.probs {
+    for &p in view.probs {
         assert!(
             (p - 0.5).abs() < 1e-6,
             "zero-mass row should be uniform, got {p}"
