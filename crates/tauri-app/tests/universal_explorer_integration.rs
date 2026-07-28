@@ -23,7 +23,7 @@ use poker_solver_core::poker::{Card, Suit, Value};
 
 use poker_solver_tauri::{
     game_back_core, game_deal_card_core, game_get_state_core, game_new_core, game_play_action_core,
-    ExplorationPosition, ExplorationState, GameSessionState, PostflopState,
+    game_solve_core, ExplorationPosition, ExplorationState, GameSessionState, PostflopState,
 };
 use tempfile::TempDir;
 
@@ -1279,6 +1279,101 @@ async fn two_player_lazy_flop_matrix_uses_concrete_root_reach_per_seat() {
         .iter()
         .all(|combo| (combo.weight - 0.25).abs() < 1e-6));
     assert!((aa.probabilities.iter().sum::<f32>() - aa.weight).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_flop_reach_anomaly(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy exact fixture should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("2p MP lazy exact fixture should initialize");
+
+    let root = game_get_state_core(&sessions, None).unwrap();
+    let sb_raise = root
+        .actions
+        .iter()
+        .find(|action| action.label == "2bb")
+        .expect("SB should expose the opening raise");
+    let after_sb_raise = game_play_action_core(&sessions, &sb_raise.id, None).unwrap();
+    let bb_reraise = after_sb_raise
+        .actions
+        .iter()
+        .find(|action| action.label == "3bb")
+        .expect("BB should expose the reraise");
+    let after_bb_reraise = game_play_action_core(&sessions, &bb_reraise.id, None).unwrap();
+    let sb_call = after_bb_reraise
+        .actions
+        .iter()
+        .find(|action| action.action_type == "call")
+        .expect("SB should expose the call");
+    let flop_chance = game_play_action_core(&sessions, &sb_call.id, None).unwrap();
+    assert!(flop_chance.is_chance);
+
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let flop = game_deal_card_core(&sessions, "Qh").unwrap();
+    assert_eq!(flop.position, "BB");
+
+    let snapshot = sessions
+        .mp_session
+        .write()
+        .as_mut()
+        .expect("MP session should remain active")
+        .exact_solve_snapshot()
+        .expect("flop snapshot should be supported");
+    assert_eq!(snapshot.oop_seat, 1, "BB is actual seat 1 in this fixture");
+    assert_eq!(snapshot.ip_seat, 0, "SB is actual seat 0 in this fixture");
+    assert_eq!(snapshot.acting_seat, 1, "BB acts first on the flop");
+    assert_eq!(snapshot.root.initial_player, 0, "range solver OOP is BB");
+    assert_eq!(
+        snapshot.root.initial_prev_action,
+        range_solver::Action::None
+    );
+    assert_eq!(snapshot.raw_reaches_by_seat.len(), 2);
+    assert!(
+        snapshot
+            .raw_reaches_by_seat
+            .iter()
+            .all(|reach| reach.len() == 1326)
+    );
+    assert_eq!(snapshot.action_history.len(), 3);
+    assert_eq!(snapshot.action_history[0].position, "SB");
+    assert_eq!(snapshot.action_history[1].position, "BB");
+    assert_eq!(snapshot.action_history[2].position, "SB");
+
+    game_solve_core(
+        &sessions,
+        Some("exact".to_string()),
+        Some(1),
+        None,
+        Some(1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(false),
+    )
+    .expect("Universal MP flop exact solve should start");
+
+    for _ in 0..200 {
+        let state = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+        if state.solve.as_ref().is_some_and(|solve| solve.is_complete) {
+            assert!(
+                state.matrix.is_some(),
+                "exact result should overlay the MP state"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("Universal MP exact solve did not complete");
 }
 
 #[tokio::test]

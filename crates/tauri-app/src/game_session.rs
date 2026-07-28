@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
 use poker_solver_core::blueprint_mp::game_tree::TreeAction as MpTreeAction;
-use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
+use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyBettingSnapshot, LazyMpGame, LazyResolvedSpot};
 use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_universal::{
     ActionDescriptor, ActionKind, BundleKind, LoadedBundle, MpLazyKey,
@@ -329,6 +329,32 @@ pub fn effective_stack_for_solve_root(root: &SolveGameRoot) -> i32 {
         .filter(|stack| *stack > 0)
         .min()
         .unwrap_or(1)
+}
+
+/// Exact solve inputs captured from a Universal MP lazy session.
+///
+/// `raw_reaches_by_seat` stays in the bundle's actual seat order. The exact
+/// solver maps those arrays to OOP/IP using `oop_seat` and `ip_seat`; keeping
+/// both facts in this type prevents display-order assumptions from leaking
+/// into solver construction.
+#[derive(Debug, Clone)]
+pub struct UniversalMpSolveSnapshot {
+    pub board: Vec<String>,
+    pub raw_reaches_by_seat: [Vec<f32>; 2],
+    pub acting_seat: u8,
+    pub pot: i32,
+    pub remaining_stacks: [i32; 2],
+    pub street_bets: [i32; 2],
+    pub facing_bet: bool,
+    pub raise_count: u8,
+    pub last_raise_to: i32,
+    pub last_aggressive_action: Option<MpTreeAction>,
+    pub oop_seat: u8,
+    pub ip_seat: u8,
+    pub root: SolveGameRoot,
+    pub bet_sizes: Vec<Vec<f64>>,
+    pub action_history: Vec<ActionRecord>,
+    pub actions: Vec<GameAction>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -847,6 +873,52 @@ impl LazyMpSession {
         }
 
         Ok(reaches)
+    }
+
+    /// Capture the exact supported MP solve inputs at the current flop spot.
+    ///
+    /// Reaches are replayed from the raw sparse rows and remain in actual seat
+    /// order. Betting metadata comes from the lazy core state, including the
+    /// raw action that established a live bet; no display label is parsed.
+    pub fn exact_solve_snapshot(&mut self) -> Result<UniversalMpSolveSnapshot, String> {
+        if self.terminal {
+            return Err(
+                "Exact solve requires a non-terminal Universal MP flop decision".to_string(),
+            );
+        }
+        if self.spot.street() != MpStreet::Flop || self.board.len() != 3 {
+            return Err(
+                "Exact solve is supported for UniversalMpLazy flop decisions only".to_string(),
+            );
+        }
+
+        let board = mp_board_strings(&self.board);
+        let action_history = self.action_history.clone();
+        let raw_reaches_by_seat = self.flop_root_reaches(&action_history, &self.board.clone())?;
+        let actions =
+            build_mp_game_actions(&self.current_actions(), mp_big_blind_amount(&self.config)?);
+        let betting = self.spot.betting_snapshot();
+        let (sb_seat, bb_seat) = mp_sb_bb_seats(&self.config)?;
+        let root = mp_solve_root(&betting, sb_seat, bb_seat)?;
+
+        Ok(UniversalMpSolveSnapshot {
+            board,
+            raw_reaches_by_seat,
+            acting_seat: betting.to_act.index(),
+            pot: chips_to_i32(betting.pot),
+            remaining_stacks: chips_array_to_i32(betting.stacks),
+            street_bets: chips_array_to_i32(betting.street_bets),
+            facing_bet: betting.facing_bet,
+            raise_count: betting.raise_count,
+            last_raise_to: chips_to_i32(betting.last_raise_to),
+            last_aggressive_action: betting.last_aggressive_action,
+            oop_seat: bb_seat,
+            ip_seat: sb_seat,
+            root,
+            bet_sizes: mp_flop_bet_sizes(&self.config)?,
+            action_history,
+            actions,
+        })
     }
 
     fn flop_bucket(
@@ -2331,6 +2403,121 @@ fn mp_big_blind_amount(config: &BlueprintMpConfig) -> Result<f64, String> {
         .ok_or_else(|| "Universal MP config must define a positive BigBlind forced bet".to_string())
 }
 
+fn mp_sb_bb_seats(config: &BlueprintMpConfig) -> Result<(u8, u8), String> {
+    let sb = config
+        .game
+        .blinds
+        .iter()
+        .find(|blind| blind.kind == ForcedBetKind::SmallBlind)
+        .map(|blind| blind.seat)
+        .ok_or_else(|| "Universal MP config must define a SmallBlind forced bet".to_string())?;
+    let bb = config
+        .game
+        .blinds
+        .iter()
+        .find(|blind| blind.kind == ForcedBetKind::BigBlind)
+        .map(|blind| blind.seat)
+        .ok_or_else(|| "Universal MP config must define a BigBlind forced bet".to_string())?;
+    if sb == bb || sb >= 2 || bb >= 2 {
+        return Err(format!(
+            "Universal MP exact solve requires distinct SB/BB seats among 0..2; got SB={sb}, BB={bb}"
+        ));
+    }
+    Ok((sb, bb))
+}
+
+fn chips_to_i32(chips: poker_solver_core::blueprint_mp::Chips) -> i32 {
+    chips.0.round() as i32
+}
+
+fn chips_array_to_i32(
+    chips: [poker_solver_core::blueprint_mp::Chips; poker_solver_core::blueprint_mp::MAX_PLAYERS],
+) -> [i32; 2] {
+    [chips_to_i32(chips[0]), chips_to_i32(chips[1])]
+}
+
+fn mp_flop_bet_sizes(config: &BlueprintMpConfig) -> Result<Vec<Vec<f64>>, String> {
+    let parse_sizes = |values: &[serde_yaml::Value], label: &str| {
+        values
+            .iter()
+            .map(|value| {
+                value.as_f64().or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|value| value.trim().parse::<f64>().ok())
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("Universal MP {label} size is not numeric"))
+    };
+    let flop = &config.action_abstraction.flop;
+    let lead = parse_sizes(&flop.lead, "flop lead")?;
+    let raise = flop.raise.first().map_or_else(
+        || Ok(lead.clone()),
+        |sizes| parse_sizes(sizes, "flop raise"),
+    )?;
+    Ok(vec![lead, raise])
+}
+
+fn mp_solve_root(
+    betting: &LazyBettingSnapshot,
+    sb_seat: u8,
+    bb_seat: u8,
+) -> Result<SolveGameRoot, String> {
+    let actual_actor = betting.to_act.index();
+    let initial_player = if actual_actor == bb_seat {
+        0
+    } else if actual_actor == sb_seat {
+        1
+    } else {
+        return Err(format!(
+            "Universal MP exact solve encountered unsupported acting seat {actual_actor}"
+        ));
+    };
+    let initial_stacks = [
+        chips_to_i32(betting.stacks[bb_seat as usize]),
+        chips_to_i32(betting.stacks[sb_seat as usize]),
+    ];
+    let street_bets = [
+        chips_to_i32(betting.street_bets[bb_seat as usize]),
+        chips_to_i32(betting.street_bets[sb_seat as usize]),
+    ];
+    let starting_pot = (chips_to_i32(betting.pot) - street_bets[0] - street_bets[1]).max(1);
+    let matched_amount = street_bets[0].min(street_bets[1]);
+
+    let (initial_prev_action, initial_prev_amount, initial_num_bets) = if betting.facing_bet {
+        let Some(action) = betting.last_aggressive_action else {
+            return Err(
+                "Universal MP exact solve is missing raw aggressive action metadata".to_string(),
+            );
+        };
+        let amount = chips_to_i32(betting.last_raise_to);
+        let previous = match action {
+            MpTreeAction::Lead(_) => range_solver::Action::Bet(amount),
+            MpTreeAction::Raise(_) => range_solver::Action::Raise(amount),
+            MpTreeAction::AllIn => range_solver::Action::AllIn(amount),
+            MpTreeAction::Fold | MpTreeAction::Check | MpTreeAction::Call => {
+                return Err(format!(
+                    "Universal MP exact solve received non-aggressive raw action {action:?} while facing a bet"
+                ));
+            }
+        };
+        (previous, amount, i32::from(betting.raise_count.max(1)))
+    } else {
+        (range_solver::Action::None, 0, 0)
+    };
+
+    Ok(SolveGameRoot {
+        starting_pot,
+        initial_player,
+        initial_stacks,
+        initial_prev_action,
+        initial_prev_amount,
+        initial_amount: matched_amount,
+        initial_num_bets,
+    })
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn build_mp_game_actions(actions: &[MpTreeAction], big_blind: f64) -> Vec<GameAction> {
     actions
@@ -2424,6 +2611,21 @@ fn semantic_action_from_tree_action(action: &TreeAction) -> SemanticAction {
 
     SemanticAction {
         action_type: action_type_string(action),
+        amount_bb,
+    }
+}
+
+fn semantic_action_from_mp_tree_action(action: &MpTreeAction) -> SemanticAction {
+    let (action_type, amount_bb) = match action {
+        MpTreeAction::Fold => ("fold", None),
+        MpTreeAction::Check => ("check", None),
+        MpTreeAction::Call => ("call", None),
+        MpTreeAction::Lead(amount) => ("bet", Some((amount / 2.0).round() as i32)),
+        MpTreeAction::Raise(amount) => ("raise", Some((amount / 2.0).round() as i32)),
+        MpTreeAction::AllIn => ("allin", None),
+    };
+    SemanticAction {
+        action_type: action_type.to_string(),
         amount_bb,
     }
 }
@@ -3277,6 +3479,87 @@ fn resolve_solve_path_from_session(ss: &SolveState, session: &GameSession) -> Op
     Some(path)
 }
 
+fn resolve_solve_path_from_mp_session(
+    ss: &SolveState,
+    session: &LazyMpSession,
+) -> Option<Vec<usize>> {
+    let anchor = ss.solve_anchor.read().clone();
+    let Some(anchor) = anchor.as_ref() else {
+        return Some(ss.solve_path.read().clone());
+    };
+    if mp_board_strings(&session.board) != anchor.board
+        || session.action_history.len() < anchor.action_ids.len()
+        || session
+            .action_history
+            .iter()
+            .take(anchor.action_ids.len())
+            .map(|action| &action.action_id)
+            .ne(anchor.action_ids.iter())
+    {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    let cache = ss.solve_cache.read();
+    for record in session.action_history.iter().skip(anchor.action_ids.len()) {
+        let node = cache.get(&path)?;
+        let record_semantic = semantic_action_from_record(record)?;
+        let action_idx = node.actions.iter().position(|action| {
+            semantic_actions_match(&record_semantic, &semantic_action_from_game_action(action))
+        })?;
+        path.push(action_idx);
+        if !cache.contains_key(&path) {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn apply_exact_solve_overlay(state: &mut GameState, ss: &SolveState, path: Option<Vec<usize>>) {
+    let is_solving = ss.solving.load(Ordering::Relaxed);
+    let iteration = ss.iteration.load(Ordering::Relaxed);
+    if !is_solving && iteration == 0 {
+        return;
+    }
+    let exp = f32::from_bits(ss.exploitability_bits.load(Ordering::Relaxed));
+    let max_iters = ss.max_iterations.load(Ordering::Relaxed);
+    let elapsed = ss
+        .solve_start
+        .read()
+        .map(|time| time.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    state.solve = Some(SolveStatus {
+        iteration,
+        max_iterations: max_iters,
+        exploitability: exp,
+        elapsed_secs: elapsed,
+        solver_name: "range".to_string(),
+        is_complete: !is_solving && iteration > 0,
+    });
+
+    let Some(path) = path else {
+        return;
+    };
+    set_solve_path_if_changed(ss, &path);
+    if let Some(node) = cached_node_for_path(ss, &path) {
+        state.matrix = Some(node.matrix);
+        state.actions = node.actions;
+        state.position = node.position;
+    } else if path.is_empty() {
+        if let Some(matrix) = ss.matrix_snapshot.read().clone() {
+            state.matrix = Some(matrix);
+        }
+        let actions = ss.solve_actions.read();
+        if !actions.is_empty() {
+            state.actions = actions.clone();
+        }
+        let position = ss.solve_position.read();
+        if !position.is_empty() {
+            state.position = position.clone();
+        }
+    }
+}
+
 fn set_solve_path_if_changed(ss: &SolveState, path: &[usize]) {
     if ss.solve_path.read().as_slice() != path {
         *ss.solve_path.write() = path.to_vec();
@@ -3338,7 +3621,13 @@ pub fn game_get_state_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
-        return session.get_state();
+        let mut state = session.get_state()?;
+        if source.as_deref() == Some("exact") {
+            let ss = session_state.exact_solve.as_ref();
+            let path = resolve_solve_path_from_mp_session(ss, session);
+            apply_exact_solve_overlay(&mut state, ss, path);
+        }
+        return Ok(state);
     }
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
@@ -3410,7 +3699,38 @@ pub fn game_play_action_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
-        return session.play_action(action_id);
+        let ss = solve_state_for_source(session_state, source.as_deref());
+        let session_action_id = if let Some(ss) = ss.as_ref() {
+            resolve_solve_path_from_mp_session(ss, session)
+                .and_then(|path| cached_node_for_path(ss, &path))
+                .and_then(|node| {
+                    node.actions
+                        .iter()
+                        .find(|action| action.id == action_id)
+                        .and_then(|action| {
+                            session
+                                .current_actions()
+                                .iter()
+                                .enumerate()
+                                .find(|(_, current)| {
+                                    semantic_actions_match(
+                                        &semantic_action_from_game_action(action),
+                                        &semantic_action_from_mp_tree_action(current),
+                                    )
+                                })
+                                .map(|(index, _)| index.to_string())
+                        })
+                })
+                .unwrap_or_else(|| action_id.to_string())
+        } else {
+            action_id.to_string()
+        };
+        let mut state = session.play_action(&session_action_id)?;
+        if let Some(ss) = ss.as_ref() {
+            let path = resolve_solve_path_from_mp_session(ss, session);
+            apply_exact_solve_overlay(&mut state, ss, path);
+        }
+        return Ok(state);
     }
     let ss = solve_state_for_source(session_state, source.as_deref());
     let source_navigation = if let Some(ss) = ss.as_ref() {
@@ -3510,7 +3830,14 @@ pub fn game_deal_card_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
-        return session.deal_card(card);
+        let mut state = session.deal_card(card)?;
+        if session_state.exact_solve.iteration.load(Ordering::Relaxed) > 0
+            || session_state.exact_solve.solving.load(Ordering::Relaxed)
+        {
+            let path = resolve_solve_path_from_mp_session(&session_state.exact_solve, session);
+            apply_exact_solve_overlay(&mut state, &session_state.exact_solve, path);
+        }
+        return Ok(state);
     }
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
@@ -3533,7 +3860,13 @@ pub fn game_back_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
-        return session.back();
+        let mut state = session.back()?;
+        if source.as_deref() == Some("exact") {
+            let ss = &session_state.exact_solve;
+            let path = resolve_solve_path_from_mp_session(ss, session);
+            apply_exact_solve_overlay(&mut state, ss, path);
+        }
+        return Ok(state);
     }
     let ss = solve_state_for_source(session_state, source.as_deref());
     let cached_parent = ss.as_ref().and_then(|ss| {
@@ -3630,66 +3963,111 @@ pub fn game_solve_core(
         solve_root,
         root_street,
     ) = {
-        let guard = session_state.session.read();
-        let session = guard.as_ref().ok_or("No game session active")?;
+        if session_state.mp_session.read().is_some() {
+            if !is_exact {
+                return Err(
+                    "UniversalMpLazy currently supports Exact solve for flop decisions only"
+                        .to_string(),
+                );
+            }
+            let mut guard = session_state.mp_session.write();
+            let session = guard.as_mut().ok_or("No MP game session active")?;
+            let snapshot = session.exact_solve_snapshot()?;
+            let oop_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.oop_seat)].clone();
+            let ip_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.ip_seat)].clone();
+            let position = if snapshot.acting_seat == snapshot.oop_seat {
+                "BB"
+            } else {
+                "SB"
+            };
+            let solve_anchor = SolveAnchor {
+                node_idx: 0,
+                board: snapshot.board.clone(),
+                action_ids: snapshot
+                    .action_history
+                    .iter()
+                    .map(|action| action.action_id.clone())
+                    .collect(),
+            };
+            (
+                snapshot.board,
+                oop_w,
+                ip_w,
+                snapshot.pot,
+                effective_stack_for_solve_root(&snapshot.root),
+                snapshot.bet_sizes,
+                None,
+                0,
+                position.to_string(),
+                solve_anchor,
+                ["BB".to_string(), "SB".to_string()],
+                snapshot.root,
+                Street::Flop,
+            )
+        } else {
+            let guard = session_state.session.read();
+            let session = guard.as_ref().ok_or("No game session active")?;
 
-        // Must be at a postflop decision node
-        if session.board.len() < 3 {
-            return Err("Solve requires a postflop position (deal board cards first)".to_string());
+            // Must be at a postflop decision node
+            if session.board.len() < 3 {
+                return Err(
+                    "Solve requires a postflop position (deal board cards first)".to_string(),
+                );
+            }
+            let node = &session.tree.nodes[session.node_idx as usize];
+            let player = match node {
+                V2GameNode::Decision { player, .. } => *player,
+                _ => return Err("Not at a decision node".to_string()),
+            };
+
+            let board = session.board.clone();
+            let oop_w = session.weights[0].clone();
+            let ip_w = session.weights[1].clone();
+            let pot = session.compute_pot();
+            let solve_root = session.solve_game_root_for_player(player)?;
+            let eff_stack = effective_stack_for_solve_root(&solve_root);
+
+            let street = session.current_street();
+            let sizes = match street {
+                Street::Flop => &session.config.action_abstraction.flop,
+                Street::Turn => &session.config.action_abstraction.turn,
+                Street::River => &session.config.action_abstraction.river,
+                Street::Preflop => return Err("Cannot solve preflop".to_string()),
+            };
+
+            let cbv_ctx = session.cbv_context.clone();
+            let position = session.position_label(player).to_string();
+            let current_node = session.node_idx;
+            let solve_anchor = SolveAnchor {
+                node_idx: current_node,
+                board: board.clone(),
+                action_ids: session
+                    .action_history
+                    .iter()
+                    .map(|a| a.action_id.clone())
+                    .collect(),
+            };
+            let player_labels = [
+                session.position_label(1 - session.tree.dealer).to_string(),
+                session.position_label(session.tree.dealer).to_string(),
+            ];
+
+            (
+                board,
+                oop_w,
+                ip_w,
+                pot,
+                eff_stack,
+                sizes.clone(),
+                cbv_ctx,
+                current_node,
+                position,
+                solve_anchor,
+                player_labels,
+                solve_root,
+                street,
+            )
         }
-        let node = &session.tree.nodes[session.node_idx as usize];
-        let player = match node {
-            V2GameNode::Decision { player, .. } => *player,
-            _ => return Err("Not at a decision node".to_string()),
-        };
-
-        let board = session.board.clone();
-        let oop_w = session.weights[0].clone();
-        let ip_w = session.weights[1].clone();
-        let pot = session.compute_pot();
-        let solve_root = session.solve_game_root_for_player(player)?;
-        let eff_stack = effective_stack_for_solve_root(&solve_root);
-
-        let street = session.current_street();
-        let sizes = match street {
-            Street::Flop => &session.config.action_abstraction.flop,
-            Street::Turn => &session.config.action_abstraction.turn,
-            Street::River => &session.config.action_abstraction.river,
-            Street::Preflop => return Err("Cannot solve preflop".to_string()),
-        };
-
-        let cbv_ctx = session.cbv_context.clone();
-        let position = session.position_label(player).to_string();
-        let current_node = session.node_idx;
-        let solve_anchor = SolveAnchor {
-            node_idx: current_node,
-            board: board.clone(),
-            action_ids: session
-                .action_history
-                .iter()
-                .map(|a| a.action_id.clone())
-                .collect(),
-        };
-        let player_labels = [
-            session.position_label(1 - session.tree.dealer).to_string(),
-            session.position_label(session.tree.dealer).to_string(),
-        ];
-
-        (
-            board,
-            oop_w,
-            ip_w,
-            pot,
-            eff_stack,
-            sizes.clone(),
-            cbv_ctx,
-            current_node,
-            position,
-            solve_anchor,
-            player_labels,
-            solve_root,
-            street,
-        )
     };
 
     // Resolve StreetBoundaryConfig to (depth_limit, model_path)

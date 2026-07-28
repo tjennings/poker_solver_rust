@@ -247,6 +247,7 @@ pub struct LazyPublicState {
     to_act: Seat,
     facing_bet: bool,
     last_raise_to: Chips,
+    last_aggressive_action: Option<TreeAction>,
     dealer: u8,
     big_blind_amount: Chips,
 }
@@ -275,6 +276,54 @@ impl LazyPublicState {
     pub const fn raise_count(self) -> u8 {
         self.raise_count
     }
+
+    /// Remaining stacks in actual seat order.
+    #[must_use]
+    pub const fn stacks(self) -> [Chips; MAX_PLAYERS] {
+        self.stacks
+    }
+
+    /// Current street contributions in actual seat order.
+    #[must_use]
+    pub const fn street_bets(self) -> [Chips; MAX_PLAYERS] {
+        self.street_bets
+    }
+
+    /// Whether the acting seat is facing an outstanding bet.
+    #[must_use]
+    pub const fn facing_bet(self) -> bool {
+        self.facing_bet
+    }
+
+    /// The raw aggressive action that established the current bet, if any.
+    #[must_use]
+    pub const fn last_aggressive_action(self) -> Option<TreeAction> {
+        self.last_aggressive_action
+    }
+
+    /// The current bet-to amount in raw game-tree chips.
+    #[must_use]
+    pub const fn last_raise_to(self) -> Chips {
+        self.last_raise_to
+    }
+}
+
+/// Exact public betting metadata for a resolved lazy spot.
+///
+/// The values are deliberately kept in actual seat order and retain the raw
+/// `TreeAction` that established a bet. Consumers building another game tree
+/// must map seats explicitly rather than infer amounts from display labels.
+#[derive(Debug, Clone, Copy)]
+pub struct LazyBettingSnapshot {
+    pub to_act: Seat,
+    pub stacks: [Chips; MAX_PLAYERS],
+    pub street_bets: [Chips; MAX_PLAYERS],
+    pub pot: Chips,
+    pub raise_count: u8,
+    pub facing_bet: bool,
+    pub last_raise_to: Chips,
+    pub last_aggressive_action: Option<TreeAction>,
+    pub street: Street,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -370,6 +419,22 @@ impl LazyResolvedSpot {
     #[must_use]
     pub fn key_for_bucket(self, bucket: u16) -> MpInfosetKey {
         self.history.key(self.state, bucket)
+    }
+
+    /// Return exact public betting metadata for this spot.
+    #[must_use]
+    pub const fn betting_snapshot(self) -> LazyBettingSnapshot {
+        LazyBettingSnapshot {
+            to_act: self.to_act(),
+            stacks: self.stacks(),
+            street_bets: self.state.street_bets(),
+            pot: self.pot(),
+            raise_count: self.state.raise_count(),
+            facing_bet: self.state.facing_bet(),
+            last_raise_to: self.state.last_raise_to(),
+            last_aggressive_action: self.state.last_aggressive_action(),
+            street: self.street(),
+        }
     }
 
     /// Advance this resolved spot by one action index.
@@ -1294,9 +1359,8 @@ fn apply_action(state: LazyPublicState, action: TreeAction) -> LazyNode {
         TreeAction::Fold => fold_child(state),
         TreeAction::Check => check_child(state),
         TreeAction::Call => call_child(state),
-        TreeAction::Lead(amount) | TreeAction::Raise(amount) => {
-            aggression_child(state, Chips(amount))
-        }
+        TreeAction::Lead(amount) => aggression_child(state, TreeAction::Lead(amount)),
+        TreeAction::Raise(amount) => aggression_child(state, TreeAction::Raise(amount)),
         TreeAction::AllIn => all_in_child(state),
     }
 }
@@ -1347,7 +1411,11 @@ fn call_child(state: LazyPublicState) -> LazyNode {
     advance_to_next_player(next)
 }
 
-fn aggression_child(state: LazyPublicState, raise_to: Chips) -> LazyNode {
+fn aggression_child(state: LazyPublicState, action: TreeAction) -> LazyNode {
+    let raise_to = match action {
+        TreeAction::Lead(amount) | TreeAction::Raise(amount) => Chips(amount),
+        _ => unreachable!("aggression_child requires a sized aggressive action"),
+    };
     let seat = state.to_act;
     let idx = seat.index() as usize;
     let additional = raise_to - state.street_bets[idx];
@@ -1360,6 +1428,7 @@ fn aggression_child(state: LazyPublicState, raise_to: Chips) -> LazyNode {
     next.raise_count += 1;
     next.facing_bet = true;
     next.last_raise_to = raise_to;
+    next.last_aggressive_action = Some(action);
     next.acted_since_aggression = PlayerSet::empty();
     next.acted_since_aggression.insert(seat);
 
@@ -1392,6 +1461,7 @@ fn all_in_child(state: LazyPublicState) -> LazyNode {
     next.raise_count += 1;
     next.facing_bet = true;
     next.last_raise_to = raise_to;
+    next.last_aggressive_action = Some(TreeAction::AllIn);
     next.acted_since_aggression = PlayerSet::empty();
     next.acted_since_aggression.insert(seat);
 
@@ -1436,6 +1506,7 @@ fn init_public_state(config: &MpGameConfig, stack: Chips) -> LazyPublicState {
         to_act: Seat::from_raw(0),
         facing_bet: true,
         last_raise_to: Chips(2.0),
+        last_aggressive_action: None,
         dealer: find_dealer(config),
         big_blind_amount: Chips(2.0),
     };
@@ -1823,6 +1894,7 @@ fn new_street_state(state: LazyPublicState, next_street: Street) -> LazyPublicSt
     next.raise_count = 0;
     next.facing_bet = false;
     next.last_raise_to = Chips::ZERO;
+    next.last_aggressive_action = None;
     next.acted_since_aggression = PlayerSet::empty();
     next.to_act = find_postflop_first_to_act(&next);
     next
@@ -2102,6 +2174,7 @@ mod tests {
             to_act: Seat::from_raw(to_act),
             facing_bet: true,
             last_raise_to: Chips(10.0),
+            last_aggressive_action: Some(TreeAction::Raise(10.0)),
             dealer: 3,
             big_blind_amount: Chips(2.0),
         }
@@ -2147,6 +2220,7 @@ mod tests {
             to_act: Seat::from_raw(0),
             facing_bet,
             last_raise_to: Chips(to_call),
+            last_aggressive_action: facing_bet.then_some(TreeAction::Lead(to_call)),
             dealer: 0,
             big_blind_amount: Chips(2.0),
         }
@@ -2177,6 +2251,7 @@ mod tests {
             to_act: Seat::from_raw(0),
             facing_bet,
             last_raise_to: Chips(10.0),
+            last_aggressive_action: facing_bet.then_some(TreeAction::Lead(10.0)),
             dealer: 0,
             big_blind_amount: Chips(2.0),
         }
