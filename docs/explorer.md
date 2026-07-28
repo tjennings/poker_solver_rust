@@ -56,11 +56,15 @@ routes through the unified loader (`blueprint_universal::loader`):
   and report a precise capability error rather than fabricating strategy.
 
 Loading is staged for universal MP lazy bundles: creating the game session does
-not load the file-backed bucket corpus. Preflop browsing uses the universal rows
-already loaded with the bundle; the bucket source is opened and cached only when
-the first flop lookup needs it. The Tauri log includes `[explorer-load]` phase
-timings plus `[game_new]` session and first-bucket timings, which separates
-universal payload/index I/O from deferred bucket I/O when diagnosing a slow load.
+not load the file-backed bucket corpus. The universal payload reader uses private
+read-only memory mappings rather than eagerly owned payload vectors. Manifest,
+header, checksum, CRC, structural, and probability-normalization validation still
+runs during load; descriptor materialization is deferred to queries as applicable.
+The Tauri log includes `[explorer-load]` timings for mapping, integrity,
+validation, and index setup, plus `[game_new]` session and first-bucket timings.
+This separates universal payload/index work from deferred bucket I/O when
+diagnosing a slow load. Universal MP-lazy bundle files must remain immutable while
+loaded. HU, eager MP, and legacy readers are unchanged.
 
 Universal bundles may be placed directly at the selected directory, under
 `final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout
