@@ -4981,9 +4981,12 @@ pub fn game_load_spot_core(
     session_state: &GameSessionState,
     spot: &str,
 ) -> Result<GameState, String> {
+    let _solve_request_guard = session_state.solve_request_gate.write();
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.load_spot(spot)?;
+    session_state.subgame_solve.reset();
+    session_state.exact_solve.reset();
     Ok(session.get_state())
 }
 
@@ -6977,6 +6980,44 @@ mod tests {
         let state = game_load_spot_core(&gss, "sb:2bb,bb:fold").unwrap();
         assert_eq!(state.action_history.len(), 2);
         assert!(state.is_terminal);
+    }
+
+    #[test]
+    fn load_spot_core_invalidates_stale_solve_generations() {
+        let gss = GameSessionState::default();
+        *gss.session.write() = Some(make_multi_street_session());
+
+        let anchor = SolveAnchor {
+            node_idx: 0,
+            board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+            action_ids: vec![],
+        };
+        let exact_generation =
+            reset_solve_state_for_start(&gss.exact_solve, 10, "BB".to_string(), anchor.clone());
+        let subgame_generation =
+            reset_solve_state_for_start(&gss.subgame_solve, 10, "BB".to_string(), anchor);
+
+        let state = game_load_spot_core(&gss, "sb:fold").unwrap();
+        assert_eq!(state.action_history.len(), 1);
+
+        for (solve_state, generation) in [
+            (&gss.exact_solve, exact_generation),
+            (&gss.subgame_solve, subgame_generation),
+        ] {
+            assert_ne!(solve_state.generation.load(Ordering::Acquire), generation);
+            assert!(!solve_state.solving.load(Ordering::Acquire));
+            assert!(solve_state.cancel.load(Ordering::Acquire));
+            assert!(solve_state.solve_cache.read().is_empty());
+            assert!(!solve_state.publish_if_current(generation, |state| {
+                state.iteration.store(99, Ordering::Relaxed);
+                state.solving.store(false, Ordering::Relaxed);
+            }));
+            assert_eq!(solve_state.iteration.load(Ordering::Acquire), 0);
+        }
+
+        let state = game_get_state_core(&gss, Some("exact".to_string())).unwrap();
+        assert!(state.solve.is_none());
+        assert!(state.matrix.is_none());
     }
 
     // -------------------------------------------------------------------
