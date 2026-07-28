@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-ff5s
 title: Harden MP exact solve cache anchors and chip units
-status: completed
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-07-28T18:21:54Z
-updated_at: 2026-07-28T18:32:35Z
+updated_at: 2026-07-28T18:34:34Z
 parent: poker_solver_rust-mk2k
 ---
 
@@ -22,3 +22,5 @@ Review follow-up for UniversalMpLazy exact flop solve.
 - MP exact overlays now require a matching solve anchor before publishing exact status or cached matrices.
 - MP exact matrices, cached actions, and semantic matching use the configured big-blind chip units.
 - Added stale-navigation and nonstandard-big-blind regression coverage while retaining the asymmetric flop exact test.
+
+## Verification Follow-up\n\nThe final focused run exposed a failure in two_player_lazy_exact_solve_uses_configured_big_blind_for_root_actions for a 1.5-chip BB. The asymmetric 2.0-chip BB test passes. Diagnose the remaining root/action amount conversion and restore the nonstandard-BB regression before completion.
