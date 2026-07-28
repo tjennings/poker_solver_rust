@@ -263,7 +263,10 @@ pub struct GameMatrixCell {
     pub hand: String,
     pub suited: bool,
     pub pair: bool,
-    pub probabilities: Vec<f32>, // one per action (averaged across combos)
+    /// One value per action. Universal lazy MP preflop values are root-reach-
+    /// weighted and sum to `weight`; other sources may expose conditional
+    /// strategy frequencies.
+    pub probabilities: Vec<f32>,
     pub combo_count: usize,
     pub weight: f32, // reaching probability
     pub ev: Option<f32>,
@@ -659,6 +662,79 @@ impl LazyMpSession {
         Ok(probabilities)
     }
 
+    fn preflop_bucket_for_hand(&self, hand_index: usize) -> Result<u16, String> {
+        let bucket_count = usize::from(self.config.clustering.preflop.buckets);
+        if bucket_count == 0 {
+            return Err("Universal MP config has zero preflop buckets".to_string());
+        }
+        Ok(if bucket_count == 169 {
+            hand_index as u16
+        } else {
+            hand_index.min(bucket_count - 1) as u16
+        })
+    }
+
+    /// Propagate each seat's root reach through the exact public action path.
+    ///
+    /// This intentionally keeps per-seat reach independent: an action only
+    /// changes the reach of the seat that selected it. Opponent actions do not
+    /// reduce the other seat's root reach.
+    fn preflop_root_reaches(
+        &self,
+        action_history: &[ActionRecord],
+    ) -> Result<[Vec<f32>; 2], String> {
+        let mut reaches = [vec![1.0; 169], vec![1.0; 169]];
+        let mut replay_spot = LazyResolvedSpot::root(&self.game);
+
+        for record in action_history {
+            if replay_spot.street() != MpStreet::Preflop {
+                return Err(format!(
+                    "Universal MP preflop reach replay reached {} before action {}",
+                    mp_street_to_string(replay_spot.street()),
+                    record.action_id
+                ));
+            }
+            let mp_actions = replay_spot.actions(&self.game);
+            let action_index = record.action_id.parse::<usize>().map_err(|_| {
+                format!(
+                    "Invalid MP action_id during reach replay: {}",
+                    record.action_id
+                )
+            })?;
+            if action_index >= mp_actions.len() {
+                return Err(format!(
+                    "MP action {action_index} out of range during reach replay (max {})",
+                    mp_actions.len().saturating_sub(1)
+                ));
+            }
+            let seat = usize::from(replay_spot.to_act().index());
+            if seat >= reaches.len() {
+                return Err(format!(
+                    "Universal MP reach replay encountered unsupported seat {}",
+                    replay_spot.to_act().index()
+                ));
+            }
+
+            for hand_index in 0..169 {
+                let bucket = self.preflop_bucket_for_hand(hand_index)?;
+                let probabilities =
+                    self.probabilities_for_bucket(replay_spot, bucket, &mp_actions)?;
+                reaches[seat][hand_index] *= probabilities[action_index];
+            }
+
+            replay_spot = replay_spot
+                .advance(&self.game, action_index)
+                .ok_or_else(|| {
+                    format!(
+                        "Universal MP reach replay action {} terminated before the requested state",
+                        record.action_id
+                    )
+                })?;
+        }
+
+        Ok(reaches)
+    }
+
     fn flop_bucket(
         &self,
         spot: LazyResolvedSpot,
@@ -823,28 +899,29 @@ impl LazyMpSession {
             ));
         }
 
-        let bucket_count = usize::from(self.config.clustering.preflop.buckets);
-        if bucket_count == 0 {
-            return Err("Universal MP config has zero preflop buckets".to_string());
-        }
+        let reaches = self.preflop_root_reaches(action_history)?;
+        let acting_seat = usize::from(spot.to_act().index());
         let mut cells = Vec::with_capacity(13);
         for (row, &rank1) in RANKS.iter().enumerate() {
             let mut row_cells = Vec::with_capacity(13);
             for (col, &rank2) in RANKS.iter().enumerate() {
                 let (label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
                 let hand_index = canonical_hand_index_from_ranks(rank1, rank2, suited);
-                let bucket = if bucket_count == 169 {
-                    hand_index as u16
-                } else {
-                    hand_index.min(bucket_count - 1) as u16
-                };
+                let bucket = self.preflop_bucket_for_hand(hand_index)?;
+                let reach = reaches[acting_seat][hand_index];
+                let conditional_probabilities =
+                    self.probabilities_for_bucket(spot, bucket, &mp_actions)?;
+                let probabilities = conditional_probabilities
+                    .into_iter()
+                    .map(|probability| reach * probability)
+                    .collect();
                 row_cells.push(GameMatrixCell {
                     hand: label,
                     suited,
                     pair,
-                    probabilities: self.probabilities_for_bucket(spot, bucket, &mp_actions)?,
+                    probabilities,
                     combo_count: 0,
-                    weight: 1.0,
+                    weight: reach,
                     ev: None,
                     combos: vec![],
                 });

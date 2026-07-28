@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-07-28T00:23:55Z
+updated_at: 2026-07-28T00:59:59Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -66,8 +66,15 @@ Added deterministic sentinel-row regression coverage for the root, intermediate,
 
 The Explorer matrix must display only root-reach-weighted action frequencies. A hand that folds at the root must have zero displayed frequency at every descendant node. Do not expose conditional off-path strategy as the primary matrix metric.
 
-- [ ] Define the exact reach-weighting semantics for each action-history segment.
-- [ ] Implement root reach propagation for lazy MP preflop matrices.
-- [ ] Add regression coverage proving root-folded 72o displays zero after SB r2 / BB r3.
-- [ ] Update user-facing labels/docs to identify the displayed metric.
-- [ ] Run focused tests and review the change.
+- [x] Define the exact reach-weighting semantics for each action-history segment.
+- [x] Implement root reach propagation for lazy MP preflop matrices.
+- [x] Add regression coverage proving root-folded 72o displays zero after SB r2 / BB r3.
+- [x] Update user-facing labels/docs to identify the displayed metric.
+- [x] Run focused tests and review the change.
+
+## Root-Reach-Weighted Implementation Summary
+
+- Lazy MP preflop matrix probabilities now represent per-seat root-reach-weighted action frequencies using exported average strategy.
+- Reach replay follows the exact action-index history and multiplies only the player acting at each prior decision; opponent actions do not reduce that playeréÝyø§yÙs marginal reach.
+- Root remains unchanged, while a root-folded hand displays zero at descendant nodes. Action descriptors, missing-row errors, and session mutation behavior are covered by regression tests.
+- Postflop matrix values remain explicitly conditional until combo-level reach and blocker-aware propagation are implemented.
