@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::bundle::{BundleReader, MpLazyBundleReader};
@@ -119,11 +120,36 @@ pub(crate) struct LegacyHuData {
 pub(crate) struct UniversalData {
     manifest: Manifest,
     reader: UniversalReader,
-    /// Safely decoded MP-lazy probabilities retained for the borrowed query API.
+    /// Per-row MP-lazy probability backing for the borrowed query API.
     ///
-    /// The wire format stores little-endian bytes, so this backing buffer is
-    /// decoded once rather than exposing an aligned `&[f32]` through a cast.
-    mp_lazy_probs: Option<Box<[f32]>>,
+    /// The wire format stores little-endian bytes. Each row is decoded into
+    /// its own stable backing allocation only when that row is queried.
+    mp_lazy_prob_cache: Option<MpLazyProbabilityCache>,
+}
+
+#[derive(Debug)]
+struct MpLazyProbabilityCache {
+    rows: Vec<OnceLock<Box<[f32]>>>,
+}
+
+impl MpLazyProbabilityCache {
+    fn new(row_count: usize) -> Self {
+        Self {
+            rows: (0..row_count).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    fn get_or_decode<F>(&self, row_idx: usize, decode: F) -> Option<&[f32]>
+    where
+        F: FnOnce() -> Option<Box<[f32]>>,
+    {
+        let row = self.rows.get(row_idx)?;
+        if let Some(probs) = row.get() {
+            return Some(probs);
+        }
+        row.set(decode()?).ok();
+        row.get().map(Box::as_ref)
+    }
 }
 
 #[derive(Debug)]
@@ -361,7 +387,7 @@ impl LoadedBundle {
         match self {
             Self::UniversalMpLazy { data, index } => {
                 let reader = data.reader.mp_lazy()?;
-                let probs = data.mp_lazy_probs.as_deref()?;
+                let prob_cache = data.mp_lazy_prob_cache.as_ref()?;
                 if !reader.is_stable() {
                     return None;
                 }
@@ -383,6 +409,8 @@ impl LoadedBundle {
                     }
                 }
                 let row_idx = row_idx?;
+                let probs = prob_cache
+                    .get_or_decode(row_idx, || decode_mp_lazy_row_probs(reader, row_idx))?;
                 let view = build_view_from_mp_lazy(reader, probs, row_idx)?;
                 reader.is_stable().then_some(view)
             }
@@ -423,8 +451,7 @@ fn query_legacy_hu(d: &LegacyHuData, arena_node_idx: u32, bucket: u16) -> Option
     Some(InfosetView { probs, actions })
 }
 
-/// Build a borrowed compatibility view from the owned MP-lazy reader and its
-/// safely decoded probability backing buffer.
+/// Build a borrowed compatibility view from one decoded MP-lazy row.
 fn build_view_from_mp_lazy<'a>(
     reader: &'a MpLazyBundleReader,
     probs: &'a [f32],
@@ -432,9 +459,7 @@ fn build_view_from_mp_lazy<'a>(
 ) -> Option<InfosetView<'a>> {
     let row = reader.row(row_idx)?;
     let count = usize::from(row.action_count);
-    let prob_start = usize::try_from(row.prob_offset).ok()?;
-    let prob_end = prob_start.checked_add(count)?;
-    let probs = probs.get(prob_start..prob_end)?;
+    let probs = probs.get(..count)?;
     let action_start = usize::try_from(row.action_offset).ok()?;
     let mut actions = Vec::with_capacity(count);
     for i in 0..count {
@@ -443,19 +468,15 @@ fn build_view_from_mp_lazy<'a>(
     Some(InfosetView { probs, actions })
 }
 
-/// Decode the MP-lazy probability payload into a stable backing buffer for
-/// the compatibility query API. Row and probability validation has already
-/// run before this helper is called, so a missing range indicates malformed
-/// in-memory state and returns `None` rather than panicking.
-fn decode_mp_lazy_probs(reader: &MpLazyBundleReader) -> Option<Box<[f32]>> {
-    let mut total = 0usize;
-    for row_idx in 0..reader.row_count() {
-        let row = reader.row(row_idx)?;
-        let start = usize::try_from(row.prob_offset).ok()?;
-        let end = start.checked_add(usize::from(row.action_count))?;
-        total = total.max(end);
-    }
-    Some(reader.prob_slice(0, total)?.into_boxed_slice())
+/// Decode one MP-lazy row's probability range into stable query backing.
+fn decode_mp_lazy_row_probs(reader: &MpLazyBundleReader, row_idx: usize) -> Option<Box<[f32]>> {
+    let row = reader.row(row_idx)?;
+    let start = usize::try_from(row.prob_offset).ok()?;
+    Some(
+        reader
+            .prob_slice(start, usize::from(row.action_count))?
+            .into_boxed_slice(),
+    )
 }
 
 /// Synthesize action descriptors from the game tree node's actions
@@ -789,7 +810,7 @@ fn load_universal(
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::Eager(reader),
-                mp_lazy_probs: None,
+                mp_lazy_prob_cache: None,
             });
             Ok(LoadedBundle::UniversalHu { data, index })
         }
@@ -799,7 +820,7 @@ fn load_universal(
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::Eager(reader),
-                mp_lazy_probs: None,
+                mp_lazy_prob_cache: None,
             });
             Ok(LoadedBundle::UniversalMpEager { data, index })
         }
@@ -814,15 +835,11 @@ fn load_universal(
                     },
                 ));
             }
-            let mp_lazy_probs = decode_mp_lazy_probs(&reader).ok_or_else(|| {
-                LoaderError::Format(super::error::FormatError::InvalidManifest {
-                    detail: "failed to decode MP-lazy probability payload".to_string(),
-                })
-            })?;
+            let mp_lazy_prob_cache = MpLazyProbabilityCache::new(reader.row_count());
             let data = Box::new(UniversalData {
                 manifest,
                 reader: UniversalReader::MpLazy(reader),
-                mp_lazy_probs: Some(mp_lazy_probs),
+                mp_lazy_prob_cache: Some(mp_lazy_prob_cache),
             });
             Ok(LoadedBundle::UniversalMpLazy { data, index })
         }
@@ -883,4 +900,37 @@ fn build_mp_lazy_index(reader: &MpLazyBundleReader) -> MpLazyIndex {
         started.elapsed().as_millis()
     );
     MpLazyIndex { ranges }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MpLazyProbabilityCache;
+    use std::cell::Cell;
+
+    #[test]
+    fn mp_lazy_probability_cache_decodes_only_requested_rows() {
+        let cache = MpLazyProbabilityCache::new(3);
+        let decode_calls = Cell::new(0);
+
+        let first = cache
+            .get_or_decode(2, || {
+                decode_calls.set(decode_calls.get() + 1);
+                Some(vec![f32::from_bits(0x3f800001)].into_boxed_slice())
+            })
+            .unwrap();
+        assert_eq!(first[0].to_bits(), 0x3f800001);
+        assert_eq!(decode_calls.get(), 1);
+        assert!(cache.rows[0].get().is_none());
+        assert!(cache.rows[1].get().is_none());
+        assert!(cache.rows[2].get().is_some());
+
+        let cached = cache
+            .get_or_decode(2, || {
+                decode_calls.set(decode_calls.get() + 1);
+                Some(vec![0.0].into_boxed_slice())
+            })
+            .unwrap();
+        assert_eq!(cached[0].to_bits(), 0x3f800001);
+        assert_eq!(decode_calls.get(), 1);
+    }
 }

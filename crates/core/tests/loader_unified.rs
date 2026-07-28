@@ -908,6 +908,22 @@ fn load_mp_lazy_and_query() {
     assert_eq!(view.actions[2].kind, ActionKind::Raise);
     assert_eq!(view.actions[2].amount_chips, 6);
     assert!(view.actions[2].is_aggressive);
+
+    let owned = bundle
+        .query_mp_lazy_owned(&key)
+        .expect("owned query should find the same lazy infoset");
+    assert_eq!(
+        view.probs
+            .iter()
+            .map(|prob| prob.to_bits())
+            .collect::<Vec<_>>(),
+        owned
+            .probs
+            .iter()
+            .map(|prob| prob.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(view.actions, owned.actions);
 }
 
 #[test]
