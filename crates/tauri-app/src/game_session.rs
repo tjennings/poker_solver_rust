@@ -539,9 +539,10 @@ impl LazyMpSession {
 
     fn ensure_all_buckets(&mut self) -> Result<&AllBuckets, String> {
         if self.all_buckets.is_none() && self.bucket_error.is_none() {
-            let source = self.bucket_source.take().ok_or_else(|| {
-                "Universal MP flop bucket source is unavailable".to_string()
-            })?;
+            let source = self
+                .bucket_source
+                .take()
+                .ok_or_else(|| "Universal MP flop bucket source is unavailable".to_string())?;
             let bucket_load_started = Instant::now();
             match crate::exploration::load_mp_all_buckets(&source) {
                 Ok(all_buckets) => self.all_buckets = Some(all_buckets),
