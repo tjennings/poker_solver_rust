@@ -1,0 +1,19 @@
+---
+# poker_solver_rust-hrq7
+title: Profile and reduce blueprint load latency
+status: in-progress
+type: bug
+priority: high
+created_at: 2026-07-28T01:45:42Z
+updated_at: 2026-07-28T01:45:42Z
+parent: poker_solver_rust-osss
+---
+
+Blueprint loading in the Tauri Explorer can take several minutes while the user sees little CPU or memory activity. Trace the complete load workflow, including universal bundle detection, manifest/payload/index construction, legacy HU reconstruction, MP lazy session setup, initial game state, and initial strategy matrix/range computation. Identify the dominant wait and whether work is being serialized, repeated, or performed before progress is visible. Implement the smallest safe fix after profiling, retaining arena/lazy storage semantics.
+
+Acceptance:
+- A representative HU and MP lazy blueprint load path has phase-level timing or equivalent evidence identifying the expensive/waiting phase.
+- The load path does not eagerly perform work that can safely remain lazy for the first view.
+- Tauri/devserver behavior remains correct for legacy HU, universal HU, and universal MP lazy bundles.
+- Add regression coverage for the fixed behavior and update explorer documentation if the load lifecycle or progress reporting changes.
+- Focused tests pass; the pre-existing dirty sample configuration remains untouched.
