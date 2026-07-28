@@ -55,6 +55,13 @@ routes through the unified loader (`blueprint_universal::loader`):
   seat selection remain unsupported; these paths preserve the current state
   and report a precise capability error rather than fabricating strategy.
 
+Loading is staged for universal MP lazy bundles: creating the game session does
+not load the file-backed bucket corpus. Preflop browsing uses the universal rows
+already loaded with the bundle; the bucket source is opened and cached only when
+the first flop lookup needs it. The Tauri log includes `[explorer-load]` phase
+timings plus `[game_new]` session and first-bucket timings, which separates
+universal payload/index I/O from deferred bucket I/O when diagnosing a slow load.
+
 Universal bundles may be placed directly at the selected directory, under
 `final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout
 `snapshot_NNNN/universal/`. The `load_blueprint_v2` snapshot path also detects
