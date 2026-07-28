@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-07-28T01:19:41Z
+updated_at: 2026-07-28T01:43:23Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -84,8 +84,15 @@ The Explorer matrix must display only root-reach-weighted action frequencies. A 
 
 The previous change weighted lazy MP preflop matrices but left postflop matrices conditional. At a flop node, BB 72o must not appear to raise if its preflop reach is zero. Extend reach weighting through postflop matrix construction, honoring board blockers and the concrete combo reach for the acting player.
 
-- [ ] Define combo-level reach semantics through preflop actions, chance cards, and postflop actions.
-- [ ] Propagate root reach into flop/turn/river matrix cells without multiplying by opponent actions.
-- [ ] Add an A-K-Q flop regression proving root-folded 72o has zero displayed action frequencies.
-- [ ] Preserve legal actions and correct combo/bucket mapping.
-- [ ] Update docs and run focused tests/review.
+- [x] Define combo-level reach semantics through preflop actions, chance cards, and postflop actions.
+- [x] Propagate root reach into flop/turn/river matrix cells without multiplying by opponent actions.
+- [x] Add an A-K-Q flop regression proving root-folded 72o has zero displayed action frequencies.
+- [x] Preserve legal actions and correct combo/bucket mapping.
+- [x] Update docs and run focused tests/review.
+
+## Postflop Reach-Weighted Implementation Summary
+
+- Lazy MP flop matrices now replay concrete combo reach through preflop and supported flop actions using street-specific buckets and exact action identities.
+- Board-blocked combos are excluded before bucket lookup and aggregation; displayed action frequencies are weighted by per-seat marginal combo reach.
+- Added the A-K-Q regression proving root-zero BB 72o remains zero on the flop while legal flop actions and blocker behavior remain intact.
+- Turn and river navigation remain unsupported and are documented as such.

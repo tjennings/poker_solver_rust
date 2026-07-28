@@ -546,11 +546,15 @@ fn write_mp_lazy_2p_bundle_with_config(dir: &Path) {
 }
 
 fn write_mp_lazy_2p_bundle_with_anomaly_rows(dir: &Path) {
-    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false);
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false, false);
+}
+
+fn write_mp_lazy_2p_bundle_with_flop_reach_anomaly(dir: &Path) {
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, true, false, true);
 }
 
 fn write_mp_lazy_2p_bundle_with_missing_preflop_row(dir: &Path) {
-    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, false, true);
+    write_mp_lazy_2p_bundle_with_options_and_anomaly(dir, true, true, false, true, false);
 }
 
 fn write_mp_lazy_2p_bundle_with_options(
@@ -564,6 +568,7 @@ fn write_mp_lazy_2p_bundle_with_options(
         include_flop_rows,
         false,
         false,
+        false,
     );
 }
 
@@ -573,6 +578,7 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
     include_flop_rows: bool,
     include_anomaly_rows: bool,
     omit_preflop_row: bool,
+    zero_bb_reraise_reach: bool,
 ) {
     let mut config = build_3p_config();
     config.game.name = "2p-lazy-session-test".to_string();
@@ -684,7 +690,15 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
             .expect("BB reraise should reach SB decision");
 
         add_preflop_rows(root, Some(&[7, 1, 2]), Some(&reordered_root_actions));
-        add_preflop_rows(sb_raise, Some(&[2, 3, 4, 1]), None);
+        add_preflop_rows(
+            sb_raise,
+            Some(if zero_bb_reraise_reach {
+                &[1, 1, 0, 1]
+            } else {
+                &[2, 3, 4, 1]
+            }),
+            None,
+        );
         add_preflop_rows(bb_reraise, Some(&[7, 2, 1]), None);
     } else {
         let mut preflop_spot = root;
@@ -708,11 +722,17 @@ fn write_mp_lazy_2p_bundle_with_options_and_anomaly(
         }
     }
     if include_flop_rows {
-        let mut flop_spot = root
-            .advance(&game, 1)
-            .and_then(|spot| spot.advance(&game, 0))
-            .expect("preflop call should reach the flop boundary");
-        for _ in 0..3 {
+        let mut flop_spot = if zero_bb_reraise_reach {
+            root.advance(&game, 2)
+                .and_then(|spot| spot.advance(&game, 2))
+                .and_then(|spot| spot.advance(&game, 1))
+                .expect("SB raise, BB reraise, SB call should reach the flop boundary")
+        } else {
+            root.advance(&game, 1)
+                .and_then(|spot| spot.advance(&game, 0))
+                .expect("preflop call should reach the flop boundary")
+        };
+        for _ in 0..if zero_bb_reraise_reach { 1 } else { 3 } {
             let flop_actions = flop_spot.actions(&game);
             for bucket in 0..=1 {
                 entries.push(SparseSnapshotEntry {
@@ -1158,6 +1178,107 @@ async fn two_player_lazy_session_uses_history_specific_sparse_row_for_72o() {
     // SB's root raise reach is 0.7, so the current conditional row is
     // displayed as root-reach-weighted frequencies.
     assert_72o_display(&after_bb_reraise, &[0.49, 0.14, 0.07], 0.7);
+}
+
+#[tokio::test]
+async fn two_player_lazy_flop_matrix_uses_concrete_root_reach_per_seat() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_flop_reach_anomaly(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy flop reach bundle should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("2p MP lazy flop reach bundle should initialize");
+
+    let root = game_get_state_core(&sessions, None).expect("root state");
+    let sb_raise = root
+        .actions
+        .iter()
+        .find(|action| action.label == "2bb")
+        .expect("SB should expose the 2bb raise");
+    let after_sb_raise = game_play_action_core(&sessions, &sb_raise.id, None)
+        .expect("SB raise should advance to BB");
+    let bb_reraise = after_sb_raise
+        .actions
+        .iter()
+        .find(|action| action.label == "3bb")
+        .expect("BB should expose the 3bb reraise");
+    let after_bb_reraise = game_play_action_core(&sessions, &bb_reraise.id, None)
+        .expect("BB reraise should advance to SB");
+    let sb_call = after_bb_reraise
+        .actions
+        .iter()
+        .find(|action| action.action_type == "call")
+        .expect("SB should expose the call");
+    let flop_chance = game_play_action_core(&sessions, &sb_call.id, None)
+        .expect("SB call should reach the flop chance boundary");
+    assert!(flop_chance.is_chance);
+
+    game_deal_card_core(&sessions, "As").expect("deal As");
+    game_deal_card_core(&sessions, "Kd").expect("deal Kd");
+    let flop = game_deal_card_core(&sessions, "Qh").expect("deal Qh");
+    assert_eq!(flop.position, "BB");
+    assert!(
+        !flop.actions.is_empty(),
+        "legal flop actions must remain present"
+    );
+
+    let matrix = flop.matrix.as_ref().expect("flop matrix");
+    assert_eq!(matrix.actions.len(), flop.actions.len());
+    let seventy_two = matrix
+        .cells
+        .iter()
+        .flatten()
+        .find(|cell| cell.hand == "72o")
+        .expect("flop matrix should include 72o");
+    assert!(
+        seventy_two.combo_count > 0,
+        "72o should have visible combos"
+    );
+    assert_eq!(seventy_two.weight, 0.0);
+    assert!(seventy_two
+        .probabilities
+        .iter()
+        .all(|probability| *probability == 0.0));
+    assert!(seventy_two.combos.iter().all(|combo| {
+        combo.weight == 0.0
+            && combo
+                .probabilities
+                .iter()
+                .all(|probability| *probability == 0.0)
+    }));
+
+    let raise_index = flop
+        .actions
+        .iter()
+        .position(|action| action.action_type == "raise" || action.action_type == "bet")
+        .expect("flop should retain a legal aggressive action");
+    let visible_nonzero = matrix
+        .cells
+        .iter()
+        .flatten()
+        .any(|cell| cell.hand != "72o" && cell.probabilities[raise_index] > 0.0);
+    assert!(
+        visible_nonzero,
+        "a visible non-72o cell should retain the nonzero flop raise frequency"
+    );
+
+    let aa = matrix
+        .cells
+        .iter()
+        .flatten()
+        .find(|cell| cell.hand == "AA")
+        .expect("flop matrix should include AA");
+    assert!(aa.combo_count < 6, "As should block at least one AA combo");
+    assert!((aa.weight - 0.25).abs() < 1e-6);
+    assert!(aa
+        .combos
+        .iter()
+        .all(|combo| (combo.weight - 0.25).abs() < 1e-6));
+    assert!((aa.probabilities.iter().sum::<f32>() - aa.weight).abs() < 1e-6);
 }
 
 #[tokio::test]

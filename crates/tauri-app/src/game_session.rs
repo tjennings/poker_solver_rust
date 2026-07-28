@@ -29,7 +29,7 @@ use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
 use poker_solver_core::hands::CanonicalHand;
 use poker_solver_core::poker::{Card as RsPokerCard, Value as RsPokerValue};
 
-use range_solver::card::{card_to_string, NOT_DEALT};
+use range_solver::card::{card_pair_to_index, card_to_string, index_to_card_pair, NOT_DEALT};
 use range_solver::interface::Game;
 use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
 use serde::Deserialize;
@@ -263,9 +263,10 @@ pub struct GameMatrixCell {
     pub hand: String,
     pub suited: bool,
     pub pair: bool,
-    /// One value per action. Universal lazy MP preflop values are root-reach-
-    /// weighted and sum to `weight`; other sources may expose conditional
-    /// strategy frequencies.
+    /// One value per action. Universal lazy MP preflop and flop matrix values
+    /// are root-reach-weighted and sum to `weight`; turn and river matrices
+    /// remain unsupported. Other sources may expose conditional strategy
+    /// frequencies.
     pub probabilities: Vec<f32>,
     pub combo_count: usize,
     pub weight: f32, // reaching probability
@@ -735,6 +736,91 @@ impl LazyMpSession {
         Ok(reaches)
     }
 
+    /// Propagate concrete-combo reach through the public action path for a
+    /// completed flop. Each action changes only the reach of its acting seat.
+    fn flop_root_reaches(
+        &self,
+        action_history: &[ActionRecord],
+        board: &[RsPokerCard],
+    ) -> Result<[Vec<f32>; 2], String> {
+        let mut reaches = [vec![1.0; 1326], vec![1.0; 1326]];
+        let mut replay_spot = LazyResolvedSpot::root(&self.game);
+
+        for record in action_history {
+            let street = replay_spot.street();
+            if !matches!(street, MpStreet::Preflop | MpStreet::Flop) {
+                return Err(format!(
+                    "Universal MP flop reach replay reached {} before action {}",
+                    mp_street_to_string(street),
+                    record.action_id
+                ));
+            }
+            let mp_actions = replay_spot.actions(&self.game);
+            let action_index = record.action_id.parse::<usize>().map_err(|_| {
+                format!(
+                    "Invalid MP action_id during flop reach replay: {}",
+                    record.action_id
+                )
+            })?;
+            if action_index >= mp_actions.len() {
+                return Err(format!(
+                    "MP action {action_index} out of range during flop reach replay (max {})",
+                    mp_actions.len().saturating_sub(1)
+                ));
+            }
+            let seat = usize::from(replay_spot.to_act().index());
+            if seat >= reaches.len() {
+                return Err(format!(
+                    "Universal MP flop reach replay encountered unsupported seat {}",
+                    replay_spot.to_act().index()
+                ));
+            }
+
+            let mut probabilities_by_bucket = HashMap::new();
+            for combo_index in 0..1326 {
+                let (card1, card2) = index_to_card_pair(combo_index);
+                let combo = [
+                    crate::exploration::range_solver_to_rs_card(card1),
+                    crate::exploration::range_solver_to_rs_card(card2),
+                ];
+                if combo_is_blocked(combo, board) {
+                    reaches[seat][combo_index] = 0.0;
+                    continue;
+                }
+
+                let bucket = if street == MpStreet::Preflop {
+                    let hand = CanonicalHand::from_cards(combo[0], combo[1]);
+                    self.preflop_bucket_for_hand(hand.index())?
+                } else {
+                    self.flop_bucket(replay_spot, "concrete combo", combo, board)?
+                };
+                let probabilities = match probabilities_by_bucket.get(&bucket) {
+                    Some(probabilities) => probabilities,
+                    None => {
+                        let probabilities =
+                            self.probabilities_for_bucket(replay_spot, bucket, &mp_actions)?;
+                        probabilities_by_bucket.insert(bucket, probabilities);
+                        probabilities_by_bucket
+                            .get(&bucket)
+                            .expect("inserted MP bucket probabilities")
+                    }
+                };
+                reaches[seat][combo_index] *= probabilities[action_index];
+            }
+
+            replay_spot = replay_spot
+                .advance(&self.game, action_index)
+                .ok_or_else(|| {
+                    format!(
+                        "Universal MP flop reach replay action {} terminated before the requested state",
+                        record.action_id
+                    )
+                })?;
+        }
+
+        Ok(reaches)
+    }
+
     fn flop_bucket(
         &self,
         spot: LazyResolvedSpot,
@@ -765,6 +851,7 @@ impl LazyMpSession {
         spot: LazyResolvedSpot,
         board: &[RsPokerCard],
         mp_actions: &[MpTreeAction],
+        action_history: &[ActionRecord],
     ) -> Result<GameMatrix, String> {
         if board.len() != 3 {
             return Err(format!(
@@ -773,6 +860,14 @@ impl LazyMpSession {
             ));
         }
         let actions = build_mp_game_actions(mp_actions, mp_big_blind_amount(&self.config)?);
+        let reaches = self.flop_root_reaches(action_history, board)?;
+        let acting_seat = usize::from(spot.to_act().index());
+        if acting_seat >= reaches.len() {
+            return Err(format!(
+                "Universal MP flop matrix encountered unsupported seat {}",
+                spot.to_act().index()
+            ));
+        }
         let mut cells = Vec::with_capacity(13);
         for (row, &rank1) in RANKS.iter().enumerate() {
             let mut row_cells = Vec::with_capacity(13);
@@ -780,16 +875,35 @@ impl LazyMpSession {
                 let (label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
                 let hand = CanonicalHand::new(mp_rank_value(rank1), mp_rank_value(rank2), suited);
                 let mut sum_probabilities = vec![0.0; actions.len()];
+                let mut sum_reach = 0.0;
                 let mut combos = Vec::new();
+                let mut probabilities_by_bucket = HashMap::new();
                 for (card1, card2) in hand.combos() {
-                    if board.iter().any(|card| *card == card1 || *card == card2) {
+                    let combo = [card1, card2];
+                    if combo_is_blocked(combo, board) {
                         continue;
                     }
                     let bucket = self.flop_bucket(spot, &label, [card1, card2], board)?;
-                    let probabilities = self.probabilities_for_bucket(spot, bucket, mp_actions)?;
+                    let probabilities = match probabilities_by_bucket.get(&bucket) {
+                        Some(probabilities) => probabilities,
+                        None => {
+                            let probabilities =
+                                self.probabilities_for_bucket(spot, bucket, mp_actions)?;
+                            probabilities_by_bucket.insert(bucket, probabilities);
+                            probabilities_by_bucket
+                                .get(&bucket)
+                                .expect("inserted MP bucket probabilities")
+                        }
+                    };
+                    let combo_index = card_pair_to_index(
+                        crate::exploration::rs_card_to_range_solver(card1),
+                        crate::exploration::rs_card_to_range_solver(card2),
+                    );
+                    let combo_reach = reaches[acting_seat][combo_index];
+                    sum_reach += combo_reach;
                     for (sum, probability) in sum_probabilities.iter_mut().zip(probabilities.iter())
                     {
-                        *sum += *probability;
+                        *sum += combo_reach * *probability;
                     }
                     let cards = format!(
                         "{}{}",
@@ -800,8 +914,11 @@ impl LazyMpSession {
                     );
                     combos.push(ComboDetail {
                         cards,
-                        probabilities,
-                        weight: 1.0,
+                        probabilities: probabilities
+                            .iter()
+                            .map(|probability| combo_reach * *probability)
+                            .collect(),
+                        weight: combo_reach,
                         bucket: Some(bucket),
                     });
                 }
@@ -820,7 +937,11 @@ impl LazyMpSession {
                     pair,
                     probabilities,
                     combo_count,
-                    weight: 1.0,
+                    weight: if combo_count == 0 {
+                        0.0
+                    } else {
+                        sum_reach / combo_count as f32
+                    },
                     ev: None,
                     combos,
                 });
@@ -877,7 +998,7 @@ impl LazyMpSession {
         let mp_actions = self.current_actions_at(spot);
         let actions = build_mp_game_actions(&mp_actions, mp_big_blind_amount(&self.config)?);
         if spot.street() == MpStreet::Flop {
-            let matrix = self.build_flop_matrix(spot, board, &mp_actions)?;
+            let matrix = self.build_flop_matrix(spot, board, &mp_actions, action_history)?;
             return Ok(GameState {
                 street,
                 position: self.position_label(spot.to_act().index()),
@@ -1114,6 +1235,12 @@ fn mp_board_strings(board: &[RsPokerCard]) -> Vec<String> {
                 .unwrap_or_else(|_| "??".to_string())
         })
         .collect()
+}
+
+fn combo_is_blocked(combo: [RsPokerCard; 2], board: &[RsPokerCard]) -> bool {
+    board
+        .iter()
+        .any(|card| *card == combo[0] || *card == combo[1])
 }
 
 fn mp_rank_value(rank: char) -> RsPokerValue {

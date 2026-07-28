@@ -108,10 +108,7 @@ rejected until a later bean adds turn bucket and row support.
 
 When using Blueprint, Subgame, or Exact strategy sources, the matrix is source-specific for the current game state. Solved Subgame and Exact sources keep their solved matrix cache anchored to the street state where the solve started, so taking actions or rewinding within that solved subtree continues to show the solved strategy instead of falling back to the blueprint matrix. Player labels in the Explorer are always seat positions (`BB`/`SB`).
 
-For Universal MP lazy preflop navigation, matrix probabilities are the exported average strategy multiplied by the displayed acting player's per-hand root reach at the exact action history. Each seat's reach is propagated independently: an action only reduces the reach of the seat that took it, so opponent actions do not reduce that seat's reach. The displayed action frequencies therefore sum to the cell's reach rather than 1.0; the root remains unchanged. The Tauri Explorer integration regression covers SB 72o after an SB raise and BB reraise.
-
-The universal MP lazy flop matrix remains conditional: the current file-backed flop bucket rows do not provide a supported combo-level root-reach path, so the explorer does not fabricate one. Turn and river lazy MP strategy display remains unavailable at the documented boundary.
-
+For Universal MP lazy sessions, both preflop and flop matrices are exported-average-strategy frequencies weighted by the displayed acting seat's concrete-combo root reach at the exact public action history. Reach is propagated independently per seat: an action changes only the reach of the seat that took it, so opponent actions do not reduce that seat's reach. At the flop, visible-board blockers have zero reach, combo details expose their individual reach weights, and each cell's probabilities sum to its mean reach across the unblocked combos. The selected board's chance probability is conditioned out; it is used only to block impossible hole-card combos and select the file-backed flop bucket rows. Turn and river lazy MP strategy display remains unsupported because the current session cannot represent those cards and rows.
 ## Simulator Tab
 
 Hand simulation interface for testing strategies against each other.
