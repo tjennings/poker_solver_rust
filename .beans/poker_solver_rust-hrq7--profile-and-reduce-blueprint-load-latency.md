@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-07-28T01:45:42Z
-updated_at: 2026-07-28T01:45:42Z
+updated_at: 2026-07-28T01:56:48Z
 parent: poker_solver_rust-osss
 ---
 
@@ -17,3 +17,14 @@ Acceptance:
 - Tauri/devserver behavior remains correct for legacy HU, universal HU, and universal MP lazy bundles.
 - Add regression coverage for the fixed behavior and update explorer documentation if the load lifecycle or progress reporting changes.
 - Focused tests pass; the pre-existing dirty sample configuration remains untouched.
+
+
+## Work Plan
+
+- [ ] Research current loading boundaries and test seams
+- [ ] Add phase-level timing logs
+- [ ] Make lazy MP session bucket loading demand-driven
+- [ ] Add focused regression coverage
+- [ ] Update explorer docs if lifecycle behavior changed
+- [ ] Run formatting and focused tests
+- [ ] Review, commit, and report results
