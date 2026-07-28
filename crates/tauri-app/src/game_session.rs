@@ -5,7 +5,7 @@
 //! `game_deal_card`, `game_back`, `game_solve`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -395,6 +395,10 @@ pub struct GameState {
 pub struct SolveState {
     pub solving: AtomicBool,
     pub cancel: Arc<AtomicBool>,
+    /// Monotonically increasing identity for the solve/session state.
+    pub generation: AtomicU64,
+    /// Serializes worker publications with reset/start invalidation.
+    publish_gate: RwLock<()>,
     pub iteration: AtomicU32,
     pub max_iterations: AtomicU32,
     /// Exploitability stored as f32 bits (use `f32::to_bits` / `f32::from_bits`).
@@ -420,6 +424,8 @@ impl Default for SolveState {
         Self {
             solving: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
+            generation: AtomicU64::new(0),
+            publish_gate: RwLock::new(()),
             iteration: AtomicU32::new(0),
             max_iterations: AtomicU32::new(0),
             exploitability_bits: AtomicU32::new(0),
@@ -435,10 +441,12 @@ impl Default for SolveState {
 }
 
 impl SolveState {
-    /// Reset all fields to defaults. Called when starting a new hand or going back.
+    /// Reset all fields and invalidate every worker from the previous state.
     pub fn reset(&self) {
+        let _publish_guard = self.publish_gate.write();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.solving.store(false, Ordering::Relaxed);
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Release);
         self.iteration.store(0, Ordering::Relaxed);
         self.max_iterations.store(0, Ordering::Relaxed);
         self.exploitability_bits.store(0, Ordering::Relaxed);
@@ -449,6 +457,18 @@ impl SolveState {
         *self.solve_cache.write() = HashMap::new();
         *self.solve_path.write() = vec![];
         *self.solve_anchor.write() = None;
+    }
+
+    fn publish_if_current<F>(&self, generation: u64, publish: F) -> bool
+    where
+        F: FnOnce(&Self),
+    {
+        let _publish_guard = self.publish_gate.read();
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        publish(self);
+        true
     }
 }
 
@@ -3741,7 +3761,9 @@ fn reset_solve_state_for_start(
     max_iters: u32,
     position_label: String,
     solve_anchor: SolveAnchor,
-) {
+) -> u64 {
+    let _publish_guard = ss.publish_gate.write();
+    let generation = ss.generation.fetch_add(1, Ordering::AcqRel) + 1;
     ss.iteration.store(0, Ordering::Relaxed);
     ss.max_iterations.store(max_iters, Ordering::Relaxed);
     ss.exploitability_bits
@@ -3755,6 +3777,7 @@ fn reset_solve_state_for_start(
     *ss.solve_anchor.write() = Some(solve_anchor);
     *ss.solve_cache.write() = HashMap::new();
     *ss.solve_path.write() = vec![];
+    generation
 }
 
 /// Get the current game state, including solve progress if active.
@@ -3879,7 +3902,10 @@ pub fn game_play_action_core(
         });
         if let (Some(ss), Some((session_action_id, next_path))) = (ss.as_ref(), cached_navigation) {
             let mut state = session.play_action_without_state(&session_action_id)?;
-            if session.spot.street() != previous_street {
+            let street_changed = session.spot.street() != previous_street;
+            let solve_in_progress = session_state.subgame_solve.solving.load(Ordering::Acquire)
+                || session_state.exact_solve.solving.load(Ordering::Acquire);
+            if street_changed || solve_in_progress {
                 session_state.subgame_solve.reset();
                 session_state.exact_solve.reset();
                 state.solve = None;
@@ -3891,7 +3917,9 @@ pub fn game_play_action_core(
         let session_action_id = action_id.to_string();
         let mut state = session.play_action(&session_action_id)?;
         let street_changed = session.spot.street() != previous_street;
-        if street_changed {
+        let solve_in_progress = session_state.subgame_solve.solving.load(Ordering::Acquire)
+            || session_state.exact_solve.solving.load(Ordering::Acquire);
+        if street_changed || solve_in_progress {
             session_state.subgame_solve.reset();
             session_state.exact_solve.reset();
             state.solve = None;
@@ -4000,18 +4028,10 @@ pub fn game_deal_card_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
-        let previous_board_len = session.board.len();
         let mut state = session.deal_card(card)?;
-        if session.board.len() != previous_board_len {
-            session_state.subgame_solve.reset();
-            session_state.exact_solve.reset();
-        }
-        if session_state.exact_solve.iteration.load(Ordering::Relaxed) > 0
-            || session_state.exact_solve.solving.load(Ordering::Relaxed)
-        {
-            let path = resolve_solve_path_from_mp_session(&session_state.exact_solve, session);
-            apply_exact_solve_overlay(&mut state, &session_state.exact_solve, path);
-        }
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
+        state.solve = None;
         return Ok(state);
     }
     let mut guard = session_state.session.write();
@@ -4035,19 +4055,10 @@ pub fn game_back_core(
     if session_state.mp_session.read().is_some() {
         let mut guard = session_state.mp_session.write();
         let session = guard.as_mut().ok_or("No MP game session active")?;
-        let previous_street = session.spot.street();
-        let previous_board_len = session.board.len();
         let mut state = session.back()?;
-        if session.spot.street() != previous_street || session.board.len() != previous_board_len {
-            session_state.subgame_solve.reset();
-            session_state.exact_solve.reset();
-            state.solve = None;
-        }
-        if source.as_deref() == Some("exact") {
-            let ss = &session_state.exact_solve;
-            let path = resolve_solve_path_from_mp_session(ss, session);
-            apply_exact_solve_overlay(&mut state, ss, path);
-        }
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
+        state.solve = None;
         return Ok(state);
     }
     let ss = solve_state_for_source(session_state, source.as_deref());
@@ -4333,7 +4344,7 @@ pub fn game_solve_core(
     // Reset solve state for this mode before building, so progress snapshots
     // cannot read a stale solved tree from an earlier solve.
     let ss = ss_ref;
-    reset_solve_state_for_start(ss, max_iters, position_label, solve_anchor);
+    let solve_generation = reset_solve_state_for_start(ss, max_iters, position_label, solve_anchor);
 
     let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
     let build_exact = is_exact || boundary_cut.is_none();
@@ -4418,7 +4429,11 @@ pub fn game_solve_core(
                     )
                 })
                 .collect();
-            *ss_clone.solve_actions.write() = actions;
+            if !ss_clone.publish_if_current(solve_generation, |state| {
+                *state.solve_actions.write() = actions;
+            }) {
+                return;
+            }
         }
 
         // Set up boundary evaluators for non-gadget path (opt_out=None).
@@ -4514,13 +4529,19 @@ pub fn game_solve_core(
 
         // Initial matrix snapshot
         let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
-        *ss_clone.matrix_snapshot.write() = Some(matrix);
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            *state.matrix_snapshot.write() = Some(matrix);
+        }) {
+            return;
+        }
 
         // Solve loop
         let has_per_boundary = !game.per_boundary_evaluators.is_empty();
         let mut t = 0u32;
         while t < max_iters {
-            if ss_clone.cancel.load(Ordering::Relaxed) {
+            if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                || ss_clone.cancel.load(Ordering::Acquire)
+            {
                 break;
             }
 
@@ -4548,7 +4569,11 @@ pub fn game_solve_core(
 
             solve_step(&game, t);
             t += 1;
-            ss_clone.iteration.store(t, Ordering::Relaxed);
+            if !ss_clone.publish_if_current(solve_generation, |state| {
+                state.iteration.store(t, Ordering::Relaxed);
+            }) {
+                return;
+            }
 
             // Capture boundary traces after this iteration's CFVs are cached.
             if let Some(ref tr) = tracer {
@@ -4564,13 +4589,21 @@ pub fn game_solve_core(
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
                 let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
-                *ss_clone.matrix_snapshot.write() = Some(matrix);
+                if !ss_clone.publish_if_current(solve_generation, |state| {
+                    *state.matrix_snapshot.write() = Some(matrix);
+                }) {
+                    return;
+                }
 
                 if is_exact {
                     let exp = compute_exploitability(&game);
-                    ss_clone
-                        .exploitability_bits
-                        .store(exp.to_bits(), Ordering::Relaxed);
+                    if !ss_clone.publish_if_current(solve_generation, |state| {
+                        state
+                            .exploitability_bits
+                            .store(exp.to_bits(), Ordering::Relaxed);
+                    }) {
+                        return;
+                    }
                     if exp.is_finite() && exp > 0.0 && exp <= target_exp {
                         eprintln!(
                             "[solve] exact converged: iter={t} exploitability={exp:.3} <= target={target_exp}"
@@ -4579,6 +4612,10 @@ pub fn game_solve_core(
                     }
                 }
             }
+        }
+
+        if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
+            return;
         }
 
         // Finalize: normalize strategy, compute EVs.
@@ -4612,7 +4649,11 @@ pub fn game_solve_core(
         let evs = game.expected_values(player);
         let final_matrix =
             build_solve_matrix_with_big_blind(&mut game, Some(&evs), action_big_blind);
-        *ss_clone.matrix_snapshot.write() = Some(final_matrix);
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            *state.matrix_snapshot.write() = Some(final_matrix);
+        }) {
+            return;
+        }
 
         // Compute exploitability using cached boundary CFVs
         let saved_evaluator = game.boundary_evaluator.take();
@@ -4620,9 +4661,13 @@ pub fn game_solve_core(
         let final_exp = compute_exploitability(&game);
         game.boundary_evaluator = saved_evaluator;
         game.per_boundary_evaluators = saved_per_boundary;
-        ss_clone
-            .exploitability_bits
-            .store(final_exp.to_bits(), Ordering::Relaxed);
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            state
+                .exploitability_bits
+                .store(final_exp.to_bits(), Ordering::Relaxed);
+        }) {
+            return;
+        }
 
         // Build solve cache for all decision nodes in the solved tree.
         game.back_to_root();
@@ -4632,10 +4677,13 @@ pub fn game_solve_core(
             "[solve] cached {} decision nodes for subgame navigation",
             solve_cache.len()
         );
-        *ss_clone.solve_cache.write() = solve_cache;
-        *ss_clone.solve_path.write() = vec![];
-
-        ss_clone.solving.store(false, Ordering::Release);
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            *state.solve_cache.write() = solve_cache;
+            *state.solve_path.write() = vec![];
+            state.solving.store(false, Ordering::Release);
+        }) {
+            return;
+        }
         let reported_exp = f32::from_bits(ss_clone.exploitability_bits.load(Ordering::Relaxed));
         eprintln!(
             "[solve] complete: {} iterations, exploitability={:.4}",
@@ -7340,6 +7388,34 @@ mod tests {
 
         assert!(ss.solve_cache.read().is_empty());
         assert!(ss.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn stale_solve_generation_cannot_publish_after_reset() {
+        let ss = SolveState::default();
+        let generation = reset_solve_state_for_start(
+            &ss,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+        );
+        assert!(ss.publish_if_current(generation, |state| {
+            state.iteration.store(1, Ordering::Relaxed);
+        }));
+
+        ss.reset();
+
+        assert_ne!(ss.generation.load(Ordering::Acquire), generation);
+        assert!(!ss.publish_if_current(generation, |state| {
+            state.iteration.store(99, Ordering::Relaxed);
+        }));
+        assert_eq!(ss.iteration.load(Ordering::Relaxed), 0);
+        assert!(!ss.solving.load(Ordering::Relaxed));
+        assert!(ss.cancel.load(Ordering::Acquire));
     }
 
     #[test]

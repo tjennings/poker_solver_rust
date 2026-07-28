@@ -1767,6 +1767,14 @@ async fn two_player_lazy_session_navigates_flop_turn_river_and_back() {
     }
     assert_eq!(state.street, "Turn");
     assert!(state.is_chance);
+    let duplicate_turn = game_deal_card_core(&sessions, "As").unwrap_err();
+    assert!(duplicate_turn.contains("Duplicate board card"));
+    let after_duplicate_turn = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(after_duplicate_turn.board, state.board);
+    assert_eq!(
+        after_duplicate_turn.action_history.len(),
+        state.action_history.len()
+    );
     let turn = game_deal_card_core(&sessions, "Jc").unwrap();
     assert_eq!(turn.street, "Turn");
     assert!(!turn.is_chance);
@@ -1784,6 +1792,14 @@ async fn two_player_lazy_session_navigates_flop_turn_river_and_back() {
     }
     assert_eq!(state.street, "River");
     assert!(state.is_chance);
+    let duplicate_river = game_deal_card_core(&sessions, "Jc").unwrap_err();
+    assert!(duplicate_river.contains("Duplicate board card"));
+    let after_duplicate_river = game_get_state_core(&sessions, None).unwrap();
+    assert_eq!(after_duplicate_river.board, state.board);
+    assert_eq!(
+        after_duplicate_river.action_history.len(),
+        state.action_history.len()
+    );
     let river = game_deal_card_core(&sessions, "Ts").unwrap();
     assert_eq!(river.street, "River");
     assert!(!river.is_chance);

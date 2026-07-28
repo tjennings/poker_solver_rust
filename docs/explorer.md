@@ -45,15 +45,17 @@ routes through the unified loader (`blueprint_universal::loader`):
   The mounted Game view can additionally open a two-player `universal_mp_lazy`
   bundle when its retained full MP `config.yaml` is present: it renders the
   preflop hand grid, exposes a chance state while a flop has 0-2 selected
-  cards, and renders the flop matrix after three unique legal cards. Flop
-  buckets come from trainer-compatible file-backed `AllBuckets` data resolved
+  cards, and renders the flop matrix after three unique legal cards. It also
+  supports legal turn and river navigation when the matching bucket sources
+  and sparse rows are present. Postflop buckets come from trainer-compatible
+  file-backed `AllBuckets` data resolved
   from a bundle-local/ancestor `buckets/` directory or a valid
   `training.cluster_path`; relative values are anchored at the retained config
   directory and searched through its ancestors before implicit bundle/ancestor
   `buckets/` directories. Missing sources, mappings, sparse rows, or action
-  schemas are errors. Turn and river dealing, eager MP bundles, and N-player
-  seat selection remain unsupported; these paths preserve the current state
-  and report a precise capability error rather than fabricating strategy.
+  schemas are errors. Eager MP bundles and N-player seat selection remain
+  unsupported; these paths preserve the current state and report a precise
+  capability error rather than fabricating strategy.
 
 Loading is staged for universal MP lazy bundles: creating the game session does
 not load the file-backed bucket corpus. The universal payload reader snapshots
@@ -112,11 +114,9 @@ When the game reaches the flop, enter board cards (e.g. `Ac Th 4d`). The app:
 
 Continue through turn and river by entering additional cards. The suit mapping from flop canonicalization is applied to turn/river cards automatically.
 
-The turn/river workflow above applies to HU Blueprint sessions. The supported
-two-player `universal_mp_lazy` Game session stops at the flop boundary: a flop
-action may expose a turn chance boundary, but dealing the turn is explicitly
-rejected until a later bean adds turn bucket and row support. Exact solving is
-available for supported two-player flop decision spots; turn/river and
+The turn/river workflow above applies to HU Blueprint sessions and the
+supported two-player `universal_mp_lazy` Game session. Universal MP exact
+solving remains limited to two-player flop decision spots; turn/river and
 multi-player exact solving remain unsupported.
 
 ### Navigation
