@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: normal
 created_at: 2026-07-28T02:19:56Z
-updated_at: 2026-07-28T02:22:05Z
+updated_at: 2026-07-28T02:22:12Z
 ---
 
 Repair only the E0502 borrow-checker regressions introduced by commit 8d944b74 in crates/tauri-app/src/game_session.rs. Preserve lazy MP bucket behavior and cache/path semantics.
@@ -13,4 +13,4 @@ Repair only the E0502 borrow-checker regressions introduced by commit 8d944b74 i
 - [x] Inspect the affected methods and baseline compiler errors
 - [x] Apply a conservative borrow-structure repair
 - [x] Run rustfmt and focused verification
-- [ ] Commit the repair and report files/tests
+- [x] Commit the repair and report files/tests
