@@ -901,7 +901,8 @@ impl LazyMpSession {
             build_mp_game_actions(&self.current_actions(), mp_big_blind_amount(&self.config)?);
         let betting = self.spot.betting_snapshot();
         let (sb_seat, bb_seat) = mp_sb_bb_seats(&self.config)?;
-        let root = mp_solve_root(&betting, sb_seat, bb_seat)?;
+        let big_blind = mp_big_blind_amount(&self.config)?;
+        let root = mp_solve_root(&betting, sb_seat, bb_seat, big_blind)?;
 
         Ok(UniversalMpSolveSnapshot {
             board,
@@ -1198,7 +1199,32 @@ impl LazyMpSession {
         self.state_at(self.spot, &board, &action_history, self.terminal)
     }
 
-    fn play_action(&mut self, action_id: &str) -> Result<GameState, String> {
+    fn state_shell(&self) -> GameState {
+        let is_chance =
+            !self.terminal && mp_required_board_cards(self.spot.street()) > self.board.len();
+        GameState {
+            street: mp_street_to_string(self.spot.street()),
+            position: if self.terminal || is_chance {
+                String::new()
+            } else {
+                self.position_label(self.spot.to_act().index())
+            },
+            board: mp_board_strings(&self.board),
+            pot: self.spot.pot().0 as i32,
+            stacks: self.display_stacks(),
+            matrix: None,
+            actions: vec![],
+            action_history: self.action_history.clone(),
+            is_terminal: self.terminal,
+            is_chance,
+            solve: None,
+        }
+    }
+
+    fn action_transition(
+        &self,
+        action_id: &str,
+    ) -> Result<(ActionRecord, LazyResolvedSpot, bool), String> {
         if self.terminal {
             return Err("Universal MP session is already terminal".to_string());
         }
@@ -1220,8 +1246,7 @@ impl LazyMpSession {
             ));
         }
         let stacks = self.display_stacks();
-        let mut next_history = self.action_history.clone();
-        next_history.push(ActionRecord {
+        let record = ActionRecord {
             action_id: action_id.to_string(),
             label: actions[action_index].label.clone(),
             position: self.position_label(self.spot.to_act().index()),
@@ -1232,17 +1257,38 @@ impl LazyMpSession {
             } else {
                 1
             }],
-            actions: actions.clone(),
-        });
+            actions,
+        };
         let next_spot = self.spot.advance(&self.game, action_index);
         let next_terminal = next_spot.is_none();
-        let next_spot = next_spot.unwrap_or(self.spot);
+        Ok((record, next_spot.unwrap_or(self.spot), next_terminal))
+    }
+
+    fn commit_action_transition(
+        &mut self,
+        record: ActionRecord,
+        next_spot: LazyResolvedSpot,
+        next_terminal: bool,
+    ) {
+        self.spot = next_spot;
+        self.action_history.push(record);
+        self.terminal = next_terminal;
+    }
+
+    fn play_action(&mut self, action_id: &str) -> Result<GameState, String> {
+        let (record, next_spot, next_terminal) = self.action_transition(action_id)?;
+        let mut next_history = self.action_history.clone();
+        next_history.push(record.clone());
         let board = self.board.clone();
         let state = self.state_at(next_spot, &board, &next_history, next_terminal)?;
-        self.spot = next_spot;
-        self.action_history = next_history;
-        self.terminal = next_terminal;
+        self.commit_action_transition(record, next_spot, next_terminal);
         Ok(state)
+    }
+
+    fn play_action_without_state(&mut self, action_id: &str) -> Result<GameState, String> {
+        let (record, next_spot, next_terminal) = self.action_transition(action_id)?;
+        self.commit_action_transition(record, next_spot, next_terminal);
+        Ok(self.state_shell())
     }
 
     fn deal_card(&mut self, card: &str) -> Result<GameState, String> {
@@ -2432,6 +2478,17 @@ fn chips_to_i32(chips: poker_solver_core::blueprint_mp::Chips) -> i32 {
     chips.0.round() as i32
 }
 
+/// Convert raw MP chip amounts to the integer units used by range-solver.
+///
+/// Range-solver has no blind-size field: its integer amounts are raw chip
+/// units. The configured BB belongs at the display and semantic-matching
+/// boundaries, not in this conversion. Keep the validated BB parameter here
+/// so every MP root conversion shares the same config contract.
+fn mp_chips_to_solver_units(amount: f64, big_blind: f64) -> i32 {
+    debug_assert!(big_blind > 0.0);
+    amount.round() as i32
+}
+
 fn chips_array_to_i32(
     chips: [poker_solver_core::blueprint_mp::Chips; poker_solver_core::blueprint_mp::MAX_PLAYERS],
 ) -> [i32; 2] {
@@ -2465,6 +2522,7 @@ fn mp_solve_root(
     betting: &LazyBettingSnapshot,
     sb_seat: u8,
     bb_seat: u8,
+    big_blind: f64,
 ) -> Result<SolveGameRoot, String> {
     let actual_actor = betting.to_act.index();
     let initial_player = if actual_actor == bb_seat {
@@ -2477,14 +2535,16 @@ fn mp_solve_root(
         ));
     };
     let initial_stacks = [
-        chips_to_i32(betting.stacks[bb_seat as usize]),
-        chips_to_i32(betting.stacks[sb_seat as usize]),
+        mp_chips_to_solver_units(betting.stacks[bb_seat as usize].0, big_blind),
+        mp_chips_to_solver_units(betting.stacks[sb_seat as usize].0, big_blind),
     ];
     let street_bets = [
-        chips_to_i32(betting.street_bets[bb_seat as usize]),
-        chips_to_i32(betting.street_bets[sb_seat as usize]),
+        mp_chips_to_solver_units(betting.street_bets[bb_seat as usize].0, big_blind),
+        mp_chips_to_solver_units(betting.street_bets[sb_seat as usize].0, big_blind),
     ];
-    let starting_pot = (chips_to_i32(betting.pot) - street_bets[0] - street_bets[1]).max(1);
+    let starting_pot =
+        (mp_chips_to_solver_units(betting.pot.0, big_blind) - street_bets[0] - street_bets[1])
+            .max(1);
     let matched_amount = street_bets[0].min(street_bets[1]);
 
     let (initial_prev_action, initial_prev_amount, initial_num_bets) = if betting.facing_bet {
@@ -2493,7 +2553,7 @@ fn mp_solve_root(
                 "Universal MP exact solve is missing raw aggressive action metadata".to_string(),
             );
         };
-        let amount = chips_to_i32(betting.last_raise_to);
+        let amount = mp_chips_to_solver_units(betting.last_raise_to.0, big_blind);
         let previous = match action {
             MpTreeAction::Lead(_) => range_solver::Action::Bet(amount),
             MpTreeAction::Raise(_) => range_solver::Action::Raise(amount),
@@ -3755,31 +3815,38 @@ pub fn game_play_action_core(
         let session = guard.as_mut().ok_or("No MP game session active")?;
         let big_blind = mp_big_blind_amount(&session.config)?;
         let ss = solve_state_for_source(session_state, source.as_deref());
-        let session_action_id = if let Some(ss) = ss.as_ref() {
-            resolve_solve_path_from_mp_session(ss, session)
-                .and_then(|path| cached_node_for_path(ss, &path))
-                .and_then(|node| {
-                    node.actions
-                        .iter()
-                        .find(|action| action.id == action_id)
-                        .and_then(|action| {
-                            session
-                                .current_actions()
-                                .iter()
-                                .enumerate()
-                                .find(|(_, current)| {
-                                    semantic_actions_match(
-                                        &semantic_action_from_game_action(action),
-                                        &semantic_action_from_mp_tree_action(current, big_blind),
-                                    )
-                                })
-                                .map(|(index, _)| index.to_string())
-                        })
+        let cached_navigation = ss.as_ref().and_then(|ss| {
+            let current_path = resolve_solve_path_from_mp_session(ss, session)?;
+            let cache = ss.solve_cache.read();
+            let current_node = cache.get(&current_path)?;
+            let cached_index = current_node
+                .actions
+                .iter()
+                .position(|action| action.id == action_id)?;
+            let cached_action = &current_node.actions[cached_index];
+            let session_action_id = session
+                .current_actions()
+                .iter()
+                .enumerate()
+                .find(|(_, current)| {
+                    semantic_actions_match(
+                        &semantic_action_from_game_action(cached_action),
+                        &semantic_action_from_mp_tree_action(current, big_blind),
+                    )
                 })
-                .unwrap_or_else(|| action_id.to_string())
-        } else {
-            action_id.to_string()
-        };
+                .map(|(index, _)| index.to_string())?;
+            let mut next_path = current_path;
+            next_path.push(cached_index);
+            cache
+                .contains_key(&next_path)
+                .then_some((session_action_id, next_path))
+        });
+        if let (Some(ss), Some((session_action_id, next_path))) = (ss.as_ref(), cached_navigation) {
+            let mut state = session.play_action_without_state(&session_action_id)?;
+            apply_exact_solve_overlay(&mut state, ss, Some(next_path));
+            return Ok(state);
+        }
+        let session_action_id = action_id.to_string();
         let mut state = session.play_action(&session_action_id)?;
         if let Some(ss) = ss.as_ref() {
             let path = resolve_solve_path_from_mp_session(ss, session);
