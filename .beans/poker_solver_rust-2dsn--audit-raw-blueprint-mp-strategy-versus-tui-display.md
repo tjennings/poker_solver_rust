@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-07-28T00:59:59Z
+updated_at: 2026-07-28T01:01:22Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -75,6 +75,6 @@ The Explorer matrix must display only root-reach-weighted action frequencies. A 
 ## Root-Reach-Weighted Implementation Summary
 
 - Lazy MP preflop matrix probabilities now represent per-seat root-reach-weighted action frequencies using exported average strategy.
-- Reach replay follows the exact action-index history and multiplies only the player acting at each prior decision; opponent actions do not reduce that playeréÝyø§yÙs marginal reach.
+- Reach replay follows the exact action-index history and multiplies only the player acting at each prior decision; opponent actions do not reduce that player's marginal reach.
 - Root remains unchanged, while a root-folded hand displays zero at descendant nodes. Action descriptors, missing-row errors, and session mutation behavior are covered by regression tests.
 - Postflop matrix values remain explicitly conditional until combo-level reach and blocker-aware propagation are implemented.
