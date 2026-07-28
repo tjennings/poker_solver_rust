@@ -4984,9 +4984,9 @@ pub fn game_load_spot_core(
     let _solve_request_guard = session_state.solve_request_gate.write();
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
-    session.load_spot(spot)?;
     session_state.subgame_solve.reset();
     session_state.exact_solve.reset();
+    session.load_spot(spot)?;
     Ok(session.get_state())
 }
 

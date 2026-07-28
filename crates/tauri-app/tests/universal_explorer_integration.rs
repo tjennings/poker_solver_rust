@@ -22,8 +22,9 @@ use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 use poker_solver_tauri::{
-    game_back_core, game_deal_card_core, game_get_state_core, game_new_core, game_play_action_core,
-    game_solve_core, ExplorationPosition, ExplorationState, GameSessionState, PostflopState,
+    game_back_core, game_deal_card_core, game_get_state_core, game_load_spot_core, game_new_core,
+    game_play_action_core, game_solve_core, ExplorationPosition, ExplorationState, GameMatrix,
+    GameSessionState, PostflopState,
 };
 use tempfile::TempDir;
 
@@ -1090,6 +1091,80 @@ async fn mp_eager_game_new_is_rejected_by_lazy_session_gate() {
     assert!(
         error.contains("supports only universal_mp_lazy") && error.contains("universal_mp_eager"),
         "unexpected eager backend error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn failed_saved_spot_replay_invalidates_existing_solve_overlays() {
+    let dir = TempDir::new().unwrap();
+    write_legacy_bundle(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("legacy bundle should load");
+
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("legacy bundle should initialize a game session");
+
+    for solve_state in [&sessions.subgame_solve, &sessions.exact_solve] {
+        solve_state
+            .generation
+            .store(10, std::sync::atomic::Ordering::Release);
+        solve_state
+            .solving
+            .store(true, std::sync::atomic::Ordering::Release);
+        solve_state
+            .iteration
+            .store(7, std::sync::atomic::Ordering::Release);
+        solve_state.solve_cache.write().insert(
+            vec![],
+            poker_solver_tauri::game_session::CachedSolveNode {
+                matrix: GameMatrix {
+                    cells: vec![],
+                    actions: vec![],
+                },
+                actions: vec![],
+                position: "SB".to_string(),
+            },
+        );
+    }
+
+    let result = game_load_spot_core(&sessions, "sb:2bb,bb:call|AsKdQh|bb:check,sb:not-an-action");
+    assert!(
+        result.is_err(),
+        "malformed saved spot should fail during replay"
+    );
+
+    for solve_state in [&sessions.subgame_solve, &sessions.exact_solve] {
+        assert_eq!(
+            solve_state
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            11,
+            "failed replay must advance the solve generation"
+        );
+        assert!(!solve_state
+            .solving
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            solve_state
+                .iteration
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(solve_state.solve_cache.read().is_empty());
+    }
+
+    let state = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+    assert!(
+        state.solve.is_none(),
+        "failed replay must not retain solve status"
+    );
+    assert!(
+        state.matrix.is_some(),
+        "live session state should remain available"
     );
 }
 
