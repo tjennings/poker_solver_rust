@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-07-29T13:00:12Z
-updated_at: 2026-07-29T13:18:33Z
+updated_at: 2026-07-29T13:22:04Z
 parent: poker_solver_rust-g7yj
 ---
 
@@ -19,7 +19,8 @@ The research phase confirmed the range-solver already supports non-terminal turn
 
 ## Work Checklist
 
-- [ ] Research current UniversalMpLazy exact-solve and range-solver contracts
+- [x] Research current UniversalMpLazy exact-solve and range-solver contracts
+  - Range solver supports Flop/Turn/River roots but uses integer chip units and per-depth rows; the MP adapter currently rounds values and reuses flop sizes.
 - [ ] Brainstorm street-aware adapter and fractional-value handling
 - [ ] Plan implementation and focused regression coverage
 - [ ] Dispatch implementation in an isolated worktree
