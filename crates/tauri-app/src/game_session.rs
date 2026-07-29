@@ -425,6 +425,12 @@ pub struct SolveState {
     pub solve_path: RwLock<Vec<usize>>,
     /// Session anchor for the cached solve tree.
     pub solve_anchor: RwLock<Option<SolveAnchor>>,
+    /// Chip scale used to build the exact MP range-solver tree.
+    ///
+    /// `None` preserves the legacy semantic matcher for HU sessions. MP exact
+    /// navigation uses this to compare raw lazy actions with the solver's
+    /// integer-chip descriptors without falling back to display labels.
+    exact_action_scale: RwLock<Option<f64>>,
 }
 
 impl Default for SolveState {
@@ -444,6 +450,7 @@ impl Default for SolveState {
             solve_cache: RwLock::new(HashMap::new()),
             solve_path: RwLock::new(vec![]),
             solve_anchor: RwLock::new(None),
+            exact_action_scale: RwLock::new(None),
         }
     }
 }
@@ -465,6 +472,7 @@ impl SolveState {
         *self.solve_cache.write() = HashMap::new();
         *self.solve_path.write() = vec![];
         *self.solve_anchor.write() = None;
+        *self.exact_action_scale.write() = None;
     }
 
     fn publish_if_current<F>(&self, generation: u64, publish: F) -> bool
@@ -2833,6 +2841,131 @@ struct SemanticAction {
     amount_bb: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScaledActionDescriptor {
+    action_type: String,
+    amount: Option<i32>,
+}
+
+fn scaled_action_descriptor(action_type: &str, amount: Option<i32>) -> ScaledActionDescriptor {
+    ScaledActionDescriptor {
+        action_type: action_type.to_ascii_lowercase(),
+        amount,
+    }
+}
+
+/// Build the exact descriptor for a raw MP action retained in a session
+/// record. Aggressive actions must be exactly representable at the solver's
+/// chip scale; rounded values are deliberately rejected.
+fn scaled_action_descriptor_from_mp_game_action(
+    action: &GameAction,
+    big_blind: f64,
+    chip_scale: f64,
+) -> Option<ScaledActionDescriptor> {
+    let action_type = action.action_type.to_ascii_lowercase();
+    let amount = match action_type.as_str() {
+        "bet" | "raise" => {
+            let amount_bb = action.exact_amount_bb?;
+            mp_chips_to_solver_units(amount_bb * big_blind, chip_scale).ok()
+        }
+        "fold" | "check" | "call" | "allin" => None,
+        _ => return None,
+    };
+    Some(scaled_action_descriptor(&action_type, amount))
+}
+
+/// Build the exact descriptor for a range-solver action. Its hidden BB value
+/// was produced from integer solver chips, so conversion back through the
+/// scaled BB is only used to recover that integer identity.
+fn scaled_action_descriptor_from_cached_action(
+    action: &GameAction,
+    scaled_big_blind: f64,
+) -> Option<ScaledActionDescriptor> {
+    let action_type = action.action_type.to_ascii_lowercase();
+    let amount = match action_type.as_str() {
+        "bet" | "raise" => {
+            let amount_bb = action.exact_amount_bb?;
+            let scaled_amount = amount_bb * scaled_big_blind;
+            if !scaled_amount.is_finite()
+                || (scaled_amount - scaled_amount.round()).abs() > 1e-7
+                || scaled_amount < f64::from(i32::MIN)
+                || scaled_amount > f64::from(i32::MAX)
+            {
+                return None;
+            }
+            Some(scaled_amount.round() as i32)
+        }
+        "fold" | "check" | "call" | "allin" => None,
+        _ => return None,
+    };
+    Some(scaled_action_descriptor(&action_type, amount))
+}
+
+fn unique_cached_action_index(
+    actions: &[GameAction],
+    target: &ScaledActionDescriptor,
+    scaled_big_blind: f64,
+) -> Option<usize> {
+    let matches: Vec<_> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            (scaled_action_descriptor_from_cached_action(action, scaled_big_blind).as_ref()
+                == Some(target))
+            .then_some(index)
+        })
+        .collect();
+    (matches.len() == 1).then_some(matches[0])
+}
+
+fn exact_mp_session_action_id_matching_cached_action(
+    live_actions: &[GameAction],
+    cached_actions: &[GameAction],
+    cached_index: usize,
+    big_blind: f64,
+    chip_scale: f64,
+) -> Result<String, String> {
+    let scaled_big_blind = big_blind * chip_scale;
+    let cached_action = cached_actions
+        .get(cached_index)
+        .ok_or_else(|| "Exact solver action index is out of range".to_string())?;
+    let target = scaled_action_descriptor_from_cached_action(cached_action, scaled_big_blind)
+        .ok_or_else(|| {
+            format!(
+                "Exact solver action '{}' has no exact scaled-chip descriptor",
+                cached_action.label
+            )
+        })?;
+
+    if unique_cached_action_index(cached_actions, &target, scaled_big_blind).is_none() {
+        return Err(format!(
+            "Exact solver action '{}' is ambiguous after scaled-chip quantization",
+            cached_action.label
+        ));
+    }
+
+    let matches: Vec<_> = live_actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            (scaled_action_descriptor_from_mp_game_action(action, big_blind, chip_scale).as_ref()
+                == Some(&target))
+            .then_some(index)
+        })
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(index.to_string()),
+        [] => Err(format!(
+            "Exact solver action '{}' is not exactly representable by the live MP action set",
+            cached_action.label
+        )),
+        _ => Err(format!(
+            "Exact solver action '{}' maps to multiple live MP actions after scaled-chip quantization",
+            cached_action.label
+        )),
+    }
+}
+
 fn action_amount_bb_from_label(label: &str) -> Option<f64> {
     let normalized = label.trim().to_ascii_lowercase().replace(' ', "");
     let bb = normalized.strip_suffix("bb")?;
@@ -3889,12 +4022,26 @@ fn resolve_solve_path_from_mp_session(
 
     let mut path = Vec::new();
     let cache = ss.solve_cache.read();
+    let exact_action_scale = *ss.exact_action_scale.read();
+    let big_blind = exact_action_scale.and_then(|_| mp_big_blind_amount(&session.config).ok());
     for record in session.action_history.iter().skip(anchor.action_ids.len()) {
         let node = cache.get(&path)?;
-        let record_semantic = semantic_action_from_record(record)?;
-        let action_idx = node.actions.iter().position(|action| {
-            semantic_actions_match(&record_semantic, &semantic_action_from_game_action(action))
-        })?;
+        let action_idx = if let (Some(chip_scale), Some(big_blind)) =
+            (exact_action_scale, big_blind)
+        {
+            let record_action = record
+                .actions
+                .iter()
+                .find(|action| action.id == record.action_id)?;
+            let target =
+                scaled_action_descriptor_from_mp_game_action(record_action, big_blind, chip_scale)?;
+            unique_cached_action_index(&node.actions, &target, big_blind * chip_scale)?
+        } else {
+            let record_semantic = semantic_action_from_record(record)?;
+            node.actions.iter().position(|action| {
+                semantic_actions_match(&record_semantic, &semantic_action_from_game_action(action))
+            })?
+        };
         path.push(action_idx);
         if !cache.contains_key(&path) {
             return None;
@@ -3926,6 +4073,12 @@ fn apply_exact_solve_overlay(state: &mut GameState, ss: &SolveState, path: Optio
     if !is_solving && iteration == 0 {
         return;
     }
+    // The live MP state starts with its Blueprint matrix. Clear that data before
+    // applying any exact snapshot so a solve in progress cannot present it as
+    // exact while the range-solver has not published a result yet.
+    state.matrix = None;
+    state.actions.clear();
+    state.position.clear();
     let Some(path) = path else {
         // The MP session no longer matches the solve anchor. Keep the live
         // state untouched and do not expose status from an unrelated solve.
@@ -4000,6 +4153,7 @@ fn reset_solve_state_for_start(
     max_iters: u32,
     position_label: String,
     solve_anchor: SolveAnchor,
+    exact_action_scale: Option<f64>,
 ) -> u64 {
     let _publish_guard = ss.publish_gate.write();
     let generation = ss.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -4016,6 +4170,7 @@ fn reset_solve_state_for_start(
     *ss.solve_anchor.write() = Some(solve_anchor);
     *ss.solve_cache.write() = HashMap::new();
     *ss.solve_path.write() = vec![];
+    *ss.exact_action_scale.write() = exact_action_scale;
     generation
 }
 
@@ -4115,32 +4270,57 @@ pub fn game_play_action_core(
         let previous_street = session.spot.street();
         let big_blind = mp_big_blind_amount(&session.config)?;
         let ss = solve_state_for_source(session_state, source.as_deref());
-        let cached_navigation = ss.as_ref().and_then(|ss| {
-            let current_path = resolve_solve_path_from_mp_session(ss, session)?;
-            let cache = ss.solve_cache.read();
-            let current_node = cache.get(&current_path)?;
-            let cached_index = current_node
-                .actions
-                .iter()
-                .position(|action| action.id == action_id)?;
-            let cached_action = &current_node.actions[cached_index];
-            let session_action_id = session
-                .current_actions()
-                .iter()
-                .enumerate()
-                .find(|(_, current)| {
-                    semantic_actions_match(
-                        &semantic_action_from_game_action(cached_action),
-                        &semantic_action_from_mp_tree_action(current, big_blind),
-                    )
-                })
-                .map(|(index, _)| index.to_string())?;
-            let mut next_path = current_path;
-            next_path.push(cached_index);
-            cache
-                .contains_key(&next_path)
-                .then_some((session_action_id, next_path))
-        });
+        let cached_navigation = if let Some(ss) = ss.as_ref() {
+            (|| -> Result<Option<(String, Vec<usize>)>, String> {
+                let Some(current_path) = resolve_solve_path_from_mp_session(ss, session) else {
+                    return Ok(None);
+                };
+                let cache = ss.solve_cache.read();
+                let Some(current_node) = cache.get(&current_path) else {
+                    return Ok(None);
+                };
+                let Some(cached_index) = current_node
+                    .actions
+                    .iter()
+                    .position(|action| action.id == action_id)
+                else {
+                    return Ok(None);
+                };
+                let current_mp_actions = session.current_actions();
+                let current_actions = build_mp_game_actions(&current_mp_actions, big_blind);
+                let session_action_id = if let Some(chip_scale) = *ss.exact_action_scale.read() {
+                    Some(exact_mp_session_action_id_matching_cached_action(
+                        &current_actions,
+                        &current_node.actions,
+                        cached_index,
+                        big_blind,
+                        chip_scale,
+                    )?)
+                } else {
+                    let cached_action = &current_node.actions[cached_index];
+                    current_mp_actions
+                        .iter()
+                        .enumerate()
+                        .find(|(_, current)| {
+                            semantic_actions_match(
+                                &semantic_action_from_game_action(cached_action),
+                                &semantic_action_from_mp_tree_action(current, big_blind),
+                            )
+                        })
+                        .map(|(index, _)| index.to_string())
+                };
+                let Some(session_action_id) = session_action_id else {
+                    return Ok(None);
+                };
+                let mut next_path = current_path;
+                next_path.push(cached_index);
+                Ok(cache
+                    .contains_key(&next_path)
+                    .then_some((session_action_id, next_path)))
+            })()?
+        } else {
+            None
+        };
         if let (Some(ss), Some((session_action_id, next_path))) = (ss.as_ref(), cached_navigation) {
             let mut state = session.play_action_without_state(&session_action_id)?;
             let street_changed = session.spot.street() != previous_street;
@@ -4534,8 +4714,13 @@ pub fn game_solve_core(
             resolve_street_boundary(&sbc, root_street)
         };
         validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
-        let solve_generation =
-            reset_solve_state_for_start(ss_ref, max_iters, inputs.8.clone(), inputs.9.clone());
+        let solve_generation = reset_solve_state_for_start(
+            ss_ref,
+            max_iters,
+            inputs.8.clone(),
+            inputs.9.clone(),
+            inputs.13,
+        );
         (inputs, boundary_cut, solve_generation)
     };
 
@@ -7291,10 +7476,15 @@ mod tests {
             board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
             action_ids: vec![],
         };
-        let exact_generation =
-            reset_solve_state_for_start(&gss.exact_solve, 10, "BB".to_string(), anchor.clone());
+        let exact_generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            anchor.clone(),
+            None,
+        );
         let subgame_generation =
-            reset_solve_state_for_start(&gss.subgame_solve, 10, "BB".to_string(), anchor);
+            reset_solve_state_for_start(&gss.subgame_solve, 10, "BB".to_string(), anchor, None);
 
         let state = game_load_spot_core(&gss, "sb:fold").unwrap();
         assert_eq!(state.action_history.len(), 1);
@@ -7802,6 +7992,7 @@ mod tests {
                 board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
                 action_ids: vec![],
             },
+            None,
         );
         assert!(ss.publish_if_current(generation, |state| {
             state.iteration.store(1, Ordering::Relaxed);
@@ -8226,6 +8417,7 @@ mod tests {
                 board: vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()],
                 action_ids: vec!["1".to_string()],
             },
+            None,
         );
 
         assert!(ss.solve_cache.read().is_empty());

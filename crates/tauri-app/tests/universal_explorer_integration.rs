@@ -1505,6 +1505,38 @@ async fn two_player_lazy_flop_matrix_uses_concrete_root_reach_per_seat() {
 }
 
 #[tokio::test]
+async fn two_player_lazy_exact_startup_hides_blueprint_overlay() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
+    enter_two_player_flop_chance(&sessions);
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let blueprint = game_deal_card_core(&sessions, "Qh").unwrap();
+    assert!(
+        blueprint.matrix.is_some(),
+        "fixture should provide Blueprint data"
+    );
+
+    sessions
+        .exact_solve
+        .solving
+        .store(true, std::sync::atomic::Ordering::Release);
+    let exact = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+    assert!(
+        exact.solve.is_some(),
+        "exact startup should expose solve status"
+    );
+    assert!(
+        exact.matrix.is_none(),
+        "exact startup must not show the Blueprint matrix"
+    );
+    assert!(
+        exact.actions.is_empty(),
+        "exact startup must not show Blueprint actions"
+    );
+}
+
+#[tokio::test]
 async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
     let dir = TempDir::new().unwrap();
     write_mp_lazy_2p_bundle_with_flop_reach_anomaly(dir.path());
@@ -1769,6 +1801,91 @@ async fn two_player_lazy_exact_solve_uses_configured_big_blind_for_root_actions(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("Universal MP exact solve with a 1.5-chip BB did not complete");
+}
+
+#[tokio::test]
+async fn two_player_lazy_exact_solve_rejects_unrepresentable_fractional_action() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_flop_reach_anomaly_and_big_blind(dir.path(), 1.5);
+
+    let config_path = dir.path().join("config.yaml");
+    let mut config: BlueprintMpConfig = serde_yaml::from_str(
+        &std::fs::read_to_string(&config_path).expect("read retained MP config"),
+    )
+    .expect("retained MP config should deserialize");
+    config.action_abstraction.flop.lead = vec![serde_yaml::Value::from(0.33)];
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&config).expect("serialize fractional MP config"),
+    )
+    .expect("write fractional MP config");
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("fractional MP exact fixture should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("fractional MP exact fixture should initialize");
+
+    let root = game_get_state_core(&sessions, None).unwrap();
+    let sb_raise = root
+        .actions
+        .iter()
+        .find(|action| action.label == "2bb")
+        .expect("SB should expose the opening raise");
+    let after_sb_raise = game_play_action_core(&sessions, &sb_raise.id, None).unwrap();
+    let bb_reraise = after_sb_raise
+        .actions
+        .iter()
+        .find(|action| action.label == "3bb")
+        .expect("BB should expose the reraise");
+    let after_bb_reraise = game_play_action_core(&sessions, &bb_reraise.id, None).unwrap();
+    let sb_call = after_bb_reraise
+        .actions
+        .iter()
+        .find(|action| action.action_type == "call")
+        .expect("SB should expose the call");
+    game_play_action_core(&sessions, &sb_call.id, None).unwrap();
+    game_deal_card_core(&sessions, "As").unwrap();
+    game_deal_card_core(&sessions, "Kd").unwrap();
+    let flop = game_deal_card_core(&sessions, "Qh").unwrap();
+    assert_eq!(flop.position, "BB");
+
+    game_solve_core(
+        &sessions,
+        Some("exact".to_string()),
+        Some(1),
+        None,
+        Some(1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(false),
+    )
+    .expect("fractional MP exact solve should start");
+
+    for _ in 0..200 {
+        let solved = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+        if solved.solve.as_ref().is_some_and(|solve| solve.is_complete) {
+            let aggressive = solved
+                .actions
+                .iter()
+                .find(|action| action.action_type == "bet" || action.action_type == "raise")
+                .expect("exact root should retain an aggressive action");
+            let error = game_play_action_core(&sessions, &aggressive.id, Some("exact".to_string()))
+                .expect_err("unrepresentable fractional action must be rejected");
+            assert!(
+                error.contains("not exactly representable"),
+                "unexpected fractional action error: {error}"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("Universal MP exact solve with an unrepresentable fractional action did not complete");
 }
 
 #[tokio::test]
