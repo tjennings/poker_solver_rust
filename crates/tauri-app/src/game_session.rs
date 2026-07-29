@@ -2915,7 +2915,10 @@ fn unique_cached_action_index(
             .then_some(index)
         })
         .collect();
-    (matches.len() == 1).then_some(matches[0])
+    match matches.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
 }
 
 fn exact_mp_session_action_id_matching_cached_action(
@@ -7833,6 +7836,34 @@ mod tests {
     // -------------------------------------------------------------------
     // Solve cache tests
     // -------------------------------------------------------------------
+
+    #[test]
+    fn unique_cached_action_index_returns_none_for_zero_matches() {
+        let target = scaled_action_descriptor("raise", Some(150));
+
+        assert_eq!(unique_cached_action_index(&[], &target, 100.0), None);
+    }
+
+    #[test]
+    fn unique_cached_action_index_returns_none_for_ambiguous_scaled_matches() {
+        let actions = vec![
+            GameAction {
+                id: "0".to_string(),
+                label: "1.5bb".to_string(),
+                action_type: "raise".to_string(),
+                exact_amount_bb: Some(1.5),
+            },
+            GameAction {
+                id: "1".to_string(),
+                label: "1.500000000000001bb".to_string(),
+                action_type: "raise".to_string(),
+                exact_amount_bb: Some(1.500000000000001),
+            },
+        ];
+        let target = scaled_action_descriptor("raise", Some(150));
+
+        assert_eq!(unique_cached_action_index(&actions, &target, 100.0), None);
+    }
 
     /// Helper to create a dummy CachedSolveNode with a recognizable hand label.
     fn make_cached_node(
