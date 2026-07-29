@@ -3138,21 +3138,13 @@ fn parse_bet_size_options_for_solve(
     if sizes.len() > 2 {
         options.per_num_bets = sizes
             .iter()
+            .skip(1)
             .enumerate()
             .map(|(depth, row)| {
-                let row_sizes = if depth == 0 {
-                    format_bet_sizes_for_solve(&[row.clone(), vec![]]).0
-                } else {
-                    format_bet_sizes_for_solve(&[vec![], row.clone()]).1
-                };
-                let parsed = if depth == 0 {
-                    BetSizeOptions::try_from((row_sizes.as_str(), "a"))
-                } else {
-                    BetSizeOptions::try_from(("a", row_sizes.as_str()))
-                };
-                parsed
-                    .map(|parsed| if depth == 0 { parsed.bet } else { parsed.raise })
-                    .map_err(|e| format!("Bad bet sizes at raise depth {depth}: {e}"))
+                let row_sizes = format_bet_sizes_for_solve(&[vec![], row.clone()]).1;
+                BetSizeOptions::try_from(("a", row_sizes.as_str()))
+                    .map(|parsed| parsed.raise)
+                    .map_err(|e| format!("Bad bet sizes at raise depth {}: {e}", depth + 1))
             })
             .collect::<Result<Vec<_>, _>>()?;
     }
@@ -6354,7 +6346,7 @@ mod tests {
             .contains(&BetSize::PotRelative(0.33)));
         assert!(config.turn_bet_sizes[0]
             .per_num_bets
-            .get(2)
+            .get(1)
             .is_some_and(|row| row.contains(&BetSize::PotRelative(0.75))));
     }
 
