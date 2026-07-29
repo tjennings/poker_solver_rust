@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getComboActionRows,
   isUniversalMpLazyBundleName,
   shouldShowStrategyMatrix,
   supportsUniversalMpLazyExact,
@@ -96,5 +97,32 @@ describe("Universal MP lazy Explorer capabilities", () => {
       shouldShowStrategyMatrix("universal_mp_lazy", "blueprint", unsolvedFlop),
     ).toBe(true);
     expect(shouldShowStrategyMatrix("hu", "exact", unsolvedFlop)).toBe(true);
+  });
+});
+
+describe("combo action rows", () => {
+  it("keeps every matrix action in order and renders zero probabilities", () => {
+    const actions = [
+      { id: "fold", label: "Fold", action_type: "fold" },
+      { id: "call", label: "Call", action_type: "call" },
+      { id: "raise", label: "Raise to 2.5", action_type: "raise" },
+    ];
+
+    const rows = getComboActionRows(actions, [0, 0.734, 0]);
+
+    expect(rows.map((row) => row.action.id)).toEqual([
+      "fold",
+      "call",
+      "raise",
+    ]);
+    expect(rows.map((row) => row.percentage)).toEqual([0, 73.4, 0]);
+    expect(rows.map((row) => row.percentageLabel)).toEqual([
+      "0.0%",
+      "73.4%",
+      "0.0%",
+    ]);
+    expect(
+      getComboActionRows(actions, [0.5]).map((row) => row.percentage),
+    ).toEqual([50, 0, 0]);
   });
 });

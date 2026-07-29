@@ -1,7 +1,7 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { invoke } from "./invoke";
 import { useGlobalConfig } from "./useGlobalConfig";
-import type { GameState } from "./game-types";
+import type { GameAction, GameState } from "./game-types";
 import { HandCell, CellDetail, ActionBlock } from "./Explorer";
 import { toMatrixCell } from "./game-explorer-utils";
 import { SUIT_COLORS, SUIT_SYMBOLS, getActionColor } from "./matrix-utils";
@@ -48,6 +48,27 @@ export function shouldShowStrategyMatrix(
   if (sessionKind !== "universal_mp_lazy" || activeSource !== "exact")
     return true;
   return supportsUniversalMpLazyExact(state) && state.solve !== null;
+}
+
+export interface ComboActionRow {
+  action: GameAction;
+  percentage: number;
+  percentageLabel: string;
+}
+
+/** Keep every combo action aligned to the shared matrix action vector. */
+export function getComboActionRows(
+  actions: readonly GameAction[],
+  probabilities: readonly number[],
+): ComboActionRow[] {
+  return actions.map((action, index) => {
+    const percentage = (probabilities[index] ?? 0) * 100;
+    return {
+      action,
+      percentage,
+      percentageLabel: `${percentage.toFixed(1)}%`,
+    };
+  });
 }
 
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
@@ -1071,6 +1092,10 @@ export default function GameExplorer() {
                           }}
                         >
                           {selectedCellData.combos.map((combo) => {
+                            const comboActionRows = getComboActionRows(
+                              matrixActions,
+                              combo.probabilities,
+                            );
                             const r1 = combo.cards[0]?.toUpperCase();
                             const s1 = combo.cards[1]?.toLowerCase();
                             const r2 = combo.cards[2]?.toUpperCase();
@@ -1133,15 +1158,12 @@ export default function GameExplorer() {
                                     marginBottom: "0.25rem",
                                   }}
                                 >
-                                  {matrixActions.map((action, i) => {
-                                    const pct =
-                                      (combo.probabilities[i] || 0) * 100;
-                                    if (pct < 0.1) return null;
-                                    return (
+                                  {comboActionRows.map(
+                                    ({ action, percentage }) => (
                                       <div
                                         key={action.id}
                                         style={{
-                                          width: `${pct}%`,
+                                          width: `${percentage}%`,
                                           background: getActionColor(
                                             action,
                                             matrixActions,
@@ -1149,14 +1171,11 @@ export default function GameExplorer() {
                                           height: "100%",
                                         }}
                                       />
-                                    );
-                                  })}
+                                    ),
+                                  )}
                                 </div>
-                                {matrixActions.map((action, i) => {
-                                  const pct =
-                                    (combo.probabilities[i] || 0) * 100;
-                                  if (pct < 0.5) return null;
-                                  return (
+                                {comboActionRows.map(
+                                  ({ action, percentageLabel }) => (
                                     <div
                                       key={action.id}
                                       style={{
@@ -1167,10 +1186,10 @@ export default function GameExplorer() {
                                       }}
                                     >
                                       <span>{action.label}</span>
-                                      <span>{pct.toFixed(0)}%</span>
+                                      <span>{percentageLabel}</span>
                                     </div>
-                                  );
-                                })}
+                                  ),
+                                )}
                               </div>
                             );
                           })}
