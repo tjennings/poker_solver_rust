@@ -622,6 +622,32 @@ fn write_mp_lazy_2p_bundle_with_options_and_missing_postflop_row(
     big_blind: f64,
     missing_postflop_row: Option<MpStreet>,
 ) {
+    write_mp_lazy_2p_bundle_with_options_and_street_sizes(
+        dir,
+        include_flop_buckets,
+        include_flop_rows,
+        include_anomaly_rows,
+        omit_preflop_row,
+        zero_bb_reraise_reach,
+        big_blind,
+        missing_postflop_row,
+        None,
+        None,
+    );
+}
+
+fn write_mp_lazy_2p_bundle_with_options_and_street_sizes(
+    dir: &Path,
+    include_flop_buckets: bool,
+    include_flop_rows: bool,
+    include_anomaly_rows: bool,
+    omit_preflop_row: bool,
+    zero_bb_reraise_reach: bool,
+    big_blind: f64,
+    missing_postflop_row: Option<MpStreet>,
+    turn_sizes: Option<MpStreetSizes>,
+    river_sizes: Option<MpStreetSizes>,
+) {
     let mut config = build_3p_config();
     config.game.name = "2p-lazy-session-test".to_string();
     config.game.num_players = 2;
@@ -645,8 +671,10 @@ fn write_mp_lazy_2p_bundle_with_options_and_missing_postflop_row(
     }
     config.action_abstraction.flop =
         serde_yaml::from_str("lead: [1.0]\nraise: [[1.0]]").expect("valid test flop action sizes");
-    config.action_abstraction.turn = config.action_abstraction.flop.clone();
-    config.action_abstraction.river = config.action_abstraction.flop.clone();
+    config.action_abstraction.turn =
+        turn_sizes.unwrap_or_else(|| config.action_abstraction.flop.clone());
+    config.action_abstraction.river =
+        river_sizes.unwrap_or_else(|| config.action_abstraction.flop.clone());
     std::fs::write(
         dir.join("config.yaml"),
         serde_yaml::to_string(&config).expect("serialize MP config"),
@@ -851,6 +879,33 @@ fn write_mp_lazy_2p_bundle_with_options_and_missing_postflop_row(
             "river.buckets",
         );
     }
+}
+
+fn write_mp_lazy_2p_bundle_with_turn_and_river_exact_actions(dir: &Path) {
+    write_mp_lazy_2p_bundle_with_options_and_street_sizes(
+        dir,
+        true,
+        true,
+        false,
+        false,
+        false,
+        2.0,
+        None,
+        Some(MpStreetSizes {
+            lead: vec![serde_yaml::Value::from(0.25)],
+            raise: vec![
+                vec![serde_yaml::Value::from(0.5)],
+                vec![serde_yaml::Value::from(0.75)],
+            ],
+        }),
+        Some(MpStreetSizes {
+            lead: vec![serde_yaml::Value::from(0.33)],
+            raise: vec![
+                vec![serde_yaml::Value::from(0.5)],
+                vec![serde_yaml::Value::from(0.75)],
+            ],
+        }),
+    );
 }
 
 fn write_test_flop_bucket(dir: &Path, bucket_count: u16) {
@@ -1661,6 +1716,14 @@ async fn two_player_lazy_exact_solve_uses_configured_big_blind_for_root_actions(
     let flop = game_deal_card_core(&sessions, "Qh").unwrap();
     assert_eq!(flop.position, "BB");
     let live_actions = flop.actions.clone();
+    let snapshot = sessions
+        .mp_session
+        .write()
+        .as_mut()
+        .expect("MP session should remain active")
+        .exact_solve_snapshot()
+        .expect("fractional chip values should use exact integer scaling");
+    assert_eq!(snapshot.solver_chip_scale, 10.0);
 
     game_solve_core(
         &sessions,
@@ -1773,6 +1836,113 @@ fn enter_two_player_flop_chance(sessions: &GameSessionState) -> poker_solver_tau
         state = game_play_action_core(sessions, &action.id, None).expect("advance preflop");
     }
     panic!("preflop line did not reach flop chance: {state:?}");
+}
+
+fn enter_two_player_turn_root(sessions: &GameSessionState) -> poker_solver_tauri::GameState {
+    let mut state = enter_two_player_flop_chance(sessions);
+    for card in ["As", "Kd", "Qh"] {
+        state = game_deal_card_core(sessions, card).expect("deal flop card");
+    }
+    while state.street == "Flop" && !state.is_chance {
+        state = game_play_action_core(sessions, "0", None).expect("advance flop checks");
+    }
+    game_deal_card_core(sessions, "Jc").expect("deal turn card")
+}
+
+fn enter_two_player_river_root(sessions: &GameSessionState) -> poker_solver_tauri::GameState {
+    let mut state = enter_two_player_turn_root(sessions);
+    while state.street == "Turn" && !state.is_chance {
+        state = game_play_action_core(sessions, "0", None).expect("advance turn checks");
+    }
+    game_deal_card_core(sessions, "Ts").expect("deal river card")
+}
+
+#[tokio::test]
+async fn two_player_lazy_exact_solve_supports_turn_root_and_turn_raise_depths() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_turn_and_river_exact_actions(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy turn exact fixture should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("2p MP lazy turn exact fixture should initialize");
+
+    let turn = enter_two_player_turn_root(&sessions);
+    assert_eq!(turn.street, "Turn");
+    assert_eq!(turn.board, vec!["As", "Kd", "Qh", "Jc"]);
+    assert!(!turn.is_chance);
+
+    let snapshot = sessions
+        .mp_session
+        .write()
+        .as_mut()
+        .expect("MP session should remain active")
+        .exact_solve_snapshot()
+        .expect("turn exact snapshot should be supported");
+    assert_eq!(snapshot.street, MpStreet::Turn);
+    assert_eq!(snapshot.bet_sizes, vec![vec![0.25], vec![0.5], vec![0.75]]);
+    assert_eq!(snapshot.board, turn.board);
+
+    game_solve_core(
+        &sessions,
+        Some("exact".to_string()),
+        Some(1),
+        None,
+        Some(1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(false),
+    )
+    .expect("Universal MP turn exact solve should start");
+
+    for _ in 0..200 {
+        let solved = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+        if solved.solve.as_ref().is_some_and(|solve| solve.is_complete) {
+            assert_eq!(solved.street, "Turn");
+            assert_eq!(solved.board, turn.board);
+            assert!(!solved.actions.is_empty());
+            assert!(solved.matrix.is_some());
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("Universal MP exact solve at a turn root did not complete");
+}
+
+#[tokio::test]
+async fn two_player_lazy_exact_snapshot_supports_river_root_street_rows() {
+    let dir = TempDir::new().unwrap();
+    write_mp_lazy_2p_bundle_with_turn_and_river_exact_actions(dir.path());
+
+    let exploration = ExplorationState::default();
+    poker_solver_tauri::load_bundle_core(&exploration, dir.path().to_string_lossy().to_string())
+        .await
+        .expect("2p MP lazy river exact fixture should load");
+    let sessions = GameSessionState::default();
+    game_new_core(&exploration, &PostflopState::default(), &sessions)
+        .expect("2p MP lazy river exact fixture should initialize");
+
+    let river = enter_two_player_river_root(&sessions);
+    assert_eq!(river.street, "River");
+    assert_eq!(river.board, vec!["As", "Kd", "Qh", "Jc", "Ts"]);
+    assert!(!river.is_chance);
+
+    let snapshot = sessions
+        .mp_session
+        .write()
+        .as_mut()
+        .expect("MP session should remain active")
+        .exact_solve_snapshot()
+        .expect("river exact snapshot should be supported");
+    assert_eq!(snapshot.street, MpStreet::River);
+    assert_eq!(snapshot.bet_sizes, vec![vec![0.33], vec![0.5], vec![0.75]]);
+    assert_eq!(snapshot.board, river.board);
 }
 
 #[tokio::test]

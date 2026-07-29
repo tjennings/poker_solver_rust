@@ -340,6 +340,7 @@ pub fn effective_stack_for_solve_root(root: &SolveGameRoot) -> i32 {
 /// into solver construction.
 #[derive(Debug, Clone)]
 pub struct UniversalMpSolveSnapshot {
+    pub street: MpStreet,
     pub board: Vec<String>,
     pub raw_reaches_by_seat: [Vec<f32>; 2],
     pub acting_seat: u8,
@@ -354,6 +355,7 @@ pub struct UniversalMpSolveSnapshot {
     pub ip_seat: u8,
     pub root: SolveGameRoot,
     pub bet_sizes: Vec<Vec<f64>>,
+    pub solver_chip_scale: f64,
     pub action_history: Vec<ActionRecord>,
     pub actions: Vec<GameAction>,
 }
@@ -911,7 +913,7 @@ impl LazyMpSession {
         Ok(reaches)
     }
 
-    /// Capture the exact supported MP solve inputs at the current flop spot.
+    /// Capture the exact supported MP solve inputs at the current postflop spot.
     ///
     /// Reaches are replayed from the raw sparse rows and remain in actual seat
     /// order. Betting metadata comes from the lazy core state, including the
@@ -919,13 +921,18 @@ impl LazyMpSession {
     pub fn exact_solve_snapshot(&mut self) -> Result<UniversalMpSolveSnapshot, String> {
         if self.terminal {
             return Err(
-                "Exact solve requires a non-terminal Universal MP flop decision".to_string(),
+                "Exact solve requires a non-terminal Universal MP postflop decision".into(),
             );
         }
-        if self.spot.street() != MpStreet::Flop || self.board.len() != 3 {
-            return Err(
-                "Exact solve is supported for UniversalMpLazy flop decisions only".to_string(),
-            );
+        let street = self.spot.street();
+        if !matches!(street, MpStreet::Flop | MpStreet::Turn | MpStreet::River)
+            || self.board.len() != mp_required_board_cards(street)
+        {
+            return Err(format!(
+                "Exact solve is supported for non-terminal UniversalMpLazy Flop, Turn, or River decisions with a complete board; got street={}, board_cards={}",
+                mp_street_to_string(street),
+                self.board.len()
+            ));
         }
 
         let board = mp_board_strings(&self.board);
@@ -937,23 +944,32 @@ impl LazyMpSession {
         let betting = self.spot.betting_snapshot();
         let (sb_seat, bb_seat) = mp_sb_bb_seats(&self.config)?;
         let big_blind = mp_big_blind_amount(&self.config)?;
-        let root = mp_solve_root(&betting, sb_seat, bb_seat, big_blind)?;
+        let solver_chip_scale = mp_exact_chip_scale(&betting, big_blind)?;
+        let root = mp_solve_root(&betting, sb_seat, bb_seat, solver_chip_scale)?;
 
         Ok(UniversalMpSolveSnapshot {
+            street,
             board,
             raw_reaches_by_seat,
             acting_seat: betting.to_act.index(),
-            pot: chips_to_i32(betting.pot),
-            remaining_stacks: chips_array_to_i32(betting.stacks),
-            street_bets: chips_array_to_i32(betting.street_bets),
+            pot: mp_chips_to_solver_units(betting.pot.0, solver_chip_scale)?,
+            remaining_stacks: [
+                mp_chips_to_solver_units(betting.stacks[0].0, solver_chip_scale)?,
+                mp_chips_to_solver_units(betting.stacks[1].0, solver_chip_scale)?,
+            ],
+            street_bets: [
+                mp_chips_to_solver_units(betting.street_bets[0].0, solver_chip_scale)?,
+                mp_chips_to_solver_units(betting.street_bets[1].0, solver_chip_scale)?,
+            ],
             facing_bet: betting.facing_bet,
             raise_count: betting.raise_count,
-            last_raise_to: chips_to_i32(betting.last_raise_to),
+            last_raise_to: mp_chips_to_solver_units(betting.last_raise_to.0, solver_chip_scale)?,
             last_aggressive_action: betting.last_aggressive_action,
             oop_seat: bb_seat,
             ip_seat: sb_seat,
             root,
-            bet_sizes: mp_flop_bet_sizes(&self.config)?,
+            bet_sizes: mp_bet_sizes_for_street(&self.config, street)?,
+            solver_chip_scale,
             action_history,
             actions,
         })
@@ -2534,28 +2550,76 @@ fn mp_sb_bb_seats(config: &BlueprintMpConfig) -> Result<(u8, u8), String> {
     Ok((sb, bb))
 }
 
-fn chips_to_i32(chips: poker_solver_core::blueprint_mp::Chips) -> i32 {
-    chips.0.round() as i32
+const MP_EXACT_MAX_CHIP_SCALE: f64 = 1_000_000.0;
+
+fn mp_exact_chip_scale(betting: &LazyBettingSnapshot, big_blind: f64) -> Result<f64, String> {
+    let amounts = [
+        big_blind,
+        betting.pot.0,
+        betting.last_raise_to.0,
+        betting.stacks[0].0,
+        betting.stacks[1].0,
+        betting.street_bets[0].0,
+        betting.street_bets[1].0,
+    ];
+    if let Some(amount) = amounts.iter().copied().find(|amount| !amount.is_finite()) {
+        return Err(format!(
+            "Universal MP exact solve does not support non-finite chip amount {amount:?}"
+        ));
+    }
+
+    let mut scale = 1.0;
+    while scale <= MP_EXACT_MAX_CHIP_SCALE {
+        if amounts
+            .iter()
+            .copied()
+            .all(|amount| mp_is_integral_scaled(amount, scale))
+        {
+            return Ok(scale);
+        }
+        scale *= 10.0;
+    }
+
+    let amount = amounts
+        .iter()
+        .copied()
+        .find(|amount| !mp_is_integral_scaled(*amount, MP_EXACT_MAX_CHIP_SCALE))
+        .unwrap_or(0.0);
+    Err(format!(
+        "Universal MP exact solve does not support fractional chip amount {amount:.17}: no exact decimal integer scaling through 6 places"
+    ))
+}
+
+fn mp_is_integral_scaled(amount: f64, scale: f64) -> bool {
+    let scaled = amount * scale;
+    scaled.is_finite() && (scaled - scaled.round()).abs() <= 1e-8
 }
 
 /// Convert raw MP chip amounts to the integer units used by range-solver.
 ///
-/// Range-solver has no blind-size field: its integer amounts are raw chip
-/// units. The configured BB belongs at the display and semantic-matching
-/// boundaries, not in this conversion. Keep the validated BB parameter here
-/// so every MP root conversion shares the same config contract.
-fn mp_chips_to_solver_units(amount: f64, big_blind: f64) -> i32 {
-    debug_assert!(big_blind > 0.0);
-    amount.round() as i32
+/// The lazy MP model stores chips as `f64`, while range-solver requires integer
+/// amounts. Exact MP snapshots provide a common decimal scale first; this
+/// conversion therefore rejects values that cannot be represented instead of
+/// silently changing the public betting state by rounding it.
+fn mp_chips_to_solver_units(amount: f64, scale: f64) -> Result<i32, String> {
+    if !mp_is_integral_scaled(amount, scale) {
+        return Err(format!(
+            "Universal MP exact solve cannot represent chip amount {amount:.17} with integer scale {scale}"
+        ));
+    }
+    let scaled = (amount * scale).round();
+    if scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+        return Err(format!(
+            "Universal MP exact solve chip amount {amount:.17} exceeds range-solver integer limits after scale {scale}"
+        ));
+    }
+    Ok(scaled as i32)
 }
 
-fn chips_array_to_i32(
-    chips: [poker_solver_core::blueprint_mp::Chips; poker_solver_core::blueprint_mp::MAX_PLAYERS],
-) -> [i32; 2] {
-    [chips_to_i32(chips[0]), chips_to_i32(chips[1])]
-}
-
-fn mp_flop_bet_sizes(config: &BlueprintMpConfig) -> Result<Vec<Vec<f64>>, String> {
+fn mp_bet_sizes_for_street(
+    config: &BlueprintMpConfig,
+    street: MpStreet,
+) -> Result<Vec<Vec<f64>>, String> {
     let parse_sizes = |values: &[serde_yaml::Value], label: &str| {
         values
             .iter()
@@ -2569,20 +2633,35 @@ fn mp_flop_bet_sizes(config: &BlueprintMpConfig) -> Result<Vec<Vec<f64>>, String
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| format!("Universal MP {label} size is not numeric"))
     };
-    let flop = &config.action_abstraction.flop;
-    let lead = parse_sizes(&flop.lead, "flop lead")?;
-    let raise = flop.raise.first().map_or_else(
-        || Ok(lead.clone()),
-        |sizes| parse_sizes(sizes, "flop raise"),
-    )?;
-    Ok(vec![lead, raise])
+    let (street_name, sizes) = match street {
+        MpStreet::Flop => ("flop", &config.action_abstraction.flop),
+        MpStreet::Turn => ("turn", &config.action_abstraction.turn),
+        MpStreet::River => ("river", &config.action_abstraction.river),
+        MpStreet::Preflop => {
+            return Err("Universal MP exact solve requires a postflop street".to_string())
+        }
+    };
+    let lead = parse_sizes(&sizes.lead, &format!("{street_name} lead"))?;
+    let mut depths = Vec::with_capacity(sizes.raise.len().max(1) + 1);
+    depths.push(lead.clone());
+    if sizes.raise.is_empty() {
+        depths.push(lead);
+    } else {
+        for (depth, values) in sizes.raise.iter().enumerate() {
+            depths.push(parse_sizes(
+                values,
+                &format!("{street_name} raise depth {depth}"),
+            )?);
+        }
+    }
+    Ok(depths)
 }
 
 fn mp_solve_root(
     betting: &LazyBettingSnapshot,
     sb_seat: u8,
     bb_seat: u8,
-    big_blind: f64,
+    chip_scale: f64,
 ) -> Result<SolveGameRoot, String> {
     let actual_actor = betting.to_act.index();
     let initial_player = if actual_actor == bb_seat {
@@ -2595,15 +2674,15 @@ fn mp_solve_root(
         ));
     };
     let initial_stacks = [
-        mp_chips_to_solver_units(betting.stacks[bb_seat as usize].0, big_blind),
-        mp_chips_to_solver_units(betting.stacks[sb_seat as usize].0, big_blind),
+        mp_chips_to_solver_units(betting.stacks[bb_seat as usize].0, chip_scale)?,
+        mp_chips_to_solver_units(betting.stacks[sb_seat as usize].0, chip_scale)?,
     ];
     let street_bets = [
-        mp_chips_to_solver_units(betting.street_bets[bb_seat as usize].0, big_blind),
-        mp_chips_to_solver_units(betting.street_bets[sb_seat as usize].0, big_blind),
+        mp_chips_to_solver_units(betting.street_bets[bb_seat as usize].0, chip_scale)?,
+        mp_chips_to_solver_units(betting.street_bets[sb_seat as usize].0, chip_scale)?,
     ];
     let starting_pot =
-        (mp_chips_to_solver_units(betting.pot.0, big_blind) - street_bets[0] - street_bets[1])
+        (mp_chips_to_solver_units(betting.pot.0, chip_scale)? - street_bets[0] - street_bets[1])
             .max(1);
     let matched_amount = street_bets[0].min(street_bets[1]);
 
@@ -2613,7 +2692,7 @@ fn mp_solve_root(
                 "Universal MP exact solve is missing raw aggressive action metadata".to_string(),
             );
         };
-        let amount = mp_chips_to_solver_units(betting.last_raise_to.0, big_blind);
+        let amount = mp_chips_to_solver_units(betting.last_raise_to.0, chip_scale)?;
         let previous = match action {
             MpTreeAction::Lead(_) => range_solver::Action::Bet(amount),
             MpTreeAction::Raise(_) => range_solver::Action::Raise(amount),
@@ -2870,6 +2949,43 @@ fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
     blueprint_sizes_to_range_solver(sizes)
 }
 
+/// Parse one street's lead and raise-depth rows for range-solver.
+///
+/// Two rows retain the historical shared raise-size behavior. Three or more
+/// rows additionally populate `per_num_bets`, whose row index matches the
+/// number of bets already made on the current street.
+fn parse_bet_size_options_for_solve(
+    sizes: &[Vec<f64>],
+) -> Result<range_solver::bet_size::BetSizeOptions, String> {
+    use range_solver::bet_size::BetSizeOptions;
+
+    let (bet_str, raise_str) = format_bet_sizes_for_solve(sizes);
+    let mut options = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
+        .map_err(|e| format!("Bad bet sizes: {e}"))?;
+    if sizes.len() > 2 {
+        options.per_num_bets = sizes
+            .iter()
+            .enumerate()
+            .map(|(depth, row)| {
+                let row_sizes = if depth == 0 {
+                    format_bet_sizes_for_solve(&[row.clone(), vec![]]).0
+                } else {
+                    format_bet_sizes_for_solve(&[vec![], row.clone()]).1
+                };
+                let parsed = if depth == 0 {
+                    BetSizeOptions::try_from((row_sizes.as_str(), "a"))
+                } else {
+                    BetSizeOptions::try_from(("a", row_sizes.as_str()))
+                };
+                parsed
+                    .map(|parsed| if depth == 0 { parsed.bet } else { parsed.raise })
+                    .map_err(|e| format!("Bad bet sizes at raise depth {depth}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(options)
+}
+
 /// Build the `CardConfig` and `ActionTree` for a postflop solve without
 /// constructing the `PostFlopGame`. Useful when the caller needs to pass
 /// these to `make_per_boundary_gadget_game` or other paths that consume
@@ -2913,7 +3029,6 @@ pub fn build_solve_game_parts_with_root(
     depth_limit_override: Option<u8>,
     root: Option<SolveGameRoot>,
 ) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
-    use range_solver::bet_size::BetSizeOptions;
     use range_solver::card::CardConfig;
     use range_solver::range::Range;
     use range_solver::{ActionTree, TreeConfig};
@@ -2924,9 +3039,7 @@ pub fn build_solve_game_parts_with_root(
         Range::from_raw_data(oop_weights).map_err(|e| format!("Bad OOP weights: {e}"))?;
     let ip_range = Range::from_raw_data(ip_weights).map_err(|e| format!("Bad IP weights: {e}"))?;
 
-    let (bet_str, raise_str) = format_bet_sizes_for_solve(bet_sizes);
-    let oop_sizes = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
-        .map_err(|e| format!("Bad bet sizes: {e}"))?;
+    let oop_sizes = parse_bet_size_options_for_solve(bet_sizes)?;
     let ip_sizes = oop_sizes.clone();
 
     let card_config = CardConfig {
@@ -4198,15 +4311,13 @@ pub fn game_solve_core(
         let inputs = {
             if session_state.mp_session.read().is_some() {
                 if !is_exact {
-                    return Err(
-                        "UniversalMpLazy currently supports Exact solve for flop decisions only"
-                            .to_string(),
-                    );
+                    return Err("UniversalMpLazy currently supports Exact solve only".to_string());
                 }
                 let mut guard = session_state.mp_session.write();
                 let session = guard.as_mut().ok_or("No MP game session active")?;
-                let action_big_blind = mp_big_blind_amount(&session.config)?;
                 let snapshot = session.exact_solve_snapshot()?;
+                let action_big_blind =
+                    mp_big_blind_amount(&session.config)? * snapshot.solver_chip_scale;
                 let oop_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.oop_seat)].clone();
                 let ip_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.ip_seat)].clone();
                 let position = if snapshot.acting_seat == snapshot.oop_seat {
@@ -4236,7 +4347,12 @@ pub fn game_solve_core(
                     solve_anchor,
                     ["BB".to_string(), "SB".to_string()],
                     snapshot.root,
-                    Street::Flop,
+                    match snapshot.street {
+                        MpStreet::Flop => Street::Flop,
+                        MpStreet::Turn => Street::Turn,
+                        MpStreet::River => Street::River,
+                        MpStreet::Preflop => return Err("Cannot solve preflop".to_string()),
+                    },
                     Some(action_big_blind),
                 )
             } else {
