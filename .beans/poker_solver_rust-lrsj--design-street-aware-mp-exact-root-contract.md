@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-07-29T13:00:06Z
-updated_at: 2026-07-29T13:14:41Z
+updated_at: 2026-07-29T13:16:22Z
 parent: poker_solver_rust-g7yj
 ---
 
@@ -15,7 +15,7 @@ Define and test the shared contract between UniversalMpLazy and the exact range 
 
 ## Checklist
 
-- [ ] Research existing exact-root/session contracts and p989 fractional-chip boundary
+- [x] Research existing exact-root/session contracts and p989 fractional-chip boundary
 - [x] Brainstorm and decide the street-aware contract shape
 - [ ] Implement contract and focused construction/validation tests via rust-developer
 - [ ] Review implementation and preserve turn/river navigation and exact-cache behavior
@@ -28,3 +28,9 @@ Define and test the shared contract between UniversalMpLazy and the exact range 
 ## Design Decision
 
 Use an explicit postflop street-aware snapshot with `MpStreet`, current board, actual-seat raw reaches, root actor, raw `f64` chip amounts, betting metadata, and full Flop/Turn/River lead plus raise-depth vectors. Keep the existing integer `SolveGameRoot` projection isolated behind a named legacy adapter conversion so the lossless snapshot does not imply that p989 is solved. Snapshot construction supports non-terminal Flop/Turn/River roots; `game_solve_core` retains an explicit UniversalMpLazy Turn/River rejection until the adapter phase.
+
+
+
+## Status
+
+Implementation was intentionally stopped at the user's request before Rust edits. Research and architecture brainstorming identified the contract shape, but no code, tests, or adapter changes landed. The implementation worktree remains clean; the existing main-worktree YAML edit is preserved.
