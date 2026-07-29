@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-07-29T13:53:54Z
-updated_at: 2026-07-29T14:20:48Z
+updated_at: 2026-07-29T14:48:50Z
 parent: poker_solver_rust-g7yj
 ---
 
@@ -15,3 +15,8 @@ The MP exact adapter preserves root chip state with scaling but still rounds fra
 ## Review Findings
 
 The first adapter patch still needs to reconcile range-solver integer action quantization with raw fractional MP actions and the existing HU semantic matcher. Exact action descriptors must remain identity-safe at scaled values instead of comparing rounded BB labels.
+
+
+## Additional Review Findings
+
+Preflight validation is still needed: unrepresentable fractional actions are currently rejected only after a solve starts. The same precision policy must cover the existing HU exact action-history matcher.
