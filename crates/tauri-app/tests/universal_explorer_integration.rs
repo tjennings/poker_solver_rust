@@ -1884,7 +1884,35 @@ async fn two_player_lazy_exact_solve_supports_turn_root_and_turn_raise_depths() 
         .expect("turn exact snapshot should be supported");
     assert_eq!(snapshot.street, MpStreet::Turn);
     assert_eq!(snapshot.bet_sizes, vec![vec![0.25], vec![0.5], vec![0.75]]);
+    assert_eq!(
+        snapshot.bet_sizes_by_street[2],
+        vec![vec![0.33], vec![0.5], vec![0.75]]
+    );
     assert_eq!(snapshot.board, turn.board);
+
+    let weights = vec![1.0f32; 1326];
+    let (_card_config, action_tree) =
+        poker_solver_tauri::build_solve_game_parts_with_root_and_street_sizes(
+            &snapshot.board,
+            &weights,
+            &weights,
+            snapshot.root.starting_pot,
+            poker_solver_tauri::effective_stack_for_solve_root(&snapshot.root),
+            &snapshot.bet_sizes_by_street,
+            true,
+            None,
+            Some(snapshot.root),
+        )
+        .expect("turn exact tree should retain every configured street row");
+    let tree_config = action_tree.config();
+    assert!(tree_config.turn_bet_sizes[0]
+        .bet
+        .iter()
+        .any(|size| *size == range_solver::bet_size::BetSize::PotRelative(0.25)));
+    assert!(tree_config.river_bet_sizes[0]
+        .bet
+        .iter()
+        .any(|size| *size == range_solver::bet_size::BetSize::PotRelative(0.33)));
 
     game_solve_core(
         &sessions,

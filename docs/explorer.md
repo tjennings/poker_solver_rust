@@ -115,9 +115,13 @@ When the game reaches the flop, enter board cards (e.g. `Ac Th 4d`). The app:
 Continue through turn and river by entering additional cards. The suit mapping from flop canonicalization is applied to turn/river cards automatically.
 
 The turn/river workflow above applies to HU Blueprint sessions and the
-supported two-player `universal_mp_lazy` Game session. Universal MP exact
-solving remains limited to two-player flop decision spots; turn/river and
-multi-player exact solving remain unsupported.
+supported two-player `universal_mp_lazy` Game session. Universal MP lazy
+supports Exact solving at non-terminal Flop, Turn, and River decision roots
+when the board is complete for that street. Preflop roots, incomplete-board
+chance states, terminal states, Subgame solves, eager MP bundles, and any
+N-player bundle remain unsupported. The Game view hides those unsupported
+Exact/Subgame affordances instead of presenting the Blueprint matrix as an
+Exact result.
 
 ### Navigation
 

@@ -1731,10 +1731,7 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
     let format_depth = |sizes: &[f64]| -> String {
         sizes
             .iter()
-            .map(|&f| {
-                let pct = (f * 100.0).round() as u32;
-                format!("{pct}%")
-            })
+            .map(|&f| format!("{}%", format_percentage_for_range_solver(f)))
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -1754,6 +1751,26 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
     };
 
     (add_allin(bet_str), add_allin(raise_str))
+}
+
+/// Preserve fractional blueprint percentages when passing them to range-solver.
+///
+/// Range-solver accepts decimal percentages, so converting through an integer
+/// percentage would make distinct configured actions share one descriptor before
+/// the solver even builds its integer chip tree.
+fn format_percentage_for_range_solver(fraction: f64) -> String {
+    let mut formatted = format!("{:.15}", fraction * 100.0);
+    while formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        formatted.clear();
+        formatted.push('0');
+    }
+    formatted
 }
 
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
@@ -4005,6 +4022,14 @@ mod tests {
         let (bet, raise) = blueprint_sizes_to_range_solver(&depths);
         assert_eq!(bet, "50%,a");
         assert_eq!(raise, "50%,a");
+    }
+
+    #[timed_test]
+    fn blueprint_sizes_preserve_fractional_percentages() {
+        let depths = vec![vec![0.925, 0.3333333333333333]];
+        let (bet, raise) = blueprint_sizes_to_range_solver(&depths);
+        assert_eq!(bet, "92.5%,33.3333333333333%,a");
+        assert_eq!(raise, "92.5%,33.3333333333333%,a");
     }
 
     #[timed_test]

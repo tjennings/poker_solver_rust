@@ -139,8 +139,10 @@ errors instead of the trainer hot path's panic behavior. Card and action
 updates are transactional, and back navigation replays the semantic action
 path and retained board selection. The Universal MP lazy browser supports
 two-player turn and river navigation, including dealing and rewinding those
-streets. Exact MP solving remains limited to non-terminal two-player flop
-decisions; turn and river exact solve roots are not supported. Eager MP and
+streets. Its exact adapter supports non-terminal two-player Flop, Turn, and
+River decision roots when the board is complete for the current street.
+Preflop roots, incomplete-board chance states, terminal roots, Subgame solves,
+eager MP bundles, and N-player exact solving remain unsupported. Eager MP and
 N-player UI remain deferred.
 
 **External baseline validation:**

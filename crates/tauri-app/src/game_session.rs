@@ -247,6 +247,11 @@ pub struct GameAction {
     pub id: String,
     pub label: String,
     pub action_type: String,
+    /// Unrounded amount in big blinds used for internal cache/session matching.
+    /// This is deliberately omitted from the frontend payload; labels remain the
+    /// user-facing representation while navigation uses the actual descriptor.
+    #[serde(skip)]
+    pub(crate) exact_amount_bb: Option<f64>,
 }
 
 /// Per-combo strategy detail (e.g., "AhKh" with its own action probabilities).
@@ -355,6 +360,7 @@ pub struct UniversalMpSolveSnapshot {
     pub ip_seat: u8,
     pub root: SolveGameRoot,
     pub bet_sizes: Vec<Vec<f64>>,
+    pub bet_sizes_by_street: [Vec<Vec<f64>>; 3],
     pub solver_chip_scale: f64,
     pub action_history: Vec<ActionRecord>,
     pub actions: Vec<GameAction>,
@@ -945,6 +951,7 @@ impl LazyMpSession {
         let (sb_seat, bb_seat) = mp_sb_bb_seats(&self.config)?;
         let big_blind = mp_big_blind_amount(&self.config)?;
         let solver_chip_scale = mp_exact_chip_scale(&betting, big_blind)?;
+        let bet_sizes_by_street = mp_bet_sizes_by_street(&self.config)?;
         let root = mp_solve_root(&betting, sb_seat, bb_seat, solver_chip_scale)?;
 
         Ok(UniversalMpSolveSnapshot {
@@ -968,7 +975,8 @@ impl LazyMpSession {
             oop_seat: bb_seat,
             ip_seat: sb_seat,
             root,
-            bet_sizes: mp_bet_sizes_for_street(&self.config, street)?,
+            bet_sizes: bet_sizes_by_street[mp_street_index(street)].clone(),
+            bet_sizes_by_street,
             solver_chip_scale,
             action_history,
             actions,
@@ -2512,6 +2520,7 @@ fn build_game_actions(tree_actions: &[TreeAction]) -> Vec<GameAction> {
             id: i.to_string(),
             label: format_tree_action(a),
             action_type: action_type_string(a),
+            exact_amount_bb: None,
         })
         .collect()
 }
@@ -2657,6 +2666,23 @@ fn mp_bet_sizes_for_street(
     Ok(depths)
 }
 
+fn mp_street_index(street: MpStreet) -> usize {
+    match street {
+        MpStreet::Flop => 0,
+        MpStreet::Turn => 1,
+        MpStreet::River => 2,
+        MpStreet::Preflop => unreachable!("preflop has no exact postflop action rows"),
+    }
+}
+
+fn mp_bet_sizes_by_street(config: &BlueprintMpConfig) -> Result<[Vec<Vec<f64>>; 3], String> {
+    Ok([
+        mp_bet_sizes_for_street(config, MpStreet::Flop)?,
+        mp_bet_sizes_for_street(config, MpStreet::Turn)?,
+        mp_bet_sizes_for_street(config, MpStreet::River)?,
+    ])
+}
+
 fn mp_solve_root(
     betting: &LazyBettingSnapshot,
     sb_seat: u8,
@@ -2741,22 +2767,31 @@ fn build_mp_game_actions(actions: &[MpTreeAction], big_blind: f64) -> Vec<GameAc
                 id: index.to_string(),
                 label,
                 action_type,
+                exact_amount_bb: match action {
+                    MpTreeAction::Lead(amount) | MpTreeAction::Raise(amount) => {
+                        (big_blind > 0.0).then_some(*amount / big_blind)
+                    }
+                    _ => None,
+                },
             }
         })
         .collect()
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn format_mp_amount(amount: f64, big_blind: f64) -> String {
     let bb = if big_blind > 0.0 {
         amount / big_blind
     } else {
         amount
     };
-    if (bb - bb.round()).abs() < 0.05 {
+    if (bb - bb.round()).abs() < 1e-9 {
         format!("{:.0}bb", bb.round())
     } else {
-        format!("{bb:.1}bb")
+        let mut formatted = format!("{bb:.12}");
+        while formatted.ends_with('0') {
+            formatted.pop();
+        }
+        format!("{formatted}bb")
     }
 }
 
@@ -2792,21 +2827,21 @@ fn action_type_string(action: &TreeAction) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SemanticAction {
     action_type: String,
-    amount_bb: Option<i32>,
+    amount_bb: Option<f64>,
 }
 
-fn action_amount_bb_from_label(label: &str) -> Option<i32> {
+fn action_amount_bb_from_label(label: &str) -> Option<f64> {
     let normalized = label.trim().to_ascii_lowercase().replace(' ', "");
     let bb = normalized.strip_suffix("bb")?;
-    bb.parse::<f64>().ok().map(|amount| amount.round() as i32)
+    bb.parse::<f64>().ok()
 }
 
 fn semantic_action_from_tree_action(action: &TreeAction) -> SemanticAction {
     let amount_bb = match action {
-        TreeAction::Bet(amount) | TreeAction::Raise(amount) => Some((amount / 2.0).round() as i32),
+        TreeAction::Bet(amount) | TreeAction::Raise(amount) => Some(amount / 2.0),
         _ => None,
     };
 
@@ -2831,12 +2866,11 @@ fn semantic_action_from_mp_tree_action(action: &MpTreeAction, big_blind: f64) ->
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-fn mp_amount_to_bb(amount: f64, big_blind: f64) -> i32 {
+fn mp_amount_to_bb(amount: f64, big_blind: f64) -> f64 {
     if big_blind > 0.0 {
-        (amount / big_blind).round() as i32
+        amount / big_blind
     } else {
-        amount.round() as i32
+        amount
     }
 }
 
@@ -2849,7 +2883,7 @@ fn semantic_action_from_game_action(action: &GameAction) -> SemanticAction {
 
     SemanticAction {
         action_type,
-        amount_bb,
+        amount_bb: action.exact_amount_bb.or(amount_bb),
     }
 }
 
@@ -2868,7 +2902,13 @@ fn semantic_actions_match(left: &SemanticAction, right: &SemanticAction) -> bool
 
     match left.action_type.as_str() {
         "fold" | "check" | "call" | "allin" => true,
-        "bet" | "raise" => left.amount_bb.is_some() && left.amount_bb == right.amount_bb,
+        "bet" | "raise" => match (left.amount_bb, right.amount_bb) {
+            (Some(left), Some(right)) => {
+                let tolerance = f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0;
+                (left - right).abs() <= tolerance
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -3029,6 +3069,35 @@ pub fn build_solve_game_parts_with_root(
     depth_limit_override: Option<u8>,
     root: Option<SolveGameRoot>,
 ) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
+    let street_bet_sizes = [bet_sizes.to_vec(), bet_sizes.to_vec(), bet_sizes.to_vec()];
+    build_solve_game_parts_with_root_and_street_sizes(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        &street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+    )
+}
+
+/// Build solve-game parts with independent abstraction rows for Flop, Turn,
+/// and River. The row at each index contains depth 0 (lead) followed by the
+/// configured raise-depth rows for that street.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solve_game_parts_with_root_and_street_sizes(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
     use range_solver::card::CardConfig;
     use range_solver::range::Range;
     use range_solver::{ActionTree, TreeConfig};
@@ -3039,8 +3108,9 @@ pub fn build_solve_game_parts_with_root(
         Range::from_raw_data(oop_weights).map_err(|e| format!("Bad OOP weights: {e}"))?;
     let ip_range = Range::from_raw_data(ip_weights).map_err(|e| format!("Bad IP weights: {e}"))?;
 
-    let oop_sizes = parse_bet_size_options_for_solve(bet_sizes)?;
-    let ip_sizes = oop_sizes.clone();
+    let flop_sizes = parse_bet_size_options_for_solve(&street_bet_sizes[0])?;
+    let turn_sizes = parse_bet_size_options_for_solve(&street_bet_sizes[1])?;
+    let river_sizes = parse_bet_size_options_for_solve(&street_bet_sizes[2])?;
 
     let card_config = CardConfig {
         range: [oop_range, ip_range],
@@ -3062,9 +3132,9 @@ pub fn build_solve_game_parts_with_root(
         initial_num_bets: root.initial_num_bets,
         rake_rate: 0.0,
         rake_cap: 0.0,
-        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
-        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
-        river_bet_sizes: [oop_sizes, ip_sizes],
+        flop_bet_sizes: [flop_sizes.clone(), flop_sizes],
+        turn_bet_sizes: [turn_sizes.clone(), turn_sizes],
+        river_bet_sizes: [river_sizes.clone(), river_sizes],
         turn_donk_sizes: None,
         river_donk_sizes: None,
         add_allin_threshold: 0.0,
@@ -3121,13 +3191,40 @@ pub fn build_solve_game_with_root(
     depth_limit_override: Option<u8>,
     root: Option<SolveGameRoot>,
 ) -> Result<PostFlopGame, String> {
-    let (card_config, action_tree) = build_solve_game_parts_with_root(
+    let street_bet_sizes = [bet_sizes.to_vec(), bet_sizes.to_vec(), bet_sizes.to_vec()];
+    build_solve_game_with_root_and_street_sizes(
         board,
         oop_weights,
         ip_weights,
         pot,
         effective_stack,
-        bet_sizes,
+        &street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+    )
+}
+
+/// Build a solve game with independent Flop, Turn, and River abstractions.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solve_game_with_root_and_street_sizes(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+) -> Result<PostFlopGame, String> {
+    let (card_config, action_tree) = build_solve_game_parts_with_root_and_street_sizes(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        street_bet_sizes,
         exact,
         depth_limit_override,
         root,
@@ -3308,6 +3405,12 @@ fn range_solver_action_to_game_action_with_big_blind(
         id: idx.to_string(),
         label,
         action_type: action_type.to_string(),
+        exact_amount_bb: match action {
+            range_solver::Action::Bet(amount) | range_solver::Action::Raise(amount) => {
+                (big_blind > 0.0).then_some(f64::from(*amount) / big_blind)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -4340,7 +4443,7 @@ pub fn game_solve_core(
                     ip_w,
                     snapshot.pot,
                     effective_stack_for_solve_root(&snapshot.root),
-                    snapshot.bet_sizes,
+                    snapshot.bet_sizes_by_street,
                     None,
                     0,
                     position.to_string(),
@@ -4385,6 +4488,7 @@ pub fn game_solve_core(
                     Street::River => &session.config.action_abstraction.river,
                     Street::Preflop => return Err("Cannot solve preflop".to_string()),
                 };
+                let street_bet_sizes = [sizes.clone(), sizes.clone(), sizes.clone()];
 
                 let cbv_ctx = session.cbv_context.clone();
                 let position = session.position_label(player).to_string();
@@ -4409,7 +4513,7 @@ pub fn game_solve_core(
                     ip_w,
                     pot,
                     eff_stack,
-                    sizes.clone(),
+                    street_bet_sizes,
                     cbv_ctx,
                     current_node,
                     position,
@@ -4448,7 +4552,7 @@ pub fn game_solve_core(
         _solve_anchor,
         player_labels,
         solve_root,
-        _root_street,
+        root_street,
         action_big_blind,
     ) = inputs;
 
@@ -4521,6 +4625,12 @@ pub fn game_solve_core(
 
     let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
     let build_exact = is_exact || boundary_cut.is_none();
+    let root_bet_sizes = &bet_sizes[match root_street {
+        Street::Flop => 0,
+        Street::Turn => 1,
+        Street::River => 2,
+        Street::Preflop => unreachable!("preflop solve roots are rejected above"),
+    }];
 
     // Gadget tree mode (A2): when gadget is enabled AND a boundary
     // cut is active, build via make_per_boundary_gadget_game which
@@ -4535,7 +4645,7 @@ pub fn game_solve_core(
             &ip_w,
             pot,
             eff_stack,
-            &bet_sizes,
+            root_bet_sizes,
             solve_root,
             depth_limit_override,
             &cbv_ctx,
@@ -4551,7 +4661,7 @@ pub fn game_solve_core(
         if gadget_enabled && cbv_ctx.is_none() {
             eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
         }
-        build_solve_game_with_root(
+        build_solve_game_with_root_and_street_sizes(
             &board,
             &oop_w,
             &ip_w,
@@ -5730,6 +5840,7 @@ mod tests {
                 id: "0".to_string(),
                 label: "Check".to_string(),
                 action_type: "check".to_string(),
+                exact_amount_bb: None,
             }],
         };
         *gss.subgame_solve.matrix_snapshot.write() = Some(dummy_matrix);
@@ -5988,6 +6099,78 @@ mod tests {
         // Should have allin at minimum
         assert!(bet_str.contains('a'));
         assert!(raise_str.contains('a'));
+    }
+
+    #[test]
+    fn format_bet_sizes_preserves_fractional_percentages() {
+        let sizes = vec![vec![0.925, 0.3333333333333333]];
+        let (bet_str, raise_str) = format_bet_sizes_for_solve(&sizes);
+        assert_eq!(bet_str, "92.5%,33.3333333333333%,a");
+        assert_eq!(raise_str, bet_str);
+    }
+
+    #[test]
+    fn semantic_action_matching_does_not_round_distinct_bb_amounts_together() {
+        let lower = range_solver_action_to_game_action_with_big_blind(
+            &range_solver::Action::Bet(149),
+            0,
+            100.0,
+        );
+        let higher = range_solver_action_to_game_action_with_big_blind(
+            &range_solver::Action::Bet(151),
+            1,
+            100.0,
+        );
+        assert_eq!(lower.label, "1.49bb");
+        assert_eq!(higher.label, "1.51bb");
+        assert!(!semantic_actions_match(
+            &semantic_action_from_game_action(&lower),
+            &semantic_action_from_game_action(&higher),
+        ));
+    }
+
+    #[test]
+    fn build_solve_game_uses_independent_street_action_rows() {
+        use range_solver::bet_size::BetSize;
+
+        let board = vec![
+            "Ah".to_string(),
+            "Kd".to_string(),
+            "Qc".to_string(),
+            "Js".to_string(),
+        ];
+        let weights = vec![1.0f32; 1326];
+        let street_sizes = [
+            vec![vec![0.10], vec![0.20], vec![0.30]],
+            vec![vec![0.25], vec![0.50], vec![0.75]],
+            vec![vec![0.33], vec![0.60], vec![0.90]],
+        ];
+        let (_cards, tree) = build_solve_game_parts_with_root_and_street_sizes(
+            &board,
+            &weights,
+            &weights,
+            20,
+            90,
+            &street_sizes,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = tree.config();
+        assert!(config.flop_bet_sizes[0]
+            .bet
+            .contains(&BetSize::PotRelative(0.10)));
+        assert!(config.turn_bet_sizes[0]
+            .bet
+            .contains(&BetSize::PotRelative(0.25)));
+        assert!(config.river_bet_sizes[0]
+            .bet
+            .contains(&BetSize::PotRelative(0.33)));
+        assert!(config.turn_bet_sizes[0]
+            .per_num_bets
+            .get(2)
+            .is_some_and(|row| row.contains(&BetSize::PotRelative(0.75))));
     }
 
     // -------------------------------------------------------------------
@@ -7492,6 +7675,7 @@ mod tests {
                 id: i.to_string(),
                 label: lbl.to_string(),
                 action_type: action_type_for_label(lbl),
+                exact_amount_bb: None,
             })
             .collect();
         let matrix = GameMatrix {
@@ -7754,11 +7938,13 @@ mod tests {
                 id: "0".to_string(),
                 label: "Call".to_string(),
                 action_type: "call".to_string(),
+                exact_amount_bb: None,
             },
             GameAction {
                 id: "1".to_string(),
                 label: "Fold".to_string(),
                 action_type: "fold".to_string(),
+                exact_amount_bb: None,
             },
         ];
         gss.subgame_solve.solve_cache.write().insert(
@@ -7791,11 +7977,13 @@ mod tests {
                 id: "0".to_string(),
                 label: "Call".to_string(),
                 action_type: "call".to_string(),
+                exact_amount_bb: None,
             },
             GameAction {
                 id: "1".to_string(),
                 label: "Fold".to_string(),
                 action_type: "fold".to_string(),
+                exact_amount_bb: None,
             },
         ];
         gss.subgame_solve.solve_cache.write().insert(
@@ -7831,11 +8019,13 @@ mod tests {
                 id: "0".to_string(),
                 label: "4bb".to_string(),
                 action_type: "bet".to_string(),
+                exact_amount_bb: None,
             },
             GameAction {
                 id: "1".to_string(),
                 label: "Fold".to_string(),
                 action_type: "fold".to_string(),
+                exact_amount_bb: None,
             },
         ];
         gss.subgame_solve.solve_cache.write().insert(
@@ -7870,6 +8060,7 @@ mod tests {
             id: "solver-call".to_string(),
             label: "Call".to_string(),
             action_type: "call".to_string(),
+            exact_amount_bb: None,
         }];
         gss.subgame_solve.solve_cache.write().insert(
             vec![],
@@ -8023,6 +8214,7 @@ mod tests {
             id: "0".to_string(),
             label: "Stale".to_string(),
             action_type: "call".to_string(),
+            exact_amount_bb: None,
         }];
 
         reset_solve_state_for_start(
