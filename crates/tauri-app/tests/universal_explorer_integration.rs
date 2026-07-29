@@ -1892,7 +1892,7 @@ async fn two_player_lazy_exact_solve_supports_turn_root_and_turn_raise_depths() 
 
     let weights = vec![1.0f32; 1326];
     let (_card_config, action_tree) =
-        poker_solver_tauri::build_solve_game_parts_with_root_and_street_sizes(
+        poker_solver_tauri::game_session::build_solve_game_parts_with_root_and_street_sizes(
             &snapshot.board,
             &weights,
             &weights,
