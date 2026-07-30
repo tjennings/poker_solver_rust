@@ -128,6 +128,9 @@ Exact result.
 - **Action buttons** -- click to advance to a child node
 - **History strip** -- shows the full action sequence at the top; click any point to rewind
 - **Available actions** -- displayed for the current decision point with probabilities
+- **Spot encoding** -- the Copy and Load controls serialize and replay the current
+  action history and board for both legacy HU and two-player `universal_mp_lazy`
+  sessions. A blueprint must be loaded before loading a spot encoding.
 
 When using Blueprint, Subgame, or Exact strategy sources, the matrix is source-specific for the current game state. Solved Subgame and Exact sources keep their solved matrix cache anchored to the street state where the solve started, so taking actions or rewinding within that solved subtree continues to show the solved strategy instead of falling back to the blueprint matrix. Player labels in the Explorer are always seat positions (`BB`/`SB`).
 
@@ -193,6 +196,8 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `canonicalize_board` | Canonicalize board cards via suit isomorphism |
 | `list_agents` | List available agent TOML configs |
 | `get_combo_classes` | Get combo-level hand class breakdown for a cell |
+| `game_encode_spot` | Encode the active game session's action history and board |
+| `game_load_spot` | Replay a spot encoding in the active legacy HU or two-player Universal MP session |
 
 ## Boundary Evaluation
 
