@@ -72,7 +72,6 @@ export function getComboActionRows(
 }
 
 export const CANCELLATION_POLL_INTERVAL_MS = 100;
-export const CANCELLATION_POLL_ATTEMPTS = 10;
 
 /** The backend stops reporting a solve once it has acknowledged cancellation. */
 export function isSolveStopped(state: Pick<GameState, "solve">): boolean {
@@ -94,6 +93,7 @@ export function requestSolveCancellation(
   isCurrentRun: (generation: number) => boolean,
   setState: (state: GameState) => void,
   setError: (message: string) => void,
+  onStopped: () => void,
   invokeCommand: typeof invoke = invoke,
 ): () => void {
   let cancelled = false;
@@ -109,7 +109,7 @@ export function requestSolveCancellation(
 
   const isActive = () => !cancelled && isCurrentRun(generation);
 
-  const pollUntilStopped = async (attempt: number): Promise<void> => {
+  const pollUntilStopped = async (): Promise<void> => {
     if (!isActive()) return;
 
     try {
@@ -118,28 +118,33 @@ export function requestSolveCancellation(
       });
       if (!isActive()) return;
       setState(state);
-      if (isSolveStopped(state) || attempt + 1 >= CANCELLATION_POLL_ATTEMPTS) {
+      if (isSolveStopped(state)) {
+        onStopped();
         return;
       }
     } catch {
-      if (!isActive() || attempt + 1 >= CANCELLATION_POLL_ATTEMPTS) return;
+      if (!isActive()) return;
     }
 
     pollTimer = setTimeout(() => {
       pollTimer = null;
-      void pollUntilStopped(attempt + 1);
+      void pollUntilStopped();
     }, CANCELLATION_POLL_INTERVAL_MS);
+  };
+
+  const observeUntilStopped = () => {
+    void pollUntilStopped();
   };
 
   void invokeCommand("game_cancel_solve", {
     mode,
     generation: backendGeneration,
   })
-    .then(() => {
-      void pollUntilStopped(0);
-    })
+    .then(observeUntilStopped)
     .catch((error) => {
-      if (isActive()) setError(String(error));
+      if (!isActive()) return;
+      setError(String(error));
+      observeUntilStopped();
     });
 
   return stopObservation;
@@ -154,6 +159,7 @@ type PendingSolveCancellation = {
 type SolveRun = {
   generation: number;
   backendGeneration: number | null;
+  cancelling: boolean;
   pollId: number | null;
   cancelCleanup: (() => void) | null;
   pendingCancellations: PendingSolveCancellation[];
@@ -318,11 +324,14 @@ export default function GameExplorer() {
   const [sessionKind, setSessionKind] = useState<GameExplorerSessionKind>("hu");
   const [subgameSolving, setSubgameSolving] = useState(false);
   const [exactSolving, setExactSolving] = useState(false);
+  const [subgameCancelling, setSubgameCancelling] = useState(false);
+  const [exactCancelling, setExactCancelling] = useState(false);
   const activeSourceRef = useRef<StrategySource>("blueprint");
   const solveRunsRef = useRef<Record<SolveMode, SolveRun>>({
     subgame: {
       generation: 0,
       backendGeneration: null,
+      cancelling: false,
       pollId: null,
       cancelCleanup: null,
       pendingCancellations: [],
@@ -330,6 +339,7 @@ export default function GameExplorer() {
     exact: {
       generation: 0,
       backendGeneration: null,
+      cancelling: false,
       pollId: null,
       cancelCleanup: null,
       pendingCancellations: [],
@@ -619,12 +629,27 @@ export default function GameExplorer() {
       const isSolving = mode === "subgame" ? subgameSolving : exactSolving;
       const setSolving =
         mode === "subgame" ? setSubgameSolving : setExactSolving;
+      const isCancelling =
+        mode === "subgame" ? subgameCancelling : exactCancelling;
+      const setCancelling =
+        mode === "subgame" ? setSubgameCancelling : setExactCancelling;
       const run = solveRunsRef.current[mode];
       const isCurrentRun = (generation: number) =>
         solveRunsRef.current[mode].generation === generation;
 
+      if (run.cancelling || isCancelling) return;
+
       const beginCancellation = (pending: PendingSolveCancellation) => {
         if (pending.backendGeneration === null) return;
+        const onStopped = () => {
+          if (!isCurrentRun(pending.generation)) return;
+          stopSolvePolling(mode);
+          run.backendGeneration = null;
+          run.cancelling = false;
+          run.cancelCleanup = null;
+          setSolving(false);
+          setCancelling(false);
+        };
         const cleanup = requestSolveCancellation(
           mode,
           pending.generation,
@@ -632,6 +657,7 @@ export default function GameExplorer() {
           isCurrentRun,
           setState,
           (message) => setError(message),
+          onStopped,
         );
         if (isCurrentRun(pending.generation)) {
           run.cancelCleanup = cleanup;
@@ -644,13 +670,14 @@ export default function GameExplorer() {
         run.generation += 1;
         const cancellationGeneration = run.generation;
         stopSolvePolling(mode);
+        run.cancelling = true;
         const pendingCancellation: PendingSolveCancellation = {
           generation: cancellationGeneration,
           solveGeneration,
           backendGeneration: run.backendGeneration,
         };
         run.pendingCancellations.push(pendingCancellation);
-        setSolving(false);
+        setCancelling(true);
 
         // Do not await this request in the click handler. The solve command
         // may still be pending, so bind cancellation once it returns its
@@ -662,13 +689,21 @@ export default function GameExplorer() {
           );
         }
       } else {
+        if (
+          run.backendGeneration !== null ||
+          run.pendingCancellations.length > 0
+        ) {
+          return;
+        }
         // Start solve
         stopSolvePolling(mode);
         run.generation += 1;
         const generation = run.generation;
         run.backendGeneration = null;
+        run.cancelling = false;
         try {
           setSolving(true);
+          setCancelling(false);
           setActiveSource(mode);
           activeSourceRef.current = mode;
           const globalConfig = JSON.parse(
@@ -712,12 +747,16 @@ export default function GameExplorer() {
               if (s.solve?.is_complete) {
                 stopSolvePolling(mode);
                 setSolving(false);
+                setCancelling(false);
+                run.cancelling = false;
                 run.backendGeneration = null;
               }
             } catch {
               if (!isCurrentRun(generation)) return;
               stopSolvePolling(mode);
               setSolving(false);
+              setCancelling(false);
+              run.cancelling = false;
               run.backendGeneration = null;
             }
           }, 500);
@@ -730,6 +769,8 @@ export default function GameExplorer() {
           if (!isCurrentRun(generation)) return;
           setError(String(e));
           setSolving(false);
+          setCancelling(false);
+          run.cancelling = false;
           run.backendGeneration = null;
           run.pendingCancellations = run.pendingCancellations.filter(
             (pending) => pending.solveGeneration !== generation,
@@ -742,6 +783,8 @@ export default function GameExplorer() {
       state,
       subgameSolving,
       exactSolving,
+      subgameCancelling,
+      exactCancelling,
       stopSolvePolling,
       stopSolveObservation,
     ],
@@ -1216,7 +1259,7 @@ export default function GameExplorer() {
                 className="strategy-tab-action"
                 onClick={() => handleSolve("subgame")}
               >
-                [{subgameSolving ? "cancel" : "solve"}]
+                [{subgameCancelling ? "cancelling..." : subgameSolving ? "cancel" : "solve"}]
               </span>
             </span>
           )}
@@ -1233,7 +1276,7 @@ export default function GameExplorer() {
                 className="strategy-tab-action"
                 onClick={() => handleSolve("exact")}
               >
-                [{exactSolving ? "cancel" : "solve"}]
+                [{exactCancelling ? "cancelling..." : exactSolving ? "cancel" : "solve"}]
               </span>
             </span>
           )}

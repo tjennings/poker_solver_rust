@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  CANCELLATION_POLL_ATTEMPTS,
   CANCELLATION_POLL_INTERVAL_MS,
   getComboActionRows,
   getBackendSolveGeneration,
@@ -155,6 +154,7 @@ describe("solve cancellation", () => {
     const states = [solvingState, stoppedState];
     const setState = vi.fn();
     const setError = vi.fn();
+    const onStopped = vi.fn();
     const invokeCommand = vi.fn(
       (command: string, args?: Record<string, unknown>): Promise<unknown> => {
         calls.push({ command, args });
@@ -171,6 +171,7 @@ describe("solve cancellation", () => {
       (generation) => generation === 4,
       setState,
       setError,
+      onStopped,
       invokeCommand,
     );
 
@@ -189,21 +190,35 @@ describe("solve cancellation", () => {
     expect(setState).toHaveBeenCalledWith(solvingState);
     await vi.advanceTimersByTimeAsync(CANCELLATION_POLL_INTERVAL_MS);
     expect(setState).toHaveBeenCalledWith(stoppedState);
+    expect(onStopped).toHaveBeenCalledTimes(1);
     expect(setError).not.toHaveBeenCalled();
   });
 
-  it("bounds best-effort refreshes when the backend keeps reporting active", async () => {
+  it("keeps observing until a delayed backend acknowledgement", async () => {
     vi.useFakeTimers();
     const calls: string[] = [];
     const solvingState = {
       ...stateFor("River", ["As", "Kd", "2c", "7h", "9s"]),
       solve,
     } as unknown as GameState;
+    const stoppedState = {
+      ...solvingState,
+      solve: { ...solve, is_complete: true },
+    } as unknown as GameState;
+    const delayedPolls = 12;
+    const delayedSolvingStates = Array.from(
+      { length: delayedPolls + 1 },
+      () => solvingState,
+    );
+    const states = [...delayedSolvingStates, stoppedState];
     const setState = vi.fn();
     const setError = vi.fn();
+    const onStopped = vi.fn();
     const invokeCommand = vi.fn((command: string): Promise<unknown> => {
       calls.push(command);
-      return Promise.resolve(command === "game_cancel_solve" ? undefined : solvingState);
+      return Promise.resolve(
+        command === "game_cancel_solve" ? undefined : states.shift(),
+      );
     }) as unknown as typeof import("./invoke").invoke;
 
     requestSolveCancellation(
@@ -213,20 +228,23 @@ describe("solve cancellation", () => {
       (generation) => generation === 4,
       setState,
       setError,
+      onStopped,
       invokeCommand,
     );
 
     await Promise.resolve();
     await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(
-      CANCELLATION_POLL_INTERVAL_MS * CANCELLATION_POLL_ATTEMPTS,
-    );
+    for (let i = 0; i < delayedPolls; i += 1) {
+      await vi.advanceTimersByTimeAsync(CANCELLATION_POLL_INTERVAL_MS);
+    }
 
-    expect(calls).toEqual([
-      "game_cancel_solve",
-      ...Array(CANCELLATION_POLL_ATTEMPTS).fill("game_get_state"),
-    ]);
-    expect(setState).toHaveBeenCalledTimes(CANCELLATION_POLL_ATTEMPTS);
+    expect(calls.filter((command) => command === "game_get_state")).toHaveLength(
+      delayedSolvingStates.length,
+    );
+    expect(onStopped).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(CANCELLATION_POLL_INTERVAL_MS);
+
+    expect(onStopped).toHaveBeenCalledTimes(1);
     expect(setError).not.toHaveBeenCalled();
   });
 
@@ -239,6 +257,7 @@ describe("solve cancellation", () => {
     const refreshedState = stateFor("River", []);
     const setState = vi.fn();
     const setError = vi.fn();
+    const onStopped = vi.fn();
     const invokeCommand = vi.fn((command: string): Promise<unknown> => {
       calls.push(command);
       return command === "game_cancel_solve"
@@ -254,6 +273,7 @@ describe("solve cancellation", () => {
       (generation) => generation === currentGeneration,
       setState,
       setError,
+      onStopped,
       invokeCommand,
     );
 
@@ -268,6 +288,7 @@ describe("solve cancellation", () => {
 
     expect(calls).toEqual(["game_cancel_solve", "game_get_state"]);
     expect(setState).not.toHaveBeenCalled();
+    expect(onStopped).not.toHaveBeenCalled();
     expect(setError).not.toHaveBeenCalled();
   });
 
