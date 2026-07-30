@@ -33,7 +33,9 @@ use poker_solver_core::poker::{Card as RsPokerCard, Value as RsPokerValue};
 
 use range_solver::card::{card_pair_to_index, card_to_string, index_to_card_pair, NOT_DEALT};
 use range_solver::interface::Game;
-use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
+use range_solver::{
+    compute_exploitability, finalize, solve_step_with_cancel, PostFlopGame, SolveStepResult,
+};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -527,6 +529,20 @@ impl SolveState {
             return false;
         }
         publish(self);
+        true
+    }
+
+    /// Request cancellation without allowing a solve reset to interleave with
+    /// generation validation and the cancel flag store.
+    fn request_cancel(&self, requested_generation: Option<u64>) -> bool {
+        let _publish_guard = self.publish_gate.read();
+        if requested_generation.is_some_and(|generation| {
+            self.generation.load(Ordering::Acquire) != generation
+                || !self.solving.load(Ordering::Acquire)
+        }) {
+            return false;
+        }
+        self.cancel.store(true, Ordering::Release);
         true
     }
 }
@@ -3310,6 +3326,33 @@ pub fn build_solve_game_parts_with_root_and_street_sizes(
     depth_limit_override: Option<u8>,
     root: Option<SolveGameRoot>,
 ) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
+    build_solve_game_parts_with_root_and_street_sizes_cancel(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_solve_game_parts_with_root_and_street_sizes_cancel(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
     use range_solver::card::CardConfig;
     use range_solver::range::Range;
     use range_solver::{ActionTree, TreeConfig};
@@ -3359,8 +3402,11 @@ pub fn build_solve_game_parts_with_root_and_street_sizes(
         },
     };
 
-    let action_tree =
-        ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
+    let action_tree = match cancel {
+        Some(cancel) => ActionTree::new_with_cancel(tree_config, cancel),
+        None => ActionTree::new(tree_config),
+    }
+    .map_err(|e| format!("Failed to build tree: {e}"))?;
     Ok((card_config, action_tree))
 }
 
@@ -3444,6 +3490,51 @@ pub fn build_solve_game_with_root_and_street_sizes(
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
     game.allocate_memory(false);
+    Ok(game)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_solve_game_with_root_and_street_sizes_cancel(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+    cancel: &AtomicBool,
+) -> Result<PostFlopGame, String> {
+    let (card_config, action_tree) = build_solve_game_parts_with_root_and_street_sizes_cancel(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+        Some(cancel),
+    )?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("Solve cancelled during game construction".to_string());
+    }
+
+    // PostFlopGame::with_config builds the arena and interpreter without a cancellation hook.
+    // It is the remaining bounded uninterruptible construction phase; check immediately around
+    // it and drop the game if cancellation arrived during that phase.
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("Solve cancelled during game construction".to_string());
+    }
+
+    game.allocate_memory(false);
+    if cancel.load(Ordering::Acquire) {
+        return Err("Solve cancelled during game memory allocation".to_string());
+    }
     Ok(game)
 }
 
@@ -4253,6 +4344,12 @@ fn reset_solve_state_for_start(
     generation
 }
 
+fn acknowledge_cancelled_solve(ss: &SolveState, generation: u64) -> bool {
+    ss.publish_if_current(generation, |state| {
+        state.solving.store(false, Ordering::Release);
+    })
+}
+
 /// Get the current game state, including solve progress if active.
 ///
 /// `source` controls which strategy data is returned:
@@ -4655,7 +4752,7 @@ pub fn game_solve_core(
     trace_iters: Option<String>,
     trace_dir: Option<String>,
     enable_gadget: Option<bool>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
     let max_iters = max_iterations.unwrap_or(200);
@@ -4902,65 +4999,139 @@ pub fn game_solve_core(
     // real subgame root.
     let gadget_tree_active = gadget_enabled && boundary_cut.is_some() && cbv_ctx.is_some();
 
-    let game_result = if gadget_tree_active {
-        build_gadget_tree_game_for_solve(
-            &board,
-            &oop_w,
-            &ip_w,
-            pot,
-            eff_stack,
-            root_bet_sizes,
-            solve_root,
-            depth_limit_override,
-            &cbv_ctx,
-            current_node_idx,
-            &boundary_cut,
-            max_iters,
-            target_exp,
-        )
+    let game = if is_exact {
+        // Exact game construction can enumerate a large tree. Keep it in the
+        // worker so cancellation can be acknowledged before and after setup.
+        None
     } else {
-        if gadget_enabled && boundary_cut.is_none() {
-            eprintln!("[solve] enable_gadget=true but no boundary cut; gadget has no effect");
-        }
-        if gadget_enabled && cbv_ctx.is_none() {
-            eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
-        }
-        build_solve_game_with_root_and_street_sizes(
-            &board,
-            &oop_w,
-            &ip_w,
-            pot,
-            eff_stack,
-            &bet_sizes,
-            build_exact,
-            depth_limit_override,
-            Some(solve_root),
-        )
-    };
-    let mut game = match game_result {
-        Ok(game) => game,
-        Err(e) => {
-            let _ = ss.publish_if_current(solve_generation, |state| {
-                state.solving.store(false, Ordering::Release);
-            });
-            return Err(e);
-        }
+        let game_result = if gadget_tree_active {
+            build_gadget_tree_game_for_solve(
+                &board,
+                &oop_w,
+                &ip_w,
+                pot,
+                eff_stack,
+                root_bet_sizes,
+                solve_root,
+                depth_limit_override,
+                &cbv_ctx,
+                current_node_idx,
+                &boundary_cut,
+                max_iters,
+                target_exp,
+            )
+        } else {
+            if gadget_enabled && boundary_cut.is_none() {
+                eprintln!("[solve] enable_gadget=true but no boundary cut; gadget has no effect");
+            }
+            if gadget_enabled && cbv_ctx.is_none() {
+                eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
+            }
+            build_solve_game_with_root_and_street_sizes(
+                &board,
+                &oop_w,
+                &ip_w,
+                pot,
+                eff_stack,
+                &bet_sizes,
+                build_exact,
+                depth_limit_override,
+                Some(solve_root),
+            )
+        };
+        Some(match game_result {
+            Ok(game) => game,
+            Err(e) => {
+                let _ = ss.publish_if_current(solve_generation, |state| {
+                    state.solving.store(false, Ordering::Release);
+                });
+                return Err(e);
+            }
+        })
     };
 
-    let position_label_for_guard = position_label.clone();
-    if let Err(e) = validate_solve_root_actor_label(
-        game.current_player(),
-        &player_labels,
-        &position_label_for_guard,
-    ) {
-        debug_assert!(false, "{e}");
-        eprintln!("[solve] {e}");
+    if let Some(ref game) = game {
+        let position_label_for_guard = position_label.clone();
+        if let Err(e) = validate_solve_root_actor_label(
+            game.current_player(),
+            &player_labels,
+            &position_label_for_guard,
+        ) {
+            debug_assert!(false, "{e}");
+            eprintln!("[solve] {e}");
+        }
     }
 
     // Spawn background thread
     let ss_clone = Arc::clone(ss_ref);
     let board_clone = board.clone();
     std::thread::spawn(move || {
+        let mut game = match game {
+            Some(game) => game,
+            None => {
+                if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                    || ss_clone.cancel.load(Ordering::Acquire)
+                {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
+
+                let game_result = build_solve_game_with_root_and_street_sizes_cancel(
+                    &board,
+                    &oop_w,
+                    &ip_w,
+                    pot,
+                    eff_stack,
+                    &bet_sizes,
+                    true,
+                    None,
+                    Some(solve_root),
+                    &ss_clone.cancel,
+                );
+                let game = match game_result {
+                    Ok(game) => game,
+                    Err(e) => {
+                        if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                            || ss_clone.cancel.load(Ordering::Acquire)
+                        {
+                            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                            return;
+                        }
+                        let _ = ss_clone.publish_if_current(solve_generation, |state| {
+                            eprintln!("[solve] failed to build exact game: {e}");
+                            state.solving.store(false, Ordering::Release);
+                        });
+                        return;
+                    }
+                };
+                if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                    || ss_clone.cancel.load(Ordering::Acquire)
+                {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
+
+                let position_label_for_guard = position_label.clone();
+                if let Err(e) = validate_solve_root_actor_label(
+                    game.current_player(),
+                    &player_labels,
+                    &position_label_for_guard,
+                ) {
+                    debug_assert!(false, "{e}");
+                    eprintln!("[solve] {e}");
+                }
+                game
+            }
+        };
+
+        if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
+            return;
+        }
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+
         // Store available actions at the explorer-visible root.
         // Under A2, game.root() IS the real subgame root.
         {
@@ -4978,11 +5149,20 @@ pub fn game_solve_core(
                     )
                 })
                 .collect();
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
             if !ss_clone.publish_if_current(solve_generation, |state| {
                 *state.solve_actions.write() = actions;
             }) {
                 return;
             }
+        }
+
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
         }
 
         // Set up boundary evaluators for non-gadget path (opt_out=None).
@@ -5057,6 +5237,10 @@ pub fn game_solve_core(
                 current_node_idx,
                 seed_start,
             );
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
         }
 
         // Set up boundary tracer (no-op when disabled).
@@ -5078,6 +5262,10 @@ pub fn game_solve_core(
 
         // Initial matrix snapshot
         let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         if !ss_clone.publish_if_current(solve_generation, |state| {
             *state.matrix_snapshot.write() = Some(matrix);
         }) {
@@ -5116,11 +5304,27 @@ pub fn game_solve_core(
                 game.set_boundary_discount(alpha, beta, gamma);
             }
 
-            solve_step(&game, t);
+            let step_result = solve_step_with_cancel(&game, t, &ss_clone.cancel);
+            if step_result == SolveStepResult::Cancelled {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
+            if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
+                return;
+            }
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
             t += 1;
             if !ss_clone.publish_if_current(solve_generation, |state| {
                 state.iteration.store(t, Ordering::Relaxed);
             }) {
+                return;
+            }
+
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
                 return;
             }
 
@@ -5137,7 +5341,15 @@ pub fn game_solve_core(
 
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
+                if ss_clone.cancel.load(Ordering::Acquire) {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
                 let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
+                if ss_clone.cancel.load(Ordering::Acquire) {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
                 if !ss_clone.publish_if_current(solve_generation, |state| {
                     *state.matrix_snapshot.write() = Some(matrix);
                 }) {
@@ -5145,7 +5357,15 @@ pub fn game_solve_core(
                 }
 
                 if is_exact {
+                    if ss_clone.cancel.load(Ordering::Acquire) {
+                        acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                        return;
+                    }
                     let exp = compute_exploitability(&game);
+                    if ss_clone.cancel.load(Ordering::Acquire) {
+                        acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                        return;
+                    }
                     if !ss_clone.publish_if_current(solve_generation, |state| {
                         state
                             .exploitability_bits
@@ -5166,6 +5386,10 @@ pub fn game_solve_core(
         if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
             return;
         }
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
 
         // Finalize: normalize strategy, compute EVs.
         // (This replaces the per-node strategy buffer with the CFR
@@ -5174,6 +5398,10 @@ pub fn game_solve_core(
             game.clear_boundary_cfvs();
         }
         finalize(&mut game);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
 
         // Flush the "last iter" trace AFTER finalize so the strategy recorded
         // matches the UI's displayed (time-averaged) strategy. Runs whether or
@@ -5198,6 +5426,10 @@ pub fn game_solve_core(
         let evs = game.expected_values(player);
         let final_matrix =
             build_solve_matrix_with_big_blind(&mut game, Some(&evs), action_big_blind);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         if !ss_clone.publish_if_current(solve_generation, |state| {
             *state.matrix_snapshot.write() = Some(final_matrix);
         }) {
@@ -5207,9 +5439,19 @@ pub fn game_solve_core(
         // Compute exploitability using cached boundary CFVs
         let saved_evaluator = game.boundary_evaluator.take();
         let saved_per_boundary = std::mem::take(&mut game.per_boundary_evaluators);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            game.boundary_evaluator = saved_evaluator;
+            game.per_boundary_evaluators = saved_per_boundary;
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         let final_exp = compute_exploitability(&game);
         game.boundary_evaluator = saved_evaluator;
         game.per_boundary_evaluators = saved_per_boundary;
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         if !ss_clone.publish_if_current(solve_generation, |state| {
             state
                 .exploitability_bits
@@ -5219,6 +5461,10 @@ pub fn game_solve_core(
         }
 
         // Build solve cache for all decision nodes in the solved tree.
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         game.back_to_root();
         let solve_cache =
             build_solve_cache_with_big_blind(&mut game, &player_labels, action_big_blind);
@@ -5226,6 +5472,10 @@ pub fn game_solve_core(
             "[solve] cached {} decision nodes for subgame navigation",
             solve_cache.len()
         );
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         if !ss_clone.publish_if_current(solve_generation, |state| {
             *state.solve_cache.write() = solve_cache;
             *state.solve_path.write() = vec![];
@@ -5240,7 +5490,7 @@ pub fn game_solve_core(
         );
     });
 
-    Ok(())
+    Ok(solve_generation)
 }
 
 /// Load an ONNX session and wire per-boundary `NeuralBoundaryEvaluator`s
@@ -5424,7 +5674,7 @@ pub fn game_solve(
     trace_iters: Option<String>,
     trace_dir: Option<String>,
     enable_gadget: Option<bool>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     game_solve_core(
         &session_state,
         mode,
@@ -5443,11 +5693,10 @@ pub fn game_solve(
 pub fn game_cancel_solve_core(
     session_state: &GameSessionState,
     mode: Option<String>,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    session_state
-        .solve_for(&mode)
-        .cancel
-        .store(true, Ordering::Relaxed);
+    let solve_state = session_state.solve_for(&mode);
+    solve_state.request_cancel(generation);
     Ok(())
 }
 
@@ -5455,8 +5704,9 @@ pub fn game_cancel_solve_core(
 pub fn game_cancel_solve(
     session_state: tauri::State<'_, GameSessionState>,
     mode: Option<String>,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    game_cancel_solve_core(&session_state, mode)
+    game_cancel_solve_core(&session_state, mode, generation)
 }
 
 /// Encode the current game state as a human-readable spot string.
@@ -6262,7 +6512,7 @@ mod tests {
             .subgame_solve
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
-        game_cancel_solve_core(&gss, None).unwrap();
+        game_cancel_solve_core(&gss, None, None).unwrap();
         assert!(gss
             .subgame_solve
             .cancel
@@ -6281,7 +6531,7 @@ mod tests {
             .exact_solve
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
-        game_cancel_solve_core(&gss, Some("exact".to_string())).unwrap();
+        game_cancel_solve_core(&gss, Some("exact".to_string()), None).unwrap();
         assert!(gss
             .exact_solve
             .cancel
@@ -6291,6 +6541,96 @@ mod tests {
             .subgame_solve
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancelled_exact_worker_acknowledges_current_generation() {
+        let gss = GameSessionState::default();
+        let generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        assert!(gss.exact_solve.solving.load(Ordering::Acquire));
+
+        game_cancel_solve_core(&gss, Some("exact".to_string()), None).unwrap();
+        assert!(gss.exact_solve.cancel.load(Ordering::Acquire));
+        assert!(acknowledge_cancelled_solve(&gss.exact_solve, generation));
+        assert!(!gss.exact_solve.solving.load(Ordering::Acquire));
+        assert_eq!(
+            gss.exact_solve.generation.load(Ordering::Acquire),
+            generation
+        );
+    }
+
+    #[test]
+    fn stale_generation_cancel_is_a_noop() {
+        let gss = GameSessionState::default();
+        let stale_generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        let current_generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        gss.exact_solve.cancel.store(false, Ordering::Release);
+
+        game_cancel_solve_core(&gss, Some("exact".to_string()), Some(stale_generation)).unwrap();
+        assert!(!gss.exact_solve.cancel.load(Ordering::Acquire));
+        assert_eq!(
+            gss.exact_solve.generation.load(Ordering::Acquire),
+            current_generation
+        );
+
+        game_cancel_solve_core(&gss, Some("exact".to_string()), Some(current_generation)).unwrap();
+        assert!(gss.exact_solve.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn generation_cancel_request_requires_active_generation_and_preserves_none_compatibility() {
+        let ss = SolveState::default();
+        let generation = reset_solve_state_for_start(
+            &ss,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+
+        assert!(!ss.request_cancel(Some(generation - 1)));
+        assert!(!ss.cancel.load(Ordering::Acquire));
+
+        ss.solving.store(false, Ordering::Release);
+        assert!(!ss.request_cancel(Some(generation)));
+        assert!(!ss.cancel.load(Ordering::Acquire));
+
+        assert!(ss.request_cancel(None));
+        assert!(ss.cancel.load(Ordering::Acquire));
     }
 
     // -------------------------------------------------------------------
