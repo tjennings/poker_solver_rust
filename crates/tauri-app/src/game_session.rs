@@ -1498,7 +1498,9 @@ impl LazyMpSession {
                         .iter()
                         .find(|action| action.label.to_lowercase() == label.to_lowercase());
                     match matched {
-                        Some(action) => self.play_action(&action.id)?,
+                        Some(action) => {
+                            self.play_action(&action.id)?;
+                        }
                         None => {
                             let available: Vec<String> = state
                                 .actions
@@ -7521,6 +7523,68 @@ mod tests {
     // -------------------------------------------------------------------
     // core function tests (encode_spot_core, load_spot_core)
     // -------------------------------------------------------------------
+
+    #[test]
+    fn encode_spot_from_history_handles_universal_mp_board_segments() {
+        let action_history = vec![
+            ActionRecord {
+                action_id: "0".to_string(),
+                label: "2bb".to_string(),
+                position: "SB".to_string(),
+                street: "Preflop".to_string(),
+                pot: 3,
+                stack: 199,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "1".to_string(),
+                label: "Call".to_string(),
+                position: "BB".to_string(),
+                street: "Preflop".to_string(),
+                pot: 4,
+                stack: 198,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "0".to_string(),
+                label: "Check".to_string(),
+                position: "BB".to_string(),
+                street: "Flop".to_string(),
+                pot: 4,
+                stack: 198,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "1".to_string(),
+                label: "Call".to_string(),
+                position: "SB".to_string(),
+                street: "Flop".to_string(),
+                pot: 8,
+                stack: 194,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "2".to_string(),
+                label: "Bet 8bb".to_string(),
+                position: "BB".to_string(),
+                street: "Turn".to_string(),
+                pot: 12,
+                stack: 190,
+                actions: vec![],
+            },
+        ];
+        let board = vec![
+            "As".to_string(),
+            "Kd".to_string(),
+            "Qh".to_string(),
+            "Jc".to_string(),
+        ];
+
+        assert_eq!(
+            encode_spot_from_history(&action_history, &board),
+            "sb:2bb,bb:call|AsKdQh|bb:check,sb:call|Jc|bb:bet 8bb"
+        );
+    }
 
     #[test]
     fn encode_spot_core_no_session_errors() {
