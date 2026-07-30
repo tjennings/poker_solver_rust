@@ -1,11 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CANCELLATION_POLL_ATTEMPTS,
+  CANCELLATION_POLL_INTERVAL_MS,
   getComboActionRows,
+  getBackendSolveGeneration,
   isUniversalMpLazyBundleName,
+  isSolveStopped,
   requestSolveCancellation,
   shouldShowStrategyMatrix,
   supportsUniversalMpLazyExact,
 } from "./GameExplorer";
+import type { GameState } from "./game-types";
 
 const matrix = { cells: [], actions: [] };
 const solve = {
@@ -129,74 +134,148 @@ describe("combo action rows", () => {
 });
 
 describe("solve cancellation", () => {
-  it("requests cancellation before starting a best-effort refresh", async () => {
-    const calls: string[] = [];
-    let resolveCancellation!: () => void;
-    const cancellation = new Promise<void>((resolve) => {
-      resolveCancellation = resolve;
-    });
-    const refreshedState = stateFor("River", ["As", "Kd", "2c", "7h", "9s"]);
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("passes the backend generation and polls until the solve stops", async () => {
+    vi.useFakeTimers();
+    const calls: Array<{
+      command: string;
+      args?: Record<string, unknown>;
+    }> = [];
+    const solvingState = {
+      ...stateFor("River", ["As", "Kd", "2c", "7h", "9s"]),
+      solve,
+    } as unknown as GameState;
+    const stoppedState = {
+      ...solvingState,
+      solve: { ...solve, is_complete: true },
+    } as unknown as GameState;
+    const states = [solvingState, stoppedState];
     const setState = vi.fn();
     const setError = vi.fn();
-    const invokeCommand = vi.fn((command: string): Promise<unknown> => {
-      calls.push(command);
-      return (command === "game_cancel_solve"
-        ? cancellation
-        : Promise.resolve(refreshedState));
-    }) as unknown as typeof import("./invoke").invoke;
+    const invokeCommand = vi.fn(
+      (command: string, args?: Record<string, unknown>): Promise<unknown> => {
+        calls.push({ command, args });
+        return Promise.resolve(
+          command === "game_cancel_solve" ? undefined : states.shift(),
+        );
+      },
+    ) as unknown as typeof import("./invoke").invoke;
 
     requestSolveCancellation(
       "exact",
       4,
+      17,
       (generation) => generation === 4,
       setState,
       setError,
       invokeCommand,
     );
 
-    expect(calls).toEqual(["game_cancel_solve"]);
-    expect(setState).not.toHaveBeenCalled();
+    expect(calls).toEqual([
+      { command: "game_cancel_solve", args: { mode: "exact", generation: 17 } },
+    ]);
 
-    resolveCancellation();
     await Promise.resolve();
     await Promise.resolve();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual({
+      command: "game_get_state",
+      args: { source: "exact" },
+    });
 
-    expect(calls).toEqual(["game_cancel_solve", "game_get_state"]);
-    expect(setState).toHaveBeenCalledWith(refreshedState);
+    expect(setState).toHaveBeenCalledWith(solvingState);
+    await vi.advanceTimersByTimeAsync(CANCELLATION_POLL_INTERVAL_MS);
+    expect(setState).toHaveBeenCalledWith(stoppedState);
     expect(setError).not.toHaveBeenCalled();
   });
 
-  it("ignores the refresh when a newer solve owns the mode", async () => {
+  it("bounds best-effort refreshes when the backend keeps reporting active", async () => {
+    vi.useFakeTimers();
     const calls: string[] = [];
-    let resolveCancellation!: () => void;
-    const cancellation = new Promise<void>((resolve) => {
-      resolveCancellation = resolve;
-    });
+    const solvingState = {
+      ...stateFor("River", ["As", "Kd", "2c", "7h", "9s"]),
+      solve,
+    } as unknown as GameState;
     const setState = vi.fn();
     const setError = vi.fn();
     const invokeCommand = vi.fn((command: string): Promise<unknown> => {
       calls.push(command);
-      return (command === "game_cancel_solve"
-        ? cancellation
-        : Promise.resolve(stateFor("River", [])));
+      return Promise.resolve(command === "game_cancel_solve" ? undefined : solvingState);
+    }) as unknown as typeof import("./invoke").invoke;
+
+    requestSolveCancellation(
+      "exact",
+      4,
+      17,
+      (generation) => generation === 4,
+      setState,
+      setError,
+      invokeCommand,
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(
+      CANCELLATION_POLL_INTERVAL_MS * CANCELLATION_POLL_ATTEMPTS,
+    );
+
+    expect(calls).toEqual([
+      "game_cancel_solve",
+      ...Array(CANCELLATION_POLL_ATTEMPTS).fill("game_get_state"),
+    ]);
+    expect(setState).toHaveBeenCalledTimes(CANCELLATION_POLL_ATTEMPTS);
+    expect(setError).not.toHaveBeenCalled();
+  });
+
+  it("ignores a refresh that resolves after a newer solve owns the mode", async () => {
+    const calls: string[] = [];
+    let resolveRefresh!: (state: GameState) => void;
+    const refresh = new Promise<GameState>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const refreshedState = stateFor("River", []);
+    const setState = vi.fn();
+    const setError = vi.fn();
+    const invokeCommand = vi.fn((command: string): Promise<unknown> => {
+      calls.push(command);
+      return command === "game_cancel_solve"
+        ? Promise.resolve(undefined)
+        : refresh;
     }) as unknown as typeof import("./invoke").invoke;
     let currentGeneration = 4;
 
     requestSolveCancellation(
       "exact",
       4,
+      17,
       (generation) => generation === currentGeneration,
       setState,
       setError,
       invokeCommand,
     );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual(["game_cancel_solve", "game_get_state"]);
+
     currentGeneration = 5;
-    resolveCancellation();
+    resolveRefresh(refreshedState as unknown as GameState);
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(calls).toEqual(["game_cancel_solve"]);
+    expect(calls).toEqual(["game_cancel_solve", "game_get_state"]);
     expect(setState).not.toHaveBeenCalled();
     expect(setError).not.toHaveBeenCalled();
+  });
+
+  it("recognizes both backend generation response shapes and stopped states", () => {
+    expect(getBackendSolveGeneration(17)).toBe(17);
+    expect(getBackendSolveGeneration({ generation: 23 })).toBe(23);
+    expect(isSolveStopped({ solve: null })).toBe(true);
+    expect(isSolveStopped({ solve: { ...solve, is_complete: true } })).toBe(true);
+    expect(isSolveStopped({ solve })).toBe(false);
   });
 });

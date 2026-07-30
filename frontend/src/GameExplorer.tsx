@@ -71,29 +71,93 @@ export function getComboActionRows(
   });
 }
 
-/** Issue cancellation independently, then opportunistically refresh its state. */
+export const CANCELLATION_POLL_INTERVAL_MS = 100;
+export const CANCELLATION_POLL_ATTEMPTS = 10;
+
+/** The backend stops reporting a solve once it has acknowledged cancellation. */
+export function isSolveStopped(state: Pick<GameState, "solve">): boolean {
+  return state.solve == null || state.solve.is_complete;
+}
+
+/** Normalize the solve generation returned by Tauri or the HTTP dev server. */
+export function getBackendSolveGeneration(
+  response: number | { generation: number },
+): number {
+  return typeof response === "number" ? response : response.generation;
+}
+
+/** Issue cancellation independently, then observe the backend until it stops. */
 export function requestSolveCancellation(
   mode: SolveMode,
   generation: number,
+  backendGeneration: number,
   isCurrentRun: (generation: number) => boolean,
   setState: (state: GameState) => void,
   setError: (message: string) => void,
   invokeCommand: typeof invoke = invoke,
-): void {
-  void invokeCommand("game_cancel_solve", { mode })
-    .then(() => {
-      if (!isCurrentRun(generation)) return;
+): () => void {
+  let cancelled = false;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
-      void invokeCommand<GameState>("game_get_state", { source: mode })
-        .then((state) => {
-          if (isCurrentRun(generation)) setState(state);
-        })
-        .catch(() => {});
+  const stopObservation = () => {
+    cancelled = true;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  };
+
+  const isActive = () => !cancelled && isCurrentRun(generation);
+
+  const pollUntilStopped = async (attempt: number): Promise<void> => {
+    if (!isActive()) return;
+
+    try {
+      const state = await invokeCommand<GameState>("game_get_state", {
+        source: mode,
+      });
+      if (!isActive()) return;
+      setState(state);
+      if (isSolveStopped(state) || attempt + 1 >= CANCELLATION_POLL_ATTEMPTS) {
+        return;
+      }
+    } catch {
+      if (!isActive() || attempt + 1 >= CANCELLATION_POLL_ATTEMPTS) return;
+    }
+
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      void pollUntilStopped(attempt + 1);
+    }, CANCELLATION_POLL_INTERVAL_MS);
+  };
+
+  void invokeCommand("game_cancel_solve", {
+    mode,
+    generation: backendGeneration,
+  })
+    .then(() => {
+      void pollUntilStopped(0);
     })
     .catch((error) => {
-      if (isCurrentRun(generation)) setError(String(error));
+      if (isActive()) setError(String(error));
     });
+
+  return stopObservation;
 }
+
+type PendingSolveCancellation = {
+  generation: number;
+  solveGeneration: number;
+  backendGeneration: number | null;
+};
+
+type SolveRun = {
+  generation: number;
+  backendGeneration: number | null;
+  pollId: number | null;
+  cancelCleanup: (() => void) | null;
+  pendingCancellations: PendingSolveCancellation[];
+};
 
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
 
@@ -255,11 +319,21 @@ export default function GameExplorer() {
   const [subgameSolving, setSubgameSolving] = useState(false);
   const [exactSolving, setExactSolving] = useState(false);
   const activeSourceRef = useRef<StrategySource>("blueprint");
-  const solveRunsRef = useRef<
-    Record<SolveMode, { generation: number; pollId: number | null }>
-  >({
-    subgame: { generation: 0, pollId: null },
-    exact: { generation: 0, pollId: null },
+  const solveRunsRef = useRef<Record<SolveMode, SolveRun>>({
+    subgame: {
+      generation: 0,
+      backendGeneration: null,
+      pollId: null,
+      cancelCleanup: null,
+      pendingCancellations: [],
+    },
+    exact: {
+      generation: 0,
+      backendGeneration: null,
+      pollId: null,
+      cancelCleanup: null,
+      pendingCancellations: [],
+    },
   });
   const [copied, setCopied] = useState(false);
   const [showLoadModal, setShowLoadModal] = useState(false);
@@ -274,12 +348,22 @@ export default function GameExplorer() {
     }
   }, []);
 
+  const stopSolveObservation = useCallback(
+    (mode: SolveMode) => {
+      const run = solveRunsRef.current[mode];
+      stopSolvePolling(mode);
+      run.cancelCleanup?.();
+      run.cancelCleanup = null;
+    },
+    [stopSolvePolling],
+  );
+
   useEffect(() => {
     return () => {
-      stopSolvePolling("subgame");
-      stopSolvePolling("exact");
+      stopSolveObservation("subgame");
+      stopSolveObservation("exact");
     };
-  }, [stopSolvePolling]);
+  }, [stopSolveObservation]);
 
   // ── List available blueprints on mount ──────────────────────────
 
@@ -539,27 +623,50 @@ export default function GameExplorer() {
       const isCurrentRun = (generation: number) =>
         solveRunsRef.current[mode].generation === generation;
 
-      if (isSolving) {
-        // Cancel
-        run.generation += 1;
-        const cancellationGeneration = run.generation;
-        stopSolvePolling(mode);
-        setSolving(false);
-
-        // Do not await this request in the click handler. The solve command
-        // may still be pending, but its continuation is invalidated above.
-        requestSolveCancellation(
+      const beginCancellation = (pending: PendingSolveCancellation) => {
+        if (pending.backendGeneration === null) return;
+        const cleanup = requestSolveCancellation(
           mode,
-          cancellationGeneration,
+          pending.generation,
+          pending.backendGeneration,
           isCurrentRun,
           setState,
           (message) => setError(message),
         );
+        if (isCurrentRun(pending.generation)) {
+          run.cancelCleanup = cleanup;
+        }
+      };
+
+      if (isSolving) {
+        // Cancel
+        const solveGeneration = run.generation;
+        run.generation += 1;
+        const cancellationGeneration = run.generation;
+        stopSolvePolling(mode);
+        const pendingCancellation: PendingSolveCancellation = {
+          generation: cancellationGeneration,
+          solveGeneration,
+          backendGeneration: run.backendGeneration,
+        };
+        run.pendingCancellations.push(pendingCancellation);
+        setSolving(false);
+
+        // Do not await this request in the click handler. The solve command
+        // may still be pending, so bind cancellation once it returns its
+        // backend generation below.
+        beginCancellation(pendingCancellation);
+        if (pendingCancellation.backendGeneration !== null) {
+          run.pendingCancellations = run.pendingCancellations.filter(
+            (pending) => pending !== pendingCancellation,
+          );
+        }
       } else {
         // Start solve
+        stopSolvePolling(mode);
         run.generation += 1;
         const generation = run.generation;
-        stopSolvePolling(mode);
+        run.backendGeneration = null;
         try {
           setSolving(true);
           setActiveSource(mode);
@@ -568,8 +675,27 @@ export default function GameExplorer() {
             localStorage.getItem("global_config") || "{}",
           );
           const params = buildSolveParams(mode, globalConfig);
-          await invoke("game_solve", { ...params });
+          const response = await invoke<number | { generation: number }>(
+            "game_solve",
+            { ...params },
+          );
+          const backendGeneration = getBackendSolveGeneration(response);
+
+          const pendingCancellation = run.pendingCancellations.find(
+            (pending) => pending.solveGeneration === generation,
+          );
+          if (
+            pendingCancellation !== undefined
+          ) {
+            pendingCancellation.backendGeneration = backendGeneration;
+            run.pendingCancellations = run.pendingCancellations.filter(
+              (pending) => pending !== pendingCancellation,
+            );
+            beginCancellation(pendingCancellation);
+            return;
+          }
           if (!isCurrentRun(generation)) return;
+          run.backendGeneration = backendGeneration;
 
           // Poll for progress
           const pollId = window.setInterval(async () => {
@@ -586,11 +712,13 @@ export default function GameExplorer() {
               if (s.solve?.is_complete) {
                 stopSolvePolling(mode);
                 setSolving(false);
+                run.backendGeneration = null;
               }
             } catch {
               if (!isCurrentRun(generation)) return;
               stopSolvePolling(mode);
               setSolving(false);
+              run.backendGeneration = null;
             }
           }, 500);
           if (!isCurrentRun(generation)) {
@@ -602,6 +730,10 @@ export default function GameExplorer() {
           if (!isCurrentRun(generation)) return;
           setError(String(e));
           setSolving(false);
+          run.backendGeneration = null;
+          run.pendingCancellations = run.pendingCancellations.filter(
+            (pending) => pending.solveGeneration !== generation,
+          );
         }
       }
     },
@@ -611,6 +743,7 @@ export default function GameExplorer() {
       subgameSolving,
       exactSolving,
       stopSolvePolling,
+      stopSolveObservation,
     ],
   );
 
