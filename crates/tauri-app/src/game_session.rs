@@ -230,6 +230,49 @@ pub struct ActionRecord {
     pub actions: Vec<GameAction>,
 }
 
+/// Encode a position from the shared action-history representation used by
+/// both the legacy and Universal MP session backends.
+fn encode_spot_from_history(action_history: &[ActionRecord], board: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current_actions: Vec<String> = Vec::new();
+    let mut prev_street = String::new();
+    let mut board_idx = 0;
+
+    for rec in action_history {
+        if rec.street != prev_street && !prev_street.is_empty() {
+            if !current_actions.is_empty() {
+                parts.push(current_actions.join(","));
+                current_actions.clear();
+            }
+            let new_cards = match prev_street.as_str() {
+                "Preflop" => 3,
+                _ => 1,
+            };
+            let end = (board_idx + new_cards).min(board.len());
+            let board_str: String = board[board_idx..end].join("");
+            board_idx = end;
+            parts.push(board_str);
+        }
+        prev_street = rec.street.clone();
+        current_actions.push(format!(
+            "{}:{}",
+            rec.position.to_lowercase(),
+            rec.label.to_lowercase()
+        ));
+    }
+
+    if !current_actions.is_empty() {
+        parts.push(current_actions.join(","));
+    }
+
+    if board_idx < board.len() {
+        let remaining: String = board[board_idx..].join("");
+        parts.push(remaining);
+    }
+
+    parts.join("|")
+}
+
 /// Solve progress info (when a subgame solve is running).
 #[derive(Debug, Clone, Serialize)]
 pub struct SolveStatus {
@@ -1410,6 +1453,86 @@ impl LazyMpSession {
         Ok(state)
     }
 
+    /// Encode the current Universal MP position using the shared spot format.
+    fn encode_spot(&self) -> String {
+        let board = mp_board_strings(&self.board);
+        encode_spot_from_history(&self.action_history, &board)
+    }
+
+    /// Reset to the lazy root and replay a human-readable spot encoding.
+    fn load_spot(&mut self, spot: &str) -> Result<(), String> {
+        let spot = spot.trim();
+        if spot.is_empty() {
+            return Ok(());
+        }
+
+        self.spot = LazyResolvedSpot::root(&self.game);
+        self.board.clear();
+        self.action_history.clear();
+        self.terminal = false;
+
+        for segment in spot.split('|') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            if segment.contains(':') {
+                for action_str in segment.split(',') {
+                    let action_str = action_str.trim();
+                    let (pos, label) = action_str.split_once(':').ok_or_else(|| {
+                        format!("Invalid action format: '{action_str}'. Expected 'position:label'")
+                    })?;
+
+                    let state = self.get_state()?;
+                    let current_position = state.position.clone();
+                    let position = current_position.to_lowercase();
+                    if pos.to_lowercase() != position {
+                        return Err(format!(
+                            "Position mismatch: '{pos}' but current position is '{current_position}'"
+                        ));
+                    }
+
+                    let matched = state
+                        .actions
+                        .iter()
+                        .find(|action| action.label.to_lowercase() == label.to_lowercase());
+                    match matched {
+                        Some(action) => self.play_action(&action.id)?,
+                        None => {
+                            let available: Vec<String> = state
+                                .actions
+                                .iter()
+                                .map(|action| {
+                                    format!("{}:{}", position, action.label.to_lowercase())
+                                })
+                                .collect();
+                            return Err(format!(
+                                "Action '{}:{}' not found. Available: {}",
+                                pos,
+                                label,
+                                available.join(", ")
+                            ));
+                        }
+                    }
+                }
+            } else {
+                let chars: Vec<char> = segment.chars().collect();
+                if chars.len() % 2 != 0 {
+                    return Err(format!(
+                        "Invalid board segment: '{segment}'. Must be pairs of rank+suit."
+                    ));
+                }
+                for chunk in chars.chunks(2) {
+                    let card: String = chunk.iter().collect();
+                    self.deal_card(&card)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn back(&mut self) -> Result<GameState, String> {
         if self.action_history.is_empty() {
             return Err("No actions to undo".to_string());
@@ -2337,48 +2460,7 @@ impl GameSession {
     /// - `|` separates street transitions (board card deals)
     /// - Board segments are card strings concatenated (e.g. "AhKdQc")
     pub fn encode_spot(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let mut current_actions: Vec<String> = Vec::new();
-        let mut prev_street = String::new();
-        let mut board_idx = 0;
-
-        for rec in &self.action_history {
-            if rec.street != prev_street && !prev_street.is_empty() {
-                // Flush current actions
-                if !current_actions.is_empty() {
-                    parts.push(current_actions.join(","));
-                    current_actions.clear();
-                }
-                // Emit board cards for the street transition
-                let new_cards = match prev_street.as_str() {
-                    "Preflop" => 3,
-                    _ => 1,
-                };
-                let end = (board_idx + new_cards).min(self.board.len());
-                let board_str: String = self.board[board_idx..end].join("");
-                board_idx = end;
-                parts.push(board_str);
-            }
-            prev_street = rec.street.clone();
-            current_actions.push(format!(
-                "{}:{}",
-                rec.position.to_lowercase(),
-                rec.label.to_lowercase()
-            ));
-        }
-
-        // Flush remaining actions
-        if !current_actions.is_empty() {
-            parts.push(current_actions.join(","));
-        }
-
-        // Emit any remaining board cards (e.g. board dealt but no actions on new street)
-        if board_idx < self.board.len() {
-            let remaining: String = self.board[board_idx..].join("");
-            parts.push(remaining);
-        }
-
-        parts.join("|")
+        encode_spot_from_history(&self.action_history, &self.board)
     }
 
     /// Parse a spot encoding and replay to that state.
@@ -5377,6 +5459,11 @@ pub fn game_cancel_solve(
 
 /// Encode the current game state as a human-readable spot string.
 pub fn game_encode_spot_core(session_state: &GameSessionState) -> Result<String, String> {
+    let mp_guard = session_state.mp_session.read();
+    if let Some(session) = mp_guard.as_ref() {
+        return Ok(session.encode_spot());
+    }
+
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
     Ok(session.encode_spot())
@@ -5388,6 +5475,16 @@ pub fn game_load_spot_core(
     spot: &str,
 ) -> Result<GameState, String> {
     let _solve_request_guard = session_state.solve_request_gate.write();
+
+    let mut mp_guard = session_state.mp_session.write();
+    if let Some(session) = mp_guard.as_mut() {
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
+        session.load_spot(spot)?;
+        return session.get_state();
+    }
+    drop(mp_guard);
+
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session_state.subgame_solve.reset();
