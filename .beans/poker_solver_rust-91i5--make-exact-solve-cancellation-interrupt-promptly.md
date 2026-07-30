@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-07-30T19:08:47Z
-updated_at: 2026-07-30T19:29:59Z
+updated_at: 2026-07-30T19:35:24Z
 ---
 
 Exact postflop solves do not visibly stop promptly when the user presses cancel. The Tauri state has a cancel flag, but the exact range-solver traversal may not observe it until an entire CFR iteration completes, and the UI awaits cancellation/state refresh before settling.
@@ -24,3 +24,14 @@ Exact postflop solves do not visibly stop promptly when the user presses cancel.
 - [ ] Reduce or eliminate the remaining exact tree-construction cancellation gap
 
 Review also identified that terminal evaluator work remains cooperative only at traversal boundaries; this is acceptable for this patch if the remaining bounded latency is documented.
+
+
+
+## Current Review Work
+
+- [x] Baseline research: trace generation, cancel, and exact construction paths
+- [ ] Return solve generation and reject stale generation cancellation
+- [ ] Add cancellation-aware action-tree construction and exact worker checks
+- [ ] Add focused stale-generation and tree-construction tests
+- [ ] Run formatting and focused range-solver/tauri/devserver verification
+- [ ] Document remaining uninterruptible construction latency and final test limitations
