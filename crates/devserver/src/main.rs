@@ -148,6 +148,7 @@ struct GameGetStateParams {
 #[derive(Deserialize)]
 struct GameCancelSolveParams {
     mode: Option<String>,
+    generation: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -699,6 +700,7 @@ async fn handle_game_cancel_solve(
     result_to_response(poker_solver_tauri::game_cancel_solve_core(
         &session_state,
         params.mode,
+        params.generation,
     ))
 }
 
@@ -866,9 +868,10 @@ mod tests {
 
     #[test]
     fn game_cancel_solve_params_deserializes_with_mode() {
-        let json = r#"{"mode": "exact"}"#;
+        let json = r#"{"mode": "exact", "generation": 42}"#;
         let params: GameCancelSolveParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.mode.as_deref(), Some("exact"));
+        assert_eq!(params.generation, Some(42));
     }
 
     #[test]
@@ -876,6 +879,7 @@ mod tests {
         let json = r#"{}"#;
         let params: GameCancelSolveParams = serde_json::from_str(json).unwrap();
         assert!(params.mode.is_none());
+        assert!(params.generation.is_none());
     }
 
     #[test]

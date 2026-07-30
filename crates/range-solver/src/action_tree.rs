@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bet_size::*;
 use crate::card::*;
@@ -385,6 +386,20 @@ impl ActionTree {
         Ok(ret)
     }
 
+    /// Creates a new [`ActionTree`], checking `cancel` while recursively building it.
+    ///
+    /// Cancellation returns an error instead of exposing the partially built tree. The
+    /// non-cancellable [`ActionTree::new`] path remains unchanged for normal callers.
+    pub fn new_with_cancel(config: TreeConfig, cancel: &AtomicBool) -> Result<Self, String> {
+        Self::check_config(&config)?;
+        let mut ret = Self {
+            config,
+            ..Default::default()
+        };
+        ret.build_tree_with_cancel(cancel)?;
+        Ok(ret)
+    }
+
     /// Obtains the configuration of the game tree.
     #[inline]
     pub fn config(&self) -> &TreeConfig {
@@ -731,6 +746,23 @@ impl ActionTree {
         self.build_tree_recursive(&mut root, BuildTreeInfo::from_config(&self.config));
     }
 
+    fn build_tree_with_cancel(&mut self, cancel: &AtomicBool) -> Result<(), String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Action tree construction cancelled".to_string());
+        }
+
+        let mut root = self.root.lock();
+        *root = ActionTreeNode::default();
+        root.board_state = self.config.initial_state;
+        root.player = self.config.initial_player;
+        root.amount = self.config.initial_amount;
+        self.build_tree_recursive_with_cancel(
+            &mut root,
+            BuildTreeInfo::from_config(&self.config),
+            cancel,
+        )
+    }
+
     /// Recursively builds the action tree.
     fn build_tree_recursive(&self, node: &mut ActionTreeNode, info: BuildTreeInfo) {
         node.remaining_stack = info.stack[0].min(info.stack[1]).max(0);
@@ -798,6 +830,83 @@ impl ActionTree {
                 );
             }
         }
+    }
+
+    fn build_tree_recursive_with_cancel(
+        &self,
+        node: &mut ActionTreeNode,
+        info: BuildTreeInfo,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Action tree construction cancelled".to_string());
+        }
+
+        node.remaining_stack = info.stack[0].min(info.stack[1]).max(0);
+
+        if node.is_terminal() {
+            return Ok(());
+        }
+
+        if node.is_chance() {
+            let depth_limit_hit = self
+                .config
+                .depth_limit
+                .is_some_and(|limit| info.street_transitions >= limit);
+
+            if depth_limit_hit {
+                node.player = PLAYER_DEPTH_BOUNDARY_FLAG;
+                node.actions.clear();
+                node.children.clear();
+                return Ok(());
+            }
+
+            let next_state = match node.board_state {
+                BoardState::Flop => BoardState::Turn,
+                BoardState::Turn => BoardState::River,
+                BoardState::River => unreachable!(),
+            };
+
+            let second_transition_blocked = self
+                .config
+                .depth_limit
+                .is_some_and(|limit| info.street_transitions + 1 >= limit);
+
+            let next_player = match (info.allin_flag, node.board_state) {
+                (false, _) => PLAYER_OOP,
+                (true, BoardState::Flop) if second_transition_blocked => PLAYER_DEPTH_BOUNDARY_FLAG,
+                (true, BoardState::Flop) => PLAYER_CHANCE_FLAG | PLAYER_CHANCE,
+                (true, _) => PLAYER_TERMINAL_FLAG,
+            };
+
+            node.actions.push(Action::Chance(0));
+            node.children.push(MutexLike::new(ActionTreeNode {
+                player: next_player,
+                board_state: next_state,
+                amount: node.amount,
+                ..Default::default()
+            }));
+
+            self.build_tree_recursive_with_cancel(
+                &mut node.children[0].lock(),
+                info.create_next(0, Action::Chance(0)),
+                cancel,
+            )?;
+        } else {
+            self.push_actions(node, &info);
+            for (action, child) in node.actions.iter().zip(node.children.iter()) {
+                if cancel.load(Ordering::Acquire) {
+                    return Err("Action tree construction cancelled".to_string());
+                }
+                self.build_tree_recursive_with_cancel(
+                    &mut child.lock(),
+                    info.create_next(node.player, *action),
+                    cancel,
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Pushes all possible actions to the given node.
@@ -1561,6 +1670,27 @@ mod tests {
         assert!(tree.added_lines().is_empty());
         assert!(tree.removed_lines().is_empty());
         assert!(tree.history().is_empty());
+    }
+
+    #[test]
+    fn cancelled_action_tree_construction_returns_no_tree() {
+        use std::sync::atomic::AtomicBool;
+
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let config = TreeConfig {
+            initial_state: BoardState::Flop,
+            starting_pot: 100,
+            effective_stack: 100,
+            flop_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(true);
+
+        let error = match ActionTree::new_with_cancel(config, &cancel) {
+            Ok(_) => panic!("cancelled construction returned a tree"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "Action tree construction cancelled");
     }
 
     // -- Config validation --

@@ -199,6 +199,13 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `game_encode_spot` | Encode the active game session's action history and board |
 | `game_load_spot` | Replay a spot encoding in the active legacy HU or two-player Universal MP session |
 
+`game_solve` returns the solve-generation number after accepting a solve request. Keep that
+number with the active solve and pass it as `generation` to `game_cancel_solve` along with the
+same `mode` (`subgame` or `exact`). A cancel request for an older generation is ignored, which
+prevents a delayed UI request from cancelling a newer solve. Cancellation is cooperative: the
+range solver checks the token during action-tree construction and CFR traversal, then the
+backend acknowledges the generation without publishing partial results.
+
 ## Boundary Evaluation
 
 The Settings view controls depth-boundary evaluators for Subgame and Exact solves. The first non-Exact street after the current root street becomes the cut point; later streets are disabled because they cannot be reached by the depth-limited solve.
