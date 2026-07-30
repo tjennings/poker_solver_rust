@@ -22,9 +22,9 @@ use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 use poker_solver_tauri::{
-    game_back_core, game_deal_card_core, game_get_state_core, game_load_spot_core, game_new_core,
-    game_play_action_core, game_solve_core, ExplorationPosition, ExplorationState, GameMatrix,
-    GameSessionState, PostflopState,
+    game_back_core, game_deal_card_core, game_encode_spot_core, game_get_state_core,
+    game_load_spot_core, game_new_core, game_play_action_core, game_solve_core,
+    ExplorationPosition, ExplorationState, GameMatrix, GameSessionState, PostflopState,
 };
 use tempfile::TempDir;
 
@@ -2182,6 +2182,51 @@ async fn two_player_lazy_session_back_replays_preflop_and_flop_state() {
     assert_eq!(restored_root.board, Vec::<String>::new());
     assert_eq!(restored_root.street, "Preflop");
     assert!(restored_root.action_history.is_empty());
+}
+
+#[tokio::test]
+async fn two_player_lazy_session_encodes_and_loads_mp_spot() {
+    let dir = TempDir::new().unwrap();
+    let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
+
+    let root = game_get_state_core(&sessions, None).expect("root state");
+    let sb_raise = root
+        .actions
+        .iter()
+        .find(|action| action.label == "2bb")
+        .expect("root should expose the legal 2bb action");
+    game_play_action_core(&sessions, &sb_raise.id, None).expect("SB 2bb raise should advance");
+
+    let after_sb_raise = game_get_state_core(&sessions, None).expect("BB state");
+    let bb_call = after_sb_raise
+        .actions
+        .iter()
+        .find(|action| action.action_type == "call")
+        .expect("BB should expose a legal call");
+    let flop_chance = game_play_action_core(&sessions, &bb_call.id, None)
+        .expect("BB call should reach the flop chance boundary");
+    assert!(flop_chance.is_chance);
+
+    game_deal_card_core(&sessions, "As").expect("deal As");
+    game_deal_card_core(&sessions, "Kd").expect("deal Kd");
+    let original = game_deal_card_core(&sessions, "Qh").expect("deal Qh");
+    let spot = game_encode_spot_core(&sessions).expect("encode MP spot");
+
+    let loaded = game_load_spot_core(&sessions, &spot).expect("load encoded MP spot");
+    assert_eq!(loaded.board, vec!["As", "Kd", "Qh"]);
+    assert_eq!(loaded.action_history.len(), original.action_history.len());
+    assert_eq!(
+        loaded
+            .action_history
+            .iter()
+            .map(|record| (record.position.as_str(), record.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("SB", "2bb"), ("BB", "Call")]
+    );
+    assert_eq!(
+        game_encode_spot_core(&sessions).expect("re-encode loaded MP spot"),
+        spot
+    );
 }
 
 #[tokio::test]
