@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   getComboActionRows,
   isUniversalMpLazyBundleName,
+  requestSolveCancellation,
   shouldShowStrategyMatrix,
   supportsUniversalMpLazyExact,
 } from "./GameExplorer";
@@ -124,5 +125,78 @@ describe("combo action rows", () => {
     expect(
       getComboActionRows(actions, [0.5]).map((row) => row.percentage),
     ).toEqual([50, 0, 0]);
+  });
+});
+
+describe("solve cancellation", () => {
+  it("requests cancellation before starting a best-effort refresh", async () => {
+    const calls: string[] = [];
+    let resolveCancellation!: () => void;
+    const cancellation = new Promise<void>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    const refreshedState = stateFor("River", ["As", "Kd", "2c", "7h", "9s"]);
+    const setState = vi.fn();
+    const setError = vi.fn();
+    const invokeCommand = vi.fn((command: string): Promise<unknown> => {
+      calls.push(command);
+      return (command === "game_cancel_solve"
+        ? cancellation
+        : Promise.resolve(refreshedState));
+    }) as unknown as typeof import("./invoke").invoke;
+
+    requestSolveCancellation(
+      "exact",
+      4,
+      (generation) => generation === 4,
+      setState,
+      setError,
+      invokeCommand,
+    );
+
+    expect(calls).toEqual(["game_cancel_solve"]);
+    expect(setState).not.toHaveBeenCalled();
+
+    resolveCancellation();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(calls).toEqual(["game_cancel_solve", "game_get_state"]);
+    expect(setState).toHaveBeenCalledWith(refreshedState);
+    expect(setError).not.toHaveBeenCalled();
+  });
+
+  it("ignores the refresh when a newer solve owns the mode", async () => {
+    const calls: string[] = [];
+    let resolveCancellation!: () => void;
+    const cancellation = new Promise<void>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    const setState = vi.fn();
+    const setError = vi.fn();
+    const invokeCommand = vi.fn((command: string): Promise<unknown> => {
+      calls.push(command);
+      return (command === "game_cancel_solve"
+        ? cancellation
+        : Promise.resolve(stateFor("River", [])));
+    }) as unknown as typeof import("./invoke").invoke;
+    let currentGeneration = 4;
+
+    requestSolveCancellation(
+      "exact",
+      4,
+      (generation) => generation === currentGeneration,
+      setState,
+      setError,
+      invokeCommand,
+    );
+    currentGeneration = 5;
+    resolveCancellation();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(calls).toEqual(["game_cancel_solve"]);
+    expect(setState).not.toHaveBeenCalled();
+    expect(setError).not.toHaveBeenCalled();
   });
 });

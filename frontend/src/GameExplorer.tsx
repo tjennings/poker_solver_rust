@@ -71,6 +71,30 @@ export function getComboActionRows(
   });
 }
 
+/** Issue cancellation independently, then opportunistically refresh its state. */
+export function requestSolveCancellation(
+  mode: SolveMode,
+  generation: number,
+  isCurrentRun: (generation: number) => boolean,
+  setState: (state: GameState) => void,
+  setError: (message: string) => void,
+  invokeCommand: typeof invoke = invoke,
+): void {
+  void invokeCommand("game_cancel_solve", { mode })
+    .then(() => {
+      if (!isCurrentRun(generation)) return;
+
+      void invokeCommand<GameState>("game_get_state", { source: mode })
+        .then((state) => {
+          if (isCurrentRun(generation)) setState(state);
+        })
+        .catch(() => {});
+    })
+    .catch((error) => {
+      if (isCurrentRun(generation)) setError(String(error));
+    });
+}
+
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
 
 const PICKER_RANKS = [
@@ -231,10 +255,31 @@ export default function GameExplorer() {
   const [subgameSolving, setSubgameSolving] = useState(false);
   const [exactSolving, setExactSolving] = useState(false);
   const activeSourceRef = useRef<StrategySource>("blueprint");
+  const solveRunsRef = useRef<
+    Record<SolveMode, { generation: number; pollId: number | null }>
+  >({
+    subgame: { generation: 0, pollId: null },
+    exact: { generation: 0, pollId: null },
+  });
   const [copied, setCopied] = useState(false);
   const [showLoadModal, setShowLoadModal] = useState(false);
   const [loadSpotInput, setLoadSpotInput] = useState("");
   const [loadSpotError, setLoadSpotError] = useState<string | null>(null);
+
+  const stopSolvePolling = useCallback((mode: SolveMode) => {
+    const run = solveRunsRef.current[mode];
+    if (run.pollId !== null) {
+      window.clearInterval(run.pollId);
+      run.pollId = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopSolvePolling("subgame");
+      stopSolvePolling("exact");
+    };
+  }, [stopSolvePolling]);
 
   // ── List available blueprints on mount ──────────────────────────
 
@@ -490,19 +535,31 @@ export default function GameExplorer() {
       const isSolving = mode === "subgame" ? subgameSolving : exactSolving;
       const setSolving =
         mode === "subgame" ? setSubgameSolving : setExactSolving;
+      const run = solveRunsRef.current[mode];
+      const isCurrentRun = (generation: number) =>
+        solveRunsRef.current[mode].generation === generation;
 
       if (isSolving) {
         // Cancel
-        try {
-          setSolving(false);
-          await invoke("game_cancel_solve", { mode });
-          const s = await invoke<GameState>("game_get_state", { source: mode });
-          setState(s);
-        } catch (e) {
-          setError(String(e));
-        }
+        run.generation += 1;
+        const cancellationGeneration = run.generation;
+        stopSolvePolling(mode);
+        setSolving(false);
+
+        // Do not await this request in the click handler. The solve command
+        // may still be pending, but its continuation is invalidated above.
+        requestSolveCancellation(
+          mode,
+          cancellationGeneration,
+          isCurrentRun,
+          setState,
+          (message) => setError(message),
+        );
       } else {
         // Start solve
+        run.generation += 1;
+        const generation = run.generation;
+        stopSolvePolling(mode);
         try {
           setSolving(true);
           setActiveSource(mode);
@@ -512,29 +569,49 @@ export default function GameExplorer() {
           );
           const params = buildSolveParams(mode, globalConfig);
           await invoke("game_solve", { ...params });
+          if (!isCurrentRun(generation)) return;
+
           // Poll for progress
-          const pollId = setInterval(async () => {
+          const pollId = window.setInterval(async () => {
+            if (!isCurrentRun(generation)) {
+              window.clearInterval(pollId);
+              return;
+            }
             try {
               const s = await invoke<GameState>("game_get_state", {
                 source: mode,
               });
+              if (!isCurrentRun(generation)) return;
               setState(s);
               if (s.solve?.is_complete) {
-                clearInterval(pollId);
+                stopSolvePolling(mode);
                 setSolving(false);
               }
             } catch {
-              clearInterval(pollId);
+              if (!isCurrentRun(generation)) return;
+              stopSolvePolling(mode);
               setSolving(false);
             }
           }, 500);
+          if (!isCurrentRun(generation)) {
+            window.clearInterval(pollId);
+            return;
+          }
+          run.pollId = pollId;
         } catch (e) {
+          if (!isCurrentRun(generation)) return;
           setError(String(e));
           setSolving(false);
         }
       }
     },
-    [sessionKind, state, subgameSolving, exactSolving],
+    [
+      sessionKind,
+      state,
+      subgameSolving,
+      exactSolving,
+      stopSolvePolling,
+    ],
   );
 
   // ── Derived state ────────────────────────────────────────────────
