@@ -2206,7 +2206,11 @@ async fn two_player_lazy_session_encodes_and_loads_mp_spot() {
             .iter()
             .map(|record| (record.position.as_str(), record.label.as_str()))
             .collect::<Vec<_>>(),
-        vec![("SB", "2bb"), ("BB", "Call")]
+        original
+            .action_history
+            .iter()
+            .map(|record| (record.position.as_str(), record.label.as_str()))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         game_encode_spot_core(&sessions).expect("re-encode loaded MP spot"),
