@@ -2189,22 +2189,7 @@ async fn two_player_lazy_session_encodes_and_loads_mp_spot() {
     let dir = TempDir::new().unwrap();
     let (_exploration, sessions) = start_two_player_lazy_session(&dir, true, true).await;
 
-    let root = game_get_state_core(&sessions, None).expect("root state");
-    let sb_raise = root
-        .actions
-        .iter()
-        .find(|action| action.label == "2bb")
-        .expect("root should expose the legal 2bb action");
-    game_play_action_core(&sessions, &sb_raise.id, None).expect("SB 2bb raise should advance");
-
-    let after_sb_raise = game_get_state_core(&sessions, None).expect("BB state");
-    let bb_call = after_sb_raise
-        .actions
-        .iter()
-        .find(|action| action.action_type == "call")
-        .expect("BB should expose a legal call");
-    let flop_chance = game_play_action_core(&sessions, &bb_call.id, None)
-        .expect("BB call should reach the flop chance boundary");
+    let flop_chance = enter_two_player_flop_chance(&sessions);
     assert!(flop_chance.is_chance);
 
     game_deal_card_core(&sessions, "As").expect("deal As");
