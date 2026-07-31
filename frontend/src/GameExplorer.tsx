@@ -1,28 +1,193 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
-import { invoke } from './invoke';
-import { useGlobalConfig } from './useGlobalConfig';
-import type {
-  GameState,
-} from './game-types';
-import { HandCell, CellDetail, ActionBlock } from './Explorer';
-import { toMatrixCell } from './game-explorer-utils';
-import {
-  SUIT_COLORS,
-  SUIT_SYMBOLS,
-  getActionColor,
-} from './matrix-utils';
-import { buildSolveParams, isPostflopStreet } from './strategy-tabs';
-import type { StrategySource, SolveMode } from './strategy-tabs';
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { invoke } from "./invoke";
+import { useGlobalConfig } from "./useGlobalConfig";
+import type { GameAction, GameState } from "./game-types";
+import { HandCell, CellDetail, ActionBlock } from "./Explorer";
+import { toMatrixCell } from "./game-explorer-utils";
+import { SUIT_COLORS, SUIT_SYMBOLS, getActionColor } from "./matrix-utils";
+import { buildSolveParams, isPostflopStreet } from "./strategy-tabs";
+import type { StrategySource, SolveMode } from "./strategy-tabs";
+
+export type GameExplorerSessionKind = "hu" | "universal_mp_lazy";
+
+/** Universal MP lazy advertises its backend kind in the loaded bundle name. */
+export function isUniversalMpLazyBundleName(
+  name: string | null | undefined,
+): boolean {
+  return name?.toLowerCase().includes("universal_mp_lazy") ?? false;
+}
+
+/** Exact MP solving requires a complete, non-terminal postflop decision root. */
+export function supportsUniversalMpLazyExact(
+  state: Pick<GameState, "street" | "board" | "is_terminal" | "is_chance">,
+): boolean {
+  const requiredBoardCards: Record<string, number> = {
+    Flop: 3,
+    Turn: 4,
+    River: 5,
+  };
+  const required = requiredBoardCards[state.street];
+  return (
+    required !== undefined &&
+    !state.is_terminal &&
+    !state.is_chance &&
+    state.board.length === required
+  );
+}
+
+/** Never present a base Blueprint matrix as an Exact result in MP-lazy mode. */
+export function shouldShowStrategyMatrix(
+  sessionKind: GameExplorerSessionKind,
+  activeSource: StrategySource,
+  state: Pick<
+    GameState,
+    "street" | "board" | "is_terminal" | "is_chance" | "matrix" | "solve"
+  >,
+): boolean {
+  if (!state.matrix) return false;
+  if (sessionKind !== "universal_mp_lazy" || activeSource !== "exact")
+    return true;
+  return supportsUniversalMpLazyExact(state) && state.solve !== null;
+}
+
+export interface ComboActionRow {
+  action: GameAction;
+  percentage: number;
+  percentageLabel: string;
+}
+
+/** Keep every combo action aligned to the shared matrix action vector. */
+export function getComboActionRows(
+  actions: readonly GameAction[],
+  probabilities: readonly number[],
+): ComboActionRow[] {
+  return actions.map((action, index) => {
+    const percentage = (probabilities[index] ?? 0) * 100;
+    return {
+      action,
+      percentage,
+      percentageLabel: `${percentage.toFixed(1)}%`,
+    };
+  });
+}
+
+export const CANCELLATION_POLL_INTERVAL_MS = 100;
+
+/** The backend stops reporting a solve once it has acknowledged cancellation. */
+export function isSolveStopped(state: Pick<GameState, "solve">): boolean {
+  return state.solve == null || state.solve.is_complete;
+}
+
+/** Normalize the solve generation returned by Tauri or the HTTP dev server. */
+export function getBackendSolveGeneration(
+  response: number | { generation: number },
+): number {
+  return typeof response === "number" ? response : response.generation;
+}
+
+/** Issue cancellation independently, then observe the backend until it stops. */
+export function requestSolveCancellation(
+  mode: SolveMode,
+  generation: number,
+  backendGeneration: number,
+  isCurrentRun: (generation: number) => boolean,
+  setState: (state: GameState) => void,
+  setError: (message: string) => void,
+  onStopped: () => void,
+  invokeCommand: typeof invoke = invoke,
+): () => void {
+  let cancelled = false;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const stopObservation = () => {
+    cancelled = true;
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  };
+
+  const isActive = () => !cancelled && isCurrentRun(generation);
+
+  const pollUntilStopped = async (): Promise<void> => {
+    if (!isActive()) return;
+
+    try {
+      const state = await invokeCommand<GameState>("game_get_state", {
+        source: mode,
+      });
+      if (!isActive()) return;
+      setState(state);
+      if (isSolveStopped(state)) {
+        onStopped();
+        return;
+      }
+    } catch {
+      if (!isActive()) return;
+    }
+
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      void pollUntilStopped();
+    }, CANCELLATION_POLL_INTERVAL_MS);
+  };
+
+  const observeUntilStopped = () => {
+    void pollUntilStopped();
+  };
+
+  void invokeCommand("game_cancel_solve", {
+    mode,
+    generation: backendGeneration,
+  })
+    .then(observeUntilStopped)
+    .catch((error) => {
+      if (!isActive()) return;
+      setError(String(error));
+      observeUntilStopped();
+    });
+
+  return stopObservation;
+}
+
+type PendingSolveCancellation = {
+  generation: number;
+  solveGeneration: number;
+  backendGeneration: number | null;
+};
+
+type SolveRun = {
+  generation: number;
+  backendGeneration: number | null;
+  cancelling: boolean;
+  pollId: number | null;
+  cancelCleanup: (() => void) | null;
+  pendingCancellations: PendingSolveCancellation[];
+};
 
 // ── Card picker (local, since Explorer.tsx does not export it) ──────────
 
-const PICKER_RANKS = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
-const PICKER_SUITS = ['s', 'h', 'd', 'c'];
+const PICKER_RANKS = [
+  "A",
+  "K",
+  "Q",
+  "J",
+  "T",
+  "9",
+  "8",
+  "7",
+  "6",
+  "5",
+  "4",
+  "3",
+  "2",
+];
+const PICKER_SUITS = ["s", "h", "d", "c"];
 const PICKER_COLORS: Record<string, string> = {
-  s: '#fff',
-  h: '#dc2626',
-  d: '#2563eb',
-  c: '#16a34a',
+  s: "#fff",
+  h: "#dc2626",
+  d: "#2563eb",
+  c: "#16a34a",
 };
 
 function CardPicker({
@@ -68,10 +233,10 @@ function CardPicker({
             return (
               <button
                 key={card}
-                className={`card-picker-card ${isDead ? 'dead' : ''} ${isSel ? 'selected' : ''}`}
+                className={`card-picker-card ${isDead ? "dead" : ""} ${isSel ? "selected" : ""}`}
                 style={{
-                  color: PICKER_COLORS[suit] || '#eee',
-                  borderColor: isSel ? '#00d9ff' : 'transparent',
+                  color: PICKER_COLORS[suit] || "#eee",
+                  borderColor: isSel ? "#00d9ff" : "transparent",
                 }}
                 disabled={isDead}
                 onClick={() => handleCardClick(card)}
@@ -104,24 +269,29 @@ function SolveProgress({ state }: { state: GameState }) {
   const solve = state.solve;
   if (!solve) return null;
 
-  const pct = solve.max_iterations > 0
-    ? Math.min((solve.iteration / solve.max_iterations) * 100, 100)
-    : 0;
+  const pct =
+    solve.max_iterations > 0
+      ? Math.min((solve.iteration / solve.max_iterations) * 100, 100)
+      : 0;
 
   return (
     <div className="progress-bar-container">
       <div className="progress-bar-track">
         <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
         <div className="progress-text">
-          {solve.solver_name} - {solve.iteration}/{solve.max_iterations} iters
-          {' '} | expl: {solve.exploitability != null ? solve.exploitability.toFixed(3) : 'n/a'}
-          {' '} | {solve.elapsed_secs.toFixed(1)}s
-          {solve.rollout_hands_per_sec > 0 && ` | ${Math.round(solve.rollout_hands_per_sec).toLocaleString()} hands/s`}
+          {solve.solver_name} - {solve.iteration}/{solve.max_iterations} iters |
+          expl:{" "}
+          {solve.exploitability != null
+            ? solve.exploitability.toFixed(3)
+            : "n/a"}{" "}
+          | {solve.elapsed_secs.toFixed(1)}s
+          {solve.rollout_hands_per_sec > 0 &&
+            ` | ${Math.round(solve.rollout_hands_per_sec).toLocaleString()} hands/s`}
           {solve.is_complete
             ? solve.iteration < solve.max_iterations
-              ? ' — target exploitability reached'
-              : ' — done'
-            : ''}
+              ? " — target exploitability reached"
+              : " — done"
+            : ""}
         </div>
       </div>
     </div>
@@ -140,17 +310,70 @@ export default function GameExplorer() {
     col: number;
   } | null>(null);
 
-  const [blueprints, setBlueprints] = useState<{ name: string; path: string; stack_depth: number; latest_snapshot: string | null }[]>([]);
+  const [blueprints, setBlueprints] = useState<
+    {
+      name: string;
+      path: string;
+      stack_depth: number;
+      latest_snapshot: string | null;
+    }[]
+  >([]);
   const [bundleName, setBundleName] = useState<string | null>(null);
   const [snapshotName, setSnapshotName] = useState<string | null>(null);
-  const [activeSource, setActiveSource] = useState<StrategySource>('blueprint');
+  const [activeSource, setActiveSource] = useState<StrategySource>("blueprint");
+  const [sessionKind, setSessionKind] = useState<GameExplorerSessionKind>("hu");
   const [subgameSolving, setSubgameSolving] = useState(false);
   const [exactSolving, setExactSolving] = useState(false);
-  const activeSourceRef = useRef<StrategySource>('blueprint');
+  const [subgameCancelling, setSubgameCancelling] = useState(false);
+  const [exactCancelling, setExactCancelling] = useState(false);
+  const activeSourceRef = useRef<StrategySource>("blueprint");
+  const solveRunsRef = useRef<Record<SolveMode, SolveRun>>({
+    subgame: {
+      generation: 0,
+      backendGeneration: null,
+      cancelling: false,
+      pollId: null,
+      cancelCleanup: null,
+      pendingCancellations: [],
+    },
+    exact: {
+      generation: 0,
+      backendGeneration: null,
+      cancelling: false,
+      pollId: null,
+      cancelCleanup: null,
+      pendingCancellations: [],
+    },
+  });
   const [copied, setCopied] = useState(false);
   const [showLoadModal, setShowLoadModal] = useState(false);
-  const [loadSpotInput, setLoadSpotInput] = useState('');
+  const [loadSpotInput, setLoadSpotInput] = useState("");
   const [loadSpotError, setLoadSpotError] = useState<string | null>(null);
+
+  const stopSolvePolling = useCallback((mode: SolveMode) => {
+    const run = solveRunsRef.current[mode];
+    if (run.pollId !== null) {
+      window.clearInterval(run.pollId);
+      run.pollId = null;
+    }
+  }, []);
+
+  const stopSolveObservation = useCallback(
+    (mode: SolveMode) => {
+      const run = solveRunsRef.current[mode];
+      stopSolvePolling(mode);
+      run.cancelCleanup?.();
+      run.cancelCleanup = null;
+    },
+    [stopSolvePolling],
+  );
+
+  useEffect(() => {
+    return () => {
+      stopSolveObservation("subgame");
+      stopSolveObservation("exact");
+    };
+  }, [stopSolveObservation]);
 
   // ── List available blueprints on mount ──────────────────────────
 
@@ -158,14 +381,20 @@ export default function GameExplorer() {
     const init = async () => {
       try {
         if (!config.blueprint_dir) {
-          setError('Set Blueprint Directory in Settings first');
+          setError("Set Blueprint Directory in Settings first");
           return;
         }
         setError(null);
-        const list = await invoke<{ name: string; path: string; stack_depth: number; has_strategy: boolean; latest_snapshot: string | null }[]>(
-          'list_blueprints', { dir: config.blueprint_dir }
-        );
-        setBlueprints(list.filter(b => b.has_strategy));
+        const list = await invoke<
+          {
+            name: string;
+            path: string;
+            stack_depth: number;
+            has_strategy: boolean;
+            latest_snapshot: string | null;
+          }[]
+        >("list_blueprints", { dir: config.blueprint_dir });
+        setBlueprints(list.filter((b) => b.has_strategy));
       } catch (e) {
         setError(String(e));
       }
@@ -180,16 +409,24 @@ export default function GameExplorer() {
       setLoading(true);
       setError(null);
       setState(null);
-      setActiveSource('blueprint');
-      activeSourceRef.current = 'blueprint';
+      setActiveSource("blueprint");
+      activeSourceRef.current = "blueprint";
       setSubgameSolving(false);
       setExactSolving(false);
-      const info = await invoke<{ snapshot_name: string | null }>('load_blueprint_v2', { path });
-      await invoke('game_new', {});
-      const s = await invoke<GameState>('game_get_state', {});
+      const info = await invoke<{
+        name?: string | null;
+        snapshot_name: string | null;
+      }>("load_blueprint_v2", { path });
+      await invoke("game_new", {});
+      const s = await invoke<GameState>("game_get_state", {});
       setState(s);
       setBundleName(name);
       setSnapshotName(info.snapshot_name ?? null);
+      setSessionKind(
+        isUniversalMpLazyBundleName(info.name ?? name)
+          ? "universal_mp_lazy"
+          : "hu",
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -203,11 +440,11 @@ export default function GameExplorer() {
     try {
       setLoading(true);
       const source = activeSourceRef.current;
-      await invoke<GameState>('game_play_action', {
+      await invoke<GameState>("game_play_action", {
         actionId,
         source,
       });
-      const s = await invoke<GameState>('game_get_state', { source });
+      const s = await invoke<GameState>("game_get_state", { source });
       setState(s);
       setSelectedCell(null);
     } catch (e) {
@@ -222,9 +459,9 @@ export default function GameExplorer() {
   const dealCard = useCallback(async (card: string) => {
     try {
       setLoading(true);
-      setActiveSource('blueprint');
-      activeSourceRef.current = 'blueprint';
-      const s = await invoke<GameState>('game_deal_card', { card });
+      setActiveSource("blueprint");
+      activeSourceRef.current = "blueprint";
+      const s = await invoke<GameState>("game_deal_card", { card });
       setState(s);
     } catch (e) {
       setError(String(e));
@@ -233,32 +470,29 @@ export default function GameExplorer() {
     }
   }, []);
 
-  const dealCards = useCallback(
-    async (cards: string[]) => {
-      try {
-        setLoading(true);
-        setActiveSource('blueprint');
-        activeSourceRef.current = 'blueprint';
-        let s: GameState | null = null;
-        for (const card of cards) {
-          s = await invoke<GameState>('game_deal_card', { card });
-        }
-        if (s) setState(s);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setLoading(false);
+  const dealCards = useCallback(async (cards: string[]) => {
+    try {
+      setLoading(true);
+      setActiveSource("blueprint");
+      activeSourceRef.current = "blueprint";
+      let s: GameState | null = null;
+      for (const card of cards) {
+        s = await invoke<GameState>("game_deal_card", { card });
       }
-    },
-    [],
-  );
+      if (s) setState(s);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   // ── Back handler ─────────────────────────────────────────────────
 
   const goBack = useCallback(async () => {
     try {
       setLoading(true);
-      const s = await invoke<GameState>('game_back', {
+      const s = await invoke<GameState>("game_back", {
         source: activeSourceRef.current,
       });
       setState(s);
@@ -275,12 +509,12 @@ export default function GameExplorer() {
   const newHand = useCallback(async () => {
     try {
       setLoading(true);
-      setActiveSource('blueprint');
-      activeSourceRef.current = 'blueprint';
+      setActiveSource("blueprint");
+      activeSourceRef.current = "blueprint";
       setSubgameSolving(false);
       setExactSolving(false);
-      await invoke('game_new', {});
-      const s = await invoke<GameState>('game_get_state', {});
+      await invoke("game_new", {});
+      const s = await invoke<GameState>("game_get_state", {});
       setState(s);
       setSelectedCell(null);
       setError(null);
@@ -305,7 +539,7 @@ export default function GameExplorer() {
         // even across street boundaries.
         let s: GameState | null = null;
         for (let i = 0; i < stepsBack; i++) {
-          s = await invoke<GameState>('game_back', {
+          s = await invoke<GameState>("game_back", {
             source: activeSourceRef.current,
           });
         }
@@ -324,9 +558,9 @@ export default function GameExplorer() {
 
   const copySpot = useCallback(async () => {
     try {
-      const spot = await invoke<string>('game_encode_spot', {});
+      const spot = await invoke<string>("game_encode_spot", {});
       // Copy to clipboard via Tauri command (webview clipboard APIs are blocked)
-      await invoke('copy_to_clipboard', { text: spot });
+      await invoke("copy_to_clipboard", { text: spot });
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch (e) {
@@ -339,14 +573,16 @@ export default function GameExplorer() {
   const loadSpot = useCallback(async () => {
     try {
       setLoadSpotError(null);
-      setActiveSource('blueprint');
-      activeSourceRef.current = 'blueprint';
+      setActiveSource("blueprint");
+      activeSourceRef.current = "blueprint";
       setSubgameSolving(false);
       setExactSolving(false);
-      const s = await invoke<GameState>('game_load_spot', { spot: loadSpotInput });
+      const s = await invoke<GameState>("game_load_spot", {
+        spot: loadSpotInput,
+      });
       setState(s);
       setShowLoadModal(false);
-      setLoadSpotInput('');
+      setLoadSpotInput("");
       setSelectedCell(null);
     } catch (e) {
       setLoadSpotError(String(e));
@@ -355,62 +591,204 @@ export default function GameExplorer() {
 
   // ── Tab switching ─────────────────────────────────────────────────
 
-  const handleTabSwitch = useCallback(async (source: StrategySource) => {
-    setActiveSource(source);
-    activeSourceRef.current = source;
-    try {
-      const s = await invoke<GameState>('game_get_state', { source });
-      setState(s);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
-  // ── Solve handler ─────────────────────────────────────────────────
-
-  const handleSolve = useCallback(async (mode: SolveMode) => {
-    const isSolving = mode === 'subgame' ? subgameSolving : exactSolving;
-    const setSolving = mode === 'subgame' ? setSubgameSolving : setExactSolving;
-
-    if (isSolving) {
-      // Cancel
+  const handleTabSwitch = useCallback(
+    async (source: StrategySource) => {
+      if (
+        sessionKind === "universal_mp_lazy" &&
+        (source === "subgame" ||
+          (source === "exact" &&
+            (!state || !supportsUniversalMpLazyExact(state))))
+      ) {
+        return;
+      }
+      setActiveSource(source);
+      activeSourceRef.current = source;
       try {
-        setSolving(false);
-        await invoke('game_cancel_solve', { mode });
-        const s = await invoke<GameState>('game_get_state', { source: mode });
+        const s = await invoke<GameState>("game_get_state", { source });
         setState(s);
       } catch (e) {
         setError(String(e));
       }
-    } else {
-      // Start solve
-      try {
-        setSolving(true);
-        setActiveSource(mode);
-        activeSourceRef.current = mode;
-        const globalConfig = JSON.parse(localStorage.getItem('global_config') || '{}');
-        const params = buildSolveParams(mode, globalConfig);
-        await invoke('game_solve', { ...params });
-        // Poll for progress
-        const pollId = setInterval(async () => {
-          try {
-            const s = await invoke<GameState>('game_get_state', { source: mode });
-            setState(s);
-            if (s.solve?.is_complete) {
-              clearInterval(pollId);
-              setSolving(false);
-            }
-          } catch {
-            clearInterval(pollId);
-            setSolving(false);
-          }
-        }, 500);
-      } catch (e) {
-        setError(String(e));
-        setSolving(false);
+    },
+    [sessionKind, state],
+  );
+
+  // ── Solve handler ─────────────────────────────────────────────────
+
+  const handleSolve = useCallback(
+    async (mode: SolveMode) => {
+      if (sessionKind === "universal_mp_lazy") {
+        if (
+          mode === "subgame" ||
+          !state ||
+          !supportsUniversalMpLazyExact(state)
+        ) {
+          return;
+        }
       }
-    }
-  }, [subgameSolving, exactSolving]);
+      const isSolving = mode === "subgame" ? subgameSolving : exactSolving;
+      const setSolving =
+        mode === "subgame" ? setSubgameSolving : setExactSolving;
+      const isCancelling =
+        mode === "subgame" ? subgameCancelling : exactCancelling;
+      const setCancelling =
+        mode === "subgame" ? setSubgameCancelling : setExactCancelling;
+      const run = solveRunsRef.current[mode];
+      const isCurrentRun = (generation: number) =>
+        solveRunsRef.current[mode].generation === generation;
+
+      if (run.cancelling || isCancelling) return;
+
+      const beginCancellation = (pending: PendingSolveCancellation) => {
+        if (pending.backendGeneration === null) return;
+        const onStopped = () => {
+          if (!isCurrentRun(pending.generation)) return;
+          stopSolvePolling(mode);
+          run.backendGeneration = null;
+          run.cancelling = false;
+          run.cancelCleanup = null;
+          setSolving(false);
+          setCancelling(false);
+        };
+        const cleanup = requestSolveCancellation(
+          mode,
+          pending.generation,
+          pending.backendGeneration,
+          isCurrentRun,
+          setState,
+          (message) => setError(message),
+          onStopped,
+        );
+        if (isCurrentRun(pending.generation)) {
+          run.cancelCleanup = cleanup;
+        }
+      };
+
+      if (isSolving) {
+        // Cancel
+        const solveGeneration = run.generation;
+        run.generation += 1;
+        const cancellationGeneration = run.generation;
+        stopSolvePolling(mode);
+        run.cancelling = true;
+        const pendingCancellation: PendingSolveCancellation = {
+          generation: cancellationGeneration,
+          solveGeneration,
+          backendGeneration: run.backendGeneration,
+        };
+        run.pendingCancellations.push(pendingCancellation);
+        setCancelling(true);
+
+        // Do not await this request in the click handler. The solve command
+        // may still be pending, so bind cancellation once it returns its
+        // backend generation below.
+        beginCancellation(pendingCancellation);
+        if (pendingCancellation.backendGeneration !== null) {
+          run.pendingCancellations = run.pendingCancellations.filter(
+            (pending) => pending !== pendingCancellation,
+          );
+        }
+      } else {
+        if (
+          run.backendGeneration !== null ||
+          run.pendingCancellations.length > 0
+        ) {
+          return;
+        }
+        // Start solve
+        stopSolvePolling(mode);
+        run.generation += 1;
+        const generation = run.generation;
+        run.backendGeneration = null;
+        run.cancelling = false;
+        try {
+          setSolving(true);
+          setCancelling(false);
+          setActiveSource(mode);
+          activeSourceRef.current = mode;
+          const globalConfig = JSON.parse(
+            localStorage.getItem("global_config") || "{}",
+          );
+          const params = buildSolveParams(mode, globalConfig);
+          const response = await invoke<number | { generation: number }>(
+            "game_solve",
+            { ...params },
+          );
+          const backendGeneration = getBackendSolveGeneration(response);
+
+          const pendingCancellation = run.pendingCancellations.find(
+            (pending) => pending.solveGeneration === generation,
+          );
+          if (
+            pendingCancellation !== undefined
+          ) {
+            pendingCancellation.backendGeneration = backendGeneration;
+            run.pendingCancellations = run.pendingCancellations.filter(
+              (pending) => pending !== pendingCancellation,
+            );
+            beginCancellation(pendingCancellation);
+            return;
+          }
+          if (!isCurrentRun(generation)) return;
+          run.backendGeneration = backendGeneration;
+
+          // Poll for progress
+          const pollId = window.setInterval(async () => {
+            if (!isCurrentRun(generation)) {
+              window.clearInterval(pollId);
+              return;
+            }
+            try {
+              const s = await invoke<GameState>("game_get_state", {
+                source: mode,
+              });
+              if (!isCurrentRun(generation)) return;
+              setState(s);
+              if (s.solve?.is_complete) {
+                stopSolvePolling(mode);
+                setSolving(false);
+                setCancelling(false);
+                run.cancelling = false;
+                run.backendGeneration = null;
+              }
+            } catch {
+              if (!isCurrentRun(generation)) return;
+              stopSolvePolling(mode);
+              setSolving(false);
+              setCancelling(false);
+              run.cancelling = false;
+              run.backendGeneration = null;
+            }
+          }, 500);
+          if (!isCurrentRun(generation)) {
+            window.clearInterval(pollId);
+            return;
+          }
+          run.pollId = pollId;
+        } catch (e) {
+          if (!isCurrentRun(generation)) return;
+          setError(String(e));
+          setSolving(false);
+          setCancelling(false);
+          run.cancelling = false;
+          run.backendGeneration = null;
+          run.pendingCancellations = run.pendingCancellations.filter(
+            (pending) => pending.solveGeneration !== generation,
+          );
+        }
+      }
+    },
+    [
+      sessionKind,
+      state,
+      subgameSolving,
+      exactSolving,
+      subgameCancelling,
+      exactCancelling,
+      stopSolvePolling,
+      stopSolveObservation,
+    ],
+  );
 
   // ── Derived state ────────────────────────────────────────────────
 
@@ -431,18 +809,22 @@ export default function GameExplorer() {
   }, [state]);
 
   const nextStreetLabel = useMemo(() => {
-    if (!state?.is_chance) return '';
+    if (!state?.is_chance) return "";
     const boardLen = state.board.length;
-    if (boardLen === 0) return 'FLOP';
-    if (boardLen === 3) return 'TURN';
-    if (boardLen === 4) return 'RIVER';
-    return '';
+    if (boardLen === 0) return "FLOP";
+    if (boardLen === 3) return "TURN";
+    if (boardLen === 4) return "RIVER";
+    return "";
   }, [state]);
 
   // ── Render ───────────────────────────────────────────────────────
 
   if (loading) {
-    return <div className="explorer"><div className="loading">Loading...</div></div>;
+    return (
+      <div className="explorer">
+        <div className="loading">Loading...</div>
+      </div>
+    );
   }
 
   // Blueprint picker — shown when no game session is active
@@ -450,34 +832,61 @@ export default function GameExplorer() {
     return (
       <div className="explorer">
         {error && (
-          <div className="error" onClick={() => setError(null)} style={{ cursor: 'pointer' }}>
+          <div
+            className="error"
+            onClick={() => setError(null)}
+            style={{ cursor: "pointer" }}
+          >
             {error}
           </div>
         )}
-        <div style={{ padding: '2rem', maxWidth: '500px', margin: '0 auto' }}>
-          <h2 style={{ color: '#e2e8f0', marginBottom: '1rem', fontSize: '1.1rem' }}>Select Blueprint</h2>
+        <div style={{ padding: "2rem", maxWidth: "500px", margin: "0 auto" }}>
+          <h2
+            style={{
+              color: "#e2e8f0",
+              marginBottom: "1rem",
+              fontSize: "1.1rem",
+            }}
+          >
+            Select Blueprint
+          </h2>
           {blueprints.length === 0 ? (
-            <p style={{ color: '#94a3b8' }}>No blueprints found. Set Blueprint Directory in Settings.</p>
+            <p style={{ color: "#94a3b8" }}>
+              No blueprints found. Set Blueprint Directory in Settings.
+            </p>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+              }}
+            >
               {blueprints.map((bp) => (
                 <button
                   key={bp.path}
                   onClick={() => loadBlueprint(bp.path, bp.name)}
                   style={{
-                    padding: '0.75rem 1rem',
-                    background: '#1e293b',
-                    border: '1px solid #334155',
-                    borderRadius: '6px',
-                    color: '#e2e8f0',
-                    cursor: 'pointer',
-                    textAlign: 'left',
-                    fontSize: '0.85rem',
+                    padding: "0.75rem 1rem",
+                    background: "#1e293b",
+                    border: "1px solid #334155",
+                    borderRadius: "6px",
+                    color: "#e2e8f0",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    fontSize: "0.85rem",
                   }}
                 >
                   <div style={{ fontWeight: 600 }}>{bp.name}</div>
-                  <div style={{ fontSize: '0.7rem', color: '#94a3b8', marginTop: '2px' }}>
-                    {bp.stack_depth > 0 ? `${bp.stack_depth}bb` : ''}{bp.latest_snapshot ? ` — ${bp.latest_snapshot}` : ''}
+                  <div
+                    style={{
+                      fontSize: "0.7rem",
+                      color: "#94a3b8",
+                      marginTop: "2px",
+                    }}
+                  >
+                    {bp.stack_depth > 0 ? `${bp.stack_depth}bb` : ""}
+                    {bp.latest_snapshot ? ` — ${bp.latest_snapshot}` : ""}
                   </div>
                 </button>
               ))}
@@ -491,7 +900,11 @@ export default function GameExplorer() {
   return (
     <div className="explorer">
       {error && (
-        <div className="error" onClick={() => setError(null)} style={{ cursor: 'pointer' }}>
+        <div
+          className="error"
+          onClick={() => setError(null)}
+          style={{ cursor: "pointer" }}
+        >
           {error}
         </div>
       )}
@@ -500,106 +913,198 @@ export default function GameExplorer() {
       {state && (
         <div className="action-strip">
           {/* Vertical toolbar */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', flexShrink: 0 }}>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "3px",
+              flexShrink: 0,
+            }}
+          >
             <button
               style={{
-                padding: '4px 6px',
-                fontSize: '0.65rem',
-                background: '#1e293b',
-                border: '1px solid #444',
-                borderRadius: '4px',
-                color: '#ccc',
-                cursor: 'pointer',
+                padding: "4px 6px",
+                fontSize: "0.65rem",
+                background: "#1e293b",
+                border: "1px solid #444",
+                borderRadius: "4px",
+                color: "#ccc",
+                cursor: "pointer",
               }}
               disabled={state.action_history.length === 0}
               onClick={goBack}
               title="Undo last action"
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg>
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
             </button>
             <button
               style={{
-                padding: '4px 6px',
-                fontSize: '0.65rem',
-                background: '#1e293b',
-                border: '1px solid #444',
-                borderRadius: '4px',
-                color: '#ccc',
-                cursor: 'pointer',
+                padding: "4px 6px",
+                fontSize: "0.65rem",
+                background: "#1e293b",
+                border: "1px solid #444",
+                borderRadius: "4px",
+                color: "#ccc",
+                cursor: "pointer",
               }}
               onClick={newHand}
               title="New hand"
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></svg>
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <polyline points="1 4 1 10 7 10" />
+                <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+              </svg>
             </button>
             <button
               style={{
-                padding: '4px 6px',
-                fontSize: '0.65rem',
-                background: copied ? '#16a34a22' : '#1e293b',
-                border: `1px solid ${copied ? '#16a34a' : '#444'}`,
-                borderRadius: '4px',
-                color: copied ? '#16a34a' : '#ccc',
-                cursor: 'pointer',
+                padding: "4px 6px",
+                fontSize: "0.65rem",
+                background: copied ? "#16a34a22" : "#1e293b",
+                border: `1px solid ${copied ? "#16a34a" : "#444"}`,
+                borderRadius: "4px",
+                color: copied ? "#16a34a" : "#ccc",
+                cursor: "pointer",
               }}
               onClick={copySpot}
-              title={copied ? 'Copied!' : 'Copy spot encoding'}
+              title={copied ? "Copied!" : "Copy spot encoding"}
             >
               {copied ? (
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
               ) : (
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </svg>
               )}
             </button>
             <button
               style={{
-                padding: '4px 6px',
-                fontSize: '0.65rem',
-                background: '#1e293b',
-                border: '1px solid #444',
-                borderRadius: '4px',
-                color: '#ccc',
-                cursor: 'pointer',
+                padding: "4px 6px",
+                fontSize: "0.65rem",
+                background: "#1e293b",
+                border: "1px solid #444",
+                borderRadius: "4px",
+                color: "#ccc",
+                cursor: "pointer",
               }}
-              onClick={() => { setShowLoadModal(true); setLoadSpotError(null); }}
+              onClick={() => {
+                setShowLoadModal(true);
+                setLoadSpotError(null);
+              }}
               title="Load spot encoding"
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" /></svg>
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
             </button>
           </div>
 
           {/* Blueprint summary card */}
           {bundleName && (
-            <div style={{
-              display: 'flex',
-              flexDirection: 'column',
-              justifyContent: 'flex-start',
-              padding: '4px 8px',
-              background: '#1a1a2e',
-              border: '1px solid #334155',
-              borderRadius: '4px',
-              flexShrink: 0,
-              gap: '2px',
-            }}>
-              <div style={{ fontSize: '0.6rem', color: '#e2e8f0', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "flex-start",
+                padding: "4px 8px",
+                background: "#1a1a2e",
+                border: "1px solid #334155",
+                borderRadius: "4px",
+                flexShrink: 0,
+                gap: "2px",
+              }}
+            >
+              <div
+                style={{
+                  fontSize: "0.6rem",
+                  color: "#e2e8f0",
+                  fontWeight: 600,
+                  whiteSpace: "nowrap",
+                }}
+              >
                 {bundleName}
               </div>
               {snapshotName && (
-                <div style={{ fontSize: '0.5rem', color: '#94a3b8', whiteSpace: 'nowrap' }}>
+                <div
+                  style={{
+                    fontSize: "0.5rem",
+                    color: "#94a3b8",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {snapshotName}
                 </div>
               )}
               <button
                 style={{
-                  fontSize: '0.5rem',
-                  color: '#00d9ff',
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: 'pointer',
+                  fontSize: "0.5rem",
+                  color: "#00d9ff",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
                   padding: 0,
-                  textAlign: 'left',
+                  textAlign: "left",
                 }}
-                onClick={() => { setState(null); setBundleName(null); setActiveSource('blueprint'); activeSourceRef.current = 'blueprint'; setSubgameSolving(false); setExactSolving(false); }}
+                onClick={() => {
+                  setState(null);
+                  setBundleName(null);
+                  setSessionKind("hu");
+                  setActiveSource("blueprint");
+                  activeSourceRef.current = "blueprint";
+                  setSubgameSolving(false);
+                  setExactSolving(false);
+                }}
               >
                 Change
               </button>
@@ -609,7 +1114,7 @@ export default function GameExplorer() {
           {/* Action history as full ActionBlocks with street cards */}
           {(() => {
             const elems: JSX.Element[] = [];
-            let prevStreet = '';
+            let prevStreet = "";
             const board = state.board;
 
             const streetBlock = (streetName: string, cards: string[]) => (
@@ -621,11 +1126,17 @@ export default function GameExplorer() {
                   {cards.map((card, i) => {
                     const rank = card[0]?.toUpperCase();
                     const suit = card[1]?.toLowerCase();
-                    const bgColor = SUIT_COLORS[suit] || '#333';
+                    const bgColor = SUIT_COLORS[suit] || "#333";
                     return (
-                      <div key={i} className="street-card" style={{ backgroundColor: bgColor }}>
+                      <div
+                        key={i}
+                        className="street-card"
+                        style={{ backgroundColor: bgColor }}
+                      >
                         <span className="card-rank">{rank}</span>
-                        <span className="card-suit">{SUIT_SYMBOLS[suit] || '?'}</span>
+                        <span className="card-suit">
+                          {SUIT_SYMBOLS[suit] || "?"}
+                        </span>
                       </div>
                     );
                   })}
@@ -635,11 +1146,15 @@ export default function GameExplorer() {
 
             state.action_history.forEach((rec, idx) => {
               // Insert street block at transitions
-              if (rec.street !== prevStreet && prevStreet !== '') {
-                const cards = prevStreet === 'Preflop' ? board.slice(0, 3)
-                  : prevStreet === 'Flop' ? board.slice(3, 4)
-                  : prevStreet === 'Turn' ? board.slice(4, 5)
-                  : [];
+              if (rec.street !== prevStreet && prevStreet !== "") {
+                const cards =
+                  prevStreet === "Preflop"
+                    ? board.slice(0, 3)
+                    : prevStreet === "Flop"
+                      ? board.slice(3, 4)
+                      : prevStreet === "Turn"
+                        ? board.slice(4, 5)
+                        : [];
                 if (cards.length > 0) {
                   const nextStreet = rec.street;
                   elems.push(streetBlock(nextStreet, cards));
@@ -654,21 +1169,35 @@ export default function GameExplorer() {
                   position={rec.position}
                   stack={rec.stack}
                   pot={rec.pot}
-                  actions={rec.actions.length > 0 ? rec.actions : [{ id: rec.action_id, label: rec.label, action_type: 'bet' }]}
+                  actions={
+                    rec.actions.length > 0
+                      ? rec.actions
+                      : [
+                          {
+                            id: rec.action_id,
+                            label: rec.label,
+                            action_type: "bet",
+                          },
+                        ]
+                  }
                   selectedAction={rec.action_id}
                   onSelect={() => rewindTo(idx)}
                   onHeaderClick={() => rewindTo(idx)}
                   isCurrent={false}
-                />
+                />,
               );
             });
 
             // Street block after last action if we transitioned to a new street
             if (prevStreet && prevStreet !== state.street && !state.is_chance) {
-              const cards = prevStreet === 'Preflop' ? board.slice(0, 3)
-                : prevStreet === 'Flop' ? board.slice(3, 4)
-                : prevStreet === 'Turn' ? board.slice(4, 5)
-                : [];
+              const cards =
+                prevStreet === "Preflop"
+                  ? board.slice(0, 3)
+                  : prevStreet === "Flop"
+                    ? board.slice(3, 4)
+                    : prevStreet === "Turn"
+                      ? board.slice(4, 5)
+                      : [];
               if (cards.length > 0) {
                 elems.push(streetBlock(state.street, cards));
               }
@@ -694,16 +1223,18 @@ export default function GameExplorer() {
           )}
 
           {/* Current action block (non-terminal, non-chance) */}
-          {!state.is_terminal && !state.is_chance && matrixActions.length > 0 && (
-            <ActionBlock
-              position={state.position}
-              stack={state.stacks[state.position === 'SB' ? 1 : 0]}
-              pot={state.pot}
-              actions={matrixActions}
-              onSelect={playAction}
-              isCurrent={true}
-            />
-          )}
+          {!state.is_terminal &&
+            !state.is_chance &&
+            matrixActions.length > 0 && (
+              <ActionBlock
+                position={state.position}
+                stack={state.stacks[state.position === "SB" ? 1 : 0]}
+                pot={state.pot}
+                actions={matrixActions}
+                onSelect={playAction}
+                isCurrent={true}
+              />
+            )}
         </div>
       )}
 
@@ -711,151 +1242,232 @@ export default function GameExplorer() {
       {state && isPostflopStreet(state.street) && (
         <div className="strategy-tabs">
           <span
-            className={`strategy-tab ${activeSource === 'blueprint' ? 'active' : ''}`}
-            onClick={() => handleTabSwitch('blueprint')}
+            className={`strategy-tab ${activeSource === "blueprint" ? "active" : ""}`}
+            onClick={() => handleTabSwitch("blueprint")}
           >
             Blueprint
           </span>
-          <span className="strategy-tab-group">
-            <span
-              className={`strategy-tab ${activeSource === 'subgame' ? 'active' : ''}`}
-              onClick={() => handleTabSwitch('subgame')}
-            >
-              Subgame
+          {sessionKind !== "universal_mp_lazy" && (
+            <span className="strategy-tab-group">
+              <span
+                className={`strategy-tab ${activeSource === "subgame" ? "active" : ""}`}
+                onClick={() => handleTabSwitch("subgame")}
+              >
+                Subgame
+              </span>
+              <span
+                className="strategy-tab-action"
+                onClick={() => handleSolve("subgame")}
+              >
+                [{subgameCancelling ? "cancelling..." : subgameSolving ? "cancel" : "solve"}]
+              </span>
             </span>
-            <span
-              className="strategy-tab-action"
-              onClick={() => handleSolve('subgame')}
-            >
-              [{subgameSolving ? 'cancel' : 'solve'}]
+          )}
+          {(sessionKind !== "universal_mp_lazy" ||
+            supportsUniversalMpLazyExact(state)) && (
+            <span className="strategy-tab-group">
+              <span
+                className={`strategy-tab ${activeSource === "exact" ? "active" : ""}`}
+                onClick={() => handleTabSwitch("exact")}
+              >
+                Exact
+              </span>
+              <span
+                className="strategy-tab-action"
+                onClick={() => handleSolve("exact")}
+              >
+                [{exactCancelling ? "cancelling..." : exactSolving ? "cancel" : "solve"}]
+              </span>
             </span>
-          </span>
-          <span className="strategy-tab-group">
-            <span
-              className={`strategy-tab ${activeSource === 'exact' ? 'active' : ''}`}
-              onClick={() => handleTabSwitch('exact')}
-            >
-              Exact
-            </span>
-            <span
-              className="strategy-tab-action"
-              onClick={() => handleSolve('exact')}
-            >
-              [{exactSolving ? 'cancel' : 'solve'}]
-            </span>
-          </span>
+          )}
         </div>
       )}
 
       {/* Strategy matrix */}
-      {state?.matrix && (
-        <div className="matrix-container">
-          <div className="matrix-with-detail">
-            <div className="hand-matrix">
-              {state.matrix.cells.map((row, rowIdx) => (
-                <div key={rowIdx} className="matrix-row">
-                  {row.map((cell, colIdx) => {
-                    const matCell = toMatrixCell(cell, matrixActions);
-                    return (
-                      <HandCell
-                        key={colIdx}
-                        cell={matCell}
-                        actions={matrixActions}
-                        reachWeight={cell.weight}
-                        isSelected={
-                          selectedCell?.row === rowIdx &&
-                          selectedCell?.col === colIdx
-                        }
-                        onClick={() =>
-                          setSelectedCell({ row: rowIdx, col: colIdx })
-                        }
-                        overlayText={
-                          cell.ev != null
-                            ? `${cell.ev >= 0 ? '+' : ''}${(cell.ev / 2).toFixed(1)}`
-                            : undefined
-                        }
-                      />
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
+      {state &&
+        shouldShowStrategyMatrix(sessionKind, activeSource, state) &&
+        state.matrix && (
+          <div className="matrix-container">
+            <div className="matrix-with-detail">
+              <div className="hand-matrix">
+                {state.matrix.cells.map((row, rowIdx) => (
+                  <div key={rowIdx} className="matrix-row">
+                    {row.map((cell, colIdx) => {
+                      const matCell = toMatrixCell(cell, matrixActions);
+                      return (
+                        <HandCell
+                          key={colIdx}
+                          cell={matCell}
+                          actions={matrixActions}
+                          reachWeight={cell.weight}
+                          isSelected={
+                            selectedCell?.row === rowIdx &&
+                            selectedCell?.col === colIdx
+                          }
+                          onClick={() =>
+                            setSelectedCell({ row: rowIdx, col: colIdx })
+                          }
+                          overlayText={
+                            cell.ev != null
+                              ? `${cell.ev >= 0 ? "+" : ""}${(cell.ev / 2).toFixed(1)}`
+                              : undefined
+                          }
+                        />
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
 
-            {/* Detail panel — right rail */}
-            <div className="detail-column" style={{ width: selectedCellData ? '300px' : '0', transition: 'width 0.15s' }}>
-              {selectedCellData && (
-                <>
-                  <CellDetail
-                    cell={toMatrixCell(selectedCellData, matrixActions)}
-                    actions={matrixActions}
-                  />
-                  {/* Per-combo breakdown grid */}
-                  {selectedCellData.combos.length > 0 && selectedCellData.combos[0].probabilities.length > 0 && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem', marginTop: '0.5rem' }}>
-                      {selectedCellData.combos.map((combo) => {
-                        const r1 = combo.cards[0]?.toUpperCase();
-                        const s1 = combo.cards[1]?.toLowerCase();
-                        const r2 = combo.cards[2]?.toUpperCase();
-                        const s2 = combo.cards[3]?.toLowerCase();
-                        return (
-                          <div
-                            key={combo.cards}
-                            className="cell-detail"
-                            style={{ width: 'auto', flex: '0 0 auto', minWidth: '80px', maxWidth: '130px', padding: '0.3rem 0.4rem' }}
-                          >
-                            <div style={{ fontWeight: 700, fontSize: '0.8rem', marginBottom: '0.15rem' }}>
-                              <span>{r1}</span>
-                              <span style={{ color: PICKER_COLORS[s1] || '#fff' }}>{SUIT_SYMBOLS[s1] || ''}</span>
-                              {' '}
-                              <span>{r2}</span>
-                              <span style={{ color: PICKER_COLORS[s2] || '#fff' }}>{SUIT_SYMBOLS[s2] || ''}</span>
-                              {combo.bucket != null && (
-                                <span style={{ fontSize: '0.55rem', color: '#666', marginLeft: '0.3rem' }}>b{combo.bucket}</span>
-                              )}
-                            </div>
-                            {/* Color bar */}
-                            <div style={{ display: 'flex', height: '6px', borderRadius: '3px', overflow: 'hidden', background: '#222', marginBottom: '0.25rem' }}>
-                              {matrixActions.map((action, i) => {
-                                const pct = (combo.probabilities[i] || 0) * 100;
-                                if (pct < 0.1) return null;
-                                return (
-                                  <div key={action.id} style={{ width: `${pct}%`, background: getActionColor(action, matrixActions), height: '100%' }} />
-                                );
-                              })}
-                            </div>
-                            {matrixActions.map((action, i) => {
-                              const pct = (combo.probabilities[i] || 0) * 100;
-                              if (pct < 0.5) return null;
-                              return (
-                                <div key={action.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.6rem', color: '#94a3b8' }}>
-                                  <span>{action.label}</span>
-                                  <span>{pct.toFixed(0)}%</span>
+              {/* Detail panel — right rail */}
+              <div
+                className="detail-column"
+                style={{
+                  width: selectedCellData ? "300px" : "0",
+                  transition: "width 0.15s",
+                }}
+              >
+                {selectedCellData && (
+                  <>
+                    <CellDetail
+                      cell={toMatrixCell(selectedCellData, matrixActions)}
+                      actions={matrixActions}
+                    />
+                    {/* Per-combo breakdown grid */}
+                    {selectedCellData.combos.length > 0 &&
+                      selectedCellData.combos[0].probabilities.length > 0 && (
+                        <div
+                          style={{
+                            display: "flex",
+                            flexWrap: "wrap",
+                            gap: "0.4rem",
+                            marginTop: "0.5rem",
+                          }}
+                        >
+                          {selectedCellData.combos.map((combo) => {
+                            const comboActionRows = getComboActionRows(
+                              matrixActions,
+                              combo.probabilities,
+                            );
+                            const r1 = combo.cards[0]?.toUpperCase();
+                            const s1 = combo.cards[1]?.toLowerCase();
+                            const r2 = combo.cards[2]?.toUpperCase();
+                            const s2 = combo.cards[3]?.toLowerCase();
+                            return (
+                              <div
+                                key={combo.cards}
+                                className="cell-detail"
+                                style={{
+                                  width: "auto",
+                                  flex: "0 0 auto",
+                                  minWidth: "80px",
+                                  maxWidth: "130px",
+                                  padding: "0.3rem 0.4rem",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    fontWeight: 700,
+                                    fontSize: "0.8rem",
+                                    marginBottom: "0.15rem",
+                                  }}
+                                >
+                                  <span>{r1}</span>
+                                  <span
+                                    style={{
+                                      color: PICKER_COLORS[s1] || "#fff",
+                                    }}
+                                  >
+                                    {SUIT_SYMBOLS[s1] || ""}
+                                  </span>{" "}
+                                  <span>{r2}</span>
+                                  <span
+                                    style={{
+                                      color: PICKER_COLORS[s2] || "#fff",
+                                    }}
+                                  >
+                                    {SUIT_SYMBOLS[s2] || ""}
+                                  </span>
+                                  {combo.bucket != null && (
+                                    <span
+                                      style={{
+                                        fontSize: "0.55rem",
+                                        color: "#666",
+                                        marginLeft: "0.3rem",
+                                      }}
+                                    >
+                                      b{combo.bucket}
+                                    </span>
+                                  )}
                                 </div>
-                              );
-                            })}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </>
-              )}
+                                {/* Color bar */}
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    height: "6px",
+                                    borderRadius: "3px",
+                                    overflow: "hidden",
+                                    background: "#222",
+                                    marginBottom: "0.25rem",
+                                  }}
+                                >
+                                  {comboActionRows.map(
+                                    ({ action, percentage }) => (
+                                      <div
+                                        key={action.id}
+                                        style={{
+                                          width: `${percentage}%`,
+                                          background: getActionColor(
+                                            action,
+                                            matrixActions,
+                                          ),
+                                          height: "100%",
+                                        }}
+                                      />
+                                    ),
+                                  )}
+                                </div>
+                                {comboActionRows.map(
+                                  ({ action, percentageLabel }) => (
+                                    <div
+                                      key={action.id}
+                                      style={{
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        fontSize: "0.6rem",
+                                        color: "#94a3b8",
+                                      }}
+                                    >
+                                      <span>{action.label}</span>
+                                      <span>{percentageLabel}</span>
+                                    </div>
+                                  ),
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                  </>
+                )}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
       {/* Card picker for chance nodes */}
       {state?.is_chance && expectedCards > 0 && (
         <div className="card-picker-container">
           <p className="card-picker-prompt">
             Select {nextStreetLabel.toLowerCase()} card
-            {expectedCards > 1 ? 's' : ''}
+            {expectedCards > 1 ? "s" : ""}
           </p>
           <CardPicker
             expectedCards={expectedCards}
             deadCards={state.board}
-            onConfirm={expectedCards === 1 ? (cards) => dealCard(cards[0]) : dealCards}
+            onConfirm={
+              expectedCards === 1 ? (cards) => dealCard(cards[0]) : dealCards
+            }
           />
         </div>
       )}
@@ -881,73 +1493,98 @@ export default function GameExplorer() {
       {showLoadModal && (
         <div
           style={{
-            position: 'fixed',
+            position: "fixed",
             top: 0,
             left: 0,
             right: 0,
             bottom: 0,
-            background: 'rgba(0,0,0,0.6)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            background: "rgba(0,0,0,0.6)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
             zIndex: 1000,
           }}
           onClick={() => setShowLoadModal(false)}
         >
           <div
             style={{
-              background: '#1a1a2e',
-              border: '1px solid #334155',
-              borderRadius: '8px',
-              padding: '1.5rem',
-              width: '500px',
-              maxWidth: '90vw',
+              background: "#1a1a2e",
+              border: "1px solid #334155",
+              borderRadius: "8px",
+              padding: "1.5rem",
+              width: "500px",
+              maxWidth: "90vw",
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 style={{ color: '#e2e8f0', marginTop: 0, marginBottom: '1rem', fontSize: '0.95rem' }}>
+            <h3
+              style={{
+                color: "#e2e8f0",
+                marginTop: 0,
+                marginBottom: "1rem",
+                fontSize: "0.95rem",
+              }}
+            >
               Load Spot
             </h3>
             <input
               type="text"
               value={loadSpotInput}
-              onChange={(e) => { setLoadSpotInput(e.target.value); setLoadSpotError(null); }}
-              onKeyDown={(e) => { if (e.key === 'Enter') loadSpot(); }}
+              onChange={(e) => {
+                setLoadSpotInput(e.target.value);
+                setLoadSpotError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") loadSpot();
+              }}
               placeholder="sb:2bb,bb:call|Td9d6h|bb:check,sb:4bb"
               style={{
-                width: '100%',
-                padding: '0.5rem',
-                fontFamily: 'monospace',
-                fontSize: '0.85rem',
-                background: '#0f0f1e',
-                border: '1px solid #334155',
-                borderRadius: '4px',
-                color: '#e2e8f0',
-                boxSizing: 'border-box',
+                width: "100%",
+                padding: "0.5rem",
+                fontFamily: "monospace",
+                fontSize: "0.85rem",
+                background: "#0f0f1e",
+                border: "1px solid #334155",
+                borderRadius: "4px",
+                color: "#e2e8f0",
+                boxSizing: "border-box",
               }}
               autoFocus
             />
             {loadSpotError && (
-              <div style={{
-                color: '#ef4444',
-                fontSize: '0.75rem',
-                marginTop: '0.5rem',
-                whiteSpace: 'pre-wrap',
-              }}>
+              <div
+                style={{
+                  color: "#ef4444",
+                  fontSize: "0.75rem",
+                  marginTop: "0.5rem",
+                  whiteSpace: "pre-wrap",
+                }}
+              >
                 {loadSpotError}
               </div>
             )}
-            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem', justifyContent: 'flex-end' }}>
+            <div
+              style={{
+                display: "flex",
+                gap: "0.5rem",
+                marginTop: "1rem",
+                justifyContent: "flex-end",
+              }}
+            >
               <button
-                onClick={() => { setShowLoadModal(false); setLoadSpotInput(''); setLoadSpotError(null); }}
+                onClick={() => {
+                  setShowLoadModal(false);
+                  setLoadSpotInput("");
+                  setLoadSpotError(null);
+                }}
                 style={{
-                  padding: '0.4rem 1rem',
-                  background: 'transparent',
-                  border: '1px solid #334155',
-                  borderRadius: '4px',
-                  color: '#94a3b8',
-                  cursor: 'pointer',
-                  fontSize: '0.8rem',
+                  padding: "0.4rem 1rem",
+                  background: "transparent",
+                  border: "1px solid #334155",
+                  borderRadius: "4px",
+                  color: "#94a3b8",
+                  cursor: "pointer",
+                  fontSize: "0.8rem",
                 }}
               >
                 Cancel
@@ -955,13 +1592,13 @@ export default function GameExplorer() {
               <button
                 onClick={loadSpot}
                 style={{
-                  padding: '0.4rem 1rem',
-                  background: '#00d9ff22',
-                  border: '1px solid #00d9ff',
-                  borderRadius: '4px',
-                  color: '#00d9ff',
-                  cursor: 'pointer',
-                  fontSize: '0.8rem',
+                  padding: "0.4rem 1rem",
+                  background: "#00d9ff22",
+                  border: "1px solid #00d9ff",
+                  borderRadius: "4px",
+                  color: "#00d9ff",
+                  cursor: "pointer",
+                  fontSize: "0.8rem",
                   fontWeight: 600,
                 }}
               >

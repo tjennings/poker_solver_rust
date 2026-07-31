@@ -1,0 +1,76 @@
+# Blueprint V2 Config - 20bb HU cEV baseline strategy-frequency validation
+# Uses the existing 500/500/500 postflop bucket files so training can start
+# without generating a new 200/200/200 bucket set.
+game:
+  name: "20bb HU cEV baseline validation"
+  players: 2
+  stack_depth: 40
+  small_blind: 1
+  big_blind: 2
+  allow_preflop_limp: false
+
+clustering:
+  algorithm: potential_aware_emd
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+  turn:
+    buckets: 500
+  river:
+    buckets: 500
+
+action_abstraction:
+  preflop:
+    - ["2.5bb"]
+    - ["5bb"]
+  flop:
+    - [0.33, 0.75, 1.0]
+    - [0.67, 1.0]
+  turn:
+    - [0.33, 0.75, 1.0]
+    - [0.67, 1.0]
+  river:
+    - [0.33, 0.75, 1.0]
+    - [0.67, 1.0]
+
+training:
+  cluster_path: "./local_data/buckets/500f_500t_500r_v2"
+  iterations: 3000000000
+  batch_size: 100
+  print_every_minutes: 1
+  lcfr_warmup_iterations: 1000000
+  lcfr_discount_interval: 1000000
+  prune_after_iterations: 3000000
+  prune_threshold: -10000
+  prune_explore_pct: 0.05
+  exploitability_interval_minutes: 0
+  optimizer: "dcfr"
+  storage_backend: "dense"
+  baseline_validation:
+    enabled: true
+    baseline_path: "local_data/baselines/cash_hu_20bb_cev.json"
+    interval_iterations: 1000
+    interval_minutes: 0
+    top_n_spots: 5
+    top_n_combos_per_spot: 5
+  # Sparse/lazy storage can be tested explicitly without changing the validator path:
+  # storage_backend: "sparse"
+
+snapshots:
+  resume: true
+  warmup_minutes: 30
+  snapshot_every_minutes: 10
+  output_dir: "./local_data/blueprints/hu_20bb_baseline_validation"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 1000
+  telemetry:
+    strategy_delta_interval_seconds: 30
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Root"
+      spot: ""
+    - name: "BB vs 2.5bb"
+      spot: "sb:2.5bb"

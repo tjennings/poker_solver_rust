@@ -3,6 +3,9 @@ name = "convergence-harness"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+doctest = false
+
 [dependencies]
 range-solver = { path = "../range-solver" }
 poker-solver-core = { path = "../core" }

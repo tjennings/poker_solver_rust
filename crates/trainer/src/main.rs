@@ -122,6 +122,18 @@ fn cfvnet_model_kind_name(mode: BoundaryInferenceMode) -> &'static str {
 
 #[derive(Parser)]
 enum Commands {
+    /// Auto-detect config format and train (dispatches to train-blueprint or train-blueprint-mp)
+    Train {
+        /// YAML config file (BlueprintV2Config or BlueprintMpConfig)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Disable the TUI dashboard
+        #[arg(long)]
+        no_tui: bool,
+        /// Override the output directory in the config
+        #[arg(long)]
+        output_dir: Option<String>,
+    },
     /// Train a full-game blueprint strategy using MCCFR (Blueprint V2)
     TrainBlueprint {
         /// YAML config file (BlueprintV2Config)
@@ -593,12 +605,45 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// Export a legacy HU blueprint bundle to universal dense format
+    #[command(name = "export-universal")]
+    ExportUniversal {
+        /// Path to legacy HU bundle directory (contains config.yaml)
+        #[arg(short, long)]
+        bundle: PathBuf,
+        /// Snapshot to export (default: final)
+        #[arg(short, long, default_value = "final")]
+        snapshot: String,
+        /// Output directory for the universal bundle
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Export an MP blueprint snapshot (eager or lazy sparse) to universal dense format
+    #[command(name = "export-universal-mp")]
+    ExportUniversalMp {
+        /// Path to MP output directory (contains config.yaml and snapshot dirs)
+        #[arg(short, long)]
+        bundle: PathBuf,
+        /// Snapshot to export (default: final snapshot found)
+        #[arg(short, long, default_value = "final")]
+        snapshot: String,
+        /// Output directory for the universal bundle
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Train {
+            config,
+            no_tui,
+            output_dir,
+        } => {
+            dispatch_train(&config, no_tui, output_dir.as_deref())?;
+        }
         Commands::TrainBlueprint { config, no_tui } => {
             let yaml = std::fs::read_to_string(&config)?;
             let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
@@ -642,6 +687,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 trainer.paused = Arc::clone(&metrics.paused);
                 trainer.quit_requested = Arc::clone(&metrics.quit_requested);
                 trainer.shared_iterations = Arc::clone(&metrics.iterations);
+                metrics
+                    .iterations
+                    .store(trainer.iterations, Ordering::Relaxed);
                 trainer.snapshot_trigger = Arc::clone(&metrics.snapshot_trigger);
                 trainer.strategy_refresh_trigger = Arc::clone(&metrics.strategy_refresh_trigger);
 
@@ -750,6 +798,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let metrics_for_spots = Arc::clone(&metrics);
                 trainer.on_exploitable_spots = Some(Box::new(move |spots| {
                     metrics_for_spots.set_exploitable_spots(spots);
+                }));
+
+                let metrics_for_baseline = Arc::clone(&metrics);
+                trainer.on_baseline_validation = Some(Box::new(move |report| {
+                    metrics_for_baseline.set_baseline_validation_report(report);
                 }));
 
                 // Wire audit refresh callback.
@@ -1755,6 +1808,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             output,
         } => {
             run_rebel_validate(&config, num_examples, &output)?;
+        }
+        Commands::ExportUniversal {
+            bundle,
+            snapshot,
+            out,
+        } => {
+            run_export_universal(&bundle, &snapshot, &out)?;
+        }
+        Commands::ExportUniversalMp {
+            bundle,
+            snapshot,
+            out,
+        } => {
+            run_export_universal_mp(&bundle, &snapshot, &out)?;
         }
     }
 
@@ -2857,14 +2924,21 @@ fn run_mp_without_tui(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> 
 }
 
 fn run_mp_without_tui_lazy(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+    use poker_solver_core::blueprint_mp::training_runtime_adapter::LazySparseMpTrainingRuntimeAdapter;
+    use poker_solver_core::training_runtime::run_until_stopped;
 
-    let ctx = setup_lazy_training(config);
-    let shared_iters = Arc::clone(&ctx.iterations);
-    let storage = Arc::clone(&ctx.storage);
-    let train_config = config.clone();
+    reject_lazy_sparse_resume(config)?;
+
+    let adapter = LazySparseMpTrainingRuntimeAdapter::new(config.clone());
+    let shared_iters = Arc::clone(&adapter.context().iterations);
+    let storage = Arc::clone(&adapter.context().storage);
     let train_handle = std::thread::spawn(move || {
-        run_lazy_training(&ctx, &train_config.training, &train_config.game)
+        let mut adapter = adapter;
+        let mut telemetry = ();
+        run_until_stopped(&mut adapter, &mut telemetry)?;
+        Ok::<u64, poker_solver_core::training_runtime::RuntimeError>(
+            adapter.context().iterations.load(Ordering::Relaxed),
+        )
     });
 
     let mut heartbeat = MpNoTuiHeartbeat::new();
@@ -2876,11 +2950,24 @@ fn run_mp_without_tui_lazy(config: &BlueprintMpConfig) -> Result<(), Box<dyn Err
         }
     }
     heartbeat.print_sparse(&shared_iters, &storage);
-    let result = train_handle.join().expect("lazy training thread panicked");
+    let meta_iterations = train_handle
+        .join()
+        .expect("lazy training thread panicked")
+        .map_err(runtime_thread_error)?;
     eprintln!(
         "Lazy sparse training complete: {} meta-iterations",
-        result.meta_iterations
+        meta_iterations
     );
+    Ok(())
+}
+
+fn reject_lazy_sparse_resume(config: &BlueprintMpConfig) -> Result<(), Box<dyn Error>> {
+    if config.snapshots.resume {
+        return Err(
+            "lazy_sparse MP resume is not implemented: sparse snapshots do not persist blocked-edge purge state or full runtime cadence metadata"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -3407,6 +3494,7 @@ fn run_mp_with_tui(
         &metrics,
         &quit_flag,
         &train_handle,
+        config,
         &config.snapshots,
         &telemetry_in_flight,
     );
@@ -3426,7 +3514,11 @@ fn run_mp_with_tui_lazy(
     config: &BlueprintMpConfig,
     tui_config: &blueprint_tui_config::BlueprintTuiConfig,
 ) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_mp::trainer::{run_lazy_training, setup_lazy_training};
+    use poker_solver_core::blueprint_mp::trainer::setup_lazy_training;
+    use poker_solver_core::blueprint_mp::training_runtime_adapter::LazySparseMpTrainingRuntimeAdapter;
+    use poker_solver_core::training_runtime::{TrainingRuntimeBackend, run_until_stopped};
+
+    reject_lazy_sparse_resume(config)?;
 
     let ctx = setup_lazy_training(config);
     let (scenarios, lazy_scenario_spots) = resolve_lazy_tui_scenarios(
@@ -3442,15 +3534,21 @@ fn run_mp_with_tui_lazy(
         config.training.time_limit_minutes,
     ));
     let shared_iters = Arc::clone(&ctx.iterations);
-    let quit_flag = Arc::clone(&ctx.quit);
     let storage = Arc::clone(&ctx.storage);
     let game = Arc::clone(&ctx.game);
     let bucket_counts = ctx.bucket_counts;
     let lazy_scenario_names: Vec<String> = scenarios.iter().map(|s| s.name.clone()).collect();
     let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
-    let train_config = config.clone();
+    let started = Instant::now();
+    let adapter = LazySparseMpTrainingRuntimeAdapter::from_context(config.clone(), ctx);
+    let controls = adapter.controls().clone();
     let train_handle = std::thread::spawn(move || {
-        run_lazy_training(&ctx, &train_config.training, &train_config.game)
+        let mut adapter = adapter;
+        let mut telemetry = ();
+        run_until_stopped(&mut adapter, &mut telemetry)?;
+        Ok::<u64, poker_solver_core::training_runtime::RuntimeError>(
+            adapter.context().iterations.load(Ordering::Relaxed),
+        )
     });
 
     bridge_mp_lazy_iterations(
@@ -3462,20 +3560,31 @@ fn run_mp_with_tui_lazy(
         bucket_counts,
         &tui_config.strategy_probe_hands,
         &metrics,
-        &quit_flag,
+        &controls,
         &train_handle,
+        config,
         &config.snapshots,
+        started,
     );
 
     metrics.quit_requested.store(true, Ordering::Relaxed);
-    quit_flag.store(true, Ordering::Relaxed);
-    let result = train_handle.join().expect("lazy training thread panicked");
+    controls.request_quit();
+    let meta_iterations = train_handle
+        .join()
+        .expect("lazy training thread panicked")
+        .map_err(runtime_thread_error)?;
     let _ = tui_handle.join();
     eprintln!(
         "Lazy sparse training complete: {} meta-iterations",
-        result.meta_iterations
+        meta_iterations
     );
     Ok(())
+}
+
+fn runtime_thread_error(
+    error: poker_solver_core::training_runtime::RuntimeError,
+) -> Box<dyn Error> {
+    Box::new(std::io::Error::other(error.to_string()))
 }
 
 fn spawn_mp_tui(
@@ -3502,6 +3611,7 @@ fn bridge_mp_iterations<T>(
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
     quit_flag: &Arc<std::sync::atomic::AtomicBool>,
     handle: &std::thread::JoinHandle<T>,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     telemetry_in_flight: &Arc<AtomicBool>,
 ) {
@@ -3514,7 +3624,14 @@ fn bridge_mp_iterations<T>(
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
             metrics.mark_snapshot_writing();
-            match save_mp_snapshot(snapshot_config, storage, tree, iters, started.elapsed()) {
+            match save_mp_snapshot(
+                config,
+                snapshot_config,
+                storage,
+                tree,
+                iters,
+                started.elapsed(),
+            ) {
                 Ok(path) => {
                     metrics.mark_snapshot_saved(&path);
                     eprintln!("  MP snapshot saved to {}", path.display());
@@ -3564,30 +3681,33 @@ fn bridge_mp_lazy_iterations<T>(
     bucket_counts: [u16; 4],
     strategy_probe_hands: &[String],
     metrics: &Arc<blueprint_tui_metrics::BlueprintTuiMetrics>,
-    quit_flag: &Arc<std::sync::atomic::AtomicBool>,
+    controls: &poker_solver_core::training_runtime::RuntimeControls,
     handle: &std::thread::JoinHandle<T>,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    started: Instant,
 ) {
     let mut last_telemetry = Instant::now();
     let telemetry_interval = Duration::from_secs(10);
-    let started = Instant::now();
     let mut previous_strategy_fingerprint = None;
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let iters = source.load(Ordering::Relaxed);
         metrics.iterations.store(iters, Ordering::Relaxed);
         if metrics.take_snapshot_trigger() {
-            metrics.mark_snapshot_writing();
-            match save_lazy_mp_snapshot(snapshot_config, storage, iters, started.elapsed()) {
-                Ok(path) => {
-                    metrics.mark_snapshot_saved(&path);
-                    eprintln!("  Lazy MP snapshot saved to {}", path.display());
-                }
-                Err(e) => {
-                    metrics.mark_snapshot_failed(&e);
-                    eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
-                }
-            }
+            let _ = save_lazy_mp_snapshot_for_tui(
+                config,
+                snapshot_config,
+                metrics,
+                storage,
+                iters,
+                started.elapsed(),
+            );
+        }
+        if metrics.is_paused() && !controls.is_paused() {
+            controls.request_pause();
+        } else if !metrics.is_paused() && controls.is_paused() {
+            controls.resume();
         }
         if last_telemetry.elapsed() >= telemetry_interval {
             let sample = storage.telemetry_sample(LAZY_TUI_TELEMETRY_SAMPLE_ENTRIES);
@@ -3619,13 +3739,36 @@ fn bridge_mp_lazy_iterations<T>(
             break;
         }
         if metrics.quit_requested.load(Ordering::Relaxed) {
-            quit_flag.store(true, Ordering::Relaxed);
+            controls.request_quit();
             break;
         }
     }
 }
 
+fn save_lazy_mp_snapshot_for_tui(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    metrics: &blueprint_tui_metrics::BlueprintTuiMetrics,
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+    iterations: u64,
+    elapsed: Duration,
+) -> poker_solver_core::training_runtime::RuntimeResult<()> {
+    metrics.mark_snapshot_writing();
+    match save_lazy_mp_snapshot(config, snapshot_config, storage, iterations, elapsed) {
+        Ok(path) => {
+            metrics.mark_snapshot_saved(&path);
+            eprintln!("  Lazy MP snapshot saved to {}", path.display());
+        }
+        Err(e) => {
+            metrics.mark_snapshot_failed(&e);
+            eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
+        }
+    }
+    Ok(())
+}
+
 fn save_mp_snapshot(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
     tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
@@ -3634,14 +3777,35 @@ fn save_mp_snapshot(
 ) -> std::io::Result<PathBuf> {
     let output_dir = PathBuf::from(&snapshot_config.output_dir);
     std::fs::create_dir_all(&output_dir)?;
+    write_mp_root_config(config, snapshot_config, &output_dir)?;
     let snapshot_idx = next_snapshot_index(&output_dir)?;
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
+    let format = snapshot_config.format;
     let strategy = mp_strategy_from_storage(storage, tree, iterations, elapsed.as_secs() / 60);
-    strategy.save(&snapshot_dir.join("strategy.bin"))?;
-    save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
 
+    if format.write_legacy() {
+        strategy.save(&snapshot_dir.join("strategy.bin"))?;
+        save_mp_storage(storage, &snapshot_dir.join("regrets.bin"))?;
+    }
+
+    write_mp_metadata(&snapshot_dir, snapshot_idx, iterations, elapsed, storage)?;
+
+    if format.write_universal() {
+        write_mp_universal(&snapshot_dir, config, tree, storage, iterations, elapsed)?;
+    }
+
+    Ok(snapshot_dir)
+}
+
+fn write_mp_metadata(
+    snapshot_dir: &Path,
+    snapshot_idx: u32,
+    iterations: u64,
+    elapsed: Duration,
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+) -> std::io::Result<()> {
     let metadata = serde_json::json!({
         "kind": "blueprint_mp",
         "snapshot_index": snapshot_idx,
@@ -3652,11 +3816,46 @@ fn save_mp_snapshot(
     });
     let metadata_json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
-    Ok(snapshot_dir)
+    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)
+}
+
+fn write_mp_universal(
+    snapshot_dir: &Path,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    tree: &poker_solver_core::blueprint_mp::game_tree::MpGameTree,
+    storage: &poker_solver_core::blueprint_mp::storage::MpStorage,
+    iterations: u64,
+    elapsed: Duration,
+) -> std::io::Result<()> {
+    let output_dir = snapshot_dir.parent().expect("snapshot dir has parent");
+    let config_yaml_path = output_dir.join("config.yaml");
+    let universal_dir = snapshot_dir.join("universal");
+    poker_solver_core::blueprint_universal::mp_eager_export::write_mp_universal_snapshot(
+        config,
+        tree,
+        storage,
+        iterations,
+        elapsed.as_secs() as f64 / 60.0,
+        &config_yaml_path,
+        &universal_dir,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+fn write_mp_root_config(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    let mut persisted = config.clone();
+    persisted.snapshots = snapshot_config.clone();
+    let yaml =
+        serde_yaml::to_string(&persisted).map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(output_dir.join("config.yaml"), yaml)
 }
 
 fn save_lazy_mp_snapshot(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
     snapshot_config: &poker_solver_core::blueprint_mp::config::MpSnapshotConfig,
     storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
     iterations: u64,
@@ -3664,15 +3863,37 @@ fn save_lazy_mp_snapshot(
 ) -> std::io::Result<PathBuf> {
     let output_dir = PathBuf::from(&snapshot_config.output_dir);
     std::fs::create_dir_all(&output_dir)?;
+    write_mp_root_config(config, snapshot_config, &output_dir)?;
     let snapshot_idx = next_snapshot_index(&output_dir)?;
     let snapshot_dir = output_dir.join(format!("snapshot_{snapshot_idx:04}"));
     std::fs::create_dir_all(&snapshot_dir)?;
 
+    let format = snapshot_config.format;
     let entries = storage.snapshot_entries();
-    let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
-    let writer = std::io::BufWriter::new(file);
-    bincode::serialize_into(writer, &entries).map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    if format.write_legacy() {
+        let file = std::fs::File::create(snapshot_dir.join("sparse_entries.bin"))?;
+        let writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(writer, &entries)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+
+    write_lazy_mp_metadata(&snapshot_dir, snapshot_idx, iterations, elapsed, storage)?;
+
+    if format.write_universal() {
+        write_lazy_mp_universal(&snapshot_dir, config, &entries, iterations, elapsed)?;
+    }
+
+    Ok(snapshot_dir)
+}
+
+fn write_lazy_mp_metadata(
+    snapshot_dir: &Path,
+    snapshot_idx: u32,
+    iterations: u64,
+    elapsed: Duration,
+    storage: &poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage,
+) -> std::io::Result<()> {
     let stats = storage.stats();
     let metadata = serde_json::json!({
         "kind": "blueprint_mp_lazy_sparse",
@@ -3687,8 +3908,55 @@ fn save_lazy_mp_snapshot(
     });
     let metadata_json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)?;
-    Ok(snapshot_dir)
+    std::fs::write(snapshot_dir.join("metadata.json"), metadata_json)
+}
+
+fn write_lazy_mp_universal(
+    snapshot_dir: &Path,
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+    entries: &[poker_solver_core::blueprint_mp::sparse_storage::SparseSnapshotEntry],
+    iterations: u64,
+    elapsed: Duration,
+) -> std::io::Result<()> {
+    let output_dir = snapshot_dir.parent().expect("snapshot dir has parent");
+    let config_yaml_path = output_dir.join("config.yaml");
+    let universal_dir = snapshot_dir.join("universal");
+    let lazy_config = lazy_export_config_from_mp(config);
+    poker_solver_core::blueprint_universal::mp_lazy_export::write_lazy_universal_snapshot(
+        &lazy_config,
+        entries,
+        iterations,
+        elapsed.as_secs() as f64 / 60.0,
+        &config_yaml_path,
+        &universal_dir,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Build a [`LazyExportConfig`] from an in-memory [`BlueprintMpConfig`].
+fn lazy_export_config_from_mp(
+    config: &poker_solver_core::blueprint_mp::config::BlueprintMpConfig,
+) -> poker_solver_core::blueprint_universal::mp_lazy_export::LazyExportConfig {
+    use poker_solver_core::blueprint_mp::config::ForcedBetKind;
+    let sb = config
+        .game
+        .blinds
+        .iter()
+        .find(|b| b.kind == ForcedBetKind::SmallBlind)
+        .map_or(0.0, |b| b.amount);
+    let bb = config
+        .game
+        .blinds
+        .iter()
+        .find(|b| b.kind == ForcedBetKind::BigBlind)
+        .map_or(0.0, |b| b.amount);
+    poker_solver_core::blueprint_universal::mp_lazy_export::LazyExportConfig {
+        num_players: config.game.num_players,
+        stack_depth: config.game.stack_depth,
+        bucket_counts: config.clustering.bucket_counts(),
+        small_blind: sb,
+        big_blind: bb,
+    }
 }
 
 fn next_snapshot_index(output_dir: &Path) -> std::io::Result<u32> {
@@ -4438,6 +4706,192 @@ fn default_hand_grid_state(name: &str) -> blueprint_tui_widgets::HandGridState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// export-universal subcommand
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// train dispatcher
+// ---------------------------------------------------------------------------
+
+/// Detected training config format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedConfigKind {
+    /// HU `BlueprintV2Config` (has `game.players`).
+    HuV2,
+    /// N-player `BlueprintMpConfig` (has `game.num_players`).
+    Mp,
+}
+
+/// Detect whether a YAML string is a `BlueprintV2Config` or `BlueprintMpConfig`.
+///
+/// Detection strategy: parse the YAML as a generic value and check for
+/// distinguishing top-level fields.
+/// - `game.num_players` present -> MP config.
+/// - `game.players` present -> HU V2 config.
+/// - Neither -> error.
+fn detect_config_kind(yaml: &str) -> Result<DetectedConfigKind, Box<dyn Error>> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+
+    let game = value
+        .get("game")
+        .ok_or("config missing top-level 'game' section")?;
+
+    if game.get("num_players").is_some() {
+        return Ok(DetectedConfigKind::Mp);
+    }
+    if game.get("players").is_some() {
+        return Ok(DetectedConfigKind::HuV2);
+    }
+
+    Err("cannot detect config type: 'game' section has neither \
+         'players' (HU V2) nor 'num_players' (MP)"
+        .into())
+}
+
+/// Auto-detect config format and dispatch to the appropriate trainer.
+///
+/// When `output_dir_override` is set, the YAML is patched in memory,
+/// written to `<output_dir>/config.yaml`, and the trainer reads the
+/// patched copy.
+fn dispatch_train(
+    config_path: &Path,
+    no_tui: bool,
+    output_dir_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(config_path)?;
+    let kind = detect_config_kind(&yaml)?;
+
+    // If output_dir is overridden, patch the YAML and write a temp copy
+    // into the output directory so the trainer reads the right path.
+    let effective_path: PathBuf = if let Some(dir) = output_dir_override {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
+        if let Some(snap) = value.get_mut("snapshots") {
+            snap["output_dir"] = serde_yaml::Value::String(dir.to_string());
+        }
+        let out_dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&out_dir)?;
+        let patched_path = out_dir.join("config.yaml");
+        let rewritten = serde_yaml::to_string(&value)?;
+        std::fs::write(&patched_path, &rewritten)?;
+        patched_path
+    } else {
+        config_path.to_path_buf()
+    };
+
+    let path_str = effective_path
+        .to_str()
+        .ok_or("config path is not valid UTF-8")?;
+
+    match kind {
+        DetectedConfigKind::HuV2 => {
+            eprintln!("Detected HU V2 config, dispatching to train-blueprint");
+            let yaml = std::fs::read_to_string(&effective_path)?;
+            let bp_config: BlueprintV2Config = serde_yaml::from_str(&yaml)?;
+            let tui_config = blueprint_tui_config::parse_tui_config(&yaml);
+
+            if tui_config.enabled && !no_tui {
+                eprintln!(
+                    "  Note: TUI is not supported via `train` dispatcher; \
+                     use `train-blueprint` for interactive TUI. Running without TUI."
+                );
+            }
+
+            let mut trainer = BlueprintTrainer::new(bp_config);
+            trainer.try_resume()?;
+            trainer.train()?;
+        }
+        DetectedConfigKind::Mp => {
+            eprintln!("Detected MP config, dispatching to train-blueprint-mp");
+            run_train_blueprint_mp(path_str, no_tui)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_export_universal(bundle: &Path, snapshot: &str, out: &Path) -> Result<(), Box<dyn Error>> {
+    use poker_solver_core::blueprint_universal::hu_export;
+
+    eprintln!("Exporting HU blueprint to universal dense format");
+    eprintln!("  Bundle: {}", bundle.display());
+    eprintln!("  Snapshot: {snapshot}");
+    eprintln!("  Output: {}", out.display());
+
+    hu_export::export_hu_bundle(bundle, snapshot, out)
+        .map_err(|e| format!("export failed: {e}"))?;
+
+    eprintln!("Export complete: {}", out.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// export-universal-mp subcommand
+// ---------------------------------------------------------------------------
+
+fn run_export_universal_mp(
+    bundle: &Path,
+    snapshot: &str,
+    out: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let snapshot_dir = bundle.join(snapshot);
+    let kind = detect_mp_snapshot_kind(&snapshot_dir)?;
+
+    eprintln!("Exporting MP blueprint to universal dense format");
+    eprintln!("  Bundle: {}", bundle.display());
+    eprintln!("  Snapshot: {snapshot}");
+    eprintln!("  Kind: {kind}");
+    eprintln!("  Output: {}", out.display());
+
+    match kind.as_str() {
+        "blueprint_mp" => {
+            use poker_solver_core::blueprint_universal::mp_eager_export;
+            mp_eager_export::export_mp_bundle(bundle, snapshot, out)
+                .map_err(|e| format!("export failed: {e}"))?;
+        }
+        "blueprint_mp_lazy_sparse" => {
+            use poker_solver_core::blueprint_universal::mp_lazy_export;
+            mp_lazy_export::export_lazy_bundle_from_disk(bundle, snapshot, out)
+                .map_err(|e| format!("export failed: {e}"))?;
+        }
+        other => {
+            return Err(format!(
+                "unsupported metadata kind \"{other}\"; \
+                 supported kinds: \"blueprint_mp\", \
+                 \"blueprint_mp_lazy_sparse\""
+            )
+            .into());
+        }
+    }
+
+    eprintln!("Export complete: {}", out.display());
+    Ok(())
+}
+
+/// Read metadata.json from a snapshot directory and return the `kind` field.
+fn detect_mp_snapshot_kind(snapshot_dir: &Path) -> Result<String, Box<dyn Error>> {
+    let meta_path = snapshot_dir.join("metadata.json");
+    if !meta_path.exists() {
+        return Err(format!("metadata.json not found at {}", meta_path.display()).into());
+    }
+    let text = std::fs::read_to_string(&meta_path)?;
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "metadata.json at {} is missing required \"kind\" field; \
+                 expected one of: \"blueprint_mp\", \
+                 \"blueprint_mp_lazy_sparse\"",
+                meta_path.display()
+            )
+        })?
+        .to_string();
+    Ok(kind)
+}
+
 #[cfg(test)]
 mod tests {
     use poker_solver_core::blueprint_mp::config::{
@@ -4956,48 +5410,134 @@ snapshots:
 
     #[test]
     fn mp_snapshot_save_creates_strategy_and_metadata() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            123,
+            std::time::Duration::from_secs(7),
+        )
+        .expect("snapshot save should succeed");
+
+        assert!(snapshot_dir.join("strategy.bin").exists());
+        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
+
+        let strategy = BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin")).unwrap();
+        assert_eq!(strategy.iterations, 123);
+        assert_eq!(strategy.bucket_counts, [2, 2, 2, 2]);
+        assert!(
+            !strategy.node_action_counts.is_empty(),
+            "snapshot should include decision-node strategy data"
+        );
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp");
+        assert_eq!(metadata["iterations"], 123);
+    }
+
+    #[test]
+    fn lazy_mp_snapshot_save_creates_sparse_entries_and_metadata() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &storage,
+            456,
+            std::time::Duration::from_secs(11),
+        )
+        .expect("lazy sparse snapshot save should succeed");
+
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
+        assert_eq!(metadata["iterations"], 456);
+        assert_eq!(metadata["entries"], 1);
+    }
+
+    /// Build a minimal `BlueprintMpConfig` suitable for snapshot tests.
+    /// Uses the given `format` for `snapshots.format`.
+    fn build_test_mp_config(
+        format: poker_solver_core::blueprint_mp::config::MpSnapshotFormat,
+    ) -> BlueprintMpConfig {
         use poker_solver_core::blueprint_mp::config::{
             ForcedBet, ForcedBetKind, MpActionAbstractionConfig, MpClusteringConfig, MpGameConfig,
             MpSnapshotConfig, MpStreetCluster, MpStreetSizes, MpTrainingConfig,
         };
-        use poker_solver_core::blueprint_mp::trainer::setup_training;
-        use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 
-        let tiny_preflop_size = MpStreetSizes {
+        let tiny_preflop = MpStreetSizes {
             lead: vec![serde_yaml::Value::String("1bb".into())],
             raise: vec![],
         };
-        let tiny_postflop_size = MpStreetSizes {
+        let tiny_postflop = MpStreetSizes {
             lead: vec![serde_yaml::Value::Number(serde_yaml::Number::from(1))],
             raise: vec![],
         };
-        let config = BlueprintMpConfig {
+        BlueprintMpConfig {
             game: MpGameConfig {
-                name: "snapshot test".into(),
+                name: "snapshot fmt test".into(),
                 num_players: 2,
                 stack_depth: 6.0,
                 allow_preflop_limp: true,
                 blinds: vec![
-                    ForcedBet {
-                        seat: 0,
-                        kind: ForcedBetKind::SmallBlind,
-                        amount: 1.0,
-                    },
-                    ForcedBet {
-                        seat: 1,
-                        kind: ForcedBetKind::BigBlind,
-                        amount: 2.0,
-                    },
+                    ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
+                    ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
                 ],
                 rake_rate: 0.0,
                 rake_cap: 0.0,
             },
             action_abstraction: MpActionAbstractionConfig {
                 max_flop_players: None,
-                preflop: tiny_preflop_size,
-                flop: tiny_postflop_size.clone(),
-                turn: tiny_postflop_size.clone(),
-                river: tiny_postflop_size,
+                preflop: tiny_preflop,
+                flop: tiny_postflop.clone(),
+                turn: tiny_postflop.clone(),
+                river: tiny_postflop,
             },
             clustering: MpClusteringConfig {
                 preflop: MpStreetCluster { buckets: 2 },
@@ -5037,50 +5577,176 @@ snapshots:
                 output_dir: String::new(),
                 resume: false,
                 max_snapshots: None,
+                format,
             },
-        };
+        }
+    }
+
+    fn assert_root_config_yaml(
+        dir: &std::path::Path,
+        expected_format: poker_solver_core::blueprint_mp::config::MpSnapshotFormat,
+        expected_output_dir: &str,
+    ) -> BlueprintMpConfig {
+        let yaml = std::fs::read_to_string(dir.join("config.yaml")).expect("read config.yaml");
+        let persisted: BlueprintMpConfig = serde_yaml::from_str(&yaml).expect("parse config.yaml");
+        assert_eq!(persisted.snapshots.format, expected_format);
+        assert_eq!(persisted.snapshots.output_dir, expected_output_dir);
+        persisted
+    }
+
+    /// MP eager: format=Universal writes a loadable universal bundle and
+    /// no legacy strategy.bin/regrets.bin.
+    #[test]
+    fn mp_snapshot_format_universal_writes_universal_bundle() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Universal);
         let ctx = setup_training(&config);
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
             output_dir: dir.path().to_string_lossy().into_owned(),
-            ..config.snapshots
+            ..config.snapshots.clone()
         };
 
         let snapshot_dir = super::save_mp_snapshot(
+            &config,
             &snapshot_config,
             &ctx.storage,
             &ctx.tree,
-            123,
-            std::time::Duration::from_secs(7),
+            42,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("snapshot save should succeed");
+
+        // Universal bundle must be present and loadable
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(universal_dir.exists(), "universal/ dir must exist");
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
+        assert!(bundle.manifest().is_some(), "manifest must be present");
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Universal,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpEager
+        );
+
+        // Legacy files must NOT be present under universal-only
+        assert!(
+            !snapshot_dir.join("strategy.bin").exists(),
+            "strategy.bin must NOT be written under format=universal"
+        );
+        assert!(
+            !snapshot_dir.join("regrets.bin").exists(),
+            "regrets.bin must NOT be written under format=universal"
+        );
+
+        // metadata.json always written
+        assert!(snapshot_dir.join("metadata.json").exists());
+    }
+
+    /// MP eager: format=Both writes both legacy files and a universal bundle.
+    #[test]
+    fn mp_snapshot_format_both_writes_legacy_and_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Both);
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            42,
+            std::time::Duration::from_secs(1),
         )
         .expect("snapshot save should succeed");
 
         assert!(snapshot_dir.join("strategy.bin").exists());
         assert!(snapshot_dir.join("regrets.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
-
-        let strategy = BlueprintV2Strategy::load(&snapshot_dir.join("strategy.bin")).unwrap();
-        assert_eq!(strategy.iterations, 123);
-        assert_eq!(strategy.bucket_counts, [2, 2, 2, 2]);
+        let universal_dir = snapshot_dir.join("universal");
         assert!(
-            !strategy.node_action_counts.is_empty(),
-            "snapshot should include decision-node strategy data"
+            universal_dir.exists(),
+            "universal/ dir must exist under Both"
         );
-
-        let metadata: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(metadata["kind"], "blueprint_mp");
-        assert_eq!(metadata["iterations"], 123);
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
+        assert!(bundle.manifest().is_some());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Both,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpEager
+        );
     }
 
+    /// MP eager: format=Legacy writes only legacy files and no universal/ dir.
     #[test]
-    fn lazy_mp_snapshot_save_creates_sparse_entries_and_metadata() {
-        use poker_solver_core::blueprint_mp::config::MpSnapshotConfig;
+    fn mp_snapshot_format_legacy_writes_no_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::trainer::setup_training;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let ctx = setup_training(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &ctx.storage,
+            &ctx.tree,
+            42,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("snapshot save should succeed");
+
+        assert!(snapshot_dir.join("strategy.bin").exists());
+        assert!(snapshot_dir.join("regrets.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
+        assert!(
+            !snapshot_dir.join("universal").exists(),
+            "universal/ dir must NOT exist under format=legacy"
+        );
+    }
+
+    /// MP lazy: format=Universal writes a loadable universal bundle and
+    /// no legacy sparse_entries.bin.
+    #[test]
+    fn lazy_mp_snapshot_format_universal_writes_universal_bundle() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
         use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
         use poker_solver_core::blueprint_mp::types::{Seat, Street};
+        use poker_solver_core::blueprint_universal::loader;
 
+        let config = build_test_mp_config(MpSnapshotFormat::Universal);
         let storage =
             poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
         let key =
@@ -5089,29 +5755,254 @@ snapshots:
         storage.add_strategy_sum(key, 2, 1, 50);
         let dir = tempfile::tempdir().unwrap();
         let snapshot_config = MpSnapshotConfig {
-            warmup_minutes: 0,
-            snapshot_every_minutes: 1,
             output_dir: dir.path().to_string_lossy().into_owned(),
-            resume: false,
-            max_snapshots: None,
+            ..config.snapshots.clone()
         };
 
         let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
             &snapshot_config,
             &storage,
-            456,
-            std::time::Duration::from_secs(11),
+            100,
+            std::time::Duration::from_secs(3),
         )
-        .expect("lazy sparse snapshot save should succeed");
+        .expect("lazy snapshot save should succeed");
+
+        // Universal bundle must be present and loadable
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(universal_dir.exists(), "universal/ dir must exist");
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
+        assert!(bundle.manifest().is_some());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Universal,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpLazy
+        );
+
+        // Legacy file must NOT be present under universal-only
+        assert!(
+            !snapshot_dir.join("sparse_entries.bin").exists(),
+            "sparse_entries.bin must NOT be written under format=universal"
+        );
+
+        assert!(snapshot_dir.join("metadata.json").exists());
+    }
+
+    /// MP lazy: format=Both writes both legacy and universal.
+    #[test]
+    fn lazy_mp_snapshot_format_both_writes_legacy_and_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+        use poker_solver_core::blueprint_universal::loader;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Both);
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &storage,
+            100,
+            std::time::Duration::from_secs(3),
+        )
+        .expect("lazy snapshot save should succeed");
 
         assert!(snapshot_dir.join("sparse_entries.bin").exists());
         assert!(snapshot_dir.join("metadata.json").exists());
+        let universal_dir = snapshot_dir.join("universal");
+        assert!(
+            universal_dir.exists(),
+            "universal/ dir must exist under Both"
+        );
+        let bundle = loader::load_bundle(&universal_dir).expect("universal bundle should load");
+        assert!(bundle.manifest().is_some());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Both,
+            &snapshot_config.output_dir,
+        );
+        let root_bundle =
+            loader::load_bundle(dir.path()).expect("root should resolve nested universal bundle");
+        assert_eq!(
+            root_bundle.kind(),
+            poker_solver_core::blueprint_universal::BundleKind::UniversalMpLazy
+        );
+    }
+
+    /// MP lazy: format=Legacy writes only legacy and no universal/ dir.
+    #[test]
+    fn lazy_mp_snapshot_format_legacy_writes_no_universal() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        let snapshot_dir = super::save_lazy_mp_snapshot(
+            &config,
+            &snapshot_config,
+            &storage,
+            100,
+            std::time::Duration::from_secs(3),
+        )
+        .expect("lazy snapshot save should succeed");
+
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_root_config_yaml(
+            dir.path(),
+            MpSnapshotFormat::Legacy,
+            &snapshot_config.output_dir,
+        );
+        assert!(
+            !snapshot_dir.join("universal").exists(),
+            "universal/ dir must NOT exist under format=legacy"
+        );
+    }
+
+    #[test]
+    fn lazy_mp_tui_snapshot_helper_preserves_sparse_format_and_status() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::sparse_storage::MpInfosetKey;
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let storage =
+            poker_solver_core::blueprint_mp::sparse_storage::SparseMpStorage::with_shards(4);
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+        let metrics = crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(Some(10), None);
+        metrics.request_snapshot();
+        assert_eq!(
+            metrics.snapshot_status_text().as_deref(),
+            Some("snapshot: queued")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        super::save_lazy_mp_snapshot_for_tui(
+            &config,
+            &snapshot_config,
+            &metrics,
+            &storage,
+            789,
+            std::time::Duration::from_secs(13),
+        )
+        .expect("TUI snapshot helper should keep runtime alive");
+
+        let snapshot_dir = dir.path().join("snapshot_0000");
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_eq!(
+            metrics.snapshot_status_text().as_deref(),
+            Some("snapshot: saved snapshot_0000")
+        );
         let metadata: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
-        assert_eq!(metadata["iterations"], 456);
+        assert_eq!(metadata["iterations"], 789);
+        assert_eq!(metadata["entries"], 1);
+    }
+
+    #[test]
+    fn lazy_mp_tui_bridge_saves_queued_snapshot_before_finished_exit() {
+        use poker_solver_core::blueprint_mp::config::{MpSnapshotConfig, MpSnapshotFormat};
+        use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
+        use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
+        use poker_solver_core::blueprint_mp::types::{Seat, Street};
+        use poker_solver_core::training_runtime::RuntimeControls;
+        use std::sync::atomic::AtomicU64;
+
+        let config = build_test_mp_config(MpSnapshotFormat::Legacy);
+        let source = std::sync::Arc::new(AtomicU64::new(321));
+        let storage = std::sync::Arc::new(SparseMpStorage::with_shards(4));
+        let key =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
+        storage.add_regret(key, 2, 0, 25);
+        storage.add_strategy_sum(key, 2, 1, 50);
+
+        let game = std::sync::Arc::new(LazyMpGame::new(&config.game, &config.action_abstraction));
+        let metrics = std::sync::Arc::new(crate::blueprint_tui_metrics::BlueprintTuiMetrics::new(
+            Some(10),
+            None,
+        ));
+        metrics.request_snapshot();
+        let controls = RuntimeControls::new();
+        let handle = std::thread::spawn(|| {});
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_config = MpSnapshotConfig {
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            ..config.snapshots.clone()
+        };
+
+        super::bridge_mp_lazy_iterations(
+            &source,
+            &storage,
+            &game,
+            &[],
+            &[],
+            [2, 2, 2, 2],
+            &[],
+            &metrics,
+            &controls,
+            &handle,
+            &config,
+            &snapshot_config,
+            std::time::Instant::now(),
+        );
+        handle.join().unwrap();
+
+        let snapshot_dir = dir.path().join("snapshot_0000");
+        assert!(snapshot_dir.join("sparse_entries.bin").exists());
+        assert!(snapshot_dir.join("metadata.json").exists());
+        assert_eq!(
+            metrics.snapshot_status_text().as_deref(),
+            Some("snapshot: saved snapshot_0000")
+        );
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["kind"], "blueprint_mp_lazy_sparse");
+        assert_eq!(metadata["iterations"], 321);
         assert_eq!(metadata["entries"], 1);
     }
 
@@ -6008,5 +6899,137 @@ model:
             "clamp"
         );
         assert_eq!(super::compare_solve::gadget_mode_label(false, false), "off");
+    }
+
+    #[test]
+    fn detect_mp_snapshot_kind_errors_on_missing_kind_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "iterations": 100,
+            "elapsed_minutes": 5,
+        });
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let result = super::detect_mp_snapshot_kind(dir.path());
+        assert!(
+            result.is_err(),
+            "expected error when kind field is missing, got {:?}",
+            result.unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Train dispatcher detection tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_config_kind_hu_v2() {
+        let yaml = r#"
+game:
+  name: test
+  players: 2
+  stack_depth: 200
+  small_blind: 1
+  big_blind: 2
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+action_abstraction:
+  preflop:
+    - ["5bb"]
+  flop:
+    - [1.0]
+  turn:
+    - [1.0]
+  river:
+    - [1.0]
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/test"
+"#;
+        let kind = super::detect_config_kind(yaml).expect("should detect");
+        assert_eq!(kind, super::DetectedConfigKind::HuV2);
+    }
+
+    #[test]
+    fn detect_config_kind_mp() {
+        let yaml = r#"
+game:
+  name: test
+  num_players: 6
+  stack_depth: 200
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  output_dir: "/tmp/test"
+"#;
+        let kind = super::detect_config_kind(yaml).expect("should detect");
+        assert_eq!(kind, super::DetectedConfigKind::Mp);
+    }
+
+    #[test]
+    fn detect_config_kind_neither_errors() {
+        let yaml = r#"
+game:
+  name: test
+  stack_depth: 200
+snapshots:
+  output_dir: "/tmp/test"
+"#;
+        let result = super::detect_config_kind(yaml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("neither"),
+            "error should mention missing fields: {msg}"
+        );
     }
 }

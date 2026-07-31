@@ -3,6 +3,9 @@ name = "gpu-range-solver"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 range-solver = { path = "../range-solver" }
 cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-12010"] }

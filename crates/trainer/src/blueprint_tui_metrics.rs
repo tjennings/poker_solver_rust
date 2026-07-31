@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use poker_solver_core::blueprint_v2::baseline_validation::BaselineValidationReport;
 use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
 
 use crate::blueprint_tui::ResolvedScenario;
@@ -95,6 +96,8 @@ pub struct BlueprintTuiMetrics {
 
     // --- top exploitable spots from BR pass ---
     pub exploitable_spots: Mutex<Vec<ExploitableSpot>>,
+    /// Latest external baseline strategy-frequency validation report.
+    pub baseline_validation_report: Mutex<Option<BaselineValidationReport>>,
 }
 
 impl BlueprintTuiMetrics {
@@ -145,6 +148,7 @@ impl BlueprintTuiMetrics {
             exploitability_start_time: Mutex::new(None),
 
             exploitable_spots: Mutex::new(Vec::new()),
+            baseline_validation_report: Mutex::new(None),
         }
     }
 
@@ -376,6 +380,14 @@ impl BlueprintTuiMetrics {
             .exploitable_spots
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = spots;
+    }
+
+    /// Replace the latest external baseline validation report.
+    pub fn set_baseline_validation_report(&self, report: BaselineValidationReport) {
+        *self
+            .baseline_validation_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(report);
     }
 
     /// Signal the start of an exploitability/BR pass with the given total sample count.
@@ -739,6 +751,24 @@ mod tests {
         let m = BlueprintTuiMetrics::new(None, None);
         let spots = m.exploitable_spots.lock().unwrap();
         assert!(spots.is_empty());
+    }
+
+    #[timed_test(10)]
+    fn baseline_validation_report_initially_empty_and_settable() {
+        let m = BlueprintTuiMetrics::new(None, None);
+        assert!(m.baseline_validation_report.lock().unwrap().is_none());
+
+        let mut report = BaselineValidationReport::default();
+        report.aggregate.spots_total = 6;
+        report.aggregate.spots_scored = 6;
+        report.aggregate.mean_total_variation = 0.125;
+        m.set_baseline_validation_report(report);
+
+        let stored = m.baseline_validation_report.lock().unwrap();
+        let stored = stored.as_ref().expect("report should be stored");
+        assert_eq!(stored.aggregate.spots_total, 6);
+        assert_eq!(stored.aggregate.spots_scored, 6);
+        assert!((stored.aggregate.mean_total_variation - 0.125).abs() < f64::EPSILON);
     }
 
     #[timed_test(10)]

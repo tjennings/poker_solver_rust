@@ -25,7 +25,7 @@ poker_solver_rust/
 │   │       ├── game/          # Action/Player types, HunlPostflop game
 │   │       ├── cfr/           # CFR utilities (regret matching, shared DCFR/LCFR logic)
 │   │       ├── blueprint_v2/  # MCCFR blueprint trainer, strategy storage, config
-│   │       ├── blueprint_mp/  # N-player (2-8) MCCFR blueprint trainer
+│   │       ├── blueprint_mp/  # N-player (2-10) MCCFR blueprint trainer
 │   │       ├── abstraction/   # Card abstraction (isomorphism, EHS2, HandClassV2)
 │   │       ├── hand_class.rs  # 19-variant hand classification system
 │   │       ├── info_key.rs    # Info set key encoding (64-bit packed)
@@ -81,19 +81,76 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 
 ## Blueprint V2 MCCFR Solver
 
-**Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set. DCFR logic (iteration weighting, regret discounting, strategy discounting) is delegated to the shared `DcfrParams` module in `cfr/dcfr.rs`.
+**Algorithm:** External-sampling MCCFR with DCFR discounting. Samples random deals (hole cards + full board), traverses preflop through river, accumulates regrets at each information set, and stores the average strategy as action-frequency sums. The trainer can use either eager dense CFR storage or an opt-in sparse row backend; both feed the same traversal abstraction and export the same dense-compatible snapshot and strategy bundle formats.
 
 **Key types:**
 - `GameConfig` -- game structure: blinds, stacks, bet sizes, abstraction mode, DCFR params
 - `HunlPostflop` -- implements the `Game` trait; manages game tree traversal with pre-dealt boards
-- `MccfrSolver` -- external-sampling MCCFR; flat buffer layout for regrets and strategy sums
+- `MccfrSolver` -- external-sampling MCCFR traversal over the `BlueprintCfrStorage` abstraction
+- `BlueprintStorage` -- eager dense flat buffers for regrets, strategy sums, optional baselines, and optional prediction values
+- `SparseBlueprintStorage` -- opt-in HU lazy row storage keyed by stable decision-node identity, bucket, and action-schema fingerprint; missing rows read as zero/uniform and writes realize rows
 - `BlueprintV2Strategy` -- serialized strategy extracted from solver; maps info set keys to action distributions
 
 **Flow:**
 1. Build `GameConfig` from YAML
 2. Initialize `HunlPostflop` game with deal pool
-3. Run MCCFR iterations with parallel batch processing
-4. Extract `BlueprintV2Strategy` for exploration
+3. Select `training.storage_backend` (`dense` by default, `sparse`/`lazy` opt-in)
+4. Run MCCFR iterations with parallel batch processing
+5. Extract `BlueprintV2Strategy` for exploration
+
+**HU storage backends:**
+- `dense` is the default and preserves historical behavior: every `(decision node, bucket, action)` regret and strategy-sum slot is allocated up front.
+- `sparse`/`lazy` keeps the existing eager arena `GameTree` but realizes CFR rows only after traversal writes to a `(decision node, bucket)` pair. Reads of unrealized rows return zero regrets/sums/predictions/baselines and uniform current/average strategy.
+- Sparse training uses the same optimizer, SAPCFR+ prediction, baseline, and regret-floor plumbing as dense storage. BRCFR+ remains dense-only in the current HU slice because its best-response prediction pass is still implemented against dense buffers.
+- Snapshots and Explorer/Tauri bundles remain dense-compatible: sparse training projects to dense `regrets.bin` and `strategy.bin` at export/resume boundaries. There is no sparse on-disk snapshot format for HU `blueprint_v2`.
+- Sparse progress logging includes realized rows/slots, dense-equivalent slots/bytes, approximate sparse resident bytes, inserts, and read/write probe counters.
+
+**Shared training runtime:** `crates/core/src/training_runtime.rs` defines the backend-neutral runtime contract used to converge the HU and MP trainers. Runtime units are explicit (`Iteration` for HU blueprint_v2, `MetaIteration` for MP), and the runtime owns stop checks, pause/quit controls, snapshot/refresh/reload requests, elapsed-time limits, and counter updates. Backend adapters seed counters from restored/current trainer state but must not mutate runtime counters while running a batch.
+
+**Universal dense blueprint format:** `docs/blueprint_format.md` specifies the versioned export format for HU, eager MP, and lazy sparse MP strategies. The format is row-oriented, records game/player/action/bucket provenance, distinguishes read-only strategy exports from resumable CFR snapshots, and keeps legacy HU bundles readable during migration. The core read/write module lives at `crates/core/src/blueprint_universal/` (manifest types, binary payload headers with CRC-64/XZ, row/action descriptors, f32 probability payloads, SHA-256 checksums, and a validating bundle writer/reader). The HU exporter (`blueprint_universal/hu_export.rs`, CLI `export-universal`) projects legacy `BlueprintV2Strategy` bundles into universal bundles with bitwise probability pass-through. The MP eager exporter (`blueprint_universal/mp_eager_export.rs`, CLI `export-universal-mp`) exports from live `MpStorage::average_strategy` or from saved snapshot dirs under the `mp_arena` namespace with explicit seats; both exporters share row machinery in `blueprint_universal/export_common.rs`. The MP lazy sparse exporter (`blueprint_universal/mp_lazy_export.rs`, via `export-universal-mp` kind dispatch) exports realized sparse rows under the `mp_semantic` namespace with verbatim semantic identity in a `strategy.semantic.bin` side table, gated by the `mp_semantic_rows_v1` required feature; rows realized by lazy traversal now carry stored action identity, so exports use concrete universal action descriptors, while synthetic rows without identity retain the safe `Opaque` fallback. The unified loader (`blueprint_universal/loader.rs`) provides `detect_bundle_kind` (cheap manifest-only detection of legacy HU vs universal HU/MP-eager/MP-lazy, `blueprint.json` taking precedence over a retained `config.yaml`, including native `snapshot_NNNN/universal/blueprint.json` output) and `load_bundle`, returning a `LoadedBundle` enum with a unified infoset query API; legacy and universal-HU loads return bitwise-identical results. The Explorer and devserver load via the unified loader (detecting `blueprint.json` before legacy `config.yaml`): universal HU bundles render through the existing HU views by reconstructing a `BlueprintV2Strategy` from the universal rows and rebuilding the tree from the `config.yaml` now retained inside each exported bundle; universal MP bundles load read-only (bundle info + manifest metadata), and the snapshot-specific `load_blueprint_v2` path delegates to nested universal loading before parsing MP `config.yaml` as HU config, with full N-player browsing UI deferred to follow-on work. Trainers write this format natively at snapshot time behind a `snapshots.format` config flag (`legacy` | `universal` | `both`, default `legacy`) for all three backends — HU, MP eager, MP lazy — with native output byte-identical to the post-hoc `export-universal` path; MP snapshot saves persist root `config.yaml` using the effective snapshot config so retained bundle config is available automatically. A `train` subcommand auto-detects HU-vs-MP config and dispatches. Remaining Phase 7 consolidation (one TUI, 2-10 players, retiring the HU/eager training paths) is tracked separately. Per user direction (2026-06-10): the end state is ONE lazy sparse training workflow supporting 2-10 players with ONE TUI; the only hard compatibility surface is the Tauri Explorer's ability to load exported strategies. Legacy-bundle conversion, HU blueprint_v2 training, and the MP eager dense backend are all transitional — retirable, not migration targets.
+
+Universal MP-lazy loading uses a private owned-byte snapshot rather than
+file-backed mappings. File-backed mappings cannot prevent another process from
+truncating or rewriting a file, so the reader checks stable file identity,
+length, and modification metadata before and after loading and validation, then
+refuses queries when a source payload change is detectable. Strict eager
+manifest, header,
+SHA-256, CRC-64, structural, and probability-normalization validation remains
+in place; row, action, probability, and semantic descriptors are materialized
+during a query only as applicable. Queries use a compact sorted range locator
+rather than a full row-key `HashMap`. Reader timings distinguish payload
+loading, integrity checks, validation, and index setup. HU, eager MP, and legacy
+readers retain their existing loading paths and behavior.
+
+The mounted Tauri Game view now has a separate lazy-session adapter for exactly
+two-player `universal_mp_lazy` bundles with a retained full MP config. It keeps
+the semantic lazy row model, renders preflop rows by seat/street/bucket/history
+identity, exposes a typed flop chance state while 0-2 cards are selected, and
+renders completed-street matrices by enumerating canonical-hand combos, removing
+board blockers, resolving each combo through trainer-compatible file-backed
+`AllBuckets`, and averaging the matching sparse row probabilities. Bucket files
+are resolved from bundle-local/ancestor `buckets/` directories or a valid
+retained `training.cluster_path`. Relative configured paths are anchored at
+the retained config directory and searched through its ancestors before
+implicit `buckets/` candidates; missing sources, mappings, rows, and
+incompatible action schemas are explicit errors. The narrow additive
+`AllBuckets::try_get_bucket` API provides the same canonical/combo lookup with
+errors instead of the trainer hot path's panic behavior. Card and action
+updates are transactional, and back navigation replays the semantic action
+path and retained board selection. The Universal MP lazy browser supports
+two-player turn and river navigation, including dealing and rewinding those
+streets. Its exact adapter supports non-terminal two-player Flop, Turn, and
+River decision roots when the board is complete for the current street.
+Preflop roots, incomplete-board chance states, terminal roots, Subgame solves,
+eager MP bundles, and N-player exact solving remain unsupported. Eager MP and
+N-player UI remain deferred.
+
+**External baseline validation:**
+- `training.baseline_validation` is an opt-in trainer diagnostic that compares learned average strategy frequencies against a pinned external preflop baseline JSON. It is separate from VR-MCCFR `use_baselines`; it does not change traversal, regrets, or strategy sums.
+- The current validator is deliberately pinned to the 20bb HU cEV cash baseline at `local_data/baselines/cash_hu_20bb_cev.json`: stack 40 chips, blinds 1/2, no SB open limp, 169 preflop buckets, and preflop raise rows `2.5bb` then `5bb`.
+- Integration passes `BaselineGamePreconditions` from the original `GameConfig` used to build the tree. The validator refuses scoring if trusted config metadata, tree shape, preflop bucket count, or baseline document schema do not match the pinned target.
+- Reports read through the `BlueprintCfrStorage` provider boundary and call `average_strategy` on `active_storage()`. Sparse validation does not project the whole strategy to dense storage.
+- Metrics are strategy-frequency distances, not EV pass/fail results: aggregate total variation, root and first-response total variation, worst-spot total variation, coverage, skipped zero-mass rows, invalid rows, unsupported spots/actions, and worst combo rows.
 
 **Abstractions:**
 - `HandClassV2` -- 19-class hand classification with intra-class strength and equity binning (28-bit hand field)
@@ -105,6 +162,7 @@ All internal values (pot, stacks, bet sizes, EVs) are in **chips**.
 - Config: `crates/core/src/blueprint_v2/config.rs`
 - MCCFR: `crates/core/src/blueprint_v2/mccfr.rs`
 - Storage: `crates/core/src/blueprint_v2/storage.rs`
+- Sparse storage: `crates/core/src/blueprint_v2/sparse_storage.rs`
 - Trainer: `crates/core/src/blueprint_v2/trainer.rs`
 
 ### Potential-Aware Clustering Pipeline
@@ -168,7 +226,7 @@ clustering:
 
 ## N-Player Blueprint (`blueprint_mp`)
 
-A clean-room N-player (2-8) MCCFR solver module alongside the existing `blueprint_v2`. Uses strong domain types and supports configurable blind/ante structures.
+A clean-room N-player (2-10) MCCFR solver module alongside the existing `blueprint_v2`. Uses strong domain types and supports configurable blind/ante structures.
 
 ### Module Structure
 
@@ -184,12 +242,13 @@ crates/core/src/blueprint_mp/
 ├── lazy_mccfr.rs       # Dynamic public-state traversal over sparse infoset storage
 ├── mccfr.rs            # External-sampling MCCFR traversal (Pluribus-style)
 ├── trainer.rs          # Training loop with per-seat traverser cycling, DCFR
+├── training_runtime_adapter.rs # Shared-runtime adapter for lazy sparse MP
 └── exploitability.rs   # Per-seat best-response diagnostic
 ```
 
 ### Key Design Decisions
 
-- **2-8 players** with `MAX_PLAYERS = 8`
+- **2-10 players** with `MAX_PLAYERS = 10`
 - **Configurable blinds**: SB, BB, ante, BB-ante, straddle via per-seat config
 - **Lead/raise split**: Separate bet sizes for opening bets vs raises
 - **Optional preflop flop-player cap**: `action_abstraction.max_flop_players` prunes non-closing preflop calls that would fill the last allowed flop seat, while preserving closing calls up to the cap
@@ -200,6 +259,8 @@ crates/core/src/blueprint_mp/
 - **Lazy public-state traversal** for 100bb migration: legal actions are generated on demand from compact betting state, chance/runout nodes are collapsed against the sampled full board, and sparse infoset keys combine seat, a street-namespaced abstract bucket, and action history
 - **Experimental negative-action subtree purge** for lazy sparse traversal: aggressive action edges whose cumulative regret falls below a configured threshold are tracked in a sharded blocked-edge set; normal traversal masks blocked aggressive edges, while physical sparse-row deletion is deferred until the DCFR discount boundary, where post-discount regrets decide whether blocked child subtrees are purged or reactivated
 - **External-sampling average strategy updates**: every visited decision infoset records the full current strategy vector; opponent actions are sampled only for recursion, not for average-strategy accounting
+- **Shared-runtime lazy adapter**: `LazySparseMpTrainingRuntimeAdapter` wraps `LazyTrainContext` without changing lazy traversal or sparse key identity. Its unit is one MP meta-iteration: one sampled deal followed by one traversal per seat. `LazyMpTrainingStepper` preserves the old lazy loop's base-iteration, pruning RNG, chance-continuation, DCFR discount, and negative-action purge cadence while allowing the shared runtime to cap batches by `BatchBudget`. Snapshot, resume, and config reload hooks for lazy MP remain trainer-side work; the core adapter fails explicitly instead of faking support.
+- **Universal dense export target**: the planned `dense_blueprint` bundle in `docs/blueprint_format.md` is the common strategy export contract for HU, eager MP, and lazy sparse MP. Lazy sparse exports are read-only until their blocked-edge purge state and runtime cadence are persisted.
 - Shares `abstraction/`, `cfr/`, and `hand_eval` with `blueprint_v2`
 
 ### 100bb MP Scaling Plan

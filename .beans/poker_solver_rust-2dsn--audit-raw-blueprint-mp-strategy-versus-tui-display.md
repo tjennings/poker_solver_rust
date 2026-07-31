@@ -5,7 +5,7 @@ status: in-progress
 type: bug
 priority: high
 created_at: 2026-05-20T13:27:27Z
-updated_at: 2026-05-20T15:42:14Z
+updated_at: 2026-07-28T01:43:23Z
 parent: poker_solver_rust-kiqt
 ---
 
@@ -43,3 +43,56 @@ Extended live lazy-sparse TUI probe cells to show dominant average action, domin
 ## Probe Observation
 
 Current-vs-average probe output shows a mixed picture with multi-million strategy-sum mass per opener row. Some suspicious hands look like plausible DCFR average lag, e.g. HJ A3s:P:aF94/cB81/s3m. Others are current-strategy folds with substantial mass, e.g. UTG A2s/A3s/A4s current F100 with s3m, HJ A5s current F100 with s2m, and CO A2s/A4s/A5s current F100 with s2m, while nearby hands like CO A3s, CO K9s, and CO 22 are current raises. This narrows the next audit to raw row internals: action labels, bucket/key, regrets, and per-action strategy sums for adjacent suited Ax hands and comparison hands.
+
+
+## New Report: SB 72o Facing Reraise
+
+SB folds 72o at the unopened/preflop opening node, but the TUI reports approximately 72% SB call frequency after SB raises to 2bb and BB reraises to 3bb. The audit must compare the raw row and action-history resolution at both nodes before changing training or storage.
+
+- [x] Reproduce the exact SB r2 / BB r3 / SB decision with a deterministic diagnostic.
+- [x] Compare 72o at opening and reraised SB nodes, including action labels and row keys.
+- [x] Classify the defect as display, navigation, keying, or training data.
+
+## Diagnostic Conclusion
+
+The exact Tauri path resolves SB after two actions to a distinct sparse row: SB raises to 2bb, BB reraises to 3bb, then SB acts. The displayed 72o value is the normalized average strategy stored for that conditional infoset. It is not the unconditional probability of reaching the node from the root. Therefore 72o can be folded at the opening node while showing a nonzero call strategy at the off-path reraised node; this is not a navigation, keying, or display-row mismatch.
+
+## Current Change
+
+Added deterministic sentinel-row regression coverage for the root, intermediate, and reraised SB nodes, plus Explorer documentation clarifying conditional strategy versus reach-weighted frequency.
+
+
+## New Requirement: Root-Reach-Weighted Display
+
+The Explorer matrix must display only root-reach-weighted action frequencies. A hand that folds at the root must have zero displayed frequency at every descendant node. Do not expose conditional off-path strategy as the primary matrix metric.
+
+- [x] Define the exact reach-weighting semantics for each action-history segment.
+- [x] Implement root reach propagation for lazy MP preflop matrices.
+- [x] Add regression coverage proving root-folded 72o displays zero after SB r2 / BB r3.
+- [x] Update user-facing labels/docs to identify the displayed metric.
+- [x] Run focused tests and review the change.
+
+## Root-Reach-Weighted Implementation Summary
+
+- Lazy MP preflop matrix probabilities now represent per-seat root-reach-weighted action frequencies using exported average strategy.
+- Reach replay follows the exact action-index history and multiplies only the player acting at each prior decision; opponent actions do not reduce that player's marginal reach.
+- Root remains unchanged, while a root-folded hand displays zero at descendant nodes. Action descriptors, missing-row errors, and session mutation behavior are covered by regression tests.
+- Postflop matrix values remain explicitly conditional until combo-level reach and blocker-aware propagation are implemented.
+
+
+## New Requirement: Root-Reach-Weighted Postflop Display
+
+The previous change weighted lazy MP preflop matrices but left postflop matrices conditional. At a flop node, BB 72o must not appear to raise if its preflop reach is zero. Extend reach weighting through postflop matrix construction, honoring board blockers and the concrete combo reach for the acting player.
+
+- [x] Define combo-level reach semantics through preflop actions, chance cards, and postflop actions.
+- [x] Propagate root reach into flop/turn/river matrix cells without multiplying by opponent actions.
+- [x] Add an A-K-Q flop regression proving root-folded 72o has zero displayed action frequencies.
+- [x] Preserve legal actions and correct combo/bucket mapping.
+- [x] Update docs and run focused tests/review.
+
+## Postflop Reach-Weighted Implementation Summary
+
+- Lazy MP flop matrices now replay concrete combo reach through preflop and supported flop actions using street-specific buckets and exact action identities.
+- Board-blocked combos are excluded before bucket lookup and aggregation; displayed action frequencies are weighted by per-seat marginal combo reach.
+- Added the A-K-Q regression proving root-zero BB 72o remains zero on the flop while legal flop actions and blocker behavior remain intact.
+- Turn and river navigation remain unsupported and are documented as such.

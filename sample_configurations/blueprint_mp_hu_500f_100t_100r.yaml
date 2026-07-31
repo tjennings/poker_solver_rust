@@ -1,0 +1,92 @@
+# Blueprint MP Config - heads-up, 500/100/100 postflop buckets, simplified actions
+# Derived from blueprint_mp_6max_500f_100t_100r.yaml to exercise the MP lazy backend in a 2-player game.
+game:
+  name: "HU simplified actions 500f 100t 100r"
+  num_players: 2
+  stack_depth: 200
+  allow_preflop_limp: false
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1
+    - seat: 1
+      type: big_blind
+      amount: 2
+
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 500
+  turn:
+    buckets: 100
+  river:
+    buckets: 100
+
+action_abstraction:
+  max_flop_players: 2
+  preflop:
+    lead: ["2bb"]
+    raise:
+      - ["0.33x", "0.75x", "1.0x"]
+      - ["0.33x", "0.75x", "1.0x"]
+      - ["0.33x", "0.75x", "1.0x"]
+  flop:
+    lead: [0.25, 0.50, 0.75]
+    raise:
+      - [0.5, 1.0]
+      - [0.5, 1.0]
+  turn:
+    lead: [0.25, 0.50, 0.75]
+    raise:
+      - [0.5, 1.0]
+      - [0.5, 1.0]
+  river:
+    lead: [0.25, 0.50, 0.75]
+    raise:
+      - [0.5, 1.0, 1.5]
+      - [0.5, 1.0, 1.5]
+
+training:
+  backend: lazy_sparse
+  cluster_path: "./local_data/buckets/500f_100t_100r_nut_high_cap_0p5_v1"
+  time_limit_minutes: 7200
+  lcfr_discount_interval: 3000000
+  lcfr_warmup_iterations: 3000000
+  prune_after_iterations: 4000000
+  traversal_pruning_enabled: true
+  prune_threshold: -6000
+  prune_explore_pct: 0.05
+  negative_action_subtree_purge_enabled: false
+  negative_action_prune_below: -100
+  negative_action_reactivate_at: 0
+  negative_action_purge_mode: scan_history_prefix
+  batch_size: 500
+  dcfr_alpha: 1.5
+  dcfr_beta: 0.0
+  dcfr_gamma: 2.0
+  exploitability_interval_minutes: 30
+  exploitability_samples: 10000
+
+snapshots:
+  resume: false
+  warmup_minutes: 60
+  snapshot_every_minutes: 30
+  format: both
+  output_dir: "./local_data/blueprints/mp_hu_500f_100t_100r_nut_high_cap_0p5_v3"
+
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB open"
+      spot: ""
+    - name: "BB vs SB open"
+      spot: "sb:2bb"
+    - name: "SB c-bet sample"
+      spot: "sb:2bb,bb:call|AsTd9d"
+    - name: "SB vs BB 3-bet"
+      spot: "sb:2bb,bb:5bb"

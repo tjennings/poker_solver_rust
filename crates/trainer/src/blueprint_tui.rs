@@ -19,6 +19,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Tabs};
 
+use poker_solver_core::blueprint_v2::baseline_validation::format_baseline_validation_lines;
+
 use crate::blueprint_tui_audit_widget::{AuditPanelState, AuditPanelWidget};
 use crate::blueprint_tui_config::TelemetryConfig;
 use crate::blueprint_tui_metrics::BlueprintTuiMetrics;
@@ -329,6 +331,13 @@ impl BlueprintTuiApp {
             .audit_panel
             .as_ref()
             .is_some_and(|p| !p.metas.is_empty());
+        let has_baseline_validation = self
+            .metrics
+            .baseline_validation_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        let has_diagnostics = has_audits || has_baseline_validation;
 
         // Three-part vertical: metrics area, grids, hotkeys.
         let main_chunks = Layout::default()
@@ -340,8 +349,8 @@ impl BlueprintTuiApp {
             ])
             .split(area);
 
-        // Split metrics area horizontally if audits configured.
-        let (metrics_area, audit_area) = if has_audits {
+        // Split metrics area horizontally if diagnostics are configured.
+        let (metrics_area, diagnostics_area) = if has_diagnostics {
             let hsplit = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -382,21 +391,46 @@ impl BlueprintTuiApp {
         self.render_avg_pos_regret(frame, sparkline_chunks[9]);
         self.render_prune_sparkline(frame, sparkline_chunks[10]);
 
-        // Render audit panel and exploitable spots in the right side area.
-        if let Some(audit_rect) = audit_area {
-            let audit_split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(audit_rect);
-
-            // Regret audit in top half.
-            if let Some(ref panel) = self.audit_panel {
-                let widget = AuditPanelWidget { state: panel };
-                frame.render_widget(&widget, audit_split[0]);
+        // Render diagnostics in the right side area.
+        if let Some(rect) = diagnostics_area {
+            match (has_audits, has_baseline_validation) {
+                (true, true) => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Percentage(34),
+                            Constraint::Percentage(33),
+                            Constraint::Percentage(33),
+                        ])
+                        .split(rect);
+                    if let Some(ref panel) = self.audit_panel {
+                        let widget = AuditPanelWidget { state: panel };
+                        frame.render_widget(&widget, chunks[0]);
+                    }
+                    self.render_baseline_validation(frame, chunks[1]);
+                    self.render_exploitable_spots(frame, chunks[2]);
+                }
+                (true, false) => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(rect);
+                    if let Some(ref panel) = self.audit_panel {
+                        let widget = AuditPanelWidget { state: panel };
+                        frame.render_widget(&widget, chunks[0]);
+                    }
+                    self.render_exploitable_spots(frame, chunks[1]);
+                }
+                (false, true) => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(rect);
+                    self.render_baseline_validation(frame, chunks[0]);
+                    self.render_exploitable_spots(frame, chunks[1]);
+                }
+                (false, false) => {}
             }
-
-            // Exploitable spots in bottom half.
-            self.render_exploitable_spots(frame, audit_split[1]);
         }
 
         // Hand grids
@@ -658,6 +692,36 @@ impl BlueprintTuiApp {
                     spot.magnitude,
                 )));
             }
+        }
+
+        let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
+        frame.render_widget(paragraph, area);
+    }
+
+    fn render_baseline_validation(&self, frame: &mut Frame, area: Rect) {
+        let report = self
+            .metrics
+            .baseline_validation_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut lines = vec![Line::from(Span::styled(
+            "Baseline Convergence",
+            Style::default().fg(Color::Cyan).bold(),
+        ))];
+
+        if let Some(report) = report {
+            for line in format_baseline_validation_lines(&report, 5, 5)
+                .into_iter()
+                .take(area.height.saturating_sub(1) as usize)
+            {
+                lines.push(Line::from(line.trim_start().to_string()));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "waiting for validation",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
@@ -1292,6 +1356,49 @@ mod tests {
         assert!(
             all_text.contains("Exploitable Spots"),
             "should contain 'Exploitable Spots' panel title: buffer did not contain it",
+        );
+    }
+
+    #[timed_test(10)]
+    fn app_renders_baseline_validation_panel() {
+        use poker_solver_core::blueprint_v2::baseline_validation::{
+            BaselineValidationReport, SpotValidationMetrics,
+        };
+
+        let metrics = make_metrics();
+        let mut report = BaselineValidationReport::default();
+        report.aggregate.spots_total = 6;
+        report.aggregate.spots_scored = 6;
+        report.aggregate.combo_rows_scored = 169;
+        report.aggregate.mean_total_variation = 0.125;
+        report.aggregate.worst_spot_total_variation = 0.25;
+        report.spots.push(SpotValidationMetrics {
+            spot_key: "root".to_string(),
+            mean_total_variation: 0.1,
+            ..SpotValidationMetrics::default()
+        });
+        report.worst_spots = report.spots.clone();
+        metrics.set_baseline_validation_report(report);
+
+        let app = BlueprintTuiApp::new(Arc::clone(&metrics), vec![], TelemetryConfig::default());
+        let backend = ratatui::backend::TestBackend::new(160, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let mut all_text = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                all_text.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        assert!(
+            all_text.contains("Baseline Convergence"),
+            "should contain baseline panel title",
+        );
+        assert!(
+            all_text.contains("aggregate_tv="),
+            "should contain aggregate baseline metric",
         );
     }
 

@@ -17,6 +17,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::info_key::SEAT_CAPACITY;
 use super::{MAX_PLAYERS, Seat, Street};
 
 const DEFAULT_SHARDS: usize = 4096;
@@ -71,6 +72,11 @@ impl MpInfosetKey {
     }
 
     /// Create a key from a global abstract-bucket id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seat.index() >= SEAT_CAPACITY` (exceeds the packed
+    /// seat field shared with `InfoKey128`).
     #[must_use]
     pub const fn from_parts(
         seat: Seat,
@@ -80,6 +86,10 @@ impl MpInfosetKey {
         history_hash: u64,
         history_len: u16,
     ) -> Self {
+        assert!(
+            seat.index() < SEAT_CAPACITY,
+            "seat exceeds packed seat capacity"
+        );
         Self {
             seat: seat.index(),
             bucket,
@@ -199,12 +209,35 @@ pub struct SparseTelemetrySample {
 pub struct SparseSnapshotEntry {
     pub key: MpInfosetKey,
     pub num_actions: u8,
+    #[serde(default)]
+    pub action_identity: Option<Vec<SparseActionDescriptor>>,
     pub regrets: Vec<i32>,
     pub strategy_sums: Vec<u64>,
 }
 
+/// Storage-local action kind for lazy sparse MP rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SparseActionKind {
+    Fold,
+    Check,
+    Call,
+    Lead,
+    Raise,
+    AllInCall,
+    AllInBetRaise,
+}
+
+/// Compact action identity stored with realized lazy sparse MP rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseActionDescriptor {
+    pub kind: SparseActionKind,
+    pub amount_chips: u32,
+    pub source_action_index: u16,
+}
+
 struct SparseNode {
     num_actions: u8,
+    action_identity: Mutex<Option<Box<[SparseActionDescriptor]>>>,
     regrets: Box<[AtomicI32]>,
     strategy_sums: Box<[AtomicU64]>,
 }
@@ -223,6 +256,7 @@ impl SparseNode {
             .into_boxed_slice();
         Self {
             num_actions: num_actions_u8,
+            action_identity: Mutex::new(None),
             regrets,
             strategy_sums,
         }
@@ -230,6 +264,40 @@ impl SparseNode {
 
     fn action_count(&self) -> usize {
         self.num_actions as usize
+    }
+
+    fn action_identity(&self) -> Option<Vec<SparseActionDescriptor>> {
+        self.action_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|actions| actions.to_vec())
+    }
+
+    fn attach_action_identity(&self, actions: &[SparseActionDescriptor]) -> bool {
+        if actions.len() != self.action_count() {
+            debug_assert_eq!(
+                actions.len(),
+                self.action_count(),
+                "action identity length must match sparse infoset action count"
+            );
+            return false;
+        }
+
+        let mut guard = self
+            .action_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = guard.as_deref() {
+            let matches = existing == actions;
+            debug_assert!(
+                matches,
+                "same sparse infoset key used with different action identities"
+            );
+            return matches;
+        }
+        *guard = Some(actions.to_vec().into_boxed_slice());
+        true
     }
 }
 
@@ -766,6 +834,26 @@ impl SparseMpStorage {
         self.get_node(key).map(|node| node.action_count())
     }
 
+    /// Return the stored action identity for a visited infoset, when available.
+    #[must_use]
+    pub fn action_identity(&self, key: MpInfosetKey) -> Option<Vec<SparseActionDescriptor>> {
+        self.get_node(key).and_then(|node| node.action_identity())
+    }
+
+    /// Record action identity for a visited infoset, allocating the row if needed.
+    ///
+    /// Returns `false` if `actions` is empty, exceeds the sparse action-count
+    /// limit, or does not match the action count of an already-allocated row.
+    pub fn record_actions(&self, key: MpInfosetKey, actions: &[SparseActionDescriptor]) -> bool {
+        if actions.is_empty() || actions.len() > u8::MAX as usize {
+            return false;
+        }
+        let Some(node) = self.get_or_create_node(key, actions.len()) else {
+            return false;
+        };
+        node.attach_action_identity(actions)
+    }
+
     /// Add a regret delta, allocating the infoset if needed.
     pub fn add_regret(&self, key: MpInfosetKey, num_actions: usize, action: usize, delta: i32) {
         if action >= num_actions {
@@ -896,6 +984,7 @@ impl SparseMpStorage {
                 entries.push(SparseSnapshotEntry {
                     key,
                     num_actions: node.num_actions,
+                    action_identity: node.action_identity(),
                     regrets: node
                         .regrets
                         .iter()
@@ -920,6 +1009,9 @@ impl SparseMpStorage {
             let Some(node) = self.get_or_create_node(entry.key, num_actions) else {
                 continue;
             };
+            if let Some(actions) = entry.action_identity {
+                node.attach_action_identity(&actions);
+            }
             for (idx, regret) in node.regrets.iter().enumerate() {
                 regret.store(*entry.regrets.get(idx).unwrap_or(&0), Ordering::Relaxed);
             }
@@ -2113,11 +2205,73 @@ mod tests {
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot[0].key < snapshot[1].key);
         assert_eq!(snapshot[0].num_actions, 3);
+        assert_eq!(snapshot[0].action_identity, None);
         assert_eq!(snapshot[0].regrets, vec![0, 0, 33]);
         assert_eq!(snapshot[0].strategy_sums, vec![0, 0, 0]);
         assert_eq!(snapshot[1].num_actions, 2);
+        assert_eq!(snapshot[1].action_identity, None);
         assert_eq!(snapshot[1].regrets, vec![0, 22]);
         assert_eq!(snapshot[1].strategy_sums, vec![11, 0]);
+    }
+
+    #[timed_test]
+    fn action_identity_attaches_snapshots_and_restores() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(4);
+        let actions = vec![
+            SparseActionDescriptor {
+                kind: SparseActionKind::Fold,
+                amount_chips: 0,
+                source_action_index: 0,
+            },
+            SparseActionDescriptor {
+                kind: SparseActionKind::Raise,
+                amount_chips: 42,
+                source_action_index: 1,
+            },
+            SparseActionDescriptor {
+                kind: SparseActionKind::AllInCall,
+                amount_chips: 0,
+                source_action_index: 2,
+            },
+            SparseActionDescriptor {
+                kind: SparseActionKind::AllInBetRaise,
+                amount_chips: 0,
+                source_action_index: 3,
+            },
+        ];
+
+        assert!(storage.record_actions(k, &actions));
+        storage.add_regret(k, 4, 1, 44);
+        storage.add_strategy_sum(k, 4, 0, 55);
+
+        let snapshot = storage.snapshot_entries();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].action_identity.as_deref(),
+            Some(actions.as_slice())
+        );
+
+        let restored = SparseMpStorage::from_snapshot_entries(snapshot);
+        assert_eq!(restored.action_identity(k), Some(actions));
+        assert_eq!(restored.get_regret(k, 1), 44);
+        assert_eq!(restored.get_strategy_sum(k, 0), 55);
+    }
+
+    #[timed_test]
+    fn snapshot_entry_without_action_identity_bincode_round_trips() {
+        let entry = SparseSnapshotEntry {
+            key: key(5),
+            num_actions: 2,
+            action_identity: None,
+            regrets: vec![1, -2],
+            strategy_sums: vec![3, 4],
+        };
+
+        let encoded = bincode::serialize(&entry).unwrap();
+        let decoded: SparseSnapshotEntry = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(decoded, entry);
     }
 
     #[timed_test]
@@ -2161,5 +2315,42 @@ mod tests {
         assert_eq!(restored.get_regret(key(4), 1), 0);
         assert_eq!(restored.get_strategy_sum(key(4), 0), 0);
         assert_eq!(restored.get_strategy_sum(key(4), 1), 55);
+    }
+
+    // ── MpInfosetKey seat guard tests ──
+
+    #[timed_test]
+    fn mp_infoset_key_seats_0_through_15() {
+        for s in 0..=15u8 {
+            let k = MpInfosetKey::from_parts(Seat::from_raw(s), 0, 0, 0, 0, 0);
+            assert_eq!(k.seat, s, "seat {s} not stored correctly");
+        }
+    }
+
+    #[timed_test]
+    #[should_panic(expected = "seat capacity")]
+    fn mp_infoset_key_seat_16_panics() {
+        let _ = MpInfosetKey::from_parts(Seat::from_raw(16), 0, 0, 0, 0, 0);
+    }
+
+    #[timed_test]
+    #[should_panic(expected = "seat capacity")]
+    fn mp_infoset_key_from_street_bucket_seat_overflow_panics() {
+        let _ = MpInfosetKey::from_street_bucket(Seat::from_raw(16), Street::Flop, 0, 0, 0, 0, 0);
+    }
+
+    #[timed_test]
+    fn mp_infoset_key_seat_9_works() {
+        let k = MpInfosetKey::from_street_bucket(
+            Seat::from_raw(9),
+            Street::Turn,
+            100,
+            0xAA,
+            0xBB,
+            0xCC,
+            4,
+        );
+        assert_eq!(k.seat, 9);
+        assert_eq!(k.seat(), Seat::from_raw(9));
     }
 }

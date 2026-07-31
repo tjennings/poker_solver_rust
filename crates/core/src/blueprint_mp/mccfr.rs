@@ -504,7 +504,7 @@ mod tests {
     #[timed_test]
     fn deal_no_duplicate_cards() {
         let mut rng = rand::thread_rng();
-        for num_players in 2..=8u8 {
+        for num_players in 2..=10u8 {
             let deal = sample_deal(num_players, &mut rng);
             let mut all_cards = Vec::new();
             for seat in 0..num_players as usize {
@@ -528,7 +528,7 @@ mod tests {
     #[timed_test]
     fn deal_correct_num_players() {
         let mut rng = rand::thread_rng();
-        for num_players in 2..=8u8 {
+        for num_players in 2..=10u8 {
             let deal = sample_deal(num_players, &mut rng);
             assert_eq!(deal.num_players, num_players);
         }
@@ -752,16 +752,12 @@ mod tests {
         // P1 wins pot. Traverser is P0.
         // P0 payoff = -1.0 (lost their contribution)
         use crate::blueprint_mp::game_tree::TerminalKind;
-        let contributions = [
-            Chips(1.0),
-            Chips(2.0),
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-            Chips::ZERO,
-        ];
+        let contributions = {
+            let mut contributions = [Chips::ZERO; MAX_PLAYERS];
+            contributions[0] = Chips(1.0);
+            contributions[1] = Chips(2.0);
+            contributions
+        };
         let kind = TerminalKind::LastStanding {
             winner: Seat::from_raw(1),
         };

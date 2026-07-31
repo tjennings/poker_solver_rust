@@ -15,6 +15,7 @@
 pub mod abstraction;
 pub mod agent;
 pub mod blueprint_mp;
+pub mod blueprint_universal;
 pub mod blueprint_v2;
 pub mod card_utils;
 pub mod cfr;
@@ -28,6 +29,7 @@ pub mod info_key;
 pub mod range;
 pub mod showdown_equity;
 pub mod simulation;
+pub mod training_runtime;
 
 pub use agent::AgentConfig;
 pub use error::SolverError;

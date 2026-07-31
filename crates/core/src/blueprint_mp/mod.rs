@@ -9,10 +9,11 @@ pub mod sparse_storage;
 pub mod storage;
 pub mod terminal;
 pub mod trainer;
+pub mod training_runtime_adapter;
 pub mod types;
 
 /// Maximum number of players supported in multiplayer blueprints.
-pub const MAX_PLAYERS: usize = 8;
+pub const MAX_PLAYERS: usize = 10;
 
 pub use config::*;
 pub use info_key::InfoKey128;

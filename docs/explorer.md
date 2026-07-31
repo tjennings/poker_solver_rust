@@ -32,10 +32,62 @@ curl -X POST http://localhost:3001/api/is_bundle_loaded -H 'Content-Type: applic
 
 Open the hamburger menu to choose a strategy source:
 
+The Explorer loads both legacy HU `blueprint_v2` bundles and universal dense
+blueprint bundles (`docs/blueprint_format.md`). When opening a directory the
+loader detects `blueprint.json` (universal) before `config.yaml` (legacy) and
+routes through the unified loader (`blueprint_universal::loader`):
+
+- **Universal HU** bundles render through the existing HU views — a
+  `BlueprintV2Strategy` is reconstructed from the universal rows (bitwise-identical
+  to the legacy strategy) using the `config.yaml` retained inside the bundle to
+  rebuild the game tree.
+- **Universal MP** bundles (eager and lazy sparse) load with manifest metadata.
+  The mounted Game view can additionally open a two-player `universal_mp_lazy`
+  bundle when its retained full MP `config.yaml` is present: it renders the
+  preflop hand grid, exposes a chance state while a flop has 0-2 selected
+  cards, and renders the flop matrix after three unique legal cards. It also
+  supports legal turn and river navigation when the matching bucket sources
+  and sparse rows are present. Postflop buckets come from trainer-compatible
+  file-backed `AllBuckets` data resolved
+  from a bundle-local/ancestor `buckets/` directory or a valid
+  `training.cluster_path`; relative values are anchored at the retained config
+  directory and searched through its ancestors before implicit bundle/ancestor
+  `buckets/` directories. Missing sources, mappings, sparse rows, or action
+  schemas are errors. Eager MP bundles and N-player seat selection remain
+  unsupported; these paths preserve the current state and report a precise
+  capability error rather than fabricating strategy.
+
+Loading is staged for universal MP lazy bundles: creating the game session does
+not load the file-backed bucket corpus. The universal payload reader snapshots
+payload bytes into private owned storage and retains source metadata guards;
+manifest, header, checksum, CRC, structural, and probability-normalization
+validation still runs during load, and descriptor materialization is deferred to
+queries as applicable. Queries return no row after a detectable payload
+replacement, truncation, or metadata change. The Tauri log includes
+`[universal-reader]` timings for payload loading, integrity, validation, and
+index setup, plus `[explorer-load]` command-level timings and `[game_new]`
+session and first-bucket timings. This separates universal payload/index work
+from deferred bucket I/O when diagnosing a slow load. HU, eager MP, and legacy
+readers are unchanged.
+
+Universal bundles may be placed directly at the selected directory, under
+`final/`, under a direct `snapshot_NNNN/`, or under the native trainer layout
+`snapshot_NNNN/universal/`. The `load_blueprint_v2` snapshot path also detects
+that nested universal layout before parsing `config.yaml`, so MP configs using
+`game.num_players` are not treated as HU `BlueprintV2Config` files.
+
+Bundle and snapshot listings report the format kind and player count for each
+entry. Snapshot listings mark `snapshot_NNNN/universal/blueprint.json` as
+loadable and read iteration metadata from either `iterations` or `iteration`.
+Legacy MP directories that contain only an MP `config.yaml` are listed as
+metadata-only entries and are not offered to the HU `load_blueprint_v2` path;
+this avoids probing them for the HU-only `game.players` field. Universal MP
+bundles remain the supported MP loading surface.
+
 ### Blueprint V2 Bundle
 Select a blueprint_v2 strategy bundle directory (output from `train-blueprint` command). Displays metadata: stack depth, bet sizes, info set count, training iterations.
 
-**Snapshot selection**: If a blueprint has multiple training snapshots (`snapshot_0000/`, `snapshot_0001/`, etc.), a second picker appears showing each snapshot with its iteration count and training time. The latest snapshot is pre-selected. Blueprints with only one snapshot load directly without the extra step.
+**Snapshot selection**: If a blueprint has multiple training snapshots (`snapshot_0000/`, `snapshot_0001/`, etc.), a second picker appears showing each snapshot with its iteration count and training time. The latest snapshot is pre-selected. Blueprints with only one snapshot load directly without the extra step. MP lazy sparse snapshots are Explorer-loadable when `snapshots.format` is `universal` or `both`, which writes `snapshot_NNNN/universal/blueprint.json`.
 
 ### Rule-Based Agents
 Agent TOML configs from `agents/*.toml` are listed automatically. Each agent maps `HandClass` variants to action frequencies. Select one to explore its strategy.
@@ -62,14 +114,27 @@ When the game reaches the flop, enter board cards (e.g. `Ac Th 4d`). The app:
 
 Continue through turn and river by entering additional cards. The suit mapping from flop canonicalization is applied to turn/river cards automatically.
 
+The turn/river workflow above applies to HU Blueprint sessions and the
+supported two-player `universal_mp_lazy` Game session. Universal MP lazy
+supports Exact solving at non-terminal Flop, Turn, and River decision roots
+when the board is complete for that street. Preflop roots, incomplete-board
+chance states, terminal states, Subgame solves, eager MP bundles, and any
+N-player bundle remain unsupported. The Game view hides those unsupported
+Exact/Subgame affordances instead of presenting the Blueprint matrix as an
+Exact result.
+
 ### Navigation
 
 - **Action buttons** -- click to advance to a child node
 - **History strip** -- shows the full action sequence at the top; click any point to rewind
 - **Available actions** -- displayed for the current decision point with probabilities
+- **Spot encoding** -- the Copy and Load controls serialize and replay the current
+  action history and board for both legacy HU and two-player `universal_mp_lazy`
+  sessions. A blueprint must be loaded before loading a spot encoding.
 
 When using Blueprint, Subgame, or Exact strategy sources, the matrix is source-specific for the current game state. Solved Subgame and Exact sources keep their solved matrix cache anchored to the street state where the solve started, so taking actions or rewinding within that solved subtree continues to show the solved strategy instead of falling back to the blueprint matrix. Player labels in the Explorer are always seat positions (`BB`/`SB`).
 
+For Universal MP lazy sessions, preflop, flop, turn, and river matrices are exported-average-strategy frequencies weighted by the displayed acting seat's concrete-combo root reach at the exact public action history. Reach is propagated independently per seat: an action changes only the reach of the seat that took it, so opponent actions do not reduce that seat's reach. On every postflop street, complete-board blockers have zero reach, combo details expose their individual reach weights, and each cell's probabilities sum to its mean reach across the unblocked combos. The selected board's chance probability is conditioned out; it is used only to block impossible hole-card combos and select the file-backed bucket rows for the current street. Universal MP lazy navigation supports legal flop, turn, and river dealing when the corresponding bucket sources and sparse rows are available.
 ## Simulator Tab
 
 Hand simulation interface for testing strategies against each other.
@@ -118,7 +183,7 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 
 | Command | Description |
 |-|-|
-| `load_bundle` | Load a trained strategy bundle (auto-detects blueprint_v2 format) |
+| `load_bundle` | Load a trained strategy bundle (auto-detects universal `blueprint.json` vs legacy `blueprint_v2` `config.yaml`) |
 | `load_blueprint_v2` | Load a blueprint_v2 strategy bundle (optional `snapshot` param to pick a specific snapshot) |
 | `list_snapshots` | List available snapshots in a blueprint directory (returns name, iterations, elapsed time) |
 | `get_strategy_matrix` | Get strategy for a position (returns 13x13 matrix) |
@@ -131,6 +196,15 @@ The explorer uses these backend commands (available as Tauri commands or HTTP `P
 | `canonicalize_board` | Canonicalize board cards via suit isomorphism |
 | `list_agents` | List available agent TOML configs |
 | `get_combo_classes` | Get combo-level hand class breakdown for a cell |
+| `game_encode_spot` | Encode the active game session's action history and board |
+| `game_load_spot` | Replay a spot encoding in the active legacy HU or two-player Universal MP session |
+
+`game_solve` returns the solve-generation number after accepting a solve request. Keep that
+number with the active solve and pass it as `generation` to `game_cancel_solve` along with the
+same `mode` (`subgame` or `exact`). A cancel request for an older generation is ignored, which
+prevents a delayed UI request from cancelling a newer solve. Cancellation is cooperative: the
+range solver checks the token during action-tree construction and CFR traversal, then the
+backend acknowledges the generation without publishing partial results.
 
 ## Boundary Evaluation
 

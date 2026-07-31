@@ -5,23 +5,37 @@
 //! `game_deal_card`, `game_back`, `game_solve`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
 use serde::Serialize;
 
+use poker_solver_core::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind};
+use poker_solver_core::blueprint_mp::game_tree::TreeAction as MpTreeAction;
+use poker_solver_core::blueprint_mp::lazy_mccfr::{
+    LazyBettingSnapshot, LazyMpGame, LazyResolvedSpot,
+};
+use poker_solver_core::blueprint_mp::Street as MpStreet;
+use poker_solver_core::blueprint_universal::{
+    ActionDescriptor, ActionKind, BundleKind, LoadedBundle, MpLazyKey,
+};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::BlueprintV2Config;
 use poker_solver_core::blueprint_v2::game_tree::{
     GameNode as V2GameNode, GameTree as V2GameTree, TreeAction,
 };
+use poker_solver_core::blueprint_v2::mccfr::AllBuckets;
 use poker_solver_core::blueprint_v2::{LeafEvaluator, Street};
+use poker_solver_core::hands::CanonicalHand;
+use poker_solver_core::poker::{Card as RsPokerCard, Value as RsPokerValue};
 
-use range_solver::card::{card_to_string, NOT_DEALT};
+use range_solver::card::{card_pair_to_index, card_to_string, index_to_card_pair, NOT_DEALT};
 use range_solver::interface::Game;
-use range_solver::{compute_exploitability, finalize, solve_step, PostFlopGame};
+use range_solver::{
+    compute_exploitability, finalize, solve_step_with_cancel, PostFlopGame, SolveStepResult,
+};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -172,9 +186,7 @@ fn boundary_evaluator_log_line(
             },
         )) => {
             let evaluator = match inference_mode {
-                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => {
-                    "Direct CFVNet"
-                }
+                cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::Direct => "Direct CFVNet",
                 cfvnet::eval::boundary_evaluator::BoundaryInferenceMode::DirectNormalizedLegacy => {
                     "Direct CFVNet (legacy scaled bcfv)"
                 }
@@ -220,6 +232,49 @@ pub struct ActionRecord {
     pub actions: Vec<GameAction>,
 }
 
+/// Encode a position from the shared action-history representation used by
+/// both the legacy and Universal MP session backends.
+fn encode_spot_from_history(action_history: &[ActionRecord], board: &[String]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current_actions: Vec<String> = Vec::new();
+    let mut prev_street = String::new();
+    let mut board_idx = 0;
+
+    for rec in action_history {
+        if rec.street != prev_street && !prev_street.is_empty() {
+            if !current_actions.is_empty() {
+                parts.push(current_actions.join(","));
+                current_actions.clear();
+            }
+            let new_cards = match prev_street.as_str() {
+                "Preflop" => 3,
+                _ => 1,
+            };
+            let end = (board_idx + new_cards).min(board.len());
+            let board_str: String = board[board_idx..end].join("");
+            board_idx = end;
+            parts.push(board_str);
+        }
+        prev_street = rec.street.clone();
+        current_actions.push(format!(
+            "{}:{}",
+            rec.position.to_lowercase(),
+            rec.label.to_lowercase()
+        ));
+    }
+
+    if !current_actions.is_empty() {
+        parts.push(current_actions.join(","));
+    }
+
+    if board_idx < board.len() {
+        let remaining: String = board[board_idx..].join("");
+        parts.push(remaining);
+    }
+
+    parts.join("|")
+}
+
 /// Solve progress info (when a subgame solve is running).
 #[derive(Debug, Clone, Serialize)]
 pub struct SolveStatus {
@@ -237,6 +292,11 @@ pub struct GameAction {
     pub id: String,
     pub label: String,
     pub action_type: String,
+    /// Unrounded amount in big blinds used for internal cache/session matching.
+    /// This is deliberately omitted from the frontend payload; labels remain the
+    /// user-facing representation while navigation uses the actual descriptor.
+    #[serde(skip)]
+    pub(crate) exact_amount_bb: Option<f64>,
 }
 
 /// Per-combo strategy detail (e.g., "AhKh" with its own action probabilities).
@@ -255,7 +315,10 @@ pub struct GameMatrixCell {
     pub hand: String,
     pub suited: bool,
     pub pair: bool,
-    pub probabilities: Vec<f32>, // one per action (averaged across combos)
+    /// One value per action. Universal lazy MP preflop and postflop matrix
+    /// values are root-reach-weighted and sum to `weight`. Other sources may
+    /// expose conditional strategy frequencies.
+    pub probabilities: Vec<f32>,
     pub combo_count: usize,
     pub weight: f32, // reaching probability
     pub ev: Option<f32>,
@@ -319,6 +382,35 @@ pub fn effective_stack_for_solve_root(root: &SolveGameRoot) -> i32 {
         .unwrap_or(1)
 }
 
+/// Exact solve inputs captured from a Universal MP lazy session.
+///
+/// `raw_reaches_by_seat` stays in the bundle's actual seat order. The exact
+/// solver maps those arrays to OOP/IP using `oop_seat` and `ip_seat`; keeping
+/// both facts in this type prevents display-order assumptions from leaking
+/// into solver construction.
+#[derive(Debug, Clone)]
+pub struct UniversalMpSolveSnapshot {
+    pub street: MpStreet,
+    pub board: Vec<String>,
+    pub raw_reaches_by_seat: [Vec<f32>; 2],
+    pub acting_seat: u8,
+    pub pot: i32,
+    pub remaining_stacks: [i32; 2],
+    pub street_bets: [i32; 2],
+    pub facing_bet: bool,
+    pub raise_count: u8,
+    pub last_raise_to: i32,
+    pub last_aggressive_action: Option<MpTreeAction>,
+    pub oop_seat: u8,
+    pub ip_seat: u8,
+    pub root: SolveGameRoot,
+    pub bet_sizes: Vec<Vec<f64>>,
+    pub bet_sizes_by_street: [Vec<Vec<f64>>; 3],
+    pub solver_chip_scale: f64,
+    pub action_history: Vec<ActionRecord>,
+    pub actions: Vec<GameAction>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BettingState {
     pot: f64,
@@ -356,6 +448,10 @@ pub struct GameState {
 pub struct SolveState {
     pub solving: AtomicBool,
     pub cancel: Arc<AtomicBool>,
+    /// Monotonically increasing identity for the solve/session state.
+    pub generation: AtomicU64,
+    /// Serializes worker publications with reset/start invalidation.
+    publish_gate: RwLock<()>,
     pub iteration: AtomicU32,
     pub max_iterations: AtomicU32,
     /// Exploitability stored as f32 bits (use `f32::to_bits` / `f32::from_bits`).
@@ -374,6 +470,12 @@ pub struct SolveState {
     pub solve_path: RwLock<Vec<usize>>,
     /// Session anchor for the cached solve tree.
     pub solve_anchor: RwLock<Option<SolveAnchor>>,
+    /// Chip scale used to build the exact MP range-solver tree.
+    ///
+    /// `None` preserves the legacy semantic matcher for HU sessions. MP exact
+    /// navigation uses this to compare raw lazy actions with the solver's
+    /// integer-chip descriptors without falling back to display labels.
+    exact_action_scale: RwLock<Option<f64>>,
 }
 
 impl Default for SolveState {
@@ -381,6 +483,8 @@ impl Default for SolveState {
         Self {
             solving: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
+            generation: AtomicU64::new(0),
+            publish_gate: RwLock::new(()),
             iteration: AtomicU32::new(0),
             max_iterations: AtomicU32::new(0),
             exploitability_bits: AtomicU32::new(0),
@@ -391,15 +495,18 @@ impl Default for SolveState {
             solve_cache: RwLock::new(HashMap::new()),
             solve_path: RwLock::new(vec![]),
             solve_anchor: RwLock::new(None),
+            exact_action_scale: RwLock::new(None),
         }
     }
 }
 
 impl SolveState {
-    /// Reset all fields to defaults. Called when starting a new hand or going back.
+    /// Reset all fields and invalidate every worker from the previous state.
     pub fn reset(&self) {
+        let _publish_guard = self.publish_gate.write();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.solving.store(false, Ordering::Relaxed);
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Release);
         self.iteration.store(0, Ordering::Relaxed);
         self.max_iterations.store(0, Ordering::Relaxed);
         self.exploitability_bits.store(0, Ordering::Relaxed);
@@ -410,6 +517,33 @@ impl SolveState {
         *self.solve_cache.write() = HashMap::new();
         *self.solve_path.write() = vec![];
         *self.solve_anchor.write() = None;
+        *self.exact_action_scale.write() = None;
+    }
+
+    fn publish_if_current<F>(&self, generation: u64, publish: F) -> bool
+    where
+        F: FnOnce(&Self),
+    {
+        let _publish_guard = self.publish_gate.read();
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        publish(self);
+        true
+    }
+
+    /// Request cancellation without allowing a solve reset to interleave with
+    /// generation validation and the cancel flag store.
+    fn request_cancel(&self, requested_generation: Option<u64>) -> bool {
+        let _publish_guard = self.publish_gate.read();
+        if requested_generation.is_some_and(|generation| {
+            self.generation.load(Ordering::Acquire) != generation
+                || !self.solving.load(Ordering::Acquire)
+        }) {
+            return false;
+        }
+        self.cancel.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -420,6 +554,14 @@ impl SolveState {
 /// Shared session state, accessible by Tauri commands.
 pub struct GameSessionState {
     pub session: RwLock<Option<GameSession>>,
+    /// Separate lazy MP session. The HU `session` field remains unchanged so
+    /// existing GameSession and solver tests keep their original ownership and
+    /// state model.
+    pub mp_session: RwLock<Option<LazyMpSession>>,
+    /// Serializes solve-input capture with session mutations. The write side
+    /// is held only while a solve request snapshots its inputs and starts a
+    /// generation; navigation uses the read side while changing state.
+    solve_request_gate: RwLock<()>,
     pub subgame_solve: Arc<SolveState>,
     pub exact_solve: Arc<SolveState>,
 }
@@ -439,10 +581,1117 @@ impl Default for GameSessionState {
     fn default() -> Self {
         Self {
             session: RwLock::new(None),
+            mp_session: RwLock::new(None),
+            solve_request_gate: RwLock::new(()),
             subgame_solve: Arc::new(SolveState::default()),
             exact_solve: Arc::new(SolveState::default()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lazy MP GameSession
+// ---------------------------------------------------------------------------
+
+/// Read-only navigation over a two-player universal lazy MP bundle.
+///
+/// The cursor remains the semantic lazy public model. The adapter adds a typed
+/// board and uses file-backed `AllBuckets` lookups for completed postflop
+/// streets; it never materializes a dense MP tree or fabricates rows.
+pub struct LazyMpSession {
+    game: LazyMpGame,
+    spot: LazyResolvedSpot,
+    bundle: Arc<LoadedBundle>,
+    config: BlueprintMpConfig,
+    all_buckets: Option<Arc<AllBuckets>>,
+    bucket_error: Option<String>,
+    bucket_source: Option<crate::exploration::UniversalMpData>,
+    board: Vec<RsPokerCard>,
+    action_history: Vec<ActionRecord>,
+    terminal: bool,
+}
+
+impl LazyMpSession {
+    pub(crate) fn from_exploration_data(
+        data: crate::exploration::UniversalMpData,
+    ) -> Result<Self, String> {
+        let bundle_kind = data.bundle.kind();
+        if bundle_kind != BundleKind::UniversalMpLazy {
+            return Err(format!(
+                "Universal MP GameExplorer supports only universal_mp_lazy bundles; received {bundle_kind}"
+            ));
+        }
+        let config = data.config.clone().ok_or_else(|| {
+            "game_new requires a retained MP config.yaml for universal MP navigation".to_string()
+        })?;
+        let manifest = data
+            .bundle
+            .manifest()
+            .ok_or_else(|| "Universal MP bundle is missing its manifest".to_string())?;
+        if manifest.game.num_players != config.game.num_players {
+            return Err(format!(
+                "Universal MP config player count ({}) does not match bundle manifest ({})",
+                config.game.num_players, manifest.game.num_players
+            ));
+        }
+        if config.game.num_players != 2 {
+            return Err(format!(
+                "Universal MP GameExplorer currently supports 2-player sessions; bundle has {} players",
+                config.game.num_players
+            ));
+        }
+        mp_big_blind_amount(&config)?;
+
+        let game = LazyMpGame::new(&config.game, &config.action_abstraction);
+        let spot = LazyResolvedSpot::root(&game);
+        let bucket_source = crate::exploration::UniversalMpData {
+            bundle: Arc::clone(&data.bundle),
+            config: data.config.clone(),
+            config_dir: data.config_dir.clone(),
+            bundle_dir: data.bundle_dir.clone(),
+        };
+        Ok(Self {
+            game,
+            spot,
+            bundle: data.bundle,
+            config: *config,
+            all_buckets: None,
+            bucket_error: None,
+            bucket_source: Some(bucket_source),
+            board: vec![],
+            action_history: vec![],
+            terminal: false,
+        })
+    }
+
+    fn ensure_all_buckets(&mut self) -> Result<&AllBuckets, String> {
+        if self.all_buckets.is_none() && self.bucket_error.is_none() {
+            let source = self
+                .bucket_source
+                .take()
+                .ok_or_else(|| "Universal MP flop bucket source is unavailable".to_string())?;
+            let bucket_load_started = Instant::now();
+            match crate::exploration::load_mp_all_buckets(&source) {
+                Ok(all_buckets) => self.all_buckets = Some(all_buckets),
+                Err(error) => self.bucket_error = Some(error),
+            }
+            eprintln!(
+                "[game_new] universal MP first bucket load completed in {:.3}s",
+                bucket_load_started.elapsed().as_secs_f64()
+            );
+        }
+
+        self.all_buckets.as_deref().ok_or_else(|| {
+            self.bucket_error
+                .clone()
+                .unwrap_or_else(|| "Universal MP flop bucket source is unavailable".to_string())
+        })
+    }
+
+    fn current_actions(&self) -> Vec<MpTreeAction> {
+        self.spot.actions(&self.game)
+    }
+
+    fn position_label(&self, seat: u8) -> String {
+        self.config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| blind.seat == seat)
+            .map(|blind| match blind.kind {
+                poker_solver_core::blueprint_mp::config::ForcedBetKind::SmallBlind => "SB",
+                poker_solver_core::blueprint_mp::config::ForcedBetKind::BigBlind => "BB",
+                _ => "P",
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("P{}", seat + 1))
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn display_stacks(&self) -> [i32; 2] {
+        let stacks = self.spot.stacks();
+        let sb_seat = self
+            .config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| {
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::SmallBlind
+            })
+            .map_or(0, |blind| blind.seat);
+        let bb_seat = self
+            .config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| {
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::BigBlind
+            })
+            .map_or(1, |blind| blind.seat);
+        [
+            stacks[bb_seat as usize].0 as i32,
+            stacks[sb_seat as usize].0 as i32,
+        ]
+    }
+
+    fn current_actions_at(&self, spot: LazyResolvedSpot) -> Vec<MpTreeAction> {
+        spot.actions(&self.game)
+    }
+
+    fn probabilities_for_bucket(
+        &self,
+        spot: LazyResolvedSpot,
+        bucket: u16,
+        mp_actions: &[MpTreeAction],
+    ) -> Result<Vec<f32>, String> {
+        let key = spot.key_for_bucket(bucket);
+        let lazy_key = MpLazyKey {
+            seat: key.seat,
+            street: spot.street() as u8,
+            local_bucket: key.local_bucket(),
+            history_hash: key.history_hash,
+            history_len: key.history_len,
+        };
+        let Some(view) = self.bundle.query_mp_lazy(&lazy_key) else {
+            return Err(format!(
+                "Universal MP sparse row is missing: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}",
+                lazy_key.seat,
+                lazy_key.street,
+                lazy_key.local_bucket,
+                lazy_key.history_hash,
+                lazy_key.history_len
+            ));
+        };
+
+        if view.actions.len() != mp_actions.len() || view.probs.len() != view.actions.len() {
+            return Err(format!(
+                "Universal MP sparse row schema mismatch: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}, row_actions={}, row_probs={}, legal_actions={}",
+                lazy_key.seat,
+                lazy_key.street,
+                lazy_key.local_bucket,
+                lazy_key.history_hash,
+                lazy_key.history_len,
+                view.actions.len(),
+                view.probs.len(),
+                mp_actions.len()
+            ));
+        }
+
+        let mut probabilities = vec![0.0; mp_actions.len()];
+        let mut seen = vec![false; mp_actions.len()];
+        for (row_index, descriptor) in view.actions.iter().enumerate() {
+            let action_index = usize::from(descriptor.source_action_index);
+            if action_index >= mp_actions.len() || seen[action_index] {
+                return Err(format!(
+                    "Universal MP sparse row action schema is incompatible: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}, source_action_index={action_index}, legal_actions={}",
+                    lazy_key.seat,
+                    lazy_key.street,
+                    lazy_key.local_bucket,
+                    lazy_key.history_hash,
+                    lazy_key.history_len,
+                    mp_actions.len()
+                ));
+            }
+            validate_mp_action_descriptor(descriptor, &mp_actions[action_index]).map_err(|error| {
+                format!(
+                    "Universal MP sparse row action schema mismatch at seat={}, street={}, local_bucket={}, history_hash={}, history_len={}, source_action_index={action_index}: {error}",
+                    lazy_key.seat,
+                    lazy_key.street,
+                    lazy_key.local_bucket,
+                    lazy_key.history_hash,
+                    lazy_key.history_len
+                )
+            })?;
+            seen[action_index] = true;
+            probabilities[action_index] = view.probs[row_index];
+        }
+        if seen.iter().any(|seen| !seen) {
+            return Err(format!(
+                "Universal MP sparse row action schema omits a legal action: seat={}, street={}, local_bucket={}, history_hash={}, history_len={}",
+                lazy_key.seat,
+                lazy_key.street,
+                lazy_key.local_bucket,
+                lazy_key.history_hash,
+                lazy_key.history_len
+            ));
+        }
+        Ok(probabilities)
+    }
+
+    fn preflop_bucket_for_hand(&self, hand_index: usize) -> Result<u16, String> {
+        let bucket_count = usize::from(self.config.clustering.preflop.buckets);
+        if bucket_count == 0 {
+            return Err("Universal MP config has zero preflop buckets".to_string());
+        }
+        Ok(if bucket_count == 169 {
+            hand_index as u16
+        } else {
+            hand_index.min(bucket_count - 1) as u16
+        })
+    }
+
+    /// Propagate each seat's root reach through the exact public action path.
+    ///
+    /// This intentionally keeps per-seat reach independent: an action only
+    /// changes the reach of the seat that selected it. Opponent actions do not
+    /// reduce the other seat's root reach.
+    fn preflop_root_reaches(
+        &self,
+        action_history: &[ActionRecord],
+    ) -> Result<[Vec<f32>; 2], String> {
+        let mut reaches = [vec![1.0; 169], vec![1.0; 169]];
+        let mut replay_spot = LazyResolvedSpot::root(&self.game);
+
+        for record in action_history {
+            if replay_spot.street() != MpStreet::Preflop {
+                return Err(format!(
+                    "Universal MP preflop reach replay reached {} before action {}",
+                    mp_street_to_string(replay_spot.street()),
+                    record.action_id
+                ));
+            }
+            let mp_actions = replay_spot.actions(&self.game);
+            let action_index = record.action_id.parse::<usize>().map_err(|_| {
+                format!(
+                    "Invalid MP action_id during reach replay: {}",
+                    record.action_id
+                )
+            })?;
+            if action_index >= mp_actions.len() {
+                return Err(format!(
+                    "MP action {action_index} out of range during reach replay (max {})",
+                    mp_actions.len().saturating_sub(1)
+                ));
+            }
+            let seat = usize::from(replay_spot.to_act().index());
+            if seat >= reaches.len() {
+                return Err(format!(
+                    "Universal MP reach replay encountered unsupported seat {}",
+                    replay_spot.to_act().index()
+                ));
+            }
+
+            for hand_index in 0..169 {
+                let bucket = self.preflop_bucket_for_hand(hand_index)?;
+                let probabilities =
+                    self.probabilities_for_bucket(replay_spot, bucket, &mp_actions)?;
+                reaches[seat][hand_index] *= probabilities[action_index];
+            }
+
+            replay_spot = replay_spot
+                .advance(&self.game, action_index)
+                .ok_or_else(|| {
+                    format!(
+                        "Universal MP reach replay action {} terminated before the requested state",
+                        record.action_id
+                    )
+                })?;
+        }
+
+        Ok(reaches)
+    }
+
+    /// Propagate concrete-combo reach through the public action path for a
+    /// completed postflop board. Each action changes only the reach of its
+    /// acting seat, while blockers are checked against the complete board.
+    fn postflop_root_reaches(
+        &mut self,
+        action_history: &[ActionRecord],
+        board: &[RsPokerCard],
+    ) -> Result<[Vec<f32>; 2], String> {
+        let mut reaches = [vec![1.0; 1326], vec![1.0; 1326]];
+        let mut replay_spot = LazyResolvedSpot::root(&self.game);
+
+        for record in action_history {
+            let street = replay_spot.street();
+            if !matches!(
+                street,
+                MpStreet::Preflop | MpStreet::Flop | MpStreet::Turn | MpStreet::River
+            ) {
+                return Err(format!(
+                    "Universal MP postflop reach replay reached {} before action {}",
+                    mp_street_to_string(street),
+                    record.action_id
+                ));
+            }
+            let mp_actions = replay_spot.actions(&self.game);
+            let action_index = record.action_id.parse::<usize>().map_err(|_| {
+                format!(
+                    "Invalid MP action_id during flop reach replay: {}",
+                    record.action_id
+                )
+            })?;
+            if action_index >= mp_actions.len() {
+                return Err(format!(
+                    "MP action {action_index} out of range during flop reach replay (max {})",
+                    mp_actions.len().saturating_sub(1)
+                ));
+            }
+            let seat = usize::from(replay_spot.to_act().index());
+            if seat >= reaches.len() {
+                return Err(format!(
+                    "Universal MP flop reach replay encountered unsupported seat {}",
+                    replay_spot.to_act().index()
+                ));
+            }
+
+            let mut probabilities_by_bucket = HashMap::new();
+            for combo_index in 0..1326 {
+                let (card1, card2) = index_to_card_pair(combo_index);
+                let combo = [
+                    crate::exploration::range_solver_to_rs_card(card1),
+                    crate::exploration::range_solver_to_rs_card(card2),
+                ];
+                if combo_is_blocked(combo, board) {
+                    reaches[seat][combo_index] = 0.0;
+                    continue;
+                }
+
+                let bucket = if street == MpStreet::Preflop {
+                    let hand = CanonicalHand::from_cards(combo[0], combo[1]);
+                    self.preflop_bucket_for_hand(hand.index())?
+                } else {
+                    let visible_board_cards = mp_required_board_cards(street);
+                    self.postflop_bucket(
+                        replay_spot,
+                        "concrete combo",
+                        combo,
+                        &board[..visible_board_cards],
+                    )?
+                };
+                let probabilities = match probabilities_by_bucket.get(&bucket) {
+                    Some(probabilities) => probabilities,
+                    None => {
+                        let probabilities =
+                            self.probabilities_for_bucket(replay_spot, bucket, &mp_actions)?;
+                        probabilities_by_bucket.insert(bucket, probabilities);
+                        probabilities_by_bucket
+                            .get(&bucket)
+                            .expect("inserted MP bucket probabilities")
+                    }
+                };
+                reaches[seat][combo_index] *= probabilities[action_index];
+            }
+
+            replay_spot = replay_spot
+                .advance(&self.game, action_index)
+                .ok_or_else(|| {
+                    format!(
+                        "Universal MP postflop reach replay action {} terminated before the requested state",
+                        record.action_id
+                    )
+                })?;
+        }
+
+        Ok(reaches)
+    }
+
+    /// Capture the exact supported MP solve inputs at the current postflop spot.
+    ///
+    /// Reaches are replayed from the raw sparse rows and remain in actual seat
+    /// order. Betting metadata comes from the lazy core state, including the
+    /// raw action that established a live bet; no display label is parsed.
+    pub fn exact_solve_snapshot(&mut self) -> Result<UniversalMpSolveSnapshot, String> {
+        if self.terminal {
+            return Err(
+                "Exact solve requires a non-terminal Universal MP postflop decision".into(),
+            );
+        }
+        let street = self.spot.street();
+        if !matches!(street, MpStreet::Flop | MpStreet::Turn | MpStreet::River)
+            || self.board.len() != mp_required_board_cards(street)
+        {
+            return Err(format!(
+                "Exact solve is supported for non-terminal UniversalMpLazy Flop, Turn, or River decisions with a complete board; got street={}, board_cards={}",
+                mp_street_to_string(street),
+                self.board.len()
+            ));
+        }
+
+        let board = mp_board_strings(&self.board);
+        let action_history = self.action_history.clone();
+        let raw_reaches_by_seat =
+            self.postflop_root_reaches(&action_history, &self.board.clone())?;
+        let actions =
+            build_mp_game_actions(&self.current_actions(), mp_big_blind_amount(&self.config)?);
+        let betting = self.spot.betting_snapshot();
+        let (sb_seat, bb_seat) = mp_sb_bb_seats(&self.config)?;
+        let big_blind = mp_big_blind_amount(&self.config)?;
+        let solver_chip_scale = mp_exact_chip_scale(&betting, big_blind)?;
+        let bet_sizes_by_street = mp_bet_sizes_by_street(&self.config)?;
+        let root = mp_solve_root(&betting, sb_seat, bb_seat, solver_chip_scale)?;
+
+        Ok(UniversalMpSolveSnapshot {
+            street,
+            board,
+            raw_reaches_by_seat,
+            acting_seat: betting.to_act.index(),
+            pot: mp_chips_to_solver_units(betting.pot.0, solver_chip_scale)?,
+            remaining_stacks: [
+                mp_chips_to_solver_units(betting.stacks[0].0, solver_chip_scale)?,
+                mp_chips_to_solver_units(betting.stacks[1].0, solver_chip_scale)?,
+            ],
+            street_bets: [
+                mp_chips_to_solver_units(betting.street_bets[0].0, solver_chip_scale)?,
+                mp_chips_to_solver_units(betting.street_bets[1].0, solver_chip_scale)?,
+            ],
+            facing_bet: betting.facing_bet,
+            raise_count: betting.raise_count,
+            last_raise_to: mp_chips_to_solver_units(betting.last_raise_to.0, solver_chip_scale)?,
+            last_aggressive_action: betting.last_aggressive_action,
+            oop_seat: bb_seat,
+            ip_seat: sb_seat,
+            root,
+            bet_sizes: bet_sizes_by_street[mp_street_index(street)].clone(),
+            bet_sizes_by_street,
+            solver_chip_scale,
+            action_history,
+            actions,
+        })
+    }
+
+    fn postflop_bucket(
+        &mut self,
+        spot: LazyResolvedSpot,
+        hand: &str,
+        hole_cards: [RsPokerCard; 2],
+        board: &[RsPokerCard],
+    ) -> Result<u16, String> {
+        let street = spot.street();
+        if street == MpStreet::Preflop {
+            return Err("Universal MP postflop bucket lookup received a preflop spot".to_string());
+        }
+        let street_name = mp_street_to_string(street).to_ascii_lowercase();
+        let all_buckets = self.ensure_all_buckets()?;
+        let bucket_street = match street {
+            MpStreet::Flop => Street::Flop,
+            MpStreet::Turn => Street::Turn,
+            MpStreet::River => Street::River,
+            MpStreet::Preflop => unreachable!("preflop was rejected above"),
+        };
+        all_buckets
+            .try_get_bucket(bucket_street, hole_cards, board)
+            .map_err(|error| {
+                format!(
+                    "Universal MP {street_name} bucket lookup failed: seat={}, street={street_name}, hand={}, board={:?}, hole_cards={:?}: {error}",
+                    spot.to_act().index(),
+                    hand,
+                    board,
+                    hole_cards
+                )
+            })
+    }
+
+    fn build_postflop_matrix(
+        &mut self,
+        spot: LazyResolvedSpot,
+        board: &[RsPokerCard],
+        mp_actions: &[MpTreeAction],
+        action_history: &[ActionRecord],
+    ) -> Result<GameMatrix, String> {
+        let required_board_cards = mp_required_board_cards(spot.street());
+        if !matches!(
+            spot.street(),
+            MpStreet::Flop | MpStreet::Turn | MpStreet::River
+        ) {
+            return Err(format!(
+                "Universal MP postflop matrix requires a postflop decision, got {}",
+                mp_street_to_string(spot.street())
+            ));
+        }
+        if board.len() != required_board_cards {
+            return Err(format!(
+                "Universal MP {} matrix requires exactly {} board cards, got {}",
+                mp_street_to_string(spot.street()).to_ascii_lowercase(),
+                required_board_cards,
+                board.len(),
+            ));
+        }
+        let actions = build_mp_game_actions(mp_actions, mp_big_blind_amount(&self.config)?);
+        let reaches = self.postflop_root_reaches(action_history, board)?;
+        let acting_seat = usize::from(spot.to_act().index());
+        if acting_seat >= reaches.len() {
+            return Err(format!(
+                "Universal MP postflop matrix encountered unsupported seat {}",
+                spot.to_act().index()
+            ));
+        }
+        let mut cells = Vec::with_capacity(13);
+        for (row, &rank1) in RANKS.iter().enumerate() {
+            let mut row_cells = Vec::with_capacity(13);
+            for (col, &rank2) in RANKS.iter().enumerate() {
+                let (label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
+                let hand = CanonicalHand::new(mp_rank_value(rank1), mp_rank_value(rank2), suited);
+                let mut sum_probabilities = vec![0.0; actions.len()];
+                let mut sum_reach = 0.0;
+                let mut combos = Vec::new();
+                let mut probabilities_by_bucket = HashMap::new();
+                for (card1, card2) in hand.combos() {
+                    let combo = [card1, card2];
+                    if combo_is_blocked(combo, board) {
+                        continue;
+                    }
+                    let bucket = self.postflop_bucket(spot, &label, [card1, card2], board)?;
+                    let probabilities = match probabilities_by_bucket.get(&bucket) {
+                        Some(probabilities) => probabilities,
+                        None => {
+                            let probabilities =
+                                self.probabilities_for_bucket(spot, bucket, mp_actions)?;
+                            probabilities_by_bucket.insert(bucket, probabilities);
+                            probabilities_by_bucket
+                                .get(&bucket)
+                                .expect("inserted MP bucket probabilities")
+                        }
+                    };
+                    let combo_index = card_pair_to_index(
+                        crate::exploration::rs_card_to_range_solver(card1),
+                        crate::exploration::rs_card_to_range_solver(card2),
+                    );
+                    let combo_reach = reaches[acting_seat][combo_index];
+                    sum_reach += combo_reach;
+                    for (sum, probability) in sum_probabilities.iter_mut().zip(probabilities.iter())
+                    {
+                        *sum += combo_reach * *probability;
+                    }
+                    let cards = format!(
+                        "{}{}",
+                        card_to_string(crate::exploration::rs_card_to_range_solver(card1))
+                            .unwrap_or_default(),
+                        card_to_string(crate::exploration::rs_card_to_range_solver(card2))
+                            .unwrap_or_default()
+                    );
+                    combos.push(ComboDetail {
+                        cards,
+                        probabilities: probabilities
+                            .iter()
+                            .map(|probability| combo_reach * *probability)
+                            .collect(),
+                        weight: combo_reach,
+                        bucket: Some(bucket),
+                    });
+                }
+                let combo_count = combos.len();
+                let probabilities = if combo_count == 0 {
+                    vec![0.0; actions.len()]
+                } else {
+                    sum_probabilities
+                        .into_iter()
+                        .map(|probability| probability / combo_count as f32)
+                        .collect()
+                };
+                row_cells.push(GameMatrixCell {
+                    hand: label,
+                    suited,
+                    pair,
+                    probabilities,
+                    combo_count,
+                    weight: if combo_count == 0 {
+                        0.0
+                    } else {
+                        sum_reach / combo_count as f32
+                    },
+                    ev: None,
+                    combos,
+                });
+            }
+            cells.push(row_cells);
+        }
+        Ok(GameMatrix { cells, actions })
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn state_at(
+        &mut self,
+        spot: LazyResolvedSpot,
+        board: &[RsPokerCard],
+        action_history: &[ActionRecord],
+        terminal: bool,
+    ) -> Result<GameState, String> {
+        let stacks = self.display_stacks_at(spot);
+        let board_strings = mp_board_strings(board);
+        let street = mp_street_to_string(spot.street());
+        if terminal {
+            return Ok(GameState {
+                street,
+                position: String::new(),
+                board: board_strings,
+                pot: spot.pot().0 as i32,
+                stacks,
+                matrix: None,
+                actions: vec![],
+                action_history: action_history.to_vec(),
+                is_terminal: true,
+                is_chance: false,
+                solve: None,
+            });
+        }
+
+        let required_board_cards = mp_required_board_cards(spot.street());
+        if required_board_cards > board.len() {
+            return Ok(GameState {
+                street,
+                position: String::new(),
+                board: board_strings,
+                pot: spot.pot().0 as i32,
+                stacks,
+                matrix: None,
+                actions: vec![],
+                action_history: action_history.to_vec(),
+                is_terminal: false,
+                is_chance: true,
+                solve: None,
+            });
+        }
+
+        let mp_actions = self.current_actions_at(spot);
+        let actions = build_mp_game_actions(&mp_actions, mp_big_blind_amount(&self.config)?);
+        if matches!(
+            spot.street(),
+            MpStreet::Flop | MpStreet::Turn | MpStreet::River
+        ) {
+            let matrix = self.build_postflop_matrix(spot, board, &mp_actions, action_history)?;
+            return Ok(GameState {
+                street,
+                position: self.position_label(spot.to_act().index()),
+                board: board_strings,
+                pot: spot.pot().0 as i32,
+                stacks,
+                matrix: Some(matrix),
+                actions,
+                action_history: action_history.to_vec(),
+                is_terminal: false,
+                is_chance: false,
+                solve: None,
+            });
+        }
+        debug_assert_eq!(spot.street(), MpStreet::Preflop);
+
+        let reaches = self.preflop_root_reaches(action_history)?;
+        let acting_seat = usize::from(spot.to_act().index());
+        let mut cells = Vec::with_capacity(13);
+        for (row, &rank1) in RANKS.iter().enumerate() {
+            let mut row_cells = Vec::with_capacity(13);
+            for (col, &rank2) in RANKS.iter().enumerate() {
+                let (label, suited, pair) = hand_label_from_matrix(row, col, rank1, rank2);
+                let hand_index = canonical_hand_index_from_ranks(rank1, rank2, suited);
+                let bucket = self.preflop_bucket_for_hand(hand_index)?;
+                let reach = reaches[acting_seat][hand_index];
+                let conditional_probabilities =
+                    self.probabilities_for_bucket(spot, bucket, &mp_actions)?;
+                let probabilities = conditional_probabilities
+                    .into_iter()
+                    .map(|probability| reach * probability)
+                    .collect();
+                row_cells.push(GameMatrixCell {
+                    hand: label,
+                    suited,
+                    pair,
+                    probabilities,
+                    combo_count: 0,
+                    weight: reach,
+                    ev: None,
+                    combos: vec![],
+                });
+            }
+            cells.push(row_cells);
+        }
+
+        Ok(GameState {
+            street,
+            position: self.position_label(spot.to_act().index()),
+            board: board_strings,
+            pot: spot.pot().0 as i32,
+            stacks,
+            matrix: Some(GameMatrix {
+                cells,
+                actions: actions.clone(),
+            }),
+            actions,
+            action_history: action_history.to_vec(),
+            is_terminal: false,
+            is_chance: false,
+            solve: None,
+        })
+    }
+
+    fn display_stacks_at(&self, spot: LazyResolvedSpot) -> [i32; 2] {
+        let stacks = spot.stacks();
+        let sb_seat = self
+            .config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| {
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::SmallBlind
+            })
+            .map_or(0, |blind| blind.seat);
+        let bb_seat = self
+            .config
+            .game
+            .blinds
+            .iter()
+            .find(|blind| {
+                blind.kind == poker_solver_core::blueprint_mp::config::ForcedBetKind::BigBlind
+            })
+            .map_or(1, |blind| blind.seat);
+        [
+            stacks[bb_seat as usize].0 as i32,
+            stacks[sb_seat as usize].0 as i32,
+        ]
+    }
+
+    fn get_state(&mut self) -> Result<GameState, String> {
+        let board = self.board.clone();
+        let action_history = self.action_history.clone();
+        self.state_at(self.spot, &board, &action_history, self.terminal)
+    }
+
+    fn state_shell(&self) -> GameState {
+        let is_chance =
+            !self.terminal && mp_required_board_cards(self.spot.street()) > self.board.len();
+        GameState {
+            street: mp_street_to_string(self.spot.street()),
+            position: if self.terminal || is_chance {
+                String::new()
+            } else {
+                self.position_label(self.spot.to_act().index())
+            },
+            board: mp_board_strings(&self.board),
+            pot: self.spot.pot().0 as i32,
+            stacks: self.display_stacks(),
+            matrix: None,
+            actions: vec![],
+            action_history: self.action_history.clone(),
+            is_terminal: self.terminal,
+            is_chance,
+            solve: None,
+        }
+    }
+
+    fn action_transition(
+        &self,
+        action_id: &str,
+    ) -> Result<(ActionRecord, LazyResolvedSpot, bool), String> {
+        if self.terminal {
+            return Err("Universal MP session is already terminal".to_string());
+        }
+        if mp_required_board_cards(self.spot.street()) > self.board.len() {
+            return Err(format!(
+                "Universal MP session is at a {} chance boundary; deal the remaining board cards before playing an action",
+                mp_street_to_string(self.spot.street())
+            ));
+        }
+        let action_index = action_id
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid MP action_id: {action_id}"))?;
+        let mp_actions = self.current_actions();
+        let actions = build_mp_game_actions(&mp_actions, mp_big_blind_amount(&self.config)?);
+        if action_index >= mp_actions.len() {
+            return Err(format!(
+                "MP action {action_index} out of range (max {})",
+                mp_actions.len().saturating_sub(1)
+            ));
+        }
+        let stacks = self.display_stacks();
+        let record = ActionRecord {
+            action_id: action_id.to_string(),
+            label: actions[action_index].label.clone(),
+            position: self.position_label(self.spot.to_act().index()),
+            street: mp_street_to_string(self.spot.street()),
+            pot: self.spot.pot().0 as i32,
+            stack: stacks[if self.spot.to_act().index() == 1 {
+                0
+            } else {
+                1
+            }],
+            actions,
+        };
+        let next_spot = self.spot.advance(&self.game, action_index);
+        let next_terminal = next_spot.is_none();
+        Ok((record, next_spot.unwrap_or(self.spot), next_terminal))
+    }
+
+    fn commit_action_transition(
+        &mut self,
+        record: ActionRecord,
+        next_spot: LazyResolvedSpot,
+        next_terminal: bool,
+    ) {
+        self.spot = next_spot;
+        self.action_history.push(record);
+        self.terminal = next_terminal;
+    }
+
+    fn play_action(&mut self, action_id: &str) -> Result<GameState, String> {
+        let (record, next_spot, next_terminal) = self.action_transition(action_id)?;
+        let mut next_history = self.action_history.clone();
+        next_history.push(record.clone());
+        let board = self.board.clone();
+        let state = self.state_at(next_spot, &board, &next_history, next_terminal)?;
+        self.commit_action_transition(record, next_spot, next_terminal);
+        Ok(state)
+    }
+
+    fn play_action_without_state(&mut self, action_id: &str) -> Result<GameState, String> {
+        let (record, next_spot, next_terminal) = self.action_transition(action_id)?;
+        self.commit_action_transition(record, next_spot, next_terminal);
+        Ok(self.state_shell())
+    }
+
+    fn deal_card(&mut self, card: &str) -> Result<GameState, String> {
+        if self.terminal {
+            return Err("Universal MP session is already terminal".to_string());
+        }
+        let required_board_cards = mp_required_board_cards(self.spot.street());
+        let valid_chance = match self.spot.street() {
+            MpStreet::Flop => self.board.len() < required_board_cards,
+            MpStreet::Turn | MpStreet::River => self.board.len() + 1 == required_board_cards,
+            MpStreet::Preflop => false,
+        };
+        if !valid_chance {
+            return Err(format!(
+                "Universal MP session is not at a supported board chance state; street={}, board_cards={}, state unchanged",
+                mp_street_to_string(self.spot.street()),
+                self.board.len()
+            ));
+        }
+        let parsed = parse_rs_poker_card(card)?;
+        if self.board.contains(&parsed) {
+            return Err(format!(
+                "Duplicate board card {card} is illegal; board unchanged"
+            ));
+        }
+        let mut next_board = self.board.clone();
+        next_board.push(parsed);
+        let action_history = self.action_history.clone();
+        let state = self.state_at(self.spot, &next_board, &action_history, false)?;
+        self.board = next_board;
+        Ok(state)
+    }
+
+    /// Encode the current Universal MP position using the shared spot format.
+    fn encode_spot(&self) -> String {
+        let board = mp_board_strings(&self.board);
+        encode_spot_from_history(&self.action_history, &board)
+    }
+
+    /// Reset to the lazy root and replay a human-readable spot encoding.
+    fn load_spot(&mut self, spot: &str) -> Result<(), String> {
+        let spot = spot.trim();
+        if spot.is_empty() {
+            return Ok(());
+        }
+
+        self.spot = LazyResolvedSpot::root(&self.game);
+        self.board.clear();
+        self.action_history.clear();
+        self.terminal = false;
+
+        for segment in spot.split('|') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+
+            if segment.contains(':') {
+                for action_str in segment.split(',') {
+                    let action_str = action_str.trim();
+                    let (pos, label) = action_str.split_once(':').ok_or_else(|| {
+                        format!("Invalid action format: '{action_str}'. Expected 'position:label'")
+                    })?;
+
+                    let state = self.get_state()?;
+                    let current_position = state.position.clone();
+                    let position = current_position.to_lowercase();
+                    if pos.to_lowercase() != position {
+                        return Err(format!(
+                            "Position mismatch: '{pos}' but current position is '{current_position}'"
+                        ));
+                    }
+
+                    let matched = state
+                        .actions
+                        .iter()
+                        .find(|action| action.label.to_lowercase() == label.to_lowercase());
+                    match matched {
+                        Some(action) => {
+                            self.play_action(&action.id)?;
+                        }
+                        None => {
+                            let available: Vec<String> = state
+                                .actions
+                                .iter()
+                                .map(|action| {
+                                    format!("{}:{}", position, action.label.to_lowercase())
+                                })
+                                .collect();
+                            return Err(format!(
+                                "Action '{}:{}' not found. Available: {}",
+                                pos,
+                                label,
+                                available.join(", ")
+                            ));
+                        }
+                    }
+                }
+            } else {
+                let chars: Vec<char> = segment.chars().collect();
+                if chars.len() % 2 != 0 {
+                    return Err(format!(
+                        "Invalid board segment: '{segment}'. Must be pairs of rank+suit."
+                    ));
+                }
+                for chunk in chars.chunks(2) {
+                    let card: String = chunk.iter().collect();
+                    self.deal_card(&card)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn back(&mut self) -> Result<GameState, String> {
+        if self.action_history.is_empty() {
+            return Err("No actions to undo".to_string());
+        }
+        let last = self.action_history.last().cloned().unwrap();
+        let target_history = self.action_history[..self.action_history.len() - 1].to_vec();
+        let mut target_spot = LazyResolvedSpot::root(&self.game);
+        let mut target_terminal = false;
+        for record in &target_history {
+            let action_index = record
+                .action_id
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid MP action_id during back: {}", record.action_id))?;
+            target_spot = match target_spot.advance(&self.game, action_index) {
+                Some(next) => next,
+                None => {
+                    target_terminal = true;
+                    break;
+                }
+            };
+        }
+        let undone_street = match last.street.as_str() {
+            "Preflop" => MpStreet::Preflop,
+            "Flop" => MpStreet::Flop,
+            "Turn" => MpStreet::Turn,
+            "River" => MpStreet::River,
+            street => return Err(format!("Invalid MP street during back: {street}")),
+        };
+        let target_board_len = self.board.len().min(mp_required_board_cards(undone_street));
+        let target_board = self.board[..target_board_len].to_vec();
+        let state = self.state_at(target_spot, &target_board, &target_history, target_terminal)?;
+        self.spot = target_spot;
+        self.board = target_board;
+        self.action_history = target_history;
+        self.terminal = target_terminal;
+        Ok(state)
+    }
+}
+
+fn mp_street_to_string(street: MpStreet) -> String {
+    match street {
+        MpStreet::Preflop => "Preflop".to_string(),
+        MpStreet::Flop => "Flop".to_string(),
+        MpStreet::Turn => "Turn".to_string(),
+        MpStreet::River => "River".to_string(),
+    }
+}
+
+const fn mp_required_board_cards(street: MpStreet) -> usize {
+    match street {
+        MpStreet::Preflop => 0,
+        MpStreet::Flop => 3,
+        MpStreet::Turn => 4,
+        MpStreet::River => 5,
+    }
+}
+
+fn mp_board_strings(board: &[RsPokerCard]) -> Vec<String> {
+    board
+        .iter()
+        .map(|card| {
+            card_to_string(crate::exploration::rs_card_to_range_solver(*card))
+                .unwrap_or_else(|_| "??".to_string())
+        })
+        .collect()
+}
+
+fn combo_is_blocked(combo: [RsPokerCard; 2], board: &[RsPokerCard]) -> bool {
+    board
+        .iter()
+        .any(|card| *card == combo[0] || *card == combo[1])
+}
+
+fn mp_rank_value(rank: char) -> RsPokerValue {
+    match rank {
+        'A' => RsPokerValue::Ace,
+        'K' => RsPokerValue::King,
+        'Q' => RsPokerValue::Queen,
+        'J' => RsPokerValue::Jack,
+        'T' => RsPokerValue::Ten,
+        '9' => RsPokerValue::Nine,
+        '8' => RsPokerValue::Eight,
+        '7' => RsPokerValue::Seven,
+        '6' => RsPokerValue::Six,
+        '5' => RsPokerValue::Five,
+        '4' => RsPokerValue::Four,
+        '3' => RsPokerValue::Three,
+        '2' => RsPokerValue::Two,
+        _ => unreachable!("RANKS contains only legal ranks"),
+    }
+}
+
+fn expected_mp_action_kind(action: &MpTreeAction) -> ActionKind {
+    match action {
+        MpTreeAction::Fold => ActionKind::Fold,
+        MpTreeAction::Check => ActionKind::Check,
+        MpTreeAction::Call => ActionKind::Call,
+        MpTreeAction::Lead(_) => ActionKind::Bet,
+        MpTreeAction::Raise(_) => ActionKind::Raise,
+        MpTreeAction::AllIn => ActionKind::AllInBetRaise,
+    }
+}
+
+fn validate_mp_action_descriptor(
+    descriptor: &ActionDescriptor,
+    action: &MpTreeAction,
+) -> Result<(), String> {
+    if descriptor.kind == ActionKind::Opaque {
+        return Ok(());
+    }
+    let kind_matches = match action {
+        MpTreeAction::AllIn => matches!(
+            descriptor.kind,
+            ActionKind::AllInCall | ActionKind::AllInBetRaise
+        ),
+        _ => descriptor.kind == expected_mp_action_kind(action),
+    };
+    if !kind_matches {
+        return Err(format!(
+            "row kind {:?} does not match legal action {:?}",
+            descriptor.kind, action
+        ));
+    }
+    let expected_amount = match action {
+        MpTreeAction::Lead(amount) | MpTreeAction::Raise(amount) => {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                Some(amount.round() as u32)
+            }
+        }
+        _ => None,
+    };
+    if let Some(expected_amount) = expected_amount {
+        if descriptor.amount_chips != expected_amount {
+            return Err(format!(
+                "row amount {} does not match legal amount {}",
+                descriptor.amount_chips, expected_amount
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,48 +2478,7 @@ impl GameSession {
     /// - `|` separates street transitions (board card deals)
     /// - Board segments are card strings concatenated (e.g. "AhKdQc")
     pub fn encode_spot(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let mut current_actions: Vec<String> = Vec::new();
-        let mut prev_street = String::new();
-        let mut board_idx = 0;
-
-        for rec in &self.action_history {
-            if rec.street != prev_street && !prev_street.is_empty() {
-                // Flush current actions
-                if !current_actions.is_empty() {
-                    parts.push(current_actions.join(","));
-                    current_actions.clear();
-                }
-                // Emit board cards for the street transition
-                let new_cards = match prev_street.as_str() {
-                    "Preflop" => 3,
-                    _ => 1,
-                };
-                let end = (board_idx + new_cards).min(self.board.len());
-                let board_str: String = self.board[board_idx..end].join("");
-                board_idx = end;
-                parts.push(board_str);
-            }
-            prev_street = rec.street.clone();
-            current_actions.push(format!(
-                "{}:{}",
-                rec.position.to_lowercase(),
-                rec.label.to_lowercase()
-            ));
-        }
-
-        // Flush remaining actions
-        if !current_actions.is_empty() {
-            parts.push(current_actions.join(","));
-        }
-
-        // Emit any remaining board cards (e.g. board dealt but no actions on new street)
-        if board_idx < self.board.len() {
-            let remaining: String = self.board[board_idx..].join("");
-            parts.push(remaining);
-        }
-
-        parts.join("|")
+        encode_spot_from_history(&self.action_history, &self.board)
     }
 
     /// Parse a spot encoding and replay to that state.
@@ -1420,8 +2628,279 @@ fn build_game_actions(tree_actions: &[TreeAction]) -> Vec<GameAction> {
             id: i.to_string(),
             label: format_tree_action(a),
             action_type: action_type_string(a),
+            exact_amount_bb: None,
         })
         .collect()
+}
+
+fn mp_big_blind_amount(config: &BlueprintMpConfig) -> Result<f64, String> {
+    config
+        .game
+        .blinds
+        .iter()
+        .find(|blind| blind.kind == ForcedBetKind::BigBlind)
+        .map(|blind| blind.amount)
+        .filter(|amount| *amount > 0.0)
+        .ok_or_else(|| "Universal MP config must define a positive BigBlind forced bet".to_string())
+}
+
+fn mp_sb_bb_seats(config: &BlueprintMpConfig) -> Result<(u8, u8), String> {
+    let sb = config
+        .game
+        .blinds
+        .iter()
+        .find(|blind| blind.kind == ForcedBetKind::SmallBlind)
+        .map(|blind| blind.seat)
+        .ok_or_else(|| "Universal MP config must define a SmallBlind forced bet".to_string())?;
+    let bb = config
+        .game
+        .blinds
+        .iter()
+        .find(|blind| blind.kind == ForcedBetKind::BigBlind)
+        .map(|blind| blind.seat)
+        .ok_or_else(|| "Universal MP config must define a BigBlind forced bet".to_string())?;
+    if sb == bb || sb >= 2 || bb >= 2 {
+        return Err(format!(
+            "Universal MP exact solve requires distinct SB/BB seats among 0..2; got SB={sb}, BB={bb}"
+        ));
+    }
+    Ok((sb, bb))
+}
+
+const MP_EXACT_MAX_CHIP_SCALE: f64 = 1_000_000.0;
+
+fn mp_exact_chip_scale(betting: &LazyBettingSnapshot, big_blind: f64) -> Result<f64, String> {
+    let amounts = [
+        big_blind,
+        betting.pot.0,
+        betting.last_raise_to.0,
+        betting.stacks[0].0,
+        betting.stacks[1].0,
+        betting.street_bets[0].0,
+        betting.street_bets[1].0,
+    ];
+    if let Some(amount) = amounts.iter().copied().find(|amount| !amount.is_finite()) {
+        return Err(format!(
+            "Universal MP exact solve does not support non-finite chip amount {amount:?}"
+        ));
+    }
+
+    let mut scale = 1.0;
+    while scale <= MP_EXACT_MAX_CHIP_SCALE {
+        if amounts
+            .iter()
+            .copied()
+            .all(|amount| mp_is_integral_scaled(amount, scale))
+        {
+            return Ok(scale);
+        }
+        scale *= 10.0;
+    }
+
+    let amount = amounts
+        .iter()
+        .copied()
+        .find(|amount| !mp_is_integral_scaled(*amount, MP_EXACT_MAX_CHIP_SCALE))
+        .unwrap_or(0.0);
+    Err(format!(
+        "Universal MP exact solve does not support fractional chip amount {amount:.17}: no exact decimal integer scaling through 6 places"
+    ))
+}
+
+fn mp_is_integral_scaled(amount: f64, scale: f64) -> bool {
+    let scaled = amount * scale;
+    scaled.is_finite() && (scaled - scaled.round()).abs() <= 1e-8
+}
+
+/// Convert raw MP chip amounts to the integer units used by range-solver.
+///
+/// The lazy MP model stores chips as `f64`, while range-solver requires integer
+/// amounts. Exact MP snapshots provide a common decimal scale first; this
+/// conversion therefore rejects values that cannot be represented instead of
+/// silently changing the public betting state by rounding it.
+fn mp_chips_to_solver_units(amount: f64, scale: f64) -> Result<i32, String> {
+    if !mp_is_integral_scaled(amount, scale) {
+        return Err(format!(
+            "Universal MP exact solve cannot represent chip amount {amount:.17} with integer scale {scale}"
+        ));
+    }
+    let scaled = (amount * scale).round();
+    if scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+        return Err(format!(
+            "Universal MP exact solve chip amount {amount:.17} exceeds range-solver integer limits after scale {scale}"
+        ));
+    }
+    Ok(scaled as i32)
+}
+
+fn mp_bet_sizes_for_street(
+    config: &BlueprintMpConfig,
+    street: MpStreet,
+) -> Result<Vec<Vec<f64>>, String> {
+    let parse_sizes = |values: &[serde_yaml::Value], label: &str| {
+        values
+            .iter()
+            .map(|value| {
+                value.as_f64().or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|value| value.trim().parse::<f64>().ok())
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("Universal MP {label} size is not numeric"))
+    };
+    let (street_name, sizes) = match street {
+        MpStreet::Flop => ("flop", &config.action_abstraction.flop),
+        MpStreet::Turn => ("turn", &config.action_abstraction.turn),
+        MpStreet::River => ("river", &config.action_abstraction.river),
+        MpStreet::Preflop => {
+            return Err("Universal MP exact solve requires a postflop street".to_string())
+        }
+    };
+    let lead = parse_sizes(&sizes.lead, &format!("{street_name} lead"))?;
+    let mut depths = Vec::with_capacity(sizes.raise.len().max(1) + 1);
+    depths.push(lead.clone());
+    if sizes.raise.is_empty() {
+        depths.push(lead);
+    } else {
+        for (depth, values) in sizes.raise.iter().enumerate() {
+            depths.push(parse_sizes(
+                values,
+                &format!("{street_name} raise depth {depth}"),
+            )?);
+        }
+    }
+    Ok(depths)
+}
+
+fn mp_street_index(street: MpStreet) -> usize {
+    match street {
+        MpStreet::Flop => 0,
+        MpStreet::Turn => 1,
+        MpStreet::River => 2,
+        MpStreet::Preflop => unreachable!("preflop has no exact postflop action rows"),
+    }
+}
+
+fn mp_bet_sizes_by_street(config: &BlueprintMpConfig) -> Result<[Vec<Vec<f64>>; 3], String> {
+    Ok([
+        mp_bet_sizes_for_street(config, MpStreet::Flop)?,
+        mp_bet_sizes_for_street(config, MpStreet::Turn)?,
+        mp_bet_sizes_for_street(config, MpStreet::River)?,
+    ])
+}
+
+fn mp_solve_root(
+    betting: &LazyBettingSnapshot,
+    sb_seat: u8,
+    bb_seat: u8,
+    chip_scale: f64,
+) -> Result<SolveGameRoot, String> {
+    let actual_actor = betting.to_act.index();
+    let initial_player = if actual_actor == bb_seat {
+        0
+    } else if actual_actor == sb_seat {
+        1
+    } else {
+        return Err(format!(
+            "Universal MP exact solve encountered unsupported acting seat {actual_actor}"
+        ));
+    };
+    let initial_stacks = [
+        mp_chips_to_solver_units(betting.stacks[bb_seat as usize].0, chip_scale)?,
+        mp_chips_to_solver_units(betting.stacks[sb_seat as usize].0, chip_scale)?,
+    ];
+    let street_bets = [
+        mp_chips_to_solver_units(betting.street_bets[bb_seat as usize].0, chip_scale)?,
+        mp_chips_to_solver_units(betting.street_bets[sb_seat as usize].0, chip_scale)?,
+    ];
+    let starting_pot =
+        (mp_chips_to_solver_units(betting.pot.0, chip_scale)? - street_bets[0] - street_bets[1])
+            .max(1);
+    let matched_amount = street_bets[0].min(street_bets[1]);
+
+    let (initial_prev_action, initial_prev_amount, initial_num_bets) = if betting.facing_bet {
+        let Some(action) = betting.last_aggressive_action else {
+            return Err(
+                "Universal MP exact solve is missing raw aggressive action metadata".to_string(),
+            );
+        };
+        let amount = mp_chips_to_solver_units(betting.last_raise_to.0, chip_scale)?;
+        let previous = match action {
+            MpTreeAction::Lead(_) => range_solver::Action::Bet(amount),
+            MpTreeAction::Raise(_) => range_solver::Action::Raise(amount),
+            MpTreeAction::AllIn => range_solver::Action::AllIn(amount),
+            MpTreeAction::Fold | MpTreeAction::Check | MpTreeAction::Call => {
+                return Err(format!(
+                    "Universal MP exact solve received non-aggressive raw action {action:?} while facing a bet"
+                ));
+            }
+        };
+        (previous, amount, i32::from(betting.raise_count.max(1)))
+    } else {
+        (range_solver::Action::None, 0, 0)
+    };
+
+    Ok(SolveGameRoot {
+        starting_pot,
+        initial_player,
+        initial_stacks,
+        initial_prev_action,
+        initial_prev_amount,
+        initial_amount: matched_amount,
+        initial_num_bets,
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn build_mp_game_actions(actions: &[MpTreeAction], big_blind: f64) -> Vec<GameAction> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let (label, action_type) = match action {
+                MpTreeAction::Fold => ("Fold".to_string(), "fold".to_string()),
+                MpTreeAction::Check => ("Check".to_string(), "check".to_string()),
+                MpTreeAction::Call => ("Call".to_string(), "call".to_string()),
+                MpTreeAction::Lead(amount) => {
+                    (format_mp_amount(*amount, big_blind), "bet".to_string())
+                }
+                MpTreeAction::Raise(amount) => {
+                    (format_mp_amount(*amount, big_blind), "raise".to_string())
+                }
+                MpTreeAction::AllIn => ("All-in".to_string(), "allin".to_string()),
+            };
+            GameAction {
+                id: index.to_string(),
+                label,
+                action_type,
+                exact_amount_bb: match action {
+                    MpTreeAction::Lead(amount) | MpTreeAction::Raise(amount) => {
+                        (big_blind > 0.0).then_some(*amount / big_blind)
+                    }
+                    _ => None,
+                },
+            }
+        })
+        .collect()
+}
+
+fn format_mp_amount(amount: f64, big_blind: f64) -> String {
+    let bb = if big_blind > 0.0 {
+        amount / big_blind
+    } else {
+        amount
+    };
+    if (bb - bb.round()).abs() < 1e-9 {
+        format!("{:.0}bb", bb.round())
+    } else {
+        let mut formatted = format!("{bb:.12}");
+        while formatted.ends_with('0') {
+            formatted.pop();
+        }
+        format!("{formatted}bb")
+    }
 }
 
 /// Format a tree action as a human-readable label.
@@ -1456,27 +2935,178 @@ fn action_type_string(action: &TreeAction) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SemanticAction {
     action_type: String,
-    amount_bb: Option<i32>,
+    amount_bb: Option<f64>,
 }
 
-fn action_amount_bb_from_label(label: &str) -> Option<i32> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScaledActionDescriptor {
+    action_type: String,
+    amount: Option<i32>,
+}
+
+fn scaled_action_descriptor(action_type: &str, amount: Option<i32>) -> ScaledActionDescriptor {
+    ScaledActionDescriptor {
+        action_type: action_type.to_ascii_lowercase(),
+        amount,
+    }
+}
+
+/// Build the exact descriptor for a raw MP action retained in a session
+/// record. Aggressive actions must be exactly representable at the solver's
+/// chip scale; rounded values are deliberately rejected.
+fn scaled_action_descriptor_from_mp_game_action(
+    action: &GameAction,
+    big_blind: f64,
+    chip_scale: f64,
+) -> Option<ScaledActionDescriptor> {
+    let action_type = action.action_type.to_ascii_lowercase();
+    let amount = match action_type.as_str() {
+        "bet" | "raise" => {
+            let amount_bb = action.exact_amount_bb?;
+            mp_chips_to_solver_units(amount_bb * big_blind, chip_scale).ok()
+        }
+        "fold" | "check" | "call" | "allin" => None,
+        _ => return None,
+    };
+    Some(scaled_action_descriptor(&action_type, amount))
+}
+
+/// Build the exact descriptor for a range-solver action. Its hidden BB value
+/// was produced from integer solver chips, so conversion back through the
+/// scaled BB is only used to recover that integer identity.
+fn scaled_action_descriptor_from_cached_action(
+    action: &GameAction,
+    scaled_big_blind: f64,
+) -> Option<ScaledActionDescriptor> {
+    let action_type = action.action_type.to_ascii_lowercase();
+    let amount = match action_type.as_str() {
+        "bet" | "raise" => {
+            let amount_bb = action.exact_amount_bb?;
+            let scaled_amount = amount_bb * scaled_big_blind;
+            if !scaled_amount.is_finite()
+                || (scaled_amount - scaled_amount.round()).abs() > 1e-7
+                || scaled_amount < f64::from(i32::MIN)
+                || scaled_amount > f64::from(i32::MAX)
+            {
+                return None;
+            }
+            Some(scaled_amount.round() as i32)
+        }
+        "fold" | "check" | "call" | "allin" => None,
+        _ => return None,
+    };
+    Some(scaled_action_descriptor(&action_type, amount))
+}
+
+fn unique_cached_action_index(
+    actions: &[GameAction],
+    target: &ScaledActionDescriptor,
+    scaled_big_blind: f64,
+) -> Option<usize> {
+    let matches: Vec<_> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            (scaled_action_descriptor_from_cached_action(action, scaled_big_blind).as_ref()
+                == Some(target))
+            .then_some(index)
+        })
+        .collect();
+    match matches.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
+fn exact_mp_session_action_id_matching_cached_action(
+    live_actions: &[GameAction],
+    cached_actions: &[GameAction],
+    cached_index: usize,
+    big_blind: f64,
+    chip_scale: f64,
+) -> Result<String, String> {
+    let scaled_big_blind = big_blind * chip_scale;
+    let cached_action = cached_actions
+        .get(cached_index)
+        .ok_or_else(|| "Exact solver action index is out of range".to_string())?;
+    let target = scaled_action_descriptor_from_cached_action(cached_action, scaled_big_blind)
+        .ok_or_else(|| {
+            format!(
+                "Exact solver action '{}' has no exact scaled-chip descriptor",
+                cached_action.label
+            )
+        })?;
+
+    if unique_cached_action_index(cached_actions, &target, scaled_big_blind).is_none() {
+        return Err(format!(
+            "Exact solver action '{}' is ambiguous after scaled-chip quantization",
+            cached_action.label
+        ));
+    }
+
+    let matches: Vec<_> = live_actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action)| {
+            (scaled_action_descriptor_from_mp_game_action(action, big_blind, chip_scale).as_ref()
+                == Some(&target))
+            .then_some(index)
+        })
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(index.to_string()),
+        [] => Err(format!(
+            "Exact solver action '{}' is not exactly representable by the live MP action set",
+            cached_action.label
+        )),
+        _ => Err(format!(
+            "Exact solver action '{}' maps to multiple live MP actions after scaled-chip quantization",
+            cached_action.label
+        )),
+    }
+}
+
+fn action_amount_bb_from_label(label: &str) -> Option<f64> {
     let normalized = label.trim().to_ascii_lowercase().replace(' ', "");
     let bb = normalized.strip_suffix("bb")?;
-    bb.parse::<f64>().ok().map(|amount| amount.round() as i32)
+    bb.parse::<f64>().ok()
 }
 
 fn semantic_action_from_tree_action(action: &TreeAction) -> SemanticAction {
     let amount_bb = match action {
-        TreeAction::Bet(amount) | TreeAction::Raise(amount) => Some((amount / 2.0).round() as i32),
+        TreeAction::Bet(amount) | TreeAction::Raise(amount) => Some(amount / 2.0),
         _ => None,
     };
 
     SemanticAction {
         action_type: action_type_string(action),
         amount_bb,
+    }
+}
+
+fn semantic_action_from_mp_tree_action(action: &MpTreeAction, big_blind: f64) -> SemanticAction {
+    let (action_type, amount_bb) = match action {
+        MpTreeAction::Fold => ("fold", None),
+        MpTreeAction::Check => ("check", None),
+        MpTreeAction::Call => ("call", None),
+        MpTreeAction::Lead(amount) => ("bet", Some(mp_amount_to_bb(*amount, big_blind))),
+        MpTreeAction::Raise(amount) => ("raise", Some(mp_amount_to_bb(*amount, big_blind))),
+        MpTreeAction::AllIn => ("allin", None),
+    };
+    SemanticAction {
+        action_type: action_type.to_string(),
+        amount_bb,
+    }
+}
+
+fn mp_amount_to_bb(amount: f64, big_blind: f64) -> f64 {
+    if big_blind > 0.0 {
+        amount / big_blind
+    } else {
+        amount
     }
 }
 
@@ -1489,7 +3119,7 @@ fn semantic_action_from_game_action(action: &GameAction) -> SemanticAction {
 
     SemanticAction {
         action_type,
-        amount_bb,
+        amount_bb: action.exact_amount_bb.or(amount_bb),
     }
 }
 
@@ -1508,7 +3138,13 @@ fn semantic_actions_match(left: &SemanticAction, right: &SemanticAction) -> bool
 
     match left.action_type.as_str() {
         "fold" | "check" | "call" | "allin" => true,
-        "bet" | "raise" => left.amount_bb.is_some() && left.amount_bb == right.amount_bb,
+        "bet" | "raise" => match (left.amount_bb, right.amount_bb) {
+            (Some(left), Some(right)) => {
+                let tolerance = f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0;
+                (left - right).abs() <= tolerance
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1589,6 +3225,35 @@ fn format_bet_sizes_for_solve(sizes: &[Vec<f64>]) -> (String, String) {
     blueprint_sizes_to_range_solver(sizes)
 }
 
+/// Parse one street's lead and raise-depth rows for range-solver.
+///
+/// Two rows retain the historical shared raise-size behavior. Three or more
+/// rows additionally populate `per_num_bets`, whose row index matches the
+/// number of bets already made on the current street.
+fn parse_bet_size_options_for_solve(
+    sizes: &[Vec<f64>],
+) -> Result<range_solver::bet_size::BetSizeOptions, String> {
+    use range_solver::bet_size::BetSizeOptions;
+
+    let (bet_str, raise_str) = format_bet_sizes_for_solve(sizes);
+    let mut options = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
+        .map_err(|e| format!("Bad bet sizes: {e}"))?;
+    if sizes.len() > 2 {
+        options.per_num_bets = sizes
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(depth, row)| {
+                let row_sizes = format_bet_sizes_for_solve(&[vec![], row.clone()]).1;
+                BetSizeOptions::try_from(("a", row_sizes.as_str()))
+                    .map(|parsed| parsed.raise)
+                    .map_err(|e| format!("Bad bet sizes at raise depth {}: {e}", depth + 1))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    Ok(options)
+}
+
 /// Build the `CardConfig` and `ActionTree` for a postflop solve without
 /// constructing the `PostFlopGame`. Useful when the caller needs to pass
 /// these to `make_per_boundary_gadget_game` or other paths that consume
@@ -1632,7 +3297,62 @@ pub fn build_solve_game_parts_with_root(
     depth_limit_override: Option<u8>,
     root: Option<SolveGameRoot>,
 ) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
-    use range_solver::bet_size::BetSizeOptions;
+    let street_bet_sizes = [bet_sizes.to_vec(), bet_sizes.to_vec(), bet_sizes.to_vec()];
+    build_solve_game_parts_with_root_and_street_sizes(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        &street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+    )
+}
+
+/// Build solve-game parts with independent abstraction rows for Flop, Turn,
+/// and River. The row at each index contains depth 0 (lead) followed by the
+/// configured raise-depth rows for that street.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solve_game_parts_with_root_and_street_sizes(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
+    build_solve_game_parts_with_root_and_street_sizes_cancel(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_solve_game_parts_with_root_and_street_sizes_cancel(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+    cancel: Option<&AtomicBool>,
+) -> Result<(range_solver::card::CardConfig, range_solver::ActionTree), String> {
     use range_solver::card::CardConfig;
     use range_solver::range::Range;
     use range_solver::{ActionTree, TreeConfig};
@@ -1643,10 +3363,9 @@ pub fn build_solve_game_parts_with_root(
         Range::from_raw_data(oop_weights).map_err(|e| format!("Bad OOP weights: {e}"))?;
     let ip_range = Range::from_raw_data(ip_weights).map_err(|e| format!("Bad IP weights: {e}"))?;
 
-    let (bet_str, raise_str) = format_bet_sizes_for_solve(bet_sizes);
-    let oop_sizes = BetSizeOptions::try_from((bet_str.as_str(), raise_str.as_str()))
-        .map_err(|e| format!("Bad bet sizes: {e}"))?;
-    let ip_sizes = oop_sizes.clone();
+    let flop_sizes = parse_bet_size_options_for_solve(&street_bet_sizes[0])?;
+    let turn_sizes = parse_bet_size_options_for_solve(&street_bet_sizes[1])?;
+    let river_sizes = parse_bet_size_options_for_solve(&street_bet_sizes[2])?;
 
     let card_config = CardConfig {
         range: [oop_range, ip_range],
@@ -1668,9 +3387,9 @@ pub fn build_solve_game_parts_with_root(
         initial_num_bets: root.initial_num_bets,
         rake_rate: 0.0,
         rake_cap: 0.0,
-        flop_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
-        turn_bet_sizes: [oop_sizes.clone(), ip_sizes.clone()],
-        river_bet_sizes: [oop_sizes, ip_sizes],
+        flop_bet_sizes: [flop_sizes.clone(), flop_sizes],
+        turn_bet_sizes: [turn_sizes.clone(), turn_sizes],
+        river_bet_sizes: [river_sizes.clone(), river_sizes],
         turn_donk_sizes: None,
         river_donk_sizes: None,
         add_allin_threshold: 0.0,
@@ -1683,8 +3402,11 @@ pub fn build_solve_game_parts_with_root(
         },
     };
 
-    let action_tree =
-        ActionTree::new(tree_config).map_err(|e| format!("Failed to build tree: {e}"))?;
+    let action_tree = match cancel {
+        Some(cancel) => ActionTree::new_with_cancel(tree_config, cancel),
+        None => ActionTree::new(tree_config),
+    }
+    .map_err(|e| format!("Failed to build tree: {e}"))?;
     Ok((card_config, action_tree))
 }
 
@@ -1727,13 +3449,40 @@ pub fn build_solve_game_with_root(
     depth_limit_override: Option<u8>,
     root: Option<SolveGameRoot>,
 ) -> Result<PostFlopGame, String> {
-    let (card_config, action_tree) = build_solve_game_parts_with_root(
+    let street_bet_sizes = [bet_sizes.to_vec(), bet_sizes.to_vec(), bet_sizes.to_vec()];
+    build_solve_game_with_root_and_street_sizes(
         board,
         oop_weights,
         ip_weights,
         pot,
         effective_stack,
-        bet_sizes,
+        &street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+    )
+}
+
+/// Build a solve game with independent Flop, Turn, and River abstractions.
+#[allow(clippy::too_many_arguments)]
+pub fn build_solve_game_with_root_and_street_sizes(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+) -> Result<PostFlopGame, String> {
+    let (card_config, action_tree) = build_solve_game_parts_with_root_and_street_sizes(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        street_bet_sizes,
         exact,
         depth_limit_override,
         root,
@@ -1741,6 +3490,51 @@ pub fn build_solve_game_with_root(
     let mut game = PostFlopGame::with_config(card_config, action_tree)
         .map_err(|e| format!("Failed to build game: {e}"))?;
     game.allocate_memory(false);
+    Ok(game)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_solve_game_with_root_and_street_sizes_cancel(
+    board: &[String],
+    oop_weights: &[f32],
+    ip_weights: &[f32],
+    pot: i32,
+    effective_stack: i32,
+    street_bet_sizes: &[Vec<Vec<f64>>; 3],
+    exact: bool,
+    depth_limit_override: Option<u8>,
+    root: Option<SolveGameRoot>,
+    cancel: &AtomicBool,
+) -> Result<PostFlopGame, String> {
+    let (card_config, action_tree) = build_solve_game_parts_with_root_and_street_sizes_cancel(
+        board,
+        oop_weights,
+        ip_weights,
+        pot,
+        effective_stack,
+        street_bet_sizes,
+        exact,
+        depth_limit_override,
+        root,
+        Some(cancel),
+    )?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("Solve cancelled during game construction".to_string());
+    }
+
+    // PostFlopGame::with_config builds the arena and interpreter without a cancellation hook.
+    // It is the remaining bounded uninterruptible construction phase; check immediately around
+    // it and drop the game if cancellation arrived during that phase.
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|e| format!("Failed to build game: {e}"))?;
+    if cancel.load(Ordering::Acquire) {
+        return Err("Solve cancelled during game construction".to_string());
+    }
+
+    game.allocate_memory(false);
+    if cancel.load(Ordering::Acquire) {
+        return Err("Solve cancelled during game memory allocation".to_string());
+    }
     Ok(game)
 }
 
@@ -1890,20 +3684,23 @@ fn build_inner_evaluator_for_solve(
     Ok(evaluator)
 }
 
-/// Convert a range-solver `Action` to a `GameAction`.
+/// Convert a range-solver `Action` to a `GameAction` using the legacy HU units.
 fn range_solver_action_to_game_action(action: &range_solver::Action, idx: usize) -> GameAction {
+    range_solver_action_to_game_action_with_big_blind(action, idx, 2.0)
+}
+
+/// Convert a range-solver action to a game action using the configured MP chip units.
+fn range_solver_action_to_game_action_with_big_blind(
+    action: &range_solver::Action,
+    idx: usize,
+    big_blind: f64,
+) -> GameAction {
     let (label, action_type) = match action {
         range_solver::Action::Fold => ("Fold".to_string(), "fold"),
         range_solver::Action::Check => ("Check".to_string(), "check"),
         range_solver::Action::Call => ("Call".to_string(), "call"),
-        range_solver::Action::Bet(amt) => {
-            let bb = *amt as f64 / 2.0;
-            (format!("{bb:.0}bb"), "bet")
-        }
-        range_solver::Action::Raise(amt) => {
-            let bb = *amt as f64 / 2.0;
-            (format!("{bb:.0}bb"), "raise")
-        }
+        range_solver::Action::Bet(amt) => (format_mp_amount(*amt as f64, big_blind), "bet"),
+        range_solver::Action::Raise(amt) => (format_mp_amount(*amt as f64, big_blind), "raise"),
         range_solver::Action::AllIn(_) => ("All-in".to_string(), "allin"),
         _ => ("?".to_string(), "unknown"),
     };
@@ -1911,13 +3708,28 @@ fn range_solver_action_to_game_action(action: &range_solver::Action, idx: usize)
         id: idx.to_string(),
         label,
         action_type: action_type.to_string(),
+        exact_amount_bb: match action {
+            range_solver::Action::Bet(amount) | range_solver::Action::Raise(amount) => {
+                (big_blind > 0.0).then_some(f64::from(*amount) / big_blind)
+            }
+            _ => None,
+        },
     }
 }
 
 /// Build a `GameMatrix` from the current `PostFlopGame` state at the root.
 fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+    build_solve_matrix_with_big_blind(game, hand_evs, None)
+}
+
+/// Build a solve matrix using the supplied chip-to-BB conversion for actions.
+fn build_solve_matrix_with_big_blind(
+    game: &mut PostFlopGame,
+    hand_evs: Option<&[f32]>,
+    big_blind: Option<f64>,
+) -> GameMatrix {
     game.back_to_root();
-    build_solve_matrix_at_current(game, hand_evs)
+    build_solve_matrix_at_current_with_big_blind(game, hand_evs, big_blind)
 }
 
 /// Build a `GameMatrix` from the current `PostFlopGame` position (without navigating to root).
@@ -1925,6 +3737,15 @@ fn build_solve_matrix(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> Game
 /// Same logic as `build_solve_matrix` but does NOT call `game.back_to_root()`.
 #[allow(clippy::cast_possible_truncation)]
 fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32]>) -> GameMatrix {
+    build_solve_matrix_at_current_with_big_blind(game, hand_evs, None)
+}
+
+/// Build a solve matrix at the current position using the supplied action units.
+fn build_solve_matrix_at_current_with_big_blind(
+    game: &mut PostFlopGame,
+    hand_evs: Option<&[f32]>,
+    big_blind: Option<f64>,
+) -> GameMatrix {
     use crate::postflop::{card_pair_to_matrix, matrix_cell_label};
 
     let player = game.current_player();
@@ -1939,7 +3760,12 @@ fn build_solve_matrix_at_current(game: &mut PostFlopGame, hand_evs: Option<&[f32
     let game_actions: Vec<GameAction> = available_actions
         .iter()
         .enumerate()
-        .map(|(i, a)| range_solver_action_to_game_action(a, i))
+        .map(|(i, a)| {
+            big_blind.map_or_else(
+                || range_solver_action_to_game_action(a, i),
+                |big_blind| range_solver_action_to_game_action_with_big_blind(a, i, big_blind),
+            )
+        })
         .collect();
     let num_actions = game_actions.len();
 
@@ -2045,14 +3871,23 @@ fn build_solve_cache(
     game: &mut PostFlopGame,
     player_labels: &[String; 2],
 ) -> HashMap<Vec<usize>, CachedSolveNode> {
+    build_solve_cache_with_big_blind(game, player_labels, None)
+}
+
+fn build_solve_cache_with_big_blind(
+    game: &mut PostFlopGame,
+    player_labels: &[String; 2],
+    big_blind: Option<f64>,
+) -> HashMap<Vec<usize>, CachedSolveNode> {
     let mut cache = HashMap::new();
-    build_solve_cache_recursive(game, player_labels, &mut vec![], &mut cache);
+    build_solve_cache_recursive(game, player_labels, big_blind, &mut vec![], &mut cache);
     cache
 }
 
 fn build_solve_cache_recursive(
     game: &mut PostFlopGame,
     player_labels: &[String; 2],
+    big_blind: Option<f64>,
     path: &mut Vec<usize>,
     cache: &mut HashMap<Vec<usize>, CachedSolveNode>,
 ) {
@@ -2060,12 +3895,17 @@ fn build_solve_cache_recursive(
         return;
     }
 
-    let matrix = build_solve_matrix_at_current(game, None);
+    let matrix = build_solve_matrix_at_current_with_big_blind(game, None, big_blind);
     let actions: Vec<GameAction> = game
         .available_actions()
         .iter()
         .enumerate()
-        .map(|(i, a)| range_solver_action_to_game_action(a, i))
+        .map(|(i, a)| {
+            big_blind.map_or_else(
+                || range_solver_action_to_game_action(a, i),
+                |big_blind| range_solver_action_to_game_action_with_big_blind(a, i, big_blind),
+            )
+        })
         .collect();
     let player = game.current_player();
     let position = player_labels
@@ -2086,7 +3926,7 @@ fn build_solve_cache_recursive(
     for i in 0..num_actions {
         game.play(i);
         path.push(i);
-        build_solve_cache_recursive(game, player_labels, path, cache);
+        build_solve_cache_recursive(game, player_labels, big_blind, path, cache);
         path.pop();
         // Navigate back: PostFlopGame has no undo, so replay from root.
         game.back_to_root();
@@ -2250,9 +4090,24 @@ pub fn game_new_core(
     postflop: &crate::postflop::PostflopState,
     session_state: &GameSessionState,
 ) -> Result<(), String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
     let cbv_ctx = postflop.cbv_context.read().clone();
+    if let Some(mp_data) = exploration.extract_universal_mp_data() {
+        let mp_session_started = Instant::now();
+        let mp_session = LazyMpSession::from_exploration_data(mp_data?)?;
+        *session_state.mp_session.write() = Some(mp_session);
+        *session_state.session.write() = None;
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
+        eprintln!(
+            "[game_new] universal MP LazyMpSession initialized in {:.3}s",
+            mp_session_started.elapsed().as_secs_f64()
+        );
+        return Ok(());
+    }
     let session = GameSession::from_exploration_state(exploration, cbv_ctx)?;
     *session_state.session.write() = Some(session);
+    *session_state.mp_session.write() = None;
     session_state.subgame_solve.reset();
     session_state.exact_solve.reset();
     Ok(())
@@ -2315,6 +4170,127 @@ fn resolve_solve_path_from_session(ss: &SolveState, session: &GameSession) -> Op
     Some(path)
 }
 
+fn resolve_solve_path_from_mp_session(
+    ss: &SolveState,
+    session: &LazyMpSession,
+) -> Option<Vec<usize>> {
+    let anchor = ss.solve_anchor.read().clone();
+    let Some(anchor) = anchor.as_ref() else {
+        return Some(ss.solve_path.read().clone());
+    };
+    if mp_board_strings(&session.board) != anchor.board
+        || session.action_history.len() < anchor.action_ids.len()
+        || session
+            .action_history
+            .iter()
+            .take(anchor.action_ids.len())
+            .map(|action| &action.action_id)
+            .ne(anchor.action_ids.iter())
+    {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    let cache = ss.solve_cache.read();
+    let exact_action_scale = *ss.exact_action_scale.read();
+    let big_blind = exact_action_scale.and_then(|_| mp_big_blind_amount(&session.config).ok());
+    for record in session.action_history.iter().skip(anchor.action_ids.len()) {
+        let node = cache.get(&path)?;
+        let action_idx = if let (Some(chip_scale), Some(big_blind)) =
+            (exact_action_scale, big_blind)
+        {
+            let record_action = record
+                .actions
+                .iter()
+                .find(|action| action.id == record.action_id)?;
+            let target =
+                scaled_action_descriptor_from_mp_game_action(record_action, big_blind, chip_scale)?;
+            unique_cached_action_index(&node.actions, &target, big_blind * chip_scale)?
+        } else {
+            let record_semantic = semantic_action_from_record(record)?;
+            node.actions.iter().position(|action| {
+                semantic_actions_match(&record_semantic, &semantic_action_from_game_action(action))
+            })?
+        };
+        path.push(action_idx);
+        if !cache.contains_key(&path) {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn reusable_mp_solve_path(
+    ss: &SolveState,
+    previous_street: MpStreet,
+    previous_board: &[RsPokerCard],
+    session: &LazyMpSession,
+) -> Option<Vec<usize>> {
+    if previous_street != session.spot.street()
+        || previous_board != session.board.as_slice()
+        || ss.solving.load(Ordering::Acquire)
+        || ss.iteration.load(Ordering::Acquire) == 0
+    {
+        return None;
+    }
+    resolve_solve_path_from_mp_session(ss, session)
+}
+
+fn apply_exact_solve_overlay(state: &mut GameState, ss: &SolveState, path: Option<Vec<usize>>) {
+    let _publish_guard = ss.publish_gate.read();
+    let is_solving = ss.solving.load(Ordering::Relaxed);
+    let iteration = ss.iteration.load(Ordering::Relaxed);
+    if !is_solving && iteration == 0 {
+        return;
+    }
+    // The live MP state starts with its Blueprint matrix. Clear that data before
+    // applying any exact snapshot so a solve in progress cannot present it as
+    // exact while the range-solver has not published a result yet.
+    state.matrix = None;
+    state.actions.clear();
+    state.position.clear();
+    let Some(path) = path else {
+        // The MP session no longer matches the solve anchor. Keep the live
+        // state untouched and do not expose status from an unrelated solve.
+        state.solve = None;
+        return;
+    };
+    let exp = f32::from_bits(ss.exploitability_bits.load(Ordering::Relaxed));
+    let max_iters = ss.max_iterations.load(Ordering::Relaxed);
+    let elapsed = ss
+        .solve_start
+        .read()
+        .map(|time| time.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    state.solve = Some(SolveStatus {
+        iteration,
+        max_iterations: max_iters,
+        exploitability: exp,
+        elapsed_secs: elapsed,
+        solver_name: "range".to_string(),
+        is_complete: !is_solving && iteration > 0,
+    });
+
+    set_solve_path_if_changed(ss, &path);
+    if let Some(node) = cached_node_for_path(ss, &path) {
+        state.matrix = Some(node.matrix);
+        state.actions = node.actions;
+        state.position = node.position;
+    } else if path.is_empty() {
+        if let Some(matrix) = ss.matrix_snapshot.read().clone() {
+            state.matrix = Some(matrix);
+        }
+        let actions = ss.solve_actions.read();
+        if !actions.is_empty() {
+            state.actions = actions.clone();
+        }
+        let position = ss.solve_position.read();
+        if !position.is_empty() {
+            state.position = position.clone();
+        }
+    }
+}
+
 fn set_solve_path_if_changed(ss: &SolveState, path: &[usize]) {
     if ss.solve_path.read().as_slice() != path {
         *ss.solve_path.write() = path.to_vec();
@@ -2347,7 +4323,10 @@ fn reset_solve_state_for_start(
     max_iters: u32,
     position_label: String,
     solve_anchor: SolveAnchor,
-) {
+    exact_action_scale: Option<f64>,
+) -> u64 {
+    let _publish_guard = ss.publish_gate.write();
+    let generation = ss.generation.fetch_add(1, Ordering::AcqRel) + 1;
     ss.iteration.store(0, Ordering::Relaxed);
     ss.max_iterations.store(max_iters, Ordering::Relaxed);
     ss.exploitability_bits
@@ -2361,6 +4340,14 @@ fn reset_solve_state_for_start(
     *ss.solve_anchor.write() = Some(solve_anchor);
     *ss.solve_cache.write() = HashMap::new();
     *ss.solve_path.write() = vec![];
+    *ss.exact_action_scale.write() = exact_action_scale;
+    generation
+}
+
+fn acknowledge_cancelled_solve(ss: &SolveState, generation: u64) -> bool {
+    ss.publish_if_current(generation, |state| {
+        state.solving.store(false, Ordering::Release);
+    })
 }
 
 /// Get the current game state, including solve progress if active.
@@ -2373,6 +4360,18 @@ pub fn game_get_state_core(
     session_state: &GameSessionState,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let _session_state_guard = session_state.solve_request_gate.read();
+    if session_state.mp_session.read().is_some() {
+        let mut guard = session_state.mp_session.write();
+        let session = guard.as_mut().ok_or("No MP game session active")?;
+        let mut state = session.get_state()?;
+        if source.as_deref() == Some("exact") {
+            let ss = session_state.exact_solve.as_ref();
+            let path = resolve_solve_path_from_mp_session(ss, session);
+            apply_exact_solve_overlay(&mut state, ss, path);
+        }
+        return Ok(state);
+    }
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
     let mut state = session.get_state();
@@ -2440,6 +4439,94 @@ pub fn game_play_action_core(
     action_id: &str,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
+    if session_state.mp_session.read().is_some() {
+        let mut guard = session_state.mp_session.write();
+        let session = guard.as_mut().ok_or("No MP game session active")?;
+        let previous_street = session.spot.street();
+        let big_blind = mp_big_blind_amount(&session.config)?;
+        let ss = solve_state_for_source(session_state, source.as_deref());
+        let cached_navigation = if let Some(ss) = ss.as_ref() {
+            (|| -> Result<Option<(String, Vec<usize>)>, String> {
+                let Some(current_path) = resolve_solve_path_from_mp_session(ss, session) else {
+                    return Ok(None);
+                };
+                let cache = ss.solve_cache.read();
+                let Some(current_node) = cache.get(&current_path) else {
+                    return Ok(None);
+                };
+                let Some(cached_index) = current_node
+                    .actions
+                    .iter()
+                    .position(|action| action.id == action_id)
+                else {
+                    return Ok(None);
+                };
+                let current_mp_actions = session.current_actions();
+                let current_actions = build_mp_game_actions(&current_mp_actions, big_blind);
+                let session_action_id = if let Some(chip_scale) = *ss.exact_action_scale.read() {
+                    Some(exact_mp_session_action_id_matching_cached_action(
+                        &current_actions,
+                        &current_node.actions,
+                        cached_index,
+                        big_blind,
+                        chip_scale,
+                    )?)
+                } else {
+                    let cached_action = &current_node.actions[cached_index];
+                    current_mp_actions
+                        .iter()
+                        .enumerate()
+                        .find(|(_, current)| {
+                            semantic_actions_match(
+                                &semantic_action_from_game_action(cached_action),
+                                &semantic_action_from_mp_tree_action(current, big_blind),
+                            )
+                        })
+                        .map(|(index, _)| index.to_string())
+                };
+                let Some(session_action_id) = session_action_id else {
+                    return Ok(None);
+                };
+                let mut next_path = current_path;
+                next_path.push(cached_index);
+                Ok(cache
+                    .contains_key(&next_path)
+                    .then_some((session_action_id, next_path)))
+            })()?
+        } else {
+            None
+        };
+        if let (Some(ss), Some((session_action_id, next_path))) = (ss.as_ref(), cached_navigation) {
+            let mut state = session.play_action_without_state(&session_action_id)?;
+            let street_changed = session.spot.street() != previous_street;
+            let solve_in_progress = session_state.subgame_solve.solving.load(Ordering::Acquire)
+                || session_state.exact_solve.solving.load(Ordering::Acquire);
+            if street_changed || solve_in_progress {
+                session_state.subgame_solve.reset();
+                session_state.exact_solve.reset();
+                state.solve = None;
+                return Ok(state);
+            }
+            apply_exact_solve_overlay(&mut state, ss, Some(next_path));
+            return Ok(state);
+        }
+        let session_action_id = action_id.to_string();
+        let mut state = session.play_action(&session_action_id)?;
+        let street_changed = session.spot.street() != previous_street;
+        let solve_in_progress = session_state.subgame_solve.solving.load(Ordering::Acquire)
+            || session_state.exact_solve.solving.load(Ordering::Acquire);
+        if street_changed || solve_in_progress {
+            session_state.subgame_solve.reset();
+            session_state.exact_solve.reset();
+            state.solve = None;
+        }
+        if let Some(ss) = ss.as_ref() {
+            let path = resolve_solve_path_from_mp_session(ss, session);
+            apply_exact_solve_overlay(&mut state, ss, path);
+        }
+        return Ok(state);
+    }
     let ss = solve_state_for_source(session_state, source.as_deref());
     let source_navigation = if let Some(ss) = ss.as_ref() {
         let guard = session_state.session.read();
@@ -2535,6 +4622,16 @@ pub fn game_deal_card_core(
     session_state: &GameSessionState,
     card: &str,
 ) -> Result<GameState, String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
+    if session_state.mp_session.read().is_some() {
+        let mut guard = session_state.mp_session.write();
+        let session = guard.as_mut().ok_or("No MP game session active")?;
+        let mut state = session.deal_card(card)?;
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
+        state.solve = None;
+        return Ok(state);
+    }
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
     session.deal_card(card)?;
@@ -2553,6 +4650,38 @@ pub fn game_back_core(
     session_state: &GameSessionState,
     source: Option<String>,
 ) -> Result<GameState, String> {
+    let _session_mutation_guard = session_state.solve_request_gate.read();
+    if session_state.mp_session.read().is_some() {
+        let mut guard = session_state.mp_session.write();
+        let session = guard.as_mut().ok_or("No MP game session active")?;
+        let previous_street = session.spot.street();
+        let previous_board = session.board.clone();
+        let mut state = session.back()?;
+        let exact_path = reusable_mp_solve_path(
+            &session_state.exact_solve,
+            previous_street,
+            &previous_board,
+            session,
+        );
+        let subgame_path = reusable_mp_solve_path(
+            &session_state.subgame_solve,
+            previous_street,
+            &previous_board,
+            session,
+        );
+        if exact_path.is_none() {
+            session_state.exact_solve.reset();
+        }
+        if subgame_path.is_none() {
+            session_state.subgame_solve.reset();
+        }
+        if source.as_deref() == Some("exact") {
+            apply_exact_solve_overlay(&mut state, &session_state.exact_solve, exact_path);
+        } else if exact_path.is_none() {
+            state.solve = None;
+        }
+        return Ok(state);
+    }
     let ss = solve_state_for_source(session_state, source.as_deref());
     let cached_parent = ss.as_ref().and_then(|ss| {
         let guard = session_state.session.read();
@@ -2623,16 +4752,154 @@ pub fn game_solve_core(
     trace_iters: Option<String>,
     trace_dir: Option<String>,
     enable_gadget: Option<bool>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let is_exact = mode.as_deref() == Some("exact");
     let ss_ref = session_state.solve_for(&mode);
+    let max_iters = max_iterations.unwrap_or(200);
 
-    // Guard: reject if this mode is already solving
-    if ss_ref.solving.load(Ordering::Relaxed) {
-        return Err("A solve is already in progress".to_string());
-    }
+    // Capture the solve inputs and advance the generation while navigation is
+    // excluded. Once this guard is released, any navigation either sees this
+    // request as current or invalidates its generation before the worker can
+    // publish.
+    let (inputs, boundary_cut, solve_generation) = {
+        let _solve_request_guard = session_state.solve_request_gate.write();
+        if ss_ref.solving.load(Ordering::Acquire) {
+            return Err("A solve is already in progress".to_string());
+        }
 
-    // Read session state under lock, clone what the thread needs
+        let inputs = {
+            if session_state.mp_session.read().is_some() {
+                if !is_exact {
+                    return Err("UniversalMpLazy currently supports Exact solve only".to_string());
+                }
+                let mut guard = session_state.mp_session.write();
+                let session = guard.as_mut().ok_or("No MP game session active")?;
+                let snapshot = session.exact_solve_snapshot()?;
+                let action_big_blind =
+                    mp_big_blind_amount(&session.config)? * snapshot.solver_chip_scale;
+                let oop_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.oop_seat)].clone();
+                let ip_w = snapshot.raw_reaches_by_seat[usize::from(snapshot.ip_seat)].clone();
+                let position = if snapshot.acting_seat == snapshot.oop_seat {
+                    "BB"
+                } else {
+                    "SB"
+                };
+                let solve_anchor = SolveAnchor {
+                    node_idx: 0,
+                    board: snapshot.board.clone(),
+                    action_ids: snapshot
+                        .action_history
+                        .iter()
+                        .map(|action| action.action_id.clone())
+                        .collect(),
+                };
+                (
+                    snapshot.board,
+                    oop_w,
+                    ip_w,
+                    snapshot.pot,
+                    effective_stack_for_solve_root(&snapshot.root),
+                    snapshot.bet_sizes_by_street,
+                    None,
+                    0,
+                    position.to_string(),
+                    solve_anchor,
+                    ["BB".to_string(), "SB".to_string()],
+                    snapshot.root,
+                    match snapshot.street {
+                        MpStreet::Flop => Street::Flop,
+                        MpStreet::Turn => Street::Turn,
+                        MpStreet::River => Street::River,
+                        MpStreet::Preflop => return Err("Cannot solve preflop".to_string()),
+                    },
+                    Some(action_big_blind),
+                )
+            } else {
+                let guard = session_state.session.read();
+                let session = guard.as_ref().ok_or("No game session active")?;
+
+                // Must be at a postflop decision node
+                if session.board.len() < 3 {
+                    return Err(
+                        "Solve requires a postflop position (deal board cards first)".to_string(),
+                    );
+                }
+                let node = &session.tree.nodes[session.node_idx as usize];
+                let player = match node {
+                    V2GameNode::Decision { player, .. } => *player,
+                    _ => return Err("Not at a decision node".to_string()),
+                };
+
+                let board = session.board.clone();
+                let oop_w = session.weights[0].clone();
+                let ip_w = session.weights[1].clone();
+                let pot = session.compute_pot();
+                let solve_root = session.solve_game_root_for_player(player)?;
+                let eff_stack = effective_stack_for_solve_root(&solve_root);
+
+                let street = session.current_street();
+                let sizes = match street {
+                    Street::Flop => &session.config.action_abstraction.flop,
+                    Street::Turn => &session.config.action_abstraction.turn,
+                    Street::River => &session.config.action_abstraction.river,
+                    Street::Preflop => return Err("Cannot solve preflop".to_string()),
+                };
+                let street_bet_sizes = [sizes.clone(), sizes.clone(), sizes.clone()];
+
+                let cbv_ctx = session.cbv_context.clone();
+                let position = session.position_label(player).to_string();
+                let current_node = session.node_idx;
+                let solve_anchor = SolveAnchor {
+                    node_idx: current_node,
+                    board: board.clone(),
+                    action_ids: session
+                        .action_history
+                        .iter()
+                        .map(|a| a.action_id.clone())
+                        .collect(),
+                };
+                let player_labels = [
+                    session.position_label(1 - session.tree.dealer).to_string(),
+                    session.position_label(session.tree.dealer).to_string(),
+                ];
+
+                (
+                    board,
+                    oop_w,
+                    ip_w,
+                    pot,
+                    eff_stack,
+                    street_bet_sizes,
+                    cbv_ctx,
+                    current_node,
+                    position,
+                    solve_anchor,
+                    player_labels,
+                    solve_root,
+                    street,
+                    None,
+                )
+            }
+        };
+
+        let root_street = inputs.12;
+        let sbc = street_boundary_config.unwrap_or_default();
+        let boundary_cut = if is_exact {
+            None
+        } else {
+            resolve_street_boundary(&sbc, root_street)
+        };
+        validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
+        let solve_generation = reset_solve_state_for_start(
+            ss_ref,
+            max_iters,
+            inputs.8.clone(),
+            inputs.9.clone(),
+            inputs.13,
+        );
+        (inputs, boundary_cut, solve_generation)
+    };
+
     let (
         board,
         oop_w,
@@ -2643,81 +4910,13 @@ pub fn game_solve_core(
         cbv_ctx,
         current_node_idx,
         position_label,
-        solve_anchor,
+        _solve_anchor,
         player_labels,
         solve_root,
         root_street,
-    ) = {
-        let guard = session_state.session.read();
-        let session = guard.as_ref().ok_or("No game session active")?;
+        action_big_blind,
+    ) = inputs;
 
-        // Must be at a postflop decision node
-        if session.board.len() < 3 {
-            return Err("Solve requires a postflop position (deal board cards first)".to_string());
-        }
-        let node = &session.tree.nodes[session.node_idx as usize];
-        let player = match node {
-            V2GameNode::Decision { player, .. } => *player,
-            _ => return Err("Not at a decision node".to_string()),
-        };
-
-        let board = session.board.clone();
-        let oop_w = session.weights[0].clone();
-        let ip_w = session.weights[1].clone();
-        let pot = session.compute_pot();
-        let solve_root = session.solve_game_root_for_player(player)?;
-        let eff_stack = effective_stack_for_solve_root(&solve_root);
-
-        let street = session.current_street();
-        let sizes = match street {
-            Street::Flop => &session.config.action_abstraction.flop,
-            Street::Turn => &session.config.action_abstraction.turn,
-            Street::River => &session.config.action_abstraction.river,
-            Street::Preflop => return Err("Cannot solve preflop".to_string()),
-        };
-
-        let cbv_ctx = session.cbv_context.clone();
-        let position = session.position_label(player).to_string();
-        let current_node = session.node_idx;
-        let solve_anchor = SolveAnchor {
-            node_idx: current_node,
-            board: board.clone(),
-            action_ids: session
-                .action_history
-                .iter()
-                .map(|a| a.action_id.clone())
-                .collect(),
-        };
-        let player_labels = [
-            session.position_label(1 - session.tree.dealer).to_string(),
-            session.position_label(session.tree.dealer).to_string(),
-        ];
-
-        (
-            board,
-            oop_w,
-            ip_w,
-            pot,
-            eff_stack,
-            sizes.clone(),
-            cbv_ctx,
-            current_node,
-            position,
-            solve_anchor,
-            player_labels,
-            solve_root,
-            street,
-        )
-    };
-
-    // Resolve StreetBoundaryConfig to (depth_limit, model_path)
-    let sbc = street_boundary_config.unwrap_or_default();
-    let boundary_cut = if is_exact {
-        None
-    } else {
-        resolve_street_boundary(&sbc, root_street)
-    };
-    validate_cfvnet_boundary_cut(&boundary_cut, root_street)?;
     eprintln!(
         "{}",
         boundary_evaluator_log_line(if is_exact { "exact" } else { "subgame" }, &boundary_cut)
@@ -2742,7 +4941,6 @@ pub fn game_solve_core(
 
     let gadget_enabled = enable_gadget.unwrap_or(false);
 
-    let max_iters = max_iterations.unwrap_or(200);
     let snapshot_interval = matrix_snapshot_interval.unwrap_or(10);
     let target_exp = target_exploitability.unwrap_or(3.0);
 
@@ -2784,13 +4982,16 @@ pub fn game_solve_core(
         }
     };
 
-    // Reset solve state for this mode before building, so progress snapshots
-    // cannot read a stale solved tree from an earlier solve.
     let ss = ss_ref;
-    reset_solve_state_for_start(ss, max_iters, position_label, solve_anchor);
 
     let depth_limit_override = boundary_cut.as_ref().map(|(depth, _)| *depth);
     let build_exact = is_exact || boundary_cut.is_none();
+    let root_bet_sizes = &bet_sizes[match root_street {
+        Street::Flop => 0,
+        Street::Turn => 1,
+        Street::River => 2,
+        Street::Preflop => unreachable!("preflop solve roots are rejected above"),
+    }];
 
     // Gadget tree mode (A2): when gadget is enabled AND a boundary
     // cut is active, build via make_per_boundary_gadget_game which
@@ -2798,63 +4999,139 @@ pub fn game_solve_core(
     // real subgame root.
     let gadget_tree_active = gadget_enabled && boundary_cut.is_some() && cbv_ctx.is_some();
 
-    let game_result = if gadget_tree_active {
-        build_gadget_tree_game_for_solve(
-            &board,
-            &oop_w,
-            &ip_w,
-            pot,
-            eff_stack,
-            &bet_sizes,
-            solve_root,
-            depth_limit_override,
-            &cbv_ctx,
-            current_node_idx,
-            &boundary_cut,
-            max_iters,
-            target_exp,
-        )
+    let game = if is_exact {
+        // Exact game construction can enumerate a large tree. Keep it in the
+        // worker so cancellation can be acknowledged before and after setup.
+        None
     } else {
-        if gadget_enabled && boundary_cut.is_none() {
-            eprintln!("[solve] enable_gadget=true but no boundary cut; gadget has no effect");
-        }
-        if gadget_enabled && cbv_ctx.is_none() {
-            eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
-        }
-        build_solve_game_with_root(
-            &board,
-            &oop_w,
-            &ip_w,
-            pot,
-            eff_stack,
-            &bet_sizes,
-            build_exact,
-            depth_limit_override,
-            Some(solve_root),
-        )
-    };
-    let mut game = match game_result {
-        Ok(game) => game,
-        Err(e) => {
-            ss.solving.store(false, Ordering::Release);
-            return Err(e);
-        }
+        let game_result = if gadget_tree_active {
+            build_gadget_tree_game_for_solve(
+                &board,
+                &oop_w,
+                &ip_w,
+                pot,
+                eff_stack,
+                root_bet_sizes,
+                solve_root,
+                depth_limit_override,
+                &cbv_ctx,
+                current_node_idx,
+                &boundary_cut,
+                max_iters,
+                target_exp,
+            )
+        } else {
+            if gadget_enabled && boundary_cut.is_none() {
+                eprintln!("[solve] enable_gadget=true but no boundary cut; gadget has no effect");
+            }
+            if gadget_enabled && cbv_ctx.is_none() {
+                eprintln!("[solve] enable_gadget=true but no CbvContext; gadget has no effect");
+            }
+            build_solve_game_with_root_and_street_sizes(
+                &board,
+                &oop_w,
+                &ip_w,
+                pot,
+                eff_stack,
+                &bet_sizes,
+                build_exact,
+                depth_limit_override,
+                Some(solve_root),
+            )
+        };
+        Some(match game_result {
+            Ok(game) => game,
+            Err(e) => {
+                let _ = ss.publish_if_current(solve_generation, |state| {
+                    state.solving.store(false, Ordering::Release);
+                });
+                return Err(e);
+            }
+        })
     };
 
-    let position_label_for_guard = ss.solve_position.read().clone();
-    if let Err(e) = validate_solve_root_actor_label(
-        game.current_player(),
-        &player_labels,
-        &position_label_for_guard,
-    ) {
-        debug_assert!(false, "{e}");
-        eprintln!("[solve] {e}");
+    if let Some(ref game) = game {
+        let position_label_for_guard = position_label.clone();
+        if let Err(e) = validate_solve_root_actor_label(
+            game.current_player(),
+            &player_labels,
+            &position_label_for_guard,
+        ) {
+            debug_assert!(false, "{e}");
+            eprintln!("[solve] {e}");
+        }
     }
 
     // Spawn background thread
     let ss_clone = Arc::clone(ss_ref);
     let board_clone = board.clone();
     std::thread::spawn(move || {
+        let mut game = match game {
+            Some(game) => game,
+            None => {
+                if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                    || ss_clone.cancel.load(Ordering::Acquire)
+                {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
+
+                let game_result = build_solve_game_with_root_and_street_sizes_cancel(
+                    &board,
+                    &oop_w,
+                    &ip_w,
+                    pot,
+                    eff_stack,
+                    &bet_sizes,
+                    true,
+                    None,
+                    Some(solve_root),
+                    &ss_clone.cancel,
+                );
+                let game = match game_result {
+                    Ok(game) => game,
+                    Err(e) => {
+                        if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                            || ss_clone.cancel.load(Ordering::Acquire)
+                        {
+                            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                            return;
+                        }
+                        let _ = ss_clone.publish_if_current(solve_generation, |state| {
+                            eprintln!("[solve] failed to build exact game: {e}");
+                            state.solving.store(false, Ordering::Release);
+                        });
+                        return;
+                    }
+                };
+                if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                    || ss_clone.cancel.load(Ordering::Acquire)
+                {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
+
+                let position_label_for_guard = position_label.clone();
+                if let Err(e) = validate_solve_root_actor_label(
+                    game.current_player(),
+                    &player_labels,
+                    &position_label_for_guard,
+                ) {
+                    debug_assert!(false, "{e}");
+                    eprintln!("[solve] {e}");
+                }
+                game
+            }
+        };
+
+        if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
+            return;
+        }
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+
         // Store available actions at the explorer-visible root.
         // Under A2, game.root() IS the real subgame root.
         {
@@ -2863,9 +5140,29 @@ pub fn game_solve_core(
                 .available_actions()
                 .iter()
                 .enumerate()
-                .map(|(i, a)| range_solver_action_to_game_action(a, i))
+                .map(|(i, a)| {
+                    action_big_blind.map_or_else(
+                        || range_solver_action_to_game_action(a, i),
+                        |big_blind| {
+                            range_solver_action_to_game_action_with_big_blind(a, i, big_blind)
+                        },
+                    )
+                })
                 .collect();
-            *ss_clone.solve_actions.write() = actions;
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
+            if !ss_clone.publish_if_current(solve_generation, |state| {
+                *state.solve_actions.write() = actions;
+            }) {
+                return;
+            }
+        }
+
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
         }
 
         // Set up boundary evaluators for non-gadget path (opt_out=None).
@@ -2940,6 +5237,10 @@ pub fn game_solve_core(
                 current_node_idx,
                 seed_start,
             );
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
         }
 
         // Set up boundary tracer (no-op when disabled).
@@ -2960,14 +5261,24 @@ pub fn game_solve_core(
             .map(|_| crate::boundary_trace::build_preceding_decision_map(&game));
 
         // Initial matrix snapshot
-        let matrix = build_solve_matrix(&mut game, None);
-        *ss_clone.matrix_snapshot.write() = Some(matrix);
+        let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            *state.matrix_snapshot.write() = Some(matrix);
+        }) {
+            return;
+        }
 
         // Solve loop
         let has_per_boundary = !game.per_boundary_evaluators.is_empty();
         let mut t = 0u32;
         while t < max_iters {
-            if ss_clone.cancel.load(Ordering::Relaxed) {
+            if ss_clone.generation.load(Ordering::Acquire) != solve_generation
+                || ss_clone.cancel.load(Ordering::Acquire)
+            {
                 break;
             }
 
@@ -2993,9 +5304,29 @@ pub fn game_solve_core(
                 game.set_boundary_discount(alpha, beta, gamma);
             }
 
-            solve_step(&game, t);
+            let step_result = solve_step_with_cancel(&game, t, &ss_clone.cancel);
+            if step_result == SolveStepResult::Cancelled {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
+            if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
+                return;
+            }
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
             t += 1;
-            ss_clone.iteration.store(t, Ordering::Relaxed);
+            if !ss_clone.publish_if_current(solve_generation, |state| {
+                state.iteration.store(t, Ordering::Relaxed);
+            }) {
+                return;
+            }
+
+            if ss_clone.cancel.load(Ordering::Acquire) {
+                acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                return;
+            }
 
             // Capture boundary traces after this iteration's CFVs are cached.
             if let Some(ref tr) = tracer {
@@ -3010,14 +5341,38 @@ pub fn game_solve_core(
 
             // Snapshot matrix and exploitability periodically
             if t.is_multiple_of(snapshot_interval) {
-                let matrix = build_solve_matrix(&mut game, None);
-                *ss_clone.matrix_snapshot.write() = Some(matrix);
+                if ss_clone.cancel.load(Ordering::Acquire) {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
+                let matrix = build_solve_matrix_with_big_blind(&mut game, None, action_big_blind);
+                if ss_clone.cancel.load(Ordering::Acquire) {
+                    acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                    return;
+                }
+                if !ss_clone.publish_if_current(solve_generation, |state| {
+                    *state.matrix_snapshot.write() = Some(matrix);
+                }) {
+                    return;
+                }
 
                 if is_exact {
+                    if ss_clone.cancel.load(Ordering::Acquire) {
+                        acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                        return;
+                    }
                     let exp = compute_exploitability(&game);
-                    ss_clone
-                        .exploitability_bits
-                        .store(exp.to_bits(), Ordering::Relaxed);
+                    if ss_clone.cancel.load(Ordering::Acquire) {
+                        acknowledge_cancelled_solve(&ss_clone, solve_generation);
+                        return;
+                    }
+                    if !ss_clone.publish_if_current(solve_generation, |state| {
+                        state
+                            .exploitability_bits
+                            .store(exp.to_bits(), Ordering::Relaxed);
+                    }) {
+                        return;
+                    }
                     if exp.is_finite() && exp > 0.0 && exp <= target_exp {
                         eprintln!(
                             "[solve] exact converged: iter={t} exploitability={exp:.3} <= target={target_exp}"
@@ -3028,6 +5383,14 @@ pub fn game_solve_core(
             }
         }
 
+        if ss_clone.generation.load(Ordering::Acquire) != solve_generation {
+            return;
+        }
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+
         // Finalize: normalize strategy, compute EVs.
         // (This replaces the per-node strategy buffer with the CFR
         // time-averaged equilibrium — the same values the UI reads.)
@@ -3035,6 +5398,10 @@ pub fn game_solve_core(
             game.clear_boundary_cfvs();
         }
         finalize(&mut game);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
 
         // Flush the "last iter" trace AFTER finalize so the strategy recorded
         // matches the UI's displayed (time-averaged) strategy. Runs whether or
@@ -3057,30 +5424,65 @@ pub fn game_solve_core(
         game.cache_normalized_weights();
         let player = game.current_player();
         let evs = game.expected_values(player);
-        let final_matrix = build_solve_matrix(&mut game, Some(&evs));
-        *ss_clone.matrix_snapshot.write() = Some(final_matrix);
+        let final_matrix =
+            build_solve_matrix_with_big_blind(&mut game, Some(&evs), action_big_blind);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            *state.matrix_snapshot.write() = Some(final_matrix);
+        }) {
+            return;
+        }
 
         // Compute exploitability using cached boundary CFVs
         let saved_evaluator = game.boundary_evaluator.take();
         let saved_per_boundary = std::mem::take(&mut game.per_boundary_evaluators);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            game.boundary_evaluator = saved_evaluator;
+            game.per_boundary_evaluators = saved_per_boundary;
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         let final_exp = compute_exploitability(&game);
         game.boundary_evaluator = saved_evaluator;
         game.per_boundary_evaluators = saved_per_boundary;
-        ss_clone
-            .exploitability_bits
-            .store(final_exp.to_bits(), Ordering::Relaxed);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            state
+                .exploitability_bits
+                .store(final_exp.to_bits(), Ordering::Relaxed);
+        }) {
+            return;
+        }
 
         // Build solve cache for all decision nodes in the solved tree.
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
         game.back_to_root();
-        let solve_cache = build_solve_cache(&mut game, &player_labels);
+        let solve_cache =
+            build_solve_cache_with_big_blind(&mut game, &player_labels, action_big_blind);
         eprintln!(
             "[solve] cached {} decision nodes for subgame navigation",
             solve_cache.len()
         );
-        *ss_clone.solve_cache.write() = solve_cache;
-        *ss_clone.solve_path.write() = vec![];
-
-        ss_clone.solving.store(false, Ordering::Release);
+        if ss_clone.cancel.load(Ordering::Acquire) {
+            acknowledge_cancelled_solve(&ss_clone, solve_generation);
+            return;
+        }
+        if !ss_clone.publish_if_current(solve_generation, |state| {
+            *state.solve_cache.write() = solve_cache;
+            *state.solve_path.write() = vec![];
+            state.solving.store(false, Ordering::Release);
+        }) {
+            return;
+        }
         let reported_exp = f32::from_bits(ss_clone.exploitability_bits.load(Ordering::Relaxed));
         eprintln!(
             "[solve] complete: {} iterations, exploitability={:.4}",
@@ -3088,7 +5490,7 @@ pub fn game_solve_core(
         );
     });
 
-    Ok(())
+    Ok(solve_generation)
 }
 
 /// Load an ONNX session and wire per-boundary `NeuralBoundaryEvaluator`s
@@ -3223,12 +5625,7 @@ pub fn game_new(
     postflop_state: tauri::State<'_, Arc<crate::postflop::PostflopState>>,
     session_state: tauri::State<'_, GameSessionState>,
 ) -> Result<(), String> {
-    let cbv_ctx = postflop_state.cbv_context.read().clone();
-    let session = GameSession::from_exploration_state(&exploration, cbv_ctx)?;
-    *session_state.session.write() = Some(session);
-    session_state.subgame_solve.reset();
-    session_state.exact_solve.reset();
-    Ok(())
+    game_new_core(&exploration, &postflop_state, &session_state)
 }
 
 #[tauri::command]
@@ -3253,10 +5650,7 @@ pub fn game_deal_card(
     session_state: tauri::State<'_, GameSessionState>,
     card: String,
 ) -> Result<GameState, String> {
-    let mut guard = session_state.session.write();
-    let session = guard.as_mut().ok_or("No game session active")?;
-    session.deal_card(&card)?;
-    Ok(session.get_state())
+    game_deal_card_core(&session_state, &card)
 }
 
 #[tauri::command]
@@ -3280,7 +5674,7 @@ pub fn game_solve(
     trace_iters: Option<String>,
     trace_dir: Option<String>,
     enable_gadget: Option<bool>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     game_solve_core(
         &session_state,
         mode,
@@ -3299,11 +5693,10 @@ pub fn game_solve(
 pub fn game_cancel_solve_core(
     session_state: &GameSessionState,
     mode: Option<String>,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    session_state
-        .solve_for(&mode)
-        .cancel
-        .store(true, Ordering::Relaxed);
+    let solve_state = session_state.solve_for(&mode);
+    solve_state.request_cancel(generation);
     Ok(())
 }
 
@@ -3311,12 +5704,18 @@ pub fn game_cancel_solve_core(
 pub fn game_cancel_solve(
     session_state: tauri::State<'_, GameSessionState>,
     mode: Option<String>,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    game_cancel_solve_core(&session_state, mode)
+    game_cancel_solve_core(&session_state, mode, generation)
 }
 
 /// Encode the current game state as a human-readable spot string.
 pub fn game_encode_spot_core(session_state: &GameSessionState) -> Result<String, String> {
+    let mp_guard = session_state.mp_session.read();
+    if let Some(session) = mp_guard.as_ref() {
+        return Ok(session.encode_spot());
+    }
+
     let guard = session_state.session.read();
     let session = guard.as_ref().ok_or("No game session active")?;
     Ok(session.encode_spot())
@@ -3327,8 +5726,21 @@ pub fn game_load_spot_core(
     session_state: &GameSessionState,
     spot: &str,
 ) -> Result<GameState, String> {
+    let _solve_request_guard = session_state.solve_request_gate.write();
+
+    let mut mp_guard = session_state.mp_session.write();
+    if let Some(session) = mp_guard.as_mut() {
+        session_state.subgame_solve.reset();
+        session_state.exact_solve.reset();
+        session.load_spot(spot)?;
+        return session.get_state();
+    }
+    drop(mp_guard);
+
     let mut guard = session_state.session.write();
     let session = guard.as_mut().ok_or("No game session active")?;
+    session_state.subgame_solve.reset();
+    session_state.exact_solve.reset();
     session.load_spot(spot)?;
     Ok(session.get_state())
 }
@@ -3422,12 +5834,14 @@ fn make_test_config() -> BlueprintV2Config {
             purify_threshold: 0.0,
             equity_cache_path: None,
             optimizer: "dcfr".to_string(),
+            storage_backend: "dense".to_string(),
             sapcfr_eta: 0.5,
             brcfr_eta: 0.6,
             brcfr_warmup_iterations: 0,
             brcfr_interval: 100_000_000,
             use_baselines: false,
             baseline_alpha: 0.01,
+            baseline_validation: Default::default(),
             prune_streets: None,
             regret_floor: None,
             exploitability_interval_minutes: 0,
@@ -3439,6 +5853,7 @@ fn make_test_config() -> BlueprintV2Config {
             output_dir: "/tmp/test".to_string(),
             resume: false,
             max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     }
 }
@@ -3954,6 +6369,7 @@ mod tests {
                 id: "0".to_string(),
                 label: "Check".to_string(),
                 action_type: "check".to_string(),
+                exact_amount_bb: None,
             }],
         };
         *gss.subgame_solve.matrix_snapshot.write() = Some(dummy_matrix);
@@ -4096,7 +6512,7 @@ mod tests {
             .subgame_solve
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
-        game_cancel_solve_core(&gss, None).unwrap();
+        game_cancel_solve_core(&gss, None, None).unwrap();
         assert!(gss
             .subgame_solve
             .cancel
@@ -4115,7 +6531,7 @@ mod tests {
             .exact_solve
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
-        game_cancel_solve_core(&gss, Some("exact".to_string())).unwrap();
+        game_cancel_solve_core(&gss, Some("exact".to_string()), None).unwrap();
         assert!(gss
             .exact_solve
             .cancel
@@ -4125,6 +6541,96 @@ mod tests {
             .subgame_solve
             .cancel
             .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancelled_exact_worker_acknowledges_current_generation() {
+        let gss = GameSessionState::default();
+        let generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        assert!(gss.exact_solve.solving.load(Ordering::Acquire));
+
+        game_cancel_solve_core(&gss, Some("exact".to_string()), None).unwrap();
+        assert!(gss.exact_solve.cancel.load(Ordering::Acquire));
+        assert!(acknowledge_cancelled_solve(&gss.exact_solve, generation));
+        assert!(!gss.exact_solve.solving.load(Ordering::Acquire));
+        assert_eq!(
+            gss.exact_solve.generation.load(Ordering::Acquire),
+            generation
+        );
+    }
+
+    #[test]
+    fn stale_generation_cancel_is_a_noop() {
+        let gss = GameSessionState::default();
+        let stale_generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        let current_generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        gss.exact_solve.cancel.store(false, Ordering::Release);
+
+        game_cancel_solve_core(&gss, Some("exact".to_string()), Some(stale_generation)).unwrap();
+        assert!(!gss.exact_solve.cancel.load(Ordering::Acquire));
+        assert_eq!(
+            gss.exact_solve.generation.load(Ordering::Acquire),
+            current_generation
+        );
+
+        game_cancel_solve_core(&gss, Some("exact".to_string()), Some(current_generation)).unwrap();
+        assert!(gss.exact_solve.cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn generation_cancel_request_requires_active_generation_and_preserves_none_compatibility() {
+        let ss = SolveState::default();
+        let generation = reset_solve_state_for_start(
+            &ss,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+
+        assert!(!ss.request_cancel(Some(generation - 1)));
+        assert!(!ss.cancel.load(Ordering::Acquire));
+
+        ss.solving.store(false, Ordering::Release);
+        assert!(!ss.request_cancel(Some(generation)));
+        assert!(!ss.cancel.load(Ordering::Acquire));
+
+        assert!(ss.request_cancel(None));
+        assert!(ss.cancel.load(Ordering::Acquire));
     }
 
     // -------------------------------------------------------------------
@@ -4212,6 +6718,78 @@ mod tests {
         // Should have allin at minimum
         assert!(bet_str.contains('a'));
         assert!(raise_str.contains('a'));
+    }
+
+    #[test]
+    fn format_bet_sizes_preserves_fractional_percentages() {
+        let sizes = vec![vec![0.925, 0.3333333333333333]];
+        let (bet_str, raise_str) = format_bet_sizes_for_solve(&sizes);
+        assert_eq!(bet_str, "92.5%,33.3333333333333%,a");
+        assert_eq!(raise_str, bet_str);
+    }
+
+    #[test]
+    fn semantic_action_matching_does_not_round_distinct_bb_amounts_together() {
+        let lower = range_solver_action_to_game_action_with_big_blind(
+            &range_solver::Action::Bet(149),
+            0,
+            100.0,
+        );
+        let higher = range_solver_action_to_game_action_with_big_blind(
+            &range_solver::Action::Bet(151),
+            1,
+            100.0,
+        );
+        assert_eq!(lower.label, "1.49bb");
+        assert_eq!(higher.label, "1.51bb");
+        assert!(!semantic_actions_match(
+            &semantic_action_from_game_action(&lower),
+            &semantic_action_from_game_action(&higher),
+        ));
+    }
+
+    #[test]
+    fn build_solve_game_uses_independent_street_action_rows() {
+        use range_solver::bet_size::BetSize;
+
+        let board = vec![
+            "Ah".to_string(),
+            "Kd".to_string(),
+            "Qc".to_string(),
+            "Js".to_string(),
+        ];
+        let weights = vec![1.0f32; 1326];
+        let street_sizes = [
+            vec![vec![0.10], vec![0.20], vec![0.30]],
+            vec![vec![0.25], vec![0.50], vec![0.75]],
+            vec![vec![0.33], vec![0.60], vec![0.90]],
+        ];
+        let (_cards, tree) = build_solve_game_parts_with_root_and_street_sizes(
+            &board,
+            &weights,
+            &weights,
+            20,
+            90,
+            &street_sizes,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = tree.config();
+        assert!(config.flop_bet_sizes[0]
+            .bet
+            .contains(&BetSize::PotRelative(0.10)));
+        assert!(config.turn_bet_sizes[0]
+            .bet
+            .contains(&BetSize::PotRelative(0.25)));
+        assert!(config.river_bet_sizes[0]
+            .bet
+            .contains(&BetSize::PotRelative(0.33)));
+        assert!(config.turn_bet_sizes[0]
+            .per_num_bets
+            .get(1)
+            .is_some_and(|row| row.contains(&BetSize::PotRelative(0.75))));
     }
 
     // -------------------------------------------------------------------
@@ -5287,6 +7865,68 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    fn encode_spot_from_history_handles_universal_mp_board_segments() {
+        let action_history = vec![
+            ActionRecord {
+                action_id: "0".to_string(),
+                label: "2bb".to_string(),
+                position: "SB".to_string(),
+                street: "Preflop".to_string(),
+                pot: 3,
+                stack: 199,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "1".to_string(),
+                label: "Call".to_string(),
+                position: "BB".to_string(),
+                street: "Preflop".to_string(),
+                pot: 4,
+                stack: 198,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "0".to_string(),
+                label: "Check".to_string(),
+                position: "BB".to_string(),
+                street: "Flop".to_string(),
+                pot: 4,
+                stack: 198,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "1".to_string(),
+                label: "Call".to_string(),
+                position: "SB".to_string(),
+                street: "Flop".to_string(),
+                pot: 8,
+                stack: 194,
+                actions: vec![],
+            },
+            ActionRecord {
+                action_id: "2".to_string(),
+                label: "Bet 8bb".to_string(),
+                position: "BB".to_string(),
+                street: "Turn".to_string(),
+                pot: 12,
+                stack: 190,
+                actions: vec![],
+            },
+        ];
+        let board = vec![
+            "As".to_string(),
+            "Kd".to_string(),
+            "Qh".to_string(),
+            "Jc".to_string(),
+        ];
+
+        assert_eq!(
+            encode_spot_from_history(&action_history, &board),
+            "sb:2bb,bb:call|AsKdQh|bb:check,sb:call|Jc|bb:bet 8bb"
+        );
+    }
+
+    #[test]
     fn encode_spot_core_no_session_errors() {
         let gss = GameSessionState::default();
         let result = game_encode_spot_core(&gss);
@@ -5320,6 +7960,49 @@ mod tests {
         let state = game_load_spot_core(&gss, "sb:2bb,bb:fold").unwrap();
         assert_eq!(state.action_history.len(), 2);
         assert!(state.is_terminal);
+    }
+
+    #[test]
+    fn load_spot_core_invalidates_stale_solve_generations() {
+        let gss = GameSessionState::default();
+        *gss.session.write() = Some(make_multi_street_session());
+
+        let anchor = SolveAnchor {
+            node_idx: 0,
+            board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+            action_ids: vec![],
+        };
+        let exact_generation = reset_solve_state_for_start(
+            &gss.exact_solve,
+            10,
+            "BB".to_string(),
+            anchor.clone(),
+            None,
+        );
+        let subgame_generation =
+            reset_solve_state_for_start(&gss.subgame_solve, 10, "BB".to_string(), anchor, None);
+
+        let state = game_load_spot_core(&gss, "sb:fold").unwrap();
+        assert_eq!(state.action_history.len(), 1);
+
+        for (solve_state, generation) in [
+            (&gss.exact_solve, exact_generation),
+            (&gss.subgame_solve, subgame_generation),
+        ] {
+            assert_ne!(solve_state.generation.load(Ordering::Acquire), generation);
+            assert!(!solve_state.solving.load(Ordering::Acquire));
+            assert!(solve_state.cancel.load(Ordering::Acquire));
+            assert!(solve_state.solve_cache.read().is_empty());
+            assert!(!solve_state.publish_if_current(generation, |state| {
+                state.iteration.store(99, Ordering::Relaxed);
+                state.solving.store(false, Ordering::Relaxed);
+            }));
+            assert_eq!(solve_state.iteration.load(Ordering::Acquire), 0);
+        }
+
+        let state = game_get_state_core(&gss, Some("exact".to_string())).unwrap();
+        assert!(state.solve.is_none());
+        assert!(state.matrix.is_none());
     }
 
     // -------------------------------------------------------------------
@@ -5655,6 +8338,34 @@ mod tests {
     // Solve cache tests
     // -------------------------------------------------------------------
 
+    #[test]
+    fn unique_cached_action_index_returns_none_for_zero_matches() {
+        let target = scaled_action_descriptor("raise", Some(150));
+
+        assert_eq!(unique_cached_action_index(&[], &target, 100.0), None);
+    }
+
+    #[test]
+    fn unique_cached_action_index_returns_none_for_ambiguous_scaled_matches() {
+        let actions = vec![
+            GameAction {
+                id: "0".to_string(),
+                label: "1.5bb".to_string(),
+                action_type: "raise".to_string(),
+                exact_amount_bb: Some(1.5),
+            },
+            GameAction {
+                id: "1".to_string(),
+                label: "1.500000000000001bb".to_string(),
+                action_type: "raise".to_string(),
+                exact_amount_bb: Some(1.500000000000001),
+            },
+        ];
+        let target = scaled_action_descriptor("raise", Some(150));
+
+        assert_eq!(unique_cached_action_index(&actions, &target, 100.0), None);
+    }
+
     /// Helper to create a dummy CachedSolveNode with a recognizable hand label.
     fn make_cached_node(
         hand_label: &str,
@@ -5678,6 +8389,7 @@ mod tests {
                 id: i.to_string(),
                 label: lbl.to_string(),
                 action_type: action_type_for_label(lbl),
+                exact_amount_bb: None,
             })
             .collect();
         let matrix = GameMatrix {
@@ -5790,6 +8502,41 @@ mod tests {
 
         assert!(ss.solve_cache.read().is_empty());
         assert!(ss.solve_path.read().is_empty());
+    }
+
+    #[test]
+    fn stale_solve_generation_cannot_publish_after_reset() {
+        let ss = SolveState::default();
+        let generation = reset_solve_state_for_start(
+            &ss,
+            10,
+            "BB".to_string(),
+            SolveAnchor {
+                node_idx: 0,
+                board: vec!["As".to_string(), "Kd".to_string(), "Qh".to_string()],
+                action_ids: vec![],
+            },
+            None,
+        );
+        assert!(ss.publish_if_current(generation, |state| {
+            state.iteration.store(1, Ordering::Relaxed);
+        }));
+
+        ss.reset();
+
+        assert_ne!(ss.generation.load(Ordering::Acquire), generation);
+        assert!(!ss.publish_if_current(generation, |state| {
+            state.iteration.store(99, Ordering::Relaxed);
+            state.solving.store(false, Ordering::Relaxed);
+            state
+                .solve_cache
+                .write()
+                .insert(vec![], make_cached_node("STALE", &["Check"], "BB"));
+        }));
+        assert_eq!(ss.iteration.load(Ordering::Relaxed), 0);
+        assert!(!ss.solving.load(Ordering::Relaxed));
+        assert!(ss.solve_cache.read().is_empty());
+        assert!(ss.cancel.load(Ordering::Acquire));
     }
 
     #[test]
@@ -5906,11 +8653,13 @@ mod tests {
                 id: "0".to_string(),
                 label: "Call".to_string(),
                 action_type: "call".to_string(),
+                exact_amount_bb: None,
             },
             GameAction {
                 id: "1".to_string(),
                 label: "Fold".to_string(),
                 action_type: "fold".to_string(),
+                exact_amount_bb: None,
             },
         ];
         gss.subgame_solve.solve_cache.write().insert(
@@ -5943,11 +8692,13 @@ mod tests {
                 id: "0".to_string(),
                 label: "Call".to_string(),
                 action_type: "call".to_string(),
+                exact_amount_bb: None,
             },
             GameAction {
                 id: "1".to_string(),
                 label: "Fold".to_string(),
                 action_type: "fold".to_string(),
+                exact_amount_bb: None,
             },
         ];
         gss.subgame_solve.solve_cache.write().insert(
@@ -5983,11 +8734,13 @@ mod tests {
                 id: "0".to_string(),
                 label: "4bb".to_string(),
                 action_type: "bet".to_string(),
+                exact_amount_bb: None,
             },
             GameAction {
                 id: "1".to_string(),
                 label: "Fold".to_string(),
                 action_type: "fold".to_string(),
+                exact_amount_bb: None,
             },
         ];
         gss.subgame_solve.solve_cache.write().insert(
@@ -6022,6 +8775,7 @@ mod tests {
             id: "solver-call".to_string(),
             label: "Call".to_string(),
             action_type: "call".to_string(),
+            exact_amount_bb: None,
         }];
         gss.subgame_solve.solve_cache.write().insert(
             vec![],
@@ -6175,6 +8929,7 @@ mod tests {
             id: "0".to_string(),
             label: "Stale".to_string(),
             action_type: "call".to_string(),
+            exact_amount_bb: None,
         }];
 
         reset_solve_state_for_start(
@@ -6186,6 +8941,7 @@ mod tests {
                 board: vec!["Ah".to_string(), "Kd".to_string(), "Qc".to_string()],
                 action_ids: vec!["1".to_string()],
             },
+            None,
         );
 
         assert!(ss.solve_cache.read().is_empty());

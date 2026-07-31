@@ -19,7 +19,9 @@ use super::config::{
 };
 use super::game_tree::{TerminalKind, TreeAction};
 use super::mccfr::{PruneStats, terminal_value};
-use super::sparse_storage::{MpInfosetKey, SparseMpStorage};
+use super::sparse_storage::{
+    MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseMpStorage,
+};
 use super::storage::{REGRET_SCALE, STRATEGY_SCALE};
 use super::types::{Chips, DealWithBuckets, PlayerSet, Seat, Street};
 use crate::poker::Card;
@@ -245,6 +247,7 @@ pub struct LazyPublicState {
     to_act: Seat,
     facing_bet: bool,
     last_raise_to: Chips,
+    last_aggressive_action: Option<TreeAction>,
     dealer: u8,
     big_blind_amount: Chips,
 }
@@ -273,6 +276,54 @@ impl LazyPublicState {
     pub const fn raise_count(self) -> u8 {
         self.raise_count
     }
+
+    /// Remaining stacks in actual seat order.
+    #[must_use]
+    pub const fn stacks(self) -> [Chips; MAX_PLAYERS] {
+        self.stacks
+    }
+
+    /// Current street contributions in actual seat order.
+    #[must_use]
+    pub const fn street_bets(self) -> [Chips; MAX_PLAYERS] {
+        self.street_bets
+    }
+
+    /// Whether the acting seat is facing an outstanding bet.
+    #[must_use]
+    pub const fn facing_bet(self) -> bool {
+        self.facing_bet
+    }
+
+    /// The raw aggressive action that established the current bet, if any.
+    #[must_use]
+    pub const fn last_aggressive_action(self) -> Option<TreeAction> {
+        self.last_aggressive_action
+    }
+
+    /// The current bet-to amount in raw game-tree chips.
+    #[must_use]
+    pub const fn last_raise_to(self) -> Chips {
+        self.last_raise_to
+    }
+}
+
+/// Exact public betting metadata for a resolved lazy spot.
+///
+/// The values are deliberately kept in actual seat order and retain the raw
+/// `TreeAction` that established a bet. Consumers building another game tree
+/// must map seats explicitly rather than infer amounts from display labels.
+#[derive(Debug, Clone, Copy)]
+pub struct LazyBettingSnapshot {
+    pub to_act: Seat,
+    pub stacks: [Chips; MAX_PLAYERS],
+    pub street_bets: [Chips; MAX_PLAYERS],
+    pub pot: Chips,
+    pub raise_count: u8,
+    pub facing_bet: bool,
+    pub last_raise_to: Chips,
+    pub last_aggressive_action: Option<TreeAction>,
+    pub street: Street,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -340,6 +391,18 @@ impl LazyResolvedSpot {
         self.state.to_act()
     }
 
+    /// Current per-seat stack amounts.
+    #[must_use]
+    pub const fn stacks(self) -> [Chips; MAX_PLAYERS] {
+        self.state.stacks
+    }
+
+    /// Current pot amount.
+    #[must_use]
+    pub const fn pot(self) -> Chips {
+        self.state.pot()
+    }
+
     /// Current street.
     #[must_use]
     pub const fn street(self) -> Street {
@@ -356,6 +419,22 @@ impl LazyResolvedSpot {
     #[must_use]
     pub fn key_for_bucket(self, bucket: u16) -> MpInfosetKey {
         self.history.key(self.state, bucket)
+    }
+
+    /// Return exact public betting metadata for this spot.
+    #[must_use]
+    pub const fn betting_snapshot(self) -> LazyBettingSnapshot {
+        LazyBettingSnapshot {
+            to_act: self.to_act(),
+            stacks: self.stacks(),
+            street_bets: self.state.street_bets(),
+            pot: self.pot(),
+            raise_count: self.state.raise_count(),
+            facing_bet: self.state.facing_bet(),
+            last_raise_to: self.state.last_raise_to(),
+            last_aggressive_action: self.state.last_aggressive_action(),
+            street: self.street(),
+        }
     }
 
     /// Advance this resolved spot by one action index.
@@ -897,6 +976,7 @@ fn traverse_traverser(
 ) -> (f64, PruneStats) {
     let num_actions = actions.len();
     debug_assert!(num_actions <= MAX_ACTIONS);
+    storage.record_actions(key, &sparse_action_descriptors(&state, actions));
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
@@ -1019,6 +1099,7 @@ fn traverse_opponent(
 ) -> (f64, PruneStats) {
     let num_actions = actions.len();
     debug_assert!(num_actions <= MAX_ACTIONS);
+    storage.record_actions(key, &sparse_action_descriptors(&state, actions));
     let mut strategy = [0.0; MAX_ACTIONS];
     storage.regret_matched_strategy(key, num_actions, &mut strategy);
     let mut blocked = [false; MAX_ACTIONS];
@@ -1091,6 +1172,45 @@ fn update_strategy_sums(
             continue;
         }
         storage.add_strategy_sum(key, num_actions, action_idx, delta);
+    }
+}
+
+fn sparse_action_descriptors(
+    state: &LazyPublicState,
+    actions: &[TreeAction],
+) -> Vec<SparseActionDescriptor> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(idx, action)| {
+            let (kind, amount_chips) = match *action {
+                TreeAction::Fold => (SparseActionKind::Fold, 0),
+                TreeAction::Check => (SparseActionKind::Check, 0),
+                TreeAction::Call => (SparseActionKind::Call, 0),
+                TreeAction::Lead(amount) => (SparseActionKind::Lead, action_amount_chips(amount)),
+                TreeAction::Raise(amount) => (SparseActionKind::Raise, action_amount_chips(amount)),
+                TreeAction::AllIn if action_increments_raise_count(state, *action) => {
+                    (SparseActionKind::AllInBetRaise, 0)
+                }
+                TreeAction::AllIn => (SparseActionKind::AllInCall, 0),
+            };
+            SparseActionDescriptor {
+                kind,
+                amount_chips,
+                source_action_index: idx as u16,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::cast_sign_loss)]
+fn action_amount_chips(amount: f64) -> u32 {
+    if amount <= 0.0 {
+        0
+    } else if amount >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        amount.round() as u32
     }
 }
 
@@ -1239,9 +1359,8 @@ fn apply_action(state: LazyPublicState, action: TreeAction) -> LazyNode {
         TreeAction::Fold => fold_child(state),
         TreeAction::Check => check_child(state),
         TreeAction::Call => call_child(state),
-        TreeAction::Lead(amount) | TreeAction::Raise(amount) => {
-            aggression_child(state, Chips(amount))
-        }
+        TreeAction::Lead(amount) => aggression_child(state, TreeAction::Lead(amount)),
+        TreeAction::Raise(amount) => aggression_child(state, TreeAction::Raise(amount)),
         TreeAction::AllIn => all_in_child(state),
     }
 }
@@ -1292,7 +1411,11 @@ fn call_child(state: LazyPublicState) -> LazyNode {
     advance_to_next_player(next)
 }
 
-fn aggression_child(state: LazyPublicState, raise_to: Chips) -> LazyNode {
+fn aggression_child(state: LazyPublicState, action: TreeAction) -> LazyNode {
+    let raise_to = match action {
+        TreeAction::Lead(amount) | TreeAction::Raise(amount) => Chips(amount),
+        _ => unreachable!("aggression_child requires a sized aggressive action"),
+    };
     let seat = state.to_act;
     let idx = seat.index() as usize;
     let additional = raise_to - state.street_bets[idx];
@@ -1305,6 +1428,7 @@ fn aggression_child(state: LazyPublicState, raise_to: Chips) -> LazyNode {
     next.raise_count += 1;
     next.facing_bet = true;
     next.last_raise_to = raise_to;
+    next.last_aggressive_action = Some(action);
     next.acted_since_aggression = PlayerSet::empty();
     next.acted_since_aggression.insert(seat);
 
@@ -1337,6 +1461,7 @@ fn all_in_child(state: LazyPublicState) -> LazyNode {
     next.raise_count += 1;
     next.facing_bet = true;
     next.last_raise_to = raise_to;
+    next.last_aggressive_action = Some(TreeAction::AllIn);
     next.acted_since_aggression = PlayerSet::empty();
     next.acted_since_aggression.insert(seat);
 
@@ -1381,6 +1506,7 @@ fn init_public_state(config: &MpGameConfig, stack: Chips) -> LazyPublicState {
         to_act: Seat::from_raw(0),
         facing_bet: true,
         last_raise_to: Chips(2.0),
+        last_aggressive_action: None,
         dealer: find_dealer(config),
         big_blind_amount: Chips(2.0),
     };
@@ -1768,6 +1894,7 @@ fn new_street_state(state: LazyPublicState, next_street: Street) -> LazyPublicSt
     next.raise_count = 0;
     next.facing_bet = false;
     next.last_raise_to = Chips::ZERO;
+    next.last_aggressive_action = None;
     next.acted_since_aggression = PlayerSet::empty();
     next.to_act = find_postflop_first_to_act(&next);
     next
@@ -2047,6 +2174,7 @@ mod tests {
             to_act: Seat::from_raw(to_act),
             facing_bet: true,
             last_raise_to: Chips(10.0),
+            last_aggressive_action: Some(TreeAction::Raise(10.0)),
             dealer: 3,
             big_blind_amount: Chips(2.0),
         }
@@ -2092,6 +2220,7 @@ mod tests {
             to_act: Seat::from_raw(0),
             facing_bet,
             last_raise_to: Chips(to_call),
+            last_aggressive_action: facing_bet.then_some(TreeAction::Lead(to_call)),
             dealer: 0,
             big_blind_amount: Chips(2.0),
         }
@@ -2122,6 +2251,7 @@ mod tests {
             to_act: Seat::from_raw(0),
             facing_bet,
             last_raise_to: Chips(10.0),
+            last_aggressive_action: facing_bet.then_some(TreeAction::Lead(10.0)),
             dealer: 0,
             big_blind_amount: Chips(2.0),
         }
@@ -2150,6 +2280,28 @@ mod tests {
             actions
                 .iter()
                 .any(|action| matches!(action, TreeAction::Lead(amount) if (*amount - 4.0).abs() < SIZE_EPSILON))
+        );
+    }
+
+    #[timed_test]
+    fn lazy_10_player_root_generates_actions_without_building_tree() {
+        let game = LazyMpGame::new(&game_config(10, 200.0), &action_config());
+
+        let root = game.root_state();
+        let actions = game.actions(&root);
+
+        assert_eq!(game.num_players, 10);
+        assert_eq!(root.to_act(), Seat::from_raw(2));
+        assert_eq!(root.street(), Street::Preflop);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Fold))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, TreeAction::Call))
         );
     }
 
@@ -2269,6 +2421,24 @@ mod tests {
         let actions = game.actions(&state);
 
         assert_eq!(actions, vec![TreeAction::Fold, TreeAction::AllIn]);
+    }
+
+    #[timed_test]
+    fn lazy_sparse_action_identity_marks_all_in_call() {
+        let state = river_spr_zero_state(true, 50.0, 50.0);
+
+        let descriptors = sparse_action_descriptors(&state, &[TreeAction::Fold, TreeAction::AllIn]);
+
+        assert_eq!(descriptors[1].kind, SparseActionKind::AllInCall);
+    }
+
+    #[timed_test]
+    fn lazy_sparse_action_identity_marks_all_in_bet_raise() {
+        let state = postflop_audit_state(Street::Flop, true, 1);
+
+        let descriptors = sparse_action_descriptors(&state, &[TreeAction::Fold, TreeAction::AllIn]);
+
+        assert_eq!(descriptors[1].kind, SparseActionKind::AllInBetRaise);
     }
 
     #[timed_test]

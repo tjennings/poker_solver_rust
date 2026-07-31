@@ -14,7 +14,7 @@
 use poker_solver_core::blueprint_v2::cluster_pipeline::{cluster_single_flop, combo_index};
 use poker_solver_core::blueprint_v2::config::{
     ActionAbstractionConfig, BlueprintV2Config, ClusteringAlgorithm, ClusteringConfig, GameConfig,
-    SnapshotConfig, StreetClusterConfig, TrainingConfig,
+    SnapshotConfig, SnapshotFormat, StreetClusterConfig, TrainingConfig,
 };
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree};
 use poker_solver_core::blueprint_v2::mccfr::{traverse_external, Deal, DealWithBuckets};
@@ -241,12 +241,14 @@ fn build_mccfr_config(
             purify_threshold: 0.0,
             equity_cache_path: None,
             optimizer: "dcfr".to_string(),
+            storage_backend: "dense".to_string(),
             sapcfr_eta: 0.5,
             brcfr_eta: 0.6,
             brcfr_warmup_iterations: 0,
             brcfr_interval: 100_000_000,
             use_baselines: false,
             baseline_alpha: 0.01,
+            baseline_validation: Default::default(),
             prune_streets: None,
             regret_floor: None,
             exploitability_interval_minutes: 0,
@@ -258,6 +260,7 @@ fn build_mccfr_config(
             output_dir: "/tmp/convergence-harness-mccfr".into(),
             resume: false,
             max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     }
 }

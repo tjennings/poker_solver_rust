@@ -44,7 +44,7 @@ impl Street {
     /// Returns `AbstractionError::InvalidBoardSize` if `len` is not 0, 3, 4, or 5.
     ///
     /// # Examples
-    /// ```
+    /// ```text
     /// use poker_solver_core::abstraction::Street;
     ///
     /// assert_eq!(Street::from_board_len(0).unwrap(), Street::Preflop);
@@ -367,6 +367,15 @@ mod tests {
         assert_eq!(abstraction.num_buckets(Street::Flop), 4);
         assert_eq!(abstraction.num_buckets(Street::Turn), 2);
         assert_eq!(abstraction.num_buckets(Street::River), 1);
+    }
+
+    #[timed_test]
+    fn doc_example_from_board_len() {
+        assert_eq!(Street::from_board_len(0).unwrap(), Street::Preflop);
+        assert_eq!(Street::from_board_len(3).unwrap(), Street::Flop);
+        assert_eq!(Street::from_board_len(4).unwrap(), Street::Turn);
+        assert_eq!(Street::from_board_len(5).unwrap(), Street::River);
+        assert!(Street::from_board_len(2).is_err());
     }
 
     #[timed_test]

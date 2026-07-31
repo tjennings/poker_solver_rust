@@ -4,9 +4,9 @@
 //!
 //! ```text
 //! hi word (64 bits):
-//!   Bits 63-61: seat position       (3 bits, 0-7)
-//!   Bits 60-33: hand/bucket         (28 bits)
-//!   Bits 32-26: reserved            (7 bits)
+//!   Bits 63-60: seat position       (4 bits, 0-15)
+//!   Bits 59-32: hand/bucket         (28 bits)
+//!   Bits 31-26: reserved            (6 bits)
 //!   Bits 25-0:  top 26 bits of action history
 //!
 //! lo word (64 bits):
@@ -15,6 +15,11 @@
 //!
 //! Total action history: 90 bits = 22 slots x 4 bits each.
 //! Actions are packed MSB-first: action\[0\] at the highest position.
+//!
+//! The seat field was widened from 3 bits to 4 bits (a full nibble) to
+//! support seats 0-9 (10-player tables) without silent aliasing. The
+//! extra bit was taken from the 7 reserved bits (now 6). The 28-bit
+//! bucket field and 90-bit action history are fully preserved.
 //!
 //! Action slot encoding (4 bits each):
 //! - 0 = fold
@@ -26,11 +31,22 @@
 use super::types::Seat;
 
 // Bit positions within the `hi` word.
-const SEAT_SHIFT: u32 = 61;
-const BUCKET_SHIFT: u32 = 33;
+const SEAT_SHIFT: u32 = 60;
+const BUCKET_SHIFT: u32 = 32;
 
-// Masks for extraction.
-const SEAT_MASK: u64 = 0x7; // 3 bits
+/// Number of bits in the seat field.
+const SEAT_BITS: u32 = 4;
+
+/// Maximum seat index that fits in the packed field (2^SEAT_BITS - 1).
+/// Shared with `MpInfosetKey::from_parts` via `SEAT_CAPACITY`.
+const MAX_PACKED_SEAT: u8 = ((1u64 << SEAT_BITS) - 1) as u8;
+
+/// Number of distinct seat values the packed field can hold (2^SEAT_BITS).
+pub(crate) const SEAT_CAPACITY: u8 = (1u64 << SEAT_BITS) as u8;
+
+// Masks for extraction — derived from field widths so they cannot silently
+// disagree with the width constants.
+const SEAT_MASK: u64 = (1u64 << SEAT_BITS) - 1;
 const BUCKET_MASK: u64 = 0xFFF_FFFF; // 28 bits
 
 /// Total number of 4-bit action slots in the 90-bit action history.
@@ -98,9 +114,20 @@ impl InfoKey128 {
     // -- private helpers --
 
     /// Pack seat and bucket into the upper bits of `hi`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seat.index()` does not fit the 4-bit seat field
+    /// (i.e. `>= 16`). This prevents silent aliasing where a
+    /// truncated seat would collide with a different seat's key.
     fn pack_header(seat: Seat, bucket: u32) -> u64 {
+        assert!(
+            seat.index() <= MAX_PACKED_SEAT,
+            "seat {} does not fit {SEAT_BITS}-bit packed field (max {MAX_PACKED_SEAT})",
+            seat.index(),
+        );
         let mut hi: u64 = 0;
-        hi |= (u64::from(seat.index()) & SEAT_MASK) << SEAT_SHIFT;
+        hi |= u64::from(seat.index()) << SEAT_SHIFT;
         hi |= (u64::from(bucket) & BUCKET_MASK) << BUCKET_SHIFT;
         hi
     }
@@ -272,8 +299,157 @@ mod tests {
     #[timed_test]
     fn all_fields_max_no_corruption() {
         let actions = vec![0xFu8; 22];
-        let key = InfoKey128::new(Seat::from_raw(7), (1u32 << 28) - 1, &actions);
-        assert_eq!(key.seat(), Seat::from_raw(7));
+        let key = InfoKey128::new(Seat::from_raw(15), (1u32 << 28) - 1, &actions);
+        assert_eq!(key.seat(), Seat::from_raw(15));
         assert_eq!(key.bucket_bits(), (1u32 << 28) - 1);
+    }
+
+    // ── Seat 0-9 aliasing prevention (the centerpiece of this slice) ──
+
+    #[timed_test]
+    fn seats_0_through_9_round_trip() {
+        for s in 0..=9u8 {
+            let key = InfoKey128::new(Seat::from_raw(s), 42, &[1, 2]);
+            assert_eq!(key.seat(), Seat::from_raw(s), "seat {s} did not round-trip");
+        }
+    }
+
+    #[timed_test]
+    fn seats_0_through_15_all_fit() {
+        for s in 0..=15u8 {
+            let key = InfoKey128::new(Seat::from_raw(s), 0, &[]);
+            assert_eq!(
+                key.seat(),
+                Seat::from_raw(s),
+                "seat {s} did not round-trip in 4-bit field"
+            );
+        }
+    }
+
+    #[timed_test]
+    fn no_aliasing_full_seat_bucket_history_cross_product() {
+        let seats: Vec<u8> = (0..=9).collect();
+        let buckets: Vec<u32> = vec![
+            0,
+            1,
+            (1 << 14) | 0,     // flop local=0
+            (1 << 14) | 42,    // flop local=42
+            (2 << 14) | 42,    // turn local=42 (same local, different street)
+            (3 << 14) | 16383, // river max local (14-bit)
+            (1u32 << 28) - 1,  // max 28-bit bucket
+            0x0ABC_DEF,        // mid-range
+        ];
+        let histories: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![1],
+            (0..22).map(|i| (i % 15) as u8).collect(), // max 22 actions
+            vec![0xF; 6],                              // boundary-slot pattern near hi/lo split
+            vec![0, 0, 0, 0, 0, 0, 5],                 // action in slot 6 (near boundary)
+        ];
+
+        let mut all_keys = HashSet::new();
+        let mut count = 0usize;
+        for &s in &seats {
+            for &b in &buckets {
+                for h in &histories {
+                    let key = InfoKey128::new(Seat::from_raw(s), b, h);
+                    all_keys.insert(key);
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            all_keys.len(),
+            count,
+            "aliasing detected: {count} tuples produced only {} distinct keys",
+            all_keys.len()
+        );
+    }
+
+    #[timed_test]
+    fn seat_8_and_9_distinct_from_0_and_1() {
+        // This is the specific aliasing bug: old 3-bit mask truncated 8->0, 9->1
+        let k0 = InfoKey128::new(Seat::from_raw(0), 100, &[1]);
+        let k8 = InfoKey128::new(Seat::from_raw(8), 100, &[1]);
+        let k1 = InfoKey128::new(Seat::from_raw(1), 100, &[1]);
+        let k9 = InfoKey128::new(Seat::from_raw(9), 100, &[1]);
+        assert_ne!(k0, k8, "seat 8 aliases seat 0");
+        assert_ne!(k1, k9, "seat 9 aliases seat 1");
+        assert_eq!(k8.seat(), Seat::from_raw(8));
+        assert_eq!(k9.seat(), Seat::from_raw(9));
+    }
+
+    #[timed_test]
+    #[should_panic(expected = "does not fit 4-bit packed field")]
+    fn seat_overflow_panics() {
+        let _ = InfoKey128::new(Seat::from_raw(16), 0, &[]);
+    }
+
+    #[timed_test]
+    fn bucket_street_namespace_across_seats() {
+        for s in [0u8, 5, 9] {
+            for street in 0..=3u32 {
+                let bucket = (street << 14) | 100;
+                let key = InfoKey128::new(Seat::from_raw(s), bucket, &[]);
+                assert_eq!(key.bucket_bits(), bucket);
+            }
+            // Same local bucket under different streets must produce distinct keys
+            let k_flop = InfoKey128::new(Seat::from_raw(s), (1 << 14) | 77, &[]);
+            let k_turn = InfoKey128::new(Seat::from_raw(s), (2 << 14) | 77, &[]);
+            assert_ne!(k_flop, k_turn);
+        }
+    }
+
+    #[timed_test]
+    fn action_history_22_slots_still_round_trips() {
+        let actions: Vec<u8> = (0..22).map(|i| ((i + 1) % 15) as u8).collect();
+        for s in [0u8, 9, 15] {
+            let key = InfoKey128::new(Seat::from_raw(s), 500, &actions);
+            assert_eq!(key.seat(), Seat::from_raw(s));
+            assert_eq!(key.bucket_bits(), 500);
+            // Verify actions are distinguishable by comparing to permutation
+            let mut actions2 = actions.clone();
+            actions2[21] = (actions2[21] + 1) % 15;
+            let key2 = InfoKey128::new(Seat::from_raw(s), 500, &actions2);
+            assert_ne!(key, key2);
+        }
+    }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+
+            #[test]
+            fn round_trip_seat_bucket_history(
+                seat in 0..=15u8,
+                bucket in 0..(1u32 << 28),
+                action_count in 0..=22usize,
+            ) {
+                let actions: Vec<u8> = (0..action_count)
+                    .map(|i| (i % 15) as u8)
+                    .collect();
+                let key = InfoKey128::new(Seat::from_raw(seat), bucket, &actions);
+                prop_assert_eq!(key.seat(), Seat::from_raw(seat));
+                prop_assert_eq!(key.bucket_bits(), bucket);
+            }
+
+            #[test]
+            fn distinct_inputs_never_collide(
+                seat_a in 0..=15u8,
+                seat_b in 0..=15u8,
+                bucket_a in 0..(1u32 << 28),
+                bucket_b in 0..(1u32 << 28),
+            ) {
+                // If any component differs, keys must differ
+                if seat_a != seat_b || bucket_a != bucket_b {
+                    let ka = InfoKey128::new(Seat::from_raw(seat_a), bucket_a, &[1]);
+                    let kb = InfoKey128::new(Seat::from_raw(seat_b), bucket_b, &[1]);
+                    prop_assert_ne!(ka, kb);
+                }
+            }
+        }
     }
 }

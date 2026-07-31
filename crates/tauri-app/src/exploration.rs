@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use poker_solver_core::abstraction::isomorphism::{CanonicalBoard, SuitMapping};
 use poker_solver_core::agent::{AgentConfig, FrequencyMap};
+use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
+use poker_solver_core::blueprint_universal::{BundleKind, LoadedBundle};
 use poker_solver_core::blueprint_v2::bucket_file::BucketFile;
 use poker_solver_core::blueprint_v2::bundle::{self as v2_bundle, BlueprintV2Strategy};
 use poker_solver_core::blueprint_v2::cbv::CbvTable;
@@ -110,6 +113,17 @@ enum StrategySource {
         /// `None` if the bundle doesn't include hand_ev.bin.
         hand_evs: Option<Vec<[[f64; 169]; 2]>>,
     },
+    /// Universal MP bundle (eager or lazy). Read-only: bundle info and
+    /// row-level queries only; full MP tree navigation is deferred.
+    UniversalMp {
+        bundle: Arc<LoadedBundle>,
+        /// Retained multiplayer config, when the bundle root or an ancestor
+        /// has a config.yaml. Direct universal fixtures may intentionally omit
+        /// it and remain metadata-loadable.
+        config: Option<Box<BlueprintMpConfig>>,
+        config_dir: Option<PathBuf>,
+        bundle_dir: PathBuf,
+    },
 }
 
 impl Default for ExplorationState {
@@ -135,6 +149,14 @@ pub(crate) struct BlueprintV2Data {
     pub(crate) hand_evs: Option<Vec<[[f64; 169]; 2]>>,
 }
 
+/// Data extracted from a loaded universal MP source for GameSession.
+pub(crate) struct UniversalMpData {
+    pub(crate) bundle: Arc<LoadedBundle>,
+    pub(crate) config: Option<Box<BlueprintMpConfig>>,
+    pub(crate) config_dir: Option<PathBuf>,
+    pub(crate) bundle_dir: PathBuf,
+}
+
 impl ExplorationState {
     /// Extract BlueprintV2 data for use by GameSession.
     ///
@@ -158,7 +180,33 @@ impl ExplorationState {
                 decision_map: decision_map.clone(),
                 hand_evs: hand_evs.clone(),
             }),
-            _ => Err("game_new requires a BlueprintV2 source".to_string()),
+            _ => Err("game_new requires a BlueprintV2 source \
+                      (MP browsing not yet supported)"
+                .to_string()),
+        }
+    }
+
+    /// Extract the retained universal MP bundle and optional config.
+    ///
+    /// The outer `Option` distinguishes a non-MP source from an MP source
+    /// whose config is missing. This lets metadata-only MP loads continue to
+    /// work while `game_new` can report the actionable missing-config error.
+    pub(crate) fn extract_universal_mp_data(&self) -> Option<Result<UniversalMpData, String>> {
+        let source_guard = self.source.read();
+        let source = source_guard.as_ref()?;
+        match source {
+            StrategySource::UniversalMp {
+                bundle,
+                config,
+                config_dir,
+                bundle_dir,
+            } => Some(Ok(UniversalMpData {
+                bundle: Arc::clone(bundle),
+                config: config.clone(),
+                config_dir: config_dir.clone(),
+                bundle_dir: bundle_dir.clone(),
+            })),
+            _ => None,
         }
     }
 }
@@ -292,26 +340,135 @@ impl Default for ExplorationPosition {
 /// Load a strategy source from a directory or agent `.toml` file
 /// (core logic, no Tauri dependency).
 ///
-/// Supports agent configs (`.toml`) and BlueprintV2 bundles (`config.yaml`).
+/// Supports agent configs (`.toml`), universal bundles (`blueprint.json`),
+/// and legacy BlueprintV2 bundles (`config.yaml`).
 pub async fn load_bundle_core(
     state: &ExplorationState,
     path: String,
 ) -> Result<BundleInfo, String> {
+    let started = Instant::now();
     let bundle_path = PathBuf::from(&path);
+    eprintln!("[explorer-load] phase=command_entry command=load_bundle path={path}");
 
     if path.ends_with(".toml") {
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_bundle source=agent path={path} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         let (info, source) = load_agent(&bundle_path)?;
         *state.source.write() = Some(source);
         state.bucket_cache.write().clear();
         *state.suit_mapping.write() = None;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_bundle source=agent elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         return Ok(info);
     }
+    // Universal bundles: detect blueprint.json BEFORE config.yaml.
+    if has_universal_sentinel(&bundle_path) {
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_bundle source=universal path={path} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let result = load_universal_bundle_core(state, &bundle_path).await;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_bundle source=universal ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        return result;
+    }
     if bundle_path.join("config.yaml").exists() {
-        // Blueprint V2 bundle — delegate to the dedicated loader.
-        return load_blueprint_v2_core(state, path, None).await;
+        // Legacy Blueprint V2 bundle — delegate to the dedicated loader.
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_bundle source=legacy_hu path={path} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let result = load_blueprint_v2_core(state, path, None).await;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_bundle source=legacy_hu ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        return result;
     }
 
-    Err("Directory does not contain config.yaml (BlueprintV2 bundle) or .toml (agent)".to_string())
+    Err("Directory does not contain blueprint.json (universal), \
+         config.yaml (BlueprintV2), or .toml (agent)"
+        .to_string())
+}
+
+/// Check whether a directory (or its final/snapshot subdirs) contains
+/// a `blueprint.json` sentinel, indicating a universal bundle.
+fn has_universal_sentinel(dir: &Path) -> bool {
+    dir.join("blueprint.json").exists()
+        || dir.join("final/blueprint.json").exists()
+        || find_latest_universal_snapshot(dir).is_some()
+}
+
+/// Find the latest `snapshot_NNNN/` subdir containing a given file.
+fn find_latest_snapshot_with_file(dir: &Path, file_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut snapshots: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("snapshot_"))
+        })
+        .filter(|e| e.path().join(file_name).exists())
+        .collect();
+    snapshots.sort_by_key(std::fs::DirEntry::file_name);
+    snapshots.last().map(std::fs::DirEntry::path)
+}
+
+/// Find the newest universal snapshot, considering both direct
+/// `snapshot_NNNN/blueprint.json` and nested
+/// `snapshot_NNNN/universal/blueprint.json` layouts together.
+fn find_latest_universal_snapshot(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut candidates = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("snapshot_") {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.join("universal/blueprint.json").exists() {
+            candidates.push((name.clone(), 0_u8, path.join("universal")));
+        }
+        if path.join("blueprint.json").exists() {
+            candidates.push((name, 1_u8, path));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    candidates.pop().map(|(_, _, path)| path)
+}
+
+/// Resolve a universal bundle for the legacy BlueprintV2 entry point.
+///
+/// The frontend historically calls `load_blueprint_v2` after selecting a
+/// snapshot. MP lazy snapshots retain an MP `config.yaml` at the root and put
+/// the Explorer-readable bundle under `snapshot_NNNN/universal/`; this helper
+/// detects that before the HU-only config parser runs.
+fn resolve_universal_for_v2_request(dir: &Path, snapshot: Option<&str>) -> Option<PathBuf> {
+    if let Some(snap_name) = snapshot {
+        let snap_dir = dir.join(snap_name);
+        if snap_dir.join("blueprint.json").exists() {
+            return Some(snap_dir);
+        }
+        let nested = snap_dir.join("universal");
+        if nested.join("blueprint.json").exists() {
+            return Some(nested);
+        }
+        return None;
+    }
+
+    has_universal_sentinel(dir).then(|| dir.to_path_buf())
 }
 
 /// Load a strategy bundle (Tauri wrapper).
@@ -355,7 +512,43 @@ pub async fn load_blueprint_v2_core(
     dir_path: String,
     snapshot: Option<String>,
 ) -> Result<BundleInfo, String> {
+    let started = Instant::now();
     let dir = PathBuf::from(&dir_path);
+    eprintln!(
+        "[explorer-load] phase=command_entry command=load_blueprint_v2 path={} snapshot={}",
+        dir_path,
+        snapshot.as_deref().unwrap_or("auto")
+    );
+    if let Some(universal_dir) = resolve_universal_for_v2_request(&dir, snapshot.as_deref()) {
+        eprintln!(
+            "[explorer-load] phase=command_resolution command=load_blueprint_v2 source=universal path={} elapsed_ms={}",
+            universal_dir.display(),
+            started.elapsed().as_millis()
+        );
+        let result = load_universal_bundle_core(state, &universal_dir).await;
+        eprintln!(
+            "[explorer-load] phase=command_complete command=load_blueprint_v2 source=universal ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+        return result;
+    }
+
+    if classify_legacy_config(&dir).kind == LegacyConfigKind::Mp {
+        return Err(
+            "Legacy multiplayer config.yaml is listable but cannot be loaded through \
+             load_blueprint_v2; use a universal MP bundle"
+                .to_string(),
+        );
+    }
+
+    eprintln!(
+        "[explorer-load] phase=command_resolution command=load_blueprint_v2 source=legacy_hu path={} elapsed_ms={}",
+        dir_path,
+        started.elapsed().as_millis()
+    );
+
+    let source_started = Instant::now();
     let (config, strategy, cbv_table, snapshot_name, strat_dir) =
         tokio::task::spawn_blocking(move || {
             let cfg = v2_bundle::load_config(&dir)
@@ -426,8 +619,15 @@ pub async fn load_blueprint_v2_core(
         })
         .await
         .map_err(|e| format!("Load task panicked: {e}"))??;
+    eprintln!(
+        "[explorer-load] phase=legacy_hu_source_load iterations={} snapshot={} elapsed_ms={}",
+        strategy.iterations,
+        snapshot_name.as_deref().unwrap_or("root"),
+        source_started.elapsed().as_millis()
+    );
 
     let aa = &config.action_abstraction;
+    let tree_started = Instant::now();
     let tree = V2GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
@@ -441,6 +641,11 @@ pub async fn load_blueprint_v2_core(
     let decision_map = tree.decision_index_map();
 
     let (decision_nodes, _, _) = tree.node_counts();
+    eprintln!(
+        "[explorer-load] phase=legacy_hu_tree decision_nodes={} elapsed_ms={}",
+        decision_nodes,
+        tree_started.elapsed().as_millis()
+    );
     let info = BundleInfo {
         name: Some(config.game.name.clone()),
         stack_depth: config.game.stack_depth as u32,
@@ -531,7 +736,597 @@ pub async fn load_blueprint_v2_core(
     state.bucket_cache.write().clear();
     *state.suit_mapping.write() = None;
 
+    eprintln!(
+        "[explorer-load] phase=command_complete command=load_blueprint_v2 source=legacy_hu ok=true elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(info)
+}
+
+/// Load a universal bundle (core logic, no Tauri dependency).
+///
+/// For HU bundles: reads the retained `config.yaml`, rebuilds the game
+/// tree, reconstructs a `BlueprintV2Strategy` from the universal rows,
+/// and stores it as `BlueprintV2` so every existing HU view works
+/// unchanged.
+///
+/// For MP bundles: stores as `UniversalMp` with read-only bundle info
+/// and row-level query access.
+async fn load_universal_bundle_core(
+    state: &ExplorationState,
+    bundle_path: &Path,
+) -> Result<BundleInfo, String> {
+    let started = Instant::now();
+    let path = bundle_path.to_path_buf();
+    let loaded = tokio::task::spawn_blocking(move || {
+        poker_solver_core::blueprint_universal::load_bundle(&path)
+            .map_err(|e| format!("Failed to load universal bundle: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Load task panicked: {e}"))??;
+
+    let kind = loaded.kind();
+    let rows = loaded.manifest().map(|manifest| manifest.layout.row_count);
+    eprintln!(
+        "[explorer-load] phase=universal_reader_load kind={kind} rows={} path={} elapsed_ms={}",
+        rows.map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+        bundle_path.display(),
+        started.elapsed().as_millis()
+    );
+
+    match kind {
+        BundleKind::UniversalHu => load_universal_hu(state, loaded, bundle_path),
+        BundleKind::UniversalMpEager | BundleKind::UniversalMpLazy => {
+            load_universal_mp(state, loaded, bundle_path)
+        }
+        BundleKind::LegacyHu => Err("Unexpected LegacyHu from universal loader".into()),
+    }
+}
+
+/// Reconstruct a `BlueprintV2Strategy` from a universal HU bundle.
+///
+/// Reads the retained `config.yaml`, builds the game tree, maps each
+/// universal row's probabilities back into the flat action_probs layout,
+/// and populates the same `StrategySource::BlueprintV2` state the
+/// Explorer already uses.
+fn load_universal_hu(
+    state: &ExplorationState,
+    loaded: LoadedBundle,
+    bundle_path: &Path,
+) -> Result<BundleInfo, String> {
+    let config_started = Instant::now();
+    let config = load_retained_hu_config(bundle_path)?;
+    eprintln!(
+        "[explorer-load] phase=hu_config source=universal_hu path={} elapsed_ms={}",
+        bundle_path.display(),
+        config_started.elapsed().as_millis()
+    );
+
+    let tree_started = Instant::now();
+    let tree = build_hu_tree(&config);
+    let decision_map = tree.decision_index_map();
+    let (decision_nodes, _, _) = tree.node_counts();
+    eprintln!(
+        "[explorer-load] phase=hu_tree source=universal_hu decision_nodes={} elapsed_ms={}",
+        decision_nodes,
+        tree_started.elapsed().as_millis()
+    );
+
+    let reconstruction_started = Instant::now();
+    let strategy = reconstruct_hu_strategy(&config, &tree, &decision_map, &loaded)?;
+    eprintln!(
+        "[explorer-load] phase=hu_reconstruction source=universal_hu target=blueprint_v2 decision_nodes={} path={} elapsed_ms={}",
+        decision_nodes,
+        bundle_path.display(),
+        reconstruction_started.elapsed().as_millis()
+    );
+
+    let info = BundleInfo {
+        name: Some(config.game.name.clone()),
+        stack_depth: config.game.stack_depth as u32,
+        bet_sizes: vec![],
+        info_sets: decision_nodes,
+        iterations: loaded.iterations(),
+        preflop_only: true,
+        rake_rate: config.game.rake_rate,
+        rake_cap: config.game.rake_cap,
+        snapshot_name: None,
+    };
+
+    *state.source.write() = Some(StrategySource::BlueprintV2 {
+        config: Box::new(config),
+        strategy: Box::new(strategy),
+        tree: Box::new(tree),
+        decision_map,
+        cbv_table: None,
+        hand_evs: None,
+        bundle_dir: bundle_path.to_path_buf(),
+    });
+    state.bucket_cache.write().clear();
+    *state.suit_mapping.write() = None;
+
+    Ok(info)
+}
+
+/// Load the retained `config.yaml` from a universal bundle directory.
+///
+/// Checks: bundle root, `final/`, then latest `snapshot_NNNN/`.
+fn load_retained_hu_config(bundle_path: &Path) -> Result<BlueprintV2Config, String> {
+    let candidates = [
+        bundle_path.join("config.yaml"),
+        bundle_path.join("final/config.yaml"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return v2_bundle::load_config(c.parent().unwrap())
+                .map_err(|e| format!("Failed to load retained config.yaml: {e}"));
+        }
+    }
+    // Check snapshot dirs.
+    if let Some(snap) = find_latest_snapshot_with_file(bundle_path, "config.yaml") {
+        return v2_bundle::load_config(&snap)
+            .map_err(|e| format!("Failed to load retained config.yaml: {e}"));
+    }
+    Err("Universal HU bundle is missing retained config.yaml; \
+         cannot rebuild game tree for Explorer"
+        .to_string())
+}
+
+/// Build a V2 game tree from a config.
+fn build_hu_tree(config: &BlueprintV2Config) -> V2GameTree {
+    let aa = &config.action_abstraction;
+    V2GameTree::build_with_options(
+        config.game.stack_depth,
+        config.game.small_blind,
+        config.game.big_blind,
+        &aa.preflop,
+        &aa.flop,
+        &aa.turn,
+        &aa.river,
+        config.game.allow_preflop_limp,
+    )
+}
+
+/// Collect (arena_idx, decision_idx, n_buckets, n_actions) tuples for
+/// each decision node reachable via the decision_map.
+#[allow(clippy::cast_possible_truncation)]
+fn collect_decision_slots(
+    tree: &V2GameTree,
+    decision_map: &[u32],
+    bucket_counts: [u16; 4],
+) -> Vec<(u32, u32, u16, usize)> {
+    tree.nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(arena_idx, node)| {
+            if let V2GameNode::Decision {
+                street, actions, ..
+            } = node
+            {
+                let di = decision_map[arena_idx];
+                if di == u32::MAX {
+                    return None;
+                }
+                let nb = bucket_counts[*street as usize];
+                Some((arena_idx as u32, di, nb, actions.len()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Reconstruct a [`BlueprintV2Strategy`] by mapping universal rows
+/// back into the flat action_probs layout.
+fn reconstruct_hu_strategy(
+    config: &BlueprintV2Config,
+    tree: &V2GameTree,
+    decision_map: &[u32],
+    loaded: &LoadedBundle,
+) -> Result<BlueprintV2Strategy, String> {
+    let bucket_counts = [
+        config.clustering.preflop.buckets,
+        config.clustering.flop.buckets,
+        config.clustering.turn.buckets,
+        config.clustering.river.buckets,
+    ];
+
+    let slots = collect_decision_slots(tree, decision_map, bucket_counts);
+    let total: usize = slots
+        .iter()
+        .map(|(_, _, nb, na)| usize::from(*nb) * *na)
+        .sum();
+
+    let mut action_probs = vec![0.0f32; total];
+    let mut offset = 0usize;
+
+    for &(arena_idx, _di, n_buckets, n_actions) in &slots {
+        for bucket in 0..n_buckets {
+            let slot = offset + usize::from(bucket) * n_actions;
+            fill_bucket_probs(
+                &mut action_probs[slot..slot + n_actions],
+                loaded.query_hu(arena_idx, bucket),
+                n_actions,
+            );
+        }
+        offset += usize::from(n_buckets) * n_actions;
+    }
+
+    Ok(BlueprintV2Strategy::from_raw_with_tree(
+        action_probs,
+        bucket_counts,
+        loaded.iterations(),
+        tree,
+    ))
+}
+
+/// Fill a probability slice from a loader view, or uniform if absent.
+fn fill_bucket_probs(
+    dest: &mut [f32],
+    view: Option<poker_solver_core::blueprint_universal::InfosetView<'_>>,
+    n_actions: usize,
+) {
+    if let Some(v) = view {
+        dest[..v.probs.len()].copy_from_slice(v.probs);
+    } else {
+        let uniform = 1.0f32 / n_actions as f32;
+        dest.iter_mut().for_each(|p| *p = uniform);
+    }
+}
+
+/// Build a [`BundleInfo`] for a universal MP bundle from its manifest.
+fn mp_bundle_info(
+    manifest: &poker_solver_core::blueprint_universal::Manifest,
+    kind: BundleKind,
+    iterations: u64,
+) -> BundleInfo {
+    let game = &manifest.game;
+    BundleInfo {
+        name: Some(format!("MP {kind} ({}-player)", game.num_players)),
+        stack_depth: game
+            .seats
+            .first()
+            .map(|s| s.starting_stack as u32)
+            .unwrap_or(0),
+        bet_sizes: vec![],
+        info_sets: manifest.layout.row_count as usize,
+        iterations,
+        preflop_only: false,
+        rake_rate: game.rake.rate,
+        rake_cap: game.rake.cap,
+        snapshot_name: None,
+    }
+}
+
+/// Load a universal MP bundle into the read-only `UniversalMp` source.
+fn load_universal_mp(
+    state: &ExplorationState,
+    loaded: LoadedBundle,
+    bundle_path: &Path,
+) -> Result<BundleInfo, String> {
+    let started = Instant::now();
+    let kind = loaded.kind();
+    let manifest = loaded.manifest().ok_or("MP bundle missing manifest")?;
+    let rows = manifest.layout.row_count;
+    let info = mp_bundle_info(manifest, kind, loaded.iterations());
+    let retained_config = load_retained_mp_config(bundle_path)?;
+    let has_retained_config = retained_config.is_some();
+    let config = retained_config
+        .as_ref()
+        .map(|retained| Box::new(retained.config.clone()));
+    let config_dir = retained_config.map(|retained| retained.dir);
+
+    *state.source.write() = Some(StrategySource::UniversalMp {
+        bundle: Arc::new(loaded),
+        config,
+        config_dir,
+        bundle_dir: bundle_path.to_path_buf(),
+    });
+    state.bucket_cache.write().clear();
+    *state.suit_mapping.write() = None;
+
+    eprintln!(
+        "[explorer-load] phase=mp_source_setup kind={kind} rows={rows} retained_config={} path={} elapsed_ms={}",
+        has_retained_config,
+        bundle_path.display(),
+        started.elapsed().as_millis()
+    );
+    Ok(info)
+}
+
+/// Retained multiplayer config and the directory it came from.
+struct RetainedMpConfig {
+    config: BlueprintMpConfig,
+    dir: PathBuf,
+}
+
+/// Load a retained multiplayer config from the bundle directory or an ancestor.
+///
+/// Nested lazy snapshots keep `blueprint.json` below the snapshot directory
+/// while the trainer-owned `config.yaml` remains at the run root. A universal
+/// bundle without any retained config is still valid for metadata and row-level
+/// APIs, so this returns `Ok(None)` in that case.
+fn load_retained_mp_config(bundle_path: &Path) -> Result<Option<RetainedMpConfig>, String> {
+    let mut dir = Some(bundle_path);
+    while let Some(candidate_dir) = dir {
+        let config_path = candidate_dir.join("config.yaml");
+        if config_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&config_path) {
+                // Universal snapshot fixtures and older runs may retain only
+                // the game section. Keep those bundles metadata-loadable and
+                // let game_new report that a full MP config is required.
+                if let Ok(config) = serde_yaml::from_str::<BlueprintMpConfig>(&text) {
+                    return Ok(Some(RetainedMpConfig {
+                        config,
+                        dir: candidate_dir.to_path_buf(),
+                    }));
+                }
+            }
+        }
+        dir = candidate_dir.parent();
+    }
+    Ok(None)
+}
+
+fn bucket_dir_candidates(
+    bundle_dir: &Path,
+    config_dir: Option<&Path>,
+    cluster_path: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut candidates = configured_bucket_dir_candidates(bundle_dir, config_dir, cluster_path);
+    let mut add_ancestors = |start: &Path| {
+        let mut dir = Some(start);
+        while let Some(candidate) = dir {
+            candidates.push(candidate.join("buckets"));
+            dir = candidate.parent();
+        }
+    };
+    add_ancestors(bundle_dir);
+    if let Some(dir) = config_dir {
+        add_ancestors(dir);
+    }
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn configured_bucket_dir_candidates(
+    bundle_dir: &Path,
+    config_dir: Option<&Path>,
+    cluster_path: Option<&str>,
+) -> Vec<PathBuf> {
+    let Some(cluster_path) = cluster_path else {
+        return Vec::new();
+    };
+
+    let configured = PathBuf::from(cluster_path);
+    let mut candidates = Vec::new();
+    if configured.is_absolute() {
+        candidates.push(configured);
+    } else {
+        let mut add_ancestors_with_path = |start: &Path| {
+            let mut dir = Some(start);
+            while let Some(candidate) = dir {
+                candidates.push(candidate.join(&configured));
+                dir = candidate.parent();
+            }
+        };
+
+        if let Some(dir) = config_dir {
+            add_ancestors_with_path(dir);
+        }
+        add_ancestors_with_path(bundle_dir);
+
+        // Preserve trainer semantics for paths relative to the process
+        // working directory as the final compatibility fallback.
+        candidates.push(configured);
+    }
+
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn validate_flop_bucket_file(file: &BucketFile, expected_bucket_count: u16) -> Result<(), String> {
+    if file.header.street != Street::Flop {
+        return Err(format!(
+            "declares street {:?}, expected {:?}",
+            file.header.street,
+            Street::Flop
+        ));
+    }
+    if file.header.bucket_count != expected_bucket_count {
+        return Err(format!(
+            "declares {} buckets, config requires {}",
+            file.header.bucket_count, expected_bucket_count
+        ));
+    }
+    if file.header.combos_per_board != 1326 {
+        return Err(format!(
+            "declares {} combos per board, expected 1326",
+            file.header.combos_per_board
+        ));
+    }
+    if file.header.board_count == 0 || file.boards.is_empty() {
+        return Err("contains no usable flop boards".to_string());
+    }
+    if file.boards.len() != file.header.board_count as usize {
+        return Err(format!(
+            "declares {} boards but contains {} board entries",
+            file.header.board_count,
+            file.boards.len()
+        ));
+    }
+    let expected_bucket_values = (file.header.board_count as usize)
+        .checked_mul(usize::from(file.header.combos_per_board))
+        .ok_or_else(|| "declares too many bucket assignments".to_string())?;
+    if file.buckets.len() != expected_bucket_values {
+        return Err(format!(
+            "declares {} boards x {} combos but contains {} bucket assignments",
+            file.header.board_count,
+            file.header.combos_per_board,
+            file.buckets.len()
+        ));
+    }
+    if file
+        .buckets
+        .iter()
+        .any(|&bucket| bucket >= expected_bucket_count)
+    {
+        return Err("contains a bucket assignment outside the configured bucket range".to_string());
+    }
+    Ok(())
+}
+
+/// Load the same file-backed bucket inputs used by the MP trainer.
+///
+/// The Explorer only needs the flop file for the supported boundary, but it
+/// keeps all available street files and per-flop files in the `AllBuckets`
+/// object so lookup semantics remain shared with training. A source directory
+/// is valid for this boundary only when it contains a readable `flop.buckets`.
+pub(crate) fn load_mp_all_buckets(data: &UniversalMpData) -> Result<Arc<AllBuckets>, String> {
+    let config = data
+        .config
+        .as_ref()
+        .ok_or_else(|| "Universal MP session is missing retained config.yaml".to_string())?;
+    let bucket_counts = config.clustering.bucket_counts();
+    let candidates = bucket_dir_candidates(
+        &data.bundle_dir,
+        data.config_dir.as_deref(),
+        config.training.cluster_path.as_deref(),
+    );
+    let searched = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+
+    let explicit_candidates = configured_bucket_dir_candidates(
+        &data.bundle_dir,
+        data.config_dir.as_deref(),
+        config.training.cluster_path.as_deref(),
+    );
+    let mut selected_cluster_dir = None;
+    let mut selected_flop_file = None;
+    let mut implicit_invalid_error = None;
+    let mut ordered_candidates = explicit_candidates.clone();
+    ordered_candidates.extend(
+        candidates
+            .iter()
+            .filter(|candidate| !explicit_candidates.contains(candidate))
+            .cloned(),
+    );
+    for candidate in &ordered_candidates {
+        let path = candidate.join("flop.buckets");
+        if !path.is_file() {
+            continue;
+        }
+
+        let source_kind = if explicit_candidates.contains(candidate) {
+            "configured training.cluster_path"
+        } else {
+            "implicit bundle/config ancestor"
+        };
+        let file = match BucketFile::load(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                let message = format!(
+                    "Failed to load Universal MP {source_kind} flop bucket file {}: {error}. Searched: {}",
+                    path.display(),
+                    searched.join(", ")
+                );
+                if source_kind == "configured training.cluster_path" {
+                    return Err(message);
+                }
+                implicit_invalid_error.get_or_insert(message);
+                continue;
+            }
+        };
+        if let Err(error) = validate_flop_bucket_file(&file, bucket_counts[1]) {
+            let message = format!(
+                "Invalid Universal MP {source_kind} flop bucket file {}: {error}. Searched: {}",
+                path.display(),
+                searched.join(", ")
+            );
+            if source_kind == "configured training.cluster_path" {
+                return Err(message);
+            }
+            implicit_invalid_error.get_or_insert(message);
+            continue;
+        }
+        selected_cluster_dir = Some(candidate.clone());
+        selected_flop_file = Some(file);
+        break;
+    }
+
+    let Some(cluster_dir) = selected_cluster_dir else {
+        if let Some(error) = implicit_invalid_error {
+            return Err(error);
+        }
+        return Err(format!(
+            "Universal MP flop bucket source is missing; expected readable flop.buckets in bundle-local/ancestor directories or training.cluster_path. Searched: {}",
+            searched.join(", ")
+        ));
+    };
+
+    let names = [
+        "preflop.buckets",
+        "flop.buckets",
+        "turn.buckets",
+        "river.buckets",
+    ];
+    let expected_streets = [Street::Preflop, Street::Flop, Street::Turn, Street::River];
+    let mut files: [Option<BucketFile>; 4] = [None, None, None, None];
+    files[1] = selected_flop_file;
+    for (index, name) in names.iter().enumerate() {
+        if index == 1 {
+            continue;
+        }
+        let path = cluster_dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let file = BucketFile::load(&path).map_err(|error| {
+            format!(
+                "Failed to load Universal MP {} bucket file {}: {error}",
+                expected_streets[index] as u8,
+                path.display()
+            )
+        })?;
+        if file.header.street != expected_streets[index] {
+            return Err(format!(
+                "Universal MP bucket file {} declares street {:?}, expected {:?}",
+                path.display(),
+                file.header.street,
+                expected_streets[index]
+            ));
+        }
+        if file.header.bucket_count != bucket_counts[index] {
+            return Err(format!(
+                "Universal MP bucket file {} declares {} buckets, config requires {} for {:?}",
+                path.display(),
+                file.header.bucket_count,
+                bucket_counts[index],
+                expected_streets[index]
+            ));
+        }
+        files[index] = Some(file);
+    }
+
+    let all_buckets = AllBuckets::new(bucket_counts, files);
+    let all_buckets = if cluster_dir.join("flop_0000.buckets").is_file() {
+        all_buckets.with_per_flop_dir(cluster_dir.clone())
+    } else {
+        all_buckets
+    };
+    Ok(Arc::new(all_buckets))
 }
 
 /// Load a Blueprint V2 bundle (Tauri wrapper).
@@ -681,36 +1476,48 @@ pub fn list_blueprints_core(dir: String) -> Result<Vec<BlueprintListEntry>, Stri
 }
 
 /// Try to interpret `dir` as a blueprint directory.
-/// Returns `Some(BlueprintListEntry)` if `config.yaml` exists.
-/// If config parsing fails, the entry is still created with defaults so
-/// the user can see it in the picker (with stack_depth = 0).
+/// Detects universal bundles (`blueprint.json`) and legacy bundles
+/// (`config.yaml`). If parsing fails, the entry is still created with
+/// defaults so the user can see it in the picker (with stack_depth = 0).
 fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
+    // Try universal first, then legacy.
+    if has_universal_sentinel(dir) {
+        return try_make_universal_entry(dir);
+    }
     if !dir.join("config.yaml").exists() {
         return None;
     }
 
-    let (name, stack_depth) = match v2_bundle::load_config(dir) {
-        Ok(config) => (config.game.name.clone(), config.game.stack_depth),
-        Err(e) => {
-            eprintln!("Warning: failed to parse config in {}: {e}", dir.display());
-            let fallback = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            (fallback, 0.0)
-        }
+    let metadata = classify_legacy_config(dir);
+    let fallback_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let (name, stack_depth) = match metadata.kind {
+        LegacyConfigKind::Hu => v2_bundle::load_config(dir)
+            .map(|config| (config.game.name, config.game.stack_depth))
+            .unwrap_or_else(|_| {
+                (
+                    metadata.name.unwrap_or_else(|| fallback_name.clone()),
+                    metadata.stack_depth.unwrap_or(0.0),
+                )
+            }),
+        LegacyConfigKind::Mp | LegacyConfigKind::Unknown => (
+            metadata.name.unwrap_or(fallback_name),
+            metadata.stack_depth.unwrap_or(0.0),
+        ),
     };
 
-    let has_strategy = dir.join("final/strategy.bin").exists()
-        || dir.join("strategy.bin").exists()
+    let has_strategy = dir.join("final/strategy.bin").is_file()
+        || dir.join("strategy.bin").is_file()
         || std::fs::read_dir(dir)
             .ok()
             .map(|rd| {
                 rd.filter_map(Result::ok).any(|e| {
-                    e.file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with("snapshot_"))
+                    e.file_name().to_str().is_some_and(|n| {
+                        n.starts_with("snapshot_") && snapshot_has_strategy(&e.path())
+                    })
                 })
             })
             .unwrap_or(false);
@@ -741,6 +1548,122 @@ fn try_make_blueprint_entry(dir: &Path) -> Option<BlueprintListEntry> {
     })
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LegacyConfigKind {
+    Hu,
+    Mp,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Default)]
+struct LegacyConfigMetadata {
+    kind: LegacyConfigKind,
+    name: Option<String>,
+    stack_depth: Option<f64>,
+}
+
+/// Read only the game metadata needed by the picker before attempting typed
+/// HU parsing. MP configs are intentionally classified without deserializing
+/// them as [`BlueprintV2Config`], because they have a different schema.
+fn classify_legacy_config(dir: &Path) -> LegacyConfigMetadata {
+    let Ok(text) = std::fs::read_to_string(dir.join("config.yaml")) else {
+        return LegacyConfigMetadata::default();
+    };
+    let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return LegacyConfigMetadata::default();
+    };
+    let Some(game) = root
+        .as_mapping()
+        .and_then(|mapping| yaml_mapping_value(mapping, "game"))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
+        return LegacyConfigMetadata::default();
+    };
+
+    let has_players = yaml_mapping_value(game, "players").is_some();
+    let has_num_players = yaml_mapping_value(game, "num_players").is_some();
+    let kind = match (has_players, has_num_players) {
+        (true, false) => LegacyConfigKind::Hu,
+        (false, true) => LegacyConfigKind::Mp,
+        _ => LegacyConfigKind::Unknown,
+    };
+
+    LegacyConfigMetadata {
+        kind,
+        name: yaml_mapping_value(game, "name")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_owned),
+        stack_depth: yaml_mapping_value(game, "stack_depth")
+            .and_then(|value| serde_yaml::from_value::<f64>(value.clone()).ok()),
+    }
+}
+
+fn yaml_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a serde_yaml::Value> {
+    mapping
+        .iter()
+        .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
+}
+
+fn snapshot_has_strategy(snapshot_dir: &Path) -> bool {
+    snapshot_dir.join("strategy.bin").is_file()
+        || snapshot_dir.join("blueprint.json").is_file()
+        || snapshot_dir.join("universal/blueprint.json").is_file()
+}
+
+/// Try to interpret `dir` as a universal bundle directory.
+/// Reads the manifest cheaply for name, stack depth, and player count.
+fn try_make_universal_entry(dir: &Path) -> Option<BlueprintListEntry> {
+    let kind = poker_solver_core::blueprint_universal::detect_bundle_kind(dir).ok()?;
+    let manifest = read_manifest_cheaply(dir)?;
+    let game = &manifest.game;
+
+    let name = format!(
+        "{} ({}-player {})",
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown"),
+        game.num_players,
+        kind,
+    );
+
+    let stack_depth = game.seats.first().map(|s| s.starting_stack).unwrap_or(0.0);
+
+    Some(BlueprintListEntry {
+        name,
+        path: dir.to_string_lossy().to_string(),
+        stack_depth,
+        has_strategy: true,
+        latest_snapshot: None,
+    })
+}
+
+/// Read a manifest cheaply from the first `blueprint.json` found:
+/// `final/`, root, then the newest direct-or-nested universal snapshot.
+fn read_manifest_cheaply(dir: &Path) -> Option<poker_solver_core::blueprint_universal::Manifest> {
+    let candidates = [dir.join("final/blueprint.json"), dir.join("blueprint.json")];
+    for c in &candidates {
+        if let Ok(text) = std::fs::read_to_string(c) {
+            if let Ok(m) = serde_json::from_str(&text) {
+                return Some(m);
+            }
+        }
+    }
+    // Check the newest universal snapshot, comparing direct and nested
+    // universal layouts by snapshot directory name.
+    if let Some(snap) = find_latest_universal_snapshot(dir) {
+        if let Ok(text) = std::fs::read_to_string(snap.join("blueprint.json")) {
+            if let Ok(m) = serde_json::from_str(&text) {
+                return Some(m);
+            }
+        }
+    }
+    None
+}
+
 /// List available blueprint bundles in a directory (Tauri wrapper).
 #[tauri::command]
 pub async fn list_blueprints(dir: String) -> Result<Vec<BlueprintListEntry>, String> {
@@ -761,7 +1684,7 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
                 return None;
             }
             let snap_dir = e.path();
-            let has_strategy = snap_dir.join("strategy.bin").exists();
+            let has_strategy = snapshot_has_strategy(&snap_dir);
 
             // Try to read metadata.json for iteration count and elapsed time.
             let (iterations, elapsed_minutes) =
@@ -770,7 +1693,9 @@ pub fn list_snapshots_core(blueprint_path: String) -> Result<Vec<SnapshotEntry>,
                     .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
                     .map(|json| {
                         (
-                            json.get("iteration").and_then(|v| v.as_u64()),
+                            json.get("iterations")
+                                .or_else(|| json.get("iteration"))
+                                .and_then(|v| v.as_u64()),
                             json.get("elapsed_minutes").and_then(|v| v.as_u64()),
                         )
                     })
@@ -806,10 +1731,7 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
     let format_depth = |sizes: &[f64]| -> String {
         sizes
             .iter()
-            .map(|&f| {
-                let pct = (f * 100.0).round() as u32;
-                format!("{pct}%")
-            })
+            .map(|&f| format!("{}%", format_percentage_for_range_solver(f)))
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -831,6 +1753,26 @@ pub fn blueprint_sizes_to_range_solver(depths: &[Vec<f64>]) -> (String, String) 
     (add_allin(bet_str), add_allin(raise_str))
 }
 
+/// Preserve fractional blueprint percentages when passing them to range-solver.
+///
+/// Range-solver accepts decimal percentages, so converting through an integer
+/// percentage would make distinct configured actions share one descriptor before
+/// the solver even builds its integer chip tree.
+fn format_percentage_for_range_solver(fraction: f64) -> String {
+    let mut formatted = format!("{:.15}", fraction * 100.0);
+    while formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        formatted.clear();
+        formatted.push('0');
+    }
+    formatted
+}
+
 /// Get the strategy matrix for a given position (core logic, no Tauri dependency).
 ///
 /// `threshold` filters out hands whose prior action probabilities fell below
@@ -849,7 +1791,14 @@ pub fn get_strategy_matrix_core(
         .as_ref()
         .ok_or_else(|| "No bundle loaded".to_string())?;
 
-    match source {
+    let initial_matrix = position.history.is_empty() && position.board.is_empty();
+    let initial_matrix_started = initial_matrix.then(Instant::now);
+    let source_kind = match source {
+        StrategySource::Agent(_) => "agent",
+        StrategySource::BlueprintV2 { .. } => "blueprint_v2",
+        StrategySource::UniversalMp { .. } => "universal_mp",
+    };
+    let result = match source {
         StrategySource::Agent(agent) => get_strategy_matrix_agent(agent, &position),
         StrategySource::BlueprintV2 {
             config,
@@ -871,7 +1820,17 @@ pub fn get_strategy_matrix_core(
                 hand_evs.as_deref(),
             )
         }
+        StrategySource::UniversalMp { .. } => Err("MP browsing not yet supported".to_string()),
+    };
+
+    if let Some(started) = initial_matrix_started {
+        eprintln!(
+            "[explorer-load] phase=initial_matrix source={source_kind} ok={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
     }
+    result
 }
 
 /// Get the strategy matrix for a given position (Tauri wrapper).
@@ -1720,6 +2679,7 @@ pub fn get_available_actions_core(
             &agent.game.bet_sizes,
             &position,
         )),
+        StrategySource::UniversalMp { .. } => Err("MP browsing not yet supported".to_string()),
     }
 }
 
@@ -1780,6 +2740,10 @@ pub fn get_bundle_info_core(state: &ExplorationState) -> Result<BundleInfo, Stri
                 rake_cap: config.game.rake_cap,
                 snapshot_name: None, // not available from this code path
             }
+        }
+        StrategySource::UniversalMp { bundle, .. } => {
+            let manifest = bundle.manifest().ok_or("missing manifest")?;
+            mp_bundle_info(manifest, bundle.kind(), bundle.iterations())
         }
     })
 }
@@ -2837,7 +3801,11 @@ pub fn get_preflop_ranges_core(
             decision_map,
             ..
         } => (config, strategy, tree, decision_map),
-        _ => return Err("get_preflop_ranges requires a BlueprintV2 source".to_string()),
+        _ => {
+            return Err("get_preflop_ranges requires a BlueprintV2 source \
+                         (MP browsing not yet supported)"
+                .to_string());
+        }
     };
 
     // 169-element weight arrays for both players, initialized to 1.0.
@@ -3057,6 +4025,14 @@ mod tests {
     }
 
     #[timed_test]
+    fn blueprint_sizes_preserve_fractional_percentages() {
+        let depths = vec![vec![0.925, 0.3333333333333333]];
+        let (bet, raise) = blueprint_sizes_to_range_solver(&depths);
+        assert_eq!(bet, "92.5%,33.3333333333333%,a");
+        assert_eq!(raise, "92.5%,33.3333333333333%,a");
+    }
+
+    #[timed_test]
     fn blueprint_sizes_empty() {
         let (bet, raise) = blueprint_sizes_to_range_solver(&[]);
         assert_eq!(bet, "a");
@@ -3251,7 +4227,8 @@ mod tests {
         let node_action_counts = vec![2u16, 2u16];
         let node_street_indices = vec![0u8, 1u8]; // preflop=0, flop=1
 
-        // Build via serde_json -> save -> load roundtrip to populate private node_offsets
+        // Build via serde_json to exercise the same serialized shape, then
+        // populate transient offsets without a filesystem roundtrip.
         let json = serde_json::json!({
             "action_probs": action_probs,
             "node_action_counts": node_action_counts,
@@ -3260,14 +4237,8 @@ mod tests {
             "iterations": 100u64,
             "elapsed_minutes": 1u64,
         });
-        let strat_raw: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
-        let tmp = std::env::temp_dir().join(format!(
-            "test_strategy_postflop_{:?}.bin",
-            std::thread::current().id()
-        ));
-        strat_raw.save(&tmp).expect("save");
-        let strat = BlueprintV2Strategy::load(&tmp).expect("load");
-        let _ = std::fs::remove_file(&tmp);
+        let mut strat: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
+        strat.post_deserialize();
 
         // decision_map: 6 nodes, node 0 -> decision 0, node 2 -> decision 1, rest -> MAX
         let decision_map = vec![0, u32::MAX, 1, u32::MAX, u32::MAX, u32::MAX];
@@ -3348,12 +4319,14 @@ mod tests {
                 purify_threshold: 0.0,
                 equity_cache_path: None,
                 optimizer: "dcfr".to_string(),
+                storage_backend: "dense".to_string(),
                 sapcfr_eta: 0.5,
                 brcfr_eta: 0.6,
                 brcfr_warmup_iterations: 0,
                 brcfr_interval: 100_000_000,
                 use_baselines: false,
                 baseline_alpha: 0.01,
+                baseline_validation: Default::default(),
                 prune_streets: None,
                 regret_floor: None,
                 exploitability_interval_minutes: 0,
@@ -3365,6 +4338,7 @@ mod tests {
                 output_dir: "/tmp".to_string(),
                 resume: false,
                 max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         }
     }
@@ -3378,7 +4352,8 @@ mod tests {
         let bucket_counts = strategy.bucket_counts;
         let all_buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
 
-        // Build via serde_json -> save -> load roundtrip
+        // Build via serde_json to exercise the same serialized shape, then
+        // populate transient offsets without a filesystem roundtrip.
         let json = serde_json::json!({
             "action_probs": strategy.action_probs,
             "node_action_counts": strategy.node_action_counts,
@@ -3387,14 +4362,9 @@ mod tests {
             "iterations": strategy.iterations,
             "elapsed_minutes": strategy.elapsed_minutes,
         });
-        let strat_raw: BlueprintV2Strategy = serde_json::from_value(json).expect("from_value");
-        let tmp = std::env::temp_dir().join(format!(
-            "test_cbv_strategy_{:?}.bin",
-            std::thread::current().id()
-        ));
-        strat_raw.save(&tmp).expect("save");
-        let cbv_strategy = BlueprintV2Strategy::load(&tmp).expect("load");
-        let _ = std::fs::remove_file(&tmp);
+        let mut cbv_strategy: BlueprintV2Strategy =
+            serde_json::from_value(json).expect("from_value");
+        cbv_strategy.post_deserialize();
 
         crate::postflop::CbvContext {
             cbv_table: CbvTable {
@@ -3918,6 +4888,108 @@ mod tests {
     }
 
     #[timed_test]
+    fn blueprint_listing_preserves_legacy_hu_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hu = tmp.path().join("legacy_hu");
+        v2_bundle::save_config(&hu, &build_minimal_config()).unwrap();
+
+        let entry = try_make_blueprint_entry(&hu).expect("legacy HU should be listed");
+        assert_eq!(entry.name, "test");
+        assert_eq!(entry.stack_depth, 200.0);
+        assert!(!entry.has_strategy);
+    }
+
+    #[timed_test]
+    fn blueprint_listing_classifies_legacy_mp_without_hu_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = tmp.path().join("legacy_mp");
+        std::fs::create_dir_all(mp.join("snapshot_0001")).unwrap();
+        std::fs::write(
+            mp.join("config.yaml"),
+            "game:\n  name: legacy six-max\n  num_players: 6\n  stack_depth: 150\n",
+        )
+        .unwrap();
+        std::fs::write(mp.join("snapshot_0001/strategy.bin"), b"strategy").unwrap();
+
+        let entry = try_make_blueprint_entry(&mp).expect("legacy MP should be listed");
+        assert_eq!(classify_legacy_config(&mp).kind, LegacyConfigKind::Mp);
+        assert_eq!(entry.name, "legacy six-max");
+        assert_eq!(entry.stack_depth, 150.0);
+        assert!(entry.has_strategy);
+        assert_eq!(entry.latest_snapshot.as_deref(), Some("snapshot_0001"));
+    }
+
+    #[timed_test]
+    fn blueprint_listing_handles_unknown_and_malformed_configs_quietly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unknown = tmp.path().join("unknown_config");
+        std::fs::create_dir_all(&unknown).unwrap();
+        std::fs::write(
+            unknown.join("config.yaml"),
+            "game:\n  name: unknown\n  stack_depth: 40\n",
+        )
+        .unwrap();
+
+        let malformed = tmp.path().join("malformed_config");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join("config.yaml"), "game: [").unwrap();
+
+        let unknown_entry = try_make_blueprint_entry(&unknown).expect("unknown should list");
+        assert_eq!(
+            classify_legacy_config(&unknown).kind,
+            LegacyConfigKind::Unknown
+        );
+        assert_eq!(unknown_entry.name, "unknown");
+        assert_eq!(unknown_entry.stack_depth, 40.0);
+        assert!(!unknown_entry.has_strategy);
+
+        let malformed_entry =
+            try_make_blueprint_entry(&malformed).expect("malformed config should list");
+        assert_eq!(
+            classify_legacy_config(&malformed).kind,
+            LegacyConfigKind::Unknown
+        );
+        assert_eq!(malformed_entry.name, "malformed_config");
+        assert_eq!(malformed_entry.stack_depth, 0.0);
+        assert!(!malformed_entry.has_strategy);
+    }
+
+    #[timed_test]
+    fn blueprint_listing_does_not_count_empty_snapshot_as_trained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = tmp.path().join("legacy_mp");
+        std::fs::create_dir_all(mp.join("snapshot_0001")).unwrap();
+        std::fs::write(
+            mp.join("config.yaml"),
+            "game:\n  name: legacy mp\n  num_players: 3\n  stack_depth: 80\n",
+        )
+        .unwrap();
+
+        let entry = try_make_blueprint_entry(&mp).expect("legacy MP should be listed");
+        assert!(!entry.has_strategy);
+        assert_eq!(entry.latest_snapshot.as_deref(), Some("snapshot_0001"));
+    }
+
+    #[tokio::test]
+    async fn load_blueprint_v2_rejects_legacy_mp_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "game:\n  name: legacy mp\n  num_players: 3\n  stack_depth: 80\n",
+        )
+        .unwrap();
+
+        let error = load_blueprint_v2_core(
+            &ExplorationState::default(),
+            tmp.path().to_string_lossy().to_string(),
+            None,
+        )
+        .await
+        .expect_err("legacy MP must not use the HU loader");
+        assert!(error.contains("cannot be loaded through load_blueprint_v2"));
+    }
+
+    #[timed_test]
     fn list_snapshots_core_reads_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let snap = tmp.path().join("snapshot_0003");
@@ -4117,6 +5189,130 @@ mod tests {
             (loaded_ev - 5.0).abs() < 0.01,
             "should load hand_ev.bin from snapshot dir (5.0), but got {} (root has 99.0)",
             loaded_ev,
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // mp_bundle_info helper tests
+    // ---------------------------------------------------------------
+
+    /// Build a minimal [`Manifest`] for MP BundleInfo helper tests.
+    fn stub_mp_manifest(
+        num_players: u8,
+        starting_stack: f64,
+        row_count: u64,
+        rake_rate: f64,
+        rake_cap: f64,
+    ) -> poker_solver_core::blueprint_universal::Manifest {
+        use poker_solver_core::blueprint_universal::*;
+        use std::collections::BTreeMap;
+        Manifest {
+            format_name: "universal_dense".into(),
+            format_version: 1,
+            compat_min_reader: 1,
+            created_at: String::new(),
+            producer: String::new(),
+            producer_git: String::new(),
+            required_features: vec![],
+            optional_features: vec![],
+            game_fingerprint: 0,
+            source_config_fingerprint: None,
+            game: GameMetadata {
+                game_kind: "nlhe".into(),
+                num_players,
+                seats: vec![SeatDescriptor {
+                    seat_id: 0,
+                    label: "SB".into(),
+                    blind_ante_role: "sb".into(),
+                    starting_stack,
+                }],
+                button_seat: 0,
+                small_blind: 0.5,
+                big_blind: 1.0,
+                antes: vec![],
+                straddles: vec![],
+                stack_units: "chips".into(),
+                rake: RakeConfig {
+                    rate: rake_rate,
+                    cap: rake_cap,
+                },
+                max_flop_players: None,
+            },
+            training: TrainingMetadata {
+                source_backend: "mp_eager_dense".into(),
+                unit_kind: "iterations".into(),
+                units_completed: 0,
+                elapsed_minutes: 0.0,
+                strategy_unit: "average".into(),
+                command: None,
+                config_path: None,
+                config_fingerprint: None,
+            },
+            strategy: StrategyMetadata {
+                normalization_tolerance: 1e-4,
+            },
+            layout: LayoutMetadata {
+                row_count,
+                action_descriptor_count: 0,
+                probability_count: 0,
+                row_sort_order: "spec_v1".into(),
+                row_namespace: vec![],
+                missing_row_policy: "uniform".into(),
+            },
+            actions: ActionsMetadata {
+                action_abstraction_fingerprint: 0,
+            },
+            buckets: BucketsMetadata {
+                bucket_mode: "fixed".into(),
+                bucket_semantic_fingerprint: 0,
+                street_bucket_counts: BTreeMap::new(),
+                bucket_files: vec![],
+                bucket_generator_version: String::new(),
+                per_flop_bucket_config: None,
+            },
+            compatibility: CompatibilityMetadata {
+                legacy_fallback: false,
+                missing_row_policy: "uniform".into(),
+                resumable: false,
+            },
+            files: BTreeMap::new(),
+        }
+    }
+
+    #[timed_test]
+    fn mp_bundle_info_builds_correct_name_and_fields() {
+        use poker_solver_core::blueprint_universal::BundleKind;
+
+        let manifest = stub_mp_manifest(6, 200.0, 5000, 0.05, 3.0);
+        let info = mp_bundle_info(&manifest, BundleKind::UniversalMpEager, 42_000);
+
+        assert_eq!(
+            info.name.as_deref(),
+            Some("MP universal_mp_eager (6-player)")
+        );
+        assert_eq!(info.stack_depth, 200);
+        assert!(info.bet_sizes.is_empty());
+        assert_eq!(info.info_sets, 5000);
+        assert_eq!(info.iterations, 42_000);
+        assert!(!info.preflop_only);
+        assert!((info.rake_rate - 0.05).abs() < f64::EPSILON);
+        assert!((info.rake_cap - 3.0).abs() < f64::EPSILON);
+        assert!(info.snapshot_name.is_none());
+    }
+
+    #[timed_test]
+    fn mp_bundle_info_empty_seats_yields_zero_stack() {
+        use poker_solver_core::blueprint_universal::BundleKind;
+
+        let mut manifest = stub_mp_manifest(3, 100.0, 100, 0.0, 0.0);
+        manifest.game.seats.clear();
+
+        let info = mp_bundle_info(&manifest, BundleKind::UniversalMpLazy, 0);
+
+        assert_eq!(info.stack_depth, 0);
+        assert_eq!(
+            info.name.as_deref(),
+            Some("MP universal_mp_lazy (3-player)")
         );
     }
 }

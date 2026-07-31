@@ -39,9 +39,9 @@ impl Seat {
 
 // === PlayerSet ===
 
-/// Bitfield representing a set of players (up to 8).
+/// Bitfield representing a set of players (up to `MAX_PLAYERS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlayerSet(u8);
+pub struct PlayerSet(u16);
 
 impl PlayerSet {
     /// An empty set with no players.
@@ -54,40 +54,38 @@ impl PlayerSet {
     #[must_use]
     pub fn all(num_players: u8) -> Self {
         debug_assert!(num_players as usize <= MAX_PLAYERS);
-        if num_players >= 8 {
-            Self(0xFF)
-        } else {
-            Self((1u8 << num_players) - 1)
-        }
+        Self((1u16 << num_players) - 1)
     }
 
     /// Whether the set contains the given seat.
     #[must_use]
     pub const fn contains(self, seat: Seat) -> bool {
-        self.0 & (1 << seat.0) != 0
+        self.0 & (1u16 << seat.0) != 0
     }
 
     /// Add a seat to the set.
     pub fn insert(&mut self, seat: Seat) {
-        self.0 |= 1 << seat.0;
+        self.0 |= 1u16 << seat.0;
     }
 
     /// Remove a seat from the set.
     pub fn remove(&mut self, seat: Seat) {
-        self.0 &= !(1 << seat.0);
+        self.0 &= !(1u16 << seat.0);
     }
 
     /// Number of players in the set.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub const fn count(self) -> u8 {
-        // count_ones() on a u8 returns at most 8, so truncation is impossible.
+        // count_ones() on the compact player bitset returns at most 16.
         self.0.count_ones() as u8
     }
 
     /// Iterate over seats in ascending order.
     pub fn iter(self) -> impl Iterator<Item = Seat> {
-        (0u8..8).filter(move |&i| self.0 & (1 << i) != 0).map(Seat)
+        (0u8..MAX_PLAYERS as u8)
+            .filter(move |&i| self.0 & (1u16 << i) != 0)
+            .map(Seat)
     }
 
     /// Find the next seat after `seat` (clockwise wrap). Returns `None` if
@@ -108,13 +106,13 @@ impl PlayerSet {
 
     /// Raw bit representation.
     #[must_use]
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u16 {
         self.0
     }
 
     /// Construct from raw bits.
     #[must_use]
-    pub const fn from_bits(bits: u8) -> Self {
+    pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
 }
@@ -297,6 +295,10 @@ const POS_5: &[&str] = &["hj", "co", "btn", "sb", "bb"];
 const POS_6: &[&str] = &["utg", "hj", "co", "btn", "sb", "bb"];
 const POS_7: &[&str] = &["utg", "mp", "hj", "co", "btn", "sb", "bb"];
 const POS_8: &[&str] = &["utg", "utg1", "mp", "hj", "co", "btn", "sb", "bb"];
+const POS_9: &[&str] = &["utg", "utg1", "utg2", "mp", "hj", "co", "btn", "sb", "bb"];
+const POS_10: &[&str] = &[
+    "utg", "utg1", "utg2", "utg3", "mp", "hj", "co", "btn", "sb", "bb",
+];
 
 fn pos_table(num_players: u8) -> &'static [&'static str] {
     match num_players {
@@ -307,6 +309,8 @@ fn pos_table(num_players: u8) -> &'static [&'static str] {
         6 => POS_6,
         7 => POS_7,
         8 => POS_8,
+        9 => POS_9,
+        10 => POS_10,
         _ => panic!("unsupported player count: {num_players}"),
     }
 }
@@ -372,7 +376,7 @@ mod tests {
     #[timed_test]
     #[should_panic(expected = "out of range")]
     fn seat_new_panics_when_index_exceeds_max() {
-        let _ = Seat::new(8, 9);
+        let _ = Seat::new(10, 11);
     }
 
     #[timed_test]
@@ -487,9 +491,27 @@ mod tests {
 
     #[timed_test]
     fn player_set_all_max_players() {
-        let ps = PlayerSet::all(8);
-        assert_eq!(ps.count(), 8);
-        assert_eq!(ps.bits(), 0xFF);
+        let ps = PlayerSet::all(10);
+        assert_eq!(ps.count(), 10);
+        assert_eq!(ps.bits(), 0x03FF);
+        assert!(ps.contains(Seat::from_raw(8)));
+        assert!(ps.contains(Seat::from_raw(9)));
+    }
+
+    #[timed_test]
+    fn player_set_high_seats_round_trip() {
+        let mut ps = PlayerSet::empty();
+        ps.insert(Seat::from_raw(8));
+        ps.insert(Seat::from_raw(9));
+
+        assert_eq!(ps.bits(), 0x0300);
+        assert_eq!(ps.count(), 2);
+        assert!(ps.contains(Seat::from_raw(8)));
+        assert!(ps.contains(Seat::from_raw(9)));
+        assert_eq!(ps.iter().map(Seat::index).collect::<Vec<_>>(), vec![8, 9]);
+
+        let round_tripped = PlayerSet::from_bits(ps.bits());
+        assert_eq!(round_tripped, ps);
     }
 
     // ── Chips tests ──
@@ -675,8 +697,17 @@ mod tests {
     }
 
     #[timed_test]
+    fn position_label_10_players() {
+        assert_eq!(position_label(Seat::from_raw(0), 10), "utg");
+        assert_eq!(position_label(Seat::from_raw(1), 10), "utg1");
+        assert_eq!(position_label(Seat::from_raw(2), 10), "utg2");
+        assert_eq!(position_label(Seat::from_raw(3), 10), "utg3");
+        assert_eq!(position_label(Seat::from_raw(9), 10), "bb");
+    }
+
+    #[timed_test]
     fn parse_position_round_trips_all() {
-        for n in 2..=8u8 {
+        for n in 2..=10u8 {
             for s in 0..n {
                 let label = position_label(Seat::from_raw(s), n);
                 let parsed = parse_position(label, n);

@@ -28,4 +28,5 @@ pub use game::StrengthItem;
 pub use solver::{
     compute_average, compute_current_ev, compute_exploitability, finalize, root_action_cfvalues,
     root_cfvalues, root_cfvalues_with_reach, root_regrets, solve, solve_step,
+    solve_step_with_cancel, SolveStepResult,
 };

@@ -37,7 +37,7 @@ impl MpGameConfig {
     /// Validate game config constraints.
     ///
     /// # Errors
-    /// Returns `Err` if `num_players` not in 2..=8, `stack_depth` <= 0,
+    /// Returns `Err` if `num_players` not in 2..=10, `stack_depth` <= 0,
     /// a blind seat >= `num_players`, or a blind amount <= 0.
     pub fn validate(&self) -> Result<(), String> {
         self.validate_players()?;
@@ -46,8 +46,11 @@ impl MpGameConfig {
     }
 
     fn validate_players(&self) -> Result<(), String> {
-        if self.num_players < 2 || self.num_players > 8 {
-            return Err(format!("num_players must be 2-8, got {}", self.num_players));
+        if self.num_players < 2 || self.num_players > 10 {
+            return Err(format!(
+                "num_players must be 2-10, got {}",
+                self.num_players
+            ));
         }
         Ok(())
     }
@@ -251,6 +254,12 @@ pub enum MpNegativeActionPurgeMode {
 
 // ── Snapshot config ──────────────────────────────────────────────────
 
+/// Type alias for the shared snapshot format enum.
+///
+/// `MpSnapshotFormat` is identical to `SnapshotFormat`; the alias
+/// preserves backward-compatible naming in MP config code.
+pub type MpSnapshotFormat = crate::training_runtime::SnapshotFormat;
+
 /// Checkpoint output settings for multiplayer training.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MpSnapshotConfig {
@@ -261,6 +270,9 @@ pub struct MpSnapshotConfig {
     pub resume: bool,
     #[serde(default)]
     pub max_snapshots: Option<u32>,
+    /// Output format for snapshots: `legacy` (default), `universal`, or `both`.
+    #[serde(default)]
+    pub format: MpSnapshotFormat,
 }
 
 // ── Default value functions ──────────────────────────────────────────
@@ -593,10 +605,10 @@ snapshots:
     }
 
     #[timed_test]
-    fn game_config_validation_rejects_9_players() {
+    fn game_config_validation_rejects_11_players() {
         let game = MpGameConfig {
             name: "Too many".into(),
-            num_players: 9,
+            num_players: 11,
             stack_depth: 100.0,
             allow_preflop_limp: true,
             blinds: vec![
@@ -702,10 +714,10 @@ snapshots:
     }
 
     #[timed_test]
-    fn validation_accepts_8_players() {
+    fn validation_accepts_10_players() {
         let game = MpGameConfig {
             name: "Max".into(),
-            num_players: 8,
+            num_players: 10,
             stack_depth: 200.0,
             allow_preflop_limp: true,
             blinds: vec![
@@ -994,5 +1006,108 @@ snapshots:
             serde_yaml::from_str(yaml).expect("failed to parse no-rake config");
         assert!((cfg.game.rake_rate).abs() < f64::EPSILON);
         assert!((cfg.game.rake_cap).abs() < f64::EPSILON);
+    }
+
+    #[timed_test]
+    fn mp_snapshot_format_defaults_to_legacy() {
+        let yaml = r#"
+game:
+  name: "Format Default"
+  num_players: 6
+  stack_depth: 200.0
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 10
+  snapshot_every_minutes: 5
+  output_dir: "/tmp/default_format"
+"#;
+        let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, MpSnapshotFormat::Legacy);
+    }
+
+    #[timed_test]
+    fn mp_snapshot_format_parses_both() {
+        let yaml = r#"
+game:
+  name: "Format Both"
+  num_players: 6
+  stack_depth: 200.0
+  blinds:
+    - seat: 0
+      type: small_blind
+      amount: 1.0
+    - seat: 1
+      type: big_blind
+      amount: 2.0
+action_abstraction:
+  preflop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  flop:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  turn:
+    lead: [1.0]
+    raise:
+      - [1.0]
+  river:
+    lead: [1.0]
+    raise:
+      - [1.0]
+clustering:
+  preflop:
+    buckets: 169
+  flop:
+    buckets: 200
+  turn:
+    buckets: 200
+  river:
+    buckets: 200
+training:
+  iterations: 100
+snapshots:
+  warmup_minutes: 10
+  snapshot_every_minutes: 5
+  output_dir: "/tmp/both_format"
+  format: both
+"#;
+        let cfg: BlueprintMpConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(cfg.snapshots.format, MpSnapshotFormat::Both);
     }
 }

@@ -50,7 +50,7 @@ use super::bucket_file::{BucketFile, PackedBoard};
 use super::cluster_pipeline::{canonical_key, combo_index};
 use super::game_tree::{GameNode, GameTree, TerminalKind};
 use super::per_flop_bucket_file::PerFlopBucketFile;
-use super::storage::BlueprintStorage;
+use super::storage::{BlueprintCfrStorage, BlueprintStorage};
 use crate::abstraction::isomorphism::CanonicalBoard;
 use crate::poker::{Card, Hand, Rankable};
 
@@ -366,6 +366,91 @@ impl AllBuckets {
         self.lookup_bucket(street as usize, hole_cards, board)
     }
 
+    /// Fallible file-backed bucket lookup for callers that must surface
+    /// missing sources or board mappings instead of panicking.
+    ///
+    /// This intentionally mirrors the production portion of [`get_bucket`]
+    /// and never enables the equity fallback. It is primarily for read-only
+    /// adapters such as the Explorer, where a rejected lookup must leave the
+    /// user-visible state unchanged.
+    pub fn try_get_bucket(
+        &self,
+        street: Street,
+        hole_cards: [Card; 2],
+        board: &[Card],
+    ) -> Result<u16, String> {
+        if street == Street::Preflop {
+            let hand = crate::hands::CanonicalHand::from_cards(hole_cards[0], hole_cards[1]);
+            let idx = hand.index() as u16;
+            return Ok(idx.min(self.bucket_counts[0].saturating_sub(1)));
+        }
+
+        let street_idx = street as usize;
+        let street_name = match street {
+            Street::Preflop => "preflop",
+            Street::Flop => "flop",
+            Street::Turn => "turn",
+            Street::River => "river",
+        };
+        if board.len() < street_idx + 2 {
+            return Err(format!(
+                "invalid {street_name} board length {} for hole cards {hole_cards:?}",
+                board.len()
+            ));
+        }
+
+        if (street_idx == 2 || street_idx == 3) && self.per_flop_dir.is_some() {
+            return self.lookup_per_flop(street_idx, hole_cards, board).ok_or_else(|| {
+                format!(
+                    "missing per-flop {street_name} bucket mapping for board {board:?} and hole cards {hole_cards:?}"
+                )
+            });
+        }
+
+        let Some(bucket_file) = self.bucket_files[street_idx].as_ref() else {
+            return Err(format!(
+                "missing {street_name} bucket file for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        };
+        let Some(board_map) = self.board_maps[street_idx].as_ref() else {
+            return Err(format!(
+                "missing {street_name} board mapping for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        };
+        let canonical = CanonicalBoard::from_cards(board).map_err(|error| {
+            format!(
+                "cannot canonicalize {street_name} board {board:?} for hole cards {hole_cards:?}: {error}"
+            )
+        })?;
+        let packed = canonical_key(&canonical.cards);
+        let Some(&board_idx) = board_map.get(&packed) else {
+            return Err(format!(
+                "missing {street_name} board mapping for canonical board {packed:?} (original {board:?}), hole cards {hole_cards:?}"
+            ));
+        };
+        let (c0, c1) = canonical.canonicalize_holding(hole_cards[0], hole_cards[1]);
+        let combo_idx = combo_index(c0, c1) as usize;
+        let combos_per_board = usize::from(bucket_file.header.combos_per_board);
+        if combo_idx >= combos_per_board {
+            return Err(format!(
+                "{street_name} bucket file combo index {combo_idx} out of range 0..{combos_per_board} for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        }
+        let flat_idx = board_idx as usize * combos_per_board + combo_idx;
+        let Some(&bucket) = bucket_file.buckets.get(flat_idx) else {
+            return Err(format!(
+                "{street_name} bucket file row missing at board index {board_idx}, combo index {combo_idx} for board {board:?} and hole cards {hole_cards:?}"
+            ));
+        };
+        if bucket >= bucket_file.header.bucket_count {
+            return Err(format!(
+                "{street_name} bucket id {bucket} exceeds declared bucket count {} for board {board:?} and hole cards {hole_cards:?}",
+                bucket_file.header.bucket_count
+            ));
+        }
+        Ok(bucket)
+    }
+
     /// Return the visible board slice for a given street.
     #[must_use]
     pub fn board_for_street(board: &[Card; 5], street: Street) -> &[Card] {
@@ -638,16 +723,16 @@ impl ScenarioEvTracker {
 /// * `full_ev_tracker` - Optional full-tree EV tracker for all decision nodes
 /// * `baseline_alpha` - EMA learning rate for VR-MCCFR baselines (0.0 = disabled)
 #[allow(clippy::too_many_arguments)]
-pub fn traverse_external(
+pub fn traverse_external<S: BlueprintCfrStorage + ?Sized, R: Rng + ?Sized>(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    storage: &S,
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
     prune: bool,
     prune_threshold: i32,
     prune_streets: [bool; 4],
-    rng: &mut impl Rng,
+    rng: &mut R,
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
@@ -939,7 +1024,7 @@ pub fn traverse_best_response(
 #[allow(clippy::too_many_arguments)]
 fn traverse_traverser(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    storage: &(impl BlueprintCfrStorage + ?Sized),
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -950,7 +1035,7 @@ fn traverse_traverser(
     prune_threshold: i32,
     street: Street,
     prune_streets: [bool; 4],
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
@@ -1006,6 +1091,18 @@ fn traverse_traverser(
         node_value += strategy[a] * child_ev;
         stats.merge(child_stats);
     }
+
+    #[cfg(test)]
+    record_mccfr_traverser_node_trace(
+        tree,
+        deal,
+        node_idx,
+        bucket,
+        strategy,
+        action_values,
+        pruned,
+        node_value,
+    );
 
     // Update regrets: delta = (action_value - node_value) * REGRET_SCALE.
     // Skip pruned actions. Also store as prediction for SAPCFR+.
@@ -1073,7 +1170,7 @@ fn baseline_corrected_value(
 #[allow(clippy::too_many_arguments)]
 fn traverse_opponent(
     tree: &GameTree,
-    storage: &BlueprintStorage,
+    storage: &(impl BlueprintCfrStorage + ?Sized),
     deal: &DealWithBuckets,
     traverser: u8,
     node_idx: u32,
@@ -1083,7 +1180,7 @@ fn traverse_opponent(
     prune: bool,
     prune_threshold: i32,
     prune_streets: [bool; 4],
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
     rake_rate: f64,
     rake_cap: f64,
     ev_tracker: Option<&ScenarioEvTracker>,
@@ -1131,6 +1228,11 @@ fn traverse_opponent(
     }
     let v = baseline_corrected_value(strategy, &baseline_buf[..num_actions], chosen, v_sampled);
 
+    #[cfg(test)]
+    record_mccfr_opponent_sample_trace(
+        tree, deal, node_idx, bucket, r, strategy, chosen, v_sampled, v,
+    );
+
     // Update baseline for the sampled action with the observed value.
     storage.update_baseline(node_idx, bucket, chosen, v_sampled, baseline_alpha);
 
@@ -1149,9 +1251,245 @@ fn rank_hand(hole: [Card; 2], board: &[Card; 5]) -> crate::poker::Rank {
 }
 
 #[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct MccfrTestTrace {
+    opponent_samples: Vec<MccfrOpponentSampleTrace>,
+    traverser_nodes: Vec<MccfrTraverserNodeTrace>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct MccfrOpponentSampleTrace {
+    public_key: String,
+    node_idx: u32,
+    player: u8,
+    street: Street,
+    bucket: u16,
+    board: String,
+    rng_threshold: f64,
+    strategy: Vec<f64>,
+    action_idx: usize,
+    action_label: String,
+    child_desc: String,
+    sampled_value: f64,
+    returned_value: f64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct MccfrTraverserNodeTrace {
+    public_key: String,
+    node_idx: u32,
+    player: u8,
+    street: Street,
+    bucket: u16,
+    board: String,
+    actions: Vec<String>,
+    child_descs: Vec<String>,
+    strategy: Vec<f64>,
+    action_values: Vec<f64>,
+    pruned: Vec<bool>,
+    node_value: f64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MCCFR_TEST_TRACE: std::cell::RefCell<Option<MccfrTestTrace>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn start_mccfr_test_trace() {
+    MCCFR_TEST_TRACE.with(|trace| {
+        *trace.borrow_mut() = Some(MccfrTestTrace::default());
+    });
+}
+
+#[cfg(test)]
+fn take_mccfr_test_trace() -> MccfrTestTrace {
+    MCCFR_TEST_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn record_mccfr_opponent_sample_trace(
+    tree: &GameTree,
+    deal: &DealWithBuckets,
+    node_idx: u32,
+    bucket: u16,
+    rng_threshold: f64,
+    strategy: &[f64],
+    action_idx: usize,
+    sampled_value: f64,
+    returned_value: f64,
+) {
+    MCCFR_TEST_TRACE.with(|trace| {
+        let mut trace_ref = trace.borrow_mut();
+        let Some(trace) = trace_ref.as_mut() else {
+            return;
+        };
+        let GameNode::Decision {
+            player,
+            street,
+            actions,
+            children,
+            ..
+        } = &tree.nodes[node_idx as usize]
+        else {
+            return;
+        };
+        trace.opponent_samples.push(MccfrOpponentSampleTrace {
+            public_key: mccfr_trace_public_key(tree, node_idx),
+            node_idx,
+            player: *player,
+            street: *street,
+            bucket,
+            board: mccfr_trace_board_label(&deal.deal.board, *street),
+            rng_threshold,
+            strategy: strategy.to_vec(),
+            action_idx,
+            action_label: format!("{:?}", actions[action_idx]),
+            child_desc: mccfr_trace_child_desc(tree, children[action_idx]),
+            sampled_value,
+            returned_value,
+        });
+    });
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn record_mccfr_traverser_node_trace(
+    tree: &GameTree,
+    deal: &DealWithBuckets,
+    node_idx: u32,
+    bucket: u16,
+    strategy: &[f64],
+    action_values: &[f64],
+    pruned: &[bool],
+    node_value: f64,
+) {
+    MCCFR_TEST_TRACE.with(|trace| {
+        let mut trace_ref = trace.borrow_mut();
+        let Some(trace) = trace_ref.as_mut() else {
+            return;
+        };
+        let GameNode::Decision {
+            player,
+            street,
+            actions,
+            children,
+            ..
+        } = &tree.nodes[node_idx as usize]
+        else {
+            return;
+        };
+        trace.traverser_nodes.push(MccfrTraverserNodeTrace {
+            public_key: mccfr_trace_public_key(tree, node_idx),
+            node_idx,
+            player: *player,
+            street: *street,
+            bucket,
+            board: mccfr_trace_board_label(&deal.deal.board, *street),
+            actions: actions.iter().map(|action| format!("{action:?}")).collect(),
+            child_descs: children
+                .iter()
+                .map(|&child| mccfr_trace_child_desc(tree, child))
+                .collect(),
+            strategy: strategy.to_vec(),
+            action_values: action_values.to_vec(),
+            pruned: pruned.to_vec(),
+            node_value,
+        });
+    });
+}
+
+#[cfg(test)]
+fn mccfr_trace_public_key(tree: &GameTree, target: u32) -> String {
+    let mut labels = Vec::new();
+    if mccfr_trace_find_public_key(tree, tree.root, target, &mut labels) {
+        if labels.is_empty() {
+            "root".to_string()
+        } else {
+            labels.join(" -> ")
+        }
+    } else {
+        format!("<unreachable:{target}>")
+    }
+}
+
+#[cfg(test)]
+fn mccfr_trace_find_public_key(
+    tree: &GameTree,
+    current: u32,
+    target: u32,
+    labels: &mut Vec<String>,
+) -> bool {
+    if current == target {
+        return true;
+    }
+    match &tree.nodes[current as usize] {
+        GameNode::Decision {
+            actions, children, ..
+        } => {
+            for (action, &child) in actions.iter().zip(children.iter()) {
+                labels.push(format!("{action:?}"));
+                if mccfr_trace_find_public_key(tree, child, target, labels) {
+                    return true;
+                }
+                labels.pop();
+            }
+        }
+        GameNode::Chance { child, next_street } => {
+            labels.push(format!("Chance({next_street:?})"));
+            if mccfr_trace_find_public_key(tree, *child, target, labels) {
+                return true;
+            }
+            labels.pop();
+        }
+        GameNode::Terminal { .. } => {}
+    }
+    false
+}
+
+#[cfg(test)]
+fn mccfr_trace_board_label(board: &[Card; 5], street: Street) -> String {
+    let visible = AllBuckets::board_for_street(board, street);
+    if visible.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("{visible:?}")
+    }
+}
+
+#[cfg(test)]
+fn mccfr_trace_child_desc(tree: &GameTree, child_idx: u32) -> String {
+    match &tree.nodes[child_idx as usize] {
+        GameNode::Decision {
+            player,
+            street,
+            actions,
+            ..
+        } => format!(
+            "Decision(player={player}, street={street:?}, actions={:?})",
+            actions
+                .iter()
+                .map(|action| format!("{action:?}"))
+                .collect::<Vec<_>>()
+        ),
+        GameNode::Chance { next_street, .. } => {
+            format!("Chance(next_street={next_street:?})")
+        }
+        GameNode::Terminal { kind, pot, stacks } => {
+            format!("Terminal(kind={kind:?}, pot={pot:.6}, stacks={stacks:?})")
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blueprint_v2::bundle::BlueprintV2Strategy;
     use crate::blueprint_v2::game_tree::GameTree;
+    use crate::blueprint_v2::sparse_storage::SparseBlueprintStorage;
     use crate::blueprint_v2::storage::BlueprintStorage;
 
     // --- ScenarioEvTracker tests ---
@@ -1476,6 +1814,7 @@ mod tests {
     use crate::poker::{Card, Suit, Value};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
 
     fn make_deal() -> Deal {
@@ -1515,6 +1854,1208 @@ mod tests {
     fn make_precomputed(buckets: &AllBuckets, deal: Deal) -> DealWithBuckets {
         let b = buckets.precompute_buckets(&deal);
         DealWithBuckets { deal, buckets: b }
+    }
+
+    struct DenseMccfrHarnessBackend {
+        name: &'static str,
+        tree: GameTree,
+        storage: BlueprintStorage,
+    }
+
+    struct SparseMccfrHarnessBackend {
+        name: &'static str,
+        tree: GameTree,
+        storage: SparseBlueprintStorage,
+    }
+
+    trait MccfrHarnessBackend {
+        fn name(&self) -> &'static str;
+        fn seed_deterministic_nonzero(&self);
+        fn public_decisions(&self) -> Vec<PublicDecisionSchema>;
+        fn traverse_with_trace(
+            &self,
+            deal: &DealWithBuckets,
+            traverser: u8,
+            seed: u64,
+        ) -> HarnessTraversalResult;
+        fn snapshot_regrets(&self) -> Vec<i32>;
+        fn snapshot_strategy_sums(&self) -> Vec<i64>;
+        fn storage_coords(&self) -> Vec<StorageCoord>;
+        fn strategy_coords(&self) -> Vec<StrategyCoord>;
+        fn dense_average_strategy(&self) -> BlueprintV2Strategy;
+        fn dense_regret_save_load_round_trip(&self) -> BlueprintStorage;
+        fn diagnostic_tree(&self) -> &GameTree;
+        fn dense_storage_projection(&self) -> BlueprintStorage;
+    }
+
+    #[derive(Clone, Debug)]
+    struct PublicDecisionSchema {
+        public_key: String,
+        debug: String,
+        player: u8,
+        street: Street,
+        actions: Vec<PublicActionSchema>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct PublicActionSchema {
+        action_idx: usize,
+        label: String,
+        child_desc: String,
+    }
+
+    struct HarnessTraversalResult {
+        ev: f64,
+        stats: PruneStats,
+        trace: MccfrTestTrace,
+    }
+
+    impl DenseMccfrHarnessBackend {
+        fn new(name: &'static str, bucket_counts: [u16; 4]) -> Self {
+            let tree = toy_tree();
+            let storage = BlueprintStorage::new(&tree, bucket_counts);
+            Self {
+                name,
+                tree,
+                storage,
+            }
+        }
+    }
+
+    impl SparseMccfrHarnessBackend {
+        fn new(name: &'static str, bucket_counts: [u16; 4]) -> Self {
+            let tree = toy_tree();
+            let storage = SparseBlueprintStorage::new(&tree, bucket_counts);
+            Self {
+                name,
+                tree,
+                storage,
+            }
+        }
+    }
+
+    impl MccfrHarnessBackend for DenseMccfrHarnessBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn seed_deterministic_nonzero(&self) {
+            seed_deterministic_nonzero_storage(&self.storage, &self.tree);
+        }
+
+        fn public_decisions(&self) -> Vec<PublicDecisionSchema> {
+            public_decisions_for_tree(&self.tree)
+        }
+
+        fn traverse_with_trace(
+            &self,
+            deal: &DealWithBuckets,
+            traverser: u8,
+            seed: u64,
+        ) -> HarnessTraversalResult {
+            start_mccfr_test_trace();
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (ev, stats) = traverse_external(
+                &self.tree,
+                &self.storage,
+                deal,
+                traverser,
+                self.tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                None,
+                None,
+                0.0,
+            );
+            HarnessTraversalResult {
+                ev,
+                stats,
+                trace: take_mccfr_test_trace(),
+            }
+        }
+
+        fn snapshot_regrets(&self) -> Vec<i32> {
+            snapshot_regrets(&self.storage, &self.tree)
+        }
+
+        fn snapshot_strategy_sums(&self) -> Vec<i64> {
+            snapshot_sums(&self.storage, &self.tree)
+        }
+
+        fn storage_coords(&self) -> Vec<StorageCoord> {
+            build_storage_coords(&self.tree, &self.storage)
+        }
+
+        fn strategy_coords(&self) -> Vec<StrategyCoord> {
+            build_strategy_coords(&self.tree, &self.storage)
+        }
+
+        fn dense_average_strategy(&self) -> BlueprintV2Strategy {
+            BlueprintV2Strategy::from_storage(&self.storage, &self.tree)
+        }
+
+        fn dense_regret_save_load_round_trip(&self) -> BlueprintStorage {
+            let tmp = std::env::temp_dir().join(format!(
+                "blueprint_v2_diff_harness_regrets_{}_{}.bin",
+                std::process::id(),
+                self.name
+            ));
+            self.storage.save_regrets(&tmp).expect("save dense regrets");
+            let loaded =
+                BlueprintStorage::load_regrets(&tmp, &self.tree, self.storage.bucket_counts)
+                    .expect("load regrets");
+            std::fs::remove_file(&tmp).ok();
+            loaded
+        }
+
+        fn diagnostic_tree(&self) -> &GameTree {
+            &self.tree
+        }
+
+        fn dense_storage_projection(&self) -> BlueprintStorage {
+            dense_storage_from_projection(&self.tree, &self.storage)
+        }
+    }
+
+    impl MccfrHarnessBackend for SparseMccfrHarnessBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn seed_deterministic_nonzero(&self) {
+            seed_deterministic_nonzero_storage(&self.storage, &self.tree);
+        }
+
+        fn public_decisions(&self) -> Vec<PublicDecisionSchema> {
+            public_decisions_for_tree(&self.tree)
+        }
+
+        fn traverse_with_trace(
+            &self,
+            deal: &DealWithBuckets,
+            traverser: u8,
+            seed: u64,
+        ) -> HarnessTraversalResult {
+            start_mccfr_test_trace();
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (ev, stats) = traverse_external(
+                &self.tree,
+                &self.storage,
+                deal,
+                traverser,
+                self.tree.root,
+                false,
+                -310_000_000,
+                [true; 4],
+                &mut rng,
+                0.0,
+                0.0,
+                None,
+                None,
+                0.0,
+            );
+            HarnessTraversalResult {
+                ev,
+                stats,
+                trace: take_mccfr_test_trace(),
+            }
+        }
+
+        fn snapshot_regrets(&self) -> Vec<i32> {
+            self.storage.project_dense_regrets_and_sums(&self.tree).0
+        }
+
+        fn snapshot_strategy_sums(&self) -> Vec<i64> {
+            self.storage.project_dense_regrets_and_sums(&self.tree).1
+        }
+
+        fn storage_coords(&self) -> Vec<StorageCoord> {
+            build_storage_coords(&self.tree, &self.storage)
+        }
+
+        fn strategy_coords(&self) -> Vec<StrategyCoord> {
+            build_strategy_coords(&self.tree, &self.storage)
+        }
+
+        fn dense_average_strategy(&self) -> BlueprintV2Strategy {
+            let dense = self.storage.to_dense_storage(&self.tree);
+            BlueprintV2Strategy::from_storage(&dense, &self.tree)
+        }
+
+        fn dense_regret_save_load_round_trip(&self) -> BlueprintStorage {
+            let dense = self.storage.to_dense_storage(&self.tree);
+            let tmp = std::env::temp_dir().join(format!(
+                "blueprint_v2_diff_harness_regrets_{}_{}.bin",
+                std::process::id(),
+                self.name
+            ));
+            dense.save_regrets(&tmp).expect("save sparse projection");
+            let loaded =
+                BlueprintStorage::load_regrets(&tmp, &self.tree, self.storage.bucket_counts)
+                    .expect("load sparse projection");
+            std::fs::remove_file(&tmp).ok();
+            loaded
+        }
+
+        fn diagnostic_tree(&self) -> &GameTree {
+            &self.tree
+        }
+
+        fn dense_storage_projection(&self) -> BlueprintStorage {
+            self.storage.to_dense_storage(&self.tree)
+        }
+    }
+
+    #[derive(Clone)]
+    struct StorageCoord {
+        node_idx: u32,
+        player: u8,
+        street: Street,
+        bucket: u16,
+        action_idx: usize,
+        action_label: String,
+    }
+
+    #[derive(Clone)]
+    struct StrategyCoord {
+        decision_idx: usize,
+        node_idx: u32,
+        player: u8,
+        street: Street,
+        bucket: u16,
+        action_idx: usize,
+        action_label: String,
+    }
+
+    fn snapshot_regrets(storage: &impl BlueprintCfrStorage, tree: &GameTree) -> Vec<i32> {
+        storage.project_dense_regrets_and_sums(tree).0
+    }
+
+    fn snapshot_sums(storage: &impl BlueprintCfrStorage, tree: &GameTree) -> Vec<i64> {
+        storage.project_dense_regrets_and_sums(tree).1
+    }
+
+    fn seed_deterministic_nonzero_storage(storage: &impl BlueprintCfrStorage, tree: &GameTree) {
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            let GameNode::Decision {
+                street, actions, ..
+            } = node
+            else {
+                continue;
+            };
+            let buckets = storage.bucket_counts()[*street as usize];
+            for bucket in 0..buckets {
+                for action_idx in 0..actions.len() {
+                    let base =
+                        (node_idx as i32 + 1) * 37 + i32::from(bucket) * 11 + action_idx as i32 * 5;
+                    let regret = if (node_idx + action_idx) % 2 == 0 {
+                        base
+                    } else {
+                        -base
+                    };
+                    let sum =
+                        (node_idx as i64 + 3) * 101 + i64::from(bucket) * 17 + action_idx as i64;
+                    storage.add_regret(node_idx as u32, bucket, action_idx, regret);
+                    storage.add_strategy_sum(node_idx as u32, bucket, action_idx, sum);
+                }
+            }
+        }
+    }
+
+    fn dense_storage_from_projection(
+        tree: &GameTree,
+        storage: &impl BlueprintCfrStorage,
+    ) -> BlueprintStorage {
+        let dense = BlueprintStorage::new(tree, storage.bucket_counts());
+        let (regrets, sums) = storage.project_dense_regrets_and_sums(tree);
+        assert_eq!(regrets.len(), dense.regrets.len());
+        assert_eq!(sums.len(), dense.strategy_sums.len());
+        for (slot, value) in regrets.into_iter().enumerate() {
+            dense.regrets[slot].store(value, Ordering::Relaxed);
+        }
+        for (slot, value) in sums.into_iter().enumerate() {
+            dense.strategy_sums[slot].store(value, Ordering::Relaxed);
+        }
+        dense
+    }
+
+    fn assert_legal_action_orders_match(
+        oracle: &dyn MccfrHarnessBackend,
+        candidate: &dyn MccfrHarnessBackend,
+    ) {
+        let oracle_map = public_decision_map(oracle.public_decisions());
+        let candidate_map = public_decision_map(candidate.public_decisions());
+
+        if oracle_map.keys().ne(candidate_map.keys()) {
+            let oracle_only = oracle_map
+                .keys()
+                .filter(|key| !candidate_map.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            let candidate_only = candidate_map
+                .keys()
+                .filter(|key| !oracle_map.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            panic!(
+                "public decision key mismatch: {} only={oracle_only:?}; {} only={candidate_only:?}",
+                oracle.name(),
+                candidate.name()
+            );
+        }
+
+        for (public_key, oracle_schema) in &oracle_map {
+            let candidate_schema = &candidate_map[public_key];
+            if oracle_schema.player != candidate_schema.player
+                || oracle_schema.street != candidate_schema.street
+                || oracle_schema.actions != candidate_schema.actions
+            {
+                panic!(
+                    "semantic legal-action/public-state mismatch at public_key={public_key}\n\
+                     {} debug={}\n{} debug={}\n\
+                     {} schema={oracle_schema:#?}\n\
+                     {} schema={candidate_schema:#?}",
+                    oracle.name(),
+                    oracle_schema.debug,
+                    candidate.name(),
+                    candidate_schema.debug,
+                    oracle.name(),
+                    candidate.name()
+                );
+            }
+        }
+    }
+
+    fn public_decision_map(
+        decisions: Vec<PublicDecisionSchema>,
+    ) -> BTreeMap<String, PublicDecisionSchema> {
+        let mut map = BTreeMap::new();
+        for decision in decisions {
+            if let Some(previous) = map.insert(decision.public_key.clone(), decision) {
+                panic!(
+                    "duplicate public decision key in harness backend: key={} previous={previous:#?}",
+                    previous.public_key
+                );
+            }
+        }
+        map
+    }
+
+    fn public_decisions_for_tree(tree: &GameTree) -> Vec<PublicDecisionSchema> {
+        tree.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(node_idx, node)| {
+                let GameNode::Decision {
+                    player,
+                    street,
+                    actions,
+                    children,
+                    ..
+                } = node
+                else {
+                    return None;
+                };
+                Some(PublicDecisionSchema {
+                    public_key: action_history(tree, node_idx as u32),
+                    debug: node_context(tree, node_idx as u32, None, None, None),
+                    player: *player,
+                    street: *street,
+                    actions: actions
+                        .iter()
+                        .zip(children.iter())
+                        .enumerate()
+                        .map(|(action_idx, (action, &child_idx))| PublicActionSchema {
+                            action_idx,
+                            label: format!("{action:?}"),
+                            child_desc: mccfr_trace_child_desc(tree, child_idx),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    fn build_storage_coords(
+        tree: &GameTree,
+        storage: &impl BlueprintCfrStorage,
+    ) -> Vec<StorageCoord> {
+        let dense_slots = storage.storage_stats().dense_equivalent_slots;
+        let mut coords: Vec<Option<StorageCoord>> = vec![None; dense_slots];
+        let mut slot = 0usize;
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            let GameNode::Decision {
+                player,
+                street,
+                actions,
+                ..
+            } = node
+            else {
+                continue;
+            };
+            let buckets = storage.bucket_counts()[*street as usize];
+            for bucket in 0..buckets {
+                for (action_idx, action) in actions.iter().enumerate() {
+                    coords[slot] = Some(StorageCoord {
+                        node_idx: node_idx as u32,
+                        player: *player,
+                        street: *street,
+                        bucket,
+                        action_idx,
+                        action_label: format!("{action:?}"),
+                    });
+                    slot += 1;
+                }
+            }
+        }
+        coords
+            .into_iter()
+            .enumerate()
+            .map(|(slot, coord)| {
+                coord.unwrap_or_else(|| panic!("missing storage coordinate for dense slot {slot}"))
+            })
+            .collect()
+    }
+
+    fn build_strategy_coords(
+        tree: &GameTree,
+        storage: &impl BlueprintCfrStorage,
+    ) -> Vec<StrategyCoord> {
+        let mut coords = Vec::new();
+        let mut decision_idx = 0usize;
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            let GameNode::Decision {
+                player,
+                street,
+                actions,
+                ..
+            } = node
+            else {
+                continue;
+            };
+            let buckets = storage.bucket_counts()[*street as usize];
+            for bucket in 0..buckets {
+                for (action_idx, action) in actions.iter().enumerate() {
+                    coords.push(StrategyCoord {
+                        decision_idx,
+                        node_idx: node_idx as u32,
+                        player: *player,
+                        street: *street,
+                        bucket,
+                        action_idx,
+                        action_label: format!("{action:?}"),
+                    });
+                }
+            }
+            decision_idx += 1;
+        }
+        coords
+    }
+
+    fn assert_i32_deltas_match(
+        label: &str,
+        oracle_before: &[i32],
+        oracle_after: &[i32],
+        candidate_before: &[i32],
+        candidate_after: &[i32],
+        coords: &[StorageCoord],
+        tree: &GameTree,
+        deal: &DealWithBuckets,
+    ) {
+        assert_eq!(
+            oracle_before.len(),
+            candidate_before.len(),
+            "{label} before length"
+        );
+        assert_eq!(
+            oracle_after.len(),
+            candidate_after.len(),
+            "{label} after length"
+        );
+        for slot in 0..oracle_after.len() {
+            let oracle_delta = oracle_after[slot].saturating_sub(oracle_before[slot]);
+            let candidate_delta = candidate_after[slot].saturating_sub(candidate_before[slot]);
+            if oracle_delta != candidate_delta {
+                panic!(
+                    "{label} delta mismatch at dense slot {slot}: {}\n\
+                     oracle before={} after={} delta={}\n\
+                     candidate before={} after={} delta={}",
+                    storage_coord_context(tree, &coords[slot], deal),
+                    oracle_before[slot],
+                    oracle_after[slot],
+                    oracle_delta,
+                    candidate_before[slot],
+                    candidate_after[slot],
+                    candidate_delta
+                );
+            }
+        }
+    }
+
+    fn assert_i64_deltas_match(
+        label: &str,
+        oracle_before: &[i64],
+        oracle_after: &[i64],
+        candidate_before: &[i64],
+        candidate_after: &[i64],
+        coords: &[StorageCoord],
+        tree: &GameTree,
+        deal: &DealWithBuckets,
+    ) {
+        assert_eq!(
+            oracle_before.len(),
+            candidate_before.len(),
+            "{label} before length"
+        );
+        assert_eq!(
+            oracle_after.len(),
+            candidate_after.len(),
+            "{label} after length"
+        );
+        for slot in 0..oracle_after.len() {
+            let oracle_delta = oracle_after[slot].saturating_sub(oracle_before[slot]);
+            let candidate_delta = candidate_after[slot].saturating_sub(candidate_before[slot]);
+            if oracle_delta != candidate_delta {
+                panic!(
+                    "{label} delta mismatch at dense slot {slot}: {}\n\
+                     oracle before={} after={} delta={}\n\
+                     candidate before={} after={} delta={}",
+                    storage_coord_context(tree, &coords[slot], deal),
+                    oracle_before[slot],
+                    oracle_after[slot],
+                    oracle_delta,
+                    candidate_before[slot],
+                    candidate_after[slot],
+                    candidate_delta
+                );
+            }
+        }
+    }
+
+    fn assert_traversal_traces_match(
+        run_idx: usize,
+        traverser: u8,
+        seed: u64,
+        oracle_name: &str,
+        oracle: &MccfrTestTrace,
+        candidate_name: &str,
+        candidate: &MccfrTestTrace,
+    ) {
+        assert_eq!(
+            oracle.opponent_samples.len(),
+            candidate.opponent_samples.len(),
+            "opponent sample trace length mismatch on run {run_idx}: traverser={traverser} seed={seed}\n\
+             {oracle_name} tail={}\n{candidate_name} tail={}",
+            trace_tail(oracle),
+            trace_tail(candidate)
+        );
+        for (event_idx, (oracle_event, candidate_event)) in oracle
+            .opponent_samples
+            .iter()
+            .zip(candidate.opponent_samples.iter())
+            .enumerate()
+        {
+            assert_opponent_sample_trace_match(
+                run_idx,
+                event_idx,
+                traverser,
+                seed,
+                oracle_name,
+                oracle_event,
+                candidate_name,
+                candidate_event,
+            );
+        }
+
+        assert_eq!(
+            oracle.traverser_nodes.len(),
+            candidate.traverser_nodes.len(),
+            "traverser action-value trace length mismatch on run {run_idx}: traverser={traverser} seed={seed}\n\
+             {oracle_name} tail={}\n{candidate_name} tail={}",
+            trace_tail(oracle),
+            trace_tail(candidate)
+        );
+        for (event_idx, (oracle_event, candidate_event)) in oracle
+            .traverser_nodes
+            .iter()
+            .zip(candidate.traverser_nodes.iter())
+            .enumerate()
+        {
+            assert_traverser_node_trace_match(
+                run_idx,
+                event_idx,
+                traverser,
+                seed,
+                oracle_name,
+                oracle_event,
+                candidate_name,
+                candidate_event,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_opponent_sample_trace_match(
+        run_idx: usize,
+        event_idx: usize,
+        traverser: u8,
+        seed: u64,
+        oracle_name: &str,
+        oracle: &MccfrOpponentSampleTrace,
+        candidate_name: &str,
+        candidate: &MccfrOpponentSampleTrace,
+    ) {
+        let context = format!(
+            "opponent sample mismatch on run {run_idx} event {event_idx}: traverser={traverser} seed={seed}"
+        );
+        if oracle.public_key != candidate.public_key
+            || oracle.player != candidate.player
+            || oracle.street != candidate.street
+            || oracle.bucket != candidate.bucket
+            || oracle.board != candidate.board
+            || oracle.action_idx != candidate.action_idx
+            || oracle.action_label != candidate.action_label
+            || oracle.child_desc != candidate.child_desc
+        {
+            panic!(
+                "{context}\n{oracle_name}: {}\n{candidate_name}: {}",
+                opponent_trace_context(oracle),
+                opponent_trace_context(candidate)
+            );
+        }
+        assert_close(
+            oracle.rng_threshold,
+            candidate.rng_threshold,
+            1e-15,
+            &format!(
+                "{context}; rng threshold diverged at {}",
+                opponent_trace_context(oracle)
+            ),
+        );
+        assert_f64_vec_close(
+            &oracle.strategy,
+            &candidate.strategy,
+            1e-15,
+            &format!(
+                "{context}; strategy vector diverged at {}",
+                opponent_trace_context(oracle)
+            ),
+        );
+        assert_close(
+            oracle.sampled_value,
+            candidate.sampled_value,
+            1e-12,
+            &format!(
+                "{context}; sampled child utility diverged at {}",
+                opponent_trace_context(oracle)
+            ),
+        );
+        assert_close(
+            oracle.returned_value,
+            candidate.returned_value,
+            1e-12,
+            &format!(
+                "{context}; returned baseline-corrected utility diverged at {}",
+                opponent_trace_context(oracle)
+            ),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_traverser_node_trace_match(
+        run_idx: usize,
+        event_idx: usize,
+        traverser: u8,
+        seed: u64,
+        oracle_name: &str,
+        oracle: &MccfrTraverserNodeTrace,
+        candidate_name: &str,
+        candidate: &MccfrTraverserNodeTrace,
+    ) {
+        let context = format!(
+            "traverser action-value mismatch on run {run_idx} event {event_idx}: traverser={traverser} seed={seed}"
+        );
+        if oracle.public_key != candidate.public_key
+            || oracle.player != candidate.player
+            || oracle.street != candidate.street
+            || oracle.bucket != candidate.bucket
+            || oracle.board != candidate.board
+            || oracle.actions != candidate.actions
+            || oracle.child_descs != candidate.child_descs
+            || oracle.pruned != candidate.pruned
+        {
+            panic!(
+                "{context}\n{oracle_name}: {}\n{candidate_name}: {}",
+                traverser_trace_context(oracle),
+                traverser_trace_context(candidate)
+            );
+        }
+        assert_f64_vec_close(
+            &oracle.strategy,
+            &candidate.strategy,
+            1e-15,
+            &format!(
+                "{context}; current strategy vector diverged at {}",
+                traverser_trace_context(oracle)
+            ),
+        );
+        assert_f64_vec_close(
+            &oracle.action_values,
+            &candidate.action_values,
+            1e-12,
+            &format!(
+                "{context}; action-value vector diverged at {}",
+                traverser_trace_context(oracle)
+            ),
+        );
+        assert_close(
+            oracle.node_value,
+            candidate.node_value,
+            1e-12,
+            &format!(
+                "{context}; strategy-weighted node value diverged at {}",
+                traverser_trace_context(oracle)
+            ),
+        );
+    }
+
+    fn assert_f64_vec_close(oracle: &[f64], candidate: &[f64], tol: f64, context: &str) {
+        assert_eq!(
+            oracle.len(),
+            candidate.len(),
+            "{context}; vector length mismatch: oracle={} candidate={}",
+            oracle.len(),
+            candidate.len()
+        );
+        for (idx, (&oracle_value, &candidate_value)) in
+            oracle.iter().zip(candidate.iter()).enumerate()
+        {
+            assert_close(
+                oracle_value,
+                candidate_value,
+                tol,
+                &format!(
+                    "{context}; vector_idx={idx} oracle_vec={oracle:?} candidate_vec={candidate:?}"
+                ),
+            );
+        }
+    }
+
+    fn assert_close(oracle: f64, candidate: f64, tol: f64, context: &str) {
+        assert!(
+            (oracle - candidate).abs() <= tol,
+            "{context}; oracle={oracle:.15} candidate={candidate:.15} delta={:.15}",
+            oracle - candidate
+        );
+    }
+
+    fn opponent_trace_context(trace: &MccfrOpponentSampleTrace) -> String {
+        format!(
+            "node={} public_key={} player={} street={:?} board={} bucket={} rng={:.15} action_idx={} action={} child={} strategy={:?} sampled_value={:.12} returned_value={:.12}",
+            trace.node_idx,
+            trace.public_key,
+            trace.player,
+            trace.street,
+            trace.board,
+            trace.bucket,
+            trace.rng_threshold,
+            trace.action_idx,
+            trace.action_label,
+            trace.child_desc,
+            trace.strategy,
+            trace.sampled_value,
+            trace.returned_value
+        )
+    }
+
+    fn traverser_trace_context(trace: &MccfrTraverserNodeTrace) -> String {
+        format!(
+            "node={} public_key={} player={} street={:?} board={} bucket={} actions={:?} children={:?} strategy={:?} action_values={:?} pruned={:?} node_value={:.12}",
+            trace.node_idx,
+            trace.public_key,
+            trace.player,
+            trace.street,
+            trace.board,
+            trace.bucket,
+            trace.actions,
+            trace.child_descs,
+            trace.strategy,
+            trace.action_values,
+            trace.pruned,
+            trace.node_value
+        )
+    }
+
+    fn trace_tail(trace: &MccfrTestTrace) -> String {
+        format!(
+            "opponent_last={}; traverser_last={}",
+            trace
+                .opponent_samples
+                .last()
+                .map(opponent_trace_context)
+                .unwrap_or_else(|| "<none>".to_string()),
+            trace
+                .traverser_nodes
+                .last()
+                .map(traverser_trace_context)
+                .unwrap_or_else(|| "<none>".to_string())
+        )
+    }
+
+    fn assert_storage_equal(
+        label: &str,
+        expected: &BlueprintStorage,
+        actual: &BlueprintStorage,
+        coords: &[StorageCoord],
+        tree: &GameTree,
+        deal: &DealWithBuckets,
+    ) {
+        for slot in 0..expected.regrets.len() {
+            let expected_regret = expected.regrets[slot].load(Ordering::Relaxed);
+            let actual_regret = actual.regrets[slot].load(Ordering::Relaxed);
+            if expected_regret != actual_regret {
+                panic!(
+                    "{label} regret mismatch at dense slot {slot}: {}\nexpected={expected_regret} actual={actual_regret}",
+                    storage_coord_context(tree, &coords[slot], deal)
+                );
+            }
+
+            let expected_sum = expected.strategy_sums[slot].load(Ordering::Relaxed);
+            let actual_sum = actual.strategy_sums[slot].load(Ordering::Relaxed);
+            if expected_sum != actual_sum {
+                panic!(
+                    "{label} strategy-sum mismatch at dense slot {slot}: {}\nexpected={expected_sum} actual={actual_sum}",
+                    storage_coord_context(tree, &coords[slot], deal)
+                );
+            }
+        }
+    }
+
+    fn assert_dense_average_strategy_equal(
+        oracle: &BlueprintV2Strategy,
+        candidate: &BlueprintV2Strategy,
+        coords: &[StrategyCoord],
+        tree: &GameTree,
+    ) {
+        assert_eq!(
+            oracle.node_action_counts, candidate.node_action_counts,
+            "dense average-strategy node action counts mismatch"
+        );
+        assert_eq!(
+            oracle.node_street_indices, candidate.node_street_indices,
+            "dense average-strategy node street indices mismatch"
+        );
+        assert_eq!(
+            oracle.bucket_counts, candidate.bucket_counts,
+            "dense average-strategy bucket counts mismatch"
+        );
+        assert_eq!(
+            oracle.action_probs.len(),
+            candidate.action_probs.len(),
+            "dense average-strategy action probability length mismatch"
+        );
+        assert_eq!(
+            coords.len(),
+            oracle.action_probs.len(),
+            "strategy coordinate length mismatch"
+        );
+
+        for (slot, (&oracle_prob, &candidate_prob)) in oracle
+            .action_probs
+            .iter()
+            .zip(candidate.action_probs.iter())
+            .enumerate()
+        {
+            if oracle_prob.to_bits() != candidate_prob.to_bits() {
+                let coord = &coords[slot];
+                panic!(
+                    "dense average-strategy mismatch at flat slot {slot}: {}\n\
+                     oracle_prob={oracle_prob:.9} candidate_prob={candidate_prob:.9}",
+                    strategy_coord_context(tree, coord)
+                );
+            }
+        }
+    }
+
+    fn action_history(tree: &GameTree, target: u32) -> String {
+        let mut labels = Vec::new();
+        if find_action_history(tree, tree.root, target, &mut labels) {
+            if labels.is_empty() {
+                "root".to_string()
+            } else {
+                labels.join(" -> ")
+            }
+        } else {
+            "<unreachable>".to_string()
+        }
+    }
+
+    fn find_action_history(
+        tree: &GameTree,
+        current: u32,
+        target: u32,
+        labels: &mut Vec<String>,
+    ) -> bool {
+        if current == target {
+            return true;
+        }
+        match &tree.nodes[current as usize] {
+            GameNode::Decision {
+                actions, children, ..
+            } => {
+                for (action, &child) in actions.iter().zip(children.iter()) {
+                    labels.push(format!("{action:?}"));
+                    if find_action_history(tree, child, target, labels) {
+                        return true;
+                    }
+                    labels.pop();
+                }
+            }
+            GameNode::Chance { child, next_street } => {
+                labels.push(format!("Chance({next_street:?})"));
+                if find_action_history(tree, *child, target, labels) {
+                    return true;
+                }
+                labels.pop();
+            }
+            GameNode::Terminal { .. } => {}
+        }
+        false
+    }
+
+    fn node_context(
+        tree: &GameTree,
+        node_idx: u32,
+        bucket: Option<u16>,
+        action_idx: Option<usize>,
+        action_label: Option<&str>,
+    ) -> String {
+        match &tree.nodes[node_idx as usize] {
+            GameNode::Decision { player, street, .. } => {
+                format!(
+                    "node={node_idx} history={} player={player} street={street:?} bucket={} action_idx={} action={} bucket_source=fileless_equity_fixture",
+                    action_history(tree, node_idx),
+                    bucket
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "<n/a>".to_string()),
+                    action_idx
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "<n/a>".to_string()),
+                    action_label.unwrap_or("<n/a>")
+                )
+            }
+            GameNode::Chance { next_street, .. } => {
+                format!(
+                    "node={node_idx} history={} chance_next_street={next_street:?}",
+                    action_history(tree, node_idx)
+                )
+            }
+            GameNode::Terminal { kind, pot, stacks } => {
+                format!(
+                    "node={node_idx} history={} terminal={kind:?} pot={pot:.3} stacks={stacks:?}",
+                    action_history(tree, node_idx)
+                )
+            }
+        }
+    }
+
+    fn storage_coord_context(
+        tree: &GameTree,
+        coord: &StorageCoord,
+        deal: &DealWithBuckets,
+    ) -> String {
+        format!(
+            "{} board={} precomputed_bucket={} coord_player={}",
+            node_context(
+                tree,
+                coord.node_idx,
+                Some(coord.bucket),
+                Some(coord.action_idx),
+                Some(&coord.action_label),
+            ),
+            visible_board_label(&deal.deal.board, coord.street),
+            deal.buckets[coord.player as usize][coord.street as usize],
+            coord.player
+        )
+    }
+
+    fn strategy_coord_context(tree: &GameTree, coord: &StrategyCoord) -> String {
+        format!(
+            "{} decision_idx={} coord_player={} coord_street={:?}",
+            node_context(
+                tree,
+                coord.node_idx,
+                Some(coord.bucket),
+                Some(coord.action_idx),
+                Some(&coord.action_label),
+            ),
+            coord.decision_idx,
+            coord.player,
+            coord.street
+        )
+    }
+
+    fn visible_board_label(board: &[Card; 5], street: Street) -> String {
+        let visible = AllBuckets::board_for_street(board, street);
+        if visible.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("{visible:?}")
+        }
+    }
+
+    #[test]
+    fn differential_harness_eager_dense_self_check() {
+        let bucket_counts = [10, 10, 10, 10];
+        let oracle = DenseMccfrHarnessBackend::new("oracle_eager_dense", bucket_counts);
+        let candidate = DenseMccfrHarnessBackend::new("candidate_eager_dense", bucket_counts);
+        let oracle_backend: &dyn MccfrHarnessBackend = &oracle;
+        let candidate_backend: &dyn MccfrHarnessBackend = &candidate;
+        run_differential_harness(oracle_backend, candidate_backend, bucket_counts);
+    }
+
+    #[test]
+    fn differential_harness_eager_dense_vs_sparse_candidate() {
+        let bucket_counts = [10, 10, 10, 10];
+        let oracle = DenseMccfrHarnessBackend::new("oracle_eager_dense", bucket_counts);
+        let candidate = SparseMccfrHarnessBackend::new("candidate_sparse", bucket_counts);
+        let oracle_backend: &dyn MccfrHarnessBackend = &oracle;
+        let candidate_backend: &dyn MccfrHarnessBackend = &candidate;
+        run_differential_harness(oracle_backend, candidate_backend, bucket_counts);
+    }
+
+    fn run_differential_harness(
+        oracle_backend: &dyn MccfrHarnessBackend,
+        candidate_backend: &dyn MccfrHarnessBackend,
+        bucket_counts: [u16; 4],
+    ) {
+        let buckets = AllBuckets::new(bucket_counts, [None, None, None, None]);
+
+        oracle_backend.seed_deterministic_nonzero();
+        candidate_backend.seed_deterministic_nonzero();
+
+        assert_legal_action_orders_match(oracle_backend, candidate_backend);
+
+        let storage_coords = oracle_backend.storage_coords();
+        let runs = [
+            (make_deal(), 0u8, 0xC0FFEE_u64),
+            (make_deal_p0_wins(), 1u8, 0xBAD5EED_u64),
+        ];
+
+        let mut last_precomputed = None;
+        for (run_idx, (deal, traverser, seed)) in runs.into_iter().enumerate() {
+            let precomputed = make_precomputed(&buckets, deal);
+            let oracle_regrets_before = oracle_backend.snapshot_regrets();
+            let candidate_regrets_before = candidate_backend.snapshot_regrets();
+            let oracle_sums_before = oracle_backend.snapshot_strategy_sums();
+            let candidate_sums_before = candidate_backend.snapshot_strategy_sums();
+
+            let oracle_result = oracle_backend.traverse_with_trace(&precomputed, traverser, seed);
+            let candidate_result =
+                candidate_backend.traverse_with_trace(&precomputed, traverser, seed);
+
+            assert_traversal_traces_match(
+                run_idx,
+                traverser,
+                seed,
+                oracle_backend.name(),
+                &oracle_result.trace,
+                candidate_backend.name(),
+                &candidate_result.trace,
+            );
+
+            assert!(
+                (oracle_result.ev - candidate_result.ev).abs() < 1e-12,
+                "traversal EV mismatch on run {run_idx}; terminal payoff or sampled opponent action may have diverged\n\
+                 traverser={traverser} seed={seed} board={} oracle_ev={:.12} candidate_ev={:.12}\n\
+                 {} trace_tail={}\n{} trace_tail={}",
+                visible_board_label(&precomputed.deal.board, Street::River),
+                oracle_result.ev,
+                candidate_result.ev,
+                oracle_backend.name(),
+                trace_tail(&oracle_result.trace),
+                candidate_backend.name(),
+                trace_tail(&candidate_result.trace)
+            );
+            assert_eq!(
+                (oracle_result.stats.hits, oracle_result.stats.total),
+                (candidate_result.stats.hits, candidate_result.stats.total),
+                "prune/sample diagnostic mismatch on run {run_idx}: traverser={traverser} seed={seed}"
+            );
+
+            let oracle_regrets_after = oracle_backend.snapshot_regrets();
+            let candidate_regrets_after = candidate_backend.snapshot_regrets();
+            let oracle_sums_after = oracle_backend.snapshot_strategy_sums();
+            let candidate_sums_after = candidate_backend.snapshot_strategy_sums();
+
+            assert_i32_deltas_match(
+                "regret",
+                &oracle_regrets_before,
+                &oracle_regrets_after,
+                &candidate_regrets_before,
+                &candidate_regrets_after,
+                &storage_coords,
+                oracle_backend.diagnostic_tree(),
+                &precomputed,
+            );
+            assert_i64_deltas_match(
+                "strategy-sum",
+                &oracle_sums_before,
+                &oracle_sums_after,
+                &candidate_sums_before,
+                &candidate_sums_after,
+                &storage_coords,
+                oracle_backend.diagnostic_tree(),
+                &precomputed,
+            );
+
+            last_precomputed = Some(precomputed);
+        }
+
+        let strategy_coords = oracle_backend.strategy_coords();
+        let oracle_strategy = oracle_backend.dense_average_strategy();
+        let candidate_strategy = candidate_backend.dense_average_strategy();
+        assert_dense_average_strategy_equal(
+            &oracle_strategy,
+            &candidate_strategy,
+            &strategy_coords,
+            oracle_backend.diagnostic_tree(),
+        );
+
+        let precomputed = last_precomputed.expect("at least one differential run");
+        let oracle_dense = oracle_backend.dense_storage_projection();
+        let candidate_dense = candidate_backend.dense_storage_projection();
+        assert_storage_equal(
+            "dense oracle vs candidate projection",
+            &oracle_dense,
+            &candidate_dense,
+            &storage_coords,
+            oracle_backend.diagnostic_tree(),
+            &precomputed,
+        );
+
+        let loaded = oracle_backend.dense_regret_save_load_round_trip();
+        assert_storage_equal(
+            "oracle dense save/load round trip",
+            &oracle_dense,
+            &loaded,
+            &storage_coords,
+            oracle_backend.diagnostic_tree(),
+            &precomputed,
+        );
+        let candidate_loaded = candidate_backend.dense_regret_save_load_round_trip();
+        assert_storage_equal(
+            "candidate dense projection save/load round trip",
+            &candidate_dense,
+            &candidate_loaded,
+            &storage_coords,
+            oracle_backend.diagnostic_tree(),
+            &precomputed,
+        );
     }
 
     #[test]

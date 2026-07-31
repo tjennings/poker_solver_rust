@@ -5,6 +5,7 @@ use crate::utility::*;
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::mem::{self, MaybeUninit};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Re-export utility functions that belong to the solver's public API.
 pub use crate::utility::{
@@ -132,6 +133,7 @@ pub fn solve<T: Game>(
         Vec::with_capacity(game.num_private_hands(0)),
         Vec::with_capacity(game.num_private_hands(1)),
     ];
+    let cancel = AtomicBool::new(false);
 
     for t in 0..max_num_iterations {
         if exploitability <= target_exploitability {
@@ -151,6 +153,7 @@ pub fn solve<T: Game>(
                 player,
                 game.initial_weights(player ^ 1),
                 &params,
+                &cancel,
             );
         }
 
@@ -179,9 +182,30 @@ pub fn solve<T: Game>(
 // solve_step() — single iteration
 // ---------------------------------------------------------------------------
 
+/// Outcome of a cancellable solver iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolveStepResult {
+    /// The traversal completed and applied its normal updates.
+    Completed,
+    /// Cancellation was observed before the iteration could finish.
+    Cancelled,
+}
+
 /// Proceeds the Discounted CFR algorithm for one iteration.
 #[inline]
 pub fn solve_step<T: Game>(game: &T, current_iteration: u32) {
+    let cancel = AtomicBool::new(false);
+    let _ = solve_step_with_cancel(game, current_iteration, &cancel);
+}
+
+/// Proceeds one Discounted CFR iteration, stopping at safe traversal boundaries
+/// when `cancel` is set.
+#[inline]
+pub fn solve_step_with_cancel<T: Game>(
+    game: &T,
+    current_iteration: u32,
+    cancel: &AtomicBool,
+) -> SolveStepResult {
     if game.is_solved() {
         panic!("Game is already solved");
     }
@@ -190,22 +214,36 @@ pub fn solve_step<T: Game>(game: &T, current_iteration: u32) {
         panic!("Game is not ready");
     }
 
+    if cancel.load(Ordering::Acquire) {
+        return SolveStepResult::Cancelled;
+    }
+
     let mut root = game.root();
     let params = DiscountParams::new(current_iteration);
 
     // Alternating updates
     for player in 0..2 {
+        if cancel.load(Ordering::Acquire) {
+            return SolveStepResult::Cancelled;
+        }
+
         let mut result = Vec::with_capacity(game.num_private_hands(player));
         result.reserve(game.num_private_hands(player));
-        solve_recursive(
+        if solve_recursive(
             result.spare_capacity_mut(),
             game,
             &mut root,
             player,
             game.initial_weights(player ^ 1),
             &params,
-        );
+            cancel,
+        ) == SolveStepResult::Cancelled
+        {
+            return SolveStepResult::Cancelled;
+        }
     }
+
+    SolveStepResult::Completed
 }
 
 // ---------------------------------------------------------------------------
@@ -225,11 +263,20 @@ fn solve_recursive<T: Game>(
     player: usize,
     cfreach: &[f32],
     params: &DiscountParams,
-) {
+    cancel: &AtomicBool,
+) -> SolveStepResult {
+    if cancel.load(Ordering::Acquire) {
+        return SolveStepResult::Cancelled;
+    }
+
     // Return the counterfactual values when the node is terminal.
     if node.is_terminal() {
         game.evaluate(result, node, player, cfreach);
-        return;
+        return if cancel.load(Ordering::Acquire) {
+            SolveStepResult::Cancelled
+        } else {
+            SolveStepResult::Completed
+        };
     }
 
     let num_actions = node.num_actions();
@@ -238,8 +285,7 @@ fn solve_recursive<T: Game>(
     // Simply recurse when there is only one action (non-chance).
     if num_actions == 1 && !node.is_chance() {
         let child = &mut node.play(0);
-        solve_recursive(result, game, child, player, cfreach, params);
-        return;
+        return solve_recursive(result, game, child, player, cfreach, params, cancel);
     }
 
     // Gadget disabled for non-owner: when the traverser is NOT the gadget
@@ -250,8 +296,7 @@ fn solve_recursive<T: Game>(
     // updates regrets on own pass; opponent sees it as a passthrough.
     if node.is_gadget() && node.gadget_owner() != Some(player) {
         let child = &mut node.play(1);
-        solve_recursive(result, game, child, player, cfreach, params);
-        return;
+        return solve_recursive(result, game, child, player, cfreach, params, cancel);
     }
 
     // Take scratch buffers from thread-local storage.
@@ -291,11 +336,26 @@ fn solve_recursive<T: Game>(
                 player,
                 &cfreach_updated,
                 params,
+                cancel,
             );
         });
 
+        if cancel.load(Ordering::Acquire) {
+            let mut scratch = take_scratch();
+            scratch.cfv_buf = cfv_mutex.into_inner();
+            scratch.cfreach_buf = cfreach_updated;
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
+
         // Re-take scratch for post-recursion work.
         let mut scratch = take_scratch();
+        if cancel.load(Ordering::Acquire) {
+            scratch.cfv_buf = cfv_mutex.into_inner();
+            scratch.cfreach_buf = cfreach_updated;
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
         scratch.result_f64_buf.clear();
         scratch.result_f64_buf.reserve(num_hands);
 
@@ -311,6 +371,13 @@ fn solve_recursive<T: Game>(
         );
         // SAFETY: sum_slices_f64_uninit writes all num_hands elements.
         unsafe { scratch.result_f64_buf.set_len(num_hands) };
+
+        if cancel.load(Ordering::Acquire) {
+            scratch.cfv_buf = cfv_buf;
+            scratch.cfreach_buf = cfreach_updated;
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
 
         // Process isomorphic chances.
         let isomorphic_chances = game.isomorphic_chances(node);
@@ -338,6 +405,7 @@ fn solve_recursive<T: Game>(
         scratch.cfv_buf = cfv_buf;
         scratch.cfreach_buf = cfreach_updated;
         put_scratch(scratch);
+        SolveStepResult::Completed
     }
     // -- Current player's decision node --
     // Use acting_player() to mask off flag bits (e.g. PLAYER_GADGET_FLAG).
@@ -357,11 +425,24 @@ fn solve_recursive<T: Game>(
                 player,
                 cfreach,
                 params,
+                cancel,
             );
         });
 
+        if cancel.load(Ordering::Acquire) {
+            let mut scratch = take_scratch();
+            scratch.cfv_buf = cfv_mutex.into_inner();
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
+
         // Re-take scratch for regret matching and updates.
         let mut scratch = take_scratch();
+        if cancel.load(Ordering::Acquire) {
+            scratch.cfv_buf = cfv_mutex.into_inner();
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
 
         // Compute strategy by regret-matching.
         if game.is_compression_enabled() {
@@ -391,6 +472,12 @@ fn solve_recursive<T: Game>(
 
         let result = fma_slices_uninit(result, &scratch.strategy_buf, &cfv_buf);
 
+        if cancel.load(Ordering::Acquire) {
+            scratch.cfv_buf = cfv_buf;
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
+
         if game.is_compression_enabled() {
             update_compressed_strategy(node, params, &mut scratch.strategy_buf, locking);
             update_compressed_regret(node, params, &mut cfv_buf, result, num_hands, locking);
@@ -401,6 +488,7 @@ fn solve_recursive<T: Game>(
 
         scratch.cfv_buf = cfv_buf;
         put_scratch(scratch);
+        SolveStepResult::Completed
     }
     // -- Opponent's decision node --
     else {
@@ -444,8 +532,17 @@ fn solve_recursive<T: Game>(
                 player,
                 row(&cfreach_actions, action, row_size),
                 params,
+                cancel,
             );
         });
+
+        if cancel.load(Ordering::Acquire) {
+            let mut scratch = take_scratch();
+            scratch.strategy_buf = cfreach_actions;
+            scratch.cfv_buf = cfv_mutex.into_inner();
+            put_scratch(scratch);
+            return SolveStepResult::Cancelled;
+        }
 
         // Extract Vec from MutexLike.
         let mut cfv_buf = cfv_mutex.into_inner();
@@ -459,6 +556,7 @@ fn solve_recursive<T: Game>(
         scratch.cfv_buf = cfv_buf;
         scratch.strategy_buf = cfreach_actions;
         put_scratch(scratch);
+        SolveStepResult::Completed
     }
 }
 
@@ -832,6 +930,45 @@ mod tests {
 
         let expl = compute_exploitability(&game);
         assert!(expl >= 0.0, "exploitability should be non-negative");
+    }
+
+    #[test]
+    fn cancelled_solve_step_before_traversal_does_not_update_root() {
+        use crate::action_tree::*;
+        use crate::bet_size::*;
+        use crate::card::*;
+        use std::sync::atomic::AtomicBool;
+
+        let oop_range: crate::range::Range = "AA,KK,QQ,AKs".parse().unwrap();
+        let ip_range: crate::range::Range = "QQ-JJ,AQs,AJs".parse().unwrap();
+        let card_config = CardConfig {
+            range: [oop_range, ip_range],
+            flop: flop_from_str("Qs Jh 2c").unwrap(),
+            turn: card_from_str("8d").unwrap(),
+            river: card_from_str("3s").unwrap(),
+        };
+        let sizes = BetSizeOptions::try_from(("50%, a", "")).unwrap();
+        let tree_config = TreeConfig {
+            initial_state: BoardState::River,
+            starting_pot: 100,
+            effective_stack: 100,
+            river_bet_sizes: [sizes.clone(), sizes],
+            ..Default::default()
+        };
+        let tree = ActionTree::new(tree_config).unwrap();
+        let mut game = PostFlopGame::with_config(card_config, tree).unwrap();
+        game.allocate_memory(false);
+
+        let before_regrets = game.node_at(0).regrets().to_vec();
+        let before_strategy = game.node_at(0).strategy().to_vec();
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            solve_step_with_cancel(&game, 0, &cancel),
+            SolveStepResult::Cancelled
+        );
+        assert_eq!(game.node_at(0).regrets(), before_regrets.as_slice());
+        assert_eq!(game.node_at(0).strategy(), before_strategy.as_slice());
     }
 
     #[test]
