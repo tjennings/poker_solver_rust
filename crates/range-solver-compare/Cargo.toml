@@ -7,6 +7,10 @@ edition = "2021"
 
 [dependencies]
 range-solver = { path = "../range-solver" }
-postflop-solver = { path = "../../external/postflop-solver", default-features = false, features = ["rayon"] }
+# Reference checkout expected beside this repo: ../../../postflop-solver.
+# On toolchains where that checkout trips `dangerous_implicit_autorefs`, run
+# this harness with `RUSTFLAGS="-A dangerous-implicit-autorefs"` instead of
+# adding repo-wide lint suppression.
+postflop-solver = { path = "../../../postflop-solver", default-features = false, features = ["rayon"] }
 rand = "0.8"
 rand_chacha = "0.3"
