@@ -232,11 +232,8 @@ impl BlueprintV2Strategy {
                 node_street_indices.push(*street as u8);
             }
         }
-        let node_offsets = compute_node_offsets(
-            &node_action_counts,
-            &node_street_indices,
-            bucket_counts,
-        );
+        let node_offsets =
+            compute_node_offsets(&node_action_counts, &node_street_indices, bucket_counts);
         Self {
             action_probs,
             node_action_counts,

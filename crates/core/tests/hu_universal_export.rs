@@ -6,9 +6,7 @@
 //! 3. Dense vs sparse projected exports produce identical strategy payloads.
 //! 4. Row ordering, action descriptors, error handling, and zero-mass rows.
 
-use poker_solver_core::blueprint_universal::{
-    ActionKind, BundleReader,
-};
+use poker_solver_core::blueprint_universal::{ActionKind, BundleReader};
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
 use poker_solver_core::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
@@ -116,9 +114,7 @@ fn tiny_export_config() -> BlueprintV2Config {
 }
 
 /// Build a tree and strategy with known probabilities for deterministic testing.
-fn build_test_tree_and_strategy(
-    config: &BlueprintV2Config,
-) -> (GameTree, BlueprintV2Strategy) {
+fn build_test_tree_and_strategy(config: &BlueprintV2Config) -> (GameTree, BlueprintV2Strategy) {
     let tree = GameTree::build_with_options(
         config.game.stack_depth,
         config.game.small_blind,
@@ -167,10 +163,8 @@ fn export_probabilities_match_legacy_strategy_bitwise() {
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .expect("export should succeed");
+    let output = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training)
+        .expect("export should succeed");
 
     // Write to disk, then load with BundleReader.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -220,8 +214,7 @@ fn export_probabilities_match_legacy_strategy_bitwise() {
                         );
                         // Check probabilities are bitwise identical.
                         for a in 0..num_actions {
-                            let universal_prob =
-                                reader.prob(row.prob_offset as usize + a).unwrap();
+                            let universal_prob = reader.prob(row.prob_offset as usize + a).unwrap();
                             assert_eq!(
                                 universal_prob.to_bits(),
                                 legacy_probs[a].to_bits(),
@@ -261,20 +254,16 @@ fn dense_and_sparse_exports_produce_identical_payloads() {
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let out_d = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training_d,
-    )
-    .expect("dense export");
+    let out_d = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training_d)
+        .expect("dense export");
 
     let training_s = hu_export::TrainingInfo {
         source_backend: "hu_sparse_projected",
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let out_s = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training_s,
-    )
-    .expect("sparse export");
+    let out_s = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training_s)
+        .expect("sparse export");
 
     // Row descriptors must be identical.
     assert_eq!(out_d.rows.len(), out_s.rows.len());
@@ -291,16 +280,15 @@ fn dense_and_sparse_exports_produce_identical_payloads() {
     // Probabilities must be bitwise identical.
     assert_eq!(out_d.probs.len(), out_s.probs.len());
     for (i, (&d, &s)) in out_d.probs.iter().zip(out_s.probs.iter()).enumerate() {
-        assert_eq!(
-            d.to_bits(),
-            s.to_bits(),
-            "prob mismatch at index {i}"
-        );
+        assert_eq!(d.to_bits(), s.to_bits(), "prob mismatch at index {i}");
     }
 
     // Only training.source_backend should differ.
     assert_eq!(out_d.manifest.training.source_backend, "hu_dense");
-    assert_eq!(out_s.manifest.training.source_backend, "hu_sparse_projected");
+    assert_eq!(
+        out_s.manifest.training.source_backend,
+        "hu_sparse_projected"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -319,10 +307,8 @@ fn action_descriptors_match_tree_actions() {
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .expect("export");
+    let output = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training)
+        .expect("export");
 
     // For each row, verify the action descriptors match the tree node's actions.
     for row in &output.rows {
@@ -398,10 +384,8 @@ fn exported_rows_satisfy_spec_sort_order() {
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .expect("export");
+    let output = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training)
+        .expect("export");
 
     // Rows must be sorted by identity_key and unique.
     for window in output.rows.windows(2) {
@@ -431,10 +415,8 @@ fn zero_mass_row_exports_uniform() {
         iterations: 100,
         elapsed_minutes: 5.0,
     };
-    let output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .expect("export");
+    let output = hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training)
+        .expect("export");
 
     // All rows from fresh storage should be uniform.
     for row in &output.rows {
@@ -462,8 +444,7 @@ fn rejects_missing_config_yaml() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out_dir = tempfile::tempdir().expect("outdir");
 
-    let err = hu_export::export_hu_bundle(dir.path(), "final", out_dir.path())
-        .unwrap_err();
+    let err = hu_export::export_hu_bundle(dir.path(), "final", out_dir.path()).unwrap_err();
     assert!(
         format!("{err:?}").contains("config"),
         "should mention missing config: {err:?}"
@@ -479,12 +460,10 @@ fn rejects_missing_strategy_bin() {
 
     // Write a valid config.yaml but no strategy.bin.
     let config = tiny_export_config();
-    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config)
-        .expect("save config");
+    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config).expect("save config");
     std::fs::create_dir_all(dir.path().join("final")).unwrap();
 
-    let err = hu_export::export_hu_bundle(dir.path(), "final", out_dir.path())
-        .unwrap_err();
+    let err = hu_export::export_hu_bundle(dir.path(), "final", out_dir.path()).unwrap_err();
     assert!(
         format!("{err:?}").contains("strategy"),
         "should mention missing strategy: {err:?}"
@@ -500,8 +479,7 @@ fn rejects_missing_metadata_json() {
 
     // Write config.yaml and strategy.bin but no metadata.json.
     let config = tiny_export_config();
-    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config)
-        .expect("save config");
+    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config).expect("save config");
 
     let tree = GameTree::build_with_options(
         config.game.stack_depth,
@@ -527,8 +505,7 @@ fn rejects_missing_metadata_json() {
     std::fs::create_dir_all(&snapshot_dir).unwrap();
     strategy.save(&snapshot_dir.join("strategy.bin")).unwrap();
 
-    let err = hu_export::export_hu_bundle(dir.path(), "final", out_dir.path())
-        .unwrap_err();
+    let err = hu_export::export_hu_bundle(dir.path(), "final", out_dir.path()).unwrap_err();
     assert!(
         format!("{err:?}").contains("metadata"),
         "should mention missing metadata: {err:?}"
@@ -543,11 +520,9 @@ fn rejects_bad_snapshot_name() {
     let out_dir = tempfile::tempdir().expect("outdir");
 
     let config = tiny_export_config();
-    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config)
-        .expect("save config");
+    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config).expect("save config");
 
-    let err = hu_export::export_hu_bundle(dir.path(), "invalid_name!", out_dir.path())
-        .unwrap_err();
+    let err = hu_export::export_hu_bundle(dir.path(), "invalid_name!", out_dir.path()).unwrap_err();
     assert!(
         matches!(err, hu_export::ExportError::BadSnapshotName { .. }),
         "should be BadSnapshotName: {err:?}"
@@ -566,8 +541,7 @@ fn full_disk_export_round_trip() {
 
     // Build a legacy bundle directory.
     let config = tiny_export_config();
-    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config)
-        .expect("save config");
+    poker_solver_core::blueprint_v2::bundle::save_config(dir.path(), &config).expect("save config");
 
     let tree = GameTree::build_with_options(
         config.game.stack_depth,
@@ -668,10 +642,8 @@ fn disk_export_retains_config_yaml_that_rebuilds_tree() {
     );
 
     // Manifest should reference config.yaml.
-    let manifest_text =
-        std::fs::read_to_string(out_dir.path().join("blueprint.json")).unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).unwrap();
+    let manifest_text = std::fs::read_to_string(out_dir.path().join("blueprint.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
     assert_eq!(
         manifest["training"]["config_path"].as_str(),
         Some("config.yaml"),

@@ -164,11 +164,7 @@ pub(crate) fn now_rfc3339_approx() -> String {
 /// Convert Unix epoch seconds to an RFC 3339 UTC timestamp string.
 fn epoch_secs_to_rfc3339(epoch: u64) -> String {
     let (days, day_secs) = (epoch / 86_400, epoch % 86_400);
-    let (hour, min, sec) = (
-        day_secs / 3600,
-        (day_secs % 3600) / 60,
-        day_secs % 60,
-    );
+    let (hour, min, sec) = (day_secs / 3600, (day_secs % 3600) / 60, day_secs % 60);
     let (year, month, day) = days_to_ymd(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
@@ -188,7 +184,16 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let month_days: [u64; 12] = [
         31,
         if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ];
     let mut month = 1u64;
     for &md in &month_days {
@@ -203,8 +208,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 
 /// True if `year` is a Gregorian leap year.
 fn is_leap(year: u64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100))
-        || year.is_multiple_of(400)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +405,10 @@ mod tests {
                 antes: vec![],
                 straddles: vec![],
                 stack_units: "chips".into(),
-                rake: RakeConfig { rate: 0.0, cap: 0.0 },
+                rake: RakeConfig {
+                    rate: 0.0,
+                    cap: 0.0,
+                },
                 max_flop_players: None,
             },
             training: TrainingMetadata {
@@ -447,8 +454,7 @@ mod tests {
 
     #[test]
     fn retain_config_yaml_copies_file_and_sets_manifest_path() {
-        let tmp = std::env::temp_dir()
-            .join("retain_config_test");
+        let tmp = std::env::temp_dir().join("retain_config_test");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -458,13 +464,11 @@ mod tests {
         let out_dir = tmp.join("output_bundle");
         let mut manifest = stub_manifest();
 
-        retain_config_yaml(&source, &out_dir, &mut manifest)
-            .unwrap();
+        retain_config_yaml(&source, &out_dir, &mut manifest).unwrap();
 
         assert!(out_dir.join("config.yaml").exists());
         assert_eq!(
-            std::fs::read_to_string(out_dir.join("config.yaml"))
-                .unwrap(),
+            std::fs::read_to_string(out_dir.join("config.yaml")).unwrap(),
             "game: test\n"
         );
         assert_eq!(
@@ -477,8 +481,7 @@ mod tests {
 
     #[test]
     fn retain_config_yaml_creates_output_dir() {
-        let tmp = std::env::temp_dir()
-            .join("retain_config_mkdir_test");
+        let tmp = std::env::temp_dir().join("retain_config_mkdir_test");
         let _ = std::fs::remove_dir_all(&tmp);
 
         let source = tmp.join("src.yaml");
@@ -488,8 +491,7 @@ mod tests {
         let nested = tmp.join("a").join("b").join("c");
         let mut manifest = stub_manifest();
 
-        retain_config_yaml(&source, &nested, &mut manifest)
-            .unwrap();
+        retain_config_yaml(&source, &nested, &mut manifest).unwrap();
 
         assert!(nested.join("config.yaml").exists());
         let _ = std::fs::remove_dir_all(&tmp);

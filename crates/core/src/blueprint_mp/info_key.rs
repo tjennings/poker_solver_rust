@@ -310,11 +310,7 @@ mod tests {
     fn seats_0_through_9_round_trip() {
         for s in 0..=9u8 {
             let key = InfoKey128::new(Seat::from_raw(s), 42, &[1, 2]);
-            assert_eq!(
-                key.seat(),
-                Seat::from_raw(s),
-                "seat {s} did not round-trip"
-            );
+            assert_eq!(key.seat(), Seat::from_raw(s), "seat {s} did not round-trip");
         }
     }
 
@@ -336,19 +332,19 @@ mod tests {
         let buckets: Vec<u32> = vec![
             0,
             1,
-            (1 << 14) | 0,       // flop local=0
-            (1 << 14) | 42,      // flop local=42
-            (2 << 14) | 42,      // turn local=42 (same local, different street)
-            (3 << 14) | 16383,   // river max local (14-bit)
-            (1u32 << 28) - 1,    // max 28-bit bucket
-            0x0ABC_DEF,          // mid-range
+            (1 << 14) | 0,     // flop local=0
+            (1 << 14) | 42,    // flop local=42
+            (2 << 14) | 42,    // turn local=42 (same local, different street)
+            (3 << 14) | 16383, // river max local (14-bit)
+            (1u32 << 28) - 1,  // max 28-bit bucket
+            0x0ABC_DEF,        // mid-range
         ];
         let histories: Vec<Vec<u8>> = vec![
             vec![],
             vec![1],
             (0..22).map(|i| (i % 15) as u8).collect(), // max 22 actions
-            vec![0xF; 6],        // boundary-slot pattern near hi/lo split
-            vec![0, 0, 0, 0, 0, 0, 5], // action in slot 6 (near boundary)
+            vec![0xF; 6],                              // boundary-slot pattern near hi/lo split
+            vec![0, 0, 0, 0, 0, 0, 5],                 // action in slot 6 (near boundary)
         ];
 
         let mut all_keys = HashSet::new();

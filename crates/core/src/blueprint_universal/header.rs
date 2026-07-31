@@ -57,12 +57,7 @@ pub struct BinaryHeader {
 impl BinaryHeader {
     /// Create a new header with the given parameters.
     #[must_use]
-    pub fn new(
-        magic: [u8; 8],
-        record_count: u64,
-        payload_len: u64,
-        payload_crc64: u64,
-    ) -> Self {
+    pub fn new(magic: [u8; 8], record_count: u64, payload_len: u64, payload_crc64: u64) -> Self {
         Self {
             magic,
             format_version: CURRENT_FORMAT_VERSION,
@@ -196,8 +191,7 @@ mod tests {
         assert_eq!(buf.len(), HEADER_SIZE);
 
         let mut cursor = Cursor::new(&buf);
-        let loaded =
-            BinaryHeader::read_from(&mut cursor, MAGIC_ROWS, "test.bin").unwrap();
+        let loaded = BinaryHeader::read_from(&mut cursor, MAGIC_ROWS, "test.bin").unwrap();
         assert_eq!(loaded, header);
     }
 
@@ -208,8 +202,7 @@ mod tests {
         header.write_to(&mut buf).unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let err = BinaryHeader::read_from(&mut cursor, MAGIC_ACTIONS, "test.bin")
-            .unwrap_err();
+        let err = BinaryHeader::read_from(&mut cursor, MAGIC_ACTIONS, "test.bin").unwrap_err();
         assert!(matches!(err, FormatError::BadMagic { .. }));
     }
 
@@ -221,20 +214,15 @@ mod tests {
         header.write_to(&mut buf).unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let err = BinaryHeader::read_from(&mut cursor, MAGIC_ROWS, "test.bin")
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            FormatError::UnsupportedFormatVersion { .. }
-        ));
+        let err = BinaryHeader::read_from(&mut cursor, MAGIC_ROWS, "test.bin").unwrap_err();
+        assert!(matches!(err, FormatError::UnsupportedFormatVersion { .. }));
     }
 
     #[test]
     fn rejects_truncated_buffer() {
         let buf = vec![0u8; 10]; // too short
         let mut cursor = Cursor::new(&buf);
-        let err = BinaryHeader::read_from(&mut cursor, MAGIC_ROWS, "test.bin")
-            .unwrap_err();
+        let err = BinaryHeader::read_from(&mut cursor, MAGIC_ROWS, "test.bin").unwrap_err();
         assert!(matches!(err, FormatError::Truncated { .. }));
     }
 }

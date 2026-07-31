@@ -13,8 +13,8 @@
 
 use poker_solver_core::blueprint_universal::hu_export::{self, TrainingInfo as HuTrainingInfo};
 use poker_solver_core::blueprint_universal::{
-    detect_bundle_kind, load_bundle, write_bundle, ActionKind, BundleData, BundleKind,
-    BundleReader, FormatError, InfosetView, LoaderError, MpLazyKey,
+    ActionKind, BundleData, BundleKind, BundleReader, FormatError, InfosetView, LoaderError,
+    MpLazyKey, detect_bundle_kind, load_bundle, write_bundle,
 };
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
@@ -540,7 +540,7 @@ use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::*;
 use poker_solver_core::blueprint_mp::mccfr::{sample_deal, traverse_external};
 use poker_solver_core::blueprint_mp::storage::MpStorage;
-use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, Seat, MAX_PLAYERS};
+use poker_solver_core::blueprint_mp::{Bucket, Chips, DealWithBuckets, MAX_PLAYERS, Seat};
 use poker_solver_core::blueprint_universal::mp_eager_export::{self, MpTrainingInfo};
 
 const MP_BUCKET_COUNTS: [u16; 4] = [10, 10, 10, 10];
@@ -749,10 +749,10 @@ fn load_mp_eager_and_query() {
 
 // ── MP lazy test ─────────────────────────────────────────────────────
 
+use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_mp::sparse_storage::{
     MpInfosetKey, SparseActionDescriptor, SparseActionKind, SparseSnapshotEntry,
 };
-use poker_solver_core::blueprint_mp::Street as MpStreet;
 use poker_solver_core::blueprint_universal::mp_lazy_export::{
     self, LazyExportConfig, LazyTrainingInfo,
 };
@@ -1148,15 +1148,17 @@ fn load_mp_lazy_query_returns_none_after_payload_truncation() {
         .set_len(0)
         .unwrap();
 
-    assert!(bundle
-        .query_mp_lazy(&MpLazyKey {
-            seat: 0,
-            street: 0,
-            local_bucket: 5,
-            history_hash: 0xAAAA,
-            history_len: 4,
-        })
-        .is_none());
+    assert!(
+        bundle
+            .query_mp_lazy(&MpLazyKey {
+                seat: 0,
+                street: 0,
+                local_bucket: 5,
+                history_hash: 0xAAAA,
+                history_len: 4,
+            })
+            .is_none()
+    );
 }
 
 // ── Detection precedence regression test ────────────────────────────

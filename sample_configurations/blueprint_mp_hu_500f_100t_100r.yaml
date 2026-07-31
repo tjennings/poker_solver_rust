@@ -54,8 +54,9 @@ training:
   lcfr_discount_interval: 3000000
   lcfr_warmup_iterations: 3000000
   prune_after_iterations: 4000000
-  prune_threshold: -1
-  prune_explore_pct: 0.0
+  traversal_pruning_enabled: true
+  prune_threshold: -6000
+  prune_explore_pct: 0.05
   negative_action_subtree_purge_enabled: false
   negative_action_prune_below: -100
   negative_action_reactivate_at: 0
@@ -72,7 +73,7 @@ snapshots:
   warmup_minutes: 60
   snapshot_every_minutes: 30
   format: both
-  output_dir: "./local_data/blueprints/mp_hu_500f_100t_100r_nut_high_cap_0p5_v1"
+  output_dir: "./local_data/blueprints/mp_hu_500f_100t_100r_nut_high_cap_0p5_v3"
 
 tui:
   enabled: true

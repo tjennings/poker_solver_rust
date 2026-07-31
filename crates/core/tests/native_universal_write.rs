@@ -10,8 +10,8 @@
 
 use std::path::Path;
 
-use poker_solver_core::blueprint_universal::hu_export;
 use poker_solver_core::blueprint_universal::Manifest;
+use poker_solver_core::blueprint_universal::hu_export;
 use poker_solver_core::blueprint_v2::bundle::BlueprintV2Strategy;
 use poker_solver_core::blueprint_v2::config::*;
 use poker_solver_core::blueprint_v2::game_tree::GameTree;
@@ -36,22 +36,36 @@ fn tiny_hu_config(output_dir: &str) -> BlueprintV2Config {
         clustering: ClusteringConfig {
             algorithm: ClusteringAlgorithm::PotentialAwareEmd,
             preflop: StreetClusterConfig {
-                buckets: 3, delta_bins: None, expected_delta: false,
-                sample_boards: None, metric: Default::default(),
+                buckets: 3,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+                metric: Default::default(),
             },
             flop: StreetClusterConfig {
-                buckets: 2, delta_bins: None, expected_delta: false,
-                sample_boards: None, metric: Default::default(),
+                buckets: 2,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+                metric: Default::default(),
             },
             turn: StreetClusterConfig {
-                buckets: 2, delta_bins: None, expected_delta: false,
-                sample_boards: None, metric: Default::default(),
+                buckets: 2,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+                metric: Default::default(),
             },
             river: StreetClusterConfig {
-                buckets: 2, delta_bins: None, expected_delta: false,
-                sample_boards: None, metric: Default::default(),
+                buckets: 2,
+                delta_bins: None,
+                expected_delta: false,
+                sample_boards: None,
+                metric: Default::default(),
             },
-            seed: 42, kmeans_iterations: 10, cfvnet_river_data: None,
+            seed: 42,
+            kmeans_iterations: 10,
+            cfvnet_river_data: None,
             per_flop: None,
         },
         action_abstraction: ActionAbstractionConfig {
@@ -61,28 +75,44 @@ fn tiny_hu_config(output_dir: &str) -> BlueprintV2Config {
             river: vec![vec![1.0]],
         },
         training: TrainingConfig {
-            cluster_path: None, iterations: Some(100),
-            time_limit_minutes: None, lcfr_warmup_iterations: 0,
-            lcfr_discount_interval: 1, prune_after_iterations: 200,
-            prune_threshold: 0, prune_explore_pct: 0.05,
-            print_every_minutes: 10, batch_size: 200,
-            target_strategy_delta: None, purify_threshold: 0.0,
-            equity_cache_path: None, dcfr_alpha: 1.0, dcfr_beta: 1.0,
-            dcfr_gamma: 1.0, dcfr_epoch_cap: None,
+            cluster_path: None,
+            iterations: Some(100),
+            time_limit_minutes: None,
+            lcfr_warmup_iterations: 0,
+            lcfr_discount_interval: 1,
+            prune_after_iterations: 200,
+            prune_threshold: 0,
+            prune_explore_pct: 0.05,
+            print_every_minutes: 10,
+            batch_size: 200,
+            target_strategy_delta: None,
+            purify_threshold: 0.0,
+            equity_cache_path: None,
+            dcfr_alpha: 1.0,
+            dcfr_beta: 1.0,
+            dcfr_gamma: 1.0,
+            dcfr_epoch_cap: None,
             optimizer: "dcfr".to_string(),
             storage_backend: "dense".to_string(),
-            sapcfr_eta: 0.5, brcfr_eta: 0.6,
-            brcfr_warmup_iterations: 0, brcfr_interval: 100_000_000,
-            use_baselines: false, baseline_alpha: 0.01,
+            sapcfr_eta: 0.5,
+            brcfr_eta: 0.6,
+            brcfr_warmup_iterations: 0,
+            brcfr_interval: 100_000_000,
+            use_baselines: false,
+            baseline_alpha: 0.01,
             baseline_validation: Default::default(),
-            prune_streets: None, regret_floor: None,
+            prune_streets: None,
+            regret_floor: None,
             exploitability_interval_minutes: 0,
             exploitability_samples: 100_000,
         },
         snapshots: SnapshotConfig {
-            warmup_minutes: 60, snapshot_every_minutes: 30,
-            output_dir: output_dir.to_string(), resume: false,
-            max_snapshots: None, format: SnapshotFormat::Legacy,
+            warmup_minutes: 60,
+            snapshot_every_minutes: 30,
+            output_dir: output_dir.to_string(),
+            resume: false,
+            max_snapshots: None,
+            format: SnapshotFormat::Legacy,
         },
     }
 }
@@ -106,8 +136,7 @@ fn manifests_equal_modulo_created_at(a: &Manifest, b: &Manifest) -> bool {
 
 /// Load a manifest from a bundle directory.
 fn load_manifest(dir: &Path) -> Manifest {
-    let text = std::fs::read_to_string(dir.join("blueprint.json"))
-        .expect("blueprint.json missing");
+    let text = std::fs::read_to_string(dir.join("blueprint.json")).expect("blueprint.json missing");
     serde_json::from_str(&text).expect("manifest parse failed")
 }
 
@@ -123,10 +152,14 @@ fn hu_native_write_payload_matches_post_hoc_export() {
 
     // Build tree and strategy
     let tree = GameTree::build_with_options(
-        config.game.stack_depth, config.game.small_blind,
-        config.game.big_blind, &config.action_abstraction.preflop,
-        &config.action_abstraction.flop, &config.action_abstraction.turn,
-        &config.action_abstraction.river, config.game.allow_preflop_limp,
+        config.game.stack_depth,
+        config.game.small_blind,
+        config.game.big_blind,
+        &config.action_abstraction.preflop,
+        &config.action_abstraction.flop,
+        &config.action_abstraction.turn,
+        &config.action_abstraction.river,
+        config.game.allow_preflop_limp,
     );
     let storage = BlueprintStorage::new(&tree, [3, 2, 2, 2]);
     let strategy = BlueprintV2Strategy::from_storage(&storage, &tree);
@@ -140,7 +173,13 @@ fn hu_native_write_payload_matches_post_hoc_export() {
     // Path A: native write
     let native_dir = dir.path().join("native");
     hu_export::write_hu_universal_snapshot(
-        &config, &tree, &strategy, 42, 1.5, &config_path, &native_dir,
+        &config,
+        &tree,
+        &strategy,
+        42,
+        1.5,
+        &config_path,
+        &native_dir,
     )
     .expect("native write");
 
@@ -151,10 +190,8 @@ fn hu_native_write_payload_matches_post_hoc_export() {
         iterations: 42,
         elapsed_minutes: 1.5,
     };
-    let mut output = hu_export::export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )
-    .unwrap();
+    let mut output =
+        hu_export::export_hu_strategy_to_universal(&config, &tree, &strategy, &training).unwrap();
     poker_solver_core::blueprint_universal::export_common::retain_config_yaml(
         &config_path,
         &posthoc_dir,
@@ -219,8 +256,16 @@ fn mp_eager_native_write_payload_matches_post_hoc_export() {
         stack_depth: 10.0,
         allow_preflop_limp: true,
         blinds: vec![
-            ForcedBet { seat: 0, kind: ForcedBetKind::SmallBlind, amount: 1.0 },
-            ForcedBet { seat: 1, kind: ForcedBetKind::BigBlind, amount: 2.0 },
+            ForcedBet {
+                seat: 0,
+                kind: ForcedBetKind::SmallBlind,
+                amount: 1.0,
+            },
+            ForcedBet {
+                seat: 1,
+                kind: ForcedBetKind::BigBlind,
+                amount: 2.0,
+            },
         ],
         rake_rate: 0.0,
         rake_cap: 0.0,
@@ -300,7 +345,13 @@ fn mp_eager_native_write_payload_matches_post_hoc_export() {
     // Path A: native write
     let native_dir = dir.path().join("native");
     mp_eager_export::write_mp_universal_snapshot(
-        &config, &tree, &storage, 42, 1.5, &config_path, &native_dir,
+        &config,
+        &tree,
+        &storage,
+        42,
+        1.5,
+        &config_path,
+        &native_dir,
     )
     .expect("native write");
 
@@ -310,10 +361,9 @@ fn mp_eager_native_write_payload_matches_post_hoc_export() {
         iterations: 42,
         elapsed_minutes: 1.5,
     };
-    let mut output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
+    let mut output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
     poker_solver_core::blueprint_universal::export_common::retain_config_yaml(
         &config_path,
         &posthoc_dir,
@@ -360,13 +410,11 @@ fn mp_eager_native_write_payload_matches_post_hoc_export() {
 
 #[test]
 fn mp_lazy_native_write_payload_matches_post_hoc_export() {
-    use poker_solver_core::blueprint_mp::sparse_storage::{
-        MpInfosetKey, SparseMpStorage,
-    };
+    use poker_solver_core::blueprint_mp::sparse_storage::{MpInfosetKey, SparseMpStorage};
     use poker_solver_core::blueprint_mp::types::{Seat, Street};
     use poker_solver_core::blueprint_universal::mp_lazy_export::{
-        LazyExportConfig, LazyTrainingInfo, export_lazy_sparse_to_universal,
-        write_lazy_bundle, write_lazy_universal_snapshot,
+        LazyExportConfig, LazyTrainingInfo, export_lazy_sparse_to_universal, write_lazy_bundle,
+        write_lazy_universal_snapshot,
     };
 
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -381,9 +429,7 @@ fn mp_lazy_native_write_payload_matches_post_hoc_export() {
 
     // Build a sparse storage with a few entries
     let storage = SparseMpStorage::with_shards(4);
-    let key = MpInfosetKey::from_street_bucket(
-        Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0,
-    );
+    let key = MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Preflop, 1, 0, 0, 0, 0);
     storage.add_regret(key, 2, 0, 25);
     storage.add_strategy_sum(key, 2, 1, 50);
 
@@ -398,10 +444,8 @@ fn mp_lazy_native_write_payload_matches_post_hoc_export() {
 
     // Path A: native write
     let native_dir = dir.path().join("native");
-    write_lazy_universal_snapshot(
-        &lazy_config, &entries, 42, 1.5, &config_path, &native_dir,
-    )
-    .expect("native write");
+    write_lazy_universal_snapshot(&lazy_config, &entries, 42, 1.5, &config_path, &native_dir)
+        .expect("native write");
 
     // Path B: post-hoc export
     let posthoc_dir = dir.path().join("posthoc");
@@ -409,9 +453,7 @@ fn mp_lazy_native_write_payload_matches_post_hoc_export() {
         iterations: 42,
         elapsed_minutes: 1.5,
     };
-    let mut output = export_lazy_sparse_to_universal(
-        &lazy_config, &entries, &training,
-    );
+    let mut output = export_lazy_sparse_to_universal(&lazy_config, &entries, &training);
     poker_solver_core::blueprint_universal::export_common::retain_config_yaml(
         &config_path,
         &posthoc_dir,
@@ -456,10 +498,14 @@ fn format_legacy_produces_no_universal_dir() {
 
     // Build tree and strategy
     let tree = GameTree::build_with_options(
-        config.game.stack_depth, config.game.small_blind,
-        config.game.big_blind, &config.action_abstraction.preflop,
-        &config.action_abstraction.flop, &config.action_abstraction.turn,
-        &config.action_abstraction.river, config.game.allow_preflop_limp,
+        config.game.stack_depth,
+        config.game.small_blind,
+        config.game.big_blind,
+        &config.action_abstraction.preflop,
+        &config.action_abstraction.flop,
+        &config.action_abstraction.turn,
+        &config.action_abstraction.river,
+        config.game.allow_preflop_limp,
     );
     let storage = BlueprintStorage::new(&tree, [3, 2, 2, 2]);
 

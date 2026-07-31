@@ -1788,11 +1788,7 @@ mod tests {
     /// the action schema fingerprint values.
     #[test]
     fn action_schema_fingerprint_regression() {
-        let actions = [
-            TreeAction::Fold,
-            TreeAction::Call,
-            TreeAction::Raise(5.0),
-        ];
+        let actions = [TreeAction::Fold, TreeAction::Call, TreeAction::Raise(5.0)];
         let fp = action_schema_fingerprint(&actions);
         assert_eq!(fp, 0x566e_b53f_9cda_1394);
     }

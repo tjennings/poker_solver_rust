@@ -38,25 +38,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::bundle::{write_bundle, BundleData};
+use super::bundle::{BundleData, write_bundle};
 use super::descriptors::{ActionDescriptor, ActionKind};
 use super::error::FormatError;
 use super::export_common::{
-    RowEntry, bucket_semantic_fingerprint, flatten_entries, now_rfc3339_approx,
-    row_key_fingerprint,
+    RowEntry, bucket_semantic_fingerprint, flatten_entries, now_rfc3339_approx, row_key_fingerprint,
 };
 use super::hash::Fnv1aHasher;
 use super::manifest::{
-    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, GameMetadata,
-    LayoutMetadata, Manifest, RakeConfig, SeatDescriptor, StrategyMetadata,
-    TrainingMetadata,
+    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, GameMetadata, LayoutMetadata,
+    Manifest, RakeConfig, SeatDescriptor, StrategyMetadata, TrainingMetadata,
 };
-use crate::blueprint_mp::config::{
-    BlueprintMpConfig, ForcedBetKind, MpStreetSizes,
-};
-use crate::blueprint_mp::game_tree::{
-    MpGameNode, MpGameTree, TreeAction,
-};
+use crate::blueprint_mp::config::{BlueprintMpConfig, ForcedBetKind, MpStreetSizes};
+use crate::blueprint_mp::game_tree::{MpGameNode, MpGameTree, TreeAction};
 use crate::blueprint_mp::storage::MpStorage;
 
 use super::export_common::NS_MP_ARENA as MP_ARENA_NS;
@@ -108,8 +102,11 @@ impl std::fmt::Display for ExportError {
                 write!(f, "missing file: {detail}")
             }
             Self::BadMetadataKind { actual } => {
-                write!(f, "bad metadata kind: expected \"blueprint_mp\", \
-                       got \"{actual}\"")
+                write!(
+                    f,
+                    "bad metadata kind: expected \"blueprint_mp\", \
+                       got \"{actual}\""
+                )
             }
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
@@ -313,11 +310,14 @@ pub fn export_mp_strategy_to_universal(
     entries.sort_by_key(RowEntry::sort_key);
 
     let (rows, actions, probs) = flatten_entries(&entries);
-    let manifest = build_mp_manifest(
-        config, training, &rows, &actions, &probs, config_counts,
-    );
+    let manifest = build_mp_manifest(config, training, &rows, &actions, &probs, config_counts);
 
-    Ok(ExportOutput { rows, actions, probs, manifest })
+    Ok(ExportOutput {
+        rows,
+        actions,
+        probs,
+        manifest,
+    })
 }
 
 /// Hard error if config vs storage bucket counts disagree.
@@ -356,7 +356,10 @@ fn collect_row_entries_with(
     for (node_idx, node) in tree.nodes.iter().enumerate() {
         let (seat, street, tree_actions) = match node {
             MpGameNode::Decision {
-                seat, street, actions, ..
+                seat,
+                street,
+                actions,
+                ..
             } => (*seat, *street, actions),
             _ => continue,
         };
@@ -368,9 +371,7 @@ fn collect_row_entries_with(
         let action_descs = build_mp_action_descriptors(tree_actions);
 
         for bucket in 0..buckets {
-            let probs = prob_fn(
-                node_idx as u32, decision_idx, bucket, num_actions,
-            );
+            let probs = prob_fn(node_idx as u32, decision_idx, bucket, num_actions);
             let fp = row_key_fingerprint(
                 MP_ARENA_NS,
                 seat.index(),
@@ -417,9 +418,7 @@ fn collect_mp_row_entries(
 }
 
 /// Build action descriptors for an MP node's actions.
-fn build_mp_action_descriptors(
-    tree_actions: &[TreeAction],
-) -> Vec<ActionDescriptor> {
+fn build_mp_action_descriptors(tree_actions: &[TreeAction]) -> Vec<ActionDescriptor> {
     tree_actions
         .iter()
         .enumerate()
@@ -544,9 +543,7 @@ fn bb_amount(game: &crate::blueprint_mp::config::MpGameConfig) -> f64 {
 /// Find the button seat per MP `game_tree` conventions.
 ///
 /// In 2-player: SB = BTN. In N-player: BTN is the seat before SB.
-fn find_mp_button(
-    game: &crate::blueprint_mp::config::MpGameConfig,
-) -> u8 {
+fn find_mp_button(game: &crate::blueprint_mp::config::MpGameConfig) -> u8 {
     let n = game.num_players;
     if n == 2 {
         game.blinds
@@ -585,8 +582,7 @@ fn build_mp_layout_metadata(
         row_count: rows.len() as u64,
         action_descriptor_count: actions.len() as u64,
         probability_count: probs.len() as u64,
-        row_sort_order:
-            "namespace_seat_street_node_bucket_fingerprint".to_string(),
+        row_sort_order: "namespace_seat_street_node_bucket_fingerprint".to_string(),
         row_namespace: vec!["mp_arena".to_string()],
         missing_row_policy: "reject".to_string(),
     }
@@ -605,13 +601,8 @@ fn build_mp_manifest(
         format_version: 1,
         compat_min_reader: 1,
         created_at: now_rfc3339_approx(),
-        producer: format!(
-            "poker-solver-core {}",
-            env!("CARGO_PKG_VERSION"),
-        ),
-        producer_git: option_env!("GIT_HASH")
-            .unwrap_or("unknown")
-            .to_string(),
+        producer: format!("poker-solver-core {}", env!("CARGO_PKG_VERSION"),),
+        producer_git: option_env!("GIT_HASH").unwrap_or("unknown").to_string(),
         required_features: Vec::new(),
         optional_features: vec![
             "row_key_fingerprint_v1".to_string(),
@@ -626,8 +617,7 @@ fn build_mp_manifest(
         },
         layout: build_mp_layout_metadata(rows, actions, probs),
         actions: ActionsMetadata {
-            action_abstraction_fingerprint:
-                mp_action_abstraction_fingerprint(config),
+            action_abstraction_fingerprint: mp_action_abstraction_fingerprint(config),
         },
         buckets: build_mp_buckets_metadata(config, bucket_counts),
         compatibility: CompatibilityMetadata {
@@ -644,24 +634,14 @@ fn build_mp_buckets_metadata(
     bucket_counts: [u16; 4],
 ) -> BucketsMetadata {
     let mut street_bucket_counts = BTreeMap::new();
-    street_bucket_counts.insert(
-        "preflop".to_string(),
-        u64::from(bucket_counts[0]),
-    );
-    street_bucket_counts
-        .insert("flop".to_string(), u64::from(bucket_counts[1]));
-    street_bucket_counts
-        .insert("turn".to_string(), u64::from(bucket_counts[2]));
-    street_bucket_counts.insert(
-        "river".to_string(),
-        u64::from(bucket_counts[3]),
-    );
+    street_bucket_counts.insert("preflop".to_string(), u64::from(bucket_counts[0]));
+    street_bucket_counts.insert("flop".to_string(), u64::from(bucket_counts[1]));
+    street_bucket_counts.insert("turn".to_string(), u64::from(bucket_counts[2]));
+    street_bucket_counts.insert("river".to_string(), u64::from(bucket_counts[3]));
 
     BucketsMetadata {
         bucket_mode: "eager_runtime_assigned".to_string(),
-        bucket_semantic_fingerprint: bucket_semantic_fingerprint(
-            bucket_counts,
-        ),
+        bucket_semantic_fingerprint: bucket_semantic_fingerprint(bucket_counts),
         street_bucket_counts,
         bucket_files: vec![],
         bucket_generator_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -695,10 +675,8 @@ fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
 fn load_mp_config(mp_output_dir: &Path) -> Result<BlueprintMpConfig, ExportError> {
     let config_path = mp_output_dir.join("config.yaml");
     require_file(&config_path, "config.yaml")?;
-    let config_text =
-        std::fs::read_to_string(&config_path).map_err(ExportError::Io)?;
-    serde_yaml::from_str(&config_text)
-        .map_err(|e| ExportError::Json(e.to_string()))
+    let config_text = std::fs::read_to_string(&config_path).map_err(ExportError::Io)?;
+    serde_yaml::from_str(&config_text).map_err(|e| ExportError::Json(e.to_string()))
 }
 
 /// Loaded MP snapshot: projected strategy plus parsed metadata.
@@ -708,18 +686,15 @@ struct MpSnapshotBundle {
 }
 
 /// Load and validate a snapshot's strategy and metadata from disk.
-fn load_mp_snapshot(
-    snapshot_dir: &Path,
-) -> Result<MpSnapshotBundle, ExportError> {
+fn load_mp_snapshot(snapshot_dir: &Path) -> Result<MpSnapshotBundle, ExportError> {
     let strategy_path = snapshot_dir.join("strategy.bin");
     require_file(&strategy_path, "strategy.bin")?;
 
     let metadata_path = snapshot_dir.join("metadata.json");
     require_file(&metadata_path, "metadata.json")?;
-    let meta_text =
-        std::fs::read_to_string(&metadata_path).map_err(ExportError::Io)?;
-    let metadata: MpSnapshotMetadata = serde_json::from_str(&meta_text)
-        .map_err(|e| ExportError::Json(e.to_string()))?;
+    let meta_text = std::fs::read_to_string(&metadata_path).map_err(ExportError::Io)?;
+    let metadata: MpSnapshotMetadata =
+        serde_json::from_str(&meta_text).map_err(|e| ExportError::Json(e.to_string()))?;
 
     if let Some(kind) = &metadata.kind
         && kind != "blueprint_mp"
@@ -729,10 +704,8 @@ fn load_mp_snapshot(
         });
     }
 
-    let strategy = crate::blueprint_v2::bundle::BlueprintV2Strategy::load(
-        &strategy_path,
-    )
-    .map_err(ExportError::Io)?;
+    let strategy = crate::blueprint_v2::bundle::BlueprintV2Strategy::load(&strategy_path)
+        .map_err(ExportError::Io)?;
 
     Ok(MpSnapshotBundle { strategy, metadata })
 }
@@ -786,15 +759,9 @@ pub fn write_mp_universal_snapshot(
         elapsed_minutes,
     };
 
-    let mut output = export_mp_strategy_to_universal(
-        config, tree, storage, &training,
-    )?;
+    let mut output = export_mp_strategy_to_universal(config, tree, storage, &training)?;
 
-    super::export_common::retain_config_yaml(
-        config_yaml_path,
-        out_dir,
-        &mut output.manifest,
-    )?;
+    super::export_common::retain_config_yaml(config_yaml_path, out_dir, &mut output.manifest)?;
 
     write_bundle(
         out_dir,
@@ -820,9 +787,7 @@ pub fn export_mp_bundle(
 ) -> Result<(), ExportError> {
     let config = load_mp_config(mp_output_dir)?;
     let snap = load_mp_snapshot(&mp_output_dir.join(snapshot))?;
-    validate_snapshot_bucket_counts(
-        config.clustering.bucket_counts(), &snap,
-    )?;
+    validate_snapshot_bucket_counts(config.clustering.bucket_counts(), &snap)?;
 
     let tree = MpGameTree::build(&config.game, &config.action_abstraction);
     let training = MpTrainingInfo {
@@ -830,9 +795,7 @@ pub fn export_mp_bundle(
         elapsed_minutes: snap.metadata.elapsed_minutes.unwrap_or(0) as f64,
     };
 
-    let mut output = export_mp_strategy_from_projected(
-        &config, &tree, &snap.strategy, &training,
-    );
+    let mut output = export_mp_strategy_from_projected(&config, &tree, &snap.strategy, &training);
 
     // Retain config.yaml so the bundle is self-contained for the Explorer.
     super::export_common::retain_config_yaml(
@@ -865,17 +828,18 @@ fn export_mp_strategy_from_projected(
     training: &MpTrainingInfo,
 ) -> ExportOutput {
     let bucket_counts = config.clustering.bucket_counts();
-    let mut entries = collect_projected_row_entries(
-        tree, strategy, bucket_counts,
-    );
+    let mut entries = collect_projected_row_entries(tree, strategy, bucket_counts);
     entries.sort_by_key(RowEntry::sort_key);
 
     let (rows, actions, probs) = flatten_entries(&entries);
-    let manifest = build_mp_manifest(
-        config, training, &rows, &actions, &probs, bucket_counts,
-    );
+    let manifest = build_mp_manifest(config, training, &rows, &actions, &probs, bucket_counts);
 
-    ExportOutput { rows, actions, probs, manifest }
+    ExportOutput {
+        rows,
+        actions,
+        probs,
+        manifest,
+    }
 }
 
 /// Collect rows from a projected [`BlueprintV2Strategy`].
@@ -896,8 +860,7 @@ fn extract_projected_probs(
     bucket: u16,
     num_actions: usize,
 ) -> Vec<f32> {
-    let legacy_probs =
-        strategy.get_action_probs(decision_idx, bucket);
+    let legacy_probs = strategy.get_action_probs(decision_idx, bucket);
     if legacy_probs.len() == num_actions {
         legacy_probs.to_vec()
     } else {
@@ -1024,6 +987,9 @@ mod tests {
     #[test]
     fn validate_bucket_counts_mismatch() {
         let result = validate_bucket_counts([10, 10, 10, 10], [5, 5, 5, 5]);
-        assert!(matches!(result, Err(ExportError::BucketCountMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(ExportError::BucketCountMismatch { .. })
+        ));
     }
 }

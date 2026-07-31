@@ -6,10 +6,7 @@
 //! 2. Probabilities match MpStorage::average_strategy for known nodes.
 //! 3. Existing MP snapshot artifacts are preserved (no changes to trainer).
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss
-)]
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use poker_solver_core::blueprint_mp::config::*;
 use poker_solver_core::blueprint_mp::game_tree::*;
@@ -68,10 +65,18 @@ fn build_3p_config() -> BlueprintMpConfig {
         river: empty,
     };
     let clustering = MpClusteringConfig {
-        preflop: MpStreetCluster { buckets: BUCKET_COUNTS[0] },
-        flop: MpStreetCluster { buckets: BUCKET_COUNTS[1] },
-        turn: MpStreetCluster { buckets: BUCKET_COUNTS[2] },
-        river: MpStreetCluster { buckets: BUCKET_COUNTS[3] },
+        preflop: MpStreetCluster {
+            buckets: BUCKET_COUNTS[0],
+        },
+        flop: MpStreetCluster {
+            buckets: BUCKET_COUNTS[1],
+        },
+        turn: MpStreetCluster {
+            buckets: BUCKET_COUNTS[2],
+        },
+        river: MpStreetCluster {
+            buckets: BUCKET_COUNTS[3],
+        },
     };
     let training = MpTrainingConfig {
         backend: MpTrainingBackend::Eager,
@@ -115,9 +120,7 @@ fn build_3p_config() -> BlueprintMpConfig {
     }
 }
 
-fn trivial_buckets(
-    deal: &poker_solver_core::blueprint_mp::Deal,
-) -> DealWithBuckets {
+fn trivial_buckets(deal: &poker_solver_core::blueprint_mp::Deal) -> DealWithBuckets {
     let mut buckets = [[Bucket(0); 4]; MAX_PLAYERS];
     for seat in 0..deal.num_players as usize {
         let card_idx = deal.hole_cards[seat][0].value as u16;
@@ -167,10 +170,9 @@ fn mp_export_roundtrip_probabilities_match() {
         iterations: 200,
         elapsed_minutes: 0.1,
     };
-    let output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .expect("export should succeed");
+    let output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .expect("export should succeed");
 
     // Write to temp dir and load back
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -198,9 +200,12 @@ fn mp_export_roundtrip_probabilities_match() {
         // Verify it's a decision node
         let node = &tree.nodes[node_idx as usize];
         let (seat, street, actions) = match node {
-            MpGameNode::Decision { seat, street, actions, .. } => {
-                (seat.index(), *street as u8, actions)
-            }
+            MpGameNode::Decision {
+                seat,
+                street,
+                actions,
+                ..
+            } => (seat.index(), *street as u8, actions),
             _ => panic!("row points to non-decision node {node_idx}"),
         };
 
@@ -219,9 +224,7 @@ fn mp_export_roundtrip_probabilities_match() {
         storage.average_strategy(node_idx, bucket, num_actions, &mut avg_buf);
         for a in 0..num_actions {
             let expected = avg_buf[a] as f32;
-            let actual = reader
-                .prob(row.prob_offset as usize + a)
-                .unwrap();
+            let actual = reader.prob(row.prob_offset as usize + a).unwrap();
             assert_eq!(
                 actual.to_bits(),
                 expected.to_bits(),
@@ -249,10 +252,9 @@ fn mp_export_rows_sorted_by_seat() {
         iterations: 50,
         elapsed_minutes: 0.0,
     };
-    let output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
+    let output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
 
     // Verify sort order: (namespace, seat, street, source_node_idx, global_bucket)
     for w in output.rows.windows(2) {
@@ -265,8 +267,7 @@ fn mp_export_rows_sorted_by_seat() {
     }
 
     // Verify that multiple seats appear
-    let seats: std::collections::HashSet<u8> =
-        output.rows.iter().map(|r| r.seat).collect();
+    let seats: std::collections::HashSet<u8> = output.rows.iter().map(|r| r.seat).collect();
     assert!(
         seats.len() >= 2,
         "3-player game should have rows for at least 2 seats, got {seats:?}"
@@ -286,10 +287,9 @@ fn mp_export_zero_mass_rows_are_uniform() {
         iterations: 0,
         elapsed_minutes: 0.0,
     };
-    let output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
+    let output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
 
     for (i, row) in output.rows.iter().enumerate() {
         let n = row.action_count as usize;
@@ -320,13 +320,9 @@ fn mp_export_rejects_bucket_count_mismatch() {
         iterations: 0,
         elapsed_minutes: 0.0,
     };
-    let result = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    );
-    assert!(
-        result.is_err(),
-        "should reject bucket count mismatch"
-    );
+    let result =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training);
+    assert!(result.is_err(), "should reject bucket count mismatch");
     let err = result.unwrap_err();
     assert!(
         matches!(err, ExportError::BucketCountMismatch { .. }),
@@ -417,10 +413,9 @@ fn mp_export_action_descriptors_correct() {
         iterations: 0,
         elapsed_minutes: 0.0,
     };
-    let output = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
+    let output =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
 
     // Find actions across the exported rows
     let mut found_fold = false;
@@ -491,14 +486,12 @@ fn mp_export_fingerprints_stable_and_differ_by_seat() {
         iterations: 0,
         elapsed_minutes: 0.0,
     };
-    let output1 = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
-    let output2 = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
+    let output1 =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
+    let output2 =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
 
     // Fingerprints are stable across runs
     assert_eq!(output1.rows.len(), output2.rows.len());
@@ -550,10 +543,9 @@ fn mp_export_disk_path_byte_identical_to_in_memory() {
         iterations: 100,
         elapsed_minutes: 0.5,
     };
-    let in_mem = mp_eager_export::export_mp_strategy_to_universal(
-        &config, &tree, &storage, &training,
-    )
-    .unwrap();
+    let in_mem =
+        mp_eager_export::export_mp_strategy_to_universal(&config, &tree, &storage, &training)
+            .unwrap();
 
     // Save snapshot the way the trainer does
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -585,12 +577,7 @@ fn mp_export_disk_path_byte_identical_to_in_memory() {
             node_action_counts.push(num_actions as u16);
             node_street_indices.push(street_idx);
             for bucket in 0..buckets {
-                storage.average_strategy(
-                    node_idx as u32,
-                    bucket,
-                    num_actions,
-                    &mut avg,
-                );
+                storage.average_strategy(node_idx as u32, bucket, num_actions, &mut avg);
                 action_probs.extend(avg[..num_actions].iter().map(|&p| p as f32));
             }
         }
@@ -628,12 +615,7 @@ fn mp_export_disk_path_byte_identical_to_in_memory() {
 
     // Export via disk wrapper
     let disk_out = tmp.path().join("disk_bundle");
-    mp_eager_export::export_mp_bundle(
-        &mp_dir,
-        "snapshot_0001",
-        &disk_out,
-    )
-    .unwrap();
+    mp_eager_export::export_mp_bundle(&mp_dir, "snapshot_0001", &disk_out).unwrap();
 
     // Export in-memory to a separate dir
     let mem_out = tmp.path().join("mem_bundle");
@@ -657,8 +639,7 @@ fn mp_export_disk_path_byte_identical_to_in_memory() {
         let disk_bytes = std::fs::read(disk_out.join(name)).unwrap();
         let mem_bytes = std::fs::read(mem_out.join(name)).unwrap();
         assert_eq!(
-            disk_bytes,
-            mem_bytes,
+            disk_bytes, mem_bytes,
             "binary payload {name} differs between disk and in-memory export"
         );
     }
@@ -670,9 +651,7 @@ fn mp_export_disk_path_byte_identical_to_in_memory() {
 fn mp_export_disk_rejects_missing_config() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out");
-    let result = mp_eager_export::export_mp_bundle(
-        tmp.path(), "snapshot_0001", &out,
-    );
+    let result = mp_eager_export::export_mp_bundle(tmp.path(), "snapshot_0001", &out);
     assert!(matches!(result, Err(ExportError::MissingFile { .. })));
 }
 
@@ -691,9 +670,7 @@ fn mp_export_disk_rejects_missing_strategy_bin() {
     // No strategy.bin written
 
     let out = tmp.path().join("out");
-    let result = mp_eager_export::export_mp_bundle(
-        &mp_dir, "snapshot_0001", &out,
-    );
+    let result = mp_eager_export::export_mp_bundle(&mp_dir, "snapshot_0001", &out);
     assert!(matches!(result, Err(ExportError::MissingFile { .. })));
 }
 
@@ -714,9 +691,7 @@ fn mp_export_disk_rejects_missing_metadata() {
     // No metadata.json
 
     let out = tmp.path().join("out");
-    let result = mp_eager_export::export_mp_bundle(
-        &mp_dir, "snapshot_0001", &out,
-    );
+    let result = mp_eager_export::export_mp_bundle(&mp_dir, "snapshot_0001", &out);
     assert!(matches!(result, Err(ExportError::MissingFile { .. })));
 }
 
@@ -748,9 +723,7 @@ fn mp_export_disk_rejects_wrong_metadata_kind() {
     std::fs::write(snapshot.join("strategy.bin"), b"dummy").unwrap();
 
     let out = tmp.path().join("out");
-    let result = mp_eager_export::export_mp_bundle(
-        &mp_dir, "snapshot_0001", &out,
-    );
+    let result = mp_eager_export::export_mp_bundle(&mp_dir, "snapshot_0001", &out);
     assert!(
         matches!(result, Err(ExportError::BadMetadataKind { .. })),
         "expected BadMetadataKind, got {result:?}"
@@ -768,10 +741,9 @@ fn mp_action_abstraction_fingerprint_changes_with_sizing() {
         iterations: 0,
         elapsed_minutes: 0.0,
     };
-    let out1 = mp_eager_export::export_mp_strategy_to_universal(
-        &config1, &tree1, &storage1, &training,
-    )
-    .unwrap();
+    let out1 =
+        mp_eager_export::export_mp_strategy_to_universal(&config1, &tree1, &storage1, &training)
+            .unwrap();
 
     // Build a config with different sizing
     let mut config2 = build_3p_config();
@@ -781,10 +753,9 @@ fn mp_action_abstraction_fingerprint_changes_with_sizing() {
     };
     let tree2 = MpGameTree::build(&config2.game, &config2.action_abstraction);
     let storage2 = MpStorage::new(&tree2, config2.clustering.bucket_counts());
-    let out2 = mp_eager_export::export_mp_strategy_to_universal(
-        &config2, &tree2, &storage2, &training,
-    )
-    .unwrap();
+    let out2 =
+        mp_eager_export::export_mp_strategy_to_universal(&config2, &tree2, &storage2, &training)
+            .unwrap();
 
     assert_ne!(
         out1.manifest.actions.action_abstraction_fingerprint,

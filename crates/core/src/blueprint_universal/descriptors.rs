@@ -234,9 +234,7 @@ impl ActionDescriptor {
     ///
     /// Returns `FormatError::InvalidManifest` if the action kind byte is
     /// unknown.
-    pub fn from_bytes(
-        buf: &[u8; ACTION_DESCRIPTOR_SIZE],
-    ) -> Result<Self, FormatError> {
+    pub fn from_bytes(buf: &[u8; ACTION_DESCRIPTOR_SIZE]) -> Result<Self, FormatError> {
         decode_action(buf)
     }
 }
@@ -247,7 +245,11 @@ fn encode_action(action: &ActionDescriptor, buf: &mut [u8; ACTION_DESCRIPTOR_SIZ
     buf[2..4].copy_from_slice(&action.source_action_index.to_le_bytes());
     buf[4..8].copy_from_slice(&action.amount_chips.to_le_bytes());
 
-    write_inline_string(&mut buf[8..40], action.size_key.as_bytes(), MAX_SIZE_KEY_LEN);
+    write_inline_string(
+        &mut buf[8..40],
+        action.size_key.as_bytes(),
+        MAX_SIZE_KEY_LEN,
+    );
     write_inline_string(&mut buf[40..96], action.label.as_bytes(), MAX_LABEL_LEN);
     // Remaining bytes are zero (padding/reserved), already zeroed.
 }
@@ -265,9 +267,7 @@ fn write_inline_string(region: &mut [u8], src: &[u8], max_len: usize) {
     }
 }
 
-fn decode_action(
-    buf: &[u8; ACTION_DESCRIPTOR_SIZE],
-) -> Result<ActionDescriptor, FormatError> {
+fn decode_action(buf: &[u8; ACTION_DESCRIPTOR_SIZE]) -> Result<ActionDescriptor, FormatError> {
     let kind = ActionKind::from_u8(buf[0]).ok_or_else(|| FormatError::InvalidManifest {
         detail: format!("unknown action kind: {}", buf[0]),
     })?;
@@ -339,12 +339,8 @@ impl SemanticKeyRecord {
         Self {
             history_hi: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             history_lo: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            history_hash: u64::from_le_bytes(
-                buf[16..24].try_into().unwrap(),
-            ),
-            history_len: u16::from_le_bytes(
-                buf[24..26].try_into().unwrap(),
-            ),
+            history_hash: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            history_len: u16::from_le_bytes(buf[24..26].try_into().unwrap()),
         }
     }
 
@@ -353,10 +349,7 @@ impl SemanticKeyRecord {
     /// # Errors
     ///
     /// Returns `FormatError::Io` on write failure.
-    pub fn write_to_writer<W: Write>(
-        &self,
-        w: &mut W,
-    ) -> Result<(), FormatError> {
+    pub fn write_to_writer<W: Write>(&self, w: &mut W) -> Result<(), FormatError> {
         let mut buf = [0u8; SEMANTIC_RECORD_SIZE];
         self.write_to(&mut buf);
         w.write_all(&buf)?;
@@ -516,22 +509,22 @@ mod tests {
         // proptest Strategy is implemented for tuples up to 12 elements,
         // so we split the 14 fields into two groups and combine them.
         let part1 = (
-            any::<u64>(),  // row_id
-            any::<u16>(),  // namespace
-            any::<u8>(),   // seat
-            any::<u8>(),   // street
-            any::<u16>(),  // local_bucket
-            any::<u32>(),  // global_bucket
-            any::<u32>(),  // source_node_idx
+            any::<u64>(), // row_id
+            any::<u16>(), // namespace
+            any::<u8>(),  // seat
+            any::<u8>(),  // street
+            any::<u16>(), // local_bucket
+            any::<u32>(), // global_bucket
+            any::<u32>(), // source_node_idx
         );
         let part2 = (
-            any::<u64>(),  // action_offset
-            any::<u16>(),  // action_count
-            any::<u64>(),  // prob_offset
-            any::<u64>(),  // row_key_fingerprint
-            any::<u64>(),  // action_schema_fingerprint
-            any::<u16>(),  // semantic_key_kind
-            any::<u64>(),  // semantic_key_offset
+            any::<u64>(), // action_offset
+            any::<u16>(), // action_count
+            any::<u64>(), // prob_offset
+            any::<u64>(), // row_key_fingerprint
+            any::<u64>(), // action_schema_fingerprint
+            any::<u16>(), // semantic_key_kind
+            any::<u64>(), // semantic_key_offset
         );
         (part1, part2).prop_map(|(p1, p2)| RowDescriptor {
             row_id: p1.0,

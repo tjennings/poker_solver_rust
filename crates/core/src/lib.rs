@@ -13,9 +13,9 @@
 //! - `poker` - Re-exported poker domain types from `rs_poker`
 
 pub mod abstraction;
-pub mod blueprint_universal;
 pub mod agent;
 pub mod blueprint_mp;
+pub mod blueprint_universal;
 pub mod blueprint_v2;
 pub mod card_utils;
 pub mod cfr;

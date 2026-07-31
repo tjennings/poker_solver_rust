@@ -15,7 +15,9 @@ pub enum FormatError {
         actual: String,
     },
 
-    #[error("unsupported format version in {file}: got {version}, reader supports up to {max_supported}")]
+    #[error(
+        "unsupported format version in {file}: got {version}, reader supports up to {max_supported}"
+    )]
     UnsupportedFormatVersion {
         file: String,
         version: u16,

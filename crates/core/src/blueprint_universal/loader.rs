@@ -30,7 +30,7 @@ use super::bundle::{BundleReader, MpLazyBundleReader};
 use super::descriptors::ActionDescriptor;
 use super::manifest::Manifest;
 
-use crate::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use crate::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use crate::blueprint_v2::config::BlueprintV2Config;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 

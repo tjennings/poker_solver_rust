@@ -1944,10 +1944,7 @@ impl BlueprintTrainer {
         )?;
 
         if !self.tui_active {
-            eprintln!(
-                "  Universal bundle written to {}",
-                universal_dir.display(),
-            );
+            eprintln!("  Universal bundle written to {}", universal_dir.display(),);
         }
         Ok(())
     }

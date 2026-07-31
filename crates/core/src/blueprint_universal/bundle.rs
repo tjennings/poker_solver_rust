@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 
 use super::descriptors::{
-    ActionDescriptor, ActionKind, RowDescriptor, SemanticKeyRecord, ACTION_DESCRIPTOR_SIZE,
-    ROW_DESCRIPTOR_SIZE, SEMANTIC_RECORD_SIZE,
+    ACTION_DESCRIPTOR_SIZE, ActionDescriptor, ActionKind, ROW_DESCRIPTOR_SIZE, RowDescriptor,
+    SEMANTIC_RECORD_SIZE, SemanticKeyRecord,
 };
 use super::error::FormatError;
 use super::export_common::{SEMANTIC_KEY_MP_HISTORY_V1, SEMANTIC_KEY_NONE};

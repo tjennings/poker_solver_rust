@@ -41,20 +41,18 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::bundle::{write_bundle, BundleData};
+use super::bundle::{BundleData, write_bundle};
 use super::descriptors::{ActionDescriptor, ActionKind, RowDescriptor};
 use super::error::FormatError;
 use super::export_common::{
-    self, RowEntry, bucket_semantic_fingerprint, flatten_entries,
-    row_key_fingerprint,
+    self, RowEntry, bucket_semantic_fingerprint, flatten_entries, row_key_fingerprint,
 };
 use super::hash::Fnv1aHasher;
 use super::manifest::{
-    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, GameMetadata,
-    LayoutMetadata, Manifest, RakeConfig, SeatDescriptor, StrategyMetadata,
-    TrainingMetadata,
+    ActionsMetadata, BucketsMetadata, CompatibilityMetadata, GameMetadata, LayoutMetadata,
+    Manifest, RakeConfig, SeatDescriptor, StrategyMetadata, TrainingMetadata,
 };
-use crate::blueprint_v2::bundle::{load_config, BlueprintV2Strategy};
+use crate::blueprint_v2::bundle::{BlueprintV2Strategy, load_config};
 use crate::blueprint_v2::config::BlueprintV2Config;
 use crate::blueprint_v2::game_tree::{GameNode, GameTree, TreeAction};
 use crate::blueprint_v2::storage::action_schema_fingerprint;
@@ -87,9 +85,7 @@ fn map_action_kind(action: &TreeAction) -> (ActionKind, bool) {
 #[allow(clippy::cast_sign_loss)]
 fn action_amount_chips(action: &TreeAction, big_blind: f64) -> u32 {
     match action {
-        TreeAction::Bet(v) | TreeAction::Raise(v) => {
-            (v * big_blind).round() as u32
-        }
+        TreeAction::Bet(v) | TreeAction::Raise(v) => (v * big_blind).round() as u32,
         _ => 0,
     }
 }
@@ -221,16 +217,14 @@ pub fn export_hu_strategy_to_universal(
 
     let (rows, actions, probs) = flatten_entries(&entries);
 
-    let manifest = build_manifest(
-        config,
-        training,
-        &rows,
-        &actions,
-        &probs,
-        bucket_counts,
-    );
+    let manifest = build_manifest(config, training, &rows, &actions, &probs, bucket_counts);
 
-    Ok(ExportOutput { rows, actions, probs, manifest })
+    Ok(ExportOutput {
+        rows,
+        actions,
+        probs,
+        manifest,
+    })
 }
 
 // RowEntry and sort_key are provided by export_common.
@@ -265,23 +259,26 @@ fn collect_row_entries(
     for (node_idx, node) in tree.nodes.iter().enumerate() {
         let (player, street, tree_actions) = match node {
             GameNode::Decision {
-                player, street, actions, ..
+                player,
+                street,
+                actions,
+                ..
             } => (*player, *street as u8, actions),
             _ => continue,
         };
 
         let buckets = bucket_counts[street as usize];
         let schema_fp = action_schema_fingerprint(tree_actions);
-        let action_descs =
-            build_action_descriptors(tree_actions, config.game.big_blind);
+        let action_descs = build_action_descriptors(tree_actions, config.game.big_blind);
 
         for bucket in 0..buckets {
-            let probs = extract_bucket_probs(
-                strategy, decision_idx, bucket, tree_actions.len(),
-            );
+            let probs = extract_bucket_probs(strategy, decision_idx, bucket, tree_actions.len());
             let fp = row_key_fingerprint(
-                HU_ARENA_NS, player, street,
-                node_idx as u32, u32::from(bucket),
+                HU_ARENA_NS,
+                player,
+                street,
+                node_idx as u32,
+                u32::from(bucket),
             );
             entries.push(RowEntry {
                 namespace: HU_ARENA_NS,
@@ -306,10 +303,7 @@ fn collect_row_entries(
 }
 
 /// Build action descriptors for a node's actions.
-fn build_action_descriptors(
-    tree_actions: &[TreeAction],
-    big_blind: f64,
-) -> Vec<ActionDescriptor> {
+fn build_action_descriptors(tree_actions: &[TreeAction], big_blind: f64) -> Vec<ActionDescriptor> {
     tree_actions
         .iter()
         .enumerate()
@@ -394,29 +388,16 @@ fn build_game_metadata(config: &BlueprintV2Config) -> GameMetadata {
 }
 
 /// Build bucket metadata from config and bucket counts.
-fn build_buckets_metadata(
-    config: &BlueprintV2Config,
-    bucket_counts: [u16; 4],
-) -> BucketsMetadata {
+fn build_buckets_metadata(config: &BlueprintV2Config, bucket_counts: [u16; 4]) -> BucketsMetadata {
     let mut street_bucket_counts = BTreeMap::new();
-    street_bucket_counts.insert(
-        "preflop".to_string(),
-        u64::from(bucket_counts[0]),
-    );
-    street_bucket_counts
-        .insert("flop".to_string(), u64::from(bucket_counts[1]));
-    street_bucket_counts
-        .insert("turn".to_string(), u64::from(bucket_counts[2]));
-    street_bucket_counts.insert(
-        "river".to_string(),
-        u64::from(bucket_counts[3]),
-    );
+    street_bucket_counts.insert("preflop".to_string(), u64::from(bucket_counts[0]));
+    street_bucket_counts.insert("flop".to_string(), u64::from(bucket_counts[1]));
+    street_bucket_counts.insert("turn".to_string(), u64::from(bucket_counts[2]));
+    street_bucket_counts.insert("river".to_string(), u64::from(bucket_counts[3]));
 
     BucketsMetadata {
         bucket_mode: bucket_mode_for_config(config),
-        bucket_semantic_fingerprint: bucket_semantic_fingerprint(
-            bucket_counts,
-        ),
+        bucket_semantic_fingerprint: bucket_semantic_fingerprint(bucket_counts),
         street_bucket_counts,
         bucket_files: vec![],
         bucket_generator_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -448,8 +429,7 @@ fn build_layout_metadata(
         row_count: rows.len() as u64,
         action_descriptor_count: actions.len() as u64,
         probability_count: probs.len() as u64,
-        row_sort_order:
-            "namespace_seat_street_node_bucket_fingerprint".to_string(),
+        row_sort_order: "namespace_seat_street_node_bucket_fingerprint".to_string(),
         row_namespace: vec!["hu_arena".to_string()],
         missing_row_policy: "reject".to_string(),
     }
@@ -468,13 +448,8 @@ fn build_manifest(
         format_version: 1,
         compat_min_reader: 1,
         created_at: now_rfc3339_approx(),
-        producer: format!(
-            "poker-solver-core {}",
-            env!("CARGO_PKG_VERSION"),
-        ),
-        producer_git: option_env!("GIT_HASH")
-            .unwrap_or("unknown")
-            .to_string(),
+        producer: format!("poker-solver-core {}", env!("CARGO_PKG_VERSION"),),
+        producer_git: option_env!("GIT_HASH").unwrap_or("unknown").to_string(),
         required_features: Vec::new(),
         optional_features: vec!["row_key_fingerprint_v1".to_string()],
         game_fingerprint: game_fingerprint(config),
@@ -486,8 +461,7 @@ fn build_manifest(
         },
         layout: build_layout_metadata(rows, actions, probs),
         actions: ActionsMetadata {
-            action_abstraction_fingerprint:
-                action_abstraction_fingerprint(config),
+            action_abstraction_fingerprint: action_abstraction_fingerprint(config),
         },
         buckets: build_buckets_metadata(config, bucket_counts),
         compatibility: CompatibilityMetadata {
@@ -562,14 +536,11 @@ fn require_file(path: &Path, label: &str) -> Result<(), ExportError> {
 }
 
 /// Load snapshot metadata from a legacy `metadata.json`.
-fn load_snapshot_metadata(
-    snapshot_dir: &Path,
-) -> Result<SnapshotMetadata, ExportError> {
+fn load_snapshot_metadata(snapshot_dir: &Path) -> Result<SnapshotMetadata, ExportError> {
     let path = snapshot_dir.join("metadata.json");
     require_file(&path, "metadata.json")?;
     let text = std::fs::read_to_string(&path).map_err(ExportError::Io)?;
-    serde_json::from_str(&text)
-        .map_err(|e| ExportError::Json(e.to_string()))
+    serde_json::from_str(&text).map_err(|e| ExportError::Json(e.to_string()))
 }
 
 /// Build a [`GameTree`] from a [`BlueprintV2Config`].
@@ -615,15 +586,9 @@ pub fn write_hu_universal_snapshot(
         elapsed_minutes,
     };
 
-    let mut output = export_hu_strategy_to_universal(
-        config, tree, strategy, &training,
-    )?;
+    let mut output = export_hu_strategy_to_universal(config, tree, strategy, &training)?;
 
-    export_common::retain_config_yaml(
-        config_yaml_path,
-        out_dir,
-        &mut output.manifest,
-    )?;
+    export_common::retain_config_yaml(config_yaml_path, out_dir, &mut output.manifest)?;
 
     write_bundle(
         out_dir,
@@ -657,8 +622,7 @@ pub fn export_hu_bundle(
     let snapshot_dir = bundle_dir.join(snapshot);
     let strategy_path = snapshot_dir.join("strategy.bin");
     require_file(&strategy_path, "strategy.bin")?;
-    let strategy =
-        BlueprintV2Strategy::load(&strategy_path).map_err(ExportError::Io)?;
+    let strategy = BlueprintV2Strategy::load(&strategy_path).map_err(ExportError::Io)?;
 
     let metadata = load_snapshot_metadata(&snapshot_dir)?;
     let tree = tree_from_config(&config);
@@ -674,9 +638,7 @@ pub fn export_hu_bundle(
         elapsed_minutes: metadata.elapsed_minutes.unwrap_or(0.0),
     };
 
-    let mut output = export_hu_strategy_to_universal(
-        &config, &tree, &strategy, &training,
-    )?;
+    let mut output = export_hu_strategy_to_universal(&config, &tree, &strategy, &training)?;
 
     // Retain config.yaml so the bundle is self-contained for the Explorer.
     export_common::retain_config_yaml(
@@ -825,22 +787,36 @@ mod tests {
             clustering: ClusteringConfig {
                 algorithm: ClusteringAlgorithm::PotentialAwareEmd,
                 preflop: StreetClusterConfig {
-                    buckets: 3, delta_bins: None, expected_delta: false,
-                    sample_boards: None, metric: Default::default(),
+                    buckets: 3,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                    metric: Default::default(),
                 },
                 flop: StreetClusterConfig {
-                    buckets: 2, delta_bins: None, expected_delta: false,
-                    sample_boards: None, metric: Default::default(),
+                    buckets: 2,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                    metric: Default::default(),
                 },
                 turn: StreetClusterConfig {
-                    buckets: 2, delta_bins: None, expected_delta: false,
-                    sample_boards: None, metric: Default::default(),
+                    buckets: 2,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                    metric: Default::default(),
                 },
                 river: StreetClusterConfig {
-                    buckets: 2, delta_bins: None, expected_delta: false,
-                    sample_boards: None, metric: Default::default(),
+                    buckets: 2,
+                    delta_bins: None,
+                    expected_delta: false,
+                    sample_boards: None,
+                    metric: Default::default(),
                 },
-                seed: 42, kmeans_iterations: 10, cfvnet_river_data: None,
+                seed: 42,
+                kmeans_iterations: 10,
+                cfvnet_river_data: None,
                 per_flop: None,
             },
             action_abstraction: ActionAbstractionConfig {
@@ -850,41 +826,60 @@ mod tests {
                 river: vec![vec![1.0]],
             },
             training: TrainingConfig {
-                cluster_path: None, iterations: Some(100),
-                time_limit_minutes: None, lcfr_warmup_iterations: 0,
-                lcfr_discount_interval: 1, prune_after_iterations: 200,
-                prune_threshold: 0, prune_explore_pct: 0.05,
-                print_every_minutes: 10, batch_size: 200,
-                target_strategy_delta: None, purify_threshold: 0.0,
-                equity_cache_path: None, dcfr_alpha: 1.0, dcfr_beta: 1.0,
-                dcfr_gamma: 1.0, dcfr_epoch_cap: None,
+                cluster_path: None,
+                iterations: Some(100),
+                time_limit_minutes: None,
+                lcfr_warmup_iterations: 0,
+                lcfr_discount_interval: 1,
+                prune_after_iterations: 200,
+                prune_threshold: 0,
+                prune_explore_pct: 0.05,
+                print_every_minutes: 10,
+                batch_size: 200,
+                target_strategy_delta: None,
+                purify_threshold: 0.0,
+                equity_cache_path: None,
+                dcfr_alpha: 1.0,
+                dcfr_beta: 1.0,
+                dcfr_gamma: 1.0,
+                dcfr_epoch_cap: None,
                 optimizer: "dcfr".to_string(),
                 storage_backend: "dense".to_string(),
-                sapcfr_eta: 0.5, brcfr_eta: 0.6,
-                brcfr_warmup_iterations: 0, brcfr_interval: 100_000_000,
-                use_baselines: false, baseline_alpha: 0.01,
+                sapcfr_eta: 0.5,
+                brcfr_eta: 0.6,
+                brcfr_warmup_iterations: 0,
+                brcfr_interval: 100_000_000,
+                use_baselines: false,
+                baseline_alpha: 0.01,
                 baseline_validation: Default::default(),
-                prune_streets: None, regret_floor: None,
+                prune_streets: None,
+                regret_floor: None,
                 exploitability_interval_minutes: 0,
                 exploitability_samples: 100_000,
             },
             snapshots: SnapshotConfig {
-                warmup_minutes: 60, snapshot_every_minutes: 30,
-                output_dir: "runs/".into(), resume: false,
-                max_snapshots: None, format: SnapshotFormat::Legacy,
+                warmup_minutes: 60,
+                snapshot_every_minutes: 30,
+                output_dir: "runs/".into(),
+                resume: false,
+                max_snapshots: None,
+                format: SnapshotFormat::Legacy,
             },
         };
 
         let tree = GameTree::build_with_options(
-            config.game.stack_depth, config.game.small_blind,
-            config.game.big_blind, &config.action_abstraction.preflop,
-            &config.action_abstraction.flop, &config.action_abstraction.turn,
-            &config.action_abstraction.river, config.game.allow_preflop_limp,
+            config.game.stack_depth,
+            config.game.small_blind,
+            config.game.big_blind,
+            &config.action_abstraction.preflop,
+            &config.action_abstraction.flop,
+            &config.action_abstraction.turn,
+            &config.action_abstraction.river,
+            config.game.allow_preflop_limp,
         );
         let storage = BlueprintStorage::new(&tree, [3, 2, 2, 2]);
-        let strategy = crate::blueprint_v2::bundle::BlueprintV2Strategy::from_storage(
-            &storage, &tree,
-        );
+        let strategy =
+            crate::blueprint_v2::bundle::BlueprintV2Strategy::from_storage(&storage, &tree);
 
         let dir = tempfile::tempdir().expect("create temp dir");
         let universal_dir = dir.path().join("universal");
@@ -894,7 +889,13 @@ mod tests {
         std::fs::write(&config_path, &config_yaml).unwrap();
 
         write_hu_universal_snapshot(
-            &config, &tree, &strategy, 42, 1.5, &config_path, &universal_dir,
+            &config,
+            &tree,
+            &strategy,
+            42,
+            1.5,
+            &config_path,
+            &universal_dir,
         )
         .expect("native write should succeed");
 

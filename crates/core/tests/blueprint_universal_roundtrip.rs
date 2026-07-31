@@ -4,11 +4,10 @@
 //! plus deterministic rejection for every known bad-input class.
 
 use poker_solver_core::blueprint_universal::{
-    ActionDescriptor, ActionKind, BundleReader, BundleWriter, FormatError, Manifest,
-    RowDescriptor,
+    ActionDescriptor, ActionKind, BundleReader, BundleWriter, FormatError, Manifest, RowDescriptor,
 };
 use poker_solver_core::blueprint_universal::{
-    SeatDescriptor, RakeConfig, BucketFileRef, PerFlopBucketConfig,
+    BucketFileRef, PerFlopBucketConfig, RakeConfig, SeatDescriptor,
 };
 
 // ---------------------------------------------------------------------------
@@ -54,7 +53,10 @@ fn test_manifest(row_count: u64, action_count: u64, prob_count: u64) -> Manifest
             antes: vec![],
             straddles: vec![],
             stack_units: "chips".to_string(),
-            rake: RakeConfig { rate: 0.0, cap: 0.0 },
+            rake: RakeConfig {
+                rate: 0.0,
+                cap: 0.0,
+            },
             max_flop_players: None,
         },
         training: TrainingMetadata {
@@ -319,8 +321,7 @@ fn rejects_crc64_mismatch() {
     let manifest_path = dir.path().join("blueprint.json");
     let manifest_text = std::fs::read_to_string(&manifest_path).expect("read");
     // Replace the old SHA in the manifest JSON.
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest_text).expect("parse");
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).expect("parse");
     let mut manifest_json = manifest_json;
     let files = manifest_json["files"].as_object_mut().unwrap();
     let entry = files
@@ -328,7 +329,10 @@ fn rejects_crc64_mismatch() {
         .unwrap()
         .as_object_mut()
         .unwrap();
-    entry.insert("sha256".to_string(), serde_json::Value::String(new_sha.clone()));
+    entry.insert(
+        "sha256".to_string(),
+        serde_json::Value::String(new_sha.clone()),
+    );
     std::fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest_json).unwrap(),
@@ -338,8 +342,7 @@ fn rejects_crc64_mismatch() {
     // Also update checksums.json.
     let checksums_path = dir.path().join("checksums.json");
     let checksums_text = std::fs::read_to_string(&checksums_path).expect("read");
-    let mut checksums: serde_json::Value =
-        serde_json::from_str(&checksums_text).expect("parse");
+    let mut checksums: serde_json::Value = serde_json::from_str(&checksums_text).expect("parse");
     checksums["strategy.rows.bin"] = serde_json::Value::String(new_sha);
     std::fs::write(
         &checksums_path,
@@ -591,7 +594,10 @@ fn rejects_missing_manifest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let err = BundleReader::open(dir.path()).unwrap_err();
     assert!(
-        matches!(err, FormatError::MissingFile { .. } | FormatError::InvalidManifest { .. }),
+        matches!(
+            err,
+            FormatError::MissingFile { .. } | FormatError::InvalidManifest { .. }
+        ),
         "expected MissingFile or InvalidManifest, got {err:?}"
     );
 }
@@ -605,19 +611,20 @@ fn manifest_new_fields_round_trip() {
     let mut manifest = test_manifest(0, 0, 0);
     manifest.game_fingerprint = 0xCAFE_BABE_DEAD_BEEF;
     manifest.source_config_fingerprint = Some(0x1111_2222_3333_4444);
-    manifest.game.seats = vec![
-        SeatDescriptor {
-            seat_id: 0,
-            label: "UTG".to_string(),
-            blind_ante_role: "none".to_string(),
-            starting_stack: 200.0,
-        },
-    ];
+    manifest.game.seats = vec![SeatDescriptor {
+        seat_id: 0,
+        label: "UTG".to_string(),
+        blind_ante_role: "none".to_string(),
+        starting_stack: 200.0,
+    }];
     manifest.game.button_seat = 0;
     manifest.game.antes = vec![0.0, 0.0, 1.0];
     manifest.game.straddles = vec![4.0];
     manifest.game.stack_units = "big_blinds".to_string();
-    manifest.game.rake = RakeConfig { rate: 0.05, cap: 3.0 };
+    manifest.game.rake = RakeConfig {
+        rate: 0.05,
+        cap: 3.0,
+    };
     manifest.game.max_flop_players = Some(3);
     manifest.training.elapsed_minutes = 42.5;
     manifest.training.strategy_unit = "current_regret_matched_strategy".to_string();
@@ -650,7 +657,10 @@ fn manifest_new_fields_round_trip() {
     let loaded: Manifest = serde_json::from_str(&text).expect("parse");
 
     assert_eq!(loaded.game_fingerprint, 0xCAFE_BABE_DEAD_BEEF);
-    assert_eq!(loaded.source_config_fingerprint, Some(0x1111_2222_3333_4444));
+    assert_eq!(
+        loaded.source_config_fingerprint,
+        Some(0x1111_2222_3333_4444)
+    );
     assert_eq!(loaded.game.seats.len(), 1);
     assert_eq!(loaded.game.seats[0].label, "UTG");
     assert_eq!(loaded.game.button_seat, 0);
@@ -661,12 +671,24 @@ fn manifest_new_fields_round_trip() {
     assert!((loaded.game.rake.cap - 3.0).abs() < 1e-9);
     assert_eq!(loaded.game.max_flop_players, Some(3));
     assert!((loaded.training.elapsed_minutes - 42.5).abs() < 1e-9);
-    assert_eq!(loaded.training.strategy_unit, "current_regret_matched_strategy");
+    assert_eq!(
+        loaded.training.strategy_unit,
+        "current_regret_matched_strategy"
+    );
     assert_eq!(loaded.training.command, Some("train --fast".to_string()));
-    assert_eq!(loaded.training.config_path, Some("/path/to/config.yaml".to_string()));
+    assert_eq!(
+        loaded.training.config_path,
+        Some("/path/to/config.yaml".to_string())
+    );
     assert_eq!(loaded.training.config_fingerprint, Some(0xAAAA_BBBB));
-    assert_eq!(*loaded.buckets.street_bucket_counts.get("preflop").unwrap(), 169);
-    assert_eq!(*loaded.buckets.street_bucket_counts.get("flop").unwrap(), 500);
+    assert_eq!(
+        *loaded.buckets.street_bucket_counts.get("preflop").unwrap(),
+        169
+    );
+    assert_eq!(
+        *loaded.buckets.street_bucket_counts.get("flop").unwrap(),
+        500
+    );
     assert_eq!(loaded.buckets.bucket_files.len(), 1);
     assert_eq!(loaded.buckets.bucket_files[0].name, "flop.buckets");
     assert_eq!(loaded.buckets.bucket_files[0].byte_size, 1024);
@@ -693,11 +715,7 @@ fn rejects_missing_file_entry_in_manifest() {
     let mut json: serde_json::Value = serde_json::from_str(&text).expect("parse");
     let files = json["files"].as_object_mut().unwrap();
     files.remove("strategy.probs.f32.bin");
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&json).unwrap(),
-    )
-    .expect("write");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&json).unwrap()).expect("write");
 
     let err = BundleReader::open(dir.path()).unwrap_err();
     assert!(
