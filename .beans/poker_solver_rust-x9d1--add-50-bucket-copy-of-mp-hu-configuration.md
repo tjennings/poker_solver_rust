@@ -3,8 +3,11 @@
 title: Add 50-bucket copy of MP HU configuration
 status: in-progress
 type: task
+priority: normal
 created_at: 2026-08-04T12:58:19Z
-updated_at: 2026-08-04T12:58:19Z
+updated_at: 2026-08-04T12:59:59Z
+blocked_by:
+    - poker_solver_rust-lr0y
 ---
 
 Create a copy of mp_hu_500f_100t_100r_nut_high_cap_0p5_v2 configured with 50 buckets on every street.
