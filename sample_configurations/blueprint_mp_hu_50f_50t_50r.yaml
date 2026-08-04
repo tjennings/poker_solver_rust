@@ -18,15 +18,14 @@ action_abstraction:
     lead:
     - 2bb
     raise:
+    - - 1.0x
+      - 3.0x
+    - - 1.0x
+      - 3.0x
     - - 0.33x
       - 0.75x
       - 1.0x
-    - - 0.33x
-      - 0.75x
-      - 1.0x
-    - - 0.33x
-      - 0.75x
-      - 1.0x
+      - 3.0x
   flop:
     lead:
     - 0.25
@@ -72,7 +71,7 @@ training:
   backend: lazy_sparse
   chance_continuation_mode: sampled_full_deal
   cluster_path: ./local_data/buckets/50f_50t_50r_nut_high_cap_0p5_v1
-  iterations: null
+  iterations: 400000000
   time_limit_minutes: 7200
   lcfr_warmup_iterations: 3000000
   lcfr_discount_interval: 3000000
@@ -99,3 +98,19 @@ snapshots:
   resume: false
   max_snapshots: null
   format: both
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs 2.5x"
+      player: BB
+      actions: ["raise-0"]
+    - name: "SB vs 3-bet"
+      player: BB
+      actions: ["raise-0", "raise-1"]

@@ -2,7 +2,7 @@
 game:
   name: "shared 50f 50t 50r buckets nut high cap 0p5"
   players: 2
-  stack_depth: 40
+  stack_depth: 200
   small_blind: 1
   big_blind: 2
 
@@ -14,8 +14,8 @@ clustering:
     buckets: 50
     metric:
       enabled: true
-      potential_weight: 0.0
-      equity_weight: 1.0
+      potential_weight: 0.8
+      equity_weight: 0.2
       nut_distance_weight: 0.50
       nut_distance_cap: 0.5
       nut_sample_boards: 500
@@ -24,8 +24,8 @@ clustering:
     sample_boards: 16432
     metric:
       enabled: true
-      potential_weight: 0.0
-      equity_weight: 1.0
+      potential_weight: 0.8
+      equity_weight: 0.2
       nut_distance_weight: 0.50
       nut_distance_cap: 0.5
       nut_sample_boards: 500
@@ -51,8 +51,25 @@ training:
   prune_threshold: -50
   batch_size: 2000
 
+tui:
+  enabled: true
+  refresh_rate_ms: 2000
+  telemetry:
+    strategy_delta_interval_seconds: 120
+    sparkline_window: 60
+  scenarios:
+    - name: "SB Open"
+      player: SB
+      actions: []
+    - name: "BB vs 2.5x"
+      player: BB
+      actions: ["raise-0"]
+    - name: "SB vs 3-bet"
+      player: BB
+      actions: ["raise-0", "raise-1"]
+
 snapshots:
-  resume: true
+  resume: false
   warmup_minutes: 60
   snapshot_every_minutes: 30
   output_dir: "./local_data/blueprints/shared_50f_50t_50r_nut_high_cap_0p5"
