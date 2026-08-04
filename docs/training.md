@@ -870,9 +870,9 @@ If the stack, blinds, limp policy, preflop buckets, tree actions, or baseline sc
 | `negative_action_purge_mode` | `scan_history_prefix` | Purge candidate detection mode. Currently only `scan_history_prefix` is supported |
 | `batch_size` | `200` | Deals per parallel batch |
 | `time_limit_minutes` | `0` | Stop after this many minutes (0 = unlimited) |
+| `purify_threshold` | `0.0` | Purify strategies with probability below this threshold (0 = disabled) |
 
 MP eager and lazy/sparse backends use the same signed-integer DCFR regret conversion: after multiplication by the positive or negative discount factor, fractional results truncate toward zero with explicit `i32` bounds. Thus `101 × 0.5` stores `50`, `-101 × 0.5` stores `-50`, and either `1 × 0.5` or `-1 × 0.5` stores `0`. Strategy-sum discounting remains unsigned and is unchanged.
-| `purify_threshold` | `0.0` | Purify strategies with probability below this threshold (0 = disabled) |
 
 **Important for SAPCFR+**: Since RM+ floors negative regrets to 0, they can't accumulate below the prune threshold. Set `prune_threshold: 0` to effectively disable pruning, or use a small negative value as a safety margin.
 
