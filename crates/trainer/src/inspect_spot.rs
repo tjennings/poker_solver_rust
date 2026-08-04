@@ -389,16 +389,8 @@ mod tests {
     fn format_report_shows_spot_header() {
         let state = make_mock_state(
             vec![
-                GameAction {
-                    id: "0".into(),
-                    label: "Fold".into(),
-                    action_type: "fold".into(),
-                },
-                GameAction {
-                    id: "1".into(),
-                    label: "Call".into(),
-                    action_type: "call".into(),
-                },
+                GameAction::new("0", "Fold", "fold"),
+                GameAction::new("1", "Call", "call"),
             ],
             vec![
                 GameMatrixCell {
@@ -436,16 +428,8 @@ mod tests {
     fn format_report_hands_sorted_by_ev_descending() {
         let state = make_mock_state(
             vec![
-                GameAction {
-                    id: "0".into(),
-                    label: "Fold".into(),
-                    action_type: "fold".into(),
-                },
-                GameAction {
-                    id: "1".into(),
-                    label: "Call".into(),
-                    action_type: "call".into(),
-                },
+                GameAction::new("0", "Fold", "fold"),
+                GameAction::new("1", "Call", "call"),
             ],
             vec![
                 GameMatrixCell {
@@ -484,16 +468,8 @@ mod tests {
     fn format_report_shows_action_summary() {
         let state = make_mock_state(
             vec![
-                GameAction {
-                    id: "0".into(),
-                    label: "Fold".into(),
-                    action_type: "fold".into(),
-                },
-                GameAction {
-                    id: "1".into(),
-                    label: "Call".into(),
-                    action_type: "call".into(),
-                },
+                GameAction::new("0", "Fold", "fold"),
+                GameAction::new("1", "Call", "call"),
             ],
             vec![
                 GameMatrixCell {
@@ -573,16 +549,8 @@ mod tests {
         // Expected: Fold 50%, Call 50%
         let state = make_mock_state(
             vec![
-                GameAction {
-                    id: "0".into(),
-                    label: "Fold".into(),
-                    action_type: "fold".into(),
-                },
-                GameAction {
-                    id: "1".into(),
-                    label: "Call".into(),
-                    action_type: "call".into(),
-                },
+                GameAction::new("0", "Fold", "fold"),
+                GameAction::new("1", "Call", "call"),
             ],
             vec![
                 GameMatrixCell {
@@ -616,11 +584,7 @@ mod tests {
     #[test]
     fn format_report_skips_zero_combo_hands() {
         let state = make_mock_state(
-            vec![GameAction {
-                id: "0".into(),
-                label: "Fold".into(),
-                action_type: "fold".into(),
-            }],
+            vec![GameAction::new("0", "Fold", "fold")],
             vec![
                 GameMatrixCell {
                     hand: "AA".into(),

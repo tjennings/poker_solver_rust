@@ -299,6 +299,26 @@ pub struct GameAction {
     pub(crate) exact_amount_bb: Option<f64>,
 }
 
+impl GameAction {
+    /// Create a frontend-visible action without an internal exact amount.
+    ///
+    /// This is the public construction path for callers outside the Tauri
+    /// crate. Internal solver actions may attach an exact amount when cache
+    /// matching must not depend on the rounded user-facing label.
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        action_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            action_type: action_type.into(),
+            exact_amount_bb: None,
+        }
+    }
+}
+
 /// Per-combo strategy detail (e.g., "AhKh" with its own action probabilities).
 #[derive(Debug, Clone, Serialize)]
 pub struct ComboDetail {
@@ -5985,6 +6005,35 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("Preflop"));
         assert!(json.contains("\"pot\":3"));
+    }
+
+    #[test]
+    fn game_action_constructor_initializes_public_fields_and_omits_exact_amount() {
+        let action = GameAction::new("solver-bet", "4bb", "bet");
+
+        assert_eq!(action.id, "solver-bet");
+        assert_eq!(action.label, "4bb");
+        assert_eq!(action.action_type, "bet");
+        assert_eq!(action.exact_amount_bb, None);
+
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["id"], "solver-bet");
+        assert_eq!(json["label"], "4bb");
+        assert_eq!(json["action_type"], "bet");
+        assert!(json.get("exact_amount_bb").is_none());
+    }
+
+    #[test]
+    fn constructed_game_action_falls_back_to_parsing_amount_from_label() {
+        let action = GameAction::new("0", " 4.5 BB ", "BET");
+
+        assert_eq!(
+            semantic_action_from_game_action(&action),
+            SemanticAction {
+                action_type: "bet".to_string(),
+                amount_bb: Some(4.5),
+            }
+        );
     }
 
     #[test]
