@@ -9,6 +9,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use poker_solver_core::abstraction::isomorphism::CanonicalBoard;
 use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
@@ -22,13 +25,85 @@ use poker_solver_core::blueprint_v2::storage::BlueprintStorage;
 use poker_solver_core::poker::{Card, Suit, Value};
 
 use poker_solver_tauri::{
-    game_back_core, game_deal_card_core, game_encode_spot_core, game_get_state_core,
-    game_load_spot_core, game_new_core, game_play_action_core, game_solve_core,
-    ExplorationPosition, ExplorationState, GameMatrix, GameSessionState, PostflopState,
+    game_back_core, game_cancel_solve_core, game_deal_card_core, game_encode_spot_core,
+    game_get_state_core, game_load_spot_core, game_new_core, game_play_action_core,
+    game_solve_core, ExplorationPosition, ExplorationState, GameMatrix, GameSessionState,
+    PostflopState,
 };
 use tempfile::TempDir;
 
 // ── Shared helpers ──────────────────────────────────────────────────
+
+// Real exact solves contend for process-wide native solver resources, so only
+// the four worker-spawning integration tests may enter that section at once.
+static EXACT_SOLVE_WORKER_TEST: Mutex<()> = Mutex::new(());
+
+const EXACT_SOLVE_DEADLINE: Duration = Duration::from_secs(30);
+const EXACT_SOLVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Wait for the current exact-solve generation without taking session locks.
+///
+/// Timeout cancellation is cleanup only: an acknowledged cancellation still
+/// fails the test that exceeded its real-time deadline.
+fn wait_for_exact_solve(sessions: &GameSessionState) -> poker_solver_tauri::GameState {
+    let solve = sessions.exact_solve.as_ref();
+    let generation = solve.generation.load(Ordering::Acquire);
+    let deadline = Instant::now() + EXACT_SOLVE_DEADLINE;
+
+    loop {
+        let observed_generation = solve.generation.load(Ordering::Acquire);
+        let solving = solve.solving.load(Ordering::Acquire);
+        let iteration = solve.iteration.load(Ordering::Acquire);
+
+        assert_eq!(
+            observed_generation, generation,
+            "exact solve generation changed while waiting: expected {generation}, observed {observed_generation}"
+        );
+
+        if !solving {
+            assert!(
+                iteration > 0,
+                "exact solve generation {generation} terminated without completing an iteration"
+            );
+            let state = game_get_state_core(sessions, Some("exact".to_string()))
+                .expect("completed exact solve state should be readable");
+            assert!(
+                state.solve.as_ref().is_some_and(|status| status.is_complete),
+                "positive-iteration exact solve generation {generation} did not publish complete status"
+            );
+            return state;
+        }
+
+        if Instant::now() >= deadline {
+            game_cancel_solve_core(sessions, Some("exact".to_string()), Some(generation))
+                .expect("generation-scoped exact solve cancellation should be accepted");
+
+            let acknowledgement_deadline = Instant::now() + EXACT_SOLVE_DEADLINE;
+            let acknowledged = loop {
+                let current_generation = solve.generation.load(Ordering::Acquire);
+                let still_solving = solve.solving.load(Ordering::Acquire);
+                if current_generation != generation {
+                    break false;
+                }
+                if !still_solving {
+                    break true;
+                }
+                if Instant::now() >= acknowledgement_deadline {
+                    break false;
+                }
+                std::thread::sleep(EXACT_SOLVE_POLL_INTERVAL);
+            };
+            let final_generation = solve.generation.load(Ordering::Acquire);
+            let final_solving = solve.solving.load(Ordering::Acquire);
+            let final_iteration = solve.iteration.load(Ordering::Acquire);
+            panic!(
+                "exact solve generation {generation} exceeded {EXACT_SOLVE_DEADLINE:?}; cancellation_acknowledged={acknowledged}, final_generation={final_generation}, final_solving={final_solving}, final_iteration={final_iteration}"
+            );
+        }
+
+        std::thread::sleep(EXACT_SOLVE_POLL_INTERVAL);
+    }
+}
 
 fn tiny_export_config() -> BlueprintV2Config {
     BlueprintV2Config {
@@ -1600,6 +1675,9 @@ async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
     assert_eq!(snapshot.action_history[1].position, "BB");
     assert_eq!(snapshot.action_history[2].position, "SB");
 
+    let _exact_solve_guard = EXACT_SOLVE_WORKER_TEST
+        .lock()
+        .expect("exact-solve worker test mutex must not be poisoned");
     game_solve_core(
         &sessions,
         Some("exact".to_string()),
@@ -1615,100 +1693,85 @@ async fn two_player_lazy_exact_solve_uses_asymmetric_flop_snapshot() {
     )
     .expect("Universal MP flop exact solve should start");
 
-    for _ in 0..200 {
-        let state = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
-        if state.solve.as_ref().is_some_and(|solve| solve.is_complete) {
-            assert!(
-                state.matrix.is_some(),
-                "exact result should overlay the MP state"
-            );
-            assert_eq!(state.position, "BB");
-            assert!(
-                !state.actions.is_empty(),
-                "exact root should expose actions"
-            );
-            assert!(
-                state
-                    .actions
-                    .iter()
-                    .any(|action| action.action_type == "bet" || action.action_type == "raise"),
-                "exact root should retain an aggressive action"
-            );
+    let state = wait_for_exact_solve(&sessions);
+    assert!(
+        state.matrix.is_some(),
+        "exact result should overlay the MP state"
+    );
+    assert_eq!(state.position, "BB");
+    assert!(
+        !state.actions.is_empty(),
+        "exact root should expose actions"
+    );
+    assert!(
+        state
+            .actions
+            .iter()
+            .any(|action| action.action_type == "bet" || action.action_type == "raise"),
+        "exact root should retain an aggressive action"
+    );
 
-            let generation_before_rewind = sessions
-                .exact_solve
-                .generation
-                .load(std::sync::atomic::Ordering::Acquire);
-            let cache_len_before_rewind = sessions.exact_solve.solve_cache.read().len();
-            let check = state
-                .actions
-                .iter()
-                .find(|action| action.action_type == "check")
-                .expect("exact flop root should expose a check action");
-            let same_street_child =
-                game_play_action_core(&sessions, &check.id, Some("exact".to_string()))
-                    .expect("same-street exact action should be replayable");
-            assert_eq!(same_street_child.street, "Flop");
-            assert!(same_street_child
-                .solve
-                .as_ref()
-                .is_some_and(|solve| solve.is_complete));
+    let generation_before_rewind = sessions.exact_solve.generation.load(Ordering::Acquire);
+    let cache_len_before_rewind = sessions.exact_solve.solve_cache.read().len();
+    let check = state
+        .actions
+        .iter()
+        .find(|action| action.action_type == "check")
+        .expect("exact flop root should expose a check action");
+    let same_street_child = game_play_action_core(&sessions, &check.id, Some("exact".to_string()))
+        .expect("same-street exact action should be replayable");
+    assert_eq!(same_street_child.street, "Flop");
+    assert!(same_street_child
+        .solve
+        .as_ref()
+        .is_some_and(|solve| solve.is_complete));
 
-            let same_street_back = game_back_core(&sessions, Some("exact".to_string()))
-                .expect("same-street exact back should succeed");
-            assert_eq!(same_street_back.street, "Flop");
-            assert!(same_street_back
-                .solve
-                .as_ref()
-                .is_some_and(|solve| solve.is_complete));
-            assert!(same_street_back.matrix.is_some());
-            assert_eq!(
-                sessions
-                    .exact_solve
-                    .generation
-                    .load(std::sync::atomic::Ordering::Acquire),
-                generation_before_rewind,
-                "same-street cache rewind must not invalidate the exact solve"
-            );
-            assert_eq!(
-                sessions.exact_solve.solve_cache.read().len(),
-                cache_len_before_rewind,
-                "same-street cache rewind must retain completed exact nodes"
-            );
+    let same_street_back = game_back_core(&sessions, Some("exact".to_string()))
+        .expect("same-street exact back should succeed");
+    assert_eq!(same_street_back.street, "Flop");
+    assert!(same_street_back
+        .solve
+        .as_ref()
+        .is_some_and(|solve| solve.is_complete));
+    assert!(same_street_back.matrix.is_some());
+    assert_eq!(
+        sessions.exact_solve.generation.load(Ordering::Acquire),
+        generation_before_rewind,
+        "same-street cache rewind must not invalidate the exact solve"
+    );
+    assert_eq!(
+        sessions.exact_solve.solve_cache.read().len(),
+        cache_len_before_rewind,
+        "same-street cache rewind must retain completed exact nodes"
+    );
 
-            let stale_back = game_back_core(&sessions, Some("exact".to_string()))
-                .expect("back from the flop should succeed");
-            assert_eq!(stale_back.street, "Preflop");
-            assert!(
-                stale_back.solve.is_none(),
-                "stale exact status must be omitted"
-            );
-            assert!(
-                !stale_back.actions.is_empty(),
-                "live preflop actions must remain"
-            );
+    let stale_back = game_back_core(&sessions, Some("exact".to_string()))
+        .expect("back from the flop should succeed");
+    assert_eq!(stale_back.street, "Preflop");
+    assert!(
+        stale_back.solve.is_none(),
+        "stale exact status must be omitted"
+    );
+    assert!(
+        !stale_back.actions.is_empty(),
+        "live preflop actions must remain"
+    );
 
-            let stale_action = game_play_action_core(
-                &sessions,
-                &stale_back.actions[0].id,
-                Some("exact".to_string()),
-            )
-            .expect("stale exact navigation should still play a live action");
-            assert!(
-                stale_action.solve.is_none(),
-                "stale exact action must not expose the old solve"
-            );
-            let after_stale_get =
-                game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
-            assert!(
-                after_stale_get.solve.is_none(),
-                "get_state must omit stale exact status"
-            );
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("Universal MP exact solve did not complete");
+    let stale_action = game_play_action_core(
+        &sessions,
+        &stale_back.actions[0].id,
+        Some("exact".to_string()),
+    )
+    .expect("stale exact navigation should still play a live action");
+    assert!(
+        stale_action.solve.is_none(),
+        "stale exact action must not expose the old solve"
+    );
+    let after_stale_get = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
+    assert!(
+        after_stale_get.solve.is_none(),
+        "get_state must omit stale exact status"
+    );
 }
 
 #[tokio::test]
@@ -1757,6 +1820,9 @@ async fn two_player_lazy_exact_solve_uses_configured_big_blind_for_root_actions(
         .expect("fractional chip values should use exact integer scaling");
     assert_eq!(snapshot.solver_chip_scale, 10.0);
 
+    let _exact_solve_guard = EXACT_SOLVE_WORKER_TEST
+        .lock()
+        .expect("exact-solve worker test mutex must not be poisoned");
     game_solve_core(
         &sessions,
         Some("exact".to_string()),
@@ -1772,35 +1838,28 @@ async fn two_player_lazy_exact_solve_uses_configured_big_blind_for_root_actions(
     )
     .expect("Universal MP exact solve with a 1.5-chip BB should start");
 
-    for _ in 0..200 {
-        let solved = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
-        if solved.solve.as_ref().is_some_and(|solve| solve.is_complete) {
-            assert_eq!(
-                solved
-                    .actions
-                    .iter()
-                    .map(|action| (&action.label, &action.action_type))
-                    .collect::<Vec<_>>(),
-                live_actions
-                    .iter()
-                    .map(|action| (&action.label, &action.action_type))
-                    .collect::<Vec<_>>(),
-                "exact cached root actions must use the configured BB units"
-            );
-            let aggressive = solved
-                .actions
-                .iter()
-                .find(|action| action.action_type == "bet" || action.action_type == "raise")
-                .expect("exact root should retain an aggressive action");
-            let child = game_play_action_core(&sessions, &aggressive.id, Some("exact".to_string()))
-                .expect("configured-BB exact action should match the live MP action");
-            assert_eq!(child.action_history.len(), 4);
-            assert!(child.solve.is_some());
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("Universal MP exact solve with a 1.5-chip BB did not complete");
+    let solved = wait_for_exact_solve(&sessions);
+    assert_eq!(
+        solved
+            .actions
+            .iter()
+            .map(|action| (&action.label, &action.action_type))
+            .collect::<Vec<_>>(),
+        live_actions
+            .iter()
+            .map(|action| (&action.label, &action.action_type))
+            .collect::<Vec<_>>(),
+        "exact cached root actions must use the configured BB units"
+    );
+    let aggressive = solved
+        .actions
+        .iter()
+        .find(|action| action.action_type == "bet" || action.action_type == "raise")
+        .expect("exact root should retain an aggressive action");
+    let child = game_play_action_core(&sessions, &aggressive.id, Some("exact".to_string()))
+        .expect("configured-BB exact action should match the live MP action");
+    assert_eq!(child.action_history.len(), 4);
+    assert!(child.solve.is_some());
 }
 
 #[tokio::test]
@@ -1852,6 +1911,9 @@ async fn two_player_lazy_exact_solve_rejects_unrepresentable_fractional_action()
     let flop = game_deal_card_core(&sessions, "Qh").unwrap();
     assert_eq!(flop.position, "BB");
 
+    let _exact_solve_guard = EXACT_SOLVE_WORKER_TEST
+        .lock()
+        .expect("exact-solve worker test mutex must not be poisoned");
     game_solve_core(
         &sessions,
         Some("exact".to_string()),
@@ -1867,25 +1929,18 @@ async fn two_player_lazy_exact_solve_rejects_unrepresentable_fractional_action()
     )
     .expect("fractional MP exact solve should start");
 
-    for _ in 0..200 {
-        let solved = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
-        if solved.solve.as_ref().is_some_and(|solve| solve.is_complete) {
-            let aggressive = solved
-                .actions
-                .iter()
-                .find(|action| action.action_type == "bet" || action.action_type == "raise")
-                .expect("exact root should retain an aggressive action");
-            let error = game_play_action_core(&sessions, &aggressive.id, Some("exact".to_string()))
-                .expect_err("unrepresentable fractional action must be rejected");
-            assert!(
-                error.contains("not exactly representable"),
-                "unexpected fractional action error: {error}"
-            );
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("Universal MP exact solve with an unrepresentable fractional action did not complete");
+    let solved = wait_for_exact_solve(&sessions);
+    let aggressive = solved
+        .actions
+        .iter()
+        .find(|action| action.action_type == "bet" || action.action_type == "raise")
+        .expect("exact root should retain an aggressive action");
+    let error = game_play_action_core(&sessions, &aggressive.id, Some("exact".to_string()))
+        .expect_err("unrepresentable fractional action must be rejected");
+    assert!(
+        error.contains("not exactly representable"),
+        "unexpected fractional action error: {error}"
+    );
 }
 
 #[tokio::test]
@@ -2031,6 +2086,9 @@ async fn two_player_lazy_exact_solve_supports_turn_root_and_turn_raise_depths() 
         .iter()
         .any(|size| *size == range_solver::bet_size::BetSize::PotRelative(0.33)));
 
+    let _exact_solve_guard = EXACT_SOLVE_WORKER_TEST
+        .lock()
+        .expect("exact-solve worker test mutex must not be poisoned");
     game_solve_core(
         &sessions,
         Some("exact".to_string()),
@@ -2046,18 +2104,11 @@ async fn two_player_lazy_exact_solve_supports_turn_root_and_turn_raise_depths() 
     )
     .expect("Universal MP turn exact solve should start");
 
-    for _ in 0..200 {
-        let solved = game_get_state_core(&sessions, Some("exact".to_string())).unwrap();
-        if solved.solve.as_ref().is_some_and(|solve| solve.is_complete) {
-            assert_eq!(solved.street, "Turn");
-            assert_eq!(solved.board, turn.board);
-            assert!(!solved.actions.is_empty());
-            assert!(solved.matrix.is_some());
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("Universal MP exact solve at a turn root did not complete");
+    let solved = wait_for_exact_solve(&sessions);
+    assert_eq!(solved.street, "Turn");
+    assert_eq!(solved.board, turn.board);
+    assert!(!solved.actions.is_empty());
+    assert!(solved.matrix.is_some());
 }
 
 #[tokio::test]
