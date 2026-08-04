@@ -744,9 +744,7 @@ fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingC
 fn discount_regret_atom(atom: &AtomicI32, d_pos: f64, d_neg: f64) {
     let v = atom.load(Ordering::Relaxed);
     let d = if v >= 0 { d_pos } else { d_neg };
-    let discounted = (f64::from(v) * d)
-        .round()
-        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let discounted = super::discount_signed_regret(v, d);
     atom.store(discounted, Ordering::Relaxed);
 }
 
@@ -1576,6 +1574,38 @@ mod tests {
     }
 
     // -- apply_dcfr_discount tests --
+
+    #[timed_test]
+    fn dcfr_discount_atom_truncates_toward_zero_symmetrically() {
+        let positive = AtomicI32::new(101);
+        let negative = AtomicI32::new(-101);
+        let positive_endpoint = AtomicI32::new(1);
+        let negative_endpoint = AtomicI32::new(-1);
+
+        discount_regret_atom(&positive, 0.5, 0.5);
+        discount_regret_atom(&negative, 0.5, 0.5);
+        discount_regret_atom(&positive_endpoint, 0.5, 0.5);
+        discount_regret_atom(&negative_endpoint, 0.5, 0.5);
+
+        assert_eq!(positive.load(Ordering::Relaxed), 50);
+        assert_eq!(negative.load(Ordering::Relaxed), -50);
+        assert_eq!(positive_endpoint.load(Ordering::Relaxed), 0);
+        assert_eq!(negative_endpoint.load(Ordering::Relaxed), 0);
+    }
+
+    #[timed_test]
+    fn repeated_dcfr_discount_atom_eliminates_integer_endpoints() {
+        let positive = AtomicI32::new(3);
+        let negative = AtomicI32::new(-3);
+
+        for _ in 0..3 {
+            discount_regret_atom(&positive, 0.5, 0.5);
+            discount_regret_atom(&negative, 0.5, 0.5);
+        }
+
+        assert_eq!(positive.load(Ordering::Relaxed), 0);
+        assert_eq!(negative.load(Ordering::Relaxed), 0);
+    }
 
     #[timed_test]
     fn dcfr_discount_reduces_positive_regrets() {

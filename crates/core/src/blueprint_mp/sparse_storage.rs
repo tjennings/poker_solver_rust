@@ -964,7 +964,10 @@ impl SparseMpStorage {
                 for regret in &node.regrets {
                     let value = regret.load(Ordering::Relaxed);
                     let factor = if value >= 0 { d_pos } else { d_neg };
-                    regret.store(discount_i32(value, factor), Ordering::Relaxed);
+                    regret.store(
+                        super::discount_signed_regret(value, factor),
+                        Ordering::Relaxed,
+                    );
                 }
                 for strategy_sum in &node.strategy_sums {
                     let value = strategy_sum.load(Ordering::Relaxed);
@@ -1350,13 +1353,6 @@ fn fill_uniform(out: &mut [f64], n: usize) {
     out[..n].fill(1.0 / n as f64);
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn discount_i32(value: i32, factor: f64) -> i32 {
-    (f64::from(value) * factor)
-        .round()
-        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-}
-
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1511,11 +1507,34 @@ mod tests {
 
         storage.discount(0.5, 0.25, 0.1);
 
-        assert_eq!(storage.get_regret(k, 0), 51);
+        assert_eq!(storage.get_regret(k, 0), 50);
         assert_eq!(storage.get_regret(k, 1), -25);
         assert_eq!(storage.get_strategy_sum(k, 0), 100);
         assert_eq!(storage.get_strategy_sum(k, 1), 200);
         assert_eq!(storage.entry_count(), 1);
+    }
+
+    #[timed_test]
+    fn discount_truncates_signed_regrets_and_eliminates_endpoints() {
+        let storage = SparseMpStorage::with_shards(4);
+        let k = key(4);
+
+        storage.add_regret(k, 4, 0, 101);
+        storage.add_regret(k, 4, 1, -101);
+        storage.add_regret(k, 4, 2, 3);
+        storage.add_regret(k, 4, 3, -3);
+
+        storage.discount(0.5, 0.5, 1.0);
+
+        assert_eq!(storage.get_regret(k, 0), 50);
+        assert_eq!(storage.get_regret(k, 1), -50);
+        assert_eq!(storage.get_regret(k, 2), 1);
+        assert_eq!(storage.get_regret(k, 3), -1);
+
+        storage.discount(0.5, 0.5, 1.0);
+
+        assert_eq!(storage.get_regret(k, 2), 0);
+        assert_eq!(storage.get_regret(k, 3), 0);
     }
 
     #[timed_test]
