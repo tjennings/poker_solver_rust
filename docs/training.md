@@ -233,6 +233,7 @@ snapshots:
 - `sample_configurations/blueprint_mp_6max_simplified_actions.yaml` -- 6-max 20bb trainer using shared 500/50/50 postflop buckets, compact action sets, and TUI scenarios
 - `sample_configurations/blueprint_mp_6max_500f_100t_100r.yaml` -- 6-max 20bb trainer using shared 500/100/100 postflop buckets for the current bucket-quality experiment
 - `sample_configurations/blueprint_mp_6max_250f_100t_20r.yaml` -- 6-max lazy-sparse trainer using shared 250/100/20 postflop buckets for lower memory and faster iteration while pruning work continues
+- `sample_configurations/blueprint_mp_hu_50f_50t_50r.yaml` -- heads-up lazy-sparse trainer using 169 preflop buckets and shared 50/50/50 postflop buckets with the nut-high-cap-0.5 abstraction
 - `sample_configurations/blueprint_mp_6max_100bb_lazy_sparse_smoke.yaml` -- 6-max 100bb lazy-sparse regression smoke with two preflop raise rows and one training iteration
 
 #### 100bb Status
@@ -260,6 +261,24 @@ Run the 250/100/20 6-max experiment with:
 cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
   -c sample_configurations/blueprint_mp_6max_250f_100t_20r.yaml
 ```
+
+Build and train the heads-up 50/50/50 preset with:
+
+```bash
+cargo run -p poker-solver-trainer --release -- cluster \
+  -c sample_configurations/blueprint_v2_50f_50t_50r_nut_high_cap_0p5.yaml \
+  -o ./local_data/buckets/50f_50t_50r_nut_high_cap_0p5_v1
+
+cargo run -p poker-solver-trainer --release -- inspect-mp-config \
+  -c sample_configurations/blueprint_mp_hu_50f_50t_50r.yaml
+
+cargo run -p poker-solver-trainer --release -- train-blueprint-mp \
+  -c sample_configurations/blueprint_mp_hu_50f_50t_50r.yaml
+```
+
+Both presets use 169 preflop buckets and 50/50/50 flop/turn/river buckets.
+Generate a new bucket set before training. Old snapshots and bucket files,
+including 500/100/100 artifacts, cannot be reused with this preset.
 
 ---
 
