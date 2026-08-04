@@ -106,11 +106,8 @@ tui:
     sparkline_window: 60
   scenarios:
     - name: "SB Open"
-      player: SB
-      actions: []
-    - name: "BB vs 2.5x"
-      player: BB
-      actions: ["raise-0"]
-    - name: "SB vs 3-bet"
-      player: BB
-      actions: ["raise-0", "raise-1"]
+      spot: ""
+    - name: "BB 3-bet"
+      spot: "sb:2bb"
+    - name: "SB 4-bet"
+      spot: "sb:2bb,bb:6bb"

@@ -6273,6 +6273,67 @@ snapshots:
     }
 
     #[timed_test(20)]
+    fn mp_hu_50_bucket_tui_preflop_scenarios_resolve_exactly() {
+        use poker_solver_core::blueprint_mp::config::BlueprintMpConfig;
+        use poker_solver_core::blueprint_mp::game_tree::TreeAction;
+        use poker_solver_core::blueprint_mp::lazy_mccfr::LazyMpGame;
+
+        let yaml = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sample_configurations/blueprint_mp_hu_50f_50t_50r.yaml"
+        ))
+        .expect("blueprint_mp_hu_50f_50t_50r.yaml must exist");
+        let config: BlueprintMpConfig =
+            serde_yaml::from_str(&yaml).expect("sample MP config must parse");
+        let tui_config = crate::blueprint_tui_config::parse_tui_config(&yaml);
+        let expected = [
+            ("SB Open", ""),
+            ("BB 3-bet", "sb:2bb"),
+            ("SB 4-bet", "sb:2bb,bb:6bb"),
+        ];
+
+        let scenarios = tui_config
+            .scenarios
+            .iter()
+            .map(|scenario| (scenario.name.as_str(), scenario.spot.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(scenarios, expected);
+
+        let lazy_game = LazyMpGame::new(&config.game, &config.action_abstraction);
+        let resolved = tui_config
+            .scenarios
+            .iter()
+            .map(|scenario| {
+                crate::mp_tui_scenarios::resolve_lazy_mp_spot(
+                    &lazy_game,
+                    &scenario.spot,
+                    config.game.num_players,
+                )
+                .unwrap_or_else(|| panic!("scenario should resolve: {}", scenario.name))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(resolved.iter().all(|(_, board)| board.is_empty()));
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|(spot, _)| spot.to_act().index())
+                .collect::<Vec<_>>(),
+            [0, 1, 0]
+        );
+
+        let actions_after_open = resolved[1].0.actions(&lazy_game);
+        assert!(
+            actions_after_open.contains(&TreeAction::Raise(6.0)),
+            "expected an exact raise 3bb action after sb:2bb"
+        );
+        assert!(
+            actions_after_open.contains(&TreeAction::Raise(12.0)),
+            "expected an exact raise 6bb action after sb:2bb"
+        );
+    }
+
+    #[timed_test(20)]
     fn lazy_strategy_probes_report_raw_row_state_and_dominant_action() {
         use poker_solver_core::blueprint_mp::config::*;
         use poker_solver_core::blueprint_mp::lazy_mccfr::{LazyMpGame, LazyResolvedSpot};
