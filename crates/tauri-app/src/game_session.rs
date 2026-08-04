@@ -6773,8 +6773,31 @@ mod tests {
     fn format_bet_sizes_preserves_fractional_percentages() {
         let sizes = vec![vec![0.925, 0.3333333333333333]];
         let (bet_str, raise_str) = format_bet_sizes_for_solve(&sizes);
-        assert_eq!(bet_str, "92.5%,33.3333333333333%,a");
+        assert_eq!(bet_str, "92.5%,33.333333333333329%,a");
         assert_eq!(raise_str, bet_str);
+    }
+
+    #[test]
+    fn fixed_precision_percentage_preserves_half_chip_rounding() {
+        use range_solver::bet_size::BetSize;
+
+        let fraction = 1.0 / 96.0;
+        let sizes = vec![vec![fraction]];
+        let (bet_str, _) = format_bet_sizes_for_solve(&sizes);
+        assert_eq!(bet_str, "1.041666666666667%,a");
+
+        let options = parse_bet_size_options_for_solve(&sizes)
+            .expect("fixed-precision percentage should be accepted by range-solver");
+        let parsed_fraction = options
+            .bet
+            .iter()
+            .find_map(|size| match size {
+                BetSize::PotRelative(parsed) => Some(*parsed),
+                _ => None,
+            })
+            .expect("formatted row should retain its pot-relative action");
+
+        assert_eq!((48.0 * parsed_fraction).round() as i32, 1);
     }
 
     #[test]

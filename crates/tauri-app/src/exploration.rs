@@ -4028,8 +4028,8 @@ mod tests {
     fn blueprint_sizes_preserve_fractional_percentages() {
         let depths = vec![vec![0.925, 0.3333333333333333]];
         let (bet, raise) = blueprint_sizes_to_range_solver(&depths);
-        assert_eq!(bet, "92.5%,33.3333333333333%,a");
-        assert_eq!(raise, "92.5%,33.3333333333333%,a");
+        assert_eq!(bet, "92.5%,33.333333333333329%,a");
+        assert_eq!(raise, "92.5%,33.333333333333329%,a");
     }
 
     #[timed_test]
