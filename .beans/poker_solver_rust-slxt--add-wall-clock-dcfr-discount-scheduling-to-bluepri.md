@@ -5,13 +5,13 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-08-05T14:24:48Z
-updated_at: 2026-08-05T14:30:07Z
+updated_at: 2026-08-05T15:04:17Z
 ---
 
 Implement the approved time-based discount interval design for blueprint_mp.
 
 - [x] Verify algorithm and architecture decisions
-- [ ] Establish clean baseline with full test suite under one minute
+- [ ] Establish focused core/trainer baseline under explicit runtime waiver
 - [ ] Implement config, scheduler, checkpoint behavior, telemetry, and docs
 - [ ] Add deterministic fake-clock and compatibility tests
 - [ ] Complete independent code review and repairs
@@ -27,3 +27,7 @@ Initial full `cargo test` was interrupted after 104.37 seconds while entering `g
 ## Approved Scope
 
 Implement config, a deterministic elapsed-time scheduler, eager/lazy integration, explicit wall-clock pass epochs, legacy compatibility, startup/per-pass telemetry, tests, and training/architecture documentation. Preserve lazy purge after each actual pass. Do not add the 40-pass stopping rule or claim checkpoint restoration; MP resume does not currently exist and snapshots cannot atomically capture trainer-local scheduler state. Wall-clock mode uses monotonic process-up elapsed time, including pauses and sweep/checkpoint overhead.
+
+## User Waiver
+
+On 2026-08-05 the user explicitly authorized proceeding with focused core/trainer tests and a final full-suite correctness run regardless of the pre-existing full-suite runtime.

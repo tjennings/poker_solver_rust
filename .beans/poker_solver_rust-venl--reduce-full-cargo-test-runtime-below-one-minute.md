@@ -1,13 +1,11 @@
 ---
 # poker_solver_rust-venl
 title: Reduce full cargo test runtime below one minute
-status: in-progress
+status: scrapped
 type: bug
 priority: critical
 created_at: 2026-08-05T14:30:33Z
-updated_at: 2026-08-05T15:00:42Z
-blocking:
-    - poker_solver_rust-slxt
+updated_at: 2026-08-05T15:04:17Z
 ---
 
 The mandatory baseline `cargo test` exceeded 60 seconds and was interrupted at 104.37 seconds. Diagnose and make the entire suite complete under one minute without losing coverage before wall-clock DCFR feature implementation continues.
@@ -24,3 +22,7 @@ Independent review rejected commit 02cbaab5: the Tauri explorer test was already
 ## Confirmed Blocker
 
 An uninterrupted, output-redirected full `cargo test -q` still exceeded 105.72 seconds and was stopped after the core 1,291-test binary completed; many workspace targets remained. Individual test bodies are fast, but separate integration binaries incur large pre/post-harness latency: for example `blueprint_universal_roundtrip` reports 0.04 seconds of tests but takes 14.35 seconds as a process. Meeting the one-minute gate requires broader test-harness consolidation or an explicitly approved alternative gate; changing an already-ignored test is not a repair.
+
+## Reasons for Scrapping
+
+The user explicitly selected option 2 on 2026-08-05: waive the one-minute full-suite gate for this feature and proceed with focused core/trainer tests plus a final full-suite correctness run regardless of runtime. The rejected runtime-neutral branch remains unmerged.
