@@ -5,7 +5,7 @@ status: in-progress
 type: task
 priority: high
 created_at: 2026-04-19T03:44:01Z
-updated_at: 2026-08-05T14:27:24Z
+updated_at: 2026-08-05T14:33:27Z
 ---
 
 Audit the full test suite, classify every test as fast-unit / slow-unit / integration, and drive the **pre-commit (non-integration) suite under 10 seconds** without reducing coverage.
@@ -79,3 +79,12 @@ Fast tests get run; slow tests get skipped. The current 4-minute suite means dev
 ## 2026-08-05 diagnostic pass
 
 Read-only diagnosis requested for the mandatory full `cargo test` exceeding 60 seconds during wall-clock DCFR development.
+
+### Evidence from this pass
+
+- Warm `cargo test --workspace --no-run`: 0.58s, proving compilation is negligible with current artifacts.
+- Direct execution of the built `cfvnet` library test target: 262 passed, 7 ignored, 29.61s total. Largest tests: `summary_contains_per_spot_results` 4.538s, `comparison_with_perfect_oracle_shows_zero_error` 3.557s, `training_with_streaming` 1.482s, `flop_depth_limited_tree_has_four_card_turn_boundaries` 1.292s, `solve_game_values_finite` 1.259s, `solve_exploitability_below_threshold` 1.060s.
+- Direct execution of the built `gpu_range_solver` test target: test harness reports 52 passed, 46 ignored, 0.03s; a second warm run completed in 0.00s. GPU tests are not the test-execution bottleneck on this host.
+- A package-isolated cfvnet cargo invocation is unsuitable for timing here because it changed feature unification and started recompiling criterion/rs_poker; it spent 196.67s mostly blocked (2.66s user CPU) before interruption.
+
+The full suite audit remains open. The next minimally invasive diagnostic is a warm `cargo test --workspace -- --test-threads=1 -Z unstable-options --report-time`, capturing per-test durations, after ensuring no concurrent Cargo process shares `target/`.
