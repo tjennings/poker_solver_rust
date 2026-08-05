@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-slxt
 title: Add wall-clock DCFR discount scheduling to blueprint_mp
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-08-05T14:24:48Z
-updated_at: 2026-08-05T15:29:59Z
+updated_at: 2026-08-05T15:51:54Z
 ---
 
 Implement the approved time-based discount interval design for blueprint_mp.
@@ -15,9 +15,9 @@ Implement the approved time-based discount interval design for blueprint_mp.
 - [x] Implement config, scheduler, telemetry, and docs (checkpoint persistence explicitly deferred)
 - [x] Add deterministic fake-clock and compatibility tests
 - [x] Complete initial independent code review and repairs
-- [ ] Complete independent re-review
-- [ ] Run the entire test suite under one minute
-- [ ] Integrate an atomic implementation commit
+- [x] Complete independent re-review
+- [x] Run the entire test suite for correctness under explicit runtime waiver
+- [x] Integrate an atomic implementation commit
 
 Reference: poker_solver_rust-ft2v development handoff and poker_solver_rust-qh5t literature research.
 
@@ -46,3 +46,7 @@ Validation: formatting passed; focused discount tests passed 55/55; core library
 ## Review Repair
 
 Fixed construction-time wall-clock arming when a lazy stepper starts at or beyond warmup, corrected documented MP fallback defaults, separated lazy DCFR sweep timing from negative-action purge timing, and added scheduled-boundary plus execution-elapsed pass telemetry. Added deterministic equality/greater-than start tests while retaining the below-warmup crossing test. Nonzero-count, newly-zeroed-count, scan-volume, and aggregate overhead telemetry remain explicitly out of scope because they require performance-sensitive scan aggregation; no extra full-table scans were added.
+
+## Summary of Changes
+
+Implemented and integrated optional wall-clock DCFR scheduling for blueprint_mp. The new nonzero `dcfr_discount_interval_seconds` key overrides legacy iteration cadence, uses shared deterministic eager/lazy scheduling with executed-pass epochs and no catch-up sweeps, repairs legacy missed-boundary triggering without changing legacy epoch semantics, preserves lazy purge ordering, and adds accurate schedule/sweep/purge telemetry. Updated config fixtures, active 600-second HU sample, training documentation, and architecture documentation. Independent re-review approved with no remaining findings. Post-merge formatting and 57 discount tests passed. The complete workspace `cargo test` exited successfully in 1,088.47 seconds under the user-approved runtime waiver; focused branch validation also passed 1,283 core tests and 342 trainer tests.
