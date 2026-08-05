@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-tmcc
 title: Render DCFR events inside MP TUI
-status: in-progress
+status: completed
 type: bug
 priority: high
 created_at: 2026-08-05T19:03:52Z
-updated_at: 2026-08-05T19:17:35Z
+updated_at: 2026-08-05T19:43:35Z
 ---
 
 Route blueprint_mp DCFR scheduler output through TUI-owned state so discount events render on the bottom status/debug line instead of writing directly to stdout/stderr and corrupting the alternate-screen UI. Preserve useful non-TUI logging.
@@ -15,9 +15,9 @@ Route blueprint_mp DCFR scheduler output through TUI-owned state so discount eve
 - [x] Establish clean focused baseline
 - [x] Implement bottom debug/status line
 - [x] Add deterministic tests
-- [ ] Complete independent review and repairs
+- [x] Complete independent review and repairs
 - [x] Run focused and full correctness verification
-- [ ] Integrate into main
+- [x] Integrate into main
 
 ## Baseline
 
@@ -30,3 +30,9 @@ Add an optional runner-owned, thread-safe blueprint_mp training-event sink share
 ## Implementation Progress
 
 Added a runner-owned typed MP training event sink with stderr fallback, eager and lazy propagation, a latest-event TUI status slot with 60-second expiry and durable cap state, and a clipped status row above the independent hotkey/snapshot footer. Removed TUI-only snapshot stderr writes and documented the routing. Focused core trainer and lazy-adapter suites, metrics/TUI suites, full core lib, full trainer bin, formatting, and workspace check all pass.
+
+
+
+## Summary of Changes
+
+Implemented typed, runner-owned DCFR training-event routing for eager and lazy blueprint_mp training. TUI runs now display DCFR pass and cap events on a clipped status row above the footer; ordinary events expire after 60 seconds and the terminal cap state remains visible. Non-TUI runs retain detailed stderr logging, and redundant snapshot stderr writes were removed. Documentation was updated. Independent review found no issues. Post-merge focused tests and the complete workspace suite passed.
