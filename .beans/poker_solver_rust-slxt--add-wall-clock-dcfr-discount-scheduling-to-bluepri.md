@@ -5,15 +5,15 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-08-05T14:24:48Z
-updated_at: 2026-08-05T15:10:49Z
+updated_at: 2026-08-05T15:22:23Z
 ---
 
 Implement the approved time-based discount interval design for blueprint_mp.
 
 - [x] Verify algorithm and architecture decisions
 - [x] Establish focused core/trainer baseline under explicit runtime waiver
-- [ ] Implement config, scheduler, checkpoint behavior, telemetry, and docs
-- [ ] Add deterministic fake-clock and compatibility tests
+- [x] Implement config, scheduler, telemetry, and docs (checkpoint persistence explicitly deferred)
+- [x] Add deterministic fake-clock and compatibility tests
 - [ ] Complete independent code review and repairs
 - [ ] Run the entire test suite under one minute
 - [ ] Integrate an atomic implementation commit
@@ -35,3 +35,9 @@ On 2026-08-05 the user explicitly authorized proceeding with focused core/traine
 ## Focused Baseline
 
 `poker-solver-core` library tests passed: 1,274 passed, 17 ignored. `poker-solver-trainer` binary tests passed: 342 passed, 1 ignored. The combined integration sweep was stopped after the relevant core library passed because of the explicitly waived per-binary harness latency.
+
+## Implementation Summary
+
+Added optional nonzero `dcfr_discount_interval_seconds`, a pure elapsed-time/iteration boundary scheduler shared by eager and lazy MP runners, explicit pass epochs, skipped-slot telemetry, legacy boundary-crossing compatibility, deterministic tests, and updated training/architecture/sample documentation. Checkpoint persistence and maximum-pass stopping remain out of scope by design.
+
+Validation: formatting passed; focused discount tests passed 55/55; core library passed 1,281 tests with 17 ignored after making the existing baseline fixture visible to the worktree; trainer binary passed 342 tests with 1 ignored; workspace compile passed. The all-target workspace check remains blocked by pre-existing broken `equity_table_bench` imports.

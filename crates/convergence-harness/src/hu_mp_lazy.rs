@@ -728,6 +728,7 @@ fn build_mp_lazy_config(harness: &HuMpLazyHarnessConfig, output_dir: &Path) -> B
             time_limit_minutes: None,
             lcfr_warmup_iterations: u64::MAX / 4,
             lcfr_discount_interval: u64::MAX / 4,
+            dcfr_discount_interval_seconds: None,
             prune_after_iterations: u64::MAX / 4,
             traversal_pruning_enabled: false,
             prune_threshold: 0,

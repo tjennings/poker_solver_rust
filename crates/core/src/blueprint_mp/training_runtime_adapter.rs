@@ -273,6 +273,7 @@ mod tests {
             time_limit_minutes: None,
             lcfr_warmup_iterations: 100,
             lcfr_discount_interval: 50,
+            dcfr_discount_interval_seconds: None,
             prune_after_iterations: 1_000_000,
             traversal_pruning_enabled: false,
             prune_threshold: -250,

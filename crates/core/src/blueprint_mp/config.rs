@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use serde::{Deserialize, Serialize};
 
 // ── Top-level config ─────────────────────────────────────────────────
@@ -178,6 +180,13 @@ pub struct MpTrainingConfig {
     pub lcfr_warmup_iterations: u64,
     #[serde(default = "default_discount_interval")]
     pub lcfr_discount_interval: u64,
+    /// Optional wall-clock interval between DCFR discount passes.
+    ///
+    /// When set, this overrides `lcfr_discount_interval`. `NonZeroU64` makes
+    /// zero invalid during deserialization rather than silently disabling the
+    /// schedule.
+    #[serde(default)]
+    pub dcfr_discount_interval_seconds: Option<NonZeroU64>,
     /// Warmup boundary for opt-in negative-action subtree purge.
     ///
     /// Ordinary regret-threshold traversal pruning also waits for this boundary
@@ -825,6 +834,7 @@ snapshots:
         );
         assert_eq!(cfg.lcfr_warmup_iterations, 5_000_000);
         assert_eq!(cfg.lcfr_discount_interval, 500_000);
+        assert_eq!(cfg.dcfr_discount_interval_seconds, None);
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
         assert!(!cfg.traversal_pruning_enabled);
         assert_eq!(cfg.prune_threshold, -250);
@@ -844,6 +854,31 @@ snapshots:
         assert!((cfg.purify_threshold).abs() < f64::EPSILON);
         assert_eq!(cfg.exploitability_interval_minutes, 0);
         assert_eq!(cfg.exploitability_samples, 100_000);
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_interval_parses_as_nonzero() {
+        let cfg: MpTrainingConfig = serde_yaml::from_str(
+            "dcfr_discount_interval_seconds: 600\nlcfr_discount_interval: 123",
+        )
+        .expect("failed to parse wall-clock discount interval");
+
+        assert_eq!(
+            cfg.dcfr_discount_interval_seconds.map(NonZeroU64::get),
+            Some(600)
+        );
+        assert_eq!(cfg.lcfr_discount_interval, 123);
+    }
+
+    #[timed_test]
+    fn zero_wall_clock_discount_interval_is_rejected() {
+        let error = serde_yaml::from_str::<MpTrainingConfig>("dcfr_discount_interval_seconds: 0")
+            .expect_err("zero wall-clock discount interval must be invalid");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected deserialization error: {error}"
+        );
     }
 
     #[timed_test]
