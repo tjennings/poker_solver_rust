@@ -912,10 +912,13 @@ coordinator pauses, snapshot work, and discount-sweep overhead. MP training does
 not currently restore trainer-local scheduling state, so the timer, factor
 epoch in wall-clock mode, and completed-pass counter have no checkpoint/resume
 guarantee. A newly started process creates a new clock, starts its pass count at
-zero, and does not count prior downtime. With a 600-second interval and a cap of
-40, discounting stops after 400 scheduler minutes following warmup in one
-uninterrupted process. This is Pluribus-inspired rather than identical because
-MP uses post-warmup DCFR rather than training-start LCFR.
+zero, and does not count prior downtime. With a 600-second interval, a cap of
+40, and no missed scheduled slots, discounting stops after 400 scheduler minutes
+following warmup in one uninterrupted process. Delayed batch checks and long
+sweeps skip missed slots rather than catching up, and skipped slots do not count
+as completed passes; they can therefore delay the 40th actual pass beyond 400
+minutes. This is Pluribus-inspired rather than identical because MP uses
+post-warmup DCFR rather than training-start LCFR.
 
 Without the wall-clock key, `lcfr_discount_interval` remains the compatibility
 schedule. The coordinator now triggers when a completed batch crosses a

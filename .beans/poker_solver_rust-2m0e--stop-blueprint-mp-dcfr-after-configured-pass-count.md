@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-08-05T16:40:22Z
-updated_at: 2026-08-05T16:53:49Z
+updated_at: 2026-08-05T16:57:26Z
 ---
 
 Implement a Pluribus-style maximum discount-pass rule for blueprint_mp.
@@ -16,7 +16,7 @@ Implement a Pluribus-style maximum discount-pass rule for blueprint_mp.
 - [x] Configure active HU sample for 40 passes
 - [x] Add deterministic eager/lazy/legacy compatibility tests
 - [x] Update training and architecture documentation
-- [ ] Complete independent review and repairs
+- [x] Complete independent review and repairs
 - [ ] Run focused and full correctness tests
 - [ ] Integrate into main
 
@@ -33,3 +33,7 @@ Add MP-only `dcfr_discount_max_passes: Option<NonZeroU64>`, default unlimited, a
 ## Implementation Progress
 
 Added the process-local optional nonzero pass cap, scheduler accounting independent of factor epoch, eager/lazy cap enforcement, final-pass telemetry, a 40-pass HU sample setting, deterministic cap/purge regression coverage, and updated training/architecture documentation. Focused MP scheduler/config tests and trainer tests pass; workspace check passes. Full core lib reached 1,289 passing tests, with four unrelated failures because the isolated worktree lacks the local baseline JSON fixture.
+
+## Review Repair
+
+Independent review found one documentation overstatement: 40 ten-minute passes finish at 400 post-warmup scheduler minutes only when no slots are missed. The training guide now explains that skipped slots consume no completed pass and can delay the 40th actual sweep.
