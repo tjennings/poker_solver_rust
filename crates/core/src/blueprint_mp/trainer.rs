@@ -88,6 +88,7 @@ struct PendingDiscount {
     boundary: DiscountBoundary,
     lateness: DiscountLateness,
     skipped_slots: u64,
+    observed_elapsed: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +138,7 @@ impl DiscountScheduler {
                 }
             },
             |interval_seconds| {
-                let armed = config.lcfr_warmup_iterations == 0;
+                let armed = start_meta_iter >= config.lcfr_warmup_iterations;
                 let next_deadline = armed.then(|| Duration::from_secs(interval_seconds.get()));
                 DiscountScheduleState::WallClock {
                     interval_seconds,
@@ -172,6 +173,7 @@ impl DiscountScheduler {
                     boundary: DiscountBoundary::MetaIteration(scheduled),
                     lateness: DiscountLateness::MetaIterations(meta_iter.saturating_sub(scheduled)),
                     skipped_slots,
+                    observed_elapsed: elapsed,
                 })
             }
             DiscountScheduleState::WallClock {
@@ -208,6 +210,7 @@ impl DiscountScheduler {
                     boundary: DiscountBoundary::Elapsed(scheduled),
                     lateness: DiscountLateness::WallClock(elapsed.saturating_sub(scheduled)),
                     skipped_slots,
+                    observed_elapsed: elapsed,
                 })
             }
         }
@@ -518,7 +521,7 @@ fn training_loop(
             let sweep_duration = discount_started.elapsed();
             let completed =
                 discount_scheduler.complete(pending, meta_iter, discount_clock_start.elapsed());
-            log_discount_pass(completed, meta_iter, config, sweep_duration);
+            log_discount_pass(completed, meta_iter, config, sweep_duration, None);
         }
     }
 
@@ -669,18 +672,26 @@ impl LazyMpTrainingStepper {
         {
             let discount_started = Instant::now();
             apply_dcfr_discount_lazy(&self.storage, pending.epoch, &self.training);
-            purge_negative_action_subtrees_after_discount(&self.storage, &self.training);
             let sweep_duration = discount_started.elapsed();
             LAZY_DISCOUNT_NANOS.fetch_add(
                 u64::try_from(sweep_duration.as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
+            let purge_started = Instant::now();
+            purge_negative_action_subtrees_after_discount(&self.storage, &self.training);
+            let purge_duration = purge_started.elapsed();
             let completed = self.discount_scheduler.complete(
                 pending,
                 self.meta_iter,
                 self.discount_clock_start.elapsed(),
             );
-            log_discount_pass(completed, self.meta_iter, &self.training, sweep_duration);
+            log_discount_pass(
+                completed,
+                self.meta_iter,
+                &self.training,
+                sweep_duration,
+                Some(purge_duration),
+            );
         }
 
         batch
@@ -990,25 +1001,34 @@ fn log_discount_pass(
     meta_iter: u64,
     config: &MpTrainingConfig,
     sweep_duration: Duration,
+    purge_duration: Option<Duration>,
 ) {
     let pending = completed.pending;
     let (d_pos, d_neg) =
         regret_discount_factors(pending.epoch, config.dcfr_alpha, config.dcfr_beta);
     let d_strat = strategy_discount_factor(pending.epoch, config.dcfr_gamma);
-    let (mode, interval, lateness) = match pending.lateness {
-        DiscountLateness::MetaIterations(late) => (
+    let (mode, interval, scheduled, lateness) = match (pending.boundary, pending.lateness) {
+        (DiscountBoundary::MetaIteration(boundary), DiscountLateness::MetaIterations(late)) => (
             "iterations",
             format!("{}meta_iterations", pending.interval),
+            format!("meta_iteration:{boundary}"),
             format!("{late}meta_iterations"),
         ),
-        DiscountLateness::WallClock(late) => (
+        (DiscountBoundary::Elapsed(boundary), DiscountLateness::WallClock(late)) => (
             "wall_clock",
             format!("{}s", pending.interval),
+            format!("elapsed:{:.3}s", boundary.as_secs_f64()),
             format!("{:.3}s", late.as_secs_f64()),
         ),
+        _ => unreachable!("discount boundary and lateness must use the same unit"),
     };
+    let purge = purge_duration.map_or_else(
+        || "n/a".to_string(),
+        |duration| format!("{:.3}s", duration.as_secs_f64()),
+    );
     eprintln!(
-        "blueprint_mp DCFR pass: mode={mode} interval={interval} meta_iter={meta_iter} epoch={} d_pos={d_pos:.9} d_neg={d_neg:.9} d_strat={d_strat:.9} lateness={lateness} skipped_slots={} sweep={:.3}s",
+        "blueprint_mp DCFR pass: mode={mode} interval={interval} scheduled={scheduled} execution_elapsed={:.3}s meta_iter={meta_iter} epoch={} d_pos={d_pos:.9} d_neg={d_neg:.9} d_strat={d_strat:.9} lateness={lateness} skipped_slots={} sweep={:.3}s purge={purge}",
+        pending.observed_elapsed.as_secs_f64(),
         pending.epoch,
         completed.skipped_slots,
         sweep_duration.as_secs_f64(),
@@ -1838,10 +1858,18 @@ mod tests {
     // -- discount scheduler tests --
 
     fn wall_clock_scheduler(warmup: u64, interval_seconds: u64) -> DiscountScheduler {
+        wall_clock_scheduler_at(0, warmup, interval_seconds)
+    }
+
+    fn wall_clock_scheduler_at(
+        start_meta_iter: u64,
+        warmup: u64,
+        interval_seconds: u64,
+    ) -> DiscountScheduler {
         let mut config = toy_training_config(1_000);
         config.lcfr_warmup_iterations = warmup;
         config.dcfr_discount_interval_seconds = NonZeroU64::new(interval_seconds);
-        DiscountScheduler::new(&config, 0)
+        DiscountScheduler::new(&config, start_meta_iter)
     }
 
     #[timed_test]
@@ -1863,6 +1891,35 @@ mod tests {
             DiscountLateness::WallClock(Duration::ZERO)
         );
         assert_eq!(pending.skipped_slots, 0);
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_arms_at_creation_when_start_equals_warmup() {
+        let mut scheduler = wall_clock_scheduler_at(100, 100, 10);
+
+        assert!(scheduler.pending(100, Duration::from_secs(9)).is_none());
+        assert_eq!(
+            scheduler
+                .pending(100, Duration::from_secs(10))
+                .expect("a stepper created at warmup should already be armed")
+                .epoch,
+            1
+        );
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_arms_at_creation_when_start_exceeds_warmup() {
+        let mut scheduler = wall_clock_scheduler_at(150, 100, 10);
+
+        assert!(scheduler.pending(150, Duration::from_secs(9)).is_none());
+        let pending = scheduler
+            .pending(150, Duration::from_secs(10))
+            .expect("a stepper created beyond warmup should already be armed");
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(
+            pending.boundary,
+            DiscountBoundary::Elapsed(Duration::from_secs(10))
+        );
     }
 
     #[timed_test]

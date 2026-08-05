@@ -858,8 +858,8 @@ If the stack, blinds, limp policy, preflop buckets, tree actions, or baseline sc
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `chance_continuation_mode` | `sampled_full_deal` | Lazy MP chance-continuation mode. `sampled_full_deal` samples a complete board up front; `sampled_turn_exact_river` samples through the turn and averages values over all legal rivers at river chance/showdown boundaries; `sampled_flop_exact_turn_river` samples through the flop and averages over all legal turn/river continuations |
-| `lcfr_warmup_iterations` | `0` | Iterations before discounting starts |
-| `lcfr_discount_interval` | `1` | Iterations between discount applications |
+| `lcfr_warmup_iterations` | `5,000,000` | Iterations before discounting starts |
+| `lcfr_discount_interval` | `500,000` | Iterations between discount applications |
 | `dcfr_discount_interval_seconds` | unset | Optional non-zero wall-clock interval for MP DCFR discounting; when set, overrides `lcfr_discount_interval` |
 | `prune_after_iterations` | `0` | Warmup boundary before opt-in MP traversal pruning and negative-action subtree purge can start |
 | `traversal_pruning_enabled` | `false` | Opt in to ordinary MP regret-threshold traversal pruning. This skips eligible traverser-side action branches, but does not physically delete sparse rows or strategy sums |
@@ -888,10 +888,11 @@ training:
 
 `dcfr_discount_interval_seconds` must be greater than zero. When present it
 overrides `lcfr_discount_interval` and schedules at most one discount pass at a
-safe completed-batch boundary. With zero warmup, the timer is armed when the
-trainer starts. With nonzero warmup, it is armed at the first completed-batch
-observation at or beyond `lcfr_warmup_iterations`; the first pass is one full
-interval later. A delayed check or long sweep skips missed wall-clock slots
+safe completed-batch boundary. The timer is armed when the scheduler is created
+if its starting meta-iteration is already at or beyond warmup (including zero
+warmup). Otherwise it is armed at the first completed-batch observation at or
+beyond `lcfr_warmup_iterations`; the first pass is one full interval later. A
+delayed check or long sweep skips missed wall-clock slots
 rather than applying catch-up passes, while keeping the next deadline anchored
 to the configured cadence. Wall-clock pass epochs begin at 1 and increment only
 when a pass actually runs.
