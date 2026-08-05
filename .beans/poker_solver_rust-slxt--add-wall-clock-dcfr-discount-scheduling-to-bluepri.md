@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-08-05T14:24:48Z
-updated_at: 2026-08-05T14:24:48Z
+updated_at: 2026-08-05T14:27:07Z
 ---
 
 Implement the approved time-based discount interval design for blueprint_mp.
@@ -19,3 +19,7 @@ Implement the approved time-based discount interval design for blueprint_mp.
 - [ ] Integrate an atomic implementation commit
 
 Reference: poker_solver_rust-ft2v development handoff and poker_solver_rust-qh5t literature research.
+
+## Baseline Blocker
+
+Initial full `cargo test` was interrupted after 104.37 seconds while entering `gpu_range_solver`; the required under-one-minute baseline was not met. Feature implementation is paused while the test-runtime path is diagnosed and repaired.
