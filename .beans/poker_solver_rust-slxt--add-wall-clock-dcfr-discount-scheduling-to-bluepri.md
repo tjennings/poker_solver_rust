@@ -5,13 +5,13 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-08-05T14:24:48Z
-updated_at: 2026-08-05T15:04:17Z
+updated_at: 2026-08-05T15:10:49Z
 ---
 
 Implement the approved time-based discount interval design for blueprint_mp.
 
 - [x] Verify algorithm and architecture decisions
-- [ ] Establish focused core/trainer baseline under explicit runtime waiver
+- [x] Establish focused core/trainer baseline under explicit runtime waiver
 - [ ] Implement config, scheduler, checkpoint behavior, telemetry, and docs
 - [ ] Add deterministic fake-clock and compatibility tests
 - [ ] Complete independent code review and repairs
@@ -31,3 +31,7 @@ Implement config, a deterministic elapsed-time scheduler, eager/lazy integration
 ## User Waiver
 
 On 2026-08-05 the user explicitly authorized proceeding with focused core/trainer tests and a final full-suite correctness run regardless of the pre-existing full-suite runtime.
+
+## Focused Baseline
+
+`poker-solver-core` library tests passed: 1,274 passed, 17 ignored. `poker-solver-trainer` binary tests passed: 342 passed, 1 ignored. The combined integration sweep was stopped after the relevant core library passed because of the explicitly waived per-binary harness latency.
