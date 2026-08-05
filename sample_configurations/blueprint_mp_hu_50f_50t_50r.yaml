@@ -80,7 +80,7 @@ training:
   dcfr_discount_max_passes: 40
   prune_after_iterations: 4000000
   traversal_pruning_enabled: true
-  prune_threshold: -1
+  prune_threshold: -20000
   prune_explore_pct: 0.05
   negative_action_subtree_purge_enabled: false
   negative_action_prune_below: -100
