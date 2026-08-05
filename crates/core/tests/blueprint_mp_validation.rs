@@ -107,6 +107,7 @@ fn build_full_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         lcfr_warmup_iterations: 0,
         lcfr_discount_interval: 50,
         dcfr_discount_interval_seconds: None,
+        dcfr_discount_max_passes: None,
         prune_after_iterations: 1_000_000,
         traversal_pruning_enabled: false,
         prune_threshold: -250,

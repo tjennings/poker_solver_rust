@@ -187,6 +187,12 @@ pub struct MpTrainingConfig {
     /// schedule.
     #[serde(default)]
     pub dcfr_discount_interval_seconds: Option<NonZeroU64>,
+    /// Optional maximum number of DCFR discount passes executed by this process.
+    ///
+    /// This limits completed table sweeps, not the factor epoch. Missing means
+    /// unlimited, while `NonZeroU64` rejects an accidental zero-pass schedule.
+    #[serde(default)]
+    pub dcfr_discount_max_passes: Option<NonZeroU64>,
     /// Warmup boundary for opt-in negative-action subtree purge.
     ///
     /// Ordinary regret-threshold traversal pruning also waits for this boundary
@@ -835,6 +841,7 @@ snapshots:
         assert_eq!(cfg.lcfr_warmup_iterations, 5_000_000);
         assert_eq!(cfg.lcfr_discount_interval, 500_000);
         assert_eq!(cfg.dcfr_discount_interval_seconds, None);
+        assert_eq!(cfg.dcfr_discount_max_passes, None);
         assert_eq!(cfg.prune_after_iterations, 5_000_000);
         assert!(!cfg.traversal_pruning_enabled);
         assert_eq!(cfg.prune_threshold, -250);
@@ -874,6 +881,25 @@ snapshots:
     fn zero_wall_clock_discount_interval_is_rejected() {
         let error = serde_yaml::from_str::<MpTrainingConfig>("dcfr_discount_interval_seconds: 0")
             .expect_err("zero wall-clock discount interval must be invalid");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected deserialization error: {error}"
+        );
+    }
+
+    #[timed_test]
+    fn discount_max_passes_parses_as_nonzero() {
+        let cfg: MpTrainingConfig = serde_yaml::from_str("dcfr_discount_max_passes: 40")
+            .expect("failed to parse discount pass cap");
+
+        assert_eq!(cfg.dcfr_discount_max_passes.map(NonZeroU64::get), Some(40));
+    }
+
+    #[timed_test]
+    fn zero_discount_max_passes_is_rejected() {
+        let error = serde_yaml::from_str::<MpTrainingConfig>("dcfr_discount_max_passes: 0")
+            .expect_err("zero discount pass cap must be invalid");
 
         assert!(
             error.to_string().contains("nonzero"),

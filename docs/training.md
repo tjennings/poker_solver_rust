@@ -861,6 +861,7 @@ If the stack, blinds, limp policy, preflop buckets, tree actions, or baseline sc
 | `lcfr_warmup_iterations` | `5,000,000` | Iterations before discounting starts |
 | `lcfr_discount_interval` | `500,000` | Iterations between discount applications |
 | `dcfr_discount_interval_seconds` | unset | Optional non-zero wall-clock interval for MP DCFR discounting; when set, overrides `lcfr_discount_interval` |
+| `dcfr_discount_max_passes` | unset | Optional non-zero cap on discount passes completed by the current MP trainer process; missing means unlimited |
 | `prune_after_iterations` | `0` | Warmup boundary before opt-in MP traversal pruning and negative-action subtree purge can start |
 | `traversal_pruning_enabled` | `false` | Opt in to ordinary MP regret-threshold traversal pruning. This skips eligible traverser-side action branches, but does not physically delete sparse rows or strategy sums |
 | `prune_threshold` | `-300` | Cumulative regret threshold for ordinary traversal pruning when `traversal_pruning_enabled` is true |
@@ -884,6 +885,7 @@ training:
   # Retained as the fallback if the wall-clock key is removed.
   lcfr_discount_interval: 3000000
   dcfr_discount_interval_seconds: 600
+  dcfr_discount_max_passes: 40
 ```
 
 `dcfr_discount_interval_seconds` must be greater than zero. When present it
@@ -897,12 +899,26 @@ rather than applying catch-up passes, while keeping the next deadline anchored
 to the configured cadence. Wall-clock pass epochs begin at 1 and increment only
 when a pass actually runs.
 
+`dcfr_discount_max_passes` independently limits completed table sweeps. The
+configured Nth pass executes in full; the N+1 boundary and every later boundary
+perform no discount scan. The cap counts actual passes only, so warmup,
+wall-clock slots missed between safe batch boundaries, and skipped iteration
+boundaries consume zero passes. It is a pass cap, not an epoch cap: iteration
+mode retains its scheduled-boundary factor epoch even when a high epoch is the
+process's first completed pass.
+
 The elapsed clock is monotonic process-up time. It includes batch work,
 coordinator pauses, snapshot work, and discount-sweep overhead. MP training does
-not currently restore trainer-local scheduling state, so this key has no
-checkpoint/resume guarantee: a newly started process creates a new clock and
-does not count prior downtime. It also does not impose Pluribus's separate
-40-pass stopping policy.
+not currently restore trainer-local scheduling state, so the timer, factor
+epoch in wall-clock mode, and completed-pass counter have no checkpoint/resume
+guarantee. A newly started process creates a new clock, starts its pass count at
+zero, and does not count prior downtime. With a 600-second interval, a cap of
+40, and no missed scheduled slots, discounting stops after 400 scheduler minutes
+following warmup in one uninterrupted process. Delayed batch checks and long
+sweeps skip missed slots rather than catching up, and skipped slots do not count
+as completed passes; they can therefore delay the 40th actual pass beyond 400
+minutes. This is Pluribus-inspired rather than identical because MP uses
+post-warmup DCFR rather than training-start LCFR.
 
 Without the wall-clock key, `lcfr_discount_interval` remains the compatibility
 schedule. The coordinator now triggers when a completed batch crosses a
