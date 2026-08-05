@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-wy0u
 title: 'Audit test suite: pre-commit tier under 10s without losing coverage'
-status: todo
+status: in-progress
 type: task
 priority: high
 created_at: 2026-04-19T03:44:01Z
-updated_at: 2026-04-19T03:44:01Z
+updated_at: 2026-08-05T14:27:24Z
 ---
 
 Audit the full test suite, classify every test as fast-unit / slow-unit / integration, and drive the **pre-commit (non-integration) suite under 10 seconds** without reducing coverage.
@@ -75,3 +75,7 @@ The full audit should replace this seed list with measured numbers.
 ## Why now
 
 Fast tests get run; slow tests get skipped. The current 4-minute suite means developers (and agents) avoid running it before commits, so regressions slip in. A <10 s gate changes the default behavior.
+
+## 2026-08-05 diagnostic pass
+
+Read-only diagnosis requested for the mandatory full `cargo test` exceeding 60 seconds during wall-clock DCFR development.
