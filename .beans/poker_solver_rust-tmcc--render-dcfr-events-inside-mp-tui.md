@@ -1,11 +1,11 @@
 ---
 # poker_solver_rust-tmcc
 title: Render DCFR events inside MP TUI
-status: completed
+status: in-progress
 type: bug
 priority: high
 created_at: 2026-08-05T19:03:52Z
-updated_at: 2026-08-05T19:43:35Z
+updated_at: 2026-08-05T19:44:40Z
 ---
 
 Route blueprint_mp DCFR scheduler output through TUI-owned state so discount events render on the bottom status/debug line instead of writing directly to stdout/stderr and corrupting the alternate-screen UI. Preserve useful non-TUI logging.
@@ -36,3 +36,7 @@ Added a runner-owned typed MP training event sink with stderr fallback, eager an
 ## Summary of Changes
 
 Implemented typed, runner-owned DCFR training-event routing for eager and lazy blueprint_mp training. TUI runs now display DCFR pass and cap events on a clipped status row above the footer; ordinary events expire after 60 seconds and the terminal cap state remains visible. Non-TUI runs retain detailed stderr logging, and redundant snapshot stderr writes were removed. Documentation was updated. Independent review found no issues. Post-merge focused tests and the complete workspace suite passed.
+
+## Delivery
+
+- [ ] Push merged main to origin and verify synchronization
