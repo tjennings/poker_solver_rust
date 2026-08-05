@@ -41,7 +41,8 @@ training:
   lcfr_warmup_iterations: 1000000
   prune_after_iterations: 1000000
   prune_threshold: -5
-  lcfr_discount_interval: 1000000
+  # lcfr_discount_interval: 1000000
+  dcfr_discount_interval_seconds: 600
   batch_size: 2000
   purify_threshold: 0.03
   dcfr_epoch_cap: 80
