@@ -3467,7 +3467,9 @@ fn run_mp_with_tui(
     config: &BlueprintMpConfig,
     tui_config: &blueprint_tui_config::BlueprintTuiConfig,
 ) -> Result<(), Box<dyn Error>> {
-    use poker_solver_core::blueprint_mp::trainer::{run_training, setup_training};
+    use poker_solver_core::blueprint_mp::trainer::{
+        SharedMpTrainingEventSink, run_training_with_event_sink, setup_training,
+    };
 
     let ctx = setup_training(config);
     let scenarios =
@@ -3483,8 +3485,15 @@ fn run_mp_with_tui(
     let scenario_node_ids: Vec<u32> = scenarios.iter().map(|s| s.node_idx).collect();
     let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
     let train_config = config.clone();
-    let train_handle =
-        std::thread::spawn(move || run_training(&ctx, &train_config.training, &train_config.game));
+    let event_sink: SharedMpTrainingEventSink = metrics.clone();
+    let train_handle = std::thread::spawn(move || {
+        run_training_with_event_sink(
+            &ctx,
+            &train_config.training,
+            &train_config.game,
+            Some(event_sink),
+        )
+    });
     let telemetry_in_flight = Arc::new(AtomicBool::new(false));
     bridge_mp_iterations(
         &shared_iters,
@@ -3540,7 +3549,8 @@ fn run_mp_with_tui_lazy(
     let lazy_scenario_names: Vec<String> = scenarios.iter().map(|s| s.name.clone()).collect();
     let tui_handle = spawn_mp_tui(&metrics, scenarios, tui_config, config.game.num_players);
     let started = Instant::now();
-    let adapter = LazySparseMpTrainingRuntimeAdapter::from_context(config.clone(), ctx);
+    let adapter = LazySparseMpTrainingRuntimeAdapter::from_context(config.clone(), ctx)
+        .with_event_sink(metrics.clone());
     let controls = adapter.controls().clone();
     let train_handle = std::thread::spawn(move || {
         let mut adapter = adapter;
@@ -3634,11 +3644,9 @@ fn bridge_mp_iterations<T>(
             ) {
                 Ok(path) => {
                     metrics.mark_snapshot_saved(&path);
-                    eprintln!("  MP snapshot saved to {}", path.display());
                 }
                 Err(e) => {
                     metrics.mark_snapshot_failed(&e);
-                    eprintln!("  Warning: failed to save MP snapshot: {e}");
                 }
             }
         }
@@ -3757,11 +3765,9 @@ fn save_lazy_mp_snapshot_for_tui(
     match save_lazy_mp_snapshot(config, snapshot_config, storage, iterations, elapsed) {
         Ok(path) => {
             metrics.mark_snapshot_saved(&path);
-            eprintln!("  Lazy MP snapshot saved to {}", path.display());
         }
         Err(e) => {
             metrics.mark_snapshot_failed(&e);
-            eprintln!("  Warning: failed to save lazy MP snapshot: {e}");
         }
     }
     Ok(())

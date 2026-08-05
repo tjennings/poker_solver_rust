@@ -62,6 +62,107 @@ pub struct TrainResult {
     pub final_strategy_delta: f64,
 }
 
+/// Thread-safe destination for infrequent multiplayer training status events.
+///
+/// Runners own and install the sink. Core training never uses a global callback,
+/// and preserves detailed stderr logging when no sink is present.
+pub trait MpTrainingEventSink: Send + Sync {
+    fn publish(&self, event: MpTrainingEvent);
+}
+
+/// Shared runner-owned multiplayer training event sink.
+pub type SharedMpTrainingEventSink = Arc<dyn MpTrainingEventSink>;
+
+/// Typed multiplayer training event suitable for terminal or UI presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MpTrainingEvent {
+    DcfrSchedule(MpDcfrScheduleEvent),
+    DcfrPass(MpDcfrPassEvent),
+}
+
+impl MpTrainingEvent {
+    /// Whether this status should remain visible instead of expiring.
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        matches!(self, Self::DcfrPass(event) if event.max_reached)
+    }
+}
+
+/// DCFR schedule selected for an MP training runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MpDcfrScheduleEvent {
+    pub mode: MpDcfrScheduleMode,
+    pub warmup_meta_iterations: u64,
+    pub max_passes: Option<NonZeroU64>,
+}
+
+/// Unit used to schedule MP DCFR passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpDcfrScheduleMode {
+    Iterations { interval: u64 },
+    WallClock { interval_seconds: NonZeroU64 },
+}
+
+/// Completed MP DCFR discount pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MpDcfrPassEvent {
+    pub completed_passes: u64,
+    pub max_passes: Option<NonZeroU64>,
+    pub epoch: u64,
+    pub meta_iteration: u64,
+    pub skipped_slots: u64,
+    pub sweep_duration: Duration,
+    pub purge_duration: Option<Duration>,
+    pub max_reached: bool,
+}
+
+/// Format an MP training event for a compact single-line status display.
+#[must_use]
+pub fn format_mp_training_event_compact(event: &MpTrainingEvent) -> String {
+    match event {
+        MpTrainingEvent::DcfrSchedule(event) => {
+            let cadence = match event.mode {
+                MpDcfrScheduleMode::Iterations { interval } => {
+                    format!("every {interval} iterations")
+                }
+                MpDcfrScheduleMode::WallClock { interval_seconds } => {
+                    format!("every {}s", interval_seconds.get())
+                }
+            };
+            let max = event
+                .max_passes
+                .map_or_else(|| "unlimited".to_string(), |max| max.get().to_string());
+            format!(
+                "DCFR schedule: {cadence} after warmup {} | max {max}",
+                event.warmup_meta_iterations
+            )
+        }
+        MpTrainingEvent::DcfrPass(event) => {
+            let pass = event.max_passes.map_or_else(
+                || event.completed_passes.to_string(),
+                |max| format!("{}/{}", event.completed_passes, max.get()),
+            );
+            let sweep = format_duration_status(event.sweep_duration);
+            let mut text = format!("DCFR pass {pass} | epoch {} | sweep {sweep}", event.epoch);
+            if event.skipped_slots > 0 {
+                text.push_str(&format!(" | skipped {}", event.skipped_slots));
+            }
+            if event.max_reached {
+                text.push_str(" | cap reached; stopped");
+            }
+            text
+        }
+    }
+}
+
+fn format_duration_status(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{:.1}ms", duration.as_secs_f64() * 1_000.0)
+    } else {
+        format!("{:.3}s", duration.as_secs_f64())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscountMode {
     Iterations,
@@ -444,6 +545,17 @@ pub fn run_training(
     training: &MpTrainingConfig,
     game: &MpGameConfig,
 ) -> TrainResult {
+    run_training_with_event_sink(ctx, training, game, None)
+}
+
+/// Run eager training with an optional runner-owned status-event sink.
+#[must_use]
+pub fn run_training_with_event_sink(
+    ctx: &TrainContext,
+    training: &MpTrainingConfig,
+    game: &MpGameConfig,
+    event_sink: Option<SharedMpTrainingEventSink>,
+) -> TrainResult {
     training_loop(
         &ctx.tree,
         &ctx.storage,
@@ -455,6 +567,7 @@ pub fn run_training(
         Chips(game.rake_cap),
         &ctx.iterations,
         &ctx.quit,
+        event_sink.as_deref(),
     )
 }
 
@@ -497,6 +610,7 @@ fn training_loop(
     rake_cap: Chips,
     iterations: &AtomicU64,
     quit: &AtomicBool,
+    event_sink: Option<&dyn MpTrainingEventSink>,
 ) -> TrainResult {
     let max_iters = config.iterations.unwrap_or(u64::MAX);
     let scaled_threshold = (f64::from(config.prune_threshold) * REGRET_SCALE)
@@ -506,7 +620,7 @@ fn training_loop(
     let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
     let discount_clock_start = Instant::now();
     let mut discount_scheduler = DiscountScheduler::new(config, meta_iter);
-    log_discount_schedule(config);
+    emit_discount_schedule(config, event_sink);
 
     loop {
         if meta_iter >= max_iters || quit.load(Ordering::Relaxed) {
@@ -542,7 +656,14 @@ fn training_loop(
             let sweep_duration = discount_started.elapsed();
             let completed =
                 discount_scheduler.complete(pending, meta_iter, discount_clock_start.elapsed());
-            log_discount_pass(completed, meta_iter, config, sweep_duration, None);
+            emit_discount_pass(
+                completed,
+                meta_iter,
+                config,
+                sweep_duration,
+                None,
+                event_sink,
+            );
         }
     }
 
@@ -574,6 +695,7 @@ pub struct LazyMpTrainingStepper {
     scaled_threshold: i32,
     discount_clock_start: Instant,
     discount_scheduler: DiscountScheduler,
+    event_sink: Option<SharedMpTrainingEventSink>,
 }
 
 impl LazyMpTrainingStepper {
@@ -584,6 +706,18 @@ impl LazyMpTrainingStepper {
         training: &MpTrainingConfig,
         game: &MpGameConfig,
         start_meta_iter: u64,
+    ) -> Self {
+        Self::from_context_with_event_sink(ctx, training, game, start_meta_iter, None)
+    }
+
+    /// Build a stepper with an optional runner-owned status-event sink.
+    #[must_use]
+    pub fn from_context_with_event_sink(
+        ctx: &LazyTrainContext,
+        training: &MpTrainingConfig,
+        game: &MpGameConfig,
+        start_meta_iter: u64,
+        event_sink: Option<SharedMpTrainingEventSink>,
     ) -> Self {
         Self::new(
             Arc::clone(&ctx.game),
@@ -597,6 +731,7 @@ impl LazyMpTrainingStepper {
             Arc::clone(&ctx.iterations),
             Arc::clone(&ctx.quit),
             start_meta_iter,
+            event_sink,
         )
     }
 
@@ -613,6 +748,7 @@ impl LazyMpTrainingStepper {
         iterations: Arc<AtomicU64>,
         quit: Arc<AtomicBool>,
         start_meta_iter: u64,
+        event_sink: Option<SharedMpTrainingEventSink>,
     ) -> Self {
         let scaled_threshold = (f64::from(training.prune_threshold) * REGRET_SCALE)
             .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
@@ -620,7 +756,7 @@ impl LazyMpTrainingStepper {
         let rng = pruning_rng_at_meta_iter(start_meta_iter, &training);
         let discount_clock_start = Instant::now();
         let discount_scheduler = DiscountScheduler::new(&training, start_meta_iter);
-        log_discount_schedule(&training);
+        emit_discount_schedule(&training, event_sink.as_deref());
         iterations.store(start_meta_iter, Ordering::Relaxed);
         Self {
             game,
@@ -638,6 +774,7 @@ impl LazyMpTrainingStepper {
             scaled_threshold,
             discount_clock_start,
             discount_scheduler,
+            event_sink,
         }
     }
 
@@ -706,12 +843,13 @@ impl LazyMpTrainingStepper {
                 self.meta_iter,
                 self.discount_clock_start.elapsed(),
             );
-            log_discount_pass(
+            emit_discount_pass(
                 completed,
                 self.meta_iter,
                 &self.training,
                 sweep_duration,
                 Some(purge_duration),
+                self.event_sink.as_deref(),
             );
         }
 
@@ -1002,7 +1140,22 @@ fn nanos_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn log_discount_schedule(config: &MpTrainingConfig) {
+fn emit_discount_schedule(config: &MpTrainingConfig, event_sink: Option<&dyn MpTrainingEventSink>) {
+    let event = MpTrainingEvent::DcfrSchedule(MpDcfrScheduleEvent {
+        mode: config.dcfr_discount_interval_seconds.map_or(
+            MpDcfrScheduleMode::Iterations {
+                interval: config.lcfr_discount_interval.max(1),
+            },
+            |interval_seconds| MpDcfrScheduleMode::WallClock { interval_seconds },
+        ),
+        warmup_meta_iterations: config.lcfr_warmup_iterations,
+        max_passes: config.dcfr_discount_max_passes,
+    });
+    if let Some(event_sink) = event_sink {
+        event_sink.publish(event);
+        return;
+    }
+
     let max_passes = config
         .dcfr_discount_max_passes
         .map_or_else(|| "unlimited".to_string(), |max| max.get().to_string());
@@ -1020,14 +1173,30 @@ fn log_discount_schedule(config: &MpTrainingConfig) {
     }
 }
 
-fn log_discount_pass(
+fn emit_discount_pass(
     completed: CompletedDiscount,
     meta_iter: u64,
     config: &MpTrainingConfig,
     sweep_duration: Duration,
     purge_duration: Option<Duration>,
+    event_sink: Option<&dyn MpTrainingEventSink>,
 ) {
     let pending = completed.pending;
+    let event = MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+        completed_passes: completed.completed_passes,
+        max_passes: completed.max_passes,
+        epoch: pending.epoch,
+        meta_iteration: meta_iter,
+        skipped_slots: completed.skipped_slots,
+        sweep_duration,
+        purge_duration,
+        max_reached: completed.max_reached,
+    });
+    if let Some(event_sink) = event_sink {
+        event_sink.publish(event);
+        return;
+    }
+
     let (d_pos, d_neg) =
         regret_discount_factors(pending.epoch, config.dcfr_alpha, config.dcfr_beta);
     let d_strat = strategy_discount_factor(pending.epoch, config.dcfr_gamma);
@@ -1267,6 +1436,7 @@ fn compute_buckets_trivial(deal: &Deal, bucket_counts: [u16; 4]) -> DealWithBuck
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
     use rand::SeedableRng;
@@ -1290,6 +1460,17 @@ mod tests {
     use crate::blueprint_v2::cluster_pipeline::{canonical_key, combo_index};
     use crate::poker::{Suit, Value};
     use crate::{abstraction::isomorphism::CanonicalBoard, blueprint_v2::bucket_file};
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<MpTrainingEvent>>,
+    }
+
+    impl MpTrainingEventSink for RecordingEventSink {
+        fn publish(&self, event: MpTrainingEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn toy_config(num_players: u8, iterations: u64) -> BlueprintMpConfig {
         let blinds = vec![
@@ -1894,6 +2075,78 @@ mod tests {
     }
 
     // -- discount scheduler tests --
+
+    #[timed_test]
+    fn compact_dcfr_pass_status_includes_required_fields_and_optional_state() {
+        let event = MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+            completed_passes: 40,
+            max_passes: NonZeroU64::new(40),
+            epoch: 77,
+            meta_iteration: 12_345,
+            skipped_slots: 2,
+            sweep_duration: Duration::from_millis(1250),
+            purge_duration: Some(Duration::from_millis(50)),
+            max_reached: true,
+        });
+
+        assert_eq!(
+            format_mp_training_event_compact(&event),
+            "DCFR pass 40/40 | epoch 77 | sweep 1.250s | skipped 2 | cap reached; stopped"
+        );
+        assert!(event.is_durable());
+    }
+
+    #[timed_test]
+    fn compact_dcfr_pass_status_omits_zero_skipped_and_unset_max() {
+        let event = MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+            completed_passes: 3,
+            max_passes: None,
+            epoch: 9,
+            meta_iteration: 100,
+            skipped_slots: 0,
+            sweep_duration: Duration::from_millis(12),
+            purge_duration: None,
+            max_reached: false,
+        });
+
+        assert_eq!(
+            format_mp_training_event_compact(&event),
+            "DCFR pass 3 | epoch 9 | sweep 12.0ms"
+        );
+        assert!(!event.is_durable());
+    }
+
+    #[timed_test]
+    fn eager_runner_routes_schedule_and_completed_pass_to_sink() {
+        let mut config = toy_config(2, 1);
+        config.training.batch_size = 1;
+        config.training.lcfr_warmup_iterations = 0;
+        config.training.lcfr_discount_interval = 1;
+        config.training.dcfr_discount_max_passes = NonZeroU64::new(1);
+        let ctx = setup_training(&config);
+        let sink = Arc::new(RecordingEventSink::default());
+        let shared_sink: SharedMpTrainingEventSink = sink.clone();
+
+        let result =
+            run_training_with_event_sink(&ctx, &config.training, &config.game, Some(shared_sink));
+
+        assert_eq!(result.meta_iterations, 1);
+        let events = sink.events.lock().unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(MpTrainingEvent::DcfrSchedule(_))
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+                completed_passes: 1,
+                epoch: 1,
+                max_reached: true,
+                ..
+            }))
+        ));
+        assert_eq!(events.len(), 2, "final pass must be a single durable event");
+    }
 
     fn wall_clock_scheduler(warmup: u64, interval_seconds: u64) -> DiscountScheduler {
         wall_clock_scheduler_at(0, warmup, interval_seconds)

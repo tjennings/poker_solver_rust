@@ -9,7 +9,9 @@ use crate::training_runtime::{
 };
 
 use super::config::{BlueprintMpConfig, MpTrainingBackend};
-use super::trainer::{LazyMpTrainingStepper, LazyTrainContext, setup_lazy_training};
+use super::trainer::{
+    LazyMpTrainingStepper, LazyTrainContext, SharedMpTrainingEventSink, setup_lazy_training,
+};
 
 type LazyRuntimeHook = Box<dyn FnMut(&LazyTrainContext) -> RuntimeResult<()> + Send + 'static>;
 
@@ -24,6 +26,7 @@ pub struct LazySparseMpTrainingRuntimeAdapter {
     snapshot_hook: Option<LazyRuntimeHook>,
     telemetry_refresh_hook: Option<LazyRuntimeHook>,
     reload_hook: Option<LazyRuntimeHook>,
+    event_sink: Option<SharedMpTrainingEventSink>,
 }
 
 impl LazySparseMpTrainingRuntimeAdapter {
@@ -50,6 +53,7 @@ impl LazySparseMpTrainingRuntimeAdapter {
             snapshot_hook: None,
             telemetry_refresh_hook: None,
             reload_hook: None,
+            event_sink: None,
         }
     }
 
@@ -100,6 +104,13 @@ impl LazySparseMpTrainingRuntimeAdapter {
         self.reload_hook = Some(Box::new(hook));
         self
     }
+
+    /// Install a runner-owned multiplayer training event sink.
+    #[must_use]
+    pub fn with_event_sink(mut self, event_sink: SharedMpTrainingEventSink) -> Self {
+        self.event_sink = Some(event_sink);
+        self
+    }
 }
 
 impl TrainingRuntimeBackend for LazySparseMpTrainingRuntimeAdapter {
@@ -139,11 +150,12 @@ impl TrainingRuntimeBackend for LazySparseMpTrainingRuntimeAdapter {
         let start_meta_iter = self.ctx.iterations.load(Ordering::Relaxed);
         self.counters.seed_units(start_meta_iter);
         self.limits = limits_from_config(&self.config);
-        self.stepper = Some(LazyMpTrainingStepper::from_context(
+        self.stepper = Some(LazyMpTrainingStepper::from_context_with_event_sink(
             &self.ctx,
             &self.config.training,
             &self.config.game,
             start_meta_iter,
+            self.event_sink.clone(),
         ));
         Ok(())
     }
@@ -208,8 +220,9 @@ fn unsupported_error(message: &'static str) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -219,12 +232,26 @@ mod tests {
         MpSnapshotConfig, MpSnapshotFormat, MpStreetCluster, MpStreetSizes, MpTrainingBackend,
         MpTrainingConfig,
     };
+    use crate::blueprint_mp::trainer::{
+        MpDcfrPassEvent, MpTrainingEvent, MpTrainingEventSink, SharedMpTrainingEventSink,
+    };
     use crate::training_runtime::{
         BatchBudget, RuntimeLimits, RuntimeStopReason, TrainingRuntimeBackend, TrainingUnit,
         run_until_stopped,
     };
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<MpTrainingEvent>>,
+    }
+
+    impl MpTrainingEventSink for RecordingEventSink {
+        fn publish(&self, event: MpTrainingEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     fn toy_config(iterations: u64) -> BlueprintMpConfig {
         let blinds = vec![
@@ -313,6 +340,44 @@ mod tests {
         let mut adapter = LazySparseMpTrainingRuntimeAdapter::new(toy_config(iterations));
         adapter.prepare().expect("prepare");
         adapter
+    }
+
+    #[test]
+    fn event_sink_propagates_through_lazy_adapter_prepare_and_pass() {
+        let mut config = toy_config(1);
+        config.training.batch_size = 1;
+        config.training.lcfr_warmup_iterations = 0;
+        config.training.lcfr_discount_interval = 1;
+        config.training.dcfr_discount_max_passes = NonZeroU64::new(1);
+        let sink = Arc::new(RecordingEventSink::default());
+        let shared_sink: SharedMpTrainingEventSink = sink.clone();
+        let mut adapter =
+            LazySparseMpTrainingRuntimeAdapter::new(config).with_event_sink(shared_sink);
+
+        adapter.prepare().expect("prepare");
+        let outcome = adapter
+            .run_next_batch(BatchBudget::from_limits(
+                adapter.limits(),
+                adapter.counters(),
+            ))
+            .expect("batch");
+
+        assert_eq!(outcome.units_completed, 1);
+        let events = sink.events.lock().unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(MpTrainingEvent::DcfrSchedule(_))
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+                completed_passes: 1,
+                epoch: 1,
+                max_reached: true,
+                ..
+            }))
+        ));
+        assert_eq!(events.len(), 2);
     }
 
     #[test]

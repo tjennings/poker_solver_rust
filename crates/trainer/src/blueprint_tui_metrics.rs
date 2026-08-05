@@ -2,8 +2,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use poker_solver_core::blueprint_mp::trainer::{
+    MpTrainingEvent, MpTrainingEventSink, format_mp_training_event_compact,
+};
 use poker_solver_core::blueprint_v2::baseline_validation::BaselineValidationReport;
 use poker_solver_core::blueprint_v2::exploitable_spots::ExploitableSpot;
 
@@ -15,6 +18,14 @@ use crate::blueprint_tui_widgets::CellStrategy;
 /// Maximum number of monitored scenarios.
 pub const MAX_SCENARIOS: usize = 16;
 const SNAPSHOT_STATUS_DETAIL_CHARS: usize = 48;
+const TRAINING_EVENT_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+struct PublishedTrainingStatus {
+    text: String,
+    published_at: Instant,
+    durable: bool,
+}
 
 /// One-line status for manual TUI snapshot requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +73,7 @@ pub struct BlueprintTuiMetrics {
     pub strategy_refresh_trigger: Arc<AtomicBool>,
     pub config_reload_trigger: Arc<AtomicBool>,
     pub snapshot_status: Mutex<SnapshotStatus>,
+    latest_training_status: Mutex<Option<PublishedTrainingStatus>>,
 
     /// Reloaded TUI state pushed by the trainer after a config reload.
     pub reloaded_tui_state: Mutex<Option<ReloadedTuiState>>,
@@ -125,6 +137,7 @@ impl BlueprintTuiMetrics {
             strategy_refresh_trigger: Arc::new(AtomicBool::new(false)),
             config_reload_trigger: Arc::new(AtomicBool::new(false)),
             snapshot_status: Mutex::new(SnapshotStatus::Idle),
+            latest_training_status: Mutex::new(None),
             reloaded_tui_state: Mutex::new(None),
 
             strategy_snapshots: Mutex::new(snapshots),
@@ -203,6 +216,42 @@ impl BlueprintTuiMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *current = status;
+    }
+
+    /// Publish an MP training event at an injected monotonic time.
+    ///
+    /// This seam keeps replacement and expiry behavior deterministic in tests.
+    pub fn publish_training_event_at(&self, event: MpTrainingEvent, now: Instant) {
+        let status = PublishedTrainingStatus {
+            text: format_mp_training_event_compact(&event),
+            published_at: now,
+            durable: event.is_durable(),
+        };
+        let mut latest = self
+            .latest_training_status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *latest = Some(status);
+    }
+
+    /// Latest non-expired MP training status at an injected monotonic time.
+    #[must_use]
+    pub fn training_status_text_at(&self, now: Instant) -> Option<String> {
+        let latest = self
+            .latest_training_status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        latest.as_ref().and_then(|status| {
+            (status.durable
+                || now.saturating_duration_since(status.published_at) < TRAINING_EVENT_TTL)
+                .then(|| status.text.clone())
+        })
+    }
+
+    /// Latest non-expired MP training status for rendering.
+    #[must_use]
+    pub fn training_status_text(&self) -> Option<String> {
+        self.training_status_text_at(Instant::now())
     }
 
     pub fn request_strategy_refresh(&self) {
@@ -418,6 +467,12 @@ impl BlueprintTuiMetrics {
     }
 }
 
+impl MpTrainingEventSink for BlueprintTuiMetrics {
+    fn publish(&self, event: MpTrainingEvent) {
+        self.publish_training_event_at(event, Instant::now());
+    }
+}
+
 fn truncate_status_detail(detail: &str) -> String {
     let mut chars = detail.chars();
     let mut truncated: String = chars.by_ref().take(SNAPSHOT_STATUS_DETAIL_CHARS).collect();
@@ -430,11 +485,28 @@ fn truncate_status_detail(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poker_solver_core::blueprint_mp::trainer::{
+        MpDcfrPassEvent, MpDcfrScheduleEvent, MpDcfrScheduleMode,
+    };
+    use std::num::NonZeroU64;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
     use test_macros::timed_test;
+
+    fn pass_event(pass: u64, max_reached: bool) -> MpTrainingEvent {
+        MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+            completed_passes: pass,
+            max_passes: NonZeroU64::new(40),
+            epoch: pass,
+            meta_iteration: pass * 100,
+            skipped_slots: 0,
+            sweep_duration: Duration::from_millis(25),
+            purge_duration: None,
+            max_reached,
+        })
+    }
 
     #[timed_test(10)]
     fn initial_state() {
@@ -445,6 +517,62 @@ mod tests {
         assert!(!m.take_snapshot_trigger());
         assert_eq!(m.snapshot_status_text(), None);
         assert_eq!(m.target_iterations, Some(1000));
+        assert_eq!(m.training_status_text(), None);
+    }
+
+    #[timed_test(10)]
+    fn ordinary_training_status_expires_after_sixty_seconds() {
+        let metrics = BlueprintTuiMetrics::new(None, None);
+        let published_at = Instant::now();
+        metrics.publish_training_event_at(pass_event(1, false), published_at);
+
+        assert!(
+            metrics
+                .training_status_text_at(published_at + Duration::from_secs(59))
+                .is_some()
+        );
+        assert_eq!(
+            metrics.training_status_text_at(published_at + Duration::from_secs(60)),
+            None
+        );
+    }
+
+    #[timed_test(10)]
+    fn latest_training_event_replaces_previous_status() {
+        let metrics = BlueprintTuiMetrics::new(None, None);
+        let now = Instant::now();
+        metrics.publish_training_event_at(
+            MpTrainingEvent::DcfrSchedule(MpDcfrScheduleEvent {
+                mode: MpDcfrScheduleMode::WallClock {
+                    interval_seconds: NonZeroU64::new(600).unwrap(),
+                },
+                warmup_meta_iterations: 3_000_000,
+                max_passes: NonZeroU64::new(40),
+            }),
+            now,
+        );
+        metrics.publish_training_event_at(pass_event(2, false), now + Duration::from_secs(1));
+
+        assert_eq!(
+            metrics
+                .training_status_text_at(now + Duration::from_secs(2))
+                .as_deref(),
+            Some("DCFR pass 2/40 | epoch 2 | sweep 25.0ms")
+        );
+    }
+
+    #[timed_test(10)]
+    fn max_reached_training_status_is_durable() {
+        let metrics = BlueprintTuiMetrics::new(None, None);
+        let now = Instant::now();
+        metrics.publish_training_event_at(pass_event(40, true), now);
+
+        assert_eq!(
+            metrics
+                .training_status_text_at(now + Duration::from_secs(86_400))
+                .as_deref(),
+            Some("DCFR pass 40/40 | epoch 40 | sweep 25.0ms | cap reached; stopped")
+        );
     }
 
     #[timed_test(10)]
