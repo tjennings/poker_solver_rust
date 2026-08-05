@@ -95,6 +95,9 @@ struct PendingDiscount {
 struct CompletedDiscount {
     pending: PendingDiscount,
     skipped_slots: u64,
+    completed_passes: u64,
+    max_passes: Option<NonZeroU64>,
+    max_reached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +123,8 @@ enum DiscountScheduleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiscountScheduler {
     warmup_iterations: u64,
+    completed_passes: u64,
+    max_passes: Option<NonZeroU64>,
     state: DiscountScheduleState,
 }
 
@@ -150,11 +155,19 @@ impl DiscountScheduler {
         );
         Self {
             warmup_iterations: config.lcfr_warmup_iterations,
+            completed_passes: 0,
+            max_passes: config.dcfr_discount_max_passes,
             state,
         }
     }
 
     fn pending(&mut self, meta_iter: u64, elapsed: Duration) -> Option<PendingDiscount> {
+        if self
+            .max_passes
+            .is_some_and(|max| self.completed_passes >= max.get())
+        {
+            return None;
+        }
         match &mut self.state {
             DiscountScheduleState::Iterations {
                 interval,
@@ -260,9 +273,17 @@ impl DiscountScheduler {
             _ => unreachable!("discount completion must match its scheduler mode"),
         };
 
+        self.completed_passes = self.completed_passes.saturating_add(1);
+        let max_reached = self
+            .max_passes
+            .is_some_and(|max| self.completed_passes >= max.get());
+
         CompletedDiscount {
             pending,
             skipped_slots: pending.skipped_slots.saturating_add(additional_skipped),
+            completed_passes: self.completed_passes,
+            max_passes: self.max_passes,
+            max_reached,
         }
     }
 }
@@ -982,16 +1003,19 @@ fn nanos_since(started: Instant) -> u64 {
 }
 
 fn log_discount_schedule(config: &MpTrainingConfig) {
+    let max_passes = config
+        .dcfr_discount_max_passes
+        .map_or_else(|| "unlimited".to_string(), |max| max.get().to_string());
     if let Some(interval) = config.dcfr_discount_interval_seconds {
         eprintln!(
-            "blueprint_mp DCFR schedule: mode=wall_clock interval={}s warmup_meta_iterations={} overrides_lcfr_discount_interval={}",
-            interval, config.lcfr_warmup_iterations, config.lcfr_discount_interval
+            "blueprint_mp DCFR schedule: mode=wall_clock interval={}s warmup_meta_iterations={} max_passes={max_passes} overrides_lcfr_discount_interval={}",
+            interval, config.lcfr_warmup_iterations, config.lcfr_discount_interval,
         );
     } else {
         eprintln!(
-            "blueprint_mp DCFR schedule: mode=iterations interval={} warmup_meta_iterations={}",
+            "blueprint_mp DCFR schedule: mode=iterations interval={} warmup_meta_iterations={} max_passes={max_passes}",
             config.lcfr_discount_interval.max(1),
-            config.lcfr_warmup_iterations
+            config.lcfr_warmup_iterations,
         );
     }
 }
@@ -1026,13 +1050,24 @@ fn log_discount_pass(
         || "n/a".to_string(),
         |duration| format!("{:.3}s", duration.as_secs_f64()),
     );
+    let max_passes = completed
+        .max_passes
+        .map_or_else(|| "unlimited".to_string(), |max| max.get().to_string());
     eprintln!(
-        "blueprint_mp DCFR pass: mode={mode} interval={interval} scheduled={scheduled} execution_elapsed={:.3}s meta_iter={meta_iter} epoch={} d_pos={d_pos:.9} d_neg={d_neg:.9} d_strat={d_strat:.9} lateness={lateness} skipped_slots={} sweep={:.3}s purge={purge}",
+        "blueprint_mp DCFR pass: pass={}/{} mode={mode} interval={interval} scheduled={scheduled} execution_elapsed={:.3}s meta_iter={meta_iter} epoch={} d_pos={d_pos:.9} d_neg={d_neg:.9} d_strat={d_strat:.9} lateness={lateness} skipped_slots={} sweep={:.3}s purge={purge}",
+        completed.completed_passes,
+        max_passes,
         pending.observed_elapsed.as_secs_f64(),
         pending.epoch,
         completed.skipped_slots,
         sweep_duration.as_secs_f64(),
     );
+    if completed.max_reached {
+        eprintln!(
+            "blueprint_mp DCFR maximum reached: completed_passes={} max_passes={}; future discount and lazy purge passes are disabled",
+            completed.completed_passes, max_passes
+        );
+    }
 }
 
 fn apply_dcfr_discount(storage: &MpStorage, epoch: u64, config: &MpTrainingConfig) {
@@ -1247,6 +1282,7 @@ mod tests {
     };
     use crate::blueprint_mp::game_tree::{MpGameNode, MpGameTree, TreeAction};
     use crate::blueprint_mp::mccfr::sample_deal;
+    use crate::blueprint_mp::sparse_storage::MpInfosetKey;
     use crate::blueprint_mp::storage::MpStorage;
     use crate::blueprint_mp::types::Street;
     use crate::blueprint_v2::Street as V2Street;
@@ -1304,6 +1340,7 @@ mod tests {
             lcfr_warmup_iterations: 0,
             lcfr_discount_interval: 50,
             dcfr_discount_interval_seconds: None,
+            dcfr_discount_max_passes: None,
             prune_after_iterations: 1_000_000,
             traversal_pruning_enabled: false,
             prune_threshold: -250,
@@ -1370,6 +1407,7 @@ mod tests {
             lcfr_warmup_iterations: 100,
             lcfr_discount_interval: 50,
             dcfr_discount_interval_seconds: None,
+            dcfr_discount_max_passes: None,
             prune_after_iterations: 1_000_000,
             traversal_pruning_enabled: false,
             prune_threshold: -250,
@@ -1982,6 +2020,39 @@ mod tests {
     }
 
     #[timed_test]
+    fn wall_clock_discount_executes_exactly_max_passes_then_stops() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.dcfr_discount_interval_seconds = NonZeroU64::new(10);
+        config.dcfr_discount_max_passes = NonZeroU64::new(2);
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        let first = scheduler
+            .pending(1, Duration::from_secs(10))
+            .expect("first pass should execute");
+        let first_completed = scheduler.complete(first, 1, Duration::from_secs(10));
+        assert_eq!(first_completed.completed_passes, 1);
+        assert!(!first_completed.max_reached);
+
+        let second = scheduler
+            .pending(2, Duration::from_secs(20))
+            .expect("final configured pass should execute");
+        let second_completed = scheduler.complete(second, 2, Duration::from_secs(20));
+        assert_eq!(second_completed.completed_passes, 2);
+        assert!(second_completed.max_reached);
+
+        assert!(scheduler.pending(3, Duration::from_secs(30)).is_none());
+        assert_eq!(scheduler.completed_passes, 2);
+        assert!(matches!(
+            scheduler.state,
+            DiscountScheduleState::WallClock {
+                next_deadline: Some(deadline),
+                ..
+            } if deadline == Duration::from_secs(30)
+        ));
+    }
+
+    #[timed_test]
     fn wall_clock_config_overrides_iteration_schedule() {
         let mut config = toy_training_config(1_000);
         config.lcfr_warmup_iterations = 0;
@@ -2059,10 +2130,147 @@ mod tests {
     }
 
     #[timed_test]
+    fn iteration_discount_pass_cap_is_distinct_from_high_factor_epoch() {
+        let mut config = toy_training_config(20_000);
+        config.lcfr_warmup_iterations = 10_000;
+        config.lcfr_discount_interval = 50;
+        config.dcfr_discount_max_passes = NonZeroU64::new(1);
+        let mut scheduler = DiscountScheduler::new(&config, 9_900);
+
+        let pending = scheduler
+            .pending(10_000, Duration::ZERO)
+            .expect("first process-local pass should execute at the warmup boundary");
+        assert_eq!(pending.epoch, 200);
+        let completed = scheduler.complete(pending, 10_000, Duration::ZERO);
+        assert_eq!(completed.completed_passes, 1);
+        assert!(completed.max_reached);
+        assert!(scheduler.pending(10_050, Duration::ZERO).is_none());
+    }
+
+    #[timed_test]
+    fn iteration_discount_executes_exactly_max_passes_then_stops() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 10;
+        config.dcfr_discount_max_passes = NonZeroU64::new(2);
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        for pass in 1..=2 {
+            let meta_iter = pass * 10;
+            let pending = scheduler
+                .pending(meta_iter, Duration::ZERO)
+                .expect("configured pass should execute");
+            assert_eq!(
+                scheduler
+                    .complete(pending, meta_iter, Duration::ZERO)
+                    .completed_passes,
+                pass
+            );
+        }
+
+        assert!(scheduler.pending(30, Duration::ZERO).is_none());
+    }
+
+    #[timed_test]
+    fn eager_values_remain_unchanged_after_discount_pass_cap() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 1;
+        config.dcfr_discount_max_passes = NonZeroU64::new(1);
+        let tree = minimal_tree(2);
+        let storage = MpStorage::new(&tree, [10; 4]);
+        let node = first_decision_node(&tree);
+        storage.add_regret(node, 0, 0, 1_000);
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        let first = scheduler
+            .pending(1, Duration::ZERO)
+            .expect("first discount should be due");
+        apply_dcfr_discount(&storage, first.epoch, &config);
+        let _ = scheduler.complete(first, 1, Duration::ZERO);
+        let capped_value = storage.get_regret(node, 0, 0);
+
+        if let Some(unexpected) = scheduler.pending(2, Duration::ZERO) {
+            apply_dcfr_discount(&storage, unexpected.epoch, &config);
+            let _ = scheduler.complete(unexpected, 2, Duration::ZERO);
+        }
+        assert_eq!(storage.get_regret(node, 0, 0), capped_value);
+    }
+
+    #[timed_test]
+    fn skipped_schedule_slots_consume_only_one_pass() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.dcfr_discount_interval_seconds = NonZeroU64::new(10);
+        config.dcfr_discount_max_passes = NonZeroU64::new(2);
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        let late = scheduler
+            .pending(1, Duration::from_secs(35))
+            .expect("late observation should execute one pass");
+        assert_eq!(late.skipped_slots, 2);
+        let completed = scheduler.complete(late, 1, Duration::from_secs(46));
+        assert_eq!(completed.skipped_slots, 3);
+        assert_eq!(completed.completed_passes, 1);
+
+        let final_pass = scheduler
+            .pending(2, Duration::from_secs(50))
+            .expect("one pass should remain despite skipped slots");
+        assert_eq!(
+            scheduler
+                .complete(final_pass, 2, Duration::from_secs(50))
+                .completed_passes,
+            2
+        );
+        assert!(scheduler.pending(3, Duration::from_secs(100)).is_none());
+    }
+
+    #[timed_test]
+    fn preseeded_iteration_start_does_not_preconsume_pass_cap() {
+        let mut config = toy_training_config(20_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 50;
+        config.dcfr_discount_max_passes = NonZeroU64::new(1);
+        let mut scheduler = DiscountScheduler::new(&config, 10_000);
+
+        assert_eq!(scheduler.completed_passes, 0);
+        let pending = scheduler
+            .pending(10_050, Duration::ZERO)
+            .expect("preseeded progress must not consume a process-local pass");
+        assert_eq!(pending.epoch, 201);
+        assert_eq!(
+            scheduler
+                .complete(pending, 10_050, Duration::ZERO)
+                .completed_passes,
+            1
+        );
+    }
+
+    #[timed_test]
+    fn unlimited_discount_schedule_remains_unbounded() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 10;
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        for pass in 1..=4 {
+            let meta_iter = pass * 10;
+            let pending = scheduler
+                .pending(meta_iter, Duration::ZERO)
+                .expect("missing cap must preserve unlimited scheduling");
+            let completed = scheduler.complete(pending, meta_iter, Duration::ZERO);
+            assert_eq!(completed.completed_passes, pass);
+            assert_eq!(completed.max_passes, None);
+            assert!(!completed.max_reached);
+        }
+    }
+
+    #[timed_test]
     fn eager_and_lazy_use_identical_scheduler_decisions() {
         let mut config = toy_training_config(1_000);
         config.lcfr_warmup_iterations = 25;
         config.dcfr_discount_interval_seconds = NonZeroU64::new(10);
+        config.dcfr_discount_max_passes = NonZeroU64::new(2);
         let mut eager = DiscountScheduler::new(&config, 0);
         let mut lazy = DiscountScheduler::new(&config, 0);
 
@@ -2083,6 +2291,43 @@ mod tests {
                 );
             }
         }
+
+        assert_eq!(eager.completed_passes, 2);
+        assert_eq!(lazy.completed_passes, 2);
+        assert!(eager.pending(100, Duration::from_secs(100)).is_none());
+        assert!(lazy.pending(100, Duration::from_secs(100)).is_none());
+    }
+
+    #[timed_test]
+    fn lazy_purge_is_not_called_after_discount_pass_cap() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 1;
+        config.dcfr_discount_max_passes = NonZeroU64::new(1);
+        config.negative_action_subtree_purge_enabled = true;
+        let storage = SparseMpStorage::with_shards(1);
+        let parent =
+            MpInfosetKey::from_street_bucket(Seat::from_raw(0), Street::Flop, 1, 0, 7, 7, 1);
+        storage.add_regret(parent, 4, 3, -100);
+        let blocked =
+            storage.transition_negative_action_edge(parent, 3, -100, -1, 0, (0, 7 | (3 << 4), 2));
+        assert!(blocked.blocked);
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        let first = scheduler
+            .pending(1, Duration::ZERO)
+            .expect("first discount should be due");
+        apply_dcfr_discount_lazy(&storage, first.epoch, &config);
+        purge_negative_action_subtrees_after_discount(&storage, &config);
+        let _ = scheduler.complete(first, 1, Duration::ZERO);
+        assert_eq!(storage.negative_action_telemetry().subtree_purge_calls, 1);
+
+        if let Some(unexpected) = scheduler.pending(2, Duration::ZERO) {
+            apply_dcfr_discount_lazy(&storage, unexpected.epoch, &config);
+            purge_negative_action_subtrees_after_discount(&storage, &config);
+            let _ = scheduler.complete(unexpected, 2, Duration::ZERO);
+        }
+        assert_eq!(storage.negative_action_telemetry().subtree_purge_calls, 1);
     }
 
     // -- apply_dcfr_discount tests --

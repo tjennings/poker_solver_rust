@@ -77,6 +77,7 @@ training:
   # Legacy iteration fallback; overridden while the wall-clock key is present.
   # lcfr_discount_interval: 3000000
   dcfr_discount_interval_seconds: 600
+  dcfr_discount_max_passes: 40
   prune_after_iterations: 4000000
   traversal_pruning_enabled: true
   prune_threshold: -1
