@@ -10,9 +10,10 @@
     clippy::too_many_arguments
 )]
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Global prune counters — accumulated per batch, read+reset by TUI bridge.
 pub static PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +60,244 @@ use crate::poker::{Card, full_deck};
 pub struct TrainResult {
     pub meta_iterations: u64,
     pub final_strategy_delta: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscountMode {
+    Iterations,
+    WallClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscountBoundary {
+    MetaIteration(u64),
+    Elapsed(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscountLateness {
+    MetaIterations(u64),
+    WallClock(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingDiscount {
+    mode: DiscountMode,
+    epoch: u64,
+    interval: u64,
+    boundary: DiscountBoundary,
+    lateness: DiscountLateness,
+    skipped_slots: u64,
+    observed_elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedDiscount {
+    pending: PendingDiscount,
+    skipped_slots: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscountScheduleState {
+    Iterations {
+        interval: u64,
+        next_boundary: Option<u64>,
+    },
+    WallClock {
+        interval_seconds: NonZeroU64,
+        armed: bool,
+        next_deadline: Option<Duration>,
+        next_epoch: u64,
+    },
+}
+
+/// Pure DCFR scheduling state shared by eager and lazy training.
+///
+/// Callers supply completed meta-iterations and monotonic process elapsed time.
+/// This keeps tests deterministic and leaves `Instant` ownership in production
+/// runners. A due pass is completed only after its table sweep succeeds, so the
+/// wall-clock schedule can advance beyond deadlines crossed during the sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscountScheduler {
+    warmup_iterations: u64,
+    state: DiscountScheduleState,
+}
+
+impl DiscountScheduler {
+    fn new(config: &MpTrainingConfig, start_meta_iter: u64) -> Self {
+        let state = config.dcfr_discount_interval_seconds.map_or_else(
+            || {
+                let interval = config.lcfr_discount_interval.max(1);
+                DiscountScheduleState::Iterations {
+                    interval,
+                    next_boundary: first_iteration_boundary(
+                        start_meta_iter,
+                        config.lcfr_warmup_iterations,
+                        interval,
+                    ),
+                }
+            },
+            |interval_seconds| {
+                let armed = start_meta_iter >= config.lcfr_warmup_iterations;
+                let next_deadline = armed.then(|| Duration::from_secs(interval_seconds.get()));
+                DiscountScheduleState::WallClock {
+                    interval_seconds,
+                    armed,
+                    next_deadline,
+                    next_epoch: 1,
+                }
+            },
+        );
+        Self {
+            warmup_iterations: config.lcfr_warmup_iterations,
+            state,
+        }
+    }
+
+    fn pending(&mut self, meta_iter: u64, elapsed: Duration) -> Option<PendingDiscount> {
+        match &mut self.state {
+            DiscountScheduleState::Iterations {
+                interval,
+                next_boundary,
+            } => {
+                let boundary = (*next_boundary)?;
+                if meta_iter < boundary {
+                    return None;
+                }
+                let skipped_slots = meta_iter.saturating_sub(boundary) / *interval;
+                let scheduled = boundary.checked_add(interval.checked_mul(skipped_slots)?)?;
+                Some(PendingDiscount {
+                    mode: DiscountMode::Iterations,
+                    epoch: scheduled / *interval,
+                    interval: *interval,
+                    boundary: DiscountBoundary::MetaIteration(scheduled),
+                    lateness: DiscountLateness::MetaIterations(meta_iter.saturating_sub(scheduled)),
+                    skipped_slots,
+                    observed_elapsed: elapsed,
+                })
+            }
+            DiscountScheduleState::WallClock {
+                interval_seconds,
+                armed,
+                next_deadline,
+                next_epoch,
+            } => {
+                if !*armed {
+                    if meta_iter < self.warmup_iterations {
+                        return None;
+                    }
+                    *armed = true;
+                    *next_deadline =
+                        elapsed.checked_add(Duration::from_secs(interval_seconds.get()));
+                    return None;
+                }
+
+                let deadline = (*next_deadline)?;
+                if elapsed < deadline {
+                    return None;
+                }
+                let skipped_slots = elapsed
+                    .saturating_sub(deadline)
+                    .as_nanos()
+                    .checked_div(interval_nanos(*interval_seconds))
+                    .and_then(|slots| u64::try_from(slots).ok())?;
+                let scheduled =
+                    checked_add_interval_slots(deadline, *interval_seconds, skipped_slots)?;
+                Some(PendingDiscount {
+                    mode: DiscountMode::WallClock,
+                    epoch: *next_epoch,
+                    interval: interval_seconds.get(),
+                    boundary: DiscountBoundary::Elapsed(scheduled),
+                    lateness: DiscountLateness::WallClock(elapsed.saturating_sub(scheduled)),
+                    skipped_slots,
+                    observed_elapsed: elapsed,
+                })
+            }
+        }
+    }
+
+    fn complete(
+        &mut self,
+        pending: PendingDiscount,
+        meta_iter: u64,
+        fresh_elapsed: Duration,
+    ) -> CompletedDiscount {
+        let additional_skipped = match (&mut self.state, pending.boundary) {
+            (
+                DiscountScheduleState::Iterations {
+                    interval,
+                    next_boundary,
+                },
+                DiscountBoundary::MetaIteration(scheduled),
+            ) => {
+                let crossed = meta_iter.saturating_sub(scheduled) / *interval;
+                *next_boundary = scheduled
+                    .checked_add(interval.saturating_mul(crossed))
+                    .and_then(|last| last.checked_add(*interval));
+                crossed
+            }
+            (
+                DiscountScheduleState::WallClock {
+                    interval_seconds,
+                    next_deadline,
+                    next_epoch,
+                    ..
+                },
+                DiscountBoundary::Elapsed(scheduled),
+            ) => {
+                let crossed = fresh_elapsed
+                    .saturating_sub(scheduled)
+                    .as_nanos()
+                    .checked_div(interval_nanos(*interval_seconds))
+                    .and_then(|slots| u64::try_from(slots).ok())
+                    .unwrap_or(u64::MAX);
+                *next_deadline = crossed.checked_add(1).and_then(|slots| {
+                    checked_add_interval_slots(scheduled, *interval_seconds, slots)
+                });
+                *next_epoch = next_epoch.checked_add(1).unwrap_or(u64::MAX);
+                crossed
+            }
+            _ => unreachable!("discount completion must match its scheduler mode"),
+        };
+
+        CompletedDiscount {
+            pending,
+            skipped_slots: pending.skipped_slots.saturating_add(additional_skipped),
+        }
+    }
+}
+
+fn first_iteration_boundary(
+    start_meta_iter: u64,
+    warmup_iterations: u64,
+    interval: u64,
+) -> Option<u64> {
+    let first_after_start = start_meta_iter
+        .checked_div(interval)?
+        .checked_add(1)?
+        .checked_mul(interval)?;
+    let first_at_or_after_warmup = if warmup_iterations == 0 {
+        interval
+    } else {
+        warmup_iterations
+            .checked_add(interval - 1)?
+            .checked_div(interval)?
+            .checked_mul(interval)?
+    };
+    Some(first_after_start.max(first_at_or_after_warmup))
+}
+
+fn interval_nanos(interval_seconds: NonZeroU64) -> u128 {
+    u128::from(interval_seconds.get()) * 1_000_000_000
+}
+
+fn checked_add_interval_slots(
+    base: Duration,
+    interval_seconds: NonZeroU64,
+    slots: u64,
+) -> Option<Duration> {
+    let seconds = interval_seconds.get().checked_mul(slots)?;
+    base.checked_add(Duration::from_secs(seconds))
 }
 
 /// Timing counters accumulated by the lazy sparse MP training loop.
@@ -244,6 +483,9 @@ fn training_loop(
         .round() as i32;
     let mut meta_iter: u64 = 0;
     let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_1234);
+    let discount_clock_start = Instant::now();
+    let mut discount_scheduler = DiscountScheduler::new(config, meta_iter);
+    log_discount_schedule(config);
 
     loop {
         if meta_iter >= max_iters || quit.load(Ordering::Relaxed) {
@@ -272,8 +514,14 @@ fn training_loop(
         meta_iter += batch;
         iterations.store(meta_iter, Ordering::Relaxed);
 
-        if should_discount(meta_iter, config) {
-            apply_dcfr_discount(storage, meta_iter, config);
+        if let Some(pending) = discount_scheduler.pending(meta_iter, discount_clock_start.elapsed())
+        {
+            let discount_started = Instant::now();
+            apply_dcfr_discount(storage, pending.epoch, config);
+            let sweep_duration = discount_started.elapsed();
+            let completed =
+                discount_scheduler.complete(pending, meta_iter, discount_clock_start.elapsed());
+            log_discount_pass(completed, meta_iter, config, sweep_duration, None);
         }
     }
 
@@ -303,6 +551,8 @@ pub struct LazyMpTrainingStepper {
     meta_iter: u64,
     rng: SmallRng,
     scaled_threshold: i32,
+    discount_clock_start: Instant,
+    discount_scheduler: DiscountScheduler,
 }
 
 impl LazyMpTrainingStepper {
@@ -347,6 +597,9 @@ impl LazyMpTrainingStepper {
             .clamp(f64::from(i32::MIN), f64::from(i32::MAX))
             .round() as i32;
         let rng = pruning_rng_at_meta_iter(start_meta_iter, &training);
+        let discount_clock_start = Instant::now();
+        let discount_scheduler = DiscountScheduler::new(&training, start_meta_iter);
+        log_discount_schedule(&training);
         iterations.store(start_meta_iter, Ordering::Relaxed);
         Self {
             game,
@@ -362,6 +615,8 @@ impl LazyMpTrainingStepper {
             meta_iter: start_meta_iter,
             rng,
             scaled_threshold,
+            discount_clock_start,
+            discount_scheduler,
         }
     }
 
@@ -411,11 +666,32 @@ impl LazyMpTrainingStepper {
         self.meta_iter += batch;
         self.iterations.store(self.meta_iter, Ordering::Relaxed);
 
-        if should_discount(self.meta_iter, &self.training) {
+        if let Some(pending) = self
+            .discount_scheduler
+            .pending(self.meta_iter, self.discount_clock_start.elapsed())
+        {
             let discount_started = Instant::now();
-            apply_dcfr_discount_lazy(&self.storage, self.meta_iter, &self.training);
+            apply_dcfr_discount_lazy(&self.storage, pending.epoch, &self.training);
+            let sweep_duration = discount_started.elapsed();
+            LAZY_DISCOUNT_NANOS.fetch_add(
+                u64::try_from(sweep_duration.as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            let purge_started = Instant::now();
             purge_negative_action_subtrees_after_discount(&self.storage, &self.training);
-            LAZY_DISCOUNT_NANOS.fetch_add(nanos_since(discount_started), Ordering::Relaxed);
+            let purge_duration = purge_started.elapsed();
+            let completed = self.discount_scheduler.complete(
+                pending,
+                self.meta_iter,
+                self.discount_clock_start.elapsed(),
+            );
+            log_discount_pass(
+                completed,
+                self.meta_iter,
+                &self.training,
+                sweep_duration,
+                Some(purge_duration),
+            );
         }
 
         batch
@@ -705,17 +981,61 @@ fn nanos_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn should_discount(meta_iter: u64, config: &MpTrainingConfig) -> bool {
-    if meta_iter < config.lcfr_warmup_iterations {
-        return false;
+fn log_discount_schedule(config: &MpTrainingConfig) {
+    if let Some(interval) = config.dcfr_discount_interval_seconds {
+        eprintln!(
+            "blueprint_mp DCFR schedule: mode=wall_clock interval={}s warmup_meta_iterations={} overrides_lcfr_discount_interval={}",
+            interval, config.lcfr_warmup_iterations, config.lcfr_discount_interval
+        );
+    } else {
+        eprintln!(
+            "blueprint_mp DCFR schedule: mode=iterations interval={} warmup_meta_iterations={}",
+            config.lcfr_discount_interval.max(1),
+            config.lcfr_warmup_iterations
+        );
     }
-    let interval = config.lcfr_discount_interval.max(1);
-    meta_iter.is_multiple_of(interval)
 }
 
-fn apply_dcfr_discount(storage: &MpStorage, meta_iter: u64, config: &MpTrainingConfig) {
-    let interval = config.lcfr_discount_interval.max(1);
-    let epoch = meta_iter / interval;
+fn log_discount_pass(
+    completed: CompletedDiscount,
+    meta_iter: u64,
+    config: &MpTrainingConfig,
+    sweep_duration: Duration,
+    purge_duration: Option<Duration>,
+) {
+    let pending = completed.pending;
+    let (d_pos, d_neg) =
+        regret_discount_factors(pending.epoch, config.dcfr_alpha, config.dcfr_beta);
+    let d_strat = strategy_discount_factor(pending.epoch, config.dcfr_gamma);
+    let (mode, interval, scheduled, lateness) = match (pending.boundary, pending.lateness) {
+        (DiscountBoundary::MetaIteration(boundary), DiscountLateness::MetaIterations(late)) => (
+            "iterations",
+            format!("{}meta_iterations", pending.interval),
+            format!("meta_iteration:{boundary}"),
+            format!("{late}meta_iterations"),
+        ),
+        (DiscountBoundary::Elapsed(boundary), DiscountLateness::WallClock(late)) => (
+            "wall_clock",
+            format!("{}s", pending.interval),
+            format!("elapsed:{:.3}s", boundary.as_secs_f64()),
+            format!("{:.3}s", late.as_secs_f64()),
+        ),
+        _ => unreachable!("discount boundary and lateness must use the same unit"),
+    };
+    let purge = purge_duration.map_or_else(
+        || "n/a".to_string(),
+        |duration| format!("{:.3}s", duration.as_secs_f64()),
+    );
+    eprintln!(
+        "blueprint_mp DCFR pass: mode={mode} interval={interval} scheduled={scheduled} execution_elapsed={:.3}s meta_iter={meta_iter} epoch={} d_pos={d_pos:.9} d_neg={d_neg:.9} d_strat={d_strat:.9} lateness={lateness} skipped_slots={} sweep={:.3}s purge={purge}",
+        pending.observed_elapsed.as_secs_f64(),
+        pending.epoch,
+        completed.skipped_slots,
+        sweep_duration.as_secs_f64(),
+    );
+}
+
+fn apply_dcfr_discount(storage: &MpStorage, epoch: u64, config: &MpTrainingConfig) {
     let (d_pos, d_neg) = regret_discount_factors(epoch, config.dcfr_alpha, config.dcfr_beta);
     let d_strat = strategy_discount_factor(epoch, config.dcfr_gamma);
 
@@ -754,9 +1074,7 @@ fn discount_strategy_sum_atom(atom: &AtomicU64, d_strat: f64) {
     atom.store(discounted, Ordering::Relaxed);
 }
 
-fn apply_dcfr_discount_lazy(storage: &SparseMpStorage, meta_iter: u64, config: &MpTrainingConfig) {
-    let interval = config.lcfr_discount_interval.max(1);
-    let epoch = meta_iter / interval;
+fn apply_dcfr_discount_lazy(storage: &SparseMpStorage, epoch: u64, config: &MpTrainingConfig) {
     let (d_pos, d_neg) = regret_discount_factors(epoch, config.dcfr_alpha, config.dcfr_beta);
     let d_strat = strategy_discount_factor(epoch, config.dcfr_gamma);
 
@@ -985,6 +1303,7 @@ mod tests {
             time_limit_minutes: None,
             lcfr_warmup_iterations: 0,
             lcfr_discount_interval: 50,
+            dcfr_discount_interval_seconds: None,
             prune_after_iterations: 1_000_000,
             traversal_pruning_enabled: false,
             prune_threshold: -250,
@@ -1050,6 +1369,7 @@ mod tests {
             time_limit_minutes: None,
             lcfr_warmup_iterations: 100,
             lcfr_discount_interval: 50,
+            dcfr_discount_interval_seconds: None,
             prune_after_iterations: 1_000_000,
             traversal_pruning_enabled: false,
             prune_threshold: -250,
@@ -1194,44 +1514,6 @@ mod tests {
         let config = toy_config(2, 50);
         let result = train_blueprint_mp(&config);
         assert_eq!(result.meta_iterations, 50);
-    }
-
-    // -- should_discount tests --
-
-    #[timed_test]
-    fn should_discount_false_during_warmup() {
-        let config = toy_training_config(1000);
-        // warmup=100, interval=50 => iter 50 is in warmup
-        assert!(!should_discount(50, &config));
-    }
-
-    #[timed_test]
-    fn should_discount_false_at_warmup_boundary() {
-        let config = toy_training_config(1000);
-        // iter=100 is still in warmup (< warmup)
-        assert!(!should_discount(99, &config));
-    }
-
-    #[timed_test]
-    fn should_discount_true_at_interval_after_warmup() {
-        let config = toy_training_config(1000);
-        // warmup=100, interval=50, iter=150 => 150 >= 100 and 150 % 50 == 0
-        assert!(should_discount(150, &config));
-    }
-
-    #[timed_test]
-    fn should_discount_false_between_intervals() {
-        let config = toy_training_config(1000);
-        // iter=125 is past warmup but 125 % 50 != 0
-        assert!(!should_discount(125, &config));
-    }
-
-    #[timed_test]
-    fn should_discount_true_at_zero_warmup() {
-        let mut config = toy_training_config(1000);
-        config.lcfr_warmup_iterations = 0;
-        // interval=50, iter=50 => 50 % 50 == 0
-        assert!(should_discount(50, &config));
     }
 
     // -- should_prune tests --
@@ -1573,6 +1855,236 @@ mod tests {
         }
     }
 
+    // -- discount scheduler tests --
+
+    fn wall_clock_scheduler(warmup: u64, interval_seconds: u64) -> DiscountScheduler {
+        wall_clock_scheduler_at(0, warmup, interval_seconds)
+    }
+
+    fn wall_clock_scheduler_at(
+        start_meta_iter: u64,
+        warmup: u64,
+        interval_seconds: u64,
+    ) -> DiscountScheduler {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = warmup;
+        config.dcfr_discount_interval_seconds = NonZeroU64::new(interval_seconds);
+        DiscountScheduler::new(&config, start_meta_iter)
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_arms_at_start_when_warmup_is_zero() {
+        let mut scheduler = wall_clock_scheduler(0, 10);
+
+        assert!(scheduler.pending(0, Duration::from_secs(9)).is_none());
+        let pending = scheduler
+            .pending(0, Duration::from_secs(10))
+            .expect("first deadline should be due exactly ten seconds after start");
+        assert_eq!(pending.mode, DiscountMode::WallClock);
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(
+            pending.boundary,
+            DiscountBoundary::Elapsed(Duration::from_secs(10))
+        );
+        assert_eq!(
+            pending.lateness,
+            DiscountLateness::WallClock(Duration::ZERO)
+        );
+        assert_eq!(pending.skipped_slots, 0);
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_arms_at_creation_when_start_equals_warmup() {
+        let mut scheduler = wall_clock_scheduler_at(100, 100, 10);
+
+        assert!(scheduler.pending(100, Duration::from_secs(9)).is_none());
+        assert_eq!(
+            scheduler
+                .pending(100, Duration::from_secs(10))
+                .expect("a stepper created at warmup should already be armed")
+                .epoch,
+            1
+        );
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_arms_at_creation_when_start_exceeds_warmup() {
+        let mut scheduler = wall_clock_scheduler_at(150, 100, 10);
+
+        assert!(scheduler.pending(150, Duration::from_secs(9)).is_none());
+        let pending = scheduler
+            .pending(150, Duration::from_secs(10))
+            .expect("a stepper created beyond warmup should already be armed");
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(
+            pending.boundary,
+            DiscountBoundary::Elapsed(Duration::from_secs(10))
+        );
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_arms_on_first_completed_batch_at_warmup() {
+        let mut scheduler = wall_clock_scheduler(100, 10);
+
+        assert!(scheduler.pending(99, Duration::from_secs(50)).is_none());
+        assert!(scheduler.pending(100, Duration::from_secs(50)).is_none());
+        assert!(scheduler.pending(110, Duration::from_secs(59)).is_none());
+        let pending = scheduler
+            .pending(110, Duration::from_secs(60))
+            .expect("deadline should be relative to the warmup observation");
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(
+            pending.boundary,
+            DiscountBoundary::Elapsed(Duration::from_secs(60))
+        );
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_skips_missed_slots_without_catch_up() {
+        let mut scheduler = wall_clock_scheduler(0, 10);
+        let pending = scheduler
+            .pending(1, Duration::from_secs(35))
+            .expect("a late deadline should produce one pass");
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(
+            pending.boundary,
+            DiscountBoundary::Elapsed(Duration::from_secs(30))
+        );
+        assert_eq!(
+            pending.lateness,
+            DiscountLateness::WallClock(Duration::from_secs(5))
+        );
+        assert_eq!(pending.skipped_slots, 2);
+
+        let completed = scheduler.complete(pending, 1, Duration::from_secs(46));
+        assert_eq!(completed.skipped_slots, 3);
+        assert!(scheduler.pending(2, Duration::from_secs(49)).is_none());
+
+        let next = scheduler
+            .pending(2, Duration::from_secs(50))
+            .expect("schedule should remain anchored at the first slot after fresh elapsed");
+        assert_eq!(next.epoch, 2);
+        assert_eq!(
+            next.boundary,
+            DiscountBoundary::Elapsed(Duration::from_secs(50))
+        );
+    }
+
+    #[timed_test]
+    fn wall_clock_discount_has_no_duplicate_pass_at_same_deadline() {
+        let mut scheduler = wall_clock_scheduler(0, 10);
+        let pending = scheduler
+            .pending(0, Duration::from_secs(10))
+            .expect("deadline should be due");
+        let _ = scheduler.complete(pending, 0, Duration::from_secs(10));
+
+        assert!(scheduler.pending(0, Duration::from_secs(10)).is_none());
+    }
+
+    #[timed_test]
+    fn wall_clock_config_overrides_iteration_schedule() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 1;
+        config.dcfr_discount_interval_seconds = NonZeroU64::new(10);
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        assert!(scheduler.pending(500, Duration::from_secs(9)).is_none());
+        assert_eq!(
+            scheduler
+                .pending(500, Duration::from_secs(10))
+                .expect("wall-clock deadline should override iteration cadence")
+                .mode,
+            DiscountMode::WallClock
+        );
+    }
+
+    #[timed_test]
+    fn iteration_discount_triggers_on_nonaligned_boundary_crossing() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 50;
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        assert!(scheduler.pending(40, Duration::ZERO).is_none());
+        let pending = scheduler
+            .pending(60, Duration::ZERO)
+            .expect("crossing iteration 50 should trigger even without exact divisibility");
+        assert_eq!(pending.mode, DiscountMode::Iterations);
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(pending.boundary, DiscountBoundary::MetaIteration(50));
+        assert_eq!(pending.lateness, DiscountLateness::MetaIterations(10));
+        let _ = scheduler.complete(pending, 60, Duration::ZERO);
+        assert!(scheduler.pending(60, Duration::ZERO).is_none());
+    }
+
+    #[timed_test]
+    fn iteration_discount_preserves_aligned_boundary_epoch() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 100;
+        config.lcfr_discount_interval = 50;
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        let pending = scheduler
+            .pending(100, Duration::ZERO)
+            .expect("aligned warmup boundary should retain legacy behavior");
+        assert_eq!(pending.epoch, 2);
+        assert_eq!(pending.boundary, DiscountBoundary::MetaIteration(100));
+        assert_eq!(pending.skipped_slots, 0);
+    }
+
+    #[timed_test]
+    fn iteration_discount_skips_crossed_boundaries_without_catch_up() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 0;
+        config.lcfr_discount_interval = 50;
+        let mut scheduler = DiscountScheduler::new(&config, 0);
+
+        let pending = scheduler
+            .pending(160, Duration::ZERO)
+            .expect("crossing multiple boundaries should produce one pass");
+        assert_eq!(pending.epoch, 3);
+        assert_eq!(pending.boundary, DiscountBoundary::MetaIteration(150));
+        assert_eq!(pending.skipped_slots, 2);
+        let completed = scheduler.complete(pending, 160, Duration::ZERO);
+        assert_eq!(completed.skipped_slots, 2);
+        assert!(scheduler.pending(199, Duration::ZERO).is_none());
+        assert_eq!(
+            scheduler
+                .pending(200, Duration::ZERO)
+                .expect("next anchored boundary should be due")
+                .epoch,
+            4
+        );
+    }
+
+    #[timed_test]
+    fn eager_and_lazy_use_identical_scheduler_decisions() {
+        let mut config = toy_training_config(1_000);
+        config.lcfr_warmup_iterations = 25;
+        config.dcfr_discount_interval_seconds = NonZeroU64::new(10);
+        let mut eager = DiscountScheduler::new(&config, 0);
+        let mut lazy = DiscountScheduler::new(&config, 0);
+
+        for (meta_iter, elapsed) in [
+            (20, Duration::from_secs(2)),
+            (30, Duration::from_secs(4)),
+            (40, Duration::from_secs(13)),
+            (50, Duration::from_secs(14)),
+            (60, Duration::from_secs(25)),
+        ] {
+            let eager_pending = eager.pending(meta_iter, elapsed);
+            let lazy_pending = lazy.pending(meta_iter, elapsed);
+            assert_eq!(eager_pending, lazy_pending);
+            if let (Some(eager_pending), Some(lazy_pending)) = (eager_pending, lazy_pending) {
+                assert_eq!(
+                    eager.complete(eager_pending, meta_iter, elapsed),
+                    lazy.complete(lazy_pending, meta_iter, elapsed)
+                );
+            }
+        }
+    }
+
     // -- apply_dcfr_discount tests --
 
     #[timed_test]
@@ -1627,6 +2139,22 @@ mod tests {
             after > 0,
             "positive regret should stay positive, got {after}"
         );
+    }
+
+    #[timed_test]
+    fn dcfr_discount_application_uses_explicit_epoch() {
+        let tree = minimal_tree(2);
+        let bucket_counts = [10u16, 10, 10, 10];
+        let storage = MpStorage::new(&tree, bucket_counts);
+        let node = first_decision_node(&tree);
+        storage.add_regret(node, 0, 0, 1_000);
+        storage.add_strategy_sum(node, 0, 0, 10_000);
+        let config = toy_training_config(1_000);
+
+        apply_dcfr_discount(&storage, 1, &config);
+
+        assert_eq!(storage.get_regret(node, 0, 0), 500);
+        assert_eq!(storage.get_strategy_sum(node, 0, 0), 2_500);
     }
 
     #[timed_test]

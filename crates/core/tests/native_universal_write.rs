@@ -298,6 +298,7 @@ fn mp_eager_native_write_payload_matches_post_hoc_export() {
         time_limit_minutes: None,
         lcfr_warmup_iterations: 0,
         lcfr_discount_interval: 1,
+        dcfr_discount_interval_seconds: None,
         prune_after_iterations: 200,
         traversal_pruning_enabled: false,
         prune_threshold: 0,
