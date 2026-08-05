@@ -82,7 +82,7 @@ impl MpTuiApp {
         }
     }
 
-    /// Render the full dashboard: metrics, grid page, hotkeys.
+    /// Render the full dashboard: metrics, grid page, training status, hotkeys.
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
         let chunks = Layout::default()
@@ -91,11 +91,13 @@ impl MpTuiApp {
                 Constraint::Length(19),
                 Constraint::Min(0),
                 Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(area);
         self.render_metrics(frame, chunks[0]);
         self.render_grid_page(frame, chunks[1]);
-        self.render_hotkeys(frame, chunks[2]);
+        self.render_training_status(frame, chunks[2]);
+        self.render_hotkeys(frame, chunks[3]);
     }
 
     /// Sample iteration counter and update sparkline histories.
@@ -334,6 +336,12 @@ impl MpTuiApp {
         );
         let p = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(p, area);
+    }
+
+    fn render_training_status(&self, frame: &mut Frame, area: Rect) {
+        let text = self.metrics.training_status_text().unwrap_or_default();
+        let paragraph = Paragraph::new(text).style(Style::default().fg(Color::Cyan));
+        frame.render_widget(paragraph, area);
     }
 }
 
@@ -617,6 +625,8 @@ pub fn page_slice<T>(items: &[T], page: usize, per_page: usize) -> &[T] {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use test_macros::timed_test;
 
     // -- page_count tests --
@@ -753,6 +763,72 @@ mod tests {
         let backend = TestBackend::new(180, 50);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    #[timed_test]
+    fn render_training_status_above_hotkeys_without_replacing_snapshot_status() {
+        use std::num::NonZeroU64;
+        use std::time::Duration;
+
+        use poker_solver_core::blueprint_mp::trainer::{MpDcfrPassEvent, MpTrainingEvent};
+        use ratatui::backend::TestBackend;
+
+        let app = test_app(0);
+        app.metrics
+            .mark_snapshot_saved(std::path::Path::new("/tmp/snapshot_0007"));
+        app.metrics.publish_training_event_at(
+            MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+                completed_passes: 2,
+                max_passes: NonZeroU64::new(40),
+                epoch: 7,
+                meta_iteration: 500,
+                skipped_slots: 0,
+                sweep_duration: Duration::from_millis(25),
+                purge_duration: None,
+                max_reached: false,
+            }),
+            Instant::now(),
+        );
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let status = buffer_row_text(buffer, 28);
+        let footer = buffer_row_text(buffer, 29);
+        assert!(status.contains("DCFR pass 2/40 | epoch 7 | sweep 25.0ms"));
+        assert!(footer.contains("[p]ause"));
+        assert!(footer.contains("snapshot: saved snapshot_0007"));
+    }
+
+    #[timed_test]
+    fn narrow_training_status_is_clipped_to_one_row() {
+        use std::time::Duration;
+
+        use poker_solver_core::blueprint_mp::trainer::{MpDcfrPassEvent, MpTrainingEvent};
+        use ratatui::backend::TestBackend;
+
+        let app = test_app(0);
+        app.metrics.publish_training_event_at(
+            MpTrainingEvent::DcfrPass(MpDcfrPassEvent {
+                completed_passes: 123,
+                max_passes: None,
+                epoch: 999,
+                meta_iteration: 500,
+                skipped_slots: 8,
+                sweep_duration: Duration::from_secs(2),
+                purge_duration: None,
+                max_reached: false,
+            }),
+            Instant::now(),
+        );
+        let backend = TestBackend::new(20, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer_row_text(buffer, 22), "DCFR pass 123 | epoc");
+        assert!(buffer_row_text(buffer, 23).starts_with("[p]ause"));
     }
 
     // -- tick tests --
@@ -1052,5 +1128,13 @@ mod tests {
             })
             .collect();
         super::MpTuiApp::new(metrics, scenarios, TelemetryConfig::default(), 6)
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 }
